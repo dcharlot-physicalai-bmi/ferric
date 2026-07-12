@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-validate:
+    name: build + validate (software GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Software Vulkan (lavapipe) so wgpu has a real compute adapter on a headless runner —
+      # the validation examples run the actual GPU kernels, just on a CPU rasterizer.
+      - name: Install lavapipe (software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+          vulkaninfo --summary || true
+
+      - name: Build workspace
+        run: cargo build --workspace --verbose
+
+      - name: Build browser target (wasm32 + WebGPU)
+        run: cargo build -p ferric-core --target wasm32-unknown-unknown
+
+      # Every example validates its GPU result against a reference (CPU / onnxruntime / numpy).
+      # Skips run_projectors (needs the SmolVLA-derived fixtures that aren't committed).
+      - name: Validate — core (transformer, LM, KV-cache generation)
+        run: |
+          for ex in transformer_block decoder_layer tiny_llm generate; do
+            echo "::group::$ex"; cargo run -p ferric-core --example $ex; echo "::endgroup::"
+          done
+
+      - name: Validate — ONNX importer vs onnxruntime references
+        run: |
+          for ex in run_mlp run_attn run_block run_struct run_swiglu; do
+            echo "::group::$ex"; cargo run -p ferric-onnx --example $ex; echo "::endgroup::"
+          done
+
+      - name: Validate — safetensors loader + Llama bridge
+        run: |
+          cargo run -p ferric-load --example load_safetensors
+          cargo run -p ferric-llama --example run_llama

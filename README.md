@@ -1,5 +1,9 @@
 # Ferric
 
+[![CI](https://github.com/dcharlot-physicalai-bmi/ferric/actions/workflows/ci.yml/badge.svg)](https://github.com/dcharlot-physicalai-bmi/ferric/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+
 **One pure-Rust AI compute ecosystem across every fabric — cloud, local, browser.** Maximally
 optimized, heterogeneous, no Python/C++ in the hot path. A model defined once runs the *same code* on
 a datacenter GPU, a laptop, an edge robot, and a browser tab.
