@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Institute for Physical AI (physicalai-bmi.org)"]
+repository = "https://github.com/dcharlot-physicalai-bmi/ferric"
+homepage = "https://physicalai-bmi.org"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Ferric-owned forks: strategic crates promoted out of vendor/ so we edit + maintain them directly.
+[patch.crates-io]
+wgpu = { path = "forks/wgpu" }
+wgpu-core = { path = "forks/wgpu-core" }
+wgpu-hal = { path = "forks/wgpu-hal" }
+wgpu-types = { path = "forks/wgpu-types" }
+wgpu-naga-bridge = { path = "forks/wgpu-naga-bridge" }
+wgpu-core-deps-apple = { path = "forks/wgpu-core-deps-apple" }
+wgpu-core-deps-emscripten = { path = "forks/wgpu-core-deps-emscripten" }
+wgpu-core-deps-windows-linux-android = { path = "forks/wgpu-core-deps-windows-linux-android" }
+naga = { path = "forks/naga" }

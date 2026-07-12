@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out">starting…</pre>
+<script type="module">
+import init, { ferric_matmul_demo } from './pkg/ferric_web.js';
+const log=(m)=>{document.getElementById('out').textContent+='\n'+m; console.log('FERRIC> '+m);};
+try {
+  await init();
+  const adapter = await navigator.gpu?.requestAdapter();
+  log('WebGPU adapter: ' + (adapter ? 'present' : 'MISSING'));
+  const res = await ferric_matmul_demo(64,48,32);   // same dims as native
+  log('result: ' + res);   // "Backend|maxdiff|[first6]"
+  const diff = parseFloat(res.split('|')[1]);
+  log(diff < 1e-4 ? 'RESULT_OK' : 'RESULT_BAD');
+} catch(e){ log('ERROR: '+(e.message||e)); log('RESULT_BAD'); }
+</script></body></html>

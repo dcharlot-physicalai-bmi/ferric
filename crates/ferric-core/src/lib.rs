@@ -1,0 +1,276 @@
+//! Ferric core — L0 (portable device/fabric abstraction) + L1 (kernel dispatch), on `wgpu`.
+//!
+//! `wgpu` gives us one API over WebGPU (browser), Vulkan, Metal, DX12, and GL. This crate wraps it
+//! into a tiny `Context` and the first real kernel (matmul), written ONCE in WGSL and run on any
+//! fabric. The same source compiles to native (Metal/Vulkan/DX12) and to `wasm32` for the browser.
+//! Numerics are validated against a plain-Rust CPU reference so "runs everywhere" also means
+//! "computes the same everywhere".
+
+use std::borrow::Cow;
+
+pub type Result<T> = std::result::Result<T, String>;
+
+mod kernels;
+pub use kernels::cpu; // CPU references for validation
+
+/// A compute context bound to one GPU adapter on whatever fabric is available.
+pub struct Context {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub backend: wgpu::Backend,
+    pub adapter_name: String,
+}
+
+/// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
+/// so a whole model runs on-device — this is the L2/L3 substrate (the graph executor works on these).
+pub struct Tensor {
+    pub buf: wgpu::Buffer,
+    pub shape: Vec<usize>,
+}
+impl Tensor {
+    pub fn len(&self) -> usize { self.shape.iter().product() }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+impl Context {
+    /// Acquire the best available compute device on this fabric (native GPU or browser WebGPU).
+    pub async fn new() -> Result<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("no compute adapter: {e:?}"))?;
+        let info = adapter.get_info();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("ferric"),
+                required_features: wgpu::Features::empty(),
+                // downlevel defaults keep us inside the WebGPU baseline → the same limits hold in a browser
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("no compute device: {e:?}"))?;
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name })
+    }
+
+    pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        })
+    }
+    pub(crate) fn storage_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        })
+    }
+    /// Copy a buffer into a fresh one of the same byte length (used for Reshape/Cast — data unchanged).
+    pub(crate) fn copy_buf(&self, src: &wgpu::Buffer, len: usize) -> wgpu::Buffer {
+        let dst = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dup"),
+            size: (len * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src, 0, &dst, 0, (len * 4) as u64);
+        self.queue.submit([enc.finish()]);
+        dst
+    }
+    pub(crate) fn uniform_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    }
+    /// An empty output storage buffer of `len` f32s (readable back via `readback`).
+    pub(crate) fn out_buffer(&self, len: usize) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out"),
+            size: (len * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    }
+    /// Compile a WGSL compute pipeline (entry `main`, auto bind-group layout).
+    pub(crate) fn pipeline(&self, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(wgsl.to_string())),
+        });
+        self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+    /// Dispatch a compute pipeline over `binds` with `groups` workgroups (queue-ordered before readback).
+    pub(crate) fn dispatch(&self, pipeline: &wgpu::ComputePipeline, binds: &[&wgpu::Buffer], groups: (u32, u32, u32)) {
+        let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
+            .collect();
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+    /// Read `len` f32s back from a storage buffer (works native + wasm).
+    pub(crate) async fn readback(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {
+        let bytes = (len * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, bytes);
+        self.queue.submit([enc.finish()]);
+        let (tx, rx) = flume::bounded(1);
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv_async().await.map_err(|e| format!("recv: {e:?}"))?.map_err(|e| format!("map: {e:?}"))?;
+        let data = staging.slice(..).get_mapped_range().map_err(|e| format!("map range: {e:?}"))?;
+        let out: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// C = A(m×k) · B(k×n), row-major, f32. One kernel, any fabric.
+    pub async fn matmul(&self, a: &[f32], b: &[f32], m: u32, k: u32, n: u32) -> Result<Vec<f32>> {
+        assert_eq!(a.len(), (m * k) as usize);
+        assert_eq!(b.len(), (k * n) as usize);
+        let out_len = (m * n) as usize;
+        let out_bytes = (out_len * 4) as u64;
+
+        let a_buf = self.storage("a", a);
+        let b_buf = self.storage("b", b);
+        let dims_buf = self.uniform_u32("dims", &[m, k, n, 0]);
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matmul"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MATMUL_WGSL)),
+        });
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("matmul"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("matmul-bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: dims_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("matmul"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let gx = (m + 15) / 16;
+            let gy = (n + 15) / 16;
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        // copy to a mappable staging buffer for readback
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: out_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
+        self.queue.submit([enc.finish()]);
+
+        // async readback that works on native (poll blocks) and wasm (browser drives the queue)
+        let (tx, rx) = flume::bounded(1);
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv_async().await.map_err(|e| format!("recv: {e:?}"))?.map_err(|e| format!("map: {e:?}"))?;
+        let data = staging.slice(..).get_mapped_range().map_err(|e| format!("map range: {e:?}"))?;
+        let out: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(out)
+    }
+}
+
+pub(crate) const MATMUL_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       a: array<f32>;
+@group(0) @binding(1) var<storage, read>       b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // m, k, n, _
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let m = dims.x; let k = dims.y; let n = dims.z;
+    let row = gid.x; let col = gid.y;
+    if (row >= m || col >= n) { return; }
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < k; i = i + 1u) {
+        acc = acc + a[row * k + i] * b[i * n + col];
+    }
+    out[row * n + col] = acc;
+}
+"#;
+
+/// Plain-Rust CPU reference (the source of truth for validation).
+pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += a[row * k + i] * b[i * n + col];
+            }
+            c[row * n + col] = acc;
+        }
+    }
+    c
+}
+
+/// Max absolute difference between two equal-length vectors.
+pub fn max_abs_diff(x: &[f32], y: &[f32]) -> f32 {
+    x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
+}

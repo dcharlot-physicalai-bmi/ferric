@@ -1,0 +1,19 @@
+[package]
+name = "ferric-llama"
+description = "Ferric Llama bridge — load a Llama/SmolLM-family safetensors checkpoint (HF layout, GQA, RoPE, SwiGLU, tied embeddings) and run its forward pass on Ferric's cross-fabric kernels. Pure Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["llama", "llm", "transformer", "ai", "inference"]
+categories = ["science"]
+exclude = ["testdata/"]
+
+[dependencies]
+ferric-core = { path = "../ferric-core", version = "0.0.1" }
+ferric-load = { path = "../ferric-load", version = "0.0.1" }
+
+[dev-dependencies]
+pollster = "1.0.1"

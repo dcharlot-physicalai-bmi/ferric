@@ -1,0 +1,19 @@
+[package]
+name = "ferric-core"
+description = "Ferric: pure-Rust cross-fabric AI compute. L0/L1 — portable device + kernel dispatch on wgpu (WebGPU/Vulkan/Metal/DX12), with a validated transformer kernel set (matmul, attention, RoPE, RMSNorm, SwiGLU)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["gpu", "webgpu", "wasm", "tensor", "ai"]
+categories = ["science", "graphics", "wasm"]
+
+[dependencies]
+bytemuck = "1.25.1"
+flume = "0.12.0"
+wgpu = "30.0.0"
+
+[dev-dependencies]
+pollster = "1.0.1"
