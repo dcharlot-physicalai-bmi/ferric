@@ -22,6 +22,8 @@ pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod nn; // transformer blocks expressed on the general runtime
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 pub use autograd::Var;
 pub use dtype::{DType, Half, QTensor};
 

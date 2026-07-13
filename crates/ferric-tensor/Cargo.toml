@@ -15,6 +15,7 @@ ferric-core = { path = "../ferric-core", version = "0.0.1" }
 wgpu = "30.0.0"
 bytemuck = "1.25.1"
 flume = "0.12.0"
+pollster = "1.0.1"
 
 [dev-dependencies]
 pollster = "1.0.1"
