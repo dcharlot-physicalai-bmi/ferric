@@ -37,9 +37,12 @@ builds fully offline from vendored source.
 | **KV-cache** autoregressive generation | *exact* vs full recompute |
 | Pure-Rust **safetensors** loader (F32/F16/BF16) | exact round-trip |
 | **Llama/SmolLM** checkpoint bridge (HF layout, GQA, tied embeddings) | matches `numpy` `1.2e-6` |
+| **General tensor runtime** — arbitrary rank, strided views, broadcasting, any-axis reductions, batched matmul | matches CPU ref |
+| **Autograd** — reverse-mode; an MLP trained on the GPU | grad-check `1.5e-5`, loss ↓ 100% |
 
 ## Crates
 - [`ferric-core`](crates/ferric-core) — L0/L1: the `wgpu` `Context` + the cross-fabric kernel set + CPU references.
+- [`ferric-tensor`](crates/ferric-tensor) — L2: the general N-D tensor runtime (strided views, broadcasting, reductions, batched matmul) + reverse-mode autograd for training.
 - [`ferric-onnx`](crates/ferric-onnx) — L3: a pure-Rust ONNX importer that runs graphs on Ferric tensor ops.
 - [`ferric-load`](crates/ferric-load) — safetensors reader (fp16/bf16 dequant) — how real checkpoints enter.
 - [`ferric-llama`](crates/ferric-llama) — maps a Llama/SmolLM safetensors checkpoint onto the kernels and runs it.

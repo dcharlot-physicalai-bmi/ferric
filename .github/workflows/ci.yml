@@ -55,3 +55,8 @@ jobs:
         run: |
           cargo run -p ferric-load --example load_safetensors
           cargo run -p ferric-llama --example run_llama
+
+      - name: Validate — general tensor runtime + autograd training
+        run: |
+          cargo run -p ferric-tensor --example general
+          cargo run -p ferric-tensor --example train
