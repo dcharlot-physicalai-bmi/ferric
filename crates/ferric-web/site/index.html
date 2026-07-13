@@ -127,15 +127,18 @@
     <div class="card"><h3>KV-cache generation</h3><div class="num">exact</div><p>Autoregressive decode, identical to a full recompute — token by token.</p></div>
     <div class="card"><h3>ONNX importer</h3><div class="num">~22 ops</div><p>Real graphs incl. SmolVLA components, matching <span class="mono">onnxruntime</span>.</p></div>
     <div class="card"><h3>Llama / SmolLM bridge</h3><div class="num">1.2e-6</div><p>Loads an HF safetensors checkpoint (GQA, tied embeddings), matched to <span class="mono">numpy</span>.</p></div>
+    <div class="card"><h3>General tensor runtime</h3><div class="num">N-D</div><p>Arbitrary rank, strided views, broadcasting, any-axis reductions, batched matmul — vs a CPU ref.</p></div>
+    <div class="card"><h3>It trains</h3><div class="num">grad ✓</div><p>Reverse-mode autograd; an MLP fit on the GPU, gradients checked to 1.5e-5.</p></div>
     <div class="card"><h3>Self-reliant</h3><div class="num">offline</div><p>Strategic deps (<span class="mono">wgpu</span>, <span class="mono">naga</span>) forked in-tree; the whole build vendors.</p></div>
   </div>
 </div></section>
 
 <section id="crates"><div class="wrap">
   <p class="eyebrow">The stack</p>
-  <h2>Five crates, published on crates.io.</h2>
+  <h2>Six crates, published on crates.io.</h2>
   <div style="margin-top:20px">
     <div class="crate"><code>ferric-core</code><span>The <span class="mono">wgpu</span> Context + the cross-fabric transformer kernel set.</span><a href="https://crates.io/crates/ferric-core" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-tensor</code><span>The general N-D tensor runtime — strided views, broadcasting, reductions, batched matmul — with autograd for training.</span><a href="https://crates.io/crates/ferric-tensor" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-onnx</code><span>A pure-Rust ONNX importer that runs graphs on Ferric tensor ops.</span><a href="https://crates.io/crates/ferric-onnx" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-load</code><span>A safetensors reader — fp16/bf16 dequant — how real checkpoints enter.</span><a href="https://crates.io/crates/ferric-load" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-llama</code><span>Maps a Llama/SmolLM safetensors checkpoint onto the kernels and runs it.</span><a href="https://crates.io/crates/ferric-llama" target="_blank">crates.io ↗</a></div>
