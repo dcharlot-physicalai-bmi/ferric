@@ -20,7 +20,9 @@ use wgpu::util::DeviceExt;
 
 pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
+pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub use autograd::Var;
+pub use dtype::{DType, Half, QTensor};
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
 #[derive(Clone)]
@@ -70,6 +72,11 @@ impl Tensor {
         Tensor { ctx: ctx.clone(), buf: Arc::new(buf), shape: shape.to_vec(), strides: contig_strides(shape), offset: 0 }
     }
     pub fn zeros(ctx: &Arc<Context>, shape: &[usize]) -> Tensor { Self::from_vec(ctx, &vec![0.0; numel(shape)], shape) }
+    /// Wrap a freshly-computed contiguous device buffer as a tensor (crate-internal).
+    pub(crate) fn from_parts(ctx: &Arc<Context>, buf: wgpu::Buffer, shape: Vec<usize>) -> Tensor {
+        let strides = contig_strides(&shape);
+        Tensor { ctx: ctx.clone(), buf: Arc::new(buf), shape, strides, offset: 0 }
+    }
 
     /// Materialize (contiguous) and read back to host in logical row-major order.
     pub async fn to_vec(&self) -> Vec<f32> {
@@ -161,6 +168,7 @@ impl Tensor {
     pub fn relu(&self) -> Tensor { self.unary(2) }
     pub fn sqrt(&self) -> Tensor { self.unary(3) }
     pub fn relu_mask(&self) -> Tensor { self.unary(4) } // 1 where x>0 else 0 (relu' )
+    pub fn abs(&self) -> Tensor { self.unary(5) }
     pub(crate) fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
 
     // ---- general reduction over arbitrary axes ----
@@ -317,6 +325,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 2u: { r = max(v, 0.0); }
         case 3u: { r = sqrt(v); }
         case 4u: { if (v > 0.0) { r = 1.0; } else { r = 0.0; } }
+        case 5u: { r = abs(v); }
         default: { r = v; }
     }
     out[i] = r;

@@ -60,3 +60,4 @@ jobs:
         run: |
           cargo run -p ferric-tensor --example general
           cargo run -p ferric-tensor --example train
+          cargo run -p ferric-tensor --example dtypes
