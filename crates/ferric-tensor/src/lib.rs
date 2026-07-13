@@ -21,6 +21,7 @@ use wgpu::util::DeviceExt;
 pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
+pub mod nn; // transformer blocks expressed on the general runtime
 pub use autograd::Var;
 pub use dtype::{DType, Half, QTensor};
 
@@ -169,6 +170,54 @@ impl Tensor {
     pub fn sqrt(&self) -> Tensor { self.unary(3) }
     pub fn relu_mask(&self) -> Tensor { self.unary(4) } // 1 where x>0 else 0 (relu' )
     pub fn abs(&self) -> Tensor { self.unary(5) }
+    pub fn sigmoid(&self) -> Tensor { self.unary(6) }
+    pub fn silu(&self) -> Tensor { self.unary(7) }
+    pub fn gelu(&self) -> Tensor { self.unary(8) }
+    pub fn scalar(&self, s: f32) -> Tensor { Tensor::from_vec(&self.ctx, &[s], &[1]) }
+
+    // ---- fused transformer fast-paths (same result as composing primitives, fewer dispatches) ----
+    /// Softmax over `axis` (fused: per-row max/exp/sum/div in one kernel).
+    pub fn softmax(&self, axis: usize) -> Tensor {
+        let r = self.rank();
+        let mut perm: Vec<usize> = (0..r).collect();
+        perm.remove(axis);
+        perm.push(axis);
+        let p = self.permute(&perm).contiguous();
+        let d = p.shape[r - 1];
+        let rows = p.numel() / d;
+        let out = empty(&self.ctx, p.numel());
+        run(&self.ctx, SOFTMAX_WGSL, "softmax", &[p.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32])], groups(rows));
+        let sm = Tensor::from_parts(&self.ctx, out, p.shape.clone());
+        let mut inv = vec![0usize; r];
+        for (i, &pp) in perm.iter().enumerate() { inv[pp] = i; }
+        sm.permute(&inv).contiguous()
+    }
+    /// RMSNorm over the last dim: x/sqrt(mean(x²)+eps)·weight (fused).
+    pub fn rmsnorm(&self, weight: &Tensor, eps: f32) -> Tensor {
+        let c = self.contiguous();
+        let d = *c.shape.last().unwrap();
+        let rows = c.numel() / d;
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, RMSNORM_WGSL, "rmsnorm", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+    /// Rotary position embedding (NeoX rotate-half) on a [T, n_heads·head_dim] tensor.
+    pub fn rope(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (n_heads * head_dim);
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+    /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
+    pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
+        let d = *self.shape.last().unwrap();
+        let c = self.contiguous();
+        let out = empty(&self.ctx, idx.len() * d);
+        let idxbuf = u32buf(&self.ctx, idx);
+        run(&self.ctx, GATHER_ROWS_WGSL, "gather_rows", &[c.buf.as_ref(), &idxbuf, &out, &u32buf(&self.ctx, &[idx.len() as u32, d as u32])], groups(idx.len() * d));
+        Tensor::from_parts(&self.ctx, out, vec![idx.len(), d])
+    }
     pub(crate) fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
 
     // ---- general reduction over arbitrary axes ----
@@ -326,6 +375,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 3u: { r = sqrt(v); }
         case 4u: { if (v > 0.0) { r = 1.0; } else { r = 0.0; } }
         case 5u: { r = abs(v); }
+        case 6u: { r = 1.0 / (1.0 + exp(-v)); }
+        case 7u: { r = v / (1.0 + exp(-v)); }
+        case 8u: {
+            let t = 1.0 / (1.0 + 0.3275911 * abs(v * 0.7071067811865476));
+            let e = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-(v * 0.7071067811865476) * (v * 0.7071067811865476));
+            let erf = select(-e, e, v >= 0.0);
+            r = 0.5 * v * (1.0 + erf);
+        }
         default: { r = v; }
     }
     out[i] = r;
@@ -369,6 +426,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var j: u32 = 0u; j < red; j = j + 1u) { acc = acc + x[base + j]; }
         out[i] = acc;
     }
+}
+"#;
+
+const SOFTMAX_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // rows, d
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x; let rows = info[0]; let d = info[1];
+    if (row >= rows) { return; }
+    let base = row * d;
+    var mx = x[base];
+    for (var j: u32 = 1u; j < d; j = j + 1u) { mx = max(mx, x[base + j]); }
+    var sum = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let e = exp(x[base + j] - mx); out[base + j] = e; sum = sum + e; }
+    let inv = 1.0 / sum;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = out[base + j] * inv; }
+}
+"#;
+
+const RMSNORM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read>        weight: array<f32>;
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    if (row >= rows) { return; }
+    let base = row * d;
+    var ms = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = ms + v * v; }
+    let inv = 1.0 / sqrt(ms / f32(d) + eps);
+    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv * weight[j]; }
+}
+"#;
+
+const ROPE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // t, h, dh, bitcast(base), offset
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]); let off = info[4];
+    let id = gid.x; if (id >= t * h) { return; }
+    let i = id / h; let head = id % h; let half = dh / 2u;
+    let o = (i * h + head) * dh; let lb = log(base);
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let inv = exp(-2.0 * f32(c) / f32(dh) * lb);
+        let ang = f32(i + off) * inv; let cs = cos(ang); let sn = sin(ang);
+        let x1 = x[o + c]; let x2 = x[o + c + half];
+        out[o + c] = x1 * cs - x2 * sn;
+        out[o + c + half] = x2 * cs + x1 * sn;
+    }
+}
+"#;
+
+const GATHER_ROWS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        table: array<f32>;
+@group(0) @binding(1) var<storage,read>        idx: array<u32>;
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // n, d
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = info[0]; let d = info[1]; let t = gid.x;
+    if (t >= n * d) { return; }
+    let i = t / d; let j = t % d;
+    out[i * d + j] = table[idx[i] * d + j];
 }
 "#;
 
