@@ -3,111 +3,212 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ferric — a pure-Rust transformer in your browser (WebGPU)</title>
+<title>Ferric — one pure-Rust AI stack, every fabric</title>
+<meta name="description" content="Ferric is a pure-Rust AI compute ecosystem that runs the same code on a datacenter GPU, a laptop, and a browser tab — with a full transformer, an ONNX importer, and a safetensors loader. Try it live on WebGPU.">
 <style>
-  :root { --bg:#0b0e14; --panel:#111725; --line:#1e2842; --ink:#e6ebf5; --dim:#8ea0c0; --gold:#e8b24a; --ok:#4ade80; --accent:#6ea8fe; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  .wrap { max-width:820px; margin:0 auto; padding:48px 22px 72px; }
-  h1 { font-size:34px; margin:0 0 6px; letter-spacing:-.02em; }
-  h1 .phi { color:var(--gold); }
-  .sub { color:var(--dim); font-size:16px; margin:0 0 28px; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px 22px; margin:16px 0; }
-  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
-  label { color:var(--dim); font-size:13px; }
-  input { background:#0a0f1c; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:14px ui-monospace,monospace; }
-  input#prompt { flex:1; min-width:180px; }
-  input#steps { width:70px; }
-  button { background:var(--gold); color:#0b0e14; border:0; border-radius:8px; padding:10px 18px; font-weight:650; font-size:14px; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  .chips { display:flex; flex-wrap:wrap; gap:7px; margin-top:6px; }
-  .chip { font:13px ui-monospace,monospace; padding:5px 9px; border-radius:7px; border:1px solid var(--line); background:#0a0f1c; color:var(--dim); }
-  .chip.gen { background:rgba(232,178,74,.12); border-color:rgba(232,178,74,.5); color:var(--gold); }
-  .kv { display:grid; grid-template-columns:auto 1fr; gap:6px 16px; font:13px ui-monospace,monospace; }
-  .kv b { color:var(--dim); font-weight:500; }
-  .ok { color:var(--ok); }
-  .muted { color:var(--dim); font-size:13px; }
-  a { color:var(--accent); text-decoration:none; }
-  .banner { border-left:3px solid var(--gold); padding:10px 14px; background:rgba(232,178,74,.07); border-radius:0 8px 8px 0; color:var(--dim); font-size:13.5px; }
-  code { color:var(--gold); font-family:ui-monospace,monospace; }
+  :root{
+    --bg:#080b12; --bg2:#0b0f19; --panel:#101728; --panel2:#0c1220; --line:#1c2540;
+    --ink:#eaf0fb; --dim:#93a3c4; --faint:#5f6f92; --gold:#e8b24a; --gold2:#f2c96b;
+    --ok:#5bd68a; --accent:#6ea8fe;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  .mono{font-family:var(--mono)}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:20;background:rgba(8,11,18,.82);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.01em}
+  .phi{color:var(--gold);font-size:22px;line-height:1}
+  nav .sp{flex:1}
+  nav a.link{color:var(--dim);font-size:14px}
+  nav a.link:hover{color:var(--ink)}
+  .btn{background:var(--gold);color:#0a0d14;padding:9px 16px;border-radius:9px;font-weight:650;font-size:14px;border:0;cursor:pointer}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn:hover{filter:brightness(1.05)}
+
+  /* hero */
+  .hero{position:relative;padding:96px 0 72px;text-align:center;overflow:hidden}
+  .hero::before{content:"";position:absolute;inset:0;background:
+     radial-gradient(680px 320px at 50% -8%, rgba(232,178,74,.14), transparent 70%),
+     radial-gradient(520px 320px at 84% 12%, rgba(110,168,254,.10), transparent 70%);pointer-events:none}
+  .badge{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);
+     color:var(--dim);font-size:12.5px;padding:6px 12px;border-radius:999px;margin-bottom:26px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  h1{font-size:clamp(40px,7vw,68px);line-height:1.02;letter-spacing:-.03em;margin:0 0 18px;font-weight:780}
+  h1 .g{color:var(--gold)}
+  .lede{max-width:640px;margin:0 auto 30px;font-size:clamp(17px,2.2vw,20px);color:var(--dim)}
+  .lede b{color:var(--ink);font-weight:600}
+  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+
+  /* generic section */
+  section{padding:64px 0;border-top:1px solid var(--line)}
+  .eyebrow{color:var(--gold);font:600 13px var(--mono);letter-spacing:.12em;text-transform:uppercase;margin:0 0 14px}
+  h2{font-size:clamp(26px,4vw,36px);letter-spacing:-.02em;margin:0 0 16px;font-weight:720}
+  .muted{color:var(--dim)}
+  .faint{color:var(--faint)}
+  p.big{font-size:18px;color:var(--dim);max-width:680px}
+
+  /* proof grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:26px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:20px}
+  .card h3{margin:0 0 6px;font-size:15px;font-weight:640}
+  .card .num{font:600 22px var(--mono);color:var(--gold);letter-spacing:-.02em}
+  .card p{margin:8px 0 0;font-size:13.5px;color:var(--faint);line-height:1.5}
+
+  /* crates */
+  .crate{display:flex;gap:14px;align-items:baseline;padding:14px 0;border-bottom:1px solid var(--line)}
+  .crate:last-child{border-bottom:0}
+  .crate code{font:600 14px var(--mono);color:var(--gold);min-width:130px}
+  .crate span{color:var(--dim);font-size:14.5px;flex:1}
+  .crate a{color:var(--faint);font-size:12.5px;white-space:nowrap}
+  .crate a:hover{color:var(--accent)}
+
+  /* playground */
+  .pg{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:24px;margin-top:24px}
+  .pgrow{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .pgrow label{color:var(--faint);font-size:12.5px}
+  input{background:#070a11;color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:14px var(--mono)}
+  input#prompt{flex:1;min-width:180px}
+  input#steps{width:74px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;font:13px var(--mono);margin-top:6px}
+  .kv b{color:var(--faint);font-weight:500}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin:8px 0 2px}
+  .chip{font:13px var(--mono);padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:#070a11;color:var(--dim)}
+  .chip.gen{background:rgba(232,178,74,.13);border-color:rgba(232,178,74,.45);color:var(--gold2)}
+  .ok{color:var(--ok)}
+  .banner{border-left:3px solid var(--gold);padding:12px 16px;background:rgba(232,178,74,.07);border-radius:0 10px 10px 0;color:var(--dim);font-size:13.5px;margin-top:16px}
+
+  footer{padding:40px 0 64px;border-top:1px solid var(--line);color:var(--faint);font-size:13.5px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center}
+  footer a{color:var(--dim)} footer a:hover{color:var(--ink)}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1><span class="phi">Ferric</span> — a transformer, in your browser</h1>
-  <p class="sub">A complete Llama/SmolVLA-style language model — RoPE attention, RMSNorm, SwiGLU — running on <b>WebGPU</b>, compiled from <b>pure Rust</b> to WebAssembly. The exact same kernels run on a datacenter GPU.</p>
 
-  <div class="panel" id="statusPanel">
-    <div class="kv">
+<nav><div class="wrap">
+  <a class="brand" href="#top"><span class="phi">Φ</span> Ferric</a>
+  <span class="sp"></span>
+  <a class="link" href="#what">What</a>
+  <a class="link" href="#proof">Proof</a>
+  <a class="link" href="#crates">Crates</a>
+  <a class="link" href="#play">Playground</a>
+  <a class="btn ghost" href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
+</div></nav>
+
+<header class="hero" id="top"><div class="wrap">
+  <span class="badge"><span class="dot"></span> one kernel — bit-identical on native GPU &amp; browser WebGPU</span>
+  <h1>One pure-Rust AI stack.<br><span class="g">Every fabric.</span></h1>
+  <p class="lede">Ferric runs the <b>same code</b> on a datacenter GPU, a laptop, an edge robot, and a browser tab — a complete transformer, an ONNX importer, and a safetensors loader, with <b>no Python or C++ in the hot path</b>.</p>
+  <div class="cta">
+    <a class="btn" href="#play">Run it live ▸</a>
+    <a class="btn ghost" href="https://crates.io/crates/ferric-core" target="_blank">crates.io</a>
+  </div>
+</div></header>
+
+<section id="what"><div class="wrap">
+  <p class="eyebrow">What it is</p>
+  <h2>A single Rust ecosystem for AI compute — cloud, local, and browser.</h2>
+  <p class="big">Browser AI today is JavaScript and C++-WASM; Rust's AI story is fragmented and weak in the browser. Ferric is the missing piece: build directly on the portable GPU layer (<span class="mono">wgpu</span>), own the kernels, the model runtime, weight loading, and browser packaging — one coherent stack where a model defined once runs, and computes the same, everywhere. Every result below is validated against an independent reference and builds fully offline from vendored source.</p>
+</div></section>
+
+<section id="proof"><div class="wrap">
+  <p class="eyebrow">Proven</p>
+  <h2>Not a plan — a working transformer.</h2>
+  <p class="muted">Each milestone checked against a CPU reference, <span class="mono">onnxruntime</span>, or <span class="mono">numpy</span>.</p>
+  <div class="grid">
+    <div class="card"><h3>Cross-fabric core</h3><div class="num">7.15e-7</div><p>One matmul kernel, native Metal vs browser WebGPU — bit-identical.</p></div>
+    <div class="card"><h3>Full transformer LM</h3><div class="num">1.9e-6</div><p>Embed → RoPE GQA attention → RMSNorm → SwiGLU, stacked, matched to CPU.</p></div>
+    <div class="card"><h3>KV-cache generation</h3><div class="num">exact</div><p>Autoregressive decode, identical to a full recompute — token by token.</p></div>
+    <div class="card"><h3>ONNX importer</h3><div class="num">~22 ops</div><p>Real graphs incl. SmolVLA components, matching <span class="mono">onnxruntime</span>.</p></div>
+    <div class="card"><h3>Llama / SmolLM bridge</h3><div class="num">1.2e-6</div><p>Loads an HF safetensors checkpoint (GQA, tied embeddings), matched to <span class="mono">numpy</span>.</p></div>
+    <div class="card"><h3>Self-reliant</h3><div class="num">offline</div><p>Strategic deps (<span class="mono">wgpu</span>, <span class="mono">naga</span>) forked in-tree; the whole build vendors.</p></div>
+  </div>
+</div></section>
+
+<section id="crates"><div class="wrap">
+  <p class="eyebrow">The stack</p>
+  <h2>Five crates, published on crates.io.</h2>
+  <div style="margin-top:20px">
+    <div class="crate"><code>ferric-core</code><span>The <span class="mono">wgpu</span> Context + the cross-fabric transformer kernel set.</span><a href="https://crates.io/crates/ferric-core" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-onnx</code><span>A pure-Rust ONNX importer that runs graphs on Ferric tensor ops.</span><a href="https://crates.io/crates/ferric-onnx" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-load</code><span>A safetensors reader — fp16/bf16 dequant — how real checkpoints enter.</span><a href="https://crates.io/crates/ferric-load" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-llama</code><span>Maps a Llama/SmolLM safetensors checkpoint onto the kernels and runs it.</span><a href="https://crates.io/crates/ferric-llama" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-web</code><span>The same core compiled to WASM, running on browser WebGPU.</span><a href="https://crates.io/crates/ferric-web" target="_blank">crates.io ↗</a></div>
+  </div>
+</div></section>
+
+<section id="play"><div class="wrap">
+  <p class="eyebrow">Playground</p>
+  <h2>A transformer, running in this tab.</h2>
+  <p class="muted">This runs a full Llama-style forward pass on your GPU via <b>WebGPU</b>, compiled from the same Rust as the native crates — and checks its own output against an in-page CPU reference.</p>
+
+  <div class="pg">
+    <div class="kv" id="statusKv">
       <b>status</b><span id="status">initializing…</span>
       <b>backend</b><span id="backend">—</span>
       <b>adapter</b><span id="adapter">—</span>
     </div>
-  </div>
-
-  <div class="panel">
-    <div class="row">
+    <div class="pgrow" style="margin-top:18px">
       <label>prompt (token ids)</label>
       <input id="prompt" value="3,14,1,15" spellcheck="false">
       <label>steps</label>
       <input id="steps" type="number" value="6" min="1" max="32">
-      <button id="run" disabled>Generate ▸</button>
+      <button class="btn" id="run" disabled>Generate ▸</button>
     </div>
-    <div id="result" style="margin-top:16px; display:none">
-      <div class="muted">prompt → generated</div>
+    <div id="result" style="margin-top:18px;display:none">
+      <div class="faint mono" style="font-size:12px">prompt → generated</div>
       <div class="chips" id="chips"></div>
-      <div class="kv" style="margin-top:16px">
+      <div class="kv" style="margin-top:14px">
         <b>correctness</b><span id="diff">—</span>
         <b>latency</b><span id="ms">—</span>
         <b>model</b><span id="model">—</span>
       </div>
     </div>
+    <div class="banner" id="gpuNote" style="display:none">This playground needs <b>WebGPU</b>. Open in Chrome or Edge (recent), or Safari Technology Preview with WebGPU enabled.</div>
   </div>
+  <p class="faint" style="font-size:13px;margin-top:16px">Weights here are fixed pseudo-random — an untrained demo net — so generation is deterministic, not meaningful language. The point is that a real transformer's <i>compute</i> runs correctly in a browser tab.</p>
+</div></section>
 
-  <div class="banner" id="gpuNote" style="display:none">
-    This page needs <b>WebGPU</b>. Open it in Chrome or Edge (recent), or Safari Technology Preview with WebGPU enabled.
-  </div>
-
-  <p class="muted" style="margin-top:24px">
-    Weights here are fixed pseudo-random (an untrained demo net), so generation is deterministic, not meaningful text — the point is that a real transformer's <i>compute</i> runs correctly in a browser tab. The GPU logits are checked live against an in-page CPU reference. &nbsp;·&nbsp;
-    <a href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">source on GitHub</a>
-  </p>
-</div>
+<footer><div class="wrap">
+  <span class="phi">Φ</span>
+  <span>Ferric — from the <a href="https://physicalai-bmi.org" target="_blank">Institute for Physical AI</a>.</span>
+  <span class="sp" style="flex:1"></span>
+  <a href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
+  <a href="https://crates.io/crates/ferric-core" target="_blank">crates.io</a>
+  <span class="faint">Apache-2.0</span>
+</div></footer>
 
 <script type="module">
 import init, { ferric_lm_demo } from './pkg/ferric_web.js';
-const $ = id => document.getElementById(id);
-const set = (id, t) => { $(id).textContent = t; };
-
-async function boot() {
-  if (!navigator.gpu) { set('status','WebGPU not available'); $('gpuNote').style.display='block'; return; }
+const $=id=>document.getElementById(id), set=(id,t)=>{$(id).textContent=t};
+async function boot(){
+  if(!navigator.gpu){ set('status','WebGPU not available'); $('gpuNote').style.display='block'; return; }
   await init();
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) { set('status','no WebGPU adapter'); $('gpuNote').style.display='block'; return; }
-  set('status','ready'); $('status').className='ok';
-  $('run').disabled = false;
-  $('run').onclick = run;
-  run();
+  const a=await navigator.gpu.requestAdapter();
+  if(!a){ set('status','no WebGPU adapter'); $('gpuNote').style.display='block'; return; }
+  set('status','ready'); $('status').className='ok'; $('run').disabled=false; $('run').onclick=run; run();
 }
-
-async function run() {
-  $('run').disabled = true; set('status','running on WebGPU…'); $('status').className='';
-  try {
-    const prompt = $('prompt').value.trim();
-    const steps = Math.max(1, Math.min(32, parseInt($('steps').value) || 6));
-    const res = JSON.parse(await ferric_lm_demo(prompt, steps));
-    set('backend', res.backend);
-    set('adapter', res.adapter);
-    $('result').style.display = 'block';
-    const chips = res.prompt.map(t => `<span class="chip">${t}</span>`)
-      .concat(res.generated.map(t => `<span class="chip gen">${t}</span>`)).join('');
-    $('chips').innerHTML = chips;
-    $('diff').innerHTML = `GPU vs CPU reference &nbsp; max|Δ| = <b>${res.logit_diff}</b> ${res.logit_diff < 1e-3 ? '<span class="ok">✓ match</span>':''}`;
-    set('ms', `${res.ms.toFixed(1)} ms  (${res.generated.length} tokens)`);
-    set('model', `${res.layers} layers · vocab ${res.vocab} · RoPE + RMSNorm + SwiGLU`);
+async function run(){
+  $('run').disabled=true; set('status','running on WebGPU…'); $('status').className='';
+  try{
+    const steps=Math.max(1,Math.min(32,parseInt($('steps').value)||6));
+    const res=JSON.parse(await ferric_lm_demo($('prompt').value.trim(),steps));
+    set('backend',res.backend); set('adapter',res.adapter||'default');
+    $('result').style.display='block';
+    $('chips').innerHTML=res.prompt.map(t=>`<span class="chip">${t}</span>`)
+      .concat(res.generated.map(t=>`<span class="chip gen">${t}</span>`)).join('');
+    $('diff').innerHTML=`GPU vs CPU reference &nbsp; max|Δ| = <b>${res.logit_diff}</b> ${res.logit_diff<1e-3?'<span class="ok">✓ match</span>':''}`;
+    set('ms',`${res.ms.toFixed(1)} ms · ${res.generated.length} tokens`);
+    set('model',`${res.layers} layers · vocab ${res.vocab} · RoPE + RMSNorm + SwiGLU`);
     set('status','ready'); $('status').className='ok';
-  } catch(e) { set('status','error: ' + (e.message||e)); $('status').className=''; }
-  $('run').disabled = false;
+  }catch(e){ set('status','error: '+(e.message||e)); $('status').className=''; }
+  $('run').disabled=false;
 }
 boot();
 </script>

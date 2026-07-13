@@ -14,3 +14,7 @@ vendor/
 # Model-derived test fixtures (exported from ainekko/smolvla_base_onnx — not redistributed here).
 # Regenerate with the projector export script; the small self-authored fixtures ARE committed.
 crates/ferric-onnx/testdata/proj/
+
+# ad-hoc headless test scripts (hardcoded local Chrome path)
+crates/ferric-web/*_test.mjs
+crates/ferric-web/site/pkg/
