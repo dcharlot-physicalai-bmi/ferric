@@ -108,6 +108,11 @@ impl Var {
         let out = self.0.value.neg();
         Var::node(out, vec![self.clone()], Box::new(|g, p| { p[0].accumulate(&g.neg()); }))
     }
+    /// Transpose two dims; gradient transposes back.
+    pub fn transpose(&self, a: usize, b: usize) -> Var {
+        let out = self.0.value.transpose(a, b);
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| { p[0].accumulate(&g.transpose(a, b)); }))
+    }
     pub fn div(&self, o: &Var) -> Var {
         let out = self.0.value.div(&o.0.value);
         let (a, b) = (self.0.value.clone(), o.0.value.clone());
