@@ -11,6 +11,9 @@ pub fn linear(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(w) }
 /// Linear in the HF convention: W is stored [out, in]; y = x·Wᵀ.
 pub fn linear_hf(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(&w.transpose(w.rank() - 1, w.rank() - 2)) }
 
+/// Weight-quantized HF linear: W is a per-row int4/int8 [out,in]; y = x·Wᵀ, W dequantized on the fly.
+pub fn linear_hf_q(x: &Tensor, w: &crate::QRow) -> Tensor { x.matmul_qweight(w) }
+
 /// Causal multi-head attention with grouped-query attention, composed from general ops (+ fused
 /// softmax). q is [T, n_heads·dh]; k/v are [T, n_kv_heads·dh]. Returns [T, n_heads·dh].
 pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {

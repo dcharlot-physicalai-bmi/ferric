@@ -62,6 +62,20 @@ async fn run() {
         println!("  {} int{bits} per-row quant round-trip        rel err = {:.2e}  ({} B → {} B)", if pass { "✅" } else { "❌" }, rel, mr * mc * 4, q.nbytes());
     }
 
+    // weight-only quantized matmul (W stays int4/int8 in memory, x is f32) vs full f32
+    let (rows, inn, outf) = (8usize, 20usize, 10usize);
+    let xa = Tensor::from_vec(&ctx, &seq(rows * inn, 50.0), &[rows, inn]);
+    let wf = Tensor::from_vec(&ctx, &seq(outf * inn, 51.0), &[outf, inn]); // [out,in] HF layout
+    let f_ref = xa.matmul(&wf.transpose(0, 1)).to_vec().await; // x·Wᵀ in f32
+    let fden = f_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    for bits in [8u32, 4] {
+        let qw = wf.quantize_rowwise(bits);
+        let y = xa.matmul_qweight(&qw).to_vec().await;
+        let rel = y.iter().zip(&f_ref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) / fden;
+        let pass = rel < if bits == 8 { 0.02 } else { 0.15 }; ok &= pass;
+        println!("  {} int{bits} weight-only matmul (W4A16-style)   rel err = {:.2e}  (W: {} B → {} B)", if pass { "✅" } else { "❌" }, rel, outf * inn * 4, qw.nbytes());
+    }
+
     println!("  memory: {} f32 bytes → {} half bytes ({}% )", x.len() * 4, hf16.nbytes(), hf16.nbytes() * 100 / (x.len() * 4));
     println!("{}", if ok { "✅ Half-precision storage + on-device dequant is exact — real fp16/bf16 weights can live on the GPU" } else { "❌ dtype mismatch" });
     assert!(ok);

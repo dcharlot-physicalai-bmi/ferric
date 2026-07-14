@@ -3,7 +3,7 @@
 //! and the path real fp16/bf16 checkpoints take. `Half` is a packed storage tensor (2 values per u32
 //! word); `dequant()` expands to a compute `Tensor`, `Tensor::to_half()` packs one down.
 
-use crate::{empty, groups, run, u32buf, Tensor};
+use crate::{empty, groups, run, u32buf, unibuf, Tensor};
 use ferric_core::Context;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -129,6 +129,21 @@ impl Tensor {
     }
 }
 
+impl Tensor {
+    /// Weight-only quantized matmul (the efficient-inference path): x [rows, in] · Wᵀ where W is a
+    /// per-row-quantized [out, in] matrix that stays packed in memory — dequantized on the fly in the
+    /// kernel. Returns [rows, out]. This is W4A16/W8A16-style: activations f32, weights int4/int8.
+    pub fn matmul_qweight(&self, w: &QRow) -> Tensor {
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "matmul_qweight is 2D");
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dims mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        run(&self.ctx, MATMUL_QW_WGSL, "matmul_qw", &[x.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out, &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, w.bits])], groups(rows * w.rows));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
 impl QRow {
     pub fn nbytes(&self) -> usize { (self.rows * self.cols * self.bits as usize).div_ceil(8) }
     /// Dequantize back to an f32 [rows, cols] tensor, on-device.
@@ -139,6 +154,29 @@ impl QRow {
         Tensor::from_parts(&self.ctx, out, vec![self.rows, self.cols])
     }
 }
+
+const MATMUL_QW_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;      // [rows, in]
+@group(0) @binding(1) var<storage,read>        qw: array<u32>;     // packed per-row int, [out, in]
+@group(0) @binding(2) var<storage,read>        scale: array<f32>;  // [out]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;    // [rows, out]
+@group(0) @binding(4) var<uniform>             info: vec4<u32>;    // rows, out, in, bits
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info.x; let o_dim = info.y; let in_dim = info.z; let bits = info.w;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let per = 32u / bits; let mask = (1u << bits) - 1u; let signbit = 1u << (bits - 1u);
+    var acc = 0.0;
+    for (var i: u32 = 0u; i < in_dim; i = i + 1u) {
+        let widx = o * in_dim + i;                       // element in W's flat [out,in]
+        var q = i32((qw[widx / per] >> (bits * (widx % per))) & mask);
+        if (q >= i32(signbit)) { q = q - i32(1u << bits); }
+        acc = acc + x[r * in_dim + i] * f32(q);          // weight dequantized on the fly
+    }
+    out[idx] = acc * scale[o];
+}
+"#;
 
 const QUANT_ROW_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        inp: array<f32>;

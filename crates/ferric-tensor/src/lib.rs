@@ -292,6 +292,12 @@ fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     })
 }
+pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
+    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("uinfo"), contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    })
+}
 fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32, u32, u32)) {
     let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
