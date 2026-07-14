@@ -44,6 +44,15 @@ async fn run() {
     let tu = t1.elapsed().as_secs_f64() / 20.0;
     println!("  timing (1M elems): fused {:.0}µs  vs  unfused {:.0}µs  ({:.2}× fewer dispatches worth)", tf * 1e6, tu * 1e6, tu / tf);
 
+    // matmul-epilogue fusion: silu(x·Wᵀ) — the FFN gate — in ONE kernel vs linear + silu (2 kernels)
+    let (rows, ind, outd) = (32usize, 48, 64);
+    let xa = Tensor::from_vec(&ctx, &seq(rows * ind, 4.0), &[rows, ind]);
+    let wg = Tensor::from_vec(&ctx, &seq(outd * ind, 5.0), &[outd, ind]);
+    let fe = xa.matmul_bt_act(&wg, 2).to_vec().await; // 2 = silu
+    let ce = ferric_tensor::nn::linear_hf(&xa, &wg).silu().to_vec().await;
+    let d3 = maxdiff(&fe, &ce); ok &= d3 < 1e-5;
+    println!("  {} fused silu(x·Wᵀ) (FFN gate) == linear+silu  max|Δ| = {:.2e}  [1 kernel vs 2]", if d3 < 1e-5 { "✅" } else { "❌" }, d3);
+
     println!("{}", if ok { "✅ Kernel fusion (runtime WGSL codegen) is exact — one dispatch, no intermediate buffers" } else { "❌ fusion mismatch" });
     assert!(ok);
 }

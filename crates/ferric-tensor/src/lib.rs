@@ -254,6 +254,20 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
     }
 
+    /// y = act(x·Wᵀ) — a linear projection with the activation fused into the matmul epilogue (one
+    /// kernel, no intermediate). act: 0 identity, 1 relu, 2 silu, 3 gelu, 4 sigmoid. Every gated FFN
+    /// (silu(x·Wgateᵀ)) and every relu/gelu MLP hidden layer collapses to a single dispatch.
+    pub fn matmul_bt_act(&self, w: &Tensor, act: u32) -> Tensor {
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "matmul_bt_act is 2D");
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        let wc = w.contiguous();
+        let out_f = wc.shape[0];
+        let out = empty(&self.ctx, rows * out_f);
+        run(&self.ctx, MATMUL_BT_ACT_WGSL, "matmul_bt_act", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32, act])], groups(rows * out_f));
+        Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
+    }
+
     /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
     pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
         let d = *self.shape.last().unwrap();
@@ -661,6 +675,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (off >= 0) { acc = acc + w[c * l + k] * x[u32(off) * ch + c]; }
     }
     out[idx] = acc;
+}
+"#;
+
+const MATMUL_BT_ACT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;    // [rows, in]
+@group(0) @binding(1) var<storage,read>        w: array<f32>;    // [out, in]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in, act
+fn act(v: f32, a: u32) -> f32 {
+    switch (a) {
+        case 1u: { return max(v, 0.0); }
+        case 2u: { return v / (1.0 + exp(-v)); }
+        case 3u: {
+            let t = 1.0 / (1.0 + 0.3275911 * abs(v * 0.7071067811865476));
+            let e = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-(v * 0.7071067811865476) * (v * 0.7071067811865476));
+            let erf = select(-e, e, v >= 0.0);
+            return 0.5 * v * (1.0 + erf);
+        }
+        case 4u: { return 1.0 / (1.0 + exp(-v)); }
+        default: { return v; }
+    }
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    var acc = 0.0;
+    for (var c: u32 = 0u; c < in_dim; c = c + 1u) { acc = acc + x[r * in_dim + c] * w[o * in_dim + c]; }
+    out[idx] = act(acc, info[3]);
 }
 "#;
 

@@ -24,9 +24,9 @@ fn logits_last(ctx: &Arc<ferric_core::Context>, g: &HashMap<String, Tensor>, ids
         let attn = nn::causal_attention(&q, &k, &v, NH, NKV);
         x = x.add(&nn::linear_hf(&attn, get(&format!("{p}.self_attn.o_proj.weight"))));
         let h2 = x.rmsnorm(get(&format!("{p}.post_attention_layernorm.weight")), EPS);
-        let gate = nn::linear_hf(&h2, get(&format!("{p}.mlp.gate_proj.weight")));
+        let gate = h2.matmul_bt_act(get(&format!("{p}.mlp.gate_proj.weight")), 2); // fused silu(x·Wᵀ)
         let up = nn::linear_hf(&h2, get(&format!("{p}.mlp.up_proj.weight")));
-        x = x.add(&nn::linear_hf(&gate.silu().mul(&up), get(&format!("{p}.mlp.down_proj.weight"))));
+        x = x.add(&nn::linear_hf(&gate.mul(&up), get(&format!("{p}.mlp.down_proj.weight"))));
     }
     let x = x.rmsnorm(get("model.norm.weight"), EPS);
     let _ = ctx;
