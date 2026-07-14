@@ -104,6 +104,49 @@ impl Var {
             p[0].accumulate(&g.mul(&mask));
         }))
     }
+    pub fn neg(&self) -> Var {
+        let out = self.0.value.neg();
+        Var::node(out, vec![self.clone()], Box::new(|g, p| { p[0].accumulate(&g.neg()); }))
+    }
+    pub fn div(&self, o: &Var) -> Var {
+        let out = self.0.value.div(&o.0.value);
+        let (a, b) = (self.0.value.clone(), o.0.value.clone());
+        Var::node(out, vec![self.clone(), o.clone()], Box::new(move |g, p| {
+            p[0].accumulate(&g.div(&b));                                  // dA = g/B
+            p[1].accumulate(&g.mul(&a).neg().div(&b.mul(&b)));            // dB = -g·A/B²
+        }))
+    }
+    pub fn exp(&self) -> Var {
+        let out = self.0.value.exp();
+        let o2 = out.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| { p[0].accumulate(&g.mul(&o2)); }))
+    }
+    pub fn log(&self) -> Var {
+        let out = self.0.value.log();
+        let x = self.0.value.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| { p[0].accumulate(&g.div(&x)); }))
+    }
+    /// Sum over `axes` (keepdim); gradient broadcasts back to the input shape.
+    pub fn sum(&self, axes: &[usize]) -> Var {
+        let out = self.0.value.sum(axes, true);
+        let ishape = self.0.value.shape.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            p[0].accumulate(&g.broadcast_to(&ishape));
+        }))
+    }
+    pub fn mean(&self, axes: &[usize]) -> Var {
+        let n: f32 = axes.iter().map(|&d| self.0.value.shape[d]).product::<usize>() as f32;
+        let s = self.sum(axes);
+        s.mul(&Var::leaf(s.0.value.scalar(1.0 / n)))
+    }
+    /// A non-differentiable copy (stop-gradient) — for the detached max in a stable softmax.
+    pub fn detach(&self) -> Var { Var::leaf(self.0.value.clone()) }
+    /// Numerically-stable softmax over `axis`, fully differentiable (built from primitives).
+    pub fn softmax(&self, axis: usize) -> Var {
+        let m = Var::leaf(self.0.value.max(&[axis], true)); // detached max
+        let e = self.sub(&m).exp();
+        e.div(&e.sum(&[axis]))
+    }
     pub fn sum_all(&self) -> Var {
         let axes: Vec<usize> = (0..self.0.value.rank()).collect();
         let out = self.0.value.sum(&axes, false);

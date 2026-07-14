@@ -62,4 +62,5 @@ jobs:
           cargo run -p ferric-tensor --example train
           cargo run -p ferric-tensor --example dtypes
           cargo run -p ferric-tensor --example transformer
+          cargo run -p ferric-tensor --example classify
           cargo run -p ferric-tensor --example fabric

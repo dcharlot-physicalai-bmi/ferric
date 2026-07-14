@@ -2,7 +2,7 @@
 // both by measured throughput (run concurrently), and pipeline an MLP's layers across devices —
 // both validated to equal single-device execution. Host-buffer transfers = the cloud/browser path.
 use ferric_core::Context;
-use ferric_tensor::sched::{Device, Fabric};
+use ferric_tensor::sched::{spawn_worker, Device, Fabric};
 use std::sync::Arc;
 
 fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 0.13 + s).sin())) * 0.1).collect() }
@@ -11,7 +11,10 @@ fn maxdiff(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).a
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
-    let fabric = Fabric::new(vec![Device::Gpu(ctx.clone()), Device::Cpu]);
+    // A CPU-backed worker reached over TCP — the "cloud" leg. Localhost stands in for a remote node;
+    // the wire path (host buffers over a socket) is identical across a real network.
+    let worker_addr = spawn_worker(Device::Cpu);
+    let fabric = Fabric::new(vec![Device::Gpu(ctx.clone()), Device::Cpu, Device::Remote(worker_addr)]);
     println!("Fabric devices: {}", fabric.devices.iter().map(|d| d.name()).collect::<Vec<_>>().join("  +  "));
 
     let w = fabric.probe();

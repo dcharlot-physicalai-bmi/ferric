@@ -11,6 +11,8 @@
 
 use crate::Tensor;
 use ferric_core::Context;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +20,9 @@ use std::time::Instant;
 pub enum Device {
     Gpu(Arc<Context>),
     Cpu,
+    /// A remote worker reached over TCP — a cloud node, or (with a WS bridge) a browser tab. Work
+    /// crosses the boundary as host buffers, exactly like the GPU/CPU hop, so it's the same fabric.
+    Remote(String),
 }
 
 impl Device {
@@ -25,6 +30,7 @@ impl Device {
         match self {
             Device::Gpu(c) => format!("GPU:{}", c.adapter_name),
             Device::Cpu => "CPU".into(),
+            Device::Remote(addr) => format!("Remote:{addr}"),
         }
     }
 
@@ -36,6 +42,7 @@ impl Device {
                 let tb = Tensor::from_vec(ctx, b, &[k, n]);
                 pollster::block_on(ta.matmul(&tb).to_vec())
             }
+            Device::Remote(addr) => remote_call(addr, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
             Device::Cpu => {
                 let mut out = vec![0.0f32; batch * m * n];
                 for bt in 0..batch {
@@ -60,6 +67,7 @@ impl Device {
                 let tw = Tensor::from_vec(ctx, w, &[in_, out]);
                 pollster::block_on(tx.matmul(&tw).relu().to_vec())
             }
+            Device::Remote(addr) => remote_call(addr, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
             Device::Cpu => {
                 let mut o = vec![0.0f32; rows * out];
                 for i in 0..rows {
@@ -103,8 +111,8 @@ impl Fabric {
     pub fn data_parallel_bmm(&self, a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize, weights: &[f32]) -> (Vec<f32>, Vec<usize>) {
         // assign a contiguous batch range to each device, sized by weight
         let mut counts: Vec<usize> = weights.iter().map(|w| (w * batch as f32).round() as usize).collect();
-        let assigned: usize = counts.iter().sum();
-        if assigned != batch { counts[0] = counts[0] as isize as usize + (batch as isize - assigned as isize) as usize; }
+        let assigned: isize = counts.iter().map(|&c| c as isize).sum();
+        counts[0] = (counts[0] as isize + (batch as isize - assigned)).max(0) as usize; // reconcile rounding
         let mut ranges = vec![]; let mut off = 0;
         for &c in &counts { ranges.push((off, off + c)); off += c; }
 
@@ -143,4 +151,63 @@ impl Fabric {
         }
         (act, trace)
     }
+}
+
+// ---------- Remote transport: a tiny binary op-server over TCP ----------
+// Request:  op:u8 · dims[4]:u32 · lenA:u32 · A(f32 LE) · lenB:u32 · B(f32 LE)
+// Response: len:u32 · result(f32 LE)
+// The same frames would ride a WebSocket to a browser tab computing on WebGPU (Device::BrowserWorker).
+
+fn wr_u32(v: &mut Vec<u8>, x: u32) { v.extend_from_slice(&x.to_le_bytes()); }
+fn wr_f32s(v: &mut Vec<u8>, f: &[f32]) { wr_u32(v, f.len() as u32); v.extend_from_slice(bytemuck::cast_slice(f)); }
+fn rd_exact(s: &mut impl Read, n: usize) -> std::io::Result<Vec<u8>> {
+    let mut b = vec![0u8; n];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+fn rd_u32(s: &mut impl Read) -> std::io::Result<u32> {
+    Ok(u32::from_le_bytes(rd_exact(s, 4)?.try_into().unwrap()))
+}
+fn rd_f32s(s: &mut impl Read) -> std::io::Result<Vec<f32>> {
+    let n = rd_u32(s)? as usize;
+    Ok(bytemuck::cast_slice(&rd_exact(s, n * 4)?).to_vec())
+}
+
+/// Client side: send one op to a remote worker and block for the result.
+fn remote_call(addr: &str, op: u8, dims: &[u32; 4], a: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut req = vec![op];
+    for &d in dims { wr_u32(&mut req, d); }
+    wr_f32s(&mut req, a);
+    wr_f32s(&mut req, b);
+    let mut s = TcpStream::connect(addr).expect("remote worker unreachable");
+    s.write_all(&req).unwrap();
+    rd_f32s(&mut s).expect("remote worker response")
+}
+
+/// Handle one request on the worker, computing with `backend` (a local GPU or CPU device).
+fn serve_one(s: &mut TcpStream, backend: &Device) -> std::io::Result<()> {
+    let op = rd_exact(s, 1)?[0];
+    let dims = [rd_u32(s)?, rd_u32(s)?, rd_u32(s)?, rd_u32(s)?];
+    let a = rd_f32s(s)?;
+    let b = rd_f32s(s)?;
+    let out = match op {
+        0 => backend.bmm(&a, &b, dims[0] as usize, dims[1] as usize, dims[2] as usize, dims[3] as usize),
+        _ => backend.linear_relu(&a, dims[0] as usize, &b, dims[1] as usize, dims[2] as usize),
+    };
+    let mut resp = Vec::new();
+    wr_f32s(&mut resp, &out);
+    s.write_all(&resp)
+}
+
+/// Spin up a worker on an ephemeral localhost port, backed by `backend`; returns its address.
+/// (Localhost stands in for a cloud node — same wire path across a real network.)
+pub fn spawn_worker(backend: Device) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind worker");
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(mut s) = stream { let _ = serve_one(&mut s, &backend); }
+        }
+    });
+    addr
 }

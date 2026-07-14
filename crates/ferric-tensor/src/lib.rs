@@ -22,10 +22,12 @@ pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod nn; // transformer blocks expressed on the general runtime
+pub mod optim; // optimizers (Adam)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 pub use autograd::Var;
 pub use dtype::{DType, Half, QTensor};
+pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
 #[derive(Clone)]
@@ -175,6 +177,7 @@ impl Tensor {
     pub fn sigmoid(&self) -> Tensor { self.unary(6) }
     pub fn silu(&self) -> Tensor { self.unary(7) }
     pub fn gelu(&self) -> Tensor { self.unary(8) }
+    pub fn log(&self) -> Tensor { self.unary(9) }
     pub fn scalar(&self, s: f32) -> Tensor { Tensor::from_vec(&self.ctx, &[s], &[1]) }
 
     // ---- fused transformer fast-paths (same result as composing primitives, fewer dispatches) ----
@@ -385,6 +388,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let erf = select(-e, e, v >= 0.0);
             r = 0.5 * v * (1.0 + erf);
         }
+        case 9u: { r = log(v); }
         default: { r = v; }
     }
     out[i] = r;
