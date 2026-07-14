@@ -45,8 +45,8 @@ Researched the exact ops each family needs (July 2026). Most reduce to primitive
 | **BitNet / ternary** (`microsoft/bitnet-b1.58-2B-4T`) | Transformer w/ ternary `{−1,0,+1}` BitLinear + int8 activations + ReLU² FFN | ternary matmul, ReLU², GGUF ternary blocks | ternary matmul ✅ (1.9e-6, 1/16 mem) · ReLU² ✅ · GGUF Q2_0/TQ2_0 ⬜ |
 | **PrismML** (Caltech spinout: Bonsai / Ternary Bonsai 1.7/4/8B) | **Architecturally identical to BitNet** — standard transformer, every linear ternary 1.58-bit (group-128, fp16 scale), ships GGUF `Q2_0` | *same as BitNet* — ternary matmul + GGUF `Q2_0` | ternary matmul ✅ · GGUF Q2_0 ⬜ |
 | **Liquid AI LFM2** (`LiquidAI/LFM2-1.2B`) | 16 blocks = 10 gated short-conv + 6 GQA; SwiGLU MLP; RMSNorm; RoPE | **causal depthwise conv1d (L=3)** + gating (⊙) | conv1d ✅ (1.5e-7) · gated block ✅ · GQA/RoPE/RMSNorm/SwiGLU ✅ — **LFM2 block fully covered** |
-| **EBM / JEM** | scalar energy `E(x)` + Langevin sampling `x -= ε∇ₓE + √ε·𝒩` | grad-w.r.t-input (✅), on-device RNG, logsumexp, host loop | autograd-w.r.t-input ✅ · RNG + logsumexp + loop ⬜ (small) |
-| **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), **non-causal attention + mask**, GELU (✅), 3D RoPE (V-JEPA2) | GELU ✅ · attention core ✅ · non-causal mask / patch-embed / 3D-RoPE ⬜ |
+| **EBM / JEM** | scalar energy `E(x)` + Langevin sampling `x -= ε∇ₓE + √ε·𝒩` | grad-w.r.t-input (✅), logsumexp, host loop | **✅ RUNS** — `examples/ebm.rs` Langevin-descends the energy (−0.12→−1.46) via autograd-∇ₓE; logsumexp composed from primitives |
+| **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), **non-causal attention**, GELU (✅), 3D RoPE (V-JEPA2) | `bidirectional_attention` ✅ · GELU ✅ · patch-embed = reshape+matmul ✅ · **encoder composable** · 3D-RoPE / mask-token ⬜ (V-JEPA2 predictor only) |
 
 **Key insight:** PrismML ≡ BitNet (both ternary transformers), so ternary matmul + GGUF-ternary covers
 *two* families. LFM2 needed only conv1d (done). EBM needs almost nothing new (we already do
