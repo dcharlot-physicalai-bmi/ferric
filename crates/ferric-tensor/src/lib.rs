@@ -272,12 +272,11 @@ impl Tensor {
         let a = self.broadcast_to(&a_full).contiguous();
         let b = other.broadcast_to(&b_full).contiguous();
         let out = empty(&self.ctx, bn * m * n);
-        // The naive kernel is already well-threaded (~the multi-thread WebGPU-GEMM tier: our M5 Max
-        // hits ~425 GFLOP/s at 1024³). Beating it to the >1 TFLOP tier needs 8×8 register tiling +
-        // vec4 loads + subgroup-matrix + per-device autotuning (documented in docs/SOTA.md); the
-        // current 4×4 `matmul_tiled` is the foundation for that but doesn't yet beat naive, so naive
-        // stays the default and we never regress. Pipeline caching (compile-once) is the shipped win.
-        let use_tiled = false;
+        // Pick the GEMM kernel by what the autotuner measured fastest for this shape+device (naive vs
+        // register-blocked tiled). No single kernel wins on every GPU, so we select by measurement:
+        // on M5 Max/Metal that's naive (~587 GFLOP/s); on GPUs where tiling wins, it's tiled. Untuned
+        // shapes default to naive (never a regression). See `autotune_matmul` + docs/SOTA.md #1/#6.
+        let use_tiled = bn == 1 && gemm_choice(m, ka, n) == Gemm::Tiled;
         if use_tiled {
             let (gx, gy) = ((n as u32).div_ceil(64), (m as u32).div_ceil(64));
             run(&self.ctx, TILED_MATMUL_WGSL, "mm_tiled", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[m as u32, ka as u32, n as u32, 0])], (gx, gy, 1));
@@ -286,6 +285,25 @@ impl Tensor {
         }
         let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
         Tensor { ctx: self.ctx.clone(), buf: Arc::new(out), strides: contig_strides(&oshape), shape: oshape, offset: 0 }
+    }
+
+    /// Autotune the GEMM kernel for this shape on this device: time naive vs tiled and cache the
+    /// winner (keyed by shape bucket). Subsequent `matmul`s of the same bucket use it. Returns the
+    /// choice. This is how GEMM stays fast *portably* — the winner differs across GPUs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn autotune_matmul(&self, other: &Tensor) -> &'static str {
+        let (m, ka) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
+        let n = other.shape[other.rank() - 1];
+        let time = |f: &dyn Fn() -> Tensor| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..8 { let _ = pollster::block_on(f().to_vec()); }
+            t0.elapsed()
+        };
+        let naive = time(&|| self.matmul_naive(other));
+        let tiled = time(&|| self.matmul_tiled(other));
+        let win = if tiled < naive { Gemm::Tiled } else { Gemm::Naive };
+        GEMM_CACHE.with(|c| c.borrow_mut().insert(gemm_bucket(m, ka, n), win));
+        if win == Gemm::Tiled { "tiled" } else { "naive" }
     }
 
     /// Force the register-blocked tiled 2D GEMM (for benchmarking / large matmuls).
@@ -341,6 +359,18 @@ fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 thread_local! {
     static PIPELINES: std::cell::RefCell<std::collections::HashMap<usize, wgpu::ComputePipeline>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    // Autotuner: shape-bucket → measured-fastest GEMM kernel for this device.
+    static GEMM_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u32), Gemm>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Gemm { Naive, Tiled }
+fn gemm_bucket(m: usize, k: usize, n: usize) -> (u32, u32, u32) {
+    let b = |x: usize| -> u32 { if x <= 128 { 128 } else if x <= 256 { 256 } else if x <= 512 { 512 } else { 1024 } };
+    (b(m), b(k), b(n))
+}
+fn gemm_choice(m: usize, k: usize, n: usize) -> Gemm {
+    GEMM_CACHE.with(|c| c.borrow().get(&gemm_bucket(m, k, n)).copied()).unwrap_or(Gemm::Naive)
 }
 fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> wgpu::ComputePipeline {
     let key = wgsl.as_ptr() as usize;
@@ -563,49 +593,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-// Register-blocked tiled GEMM: a 16×16 workgroup computes a 64×64 output tile, each thread a 4×4
-// micro-tile in registers. Shared memory stages 64×16 of A and 16×64 of B; each staged value is
-// reused across 4 accumulators, raising arithmetic intensity — the real fast-GEMM structure (this is
-// what actually beats the cache-friendly naive kernel, vs. a plain 1-output-per-thread shared tile).
-// BM=BN=64, BK=16, TM=TN=4, 256 threads.
+// High-intensity register-blocked GEMM: an 8×8 workgroup (64 threads) computes a 64×64 output tile,
+// EACH THREAD an 8×8 micro-tile held in 64 registers. Per K-step every thread loads 8 A-values and
+// 8 B-values from shared memory and does 64 FMAs — arithmetic intensity 4× the 4×4 version, which is
+// what lifts a WebGPU GEMM toward the >1 TFLOP tier (vs. a cache-friendly naive kernel). BM=BN=64,
+// BK=8, TM=TN=8, 64 threads.
 const TILED_MATMUL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;   // [M,K]
 @group(0) @binding(1) var<storage,read>        b: array<f32>;   // [K,N]
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [M,N]
 @group(0) @binding(3) var<storage,read>        info: array<u32>; // M,K,N
-var<workgroup> As: array<f32, 1024>; // 64×16
-var<workgroup> Bs: array<f32, 1024>; // 16×64
-@compute @workgroup_size(16, 16, 1)
+var<workgroup> As: array<f32, 512>; // 64×8
+var<workgroup> Bs: array<f32, 512>; // 8×64
+@compute @workgroup_size(8, 8, 1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let m = info[0]; let k = info[1]; let n = info[2];
     let row0 = wid.y * 64u; let col0 = wid.x * 64u;
-    let li = lid.y * 16u + lid.x;          // 0..255
-    let tr = lid.y * 4u; let tc = lid.x * 4u; // this thread's 4×4 micro-tile origin within the 64×64 tile
-    var acc: array<f32, 16>;
-    for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
-    let ntiles = (k + 15u) / 16u;
+    let li = lid.y * 8u + lid.x;             // 0..63
+    let tr = lid.y * 8u; let tc = lid.x * 8u; // this thread's 8×8 micro-tile origin within the 64×64 tile
+    var acc: array<f32, 64>;
+    for (var i = 0u; i < 64u; i++) { acc[i] = 0.0; }
+    let ntiles = (k + 7u) / 8u;
     for (var t = 0u; t < ntiles; t++) {
-        // cooperatively stage A[64×16] and B[16×64] (256 threads × 4 elems each)
-        for (var e = 0u; e < 4u; e++) {
-            let ia = li + e * 256u; let ar = ia / 16u; let ak = ia % 16u;
-            let gr = row0 + ar; let gk = t * 16u + ak;
+        // stage A[64×8] and B[8×64] into shared memory (64 threads × 8 elems each)
+        for (var e = 0u; e < 8u; e++) {
+            let ia = li + e * 64u; let ar = ia / 8u; let ak = ia % 8u;
+            let gr = row0 + ar; let gk = t * 8u + ak;
             As[ia] = select(0.0, a[gr * k + gk], gr < m && gk < k);
-            let ib = li + e * 256u; let bk = ib / 64u; let bc = ib % 64u;
-            let gk2 = t * 16u + bk; let gc = col0 + bc;
-            Bs[ib] = select(0.0, b[gk2 * n + gc], gk2 < k && gc < n);
+            let bk = ia / 64u; let bc = ia % 64u;
+            let gk2 = t * 8u + bk; let gc = col0 + bc;
+            Bs[ia] = select(0.0, b[gk2 * n + gc], gk2 < k && gc < n);
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < 16u; kk++) {
-            var ra: array<f32, 4>; var rb: array<f32, 4>;
-            for (var i = 0u; i < 4u; i++) { ra[i] = As[(tr + i) * 16u + kk]; rb[i] = Bs[kk * 64u + tc + i]; }
-            for (var i = 0u; i < 4u; i++) { for (var j = 0u; j < 4u; j++) { acc[i * 4u + j] = acc[i * 4u + j] + ra[i] * rb[j]; } }
+        for (var kk = 0u; kk < 8u; kk++) {
+            var ra: array<f32, 8>; var rb: array<f32, 8>;
+            for (var i = 0u; i < 8u; i++) { ra[i] = As[(tr + i) * 8u + kk]; rb[i] = Bs[kk * 64u + tc + i]; }
+            for (var i = 0u; i < 8u; i++) { for (var j = 0u; j < 8u; j++) { acc[i * 8u + j] = acc[i * 8u + j] + ra[i] * rb[j]; } }
         }
         workgroupBarrier();
     }
-    for (var i = 0u; i < 4u; i++) {
-        for (var j = 0u; j < 4u; j++) {
+    for (var i = 0u; i < 8u; i++) {
+        for (var j = 0u; j < 8u; j++) {
             let r = row0 + tr + i; let c = col0 + tc + j;
-            if (r < m && c < n) { out[r * n + c] = acc[i * 4u + j]; }
+            if (r < m && c < n) { out[r * n + c] = acc[i * 8u + j]; }
         }
     }
 }

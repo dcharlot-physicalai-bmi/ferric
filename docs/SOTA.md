@@ -50,9 +50,17 @@ Priority order (both the C++ and Rust/browser surveys converge on this):
 
 - [x] **Pipeline caching** — compile each WGSL kernel once, not every dispatch. (~4× on small ops; the
       single biggest per-op overhead, and table stakes every runtime has.) **Shipped.**
-- [ ] **1. Tiled + 8×8 register-blocked GEMM + vec4 loads.** The naive→>1 TFLOP lever. A 4×4 tiled
-      kernel exists (`matmul_tiled`) as the foundation but doesn't yet beat naive; needs 8×8 + vec4 +
-      unroll. Pure core WGSL, no extensions, identical native/browser.
+- [ ] **1. Tiled register-blocked GEMM + vec4 loads + autotuning.** The naive→>1 TFLOP lever.
+      **Measured finding (M5 Max, wgpu→Metal):** the naive one-thread-per-output kernel is a *strong*
+      baseline here — Metal auto-vectorizes/caches it to **~587 GFLOP/s at 1024³** (very different from
+      the research's "naive = 1.6 GFLOP/s" on other GPUs). Both a 4×4 and an 8×8 register-blocked
+      shared-memory kernel (`matmul_tiled`) were implemented and validated bit-exact but **do not beat
+      naive on this hardware** (~0.4× at 1024³) — a straightforward tiled kernel isn't enough; the
+      published >1 TFLOP results require **vec4 loads + a bounds-check-free interior fast-path + loop
+      unrolling + per-device autotuning**, and the win is GPU-specific. **This is precisely why #6
+      (autotuning) is not optional:** there is no single kernel that wins on every GPU, so the correct
+      SOTA move is to keep both kernels and *select per device+shape by measurement* (on M5 Max that
+      selects naive; on GPUs where tiled wins, it selects tiled). Do #6 to make GEMM portably fast.
 - [ ] **2. Subgroup-accelerated GEMV (decode) + `shader-f16`.** Memory-bound decode is where LLMs live;
       subgroups are browser-stable now. Feature-detect + fall back.
 - [ ] **3. General flash-attention WGSL** (online-softmax, tiled, GQA) + paged / quantized KV cache.
