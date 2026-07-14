@@ -11,7 +11,7 @@ keywords = ["tensor", "gpu", "webgpu", "ndarray", "ai"]
 categories = ["science", "mathematics"]
 
 [dependencies]
-ferric-core = { path = "../ferric-core", version = "0.0.1" }
+ferric-core = { path = "../ferric-core", version = "0.1" }
 wgpu = "30.0.0"
 bytemuck = "1.25.1"
 flume = "0.12.0"

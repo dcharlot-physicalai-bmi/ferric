@@ -13,7 +13,7 @@ exclude = ["testdata/"]
 
 [dependencies]
 prost = "0.14"
-ferric-core = { path = "../ferric-core", version = "0.0.1" }
+ferric-core = { path = "../ferric-core", version = "0.1" }
 
 [build-dependencies]
 prost-build = "0.14"

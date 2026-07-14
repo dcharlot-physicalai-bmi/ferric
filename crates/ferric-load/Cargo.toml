@@ -16,5 +16,5 @@ serde_json = "1"
 half = "2"
 
 [dev-dependencies]
-ferric-core = { path = "../ferric-core", version = "0.0.1" }
+ferric-core = { path = "../ferric-core", version = "0.1" }
 pollster = "1.0.1"
