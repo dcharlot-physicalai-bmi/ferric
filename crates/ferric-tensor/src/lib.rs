@@ -26,7 +26,7 @@ pub mod optim; // optimizers (Adam)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 pub use autograd::Var;
-pub use dtype::{DType, Half, QTensor};
+pub use dtype::{DType, Half, QRow, QTensor};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).

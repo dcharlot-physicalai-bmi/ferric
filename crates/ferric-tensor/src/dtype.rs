@@ -102,6 +102,85 @@ impl QTensor {
     }
 }
 
+/// Per-row (per-output-channel) quantized 2D matrix at `bits` ∈ {4,8}, packed 32/bits per word,
+/// with one scale per row — more accurate than a single per-tensor scale, and int4 is 1/8 the memory.
+pub struct QRow {
+    ctx: Arc<Context>,
+    buf: Arc<wgpu::Buffer>,
+    scale: Arc<wgpu::Buffer>, // [rows] f32
+    pub rows: usize,
+    pub cols: usize,
+    pub bits: u32,
+}
+
+impl Tensor {
+    /// Per-row symmetric quantization of a 2D matrix at 4 or 8 bits (scale = max|row|/(2^(bits-1)−1)).
+    pub fn quantize_rowwise(&self, bits: u32) -> QRow {
+        let c = self.contiguous();
+        assert_eq!(c.rank(), 2, "rowwise quant is 2D");
+        let (rows, cols) = (c.shape[0], c.shape[1]);
+        let qmax = ((1u32 << (bits - 1)) - 1) as f32;
+        let scale = c.abs().max(&[1], false).mul(&c.scalar(1.0 / qmax)); // [rows]
+        let per_word = (32 / bits) as usize;
+        let words = (rows * cols).div_ceil(per_word);
+        let out = empty(&self.ctx, words);
+        run(&self.ctx, QUANT_ROW_WGSL, "quant_row", &[c.buf.as_ref(), scale.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, cols as u32, bits, qmax.to_bits()])], groups(words));
+        QRow { ctx: self.ctx.clone(), buf: Arc::new(out), scale: scale.buf.clone(), rows, cols, bits }
+    }
+}
+
+impl QRow {
+    pub fn nbytes(&self) -> usize { (self.rows * self.cols * self.bits as usize).div_ceil(8) }
+    /// Dequantize back to an f32 [rows, cols] tensor, on-device.
+    pub fn dequant(&self) -> Tensor {
+        let n = self.rows * self.cols;
+        let out = empty(&self.ctx, n);
+        run(&self.ctx, DEQUANT_ROW_WGSL, "dequant_row", &[self.buf.as_ref(), self.scale.as_ref(), &out, &u32buf(&self.ctx, &[self.rows as u32, self.cols as u32, self.bits])], groups(n));
+        Tensor::from_parts(&self.ctx, out, vec![self.rows, self.cols])
+    }
+}
+
+const QUANT_ROW_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        inp: array<f32>;
+@group(0) @binding(1) var<storage,read>        scale: array<f32>; // [rows]
+@group(0) @binding(2) var<storage,read_write>  out: array<u32>;
+@group(0) @binding(3) var<storage,read>        info: array<u32>;  // rows, cols, bits, bitcast(qmax)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x; let rows = info[0]; let cols = info[1]; let bits = info[2]; let qmax = bitcast<f32>(info[3]);
+    let per = 32u / bits; let n = rows * cols; let words = (n + per - 1u) / per;
+    if (w >= words) { return; }
+    let mask = (1u << bits) - 1u;
+    var word: u32 = 0u;
+    for (var lane: u32 = 0u; lane < per; lane = lane + 1u) {
+        let idx = w * per + lane;
+        if (idx < n) {
+            var s = scale[idx / cols]; if (s == 0.0) { s = 1.0; }
+            let q = i32(clamp(round(inp[idx] / s), -qmax, qmax));
+            word = word | ((u32(q) & mask) << (bits * lane));
+        }
+    }
+    out[w] = word;
+}
+"#;
+
+const DEQUANT_ROW_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        inp: array<u32>;
+@group(0) @binding(1) var<storage,read>        scale: array<f32>; // [rows]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(3) var<storage,read>        info: array<u32>;  // rows, cols, bits
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info[0]; let cols = info[1]; let bits = info[2];
+    let n = rows * cols; if (idx >= n) { return; }
+    let per = 32u / bits; let mask = (1u << bits) - 1u; let signbit = 1u << (bits - 1u);
+    let word = inp[idx / per]; let lane = idx % per;
+    var v = i32((word >> (bits * lane)) & mask);
+    if (v >= i32(signbit)) { v = v - i32(1u << bits); }
+    out[idx] = f32(v) * scale[idx / cols];
+}
+"#;
+
 const QUANT_I8_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        inp: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<u32>;   // 4x int8 per word

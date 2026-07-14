@@ -8,19 +8,27 @@ use crate::Tensor;
 /// Linear y = x·W in the [in,out] weight convention (no bias) — just a matmul.
 pub fn linear(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(w) }
 
-/// Causal multi-head attention, composed entirely from general ops (+ a fused softmax).
-/// q/k/v are [T, n_heads·head_dim] with heads contiguous per row. Returns [T, n_heads·head_dim].
-pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize) -> Tensor {
+/// Linear in the HF convention: W is stored [out, in]; y = x·Wᵀ.
+pub fn linear_hf(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(&w.transpose(w.rank() - 1, w.rank() - 2)) }
+
+/// Causal multi-head attention with grouped-query attention, composed from general ops (+ fused
+/// softmax). q is [T, n_heads·dh]; k/v are [T, n_kv_heads·dh]. Returns [T, n_heads·dh].
+pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
     let t = q.shape[0];
     let d = q.shape[1];
     let dh = d / n_heads;
+    let g = n_heads / n_kv_heads;
     let scale = 1.0 / (dh as f32).sqrt();
-    // [T, d] → [n_heads, T, head_dim]
-    let heads = |x: &Tensor| x.reshape(&[t, n_heads, dh]).permute(&[1, 0, 2]).contiguous();
-    let (qh, kh, vh) = (heads(q), heads(k), heads(v));
-    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)); // [h, T, T]
+    let qh = q.reshape(&[t, n_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nh, T, dh]
+    // K/V: [T, nkv·dh] → [nkv, T, dh] → repeat each kv head g times → [nh, T, dh]
+    let kv_heads = |x: &Tensor| {
+        let hx = x.reshape(&[t, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nkv, T, dh]
+        hx.reshape(&[n_kv_heads, 1, t, dh]).broadcast_to(&[n_kv_heads, g, t, dh]).reshape(&[n_heads, t, dh])
+    };
+    let (kh, vh) = (kv_heads(k), kv_heads(v));
+    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)); // [nh, T, T]
     let probs = scores.add(&causal_mask(q, t)).softmax(2);             // masked softmax over keys
-    let ctx = probs.matmul(&vh);                                       // [h, T, head_dim]
+    let ctx = probs.matmul(&vh);                                       // [nh, T, dh]
     ctx.permute(&[1, 0, 2]).reshape(&[t, d])
 }
 

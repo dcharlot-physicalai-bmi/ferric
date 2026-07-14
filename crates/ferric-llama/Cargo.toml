@@ -17,3 +17,5 @@ ferric-load = { path = "../ferric-load", version = "0.0.1" }
 
 [dev-dependencies]
 pollster = "1.0.1"
+ferric-tensor = { path = "../ferric-tensor" }
+ferric-load = { path = "../ferric-load", version = "0.0.1" }

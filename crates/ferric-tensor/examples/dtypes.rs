@@ -48,6 +48,20 @@ async fn run() {
     let qok = rel < 0.03; ok &= qok;
     println!("  {} int8 quantized matmul vs f32          rel err = {:.2e}", if qok { "✅" } else { "❌" }, rel);
 
+    // per-row int8 / int4 quantization (per-row scales; int4 = 1/8 the memory)
+    let (mr, mc) = (12usize, 20usize);
+    let w = seq(mr * mc, 42.0);
+    let tw = Tensor::from_vec(&ctx, &w, &[mr, mc]);
+    let denom = w.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    for bits in [8u32, 4] {
+        let q = tw.quantize_rowwise(bits);
+        let deq = q.dequant().to_vec().await;
+        let rel = deq.iter().zip(&w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) / denom;
+        let tol = if bits == 8 { 0.02 } else { 0.2 };
+        let pass = rel < tol; ok &= pass;
+        println!("  {} int{bits} per-row quant round-trip        rel err = {:.2e}  ({} B → {} B)", if pass { "✅" } else { "❌" }, rel, mr * mc * 4, q.nbytes());
+    }
+
     println!("  memory: {} f32 bytes → {} half bytes ({}% )", x.len() * 4, hf16.nbytes(), hf16.nbytes() * 100 / (x.len() * 4));
     println!("{}", if ok { "✅ Half-precision storage + on-device dequant is exact — real fp16/bf16 weights can live on the GPU" } else { "❌ dtype mismatch" });
     assert!(ok);

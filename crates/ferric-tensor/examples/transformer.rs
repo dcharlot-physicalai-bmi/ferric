@@ -46,7 +46,7 @@ async fn run() {
     let q = nn::linear(&rms1, &tv(&wq, &[d, d])).rope(h, dh, base, 0);
     let k = nn::linear(&rms1, &tv(&wk, &[d, d])).rope(h, dh, base, 0);
     let v = nn::linear(&rms1, &tv(&wv, &[d, d]));
-    let attn = nn::causal_attention(&q, &k, &v, h);
+    let attn = nn::causal_attention(&q, &k, &v, h, h);
     let x2 = x.add(&nn::linear(&attn, &tv(&wo, &[d, d])));
     let rms2 = x2.rmsnorm(&tv(&wn2, &[d]), eps);
     let g = nn::linear(&rms2, &tv(&wg, &[d, hff]));
