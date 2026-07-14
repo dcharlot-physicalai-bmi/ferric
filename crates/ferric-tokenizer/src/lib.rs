@@ -61,6 +61,20 @@ impl Bpe {
         Ok(Bpe::new(vocab, &merges))
     }
 
+    /// Load from an HF `tokenizer.json` (the single-file format) — reads `model.vocab` + `model.merges`.
+    pub fn from_tokenizer_json(bytes: &[u8]) -> Result<Bpe, String> {
+        let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let model = &v["model"];
+        let vocab: HashMap<String, u32> = model["vocab"].as_object().ok_or("no model.vocab")?
+            .iter().map(|(k, val)| (k.clone(), val.as_u64().unwrap() as u32)).collect();
+        let merges: Vec<(String, String)> = model["merges"].as_array().ok_or("no model.merges")?.iter().filter_map(|m| {
+            if let Some(s) = m.as_str() { let mut it = s.splitn(2, ' '); Some((it.next()?.to_string(), it.next()?.to_string())) }
+            else if let Some(a) = m.as_array() { Some((a[0].as_str()?.to_string(), a[1].as_str()?.to_string())) }
+            else { None }
+        }).collect();
+        Ok(Bpe::new(vocab, &merges))
+    }
+
     pub fn vocab_size(&self) -> usize { self.encoder.len() }
 
     /// Apply BPE to one pre-token's symbols: repeatedly merge the lowest-rank adjacent pair.

@@ -38,7 +38,10 @@ builds fully offline from vendored source.
 | Pure-Rust **safetensors** loader (F32/F16/BF16) | exact round-trip |
 | **Llama/SmolLM** checkpoint bridge (HF layout, GQA, tied embeddings) | matches `numpy` `1.2e-6` |
 | **General tensor runtime** — arbitrary rank, strided views, broadcasting, any-axis reductions, batched matmul | matches CPU ref |
-| **Autograd** — reverse-mode; an MLP trained on the GPU | grad-check `1.5e-5`, loss ↓ 100% |
+| **Autograd** — reverse-mode; an MLP *and* a transformer trained on the GPU | grad-check `1.5e-5`, 100% acc |
+| **Runs a REAL model** — SmolLM2-135M (30-layer Llama, GQA, tied, bf16) end-to-end | logits match numpy `1.4e-6` |
+| **Generates REAL text** — HF tokenizer + greedy decode | *"The capital of France is the capital of the country."* |
+| **Model families** — BitNet/PrismML (ternary), Liquid LFM2 (conv1d), EBM (Langevin), JEPA/V-JEPA2 | all validated |
 
 ## Crates
 - [`ferric-core`](crates/ferric-core) — L0/L1: the `wgpu` `Context` + the cross-fabric kernel set + CPU references.
