@@ -409,7 +409,7 @@ fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 // kernel); assumes one device per thread, which holds for all Ferric usage. Every SOTA runtime
 // caches compiled kernels; this is the single biggest per-op overhead removed.
 thread_local! {
-    static PIPELINES: std::cell::RefCell<std::collections::HashMap<usize, wgpu::ComputePipeline>> =
+    static PIPELINES: std::cell::RefCell<std::collections::HashMap<(usize, u64), wgpu::ComputePipeline>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     // Autotuner: shape-bucket → measured-fastest GEMM kernel for this device.
     static GEMM_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u32), Gemm>> =
@@ -425,7 +425,12 @@ fn gemm_choice(m: usize, k: usize, n: usize) -> Gemm {
     GEMM_CACHE.with(|c| c.borrow().get(&gemm_bucket(m, k, n)).copied()).unwrap_or(Gemm::Naive)
 }
 fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> wgpu::ComputePipeline {
-    let key = wgsl.as_ptr() as usize;
+    // key by (device, content-hash): caches dynamically-generated fusion shaders too, and stays
+    // correct across multiple GPUs (a device-A pipeline is never reused on device B).
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    wgsl.hash(&mut h);
+    let key = ((&ctx.device as *const wgpu::Device) as usize, h.finish());
     PIPELINES.with(|c| {
         c.borrow_mut().entry(key).or_insert_with(|| {
             let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
