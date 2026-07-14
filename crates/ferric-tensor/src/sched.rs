@@ -23,6 +23,9 @@ pub enum Device {
     /// A remote worker reached over TCP — a cloud node, or (with a WS bridge) a browser tab. Work
     /// crosses the boundary as host buffers, exactly like the GPU/CPU hop, so it's the same fabric.
     Remote(String),
+    /// A browser tab reached over a WebSocket, computing on the tab's WebGPU. Same op frames as
+    /// Remote, different transport — this is the fabric physically spanning cloud+local+browser.
+    BrowserWorker(Arc<crate::ws::WsConn>),
 }
 
 impl Device {
@@ -31,6 +34,7 @@ impl Device {
             Device::Gpu(c) => format!("GPU:{}", c.adapter_name),
             Device::Cpu => "CPU".into(),
             Device::Remote(addr) => format!("Remote:{addr}"),
+            Device::BrowserWorker(_) => "BrowserWorker".into(),
         }
     }
 
@@ -43,6 +47,7 @@ impl Device {
                 pollster::block_on(ta.matmul(&tb).to_vec())
             }
             Device::Remote(addr) => remote_call(addr, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
+            Device::BrowserWorker(conn) => browser_call(conn, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
             Device::Cpu => {
                 let mut out = vec![0.0f32; batch * m * n];
                 for bt in 0..batch {
@@ -68,6 +73,7 @@ impl Device {
                 pollster::block_on(tx.matmul(&tw).relu().to_vec())
             }
             Device::Remote(addr) => remote_call(addr, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
+            Device::BrowserWorker(conn) => browser_call(conn, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
             Device::Cpu => {
                 let mut o = vec![0.0f32; rows * out];
                 for i in 0..rows {
@@ -171,6 +177,22 @@ fn rd_u32(s: &mut impl Read) -> std::io::Result<u32> {
 fn rd_f32s(s: &mut impl Read) -> std::io::Result<Vec<f32>> {
     let n = rd_u32(s)? as usize;
     Ok(bytemuck::cast_slice(&rd_exact(s, n * 4)?).to_vec())
+}
+
+/// Build an op request frame (op · dims · A · B) — shared by the TCP and WebSocket transports.
+fn op_frame(op: u8, dims: &[u32; 4], a: &[f32], b: &[f32]) -> Vec<u8> {
+    let mut req = vec![op];
+    for &d in dims { wr_u32(&mut req, d); }
+    wr_f32s(&mut req, a);
+    wr_f32s(&mut req, b);
+    req
+}
+
+/// Client side: dispatch one op to a browser tab over the WebSocket; the tab computes on WebGPU.
+fn browser_call(conn: &crate::ws::WsConn, op: u8, dims: &[u32; 4], a: &[f32], b: &[f32]) -> Vec<f32> {
+    conn.send(&op_frame(op, dims, a, b)).expect("browser worker send");
+    let resp = conn.recv().expect("browser worker response");
+    bytemuck::cast_slice(&resp).to_vec()
 }
 
 /// Client side: send one op to a remote worker and block for the result.

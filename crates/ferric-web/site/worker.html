@@ -1,0 +1,19 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Ferric browser worker</title></head>
+<body style="font:14px system-ui;background:#0b0e14;color:#eaf0fb;padding:20px">
+<h3>Ferric — browser worker (WebGPU)</h3><pre id="log">connecting…</pre>
+<script type="module">
+import init, { ferric_worker_exec } from './pkg/ferric_web.js';
+const log = m => { document.getElementById('log').textContent += '\n'+m; };
+await init();
+if (!navigator.gpu) { log('NO WEBGPU'); } else {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { log('connected — ready'); ws.send(new Uint8Array([82,68,89,0])); }; // "RDY\0"
+  ws.onmessage = async (e) => {
+    const out = await ferric_worker_exec(new Uint8Array(e.data));
+    ws.send(out);
+    log('served op ('+e.data.byteLength+'B → '+out.length+'B)');
+  };
+  ws.onerror = () => log('ws error');
+}
+</script></body></html>

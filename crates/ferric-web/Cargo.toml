@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ferric-core = { path = "../ferric-core", version = "0.0.1" }
+ferric-tensor = { path = "../ferric-tensor", version = "0.0.1" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
