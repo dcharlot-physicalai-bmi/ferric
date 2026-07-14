@@ -97,7 +97,7 @@ impl Bpe {
     /// Encode text → token ids (lossless byte-level).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        for word in split(text) {
+        for word in pretokenize(text) {
             let symbols: Vec<String> = word.bytes().map(|b| self.b2u[b as usize].to_string()).collect();
             for tok in self.bpe(symbols) {
                 // any merged token is in the vocab; base byte-symbols always are
@@ -115,17 +115,54 @@ impl Bpe {
     }
 }
 
-/// Lossless whitespace-aware pre-tokenizer: keep leading spaces attached to the following word.
-fn split(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
+/// The HF SmolLM/GPT-2 pre-tokenizer: a `Digits(individual)` split (each digit isolated) followed by
+/// the ByteLevel GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
+/// Hand-rolled to match `tokenizers` token-for-token — contractions, leading-space attach, multi-space
+/// runs (last space joins the next word), punctuation runs, digits individual.
+fn pretokenize(text: &str) -> Vec<String> {
+    // Digits step: isolate each digit; group consecutive non-digits.
+    let mut frags: Vec<Vec<char>> = Vec::new();
+    let mut cur: Vec<char> = Vec::new();
     for c in text.chars() {
-        if c == ' ' && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+        if c.is_ascii_digit() {
+            if !cur.is_empty() { frags.push(std::mem::take(&mut cur)); }
+            frags.push(vec![c]);
+        } else {
+            cur.push(c);
         }
-        cur.push(c);
     }
-    if !cur.is_empty() { out.push(cur); }
+    if !cur.is_empty() { frags.push(cur); }
+
+    let is_l = |c: char| c.is_alphabetic();
+    let is_n = |c: char| c.is_ascii_digit();
+    let is_punct = |c: char| !c.is_whitespace() && !is_l(c) && !is_n(c);
+    let mut out = Vec::new();
+    for f in &frags {
+        let n = f.len();
+        let mut i = 0;
+        while i < n {
+            let c = f[i];
+            // contractions
+            if c == '\'' && i + 1 < n {
+                let two: String = f[i + 1..(i + 3).min(n)].iter().collect();
+                if two.starts_with("re") || two.starts_with("ve") || two.starts_with("ll") { out.push(f[i..i + 3].iter().collect()); i += 3; continue; }
+                if matches!(f[i + 1], 's' | 't' | 'm' | 'd') { out.push(f[i..i + 2].iter().collect()); i += 2; continue; }
+            }
+            let sp = c == ' ';
+            let j = i + sp as usize;
+            let cls = |p: &dyn Fn(char) -> bool| j < n && p(f[j]);
+            if cls(&is_l) || cls(&is_n) || cls(&is_punct) {
+                let pred: &dyn Fn(char) -> bool = if is_l(f[j]) { &is_l } else if is_n(f[j]) { &is_n } else { &is_punct };
+                let mut e = j; while e < n && pred(f[e]) { e += 1; }
+                out.push(f[i..e].iter().collect()); i = e; continue;
+            }
+            // whitespace run (reached only when the space isn't a single space before content):
+            // if content follows, the last space joins it (leave it); otherwise emit the whole run.
+            let mut e = i; while e < n && f[e].is_whitespace() { e += 1; }
+            if e < n { out.push(f[i..e - 1].iter().collect()); i = e - 1; } // ≥2 spaces before content
+            else { out.push(f[i..e].iter().collect()); i = e; }            // run at fragment end
+        }
+    }
     if out.is_empty() { out.push(String::new()); }
     out
 }
