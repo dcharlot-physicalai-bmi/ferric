@@ -13,6 +13,7 @@ const F16T: u32 = 1;
 const Q4_0: u32 = 2;
 const Q8_0: u32 = 8;
 const Q4_K: u32 = 12;
+const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
 
 #[derive(Debug, Clone)]
 pub enum Meta { U(u64), I(i64), F(f64), Bool(bool), Str(String), Arr(Vec<Meta>) }
@@ -100,6 +101,7 @@ impl Gguf {
             Q8_0 => deq_q8_0(raw, n),
             Q4_0 => deq_q4_0(raw, n),
             Q4_K => deq_q4_k(raw, n),
+            TQ2_0 => deq_tq2_0(raw, n),
             other => return Err(format!("unsupported ggml type {other}")),
         })
     }
@@ -165,6 +167,39 @@ fn deq_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// TQ2_0 (llama.cpp ternary / BitNet): 256-value super-block = `qs[64]` (2-bit codes, 4 per byte) then
+/// `f16 d`. Value = d·(code−1), code ∈ {0,1,2} → {−1,0,+1}. Output order matches llama.cpp's layout.
+fn deq_tq2_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(66).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[64..66]);
+        for jg in 0..2 {               // two 128-value halves (byte groups 0..32, 32..64)
+            for l in 0..4 {            // the 4 two-bit lanes in each byte
+                for m in 0..32 {
+                    let code = ((blk[jg * 32 + m] >> (2 * l)) & 3) as i32;
+                    out[bi * 256 + jg * 128 + l * 32 + m] = d * (code - 1) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Encode ternary values (as codes {−1,0,+1}) into a TQ2_0 block — for test fixtures / writing GGUF.
+pub fn quant_tq2_0(codes: &[i8], d: f32) -> Vec<u8> {
+    let mut qs = vec![0u8; 64];
+    for jg in 0..2 {
+        for l in 0..4 {
+            for m in 0..32 {
+                let code = (codes[jg * 128 + l * 32 + m] + 1) as u8 & 3; // {−1,0,1}→{0,1,2}
+                qs[jg * 32 + m] |= code << (2 * l);
+            }
+        }
+    }
+    qs.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+    qs
 }
 
 // ---- quantizers (used to build test fixtures; also handy for writing GGUF) ----

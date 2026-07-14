@@ -217,6 +217,18 @@ impl Tensor {
         run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
+    /// 3D rotary position embedding (V-JEPA 2): head_dim split into 3 groups (temporal/height/width),
+    /// each rotated by the token's coordinate along that axis. self is [T, n_heads·head_dim], T=gt·gh·gw.
+    pub fn rope_3d(&self, n_heads: usize, head_dim: usize, base: f32, gt: usize, gh: usize, gw: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (n_heads * head_dim);
+        assert_eq!(t, gt * gh * gw, "T must equal gt·gh·gw");
+        assert_eq!(head_dim % 6, 0, "head_dim must be divisible by 6 for 3D RoPE");
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, ROPE_3D_WGSL, "rope3d", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, gt as u32, gh as u32, gw as u32, base.to_bits()])], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     /// Causal depthwise conv1d — the LFM2 / Liquid AI short-conv mixer. self is [T, C] (sequence ×
     /// channels), weight is [C, L] (per-channel kernel of length L). Causal: out[t] sees only t-L+1..t.
     pub fn depthwise_conv1d_causal(&self, weight: &Tensor, l: usize) -> Tensor {
@@ -587,6 +599,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x1 = x[o + c]; let x2 = x[o + c + half];
         out[o + c] = x1 * cs - x2 * sn;
         out[o + c + half] = x2 * cs + x1 * sn;
+    }
+}
+"#;
+
+const ROPE_3D_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // T, H, dh, gt, gh, gw, bitcast(base)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tt = info[0]; let h = info[1]; let dh = info[2];
+    let gt = info[3]; let gh = info[4]; let gw = info[5]; let base = bitcast<f32>(info[6]);
+    let id = gid.x; if (id >= tt * h) { return; }
+    let t = id / h; let head = id % h;
+    var co = array<u32, 3>(t / (gh * gw), (t / gw) % gh, t % gw); // (it, ih, iw)
+    let g = dh / 3u; let half = g / 2u; let lb = log(base);
+    for (var gi: u32 = 0u; gi < 3u; gi = gi + 1u) {
+        let coord = f32(co[gi]);
+        let off = (t * h + head) * dh + gi * g;
+        for (var c: u32 = 0u; c < half; c = c + 1u) {
+            let inv = exp(-2.0 * f32(c) / f32(g) * lb);
+            let ang = coord * inv; let cs = cos(ang); let sn = sin(ang);
+            let x1 = x[off + c]; let x2 = x[off + c + half];
+            out[off + c] = x1 * cs - x2 * sn;
+            out[off + c + half] = x2 * cs + x1 * sn;
+        }
     }
 }
 "#;

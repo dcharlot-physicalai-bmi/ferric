@@ -42,18 +42,19 @@ Researched the exact ops each family needs (July 2026). Most reduce to primitive
 
 | Family | What it is | New primitives needed | Status |
 |---|---|---|---|
-| **BitNet / ternary** (`microsoft/bitnet-b1.58-2B-4T`) | Transformer w/ ternary `{−1,0,+1}` BitLinear + int8 activations + ReLU² FFN | ternary matmul, ReLU², GGUF ternary blocks | ternary matmul ✅ (1.9e-6, 1/16 mem) · ReLU² ✅ · GGUF Q2_0/TQ2_0 ⬜ |
-| **PrismML** (Caltech spinout: Bonsai / Ternary Bonsai 1.7/4/8B) | **Architecturally identical to BitNet** — standard transformer, every linear ternary 1.58-bit (group-128, fp16 scale), ships GGUF `Q2_0` | *same as BitNet* — ternary matmul + GGUF `Q2_0` | ternary matmul ✅ · GGUF Q2_0 ⬜ |
+| **BitNet / ternary** (`microsoft/bitnet-b1.58-2B-4T`) | Transformer w/ ternary `{−1,0,+1}` BitLinear + int8 activations + ReLU² FFN | ternary matmul, ReLU², GGUF ternary blocks | ✅ ternary matmul (1.9e-6, 1/16 mem) · ReLU² · **GGUF TQ2_0 loads** |
+| **PrismML** (Caltech spinout: Bonsai / Ternary Bonsai 1.7/4/8B) | **Architecturally identical to BitNet** — standard transformer, every linear ternary 1.58-bit, ships GGUF | *same as BitNet* — ternary matmul + GGUF ternary | ✅ ternary matmul · GGUF TQ2_0 (their `Q2_0` fork ≈ same 2-bit family) |
 | **Liquid AI LFM2** (`LiquidAI/LFM2-1.2B`) | 16 blocks = 10 gated short-conv + 6 GQA; SwiGLU MLP; RMSNorm; RoPE | **causal depthwise conv1d (L=3)** + gating (⊙) | conv1d ✅ (1.5e-7) · gated block ✅ · GQA/RoPE/RMSNorm/SwiGLU ✅ — **LFM2 block fully covered** |
 | **EBM / JEM** | scalar energy `E(x)` + Langevin sampling `x -= ε∇ₓE + √ε·𝒩` | grad-w.r.t-input (✅), logsumexp, host loop | **✅ RUNS** — `examples/ebm.rs` Langevin-descends the energy (−0.12→−1.46) via autograd-∇ₓE; logsumexp composed from primitives |
-| **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), **non-causal attention**, GELU (✅), 3D RoPE (V-JEPA2) | `bidirectional_attention` ✅ · GELU ✅ · patch-embed = reshape+matmul ✅ · **encoder composable** · 3D-RoPE / mask-token ⬜ (V-JEPA2 predictor only) |
+| **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), non-causal attention, GELU, 3D RoPE, mask-token | ✅ **FULLY RUNS** — `examples/jepa.rs`: patch-embed→bidirectional encoder w/ **3D RoPE** (5.96e-8)→GELU MLP→**mask-token blend**→predictor, end to end |
 
 **Key insight:** PrismML ≡ BitNet (both ternary transformers), so ternary matmul + GGUF-ternary covers
 *two* families. LFM2 needed only conv1d (done). EBM needs almost nothing new (we already do
 grad-w.r.t-input). JEPA is a standard ViT + a few small primitives.
 
-**Remaining model-family gaps (all small/tractable):** GGUF ternary blocks (`Q2_0`/`TQ2_0`), on-device
-RNG + `logsumexp` (EBM sampling), non-causal attention + additive mask + patch-embed + 3D-RoPE (JEPA).
+**All 5 families now run** (BitNet/PrismML ternary, LFM2, EBM, JEPA/V-JEPA2). Remaining refinements:
+GGUF `TQ1_0`/`I2_S` ternary variants + PrismML's exact `Q2_0` fork spec; true multi-chain SGLD via
+on-device RNG; and loading a *real* downloaded checkpoint of each (weights + tokenizer/config).
 
 ## Device coverage — CPU / GPU / NPU (honest)
 `sched::detect_devices()` + `examples/devices.rs` enumerate and use everything present:

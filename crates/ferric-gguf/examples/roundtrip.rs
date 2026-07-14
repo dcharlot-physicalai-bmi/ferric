@@ -1,7 +1,7 @@
 //! Validates the GGUF reader end-to-end: builds a synthetic GGUF in memory (metadata + F32/Q8_0/Q4_0
 //! tensors), parses it, and dequantizes each back within quantization tolerance. Then validates the
 //! Q4_K (k-quant) super-block dequant formula against a hand-constructed block with known values.
-use ferric_gguf::{parse, quant_q4_0, quant_q8_0, Meta};
+use ferric_gguf::{parse, quant_q4_0, quant_q8_0, quant_tq2_0, Meta};
 use half::f16;
 
 fn w_str(o: &mut Vec<u8>, s: &str) { o.extend_from_slice(&(s.len() as u64).to_le_bytes()); o.extend_from_slice(s.as_bytes()); }
@@ -86,6 +86,24 @@ fn main() {
     ok &= qk_ok;
     println!("  {} Q4_K super-block dequant formula (256 vals)", if qk_ok { "✅" } else { "❌" });
 
-    println!("{}", if ok { "✅ GGUF reader: parses the container + dequantizes F32/Q8_0/Q4_0/Q4_K — the llama.cpp/HF model corpus loads" } else { "❌ gguf failed" });
+    // ---- TQ2_0 (ternary / BitNet GGUF) round-trip: known codes {−1,0,+1} → d·code ----
+    let codes: Vec<i8> = (0..256).map(|i| (i % 3) as i8 - 1).collect(); // pattern of −1,0,+1
+    let dsc = 0.75f32;
+    let tq = quant_tq2_0(&codes, dsc);
+    let mut o3 = Vec::new();
+    o3.extend_from_slice(b"GGUF"); o3.extend_from_slice(&3u32.to_le_bytes());
+    o3.extend_from_slice(&1u64.to_le_bytes()); o3.extend_from_slice(&0u64.to_le_bytes());
+    w_str(&mut o3, "wt"); o3.extend_from_slice(&1u32.to_le_bytes()); o3.extend_from_slice(&256u64.to_le_bytes());
+    o3.extend_from_slice(&35u32.to_le_bytes()); o3.extend_from_slice(&0u64.to_le_bytes());
+    while o3.len() % 32 != 0 { o3.push(0); }
+    o3.extend_from_slice(&tq);
+    let gt = parse(o3).unwrap();
+    let dt = gt.dequant("wt").unwrap();
+    let exp: Vec<f32> = codes.iter().map(|&c| dsc * c as f32).collect();
+    let tqok = dt.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) < 1e-3;
+    ok &= tqok;
+    println!("  {} TQ2_0 ternary (BitNet) block dequant (256 vals)", if tqok { "✅" } else { "❌" });
+
+    println!("{}", if ok { "✅ GGUF reader: parses the container + dequantizes F32/Q8_0/Q4_0/Q4_K/TQ2_0 — the llama.cpp/HF corpus (incl. BitNet ternary) loads" } else { "❌ gguf failed" });
     assert!(ok);
 }
