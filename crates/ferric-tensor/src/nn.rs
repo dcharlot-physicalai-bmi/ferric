@@ -35,6 +35,25 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv
     ctx.permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
+/// Incremental-decode attention against a KV cache (one new query token vs all cached keys/values).
+/// q is [1, n_heads·dh]; k/v are the cache [S, n_kv_heads·dh]. No mask (cache precedes the query).
+/// Composed from general ops — the KV-cache decode path, no bespoke kernel.
+pub fn decode_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+    let d = q.shape[1];
+    let dh = d / n_heads;
+    let s = k.shape[0];
+    let g = n_heads / n_kv_heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh = q.reshape(&[1, n_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nh, 1, dh]
+    let kv_heads = |x: &Tensor| {
+        let hx = x.reshape(&[s, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nkv, S, dh]
+        hx.reshape(&[n_kv_heads, 1, s, dh]).broadcast_to(&[n_kv_heads, g, s, dh]).reshape(&[n_heads, s, dh])
+    };
+    let (kh, vh) = (kv_heads(k), kv_heads(v)); // [nh, S, dh]
+    let probs = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)).softmax(2); // [nh, 1, S]
+    probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[1, d]) // [nh,1,dh] → [1,d]
+}
+
 /// Bidirectional (non-causal) multi-head attention — JEPA/ViT encoders. No causal mask; every
 /// position attends to all others. q [T, n_heads·dh]; k/v [T, n_kv_heads·dh]. Returns [T, n_heads·dh].
 pub fn bidirectional_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
