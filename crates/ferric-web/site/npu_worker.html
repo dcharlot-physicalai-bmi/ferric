@@ -1,0 +1,50 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Ferric NPU worker (WebNN)</title></head>
+<body style="font:14px system-ui;background:#0b0e14;color:#eaf0fb;padding:20px">
+<h3>Ferric — NPU worker (WebNN → CoreML/ANE on macOS)</h3><pre id="log">starting…</pre>
+<script>
+const log = m => { document.getElementById('log').textContent += '\n'+m; console.log('NPU> '+m); };
+async function main() {
+  // pick the best available WebNN device: NPU first, then GPU, then CPU
+  let context = null, device = 'NO_WEBNN';
+  if ('ml' in navigator) {
+    for (const dt of ['npu', 'gpu', 'cpu']) {
+      try { context = await navigator.ml.createContext({ deviceType: dt }); device = dt; break; } catch (e) {}
+    }
+    if (!context) { try { context = await navigator.ml.createContext(); device = 'default'; } catch(e){ device = 'NO_WEBNN'; } }
+  }
+  log('WEBNN_DEVICE:' + device);
+
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => ws.send(new TextEncoder().encode('WEBNN:' + device)); // report device in the ready frame
+  ws.onmessage = async (e) => {
+    const dv = new DataView(e.data); const u8 = new Uint8Array(e.data);
+    const rd = o => dv.getUint32(o, true);
+    const op = u8[0];
+    const dims = [rd(1), rd(5), rd(9), rd(13)];
+    let off = 17; const la = rd(off); off += 4;
+    const a = new Float32Array(e.data.slice(off, off + la*4)); off += la*4;
+    const lb = rd(off); off += 4;
+    const b = new Float32Array(e.data.slice(off, off + lb*4));
+    const [batch, m, k, n] = op === 0 ? dims : [1, dims[0], dims[1], dims[2]];
+    try {
+      // build a WebNN graph: C = A·B (+ relu) — runs on the NPU when the device is 'npu'
+      const builder = new MLGraphBuilder(context);
+      const A = builder.input('A', { dataType: 'float32', dimensions: [m, k] });
+      const B = builder.constant({ dataType: 'float32', dimensions: [k, n] }, b);
+      let C = builder.matmul(A, B);
+      if (op === 1) C = builder.relu(C);
+      const graph = await builder.build({ C });
+      const out = new Float32Array(batch * m * n);
+      for (let bt = 0; bt < batch; bt++) {
+        const res = new Float32Array(m * n);
+        await context.compute(graph, { A: a.subarray(bt*m*k, (bt+1)*m*k) }, { C: res });
+        out.set(res, bt * m * n);
+      }
+      ws.send(out.buffer);
+      log('served ['+m+'x'+k+']x['+k+'x'+n+'] on WebNN:' + device);
+    } catch (err) { log('WEBNN_OP_ERR:' + (err.message||err)); ws.send(new Float32Array(batch*m*n).buffer); }
+  };
+}
+main();
+</script></body></html>

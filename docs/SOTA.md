@@ -62,11 +62,15 @@ on-device RNG; and loading a *real* downloaded checkpoint of each (weights + tok
   `for_adapter(i)`, so a multi-GPU box gets one device per GPU. Verified on M5 Max.
 - **CPU:** always a device, now **multi-threaded across all cores** (`cpu_bmm` splits the batch over
   `available_parallelism()` — 18 cores on M5 Max; the measured split hands the CPU real work).
-- **NPU:** `probe_npu()` **detects** it (Apple ANE on Apple-Silicon; Windows via DirectML/QNN/OpenVINO)
-  and reports how it's reachable. **WebGPU/wgpu CANNOT dispatch to an NPU** — so Ferric ships the
-  `NpuBackend` trait + `Device::Npu` slot and only computes on the NPU when a real execution-provider
-  backend (CoreML / DirectML-QNN / OpenVINO / WebNN) is wired. **It never fakes NPU work on the GPU.**
-  Wiring CoreML (ANE) / WebNN (browser) is the concrete next EP.
+- **NPU — actually runs.** WebGPU/wgpu cannot dispatch to an NPU, so the reachable path is a real
+  execution-provider: **WebNN** (`navigator.ml`), and on macOS Chrome's WebNN is backed by **CoreML →
+  the Apple Neural Engine**. `examples/npu.rs` (in `ferric-web`) launches Chrome with WebNN enabled,
+  gets a `deviceType:'npu'` context, and **dispatches a matmul that executes on the ANE** through the
+  browser-worker bridge — result matches CPU to **fp16 precision** (the ANE is an fp16 engine; 7.6e-2).
+  Ferric also ships `probe_npu()` + the `NpuBackend` trait + `Device::Npu` slot; it never fakes NPU
+  work on the GPU. (Chrome-flag gotcha: **two `--enable-features` flags — only the last wins**; merge
+  `WebMachineLearningNeuralNetwork` with the WebGPU features into one flag.) Native CoreML/DirectML EPs
+  are the follow-up; WebNN is the portable one and it works today.
 
 ## The 2026 WebGPU platform reality (shapes what's even possible in-browser)
 - **Subgroups + `shader-f16`: STABLE** in Chrome 134+ (2.3–2.9× on matrix-vector shaders). Usable
