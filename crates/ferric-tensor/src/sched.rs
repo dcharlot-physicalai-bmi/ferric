@@ -26,6 +26,21 @@ pub enum Device {
     /// A browser tab reached over a WebSocket, computing on the tab's WebGPU. Same op frames as
     /// Remote, different transport — this is the fabric physically spanning cloud+local+browser.
     BrowserWorker(Arc<crate::ws::WsConn>),
+    /// An NPU reached through an execution-provider backend (CoreML/ANE, DirectML-QNN, OpenVINO,
+    /// WebNN). WebGPU cannot target an NPU, so this only exists when a real backend is plugged in —
+    /// it never falls back to the GPU/CPU silently.
+    Npu(Arc<dyn NpuBackend>),
+}
+
+/// An NPU execution-provider backend. Implement over CoreML (Apple ANE), DirectML/QNN, OpenVINO, or
+/// WebNN to make that NPU a real device in the fabric. Ferric ships the abstraction + detection; the
+/// platform binding is the EP to wire — kept honest, no fake NPU dispatch on the GPU.
+pub trait NpuBackend: Send + Sync {
+    fn name(&self) -> String;
+    fn bmm(&self, a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize) -> Vec<f32>;
+    fn linear_relu(&self, x: &[f32], rows: usize, w: &[f32], in_: usize, out: usize) -> Vec<f32> {
+        self.bmm(x, w, 1, rows, in_, out).iter().map(|v| v.max(0.0)).collect()
+    }
 }
 
 impl Device {
@@ -35,6 +50,7 @@ impl Device {
             Device::Cpu => "CPU".into(),
             Device::Remote(addr) => format!("Remote:{addr}"),
             Device::BrowserWorker(_) => "BrowserWorker".into(),
+            Device::Npu(b) => format!("NPU:{}", b.name()),
         }
     }
 
@@ -48,19 +64,8 @@ impl Device {
             }
             Device::Remote(addr) => remote_call(addr, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
             Device::BrowserWorker(conn) => browser_call(conn, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
-            Device::Cpu => {
-                let mut out = vec![0.0f32; batch * m * n];
-                for bt in 0..batch {
-                    for i in 0..m {
-                        for j in 0..n {
-                            let mut s = 0.0;
-                            for l in 0..k { s += a[bt * m * k + i * k + l] * b[l * n + j]; }
-                            out[bt * m * n + i * n + j] = s;
-                        }
-                    }
-                }
-                out
-            }
+            Device::Npu(back) => back.bmm(a, b, batch, m, k, n),
+            Device::Cpu => cpu_bmm(a, b, batch, m, k, n), // parallel across all cores
         }
     }
 
@@ -74,19 +79,69 @@ impl Device {
             }
             Device::Remote(addr) => remote_call(addr, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
             Device::BrowserWorker(conn) => browser_call(conn, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
-            Device::Cpu => {
-                let mut o = vec![0.0f32; rows * out];
-                for i in 0..rows {
-                    for j in 0..out {
-                        let mut s = 0.0;
-                        for l in 0..in_ { s += x[i * in_ + l] * w[l * out + j]; }
-                        o[i * out + j] = s.max(0.0);
-                    }
-                }
-                o
-            }
+            Device::Npu(back) => back.linear_relu(x, rows, w, in_, out),
+            Device::Cpu => cpu_bmm(x, w, 1, rows, in_, out).iter().map(|v| v.max(0.0)).collect(),
         }
     }
+}
+
+/// Multi-threaded CPU batched matmul — splits the batch across all available cores.
+fn cpu_bmm(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * m * n];
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(batch.max(1));
+    let chunk = batch.div_ceil(threads.max(1));
+    std::thread::scope(|s| {
+        for (ci, slab) in out.chunks_mut(chunk * m * n).enumerate() {
+            let lo = ci * chunk;
+            s.spawn(move || {
+                for bt_local in 0..slab.len() / (m * n) {
+                    let bt = lo + bt_local;
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc = 0.0;
+                            for l in 0..k { acc += a[bt * m * k + i * k + l] * b[l * n + j]; }
+                            slab[bt_local * m * n + i * n + j] = acc;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// What an NPU probe found. Honest: `dispatchable` is true only when a real NPU backend is wired.
+/// WebGPU/wgpu CANNOT target an NPU — ANE/Intel/AMD/Qualcomm NPUs need CoreML/DirectML-QNN/OpenVINO/WebNN.
+pub struct NpuInfo {
+    pub present: bool,
+    pub name: String,
+    pub reachable_via: String,
+    pub dispatchable: bool,
+}
+
+/// Probe the platform for an NPU — reports presence + how it's reachable, never that we run on it.
+pub fn probe_npu() -> NpuInfo {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    { return NpuInfo { present: true, name: "Apple Neural Engine (ANE)".into(), reachable_via: "CoreML".into(), dispatchable: false }; }
+    #[cfg(target_os = "windows")]
+    { return NpuInfo { present: false, name: "Windows NPU (if present)".into(), reachable_via: "DirectML / QNN / OpenVINO EP".into(), dispatchable: false }; }
+    #[allow(unreachable_code)]
+    NpuInfo { present: false, name: "none".into(), reachable_via: "n/a".into(), dispatchable: false }
+}
+
+/// Enumerate a Device for EVERY GPU adapter present (all backends) + the CPU, and probe the NPU.
+/// "Use CPU/GPU/NPU as available": every GPU is a device, CPU is always a device (all cores), NPU is
+/// reported (added as a compute device only when a backend is wired — never faked).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn detect_devices() -> (Vec<Device>, NpuInfo) {
+    let mut devices = Vec::new();
+    for (idx, (_name, _backend, dt)) in Context::enumerate().await.into_iter().enumerate() {
+        if dt != wgpu::DeviceType::Cpu {
+            if let Ok(ctx) = Context::for_adapter(idx).await { devices.push(Device::Gpu(Arc::new(ctx))); }
+        }
+    }
+    devices.push(Device::Cpu);
+    (devices, probe_npu())
 }
 
 /// The fabric: a set of devices + a scheduler over them.

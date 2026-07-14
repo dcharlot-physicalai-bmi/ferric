@@ -72,4 +72,5 @@ jobs:
           cargo run -p ferric-tensor --example ebm
           cargo run -p ferric-gguf --example roundtrip
           cargo run -p ferric-tokenizer --example roundtrip
+          cargo run -p ferric-tensor --example devices
           cargo run -p ferric-tensor --example fabric

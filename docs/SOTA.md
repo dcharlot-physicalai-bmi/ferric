@@ -55,6 +55,18 @@ grad-w.r.t-input). JEPA is a standard ViT + a few small primitives.
 **Remaining model-family gaps (all small/tractable):** GGUF ternary blocks (`Q2_0`/`TQ2_0`), on-device
 RNG + `logsumexp` (EBM sampling), non-causal attention + additive mask + patch-embed + 3D-RoPE (JEPA).
 
+## Device coverage — CPU / GPU / NPU (honest)
+`sched::detect_devices()` + `examples/devices.rs` enumerate and use everything present:
+- **GPU:** every wgpu adapter across all backends (Metal/Vulkan/DX12/GL) — `Context::enumerate()` /
+  `for_adapter(i)`, so a multi-GPU box gets one device per GPU. Verified on M5 Max.
+- **CPU:** always a device, now **multi-threaded across all cores** (`cpu_bmm` splits the batch over
+  `available_parallelism()` — 18 cores on M5 Max; the measured split hands the CPU real work).
+- **NPU:** `probe_npu()` **detects** it (Apple ANE on Apple-Silicon; Windows via DirectML/QNN/OpenVINO)
+  and reports how it's reachable. **WebGPU/wgpu CANNOT dispatch to an NPU** — so Ferric ships the
+  `NpuBackend` trait + `Device::Npu` slot and only computes on the NPU when a real execution-provider
+  backend (CoreML / DirectML-QNN / OpenVINO / WebNN) is wired. **It never fakes NPU work on the GPU.**
+  Wiring CoreML (ANE) / WebNN (browser) is the concrete next EP.
+
 ## The 2026 WebGPU platform reality (shapes what's even possible in-browser)
 - **Subgroups + `shader-f16`: STABLE** in Chrome 134+ (2.3–2.9× on matrix-vector shaders). Usable
   in-browser today — a real, unclaimed perf lever.

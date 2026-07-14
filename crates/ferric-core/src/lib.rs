@@ -59,6 +59,37 @@ impl Context {
         Ok(Self { device, queue, backend: info.backend, adapter_name: info.name })
     }
 
+    /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
+    /// so the scheduler can use all of them, not just one. Returns (name, backend, device_type).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn enumerate() -> Vec<(String, wgpu::Backend, wgpu::DeviceType)> {
+        let instance = wgpu::Instance::default();
+        instance.enumerate_adapters(wgpu::Backends::all()).await.iter()
+            .map(|a| { let i = a.get_info(); (i.name, i.backend, i.device_type) })
+            .collect()
+    }
+
+    /// Build a Context on a specific enumerated adapter (by index into `enumerate()`), so each GPU in
+    /// the machine can be its own device in the fabric.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn for_adapter(idx: usize) -> Result<Self> {
+        let instance = wgpu::Instance::default();
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let adapter = adapters.into_iter().nth(idx).ok_or_else(|| format!("no adapter at index {idx}"))?;
+        let info = adapter.get_info();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("ferric"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| format!("no compute device: {e:?}"))?;
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name })
+    }
+
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
         use wgpu::util::DeviceExt;
         self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
