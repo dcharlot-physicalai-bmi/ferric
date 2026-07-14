@@ -76,6 +76,21 @@ async fn run() {
         println!("  {} int{bits} weight-only matmul (W4A16-style)   rel err = {:.2e}  (W: {} B → {} B)", if pass { "✅" } else { "❌" }, rel, outf * inn * 4, qw.nbytes());
     }
 
+    // ternary (BitNet b1.58) weight matmul: weights {-1,0,+1}, 2 bits each, multiply-free
+    let wv = seq(mr * mc, 60.0);
+    let xv2 = seq(4 * mc, 61.0);
+    let tern = Tensor::from_vec(&ctx, &wv, &[mr, mc]).quantize_ternary();
+    let ty = Tensor::from_vec(&ctx, &xv2, &[4, mc]).matmul_ternary(&tern).to_vec().await;
+    let mut cref = vec![0.0f32; 4 * mr];
+    for o in 0..mr {
+        let am: f32 = (0..mc).map(|i| wv[o*mc+i].abs()).sum::<f32>() / mc as f32;
+        let s = if am==0.0 {1.0} else {am};
+        for r in 0..4 { let mut acc=0.0f32; for i in 0..mc { let t=(wv[o*mc+i]/s).round().clamp(-1.0,1.0); acc+=xv2[r*mc+i]*t; } cref[r*mr+o]=acc*s; }
+    }
+    let td = ty.iter().zip(&cref).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+    let tpass = td < 1e-3; ok &= tpass;
+    println!("  {} ternary (BitNet) matmul vs CPU ternary ref  max|Δ| = {:.2e}  (W: {} B -> {} B)", if tpass {"✅"} else {"❌"}, td, mr*mc*4, tern.nbytes());
+
     println!("  memory: {} f32 bytes → {} half bytes ({}% )", x.len() * 4, hf16.nbytes(), hf16.nbytes() * 100 / (x.len() * 4));
     println!("{}", if ok { "✅ Half-precision storage + on-device dequant is exact — real fp16/bf16 weights can live on the GPU" } else { "❌ dtype mismatch" });
     assert!(ok);

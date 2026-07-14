@@ -28,7 +28,7 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub use autograd::Var;
-pub use dtype::{DType, Half, QRow, QTensor};
+pub use dtype::{DType, Half, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
@@ -180,6 +180,7 @@ impl Tensor {
     pub fn silu(&self) -> Tensor { self.unary(7) }
     pub fn gelu(&self) -> Tensor { self.unary(8) }
     pub fn log(&self) -> Tensor { self.unary(9) }
+    pub fn relu2(&self) -> Tensor { self.unary(10) } // ReLU² (BitNet FFN)
     pub fn scalar(&self, s: f32) -> Tensor { Tensor::from_vec(&self.ctx, &[s], &[1]) }
 
     // ---- fused transformer fast-paths (same result as composing primitives, fewer dispatches) ----
@@ -216,6 +217,16 @@ impl Tensor {
         run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
+    /// Causal depthwise conv1d — the LFM2 / Liquid AI short-conv mixer. self is [T, C] (sequence ×
+    /// channels), weight is [C, L] (per-channel kernel of length L). Causal: out[t] sees only t-L+1..t.
+    pub fn depthwise_conv1d_causal(&self, weight: &Tensor, l: usize) -> Tensor {
+        let c = self.contiguous();
+        let (t, ch) = (c.shape[0], c.shape[1]);
+        let out = empty(&self.ctx, t * ch);
+        run(&self.ctx, CONV1D_WGSL, "conv1d", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, ch as u32, l as u32, 0])], groups(t * ch));
+        Tensor::from_parts(&self.ctx, out, vec![t, ch])
+    }
+
     /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
     pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
         let d = *self.shape.last().unwrap();
@@ -478,6 +489,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             r = 0.5 * v * (1.0 + erf);
         }
         case 9u: { r = log(v); }
+        case 10u: { let z = max(v, 0.0); r = z * z; } // ReLU² (BitNet FFN)
         default: { r = v; }
     }
     out[i] = r;
@@ -576,6 +588,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out[o + c] = x1 * cs - x2 * sn;
         out[o + c + half] = x2 * cs + x1 * sn;
     }
+}
+"#;
+
+const CONV1D_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;      // [T, C]
+@group(0) @binding(1) var<storage,read>        w: array<f32>;      // [C, L]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;    // [T, C]
+@group(0) @binding(3) var<storage,read>        info: array<u32>;   // T, C, L
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let t = info[0]; let ch = info[1]; let l = info[2];
+    if (idx >= t * ch) { return; }
+    let row = idx / ch; let c = idx % ch;
+    var acc = 0.0;
+    for (var k: u32 = 0u; k < l; k = k + 1u) {
+        // causal: source position = row - (L-1) + k
+        let off = i32(row) - i32(l) + 1 + i32(k);
+        if (off >= 0) { acc = acc + w[c * l + k] * x[u32(off) * ch + c]; }
+    }
+    out[idx] = acc;
 }
 "#;
 

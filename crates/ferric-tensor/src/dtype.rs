@@ -155,6 +155,88 @@ impl QRow {
     }
 }
 
+/// A ternary-weight matrix (BitNet b1.58 family): weights ∈ {−1,0,+1} packed 16 per u32 (2 bits
+/// each), with a per-output-channel scale (absmean). The matmul is effectively multiply-free — each
+/// weight just adds, subtracts, or skips an activation. 1.58 bits/weight ≈ 1/16 the memory of f32.
+pub struct Ternary {
+    ctx: Arc<Context>,
+    buf: Arc<wgpu::Buffer>,
+    scale: Arc<wgpu::Buffer>, // [out] = absmean per row
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Tensor {
+    /// Quantize a 2D [out,in] weight to ternary {−1,0,+1} with per-row absmean scale (BitNet-style).
+    pub fn quantize_ternary(&self) -> Ternary {
+        let c = self.contiguous();
+        assert_eq!(c.rank(), 2, "ternary quant is 2D");
+        let (rows, cols) = (c.shape[0], c.shape[1]);
+        let scale = c.abs().mean(&[1], false); // [rows] absmean
+        let words = (rows * cols).div_ceil(16);
+        let out = empty(&self.ctx, words);
+        run(&self.ctx, QUANT_TERNARY_WGSL, "quant_ternary", &[c.buf.as_ref(), scale.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, cols as u32])], groups(words));
+        Ternary { ctx: self.ctx.clone(), buf: Arc::new(out), scale: scale.buf.clone(), rows, cols }
+    }
+    /// Multiply-free ternary matmul: x [rows,in] · Wᵀ where W is ternary [out,in]. Returns [rows,out].
+    pub fn matmul_ternary(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dims mismatch");
+        let out = empty(&self.ctx, rows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_WGSL, "matmul_ternary", &[x.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out, &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, 0])], groups(rows * w.rows));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+impl Ternary {
+    pub fn nbytes(&self) -> usize { (self.rows * self.cols * 2).div_ceil(8) }
+}
+
+const QUANT_TERNARY_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        inp: array<f32>;
+@group(0) @binding(1) var<storage,read>        scale: array<f32>; // [rows] absmean
+@group(0) @binding(2) var<storage,read_write>  out: array<u32>;   // 16 ternary codes per word
+@group(0) @binding(3) var<storage,read>        info: array<u32>;  // rows, cols
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x; let rows = info[0]; let cols = info[1]; let n = rows * cols; let words = (n + 15u) / 16u;
+    if (w >= words) { return; }
+    var word: u32 = 0u;
+    for (var lane: u32 = 0u; lane < 16u; lane = lane + 1u) {
+        let idx = 16u * w + lane;
+        if (idx < n) {
+            var s = scale[idx / cols]; if (s == 0.0) { s = 1.0; }
+            let t = clamp(round(inp[idx] / s), -1.0, 1.0);      // {−1,0,+1}
+            let code = u32(i32(t) + 1);                          // {0,1,2}
+            word = word | (code << (2u * lane));
+        }
+    }
+    out[w] = word;
+}
+"#;
+
+const MATMUL_TERNARY_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;     // [rows, in]
+@group(0) @binding(1) var<storage,read>        tw: array<u32>;    // packed ternary [out, in]
+@group(0) @binding(2) var<storage,read>        scale: array<f32>; // [out]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;   // [rows, out]
+@group(0) @binding(4) var<uniform>             info: vec4<u32>;   // rows, out, in
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    var acc = 0.0;
+    for (var i: u32 = 0u; i < in_dim; i = i + 1u) {
+        let widx = o * in_dim + i;
+        let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u; // {0,1,2}
+        let t = f32(i32(code) - 1);                              // {−1,0,+1}  (multiply-free in spirit)
+        acc = acc + x[r * in_dim + i] * t;
+    }
+    out[idx] = acc * scale[o];
+}
+"#;
+
 const MATMUL_QW_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;      // [rows, in]
 @group(0) @binding(1) var<storage,read>        qw: array<u32>;     // packed per-row int, [out, in]

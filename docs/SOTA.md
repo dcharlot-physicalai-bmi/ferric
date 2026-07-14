@@ -37,6 +37,24 @@ well-threaded but *naive* one-thread-per-output kernel (~425 GFLOP/s at 1024³ o
 subgroup-matrix (tensor cores) more. We have no general flash-attention path, no GGUF/k-quants, no
 tokenizer, no kernel fusion, no autotuning.
 
+## Model-family coverage (Liquid AI, PrismML, BitNet, EBM, JEPA)
+Researched the exact ops each family needs (July 2026). Most reduce to primitives Ferric already has.
+
+| Family | What it is | New primitives needed | Status |
+|---|---|---|---|
+| **BitNet / ternary** (`microsoft/bitnet-b1.58-2B-4T`) | Transformer w/ ternary `{−1,0,+1}` BitLinear + int8 activations + ReLU² FFN | ternary matmul, ReLU², GGUF ternary blocks | ternary matmul ✅ (1.9e-6, 1/16 mem) · ReLU² ✅ · GGUF Q2_0/TQ2_0 ⬜ |
+| **PrismML** (Caltech spinout: Bonsai / Ternary Bonsai 1.7/4/8B) | **Architecturally identical to BitNet** — standard transformer, every linear ternary 1.58-bit (group-128, fp16 scale), ships GGUF `Q2_0` | *same as BitNet* — ternary matmul + GGUF `Q2_0` | ternary matmul ✅ · GGUF Q2_0 ⬜ |
+| **Liquid AI LFM2** (`LiquidAI/LFM2-1.2B`) | 16 blocks = 10 gated short-conv + 6 GQA; SwiGLU MLP; RMSNorm; RoPE | **causal depthwise conv1d (L=3)** + gating (⊙) | conv1d ✅ (1.5e-7) · gated block ✅ · GQA/RoPE/RMSNorm/SwiGLU ✅ — **LFM2 block fully covered** |
+| **EBM / JEM** | scalar energy `E(x)` + Langevin sampling `x -= ε∇ₓE + √ε·𝒩` | grad-w.r.t-input (✅), on-device RNG, logsumexp, host loop | autograd-w.r.t-input ✅ · RNG + logsumexp + loop ⬜ (small) |
+| **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), **non-causal attention + mask**, GELU (✅), 3D RoPE (V-JEPA2) | GELU ✅ · attention core ✅ · non-causal mask / patch-embed / 3D-RoPE ⬜ |
+
+**Key insight:** PrismML ≡ BitNet (both ternary transformers), so ternary matmul + GGUF-ternary covers
+*two* families. LFM2 needed only conv1d (done). EBM needs almost nothing new (we already do
+grad-w.r.t-input). JEPA is a standard ViT + a few small primitives.
+
+**Remaining model-family gaps (all small/tractable):** GGUF ternary blocks (`Q2_0`/`TQ2_0`), on-device
+RNG + `logsumexp` (EBM sampling), non-causal attention + additive mask + patch-embed + 3D-RoPE (JEPA).
+
 ## The 2026 WebGPU platform reality (shapes what's even possible in-browser)
 - **Subgroups + `shader-f16`: STABLE** in Chrome 134+ (2.3–2.9× on matrix-vector shaders). Usable
   in-browser today — a real, unclaimed perf lever.

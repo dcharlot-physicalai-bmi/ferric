@@ -1,0 +1,17 @@
+[package]
+name = "ferric-gguf"
+description = "Ferric GGUF reader — pure-Rust parser for the llama.cpp GGUF container + dequantizers for F32/F16/Q8_0/Q4_0/Q4_K (k-quant). Unlocks the entire llama.cpp/HF quantized-model corpus."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["gguf", "quantization", "llama", "llm", "ai"]
+categories = ["parser-implementations", "science"]
+
+[dependencies]
+half = "2"
+
+[dev-dependencies]
+pollster = "1.0.1"
