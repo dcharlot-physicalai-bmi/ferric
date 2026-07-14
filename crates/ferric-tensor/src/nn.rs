@@ -8,8 +8,8 @@ use crate::Tensor;
 /// Linear y = x·W in the [in,out] weight convention (no bias) — just a matmul.
 pub fn linear(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(w) }
 
-/// Linear in the HF convention: W is stored [out, in]; y = x·Wᵀ.
-pub fn linear_hf(x: &Tensor, w: &Tensor) -> Tensor { x.matmul(&w.transpose(w.rank() - 1, w.rank() - 2)) }
+/// Linear in the HF convention: W is stored [out, in]; y = x·Wᵀ (direct, no transpose materialized).
+pub fn linear_hf(x: &Tensor, w: &Tensor) -> Tensor { x.matmul_bt(w) }
 
 /// Weight-quantized HF linear: W is a per-row int4/int8 [out,in]; y = x·Wᵀ, W dequantized on the fly.
 pub fn linear_hf_q(x: &Tensor, w: &crate::QRow) -> Tensor { x.matmul_qweight(w) }

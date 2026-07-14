@@ -239,6 +239,20 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![t, ch])
     }
 
+    /// y = x·Wᵀ where x is [rows,in] and W is stored [out,in] (HF linear convention) — computed
+    /// directly, without materializing Wᵀ. Essential for big tied LM heads (avoids a huge transpose).
+    pub fn matmul_bt(&self, w: &Tensor) -> Tensor {
+        let x = self.contiguous();
+        assert_eq!(x.rank(), 2, "matmul_bt is 2D");
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        let wc = w.contiguous();
+        let out_f = wc.shape[0];
+        assert_eq!(inn, wc.shape[1], "inner dims mismatch");
+        let out = empty(&self.ctx, rows * out_f);
+        run(&self.ctx, MATMUL_BT_WGSL, "matmul_bt", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32])], groups(rows * out_f));
+        Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
+    }
+
     /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
     pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
         let d = *self.shape.last().unwrap();
@@ -645,6 +659,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let off = i32(row) - i32(l) + 1 + i32(k);
         if (off >= 0) { acc = acc + w[c * l + k] * x[u32(off) * ch + c]; }
     }
+    out[idx] = acc;
+}
+"#;
+
+const MATMUL_BT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;    // [rows, in]
+@group(0) @binding(1) var<storage,read>        w: array<f32>;    // [out, in]  (HF layout)
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    var acc = 0.0;
+    for (var c: u32 = 0u; c < in_dim; c = c + 1u) { acc = acc + x[r * in_dim + c] * w[o * in_dim + c]; }
     out[idx] = acc;
 }
 "#;
