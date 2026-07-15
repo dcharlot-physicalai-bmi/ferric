@@ -237,6 +237,74 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// PrismML **Q2_0** ternary weights held on the GPU in their native packed form (group-128 blocks:
+/// `f16 d` + 32 bytes of 2-bit codes = 34 B / 128 weights ≈ 2.125 bpw). A 27B model stays ~7 GB
+/// instead of the 108 GB it would need dequantized to f32 — so the matmul must read the packed
+/// blocks directly, which is what `Tensor::matmul_q2_0` does.
+pub struct Q2_0Weights {
+    ctx: Arc<Context>,
+    buf: Arc<wgpu::Buffer>,
+    pub rows: usize, // out features
+    pub cols: usize, // in features (multiple of 128)
+}
+
+impl Q2_0Weights {
+    /// Upload raw Q2_0 block bytes (as they appear in the GGUF) for an [out, in] weight.
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q2_0Weights {
+        assert_eq!(cols % 128, 0, "Q2_0 rows must be a multiple of 128");
+        assert_eq!(bytes.len(), rows * (cols / 128) * 34, "unexpected Q2_0 byte length");
+        let mut words: Vec<u32> = vec![0; bytes.len().div_ceil(4)];
+        for (i, &b) in bytes.iter().enumerate() { words[i / 4] |= (b as u32) << (8 * (i % 4)); }
+        let buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("q2_0"), contents: bytemuck::cast_slice(&words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        });
+        Q2_0Weights { ctx: ctx.clone(), buf: Arc::new(buf), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 128) * 34 }
+}
+
+impl Tensor {
+    /// y = x·Wᵀ where W is PrismML Q2_0 ternary held PACKED on the GPU (dequantized per-block on the
+    /// fly inside the kernel). x [rows, in] → [rows, out]. This is what makes a 27B ternary model fit.
+    pub fn matmul_q2_0(&self, w: &Q2_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        run(&self.ctx, MATMUL_Q2_0_WGSL, "matmul_q2_0",
+            &[x.buf.as_ref(), w.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32])],
+            groups(rows * w.rows));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
+const MATMUL_Q2_0_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:  array<f32>;   // [rows, in]
+@group(0) @binding(1) var<storage,read>        qw: array<u32>;   // raw Q2_0 blocks (34 B each), byte-addressed
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in
+fn gbyte(i: u32) -> u32 { return (qw[i >> 2u] >> (8u * (i & 3u))) & 0xffu; } // 34B blocks aren't u32-aligned
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 128u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let base = (o * nblk + blk) * 34u;
+        let dbits = gbyte(base) | (gbyte(base + 1u) << 8u);      // f16 scale for this 128-group
+        let d = unpack2x16float(dbits).x;
+        for (var jj: u32 = 0u; jj < 128u; jj = jj + 1u) {
+            let code = (gbyte(base + 2u + (jj >> 2u)) >> (2u * (jj & 3u))) & 3u; // 4 codes per byte
+            acc = acc + x[r * in_dim + blk * 128u + jj] * f32(i32(code) - 1) * d; // w = (q−1)·d
+        }
+    }
+    out[idx] = acc;
+}
+"#;
+
 const MATMUL_QW_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;      // [rows, in]
 @group(0) @binding(1) var<storage,read>        qw: array<u32>;     // packed per-row int, [out, in]
