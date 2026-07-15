@@ -35,6 +35,71 @@ impl E {
     fn bin(&self, op: &'static str, o: &E) -> E { E(Rc::new(Node::Bin(op, self.clone(), o.clone()))) }
 }
 
+/// Rebuild an expression with its input indices remapped (used when merging two lazy subgraphs).
+fn remap(e: &E, map: &[usize]) -> E {
+    match &*e.0 {
+        Node::Input(i) => E::input(map[*i]),
+        Node::Scalar(s) => E::scalar(*s),
+        Node::Un(op, a) => E(Rc::new(Node::Un(op, remap(a, map)))),
+        Node::Bin(op, a, b) => E(Rc::new(Node::Bin(op, remap(a, map), remap(b, map)))),
+    }
+}
+
+/// Whole-(elementwise)-graph fusion: build a chain of ops on tensors naturally and `eval()` compiles
+/// the ENTIRE accumulated subgraph into ONE kernel — inputs tracked and deduplicated automatically,
+/// no manual `E::input` bookkeeping. Non-elementwise ops (matmul, reductions) are fusion boundaries:
+/// `eval()` there and keep going.
+#[derive(Clone)]
+pub struct Lazy {
+    expr: E,
+    inputs: Vec<Tensor>,
+}
+
+impl Lazy {
+    /// Start a lazy subgraph from a materialized tensor.
+    pub fn of(t: &Tensor) -> Lazy { Lazy { expr: E::input(0), inputs: vec![t.clone()] } }
+    pub fn exp(&self) -> Lazy { self.un("exp") }
+    pub fn relu(&self) -> Lazy { self.un("relu") }
+    pub fn sigmoid(&self) -> Lazy { self.un("sigmoid") }
+    pub fn silu(&self) -> Lazy { self.un("silu") }
+    pub fn neg(&self) -> Lazy { self.un("neg") }
+    pub fn add(&self, o: &Lazy) -> Lazy { self.bin(o, "+") }
+    pub fn sub(&self, o: &Lazy) -> Lazy { self.bin(o, "-") }
+    pub fn mul(&self, o: &Lazy) -> Lazy { self.bin(o, "*") }
+    pub fn div(&self, o: &Lazy) -> Lazy { self.bin(o, "/") }
+    pub fn max(&self, o: &Lazy) -> Lazy { self.bin(o, "max") }
+    /// Scale by a constant, folded into the fused kernel (no extra tensor, no extra dispatch).
+    pub fn scale(&self, s: f32) -> Lazy {
+        Lazy { expr: E(Rc::new(Node::Bin("*", self.expr.clone(), E::scalar(s)))), inputs: self.inputs.clone() }
+    }
+    /// How many distinct input tensors this subgraph reads (must stay within the storage-buffer cap).
+    pub fn n_inputs(&self) -> usize { self.inputs.len() }
+
+    fn un(&self, op: &'static str) -> Lazy {
+        Lazy { expr: E(Rc::new(Node::Un(op, self.expr.clone()))), inputs: self.inputs.clone() }
+    }
+    fn bin(&self, o: &Lazy, op: &'static str) -> Lazy {
+        // merge input lists, deduplicating tensors that appear in both subgraphs
+        let mut inputs = self.inputs.clone();
+        let mut map = Vec::with_capacity(o.inputs.len());
+        for t in &o.inputs {
+            let ptr = std::sync::Arc::as_ptr(&t.buf);
+            match inputs.iter().position(|x| std::sync::Arc::as_ptr(&x.buf) == ptr) {
+                Some(pos) => map.push(pos),
+                None => { inputs.push(t.clone()); map.push(inputs.len() - 1); }
+            }
+        }
+        let rhs = remap(&o.expr, &map);
+        Lazy { expr: E(Rc::new(Node::Bin(op, self.expr.clone(), rhs))), inputs }
+    }
+
+    /// Compile the whole accumulated subgraph to a single kernel and run it.
+    pub fn eval(&self) -> Tensor {
+        let refs: Vec<&Tensor> = self.inputs.iter().collect();
+        eval(&refs, &self.expr)
+    }
+}
+
 /// Compile the expression to WGSL (SSA, CSE by node identity) → (shader source, input count).
 fn codegen(e: &E) -> (String, usize) {
     let mut body = String::new();

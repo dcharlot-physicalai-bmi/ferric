@@ -53,6 +53,23 @@ async fn run() {
     let d3 = maxdiff(&fe, &ce); ok &= d3 < 1e-5;
     println!("  {} fused silu(x·Wᵀ) (FFN gate) == linear+silu  max|Δ| = {:.2e}  [1 kernel vs 2]", if d3 < 1e-5 { "✅" } else { "❌" }, d3);
 
+
+    // ---- WHOLE-GRAPH fusion: build a long chain naturally; eval() fuses ALL of it into 1 kernel ----
+    use ferric_tensor::fuse::Lazy;
+    // silu(g)*u + relu(c)*0.5 - g  → 7 elementwise ops, 3 inputs, ONE dispatch (inputs auto-deduped:
+    // g appears twice but is a single binding)
+    let lz = Lazy::of(&g).silu().mul(&Lazy::of(&u))
+        .add(&Lazy::of(&c).relu().scale(0.5))
+        .sub(&Lazy::of(&g));
+    let fused_all = lz.eval().to_vec().await;
+    let eager = g.silu().mul(&u).add(&c.relu().mul(&c.scalar(0.5))).sub(&g).to_vec().await;
+    let dl = maxdiff(&fused_all, &eager); ok &= dl < 1e-5;
+    println!("  {} whole-graph: silu(g)·u + relu(c)·0.5 − g   max|Δ| = {:.2e}  [1 kernel vs 6, {} inputs]", if dl < 1e-5 { "✅" } else { "❌" }, dl, lz.n_inputs());
+    // timing the long chain
+    for _ in 0..3 { let _ = lz.eval().to_vec().await; }
+    let t2 = Instant::now(); for _ in 0..20 { let _ = lz.eval().to_vec().await; } let tfl = t2.elapsed().as_secs_f64()/20.0;
+    let t3 = Instant::now(); for _ in 0..20 { let _ = g.silu().mul(&u).add(&c.relu().mul(&c.scalar(0.5))).sub(&g).to_vec().await; } let tel = t3.elapsed().as_secs_f64()/20.0;
+    println!("  timing (1M, 6-op chain): fused {:.0}µs  vs  eager {:.0}µs  ({:.2}×)", tfl*1e6, tel*1e6, tel/tfl);
     println!("{}", if ok { "✅ Kernel fusion (runtime WGSL codegen) is exact — one dispatch, no intermediate buffers" } else { "❌ fusion mismatch" });
     assert!(ok);
 }
