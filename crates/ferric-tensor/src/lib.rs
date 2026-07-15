@@ -218,6 +218,24 @@ impl Tensor {
         run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
+    /// **Gated delta rule** — the linear-attention recurrence behind Qwen3-Next / Qwen3.5 (and so
+    /// PrismML Bonsai-27B, whose 64 layers are 75% linear attention). Per head, a recurrent state
+    /// `S [dk, dv]` evolves over the sequence:
+    ///   `S = S·gₜ` ; `Δ = (vₜ − kₜᵀS)·βₜ` ; `S += kₜ ⊗ Δ` ; `outₜ = qₜᵀS`
+    /// self = q [T,H,dk] (expected L2-normed and scaled), k [T,H,dk], v [T,H,dv], gb [T,H,2] = (g, β)
+    /// where the decay is `exp(g)`. Returns [T,H,dv]. One thread owns a column S[:,j] and walks T.
+    pub fn gated_delta_rule(&self, k: &Tensor, v: &Tensor, gb: &Tensor, h: usize, dk: usize, dv: usize) -> Tensor {
+        assert!(dk <= 128, "gated_delta_rule: head_k_dim ≤ 128");
+        let (q, k, v, gb) = (self.contiguous(), k.contiguous(), v.contiguous(), gb.contiguous());
+        let t = q.numel() / (h * dk);
+        let out = empty(&self.ctx, t * h * dv);
+        run(&self.ctx, GATED_DELTA_WGSL, "gdn",
+            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), gb.buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[t as u32, h as u32, dk as u32, dv as u32])],
+            groups(h * dv));
+        Tensor::from_parts(&self.ctx, out, vec![t, h, dv])
+    }
+
     /// 3D rotary position embedding (V-JEPA 2): head_dim split into 3 groups (temporal/height/width),
     /// each rotated by the token's coordinate along that axis. self is [T, n_heads·head_dim], T=gt·gh·gw.
     pub fn rope_3d(&self, n_heads: usize, head_dim: usize, base: f32, gt: usize, gh: usize, gw: usize) -> Tensor {
@@ -633,6 +651,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x1 = x[o + c]; let x2 = x[o + c + half];
         out[o + c] = x1 * cs - x2 * sn;
         out[o + c + half] = x2 * cs + x1 * sn;
+    }
+}
+"#;
+
+const GATED_DELTA_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        q:  array<f32>;   // [T,H,dk] (L2-normed, scaled)
+@group(0) @binding(1) var<storage,read>        k:  array<f32>;   // [T,H,dk] (L2-normed)
+@group(0) @binding(2) var<storage,read>        v:  array<f32>;   // [T,H,dv]
+@group(0) @binding(3) var<storage,read>        gb: array<f32>;   // [T,H,2] = (g, beta)
+@group(0) @binding(4) var<storage,read_write>  out: array<f32>;  // [T,H,dv]
+@group(0) @binding(5) var<storage,read>        info: array<u32>; // T,H,dk,dv
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let t_len = info[0]; let h = info[1]; let dk = info[2]; let dv = info[3];
+    if (idx >= h * dv) { return; }
+    let head = idx / dv; let j = idx % dv;   // this thread owns state column S[:, j]
+    var s: array<f32, 128>;
+    for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = 0.0; }
+    for (var t: u32 = 0u; t < t_len; t = t + 1u) {
+        let gbase = (t * h + head) * 2u;
+        let decay = exp(gb[gbase]);
+        let beta = gb[gbase + 1u];
+        let kb = (t * h + head) * dk;
+        // decay the state, and accumulate kv_mem = kᵀ·S[:,j] against the DECAYED state
+        var kv = 0.0;
+        for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = s[i] * decay; kv = kv + s[i] * k[kb + i]; }
+        let delta = (v[(t * h + head) * dv + j] - kv) * beta;
+        // rank-1 update S[:,j] += k·delta, then read out = qᵀ·S[:,j] from the UPDATED state
+        var o = 0.0;
+        for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = s[i] + k[kb + i] * delta; o = o + s[i] * q[kb + i]; }
+        out[(t * h + head) * dv + j] = o;
     }
 }
 "#;
