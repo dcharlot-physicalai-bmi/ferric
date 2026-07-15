@@ -65,19 +65,32 @@ Remaining: GGUF `TQ1_0`/`I2_S` ternary variants; true multi-chain SGLD via on-de
 4-bit HQQ **vision tower** (text path is done); and a KV/recurrent-state cache so Bonsai decodes
 incrementally instead of re-prefilling.
 
-**Speed, honestly.** Correctness is not yet competitive with speed. On the same M5 Max, Bonsai-27B:
+**Speed, honestly.** Correctness landed before speed. On the same M5 Max, Bonsai-27B:
 
-| | Ferric | llama.cpp (Metal) |
-|---|---|---|
-| load | 10 s | 0.25 s (mmap) |
-| prefill | ~500 ms/token | 15.6 ms/token |
-| decode | re-prefills (no cache) | 22 ms/token |
+| | Ferric (first run) | Ferric (now) | llama.cpp (Metal) |
+|---|---|---|---|
+| load | 10 s | 6 s | 0.25 s (mmap) |
+| prefill | ~500 ms/token | **270 ms/token** | 15.6 ms/token |
+| decode | re-prefills (no cache) | re-prefills (no cache) | 22 ms/token |
 
-That is ~32× off, and the causes are known rather than mysterious: `matmul_q2_0` is an untiled
-one-thread-per-output kernel, every op is its own dispatch (the fusion compiler isn't applied to this
-path yet), there's no KV/recurrent-state cache, and load re-uploads instead of mmap-ing. None of these
-is architectural — but until they're closed, the honest claim is **"Ferric runs Bonsai-27B correctly,"
-not "Ferric runs it well."**
+Still ~17× off (was ~32×), for known reasons: no KV/recurrent-state cache (so `--gen` re-prefills
+every step), every op is its own dispatch (the fusion compiler isn't applied to this path yet), and
+load re-uploads instead of mmap-ing. The honest claim remains **"Ferric runs Bonsai-27B correctly,"**
+not that it runs it as fast as llama.cpp.
+
+### What the Q2_0 matmul work actually taught (measured, not assumed)
+1. **The 34-byte block is hostile to a GPU.** `f16 d` + 32 code bytes isn't a multiple of 4, so a
+   shader can't address codes as `u32` and falls back to a byte-extract that re-reads the same word
+   once per weight. Repacking on upload into an aligned codes array + separate scales array (same
+   bytes, our choice of layout) lets the inner loop read 8 words per block instead of 128.
+2. **Benchmark methodology dominated the first conclusions.** Awaiting each rep measured
+   submit+fence+readback (~1 ms), not the kernel — it made every shape look like a flat ~2.3 ms and
+   hid all real differences. Dispatches are async; queue the reps and sync once.
+3. **The kernel selector is output count, not K depth.** Flat (one thread per output) starves at
+   decode-sized output counts; split-K (workgroup per output, 64× the threads) wins there by up to
+   2.6×, and *loses* by 1.6× at prefill where flat already saturates. Crossover ≈16K outputs.
+   Selecting per shape beats either kernel fixed: **1.35 s vs 2.21 s (flat) / 2.01 s (split-K)** on a
+   real 5-token forward, because one Bonsai layer mixes both regimes.
 
 ### Bonsai-27B: the two conventions that only the fork's source reveals
 The GGUF is written to match PrismML's llama.cpp fork, not the HF reference. Both of these produce

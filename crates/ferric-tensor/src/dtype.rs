@@ -243,23 +243,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// blocks directly, which is what `Tensor::matmul_q2_0` does.
 pub struct Q2_0Weights {
     ctx: Arc<Context>,
-    buf: Arc<wgpu::Buffer>,
+    codes: Arc<wgpu::Buffer>,  // 8 u32 per block — 16 two-bit codes per word, u32-aligned
+    scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
     pub rows: usize, // out features
     pub cols: usize, // in features (multiple of 128)
 }
 
 impl Q2_0Weights {
     /// Upload raw Q2_0 block bytes (as they appear in the GGUF) for an [out, in] weight.
+    ///
+    /// The on-disk block is `f16 d` + 32 code bytes = **34 bytes**, which is not a multiple of 4 —
+    /// so a shader can't address the codes as `u32` and is forced into a byte-extract that re-reads
+    /// the same word once per weight (16× the necessary traffic). Since the GPU-side layout is ours
+    /// to choose, split the blocks on upload into an aligned codes array and a separate scales
+    /// array. Identical bytes and identical math, but the inner loop reads 8 words per block instead
+    /// of 128.
     pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q2_0Weights {
         assert_eq!(cols % 128, 0, "Q2_0 rows must be a multiple of 128");
         assert_eq!(bytes.len(), rows * (cols / 128) * 34, "unexpected Q2_0 byte length");
-        let mut words: Vec<u32> = vec![0; bytes.len().div_ceil(4)];
-        for (i, &b) in bytes.iter().enumerate() { words[i / 4] |= (b as u32) << (8 * (i % 4)); }
-        let buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("q2_0"), contents: bytemuck::cast_slice(&words),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        });
-        Q2_0Weights { ctx: ctx.clone(), buf: Arc::new(buf), rows, cols }
+        let nblk = rows * (cols / 128);
+        let mut codes: Vec<u32> = vec![0; nblk * 8];
+        let mut scales: Vec<u32> = vec![0; nblk.div_ceil(2)];
+        for b in 0..nblk {
+            let src = &bytes[b * 34..b * 34 + 34];
+            let d = u16::from_le_bytes([src[0], src[1]]) as u32;
+            scales[b / 2] |= d << (16 * (b % 2));
+            for w in 0..8 {
+                let c = &src[2 + w * 4..2 + w * 4 + 4];
+                codes[b * 8 + w] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let mk = |label, data: &[u32]| {
+            Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label), contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            }))
+        };
+        Q2_0Weights { ctx: ctx.clone(), codes: mk("q2_0.codes", &codes), scales: mk("q2_0.scales", &scales), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 128) * 34 }
 }
@@ -272,36 +292,136 @@ impl Tensor {
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
-        run(&self.ctx, MATMUL_Q2_0_WGSL, "matmul_q2_0",
-            &[x.buf.as_ref(), w.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32])],
-            groups(rows * w.rows));
+        let n = rows * w.rows;
+        if q2_0_split_k(n) {
+            // One workgroup per output element, laid out 2D because rows·out overruns the 65535
+            // per-dimension cap (e.g. 5 tokens × 17408 outputs).
+            let grid_w = n.min(32768);
+            let grid_h = n.div_ceil(grid_w);
+            run(&self.ctx, MATMUL_Q2_0_SPLITK_WGSL, "matmul_q2_0_splitk",
+                &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, grid_w as u32])],
+                (grid_w as u32, grid_h as u32, 1));
+        } else {
+            run(&self.ctx, MATMUL_Q2_0_FLAT_WGSL, "matmul_q2_0_flat",
+                &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, 0])],
+                groups(n));
+        }
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
 }
 
-const MATMUL_Q2_0_WGSL: &str = r#"
-@group(0) @binding(0) var<storage,read>        x:  array<f32>;   // [rows, in]
-@group(0) @binding(1) var<storage,read>        qw: array<u32>;   // raw Q2_0 blocks (34 B each), byte-addressed
-@group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
-@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in
-fn gbyte(i: u32) -> u32 { return (qw[i >> 2u] >> (8u * (i & 3u))) & 0xffu; } // 34B blocks aren't u32-aligned
+/// Which `matmul_q2_0` kernel to use. The deciding factor is measured, and it is the number of
+/// *output elements* (`rows·out`) — not the K depth, as one might assume:
+///
+///   ffn_down 17408→5120, 1 token   flat 1.04 ms → split-K 0.40 ms   (2.6× faster)
+///   gdn qkv  5120→10240,  1 token   flat 0.64 ms → split-K 0.34 ms   (1.9× faster)
+///   gdn qkv  5120→10240,  5 tokens  flat 0.90 ms → split-K 1.46 ms   (1.6× slower)
+///
+/// Flat gives one thread per output, so a small output count (decode, one token) leaves the GPU
+/// starved and split-K's 64×-more-threads wins. Once the output count is large (prefill), flat
+/// already saturates and split-K's barriers are pure overhead. Crossover sits near 16K outputs.
+/// `FERRIC_Q2_0_KERNEL=flat|splitk` forces one, for benchmarking.
+fn q2_0_split_k(n_out: usize) -> bool {
+    match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
+        Ok("flat") => false,
+        Ok("splitk") => true,
+        _ => n_out < 16384,
+    }
+}
+
+/// One thread per output element, walking all of K itself. No barriers, but a long dependent
+/// accumulate chain and only `rows·out` threads in flight.
+const MATMUL_Q2_0_FLAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    let idx = gid.x; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
     if (idx >= rows * o_dim) { return; }
     let o = idx % o_dim; let r = idx / o_dim;
     let nblk = in_dim / 128u;
     var acc = 0.0;
     for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
-        let base = (o * nblk + blk) * 34u;
-        let dbits = gbyte(base) | (gbyte(base + 1u) << 8u);      // f16 scale for this 128-group
-        let d = unpack2x16float(dbits).x;
-        for (var jj: u32 = 0u; jj < 128u; jj = jj + 1u) {
-            let code = (gbyte(base + 2u + (jj >> 2u)) >> (2u * (jj & 3u))) & 3u; // 4 codes per byte
-            acc = acc + x[r * in_dim + blk * 128u + jj] * f32(i32(code) - 1) * d; // w = (q−1)·d
+        let bi = o * nblk + blk;
+        let sw = unpack2x16float(scales[bi >> 1u]);
+        let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+        let cbase = bi * 8u;
+        let xbase = r * in_dim + blk * 128u;
+        var bacc = 0.0;
+        for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+            let word = codes[cbase + w];
+            let xb = xbase + w * 16u;
+            for (var b: u32 = 0u; b < 16u; b = b + 1u) {
+                bacc = bacc + x[xb + b] * f32(i32((word >> (2u * b)) & 3u) - 1);
+            }
         }
+        acc = acc + bacc * d;
     }
     out[idx] = acc;
+}
+"#;
+
+// **Split-K**: one workgroup per output element, its 64 threads splitting the K reduction and
+// combining through shared memory. The obvious one-thread-per-output shape leaves each thread
+// walking a 5120-long dependent accumulate chain, and with only `rows·out` threads there isn't
+// enough work in flight to hide memory latency — measurably so: 1-token and 5-token matmuls took
+// the *same* wall time, which is the signature of a latency-bound kernel, not a bandwidth-bound
+// one. Splitting K gives 64× the parallelism and shortens each chain by 64×, and it makes adjacent
+// threads read adjacent code words instead of rows 1360 B apart.
+const MATMUL_Q2_0_SPLITK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;  // [rows, in]
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;  // 8 u32/block, 16 codes per word
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;  // f16/block, 2 packed per u32
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;  // [rows, out]
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, grid_w
+
+var<workgroup> partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    // 2D grid: rows·out exceeds the 65535 per-dimension workgroup cap at real shapes.
+    let idx = wg.x + wg.y * info.w;
+    let t = lid.x;
+    let n = rows * o_dim;
+    // Uniform across the workgroup (depends only on workgroup_id), so the barriers below stay in
+    // uniform control flow.
+    if (idx < n) {
+        let o = idx % o_dim; let r = idx / o_dim;
+        let nblk = in_dim / 128u;
+        var acc = 0.0;
+        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+            let bi = o * nblk + blk;
+            let sw = unpack2x16float(scales[bi >> 1u]);
+            let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+            let cbase = bi * 8u;
+            let xbase = r * in_dim + blk * 128u;
+            // Sum the ternary-weighted x first, then apply the block scale once (it's constant over
+            // the 128-group) — 1 multiply per block instead of 128.
+            var bacc = 0.0;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cbase + w];   // one load feeds 16 weights
+                let xb = xbase + w * 16u;
+                for (var b: u32 = 0u; b < 16u; b = b + 1u) {
+                    let code = (word >> (2u * b)) & 3u;
+                    bacc = bacc + x[xb + b] * f32(i32(code) - 1);   // w = (q−1)·d
+                }
+            }
+            acc = acc + bacc * d;
+        }
+        partial[t] = acc;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+            if (t < s) { partial[t] = partial[t] + partial[t + s]; }
+            workgroupBarrier();
+        }
+        if (t == 0u) { out[idx] = partial[0]; }
+    }
 }
 "#;
 
