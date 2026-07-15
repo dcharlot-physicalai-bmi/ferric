@@ -128,6 +128,18 @@ impl Tensor {
         Tensor { ctx: self.ctx.clone(), buf: self.buf.clone(), shape: shape.to_vec(), strides, offset: self.offset }
     }
 
+    /// Zero-copy slice along `dim`: rows/cols [start, start+len). A strided view — no copy until an
+    /// op materializes it. This is how interleaved projections (e.g. Qwen3.5's fused qkvz) get split.
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Tensor {
+        assert!(start + len <= self.shape[dim], "narrow {start}+{len} out of range for dim {dim} ({})", self.shape[dim]);
+        let mut shape = self.shape.clone();
+        shape[dim] = len;
+        Tensor {
+            ctx: self.ctx.clone(), buf: self.buf.clone(), shape,
+            strides: self.strides.clone(), offset: self.offset + start * self.strides[dim],
+        }
+    }
+
     /// Materialize a (possibly strided/broadcast) view into a fresh contiguous buffer.
     pub fn contiguous(&self) -> Tensor {
         if self.is_contiguous() {
@@ -182,6 +194,7 @@ impl Tensor {
     pub fn gelu(&self) -> Tensor { self.unary(8) }
     pub fn log(&self) -> Tensor { self.unary(9) }
     pub fn relu2(&self) -> Tensor { self.unary(10) } // ReLU² (BitNet FFN)
+    pub fn softplus(&self) -> Tensor { self.unary(11) } // log(1+eˣ) — Qwen3.5 gate
     pub fn scalar(&self, s: f32) -> Tensor { Tensor::from_vec(&self.ctx, &[s], &[1]) }
 
     // ---- fused transformer fast-paths (same result as composing primitives, fewer dispatches) ----
@@ -554,6 +567,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         case 9u: { r = log(v); }
         case 10u: { let z = max(v, 0.0); r = z * z; } // ReLU² (BitNet FFN)
+        case 11u: { r = max(v, 0.0) + log(1.0 + exp(-abs(v))); } // softplus (stable)
         default: { r = v; }
     }
     out[i] = r;
