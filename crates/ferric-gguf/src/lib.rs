@@ -35,36 +35,59 @@ pub struct Gguf {
     data_start: usize,
 }
 
-struct Cur<'a> { b: &'a [u8], p: usize }
+/// Bounds-safe cursor: any read past the end sets `ok = false` and yields a zero value rather than
+/// panicking. That makes `parse` total over arbitrary bytes — it rejects malformed files, and lets
+/// `GgufFile` probe a truncated *prefix* to discover how large the header is.
+struct Cur<'a> { b: &'a [u8], p: usize, ok: bool }
 impl<'a> Cur<'a> {
-    fn u32(&mut self) -> u32 { let v = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap()); self.p += 4; v }
-    fn u64(&mut self) -> u64 { let v = u64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap()); self.p += 8; v }
+    fn take(&mut self, k: usize) -> Option<&'a [u8]> {
+        if !self.ok || self.p + k > self.b.len() { self.ok = false; return None; }
+        let s = &self.b[self.p..self.p + k];
+        self.p += k;
+        Some(s)
+    }
+    fn u32(&mut self) -> u32 { self.take(4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap())) }
+    fn u64(&mut self) -> u64 { self.take(8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap())) }
+    fn u16(&mut self) -> u16 { self.take(2).map_or(0, |s| u16::from_le_bytes(s.try_into().unwrap())) }
     fn i64(&mut self) -> i64 { self.u64() as i64 }
     fn f32(&mut self) -> f32 { f32::from_bits(self.u32()) }
     fn f64(&mut self) -> f64 { f64::from_bits(self.u64()) }
-    fn u8(&mut self) -> u8 { let v = self.b[self.p]; self.p += 1; v }
-    fn str(&mut self) -> String { let n = self.u64() as usize; let s = String::from_utf8_lossy(&self.b[self.p..self.p + n]).into_owned(); self.p += n; s }
+    fn u8(&mut self) -> u8 { self.take(1).map_or(0, |s| s[0]) }
+    fn str(&mut self) -> String {
+        let n = self.u64() as usize;
+        // Guard before allocating: a garbage length must not turn into a huge reservation.
+        if n > self.b.len().saturating_sub(self.p) { self.ok = false; return String::new(); }
+        self.take(n).map_or(String::new(), |s| String::from_utf8_lossy(s).into_owned())
+    }
     fn val(&mut self, ty: u32) -> Meta {
         match ty {
             0 => Meta::U(self.u8() as u64),
             1 => Meta::I(self.u8() as i8 as i64),
-            2 => { let v = u16::from_le_bytes([self.b[self.p], self.b[self.p + 1]]) as u64; self.p += 2; Meta::U(v) }
-            3 => { let v = i16::from_le_bytes([self.b[self.p], self.b[self.p + 1]]) as i64; self.p += 2; Meta::I(v) }
+            2 => Meta::U(self.u16() as u64),
+            3 => Meta::I(self.u16() as i16 as i64),
             4 => Meta::U(self.u32() as u64),
             5 => Meta::I(self.u32() as i32 as i64),
             6 => Meta::F(self.f32() as f64),
             7 => Meta::Bool(self.u8() != 0),
             8 => Meta::Str(self.str()),
-            9 => { let et = self.u32(); let n = self.u64(); Meta::Arr((0..n).map(|_| self.val(et)).collect()) }
+            9 => {
+                let et = self.u32();
+                let n = self.u64();
+                // Each element costs ≥1 byte on disk, so a count beyond the remaining bytes is garbage.
+                if n as usize > self.b.len().saturating_sub(self.p) { self.ok = false; return Meta::Arr(Vec::new()); }
+                let mut v = Vec::new();
+                for _ in 0..n { if !self.ok { break; } v.push(self.val(et)); }
+                Meta::Arr(v)
+            }
             10 => Meta::U(self.u64()),
             11 => Meta::I(self.i64()),
             12 => Meta::F(self.f64()),
-            _ => Meta::U(0),
+            _ => { self.ok = false; Meta::U(0) }
         }
     }
 }
 pub fn parse(bytes: Vec<u8>) -> Result<Gguf, String> {
-    let mut c = Cur { b: &bytes, p: 0 };
+    let mut c = Cur { b: &bytes, p: 0, ok: true };
     if c.u32() != u32::from_le_bytes(*b"GGUF") { return Err("not a GGUF file".into()); }
     let _ver = c.u32();
     let n_tensors = c.u64();
@@ -84,6 +107,7 @@ pub fn parse(bytes: Vec<u8>) -> Result<Gguf, String> {
         let offset = c.u64();
         tensors.push(TensorInfo { name, dims, ggml_type, offset });
     }
+    if !c.ok { return Err("GGUF header truncated or malformed".into()); }
     let align = match metadata.get("general.alignment") { Some(Meta::U(a)) => *a as usize, _ => 32 };
     let data_start = c.p.div_ceil(align) * align;
     Ok(Gguf { metadata, tensors, data: bytes, data_start })
@@ -96,19 +120,108 @@ impl Gguf {
     pub fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
         let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
         let n: usize = t.dims.iter().product::<u64>() as usize;
-        let raw = &self.data[self.data_start + t.offset as usize..];
-        Ok(match t.ggml_type {
-            F32 => raw[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-            F16T => raw[..n * 2].chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
-            Q8_0 => deq_q8_0(raw, n),
-            Q4_0 => deq_q4_0(raw, n),
-            Q4_K => deq_q4_k(raw, n),
-            TQ2_0 => deq_tq2_0(raw, n),
-            Q1_0 => deq_q1_0(raw, n),
-            Q2_0 => deq_q2_0(raw, n),
-            other => return Err(format!("unsupported ggml type {other}")),
-        })
+        deq_raw(&self.data[self.data_start + t.offset as usize..], n, t.ggml_type)
     }
+}
+
+/// On-disk byte size of `n` elements stored as ggml type `ty`.
+pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
+    Ok(match ty {
+        F32 => n * 4,
+        F16T => n * 2,
+        Q8_0 => n / 32 * 34,
+        Q4_0 => n / 32 * 18,
+        Q4_K => n / 256 * 144,
+        TQ2_0 => n / 256 * 66,
+        Q1_0 => n / 128 * 18,
+        Q2_0 => n / 128 * 34,
+        other => return Err(format!("unsupported ggml type {other}")),
+    })
+}
+
+/// Dequantize `n` elements of ggml type `ty` out of a raw byte slice.
+pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
+    Ok(match ty {
+        F32 => raw[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+        F16T => raw[..n * 2].chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
+        Q8_0 => deq_q8_0(raw, n),
+        Q4_0 => deq_q4_0(raw, n),
+        Q4_K => deq_q4_k(raw, n),
+        TQ2_0 => deq_tq2_0(raw, n),
+        Q1_0 => deq_q1_0(raw, n),
+        Q2_0 => deq_q2_0(raw, n),
+        other => return Err(format!("unsupported ggml type {other}")),
+    })
+}
+
+/// **Lazy, file-backed GGUF** — parses the header from a bounded prefix read, then pulls each
+/// tensor's bytes on demand. A 27B ternary checkpoint is 7 GB on disk; this keeps exactly one
+/// tensor in host RAM at a time so peak memory is the largest tensor, not the whole file.
+pub struct GgufFile {
+    pub metadata: HashMap<String, Meta>,
+    pub tensors: Vec<TensorInfo>,
+    f: std::cell::RefCell<std::fs::File>,
+    data_start: u64,
+}
+
+impl GgufFile {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<GgufFile, String> {
+        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
+        // Header = magic + metadata (which includes the tokenizer vocab, often megabytes) + tensor
+        // infos. Its size isn't known up front, so read a prefix and grow until it parses.
+        let mut cap = (8usize << 20).min(len);
+        loop {
+            let mut buf = vec![0u8; cap];
+            let n = read_prefix(&mut f, &mut buf)?;
+            buf.truncate(n);
+            match parse(buf) {
+                Ok(g) => return Ok(GgufFile {
+                    metadata: g.metadata, tensors: g.tensors,
+                    data_start: g.data_start as u64, f: std::cell::RefCell::new(f),
+                }),
+                Err(e) => {
+                    if cap >= len { return Err(e); }
+                    cap = (cap * 4).min(len);
+                }
+            }
+        }
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
+
+    /// The tensor's raw on-disk bytes — packed, exactly as stored (feed straight to a native
+    /// quantized matmul so the weights never round-trip through f32).
+    pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
+        let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        let n: usize = t.dims.iter().product::<u64>() as usize;
+        let sz = type_size(t.ggml_type, n)?;
+        let mut buf = vec![0u8; sz];
+        read_at(&mut self.f.borrow_mut(), self.data_start + t.offset, &mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
+        let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        let n: usize = t.dims.iter().product::<u64>() as usize;
+        deq_raw(&self.raw(name)?, n, t.ggml_type)
+    }
+}
+
+fn read_prefix(f: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut got = 0;
+    while got < buf.len() {
+        match f.read(&mut buf[got..]).map_err(|e| e.to_string())? { 0 => break, k => got += k }
+    }
+    Ok(got)
+}
+
+fn read_at(f: &mut std::fs::File, off: u64, buf: &mut [u8]) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+    f.read_exact(buf).map_err(|e| e.to_string())
 }
 
 fn rd_f16(b: &[u8]) -> f32 { f16::from_le_bytes([b[0], b[1]]).to_f32() }

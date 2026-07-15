@@ -140,6 +140,27 @@ impl Tensor {
         }
     }
 
+    /// Concatenate two tensors along `dim`. Both may be strided views (no pre-materialization).
+    /// Output-indexed: each thread decides which side it reads from, so this stays within the
+    /// WebGPU baseline 4-storage-buffer limit. `cat_all` folds a slice of tensors through this.
+    pub fn cat(&self, other: &Tensor, dim: usize) -> Tensor {
+        assert_eq!(self.rank(), other.rank(), "cat: rank mismatch");
+        for d in 0..self.rank() {
+            if d != dim { assert_eq!(self.shape[d], other.shape[d], "cat: dim {d} mismatch {:?} vs {:?}", self.shape, other.shape); }
+        }
+        let mut shape = self.shape.clone();
+        shape[dim] += other.shape[dim];
+        let n = numel(&shape);
+        let out = empty(&self.ctx, n);
+        // info: [rank, dim, n, offA, offB, aDim, shape[r], aStr[r], bStr[r]]
+        let mut info = vec![self.rank() as u32, dim as u32, n as u32, self.offset as u32, other.offset as u32, self.shape[dim] as u32];
+        info.extend(shape.iter().map(|&x| x as u32));
+        info.extend(self.strides.iter().map(|&x| x as u32));
+        info.extend(other.strides.iter().map(|&x| x as u32));
+        run(&self.ctx, CAT_WGSL, "cat", &[&self.buf, &other.buf, &out, &u32buf(&self.ctx, &info)], groups(n));
+        Tensor::from_parts(&self.ctx, out, shape)
+    }
+
     /// Materialize a (possibly strided/broadcast) view into a fresh contiguous buffer.
     pub fn contiguous(&self) -> Tensor {
         if self.is_contiguous() {
@@ -223,6 +244,18 @@ impl Tensor {
         run(&self.ctx, RMSNORM_WGSL, "rmsnorm", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
+    /// L2 normalize over the last dim: `x / max(√Σx², eps)`. Distinct from RMSNorm — no mean, no
+    /// learned weight, and eps clamps the divisor rather than being added under the root. This is
+    /// what Qwen3.5 / Bonsai applies to the gated-delta-net q and k.
+    pub fn l2norm(&self, eps: f32) -> Tensor {
+        let c = self.contiguous();
+        let d = *c.shape.last().unwrap();
+        let rows = c.numel() / d;
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, L2NORM_WGSL, "l2norm", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     /// Rotary position embedding (NeoX rotate-half) on a [T, n_heads·head_dim] tensor.
     pub fn rope(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
         let c = self.contiguous();
@@ -511,6 +544,33 @@ async fn readback(ctx: &Context, buf: &wgpu::Buffer, n: usize) -> Vec<f32> {
 
 // ---------- general kernels ----------
 // row-major decode of a linear output index into per-input strided offsets.
+const CAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        a: array<f32>;
+@group(0) @binding(1) var<storage,read>        b: array<f32>;
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rank,dim,n,offA,offB,aDim,shape[r],aStr[r],bStr[r]
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; let rank = info[0]; let dim = info[1]; let n = info[2]; let aDim = info[5];
+    if (i >= n) { return; }
+    // decompose i over the OUTPUT shape, then route each thread to whichever side owns its slot
+    var rem = i; var from_a = true; var idx_at_dim: u32 = 0u;
+    var coord = array<u32, 8>();
+    for (var dd: u32 = 0u; dd < rank; dd = dd + 1u) {
+        let d = rank - 1u - dd;
+        let sz = info[6u + d];
+        coord[d] = rem % sz; rem = rem / sz;
+    }
+    idx_at_dim = coord[dim];
+    from_a = idx_at_dim < aDim;
+    if (!from_a) { coord[dim] = idx_at_dim - aDim; }
+    let stride_base = select(6u + 2u * rank, 6u + rank, from_a);
+    var src = select(info[4], info[3], from_a);
+    for (var d: u32 = 0u; d < rank; d = d + 1u) { src = src + coord[d] * info[stride_base + d]; }
+    out[i] = select(b[src], a[src], from_a);
+}
+"#;
+
 const BINARY_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;
 @group(0) @binding(1) var<storage,read>        b: array<f32>;
@@ -646,6 +706,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = ms + v * v; }
     let inv = 1.0 / sqrt(ms / f32(d) + eps);
     for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv * weight[j]; }
+}
+"#;
+
+const L2NORM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    if (row >= rows) { return; }
+    let base = row * d;
+    var ss = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ss = ss + v * v; }
+    let inv = 1.0 / max(sqrt(ss), eps);   // eps clamps the divisor (not added under the root)
+    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv; }
 }
 "#;
 

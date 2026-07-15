@@ -81,3 +81,5 @@ impl Llama {
         ctx.to_vec(&logits).await
     }
 }
+
+pub mod qwen35;

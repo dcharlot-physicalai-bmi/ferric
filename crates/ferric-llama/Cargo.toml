@@ -14,6 +14,8 @@ exclude = ["testdata/"]
 [dependencies]
 ferric-core = { path = "../ferric-core", version = "0.1" }
 ferric-load = { path = "../ferric-load", version = "0.1" }
+ferric-tensor = { path = "../ferric-tensor", version = "0.1" }
+ferric-gguf = { path = "../ferric-gguf", version = "0.1" }
 
 [dev-dependencies]
 pollster = "1.0.1"

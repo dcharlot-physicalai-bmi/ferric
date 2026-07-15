@@ -36,6 +36,24 @@ async fn run() {
     let spref: Vec<f32> = z.iter().map(|&v| v.max(0.0) + (1.0 + (-v.abs()).exp()).ln()).collect();
     let es = maxdiff(&sp, &spref); ok &= es < 1e-6;
     println!("  {} softplus vs CPU · max|Δ| = {es:.1e}", if es < 1e-6 { "✅" } else { "❌" });
-    println!("{}", if ok { "✅ narrow + softplus — the Qwen3.5/Bonsai GDN layer's remaining primitives" } else { "❌ failed" });
+    // l2norm vs CPU, matching ggml's exact form: x / max(√Σx², eps) — eps clamps the divisor and
+    // is NOT added under the root (that's RMSNorm's shape), and there's no mean and no weight.
+    let (rows, dd) = (5usize, 16usize);
+    let ld = seq(rows * dd, 3.0);
+    let ln = Tensor::from_vec(&ctx, &ld, &[rows, dd]).l2norm(1e-6).to_vec().await;
+    let mut lref = vec![0.0f32; rows * dd];
+    for r in 0..rows {
+        let ss: f32 = ld[r * dd..(r + 1) * dd].iter().map(|v| v * v).sum();
+        let inv = 1.0 / ss.sqrt().max(1e-6);
+        for j in 0..dd { lref[r * dd + j] = ld[r * dd + j] * inv; }
+    }
+    let el = maxdiff(&ln, &lref); ok &= el < 1e-6;
+    println!("  {} l2norm vs CPU (ggml form: x/max(√Σx²,eps)) · max|Δ| = {el:.1e}", if el < 1e-6 { "✅" } else { "❌" });
+    // and the property that defines it: each row ends up unit-norm
+    let unit = (0..rows).map(|r| (ln[r * dd..(r + 1) * dd].iter().map(|v| v * v).sum::<f32>().sqrt() - 1.0).abs()).fold(0.0f32, f32::max);
+    ok &= unit < 1e-5;
+    println!("  {} l2norm rows are unit-norm · max|‖row‖−1| = {unit:.1e}", if unit < 1e-5 { "✅" } else { "❌" });
+
+    println!("{}", if ok { "✅ narrow + softplus + l2norm — the Qwen3.5/Bonsai GDN layer's remaining primitives" } else { "❌ failed" });
     assert!(ok);
 }
