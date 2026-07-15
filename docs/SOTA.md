@@ -61,26 +61,26 @@ the same would have covered one family, not two.
 | Liquid LFM2-350M | 350M | transformers | 4.7e-6 |
 | **PrismML Ternary Bonsai-27B** | **27B** | **their llama.cpp fork** | **7.8e-4** |
 
-Remaining: GGUF `TQ1_0`/`I2_S` ternary variants; true multi-chain SGLD via on-device RNG; Bonsai's
-4-bit HQQ **vision tower** (text path is done); and a KV/recurrent-state cache so Bonsai decodes
-incrementally instead of re-prefilling.
+Remaining: GGUF `TQ1_0`/`I2_S` ternary variants; true multi-chain SGLD via on-device RNG; and
+Bonsai's 4-bit HQQ **vision tower** (the text path is done).
 
 **Speed, honestly.** Correctness landed before speed. On the same M5 Max, Bonsai-27B:
 
 | | Ferric (first run) | Ferric (now) | llama.cpp (Metal) |
 |---|---|---|---|
 | load | 10 s | 6 s | 0.25 s (mmap) |
-| prefill | ~500 ms/token | **270 ms/token** | 15.6 ms/token |
-| decode | re-prefills (no cache) | re-prefills (no cache) | 22 ms/token |
+| prefill (5 tok) | 2.5 s | **1.35 s** | 0.08 s |
+| decode | re-prefilled (17.3 s / 12 tok) | **cached — 3.8 s / 12 tok** | 0.26 s / 12 tok |
 
-Still ~17× off (was ~32×), for known reasons: no KV/recurrent-state cache (so `--gen` re-prefills
-every step), every op is its own dispatch (the fusion compiler isn't applied to this path yet), and
-load re-uploads instead of mmap-ing. The honest claim remains **"Ferric runs Bonsai-27B correctly,"**
-not that it runs it as fast as llama.cpp.
+Decode is ~290 ms/token against llama.cpp's 22 ms — still ~13× off (was ~32×). The remaining causes
+are known: every op is its own dispatch (the fusion compiler isn't applied to this path yet), the KV
+cache re-concatenates rather than writing into a reserved buffer, and load re-uploads instead of
+mmap-ing. The honest claim stays **"Ferric runs Bonsai-27B correctly,"** not that it matches
+llama.cpp's speed.
 
-### What the Q2_0 matmul work actually taught (measured, not assumed)
-1. **The 34-byte block is hostile to a GPU.** `f16 d` + 32 code bytes isn't a multiple of 4, so a
-   shader can't address codes as `u32` and falls back to a byte-extract that re-reads the same word
+### What the perf work actually taught (measured, not assumed)
+1. **The 34-byte Q2_0 block is hostile to a GPU.** `f16 d` + 32 code bytes isn't a multiple of 4, so
+   a shader can't address codes as `u32` and falls back to a byte-extract that re-reads the same word
    once per weight. Repacking on upload into an aligned codes array + separate scales array (same
    bytes, our choice of layout) lets the inner loop read 8 words per block instead of 128.
 2. **Benchmark methodology dominated the first conclusions.** Awaiting each rep measured
@@ -89,20 +89,19 @@ not that it runs it as fast as llama.cpp.
 3. **The kernel selector is output count, not K depth.** Flat (one thread per output) starves at
    decode-sized output counts; split-K (workgroup per output, 64× the threads) wins there by up to
    2.6×, and *loses* by 1.6× at prefill where flat already saturates. Crossover ≈16K outputs.
-   Selecting per shape beats either kernel fixed: **1.35 s vs 2.21 s (flat) / 2.01 s (split-K)** on a
-   real 5-token forward, because one Bonsai layer mixes both regimes.
+   Selecting per shape beats either kernel fixed: **1.35 s vs 2.21 s (flat) / 2.01 s (split-K)**.
+4. **A 1D dispatch grid caps at 65535 workgroups = 4.19M threads** — which a real LM head passes at
+   17 tokens (17 × 248320 = 4.22M). This was latent in `groups(n)` from the start and only surfaced
+   once generation ran long enough; big-vocab models hit it early.
 
-### Bonsai-27B: the two conventions that only the fork's source reveals
-The GGUF is written to match PrismML's llama.cpp fork, not the HF reference. Both of these produce
-plausible-looking but wrong numbers if assumed from the HF model code:
-1. **`ssm_a` is stored already as `-exp(A_log)`** → the decay gate is a plain multiply.
-2. **V/Z/beta/alpha/conv-V/out_proj heads are pre-permuted to *tiled* order**, because ggml
-   broadcasts q/k across v heads with `head % n_k_heads`. HF keeps grouped order and uses
-   `repeat_interleave`. Loading GGUF weights therefore *requires* the tiled broadcast.
+### The cache: state carry is the whole game
+Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
+state **and** the short conv's receptive field — a lone token can't be convolved, so the carried tail
+is prepended (which doubles as the causal zero-padding a fresh sequence needs). The correctness bar
+is equivalence, and it's asserted two ways: `gdn_state` shows the recurrence carries **bit-exactly**
+(0.0e0) across every split, and `run_bonsai --verify-cache` requires cached decode to emit token ids
+identical to re-prefilling — currently 12/12 identical at 4.5× the speed.
 
-Text-only inference is exact under standard partial RoPE: the checkpoint uses interleaved MRoPE
-(sections `[11,11,10,0]`), but for text all position components are equal, so MRoPE collapses to
-ordinary RoPE over the first 64 of each head's 256 dims.
 
 ## Device coverage — CPU / GPU / NPU (honest)
 `sched::detect_devices()` + `examples/devices.rs` enumerate and use everything present:
