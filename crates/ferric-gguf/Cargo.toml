@@ -14,4 +14,5 @@ categories = ["parser-implementations", "science"]
 half = "2"
 
 [dev-dependencies]
+half = "2"
 pollster = "1.0.1"

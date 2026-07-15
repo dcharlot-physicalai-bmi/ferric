@@ -1,7 +1,7 @@
 //! Validates the GGUF reader end-to-end: builds a synthetic GGUF in memory (metadata + F32/Q8_0/Q4_0
 //! tensors), parses it, and dequantizes each back within quantization tolerance. Then validates the
 //! Q4_K (k-quant) super-block dequant formula against a hand-constructed block with known values.
-use ferric_gguf::{parse, quant_q4_0, quant_q8_0, quant_tq2_0, Meta};
+use ferric_gguf::{parse, quant_q1_0, quant_q2_0, quant_q4_0, quant_q8_0, quant_tq2_0, Meta};
 use half::f16;
 
 fn w_str(o: &mut Vec<u8>, s: &str) { o.extend_from_slice(&(s.len() as u64).to_le_bytes()); o.extend_from_slice(s.as_bytes()); }
@@ -104,6 +104,39 @@ fn main() {
     ok &= tqok;
     println!("  {} TQ2_0 ternary (BitNet) block dequant (256 vals)", if tqok { "✅" } else { "❌" });
 
-    println!("{}", if ok { "✅ GGUF reader: parses the container + dequantizes F32/Q8_0/Q4_0/Q4_K/TQ2_0 — the llama.cpp/HF corpus (incl. BitNet ternary) loads" } else { "❌ gguf failed" });
+
+    // ---- PrismML Bonsai formats: Q1_0 (1-bit) + Q2_0 (ternary), group-128 ----
+    let px: Vec<f32> = (0..256).map(|i| ((i as f32 * 0.11).sin()) * 2.0).collect();
+    for (name, ty, data, blkb) in [
+        ("Q1_0", 41u32, quant_q1_0(&px), 18usize),
+        ("Q2_0", 42u32, quant_q2_0(&px), 34usize),
+    ] {
+        let mut o = Vec::new();
+        o.extend_from_slice(b"GGUF"); o.extend_from_slice(&3u32.to_le_bytes());
+        o.extend_from_slice(&1u64.to_le_bytes()); o.extend_from_slice(&0u64.to_le_bytes());
+        w_str(&mut o, "w"); o.extend_from_slice(&1u32.to_le_bytes()); o.extend_from_slice(&256u64.to_le_bytes());
+        o.extend_from_slice(&ty.to_le_bytes()); o.extend_from_slice(&0u64.to_le_bytes());
+        while o.len() % 32 != 0 { o.push(0); }
+        o.extend_from_slice(&data);
+        let gp = parse(o).unwrap();
+        let got = gp.dequant("w").unwrap();
+        // expected per the published spec
+        let mut exp = vec![0.0f32; 256];
+        for b in 0..2 {
+            let blk = &px[b*128..(b+1)*128];
+            if ty == 41 { // 1-bit: d = mean|x|, value = sign(x)>=0 ? +d : -d
+                let d = half::f16::from_f32(blk.iter().map(|v| v.abs()).sum::<f32>() / 128.0).to_f32();
+                for j in 0..128 { exp[b*128+j] = if blk[j] >= 0.0 { d } else { -d }; }
+            } else { // ternary: d = amax, value = clamp(round(x/d),-1,2)*d
+                let d = half::f16::from_f32(blk.iter().fold(0.0f32, |a,&v| a.max(v.abs()))).to_f32();
+                for j in 0..128 { exp[b*128+j] = ((blk[j]/d).round() as i32).clamp(-1,2) as f32 * d; }
+            }
+        }
+        let e = got.iter().zip(&exp).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+        let pass = e < 1e-3; ok &= pass;
+        let bpw = blkb as f32 * 8.0 / 128.0;
+        println!("  {} PrismML {name} block dequant (256 vals, {bpw:.3} bpw) max|Δ| = {e:.1e}", if pass { "✅" } else { "❌" });
+    }
+    println!("{}", if ok { "✅ GGUF reader: F32/F16/Q8_0/Q4_0/Q4_K/TQ2_0 + PrismML Q1_0 (1-bit) & Q2_0 (ternary) — the llama.cpp/HF corpus incl. BitNet and PrismML Bonsai loads" } else { "❌ gguf failed" });
     assert!(ok);
 }

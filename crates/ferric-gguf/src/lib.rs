@@ -14,6 +14,8 @@ const Q4_0: u32 = 2;
 const Q8_0: u32 = 8;
 const Q4_K: u32 = 12;
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
+const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
+const Q2_0: u32 = 42; // PrismML ternary: {−1,0,+1}·scale, group-128 (2.125 bpw on disk)
 
 #[derive(Debug, Clone)]
 pub enum Meta { U(u64), I(i64), F(f64), Bool(bool), Str(String), Arr(Vec<Meta>) }
@@ -102,6 +104,8 @@ impl Gguf {
             Q4_0 => deq_q4_0(raw, n),
             Q4_K => deq_q4_k(raw, n),
             TQ2_0 => deq_tq2_0(raw, n),
+            Q1_0 => deq_q1_0(raw, n),
+            Q2_0 => deq_q2_0(raw, n),
             other => return Err(format!("unsupported ggml type {other}")),
         })
     }
@@ -183,6 +187,66 @@ fn deq_tq2_0(raw: &[u8], n: usize) -> Vec<f32> {
                 }
             }
         }
+    }
+    out
+}
+
+/// **Q1_0** — PrismML "Bonsai" 1-bit (also mainline llama.cpp type 41). 128-value block = `f16 d`
+/// then `qs[16]`; element j → byte j/8, bit j%8 (LSB-first); value = bit ? +d : −d. 1.125 bpw.
+fn deq_q1_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(18).take(n / 128).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        for j in 0..128 {
+            let bit = (blk[2 + j / 8] >> (j % 8)) & 1;
+            out[bi * 128 + j] = if bit == 1 { d } else { -d };
+        }
+    }
+    out
+}
+
+/// **Q2_0** — PrismML "Ternary Bonsai" (group-128). 128-value block = `f16 d` then `qs[32]`;
+/// element j → byte j/4, bits (j%4)*2 (LSB-first, 4/byte); value = (q−1)·d, q ∈ {0..3}
+/// (q=3 → +2d is reserved/unused for ternary, but decode the arithmetic form). 2.125 bpw on disk.
+fn deq_q2_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(34).take(n / 128).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        for j in 0..128 {
+            let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 3) as i32;
+            out[bi * 128 + j] = (q - 1) as f32 * d;
+        }
+    }
+    out
+}
+
+/// Quantize to Q1_0 (PrismML 1-bit): d = mean(|x|) over the 128-group; bit = sign(x) ≥ 0.
+pub fn quant_q1_0(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in x.chunks(128) {
+        let d = blk.iter().map(|v| v.abs()).sum::<f32>() / 128.0;
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        let mut qs = [0u8; 16];
+        for (j, &v) in blk.iter().enumerate() {
+            if v >= 0.0 { qs[j / 8] |= 1 << (j % 8); }
+        }
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+
+/// Quantize to Q2_0 (PrismML ternary): d = amax over the 128-group; q = clamp(round(x/d)+1, 0, 3).
+pub fn quant_q2_0(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in x.chunks(128) {
+        let d = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        let mut qs = [0u8; 32];
+        for (j, &v) in blk.iter().enumerate() {
+            let q = if d != 0.0 { ((v / d).round() as i32 + 1).clamp(0, 3) } else { 1 };
+            qs[j / 4] |= (q as u8) << ((j % 4) * 2);
+        }
+        out.extend_from_slice(&qs);
     }
     out
 }
