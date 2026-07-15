@@ -969,3 +969,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[idx] = acc;
 }
 "#;
+
+/// Read-bandwidth probe: stream a buffer that is far larger than any cache and do only enough
+/// arithmetic to keep the loads live. Isolates *memory* throughput from the ALU work a real kernel
+/// layers on top, which is the only way to tell a bandwidth wall from an ALU wall.
+/// `per_thread` = 1 reads scalar u32s, 4 reads vec4<u32>. Returns (seconds, bytes).
+pub async fn probe_read_bandwidth(ctx: &Arc<Context>, bytes: usize, per_thread: u32) -> (f64, usize) {
+    let words = bytes / 4;
+    let src = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("bw.src"), size: (words * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let nwg = 16384usize; // enough workgroups to fill the machine; each strides over the buffer
+    let out = empty(ctx, nwg);
+    let wgsl = if per_thread == 4 { BW_VEC4_WGSL } else { BW_SCALAR_WGSL };
+    let unit = if per_thread == 4 { words / 4 } else { words };
+    let info = unibuf(ctx, &[unit as u32, nwg as u32, 0, 0]);
+    // warm (shader compile + first touch)
+    run(ctx, wgsl, "bw", &[&src, &out, &info], (nwg as u32, 1, 1));
+    let _ = readback(ctx, &out, 1).await;
+    let reps = 3;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps { run(ctx, wgsl, "bw", &[&src, &out, &info], (nwg as u32, 1, 1)); }
+    let _ = readback(ctx, &out, 1).await;
+    ((t0.elapsed().as_secs_f64()) / reps as f64, words * 4)
+}
+
+const BW_SCALAR_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       src:  array<u32>;
+@group(0) @binding(1) var<storage,read_write> out:  array<f32>;
+@group(0) @binding(2) var<uniform>            info: vec4<u32>; // n_units, n_workgroups
+var<workgroup> partial: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = info.x; let nwg = info.y;
+    // Each workgroup takes a contiguous slab; within it threads read consecutive words.
+    let per = (n + nwg - 1u) / nwg;
+    let start = wg.x * per;
+    var acc = 0u;
+    for (var i: u32 = start + lid.x; i < min(start + per, n); i = i + 64u) { acc = acc + src[i]; }
+    partial[lid.x] = acc;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var s = 0u;
+        for (var j: u32 = 0u; j < 64u; j = j + 1u) { s = s + partial[j]; }
+        out[wg.x] = f32(s);   // consumed, so the reads can't be optimized away
+    }
+}
+"#;
+
+const BW_VEC4_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       src:  array<vec4<u32>>;
+@group(0) @binding(1) var<storage,read_write> out:  array<f32>;
+@group(0) @binding(2) var<uniform>            info: vec4<u32>; // n_units (vec4s), n_workgroups
+var<workgroup> partial: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let n = info.x; let nwg = info.y;
+    let per = (n + nwg - 1u) / nwg;
+    let start = wg.x * per;
+    var acc = 0u;
+    for (var i: u32 = start + lid.x; i < min(start + per, n); i = i + 64u) {
+        let v = src[i];
+        acc = acc + v.x + v.y + v.z + v.w;
+    }
+    partial[lid.x] = acc;
+    workgroupBarrier();
+    if (lid.x == 0u) {
+        var s = 0u;
+        for (var j: u32 = 0u; j < 64u; j = j + 1u) { s = s + partial[j]; }
+        out[wg.x] = f32(s);
+    }
+}
+"#;
