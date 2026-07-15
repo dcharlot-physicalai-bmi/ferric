@@ -13,8 +13,11 @@ async fn run() {
     println!("  kernel: {}\n", std::env::var("FERRIC_Q2_0_KERNEL").unwrap_or_else(|_| "auto (per-shape)".into()));
     println!("  {:<22} {:>5} {:>10} {:>11} {:>12}", "shape (in→out)", "toks", "packed", "time", "GB/s");
 
-    // (in, out) for the projections that dominate a Bonsai layer
-    let shapes = [(5120usize, 17408usize, "ffn_gate/up"), (17408, 5120, "ffn_down"), (5120, 10240, "gdn qkv"), (5120, 12288, "attn q")];
+    // (in, out) for the projections that dominate a Bonsai layer, plus the LM head — at 338 MB the
+    // head is far too big to sit in cache, so it's the one shape here that measures true DRAM
+    // streaming. The others (~24 MB) fit in the SLC and are re-read across reps, which flatters
+    // them: the real model touches each weight once per token, always cold.
+    let shapes = [(5120usize, 17408usize, "ffn_gate/up"), (17408, 5120, "ffn_down"), (5120, 10240, "gdn qkv"), (5120, 12288, "attn q"), (5120, 248320, "lm_head (cold)")];
     for (inn, out, name) in shapes {
         // build packed weights once
         let w: Vec<f32> = (0..out * inn).map(|i| ((i % 3) as f32 - 1.0) * 0.02).collect();
@@ -29,7 +32,7 @@ async fn run() {
             let _ = x.matmul_q2_0(&qw).to_vec().await;
             // Queue the reps and sync ONCE at the end. Awaiting each rep would measure
             // submit+fence+readback latency (~1 ms) rather than the kernel — dispatches are async.
-            let reps = 20;
+            let reps = if bytes > 100_000_000 { 4 } else { 20 };
             let t0 = std::time::Instant::now();
             let mut last = None;
             for _ in 0..reps { last = Some(x.matmul_q2_0(&qw)); }

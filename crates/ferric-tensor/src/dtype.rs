@@ -325,13 +325,17 @@ impl Tensor {
 ///
 /// Flat gives one thread per output, so a small output count (decode, one token) leaves the GPU
 /// starved and split-K's 64×-more-threads wins. Once the output count is large (prefill), flat
-/// already saturates and split-K's barriers are pure overhead. Crossover sits near 16K outputs.
+/// already saturates and split-K's barriers are pure overhead. The crossover moved to ~32K outputs
+/// once split-K became coalesced; 32768 is the value that separates the real cases:
+///   1 token  ffn_gate  (n= 17408) → split-K 0.74 ms vs flat 0.84
+///   1 token  lm_head   (n=248320) → flat     4.79 ms vs split-K 5.05
+///   5 tokens gdn qkv   (n= 51200) → flat     0.89 ms vs split-K 0.99
 /// `FERRIC_Q2_0_KERNEL=flat|splitk` forces one, for benchmarking.
 fn q2_0_split_k(n_out: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
         Ok("flat") => false,
         Ok("splitk") => true,
-        _ => n_out < 16384,
+        _ => n_out < 32768,
     }
 }
 
@@ -401,25 +405,28 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     if (idx < n) {
         let o = idx % o_dim; let r = idx / o_dim;
         let nblk = in_dim / 128u;
+        let nwords = nblk * 8u;
+        let wbase = o * nwords;
         var acc = 0.0;
-        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+        // Stride over *words*, not blocks: thread t takes word t, t+64, … so adjacent threads read
+        // adjacent u32s and a SIMD group sweeps one contiguous run. Striding by block instead puts
+        // adjacent threads 32 B apart, scattering a 32-wide group across 32 cache lines and using
+        // 4 bytes of each. Measured: gdn qkv @1 token 0.34 ms → 0.24 ms, attn q 0.41 → 0.28.
+        // (A vec4<u32> variant — 64 codes per load — was tried and is *worse*: it cuts the work
+        // units 4×, wrecking load balance, and Apple already coalesces consecutive u32 loads.)
+        for (var w: u32 = t; w < nwords; w = w + 64u) {
+            let blk = w >> 3u;
             let bi = o * nblk + blk;
             let sw = unpack2x16float(scales[bi >> 1u]);
             let d = select(sw.y, sw.x, (bi & 1u) == 0u);
-            let cbase = bi * 8u;
-            let xbase = r * in_dim + blk * 128u;
-            // Sum the ternary-weighted x first, then apply the block scale once (it's constant over
-            // the 128-group) — 1 multiply per block instead of 128.
+            let word = codes[wbase + w];        // coalesced; one load feeds 16 weights
+            let xb = r * in_dim + blk * 128u + (w & 7u) * 16u;
             var bacc = 0.0;
-            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
-                let word = codes[cbase + w];   // one load feeds 16 weights
-                let xb = xbase + w * 16u;
-                for (var b: u32 = 0u; b < 16u; b = b + 1u) {
-                    let code = (word >> (2u * b)) & 3u;
-                    bacc = bacc + x[xb + b] * f32(i32(code) - 1);   // w = (q−1)·d
-                }
+            for (var b: u32 = 0u; b < 16u; b = b + 1u) {
+                let code = (word >> (2u * b)) & 3u;
+                bacc = bacc + x[xb + b] * f32(i32(code) - 1);   // w = (q−1)·d
             }
-            acc = acc + bacc * d;
+            acc = acc + bacc * d;   // the scale is constant across the 128-group
         }
         partial[t] = acc;
         workgroupBarrier();

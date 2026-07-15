@@ -93,6 +93,22 @@ llama.cpp's speed.
 4. **A 1D dispatch grid caps at 65535 workgroups = 4.19M threads** — which a real LM head passes at
    17 tokens (17 × 248320 = 4.22M). This was latent in `groups(n)` from the start and only surfaced
    once generation ran long enough; big-vocab models hit it early.
+5. **Micro-benchmark gains did not transfer, because the benchmark was cache-resident.** Re-reading
+   one 24 MB weight 20× leaves it in the SLC; the real model touches each weight once per token,
+   always cold from DRAM. Coalescing the split-K loads (stride by *word*, not by block) won 30–40% on
+   the bench — `gdn qkv` @1 token 0.34 → 0.24 ms — and **zero** end-to-end (295 → 301 ms/token, noise).
+   The only honest shape here is the 338 MB LM head, far too big to cache: cold, both kernels land at
+   ~66–70 GB/s. In the cold-streaming regime the kernel choice barely matters — we're DRAM-bound.
+   A `vec4<u32>` variant (64 codes/load) was tried and is *worse*: it cuts work units 4×, wrecking
+   load balance, and Apple already coalesces consecutive `u32` loads.
+6. **Per-dispatch overhead is real but not the story:** ~0.06 ms for a trivial op × ~640 ops/token
+   ≈ 38 ms, about 13% of decode.
+
+**So the remaining 13× is DRAM throughput, not kernel cleverness.** We stream 7.17 GB/token at
+~30–70 GB/s; llama.cpp's Metal kernels hit ~326 GB/s (≈90% of roofline) and so decode in 22 ms.
+Closing that needs the things a mature kernel does — more outputs per thread, simdgroup reductions,
+vectorized f32 activation loads — not another selector tweak. Measured, not assumed, is the rule:
+three separate conclusions here died on contact with a correct measurement.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
