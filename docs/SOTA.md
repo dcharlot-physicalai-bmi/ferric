@@ -43,18 +43,53 @@ Researched the exact ops each family needs (July 2026). Most reduce to primitive
 | Family | What it is | New primitives needed | Status |
 |---|---|---|---|
 | **BitNet / ternary** (`microsoft/bitnet-b1.58-2B-4T`) | Transformer w/ ternary `{−1,0,+1}` BitLinear + int8 activations + ReLU² FFN | ternary matmul, ReLU², GGUF ternary blocks | ✅ ternary matmul (1.9e-6, 1/16 mem) · ReLU² · **GGUF TQ2_0 loads** |
-| **PrismML** (Caltech spinout: Bonsai / Ternary Bonsai 1.7/4/8B) | **Architecturally identical to BitNet** — standard transformer, every linear ternary 1.58-bit, ships GGUF | *same as BitNet* — ternary matmul + GGUF ternary | ✅ ternary matmul · GGUF TQ2_0 (their `Q2_0` fork ≈ same 2-bit family) |
+| **PrismML** (Caltech spinout: Ternary Bonsai **27B**, + 1.7/4/8B) | **NOT a plain ternary transformer** — a Qwen3.5 hybrid: 64 blocks = 48 **gated delta net** linear-attention + 16 full **gated** GQA (partial RoPE, QK-norm), every projection ternary in their own `Q2_0` (2.125 bpw) | gated delta rule, l2norm, softplus, `cat`/`narrow`, Q2_0-native matmul, partial RoPE | ✅ **RUNS — 27B validated vs their llama.cpp fork, max\|Δ\| = 7.8e-4** (`examples/run_bonsai.rs`) |
 | **Liquid AI LFM2** (`LiquidAI/LFM2-1.2B`) | 16 blocks = 10 gated short-conv + 6 GQA; SwiGLU MLP; RMSNorm; RoPE | **causal depthwise conv1d (L=3)** + gating (⊙) | conv1d ✅ (1.5e-7) · gated block ✅ · GQA/RoPE/RMSNorm/SwiGLU ✅ — **LFM2 block fully covered** |
 | **EBM / JEM** | scalar energy `E(x)` + Langevin sampling `x -= ε∇ₓE + √ε·𝒩` | grad-w.r.t-input (✅), logsumexp, host loop | **✅ RUNS** — `examples/ebm.rs` Langevin-descends the energy (−0.12→−1.46) via autograd-∇ₓE; logsumexp composed from primitives |
 | **JEPA** (I-JEPA, V-JEPA 2) | ViT encoder + predictor, latent-space prediction | patch embed (unfold+matmul), non-causal attention, GELU, 3D RoPE, mask-token | ✅ **FULLY RUNS** — `examples/jepa.rs`: patch-embed→bidirectional encoder w/ **3D RoPE** (5.96e-8)→GELU MLP→**mask-token blend**→predictor, end to end |
 
-**Key insight:** PrismML ≡ BitNet (both ternary transformers), so ternary matmul + GGUF-ternary covers
-*two* families. LFM2 needed only conv1d (done). EBM needs almost nothing new (we already do
-grad-w.r.t-input). JEPA is a standard ViT + a few small primitives.
+**Correction (2026-07):** the earlier note here claimed *PrismML ≡ BitNet*. Running the real
+Bonsai-27B disproved that — it is a **Qwen3.5 hybrid**, three-quarters linear attention, and needs a
+gated-delta-rule recurrence that a plain ternary transformer never exercises. Assuming the two were
+the same would have covered one family, not two.
 
-**All 5 families now run** (BitNet/PrismML ternary, LFM2, EBM, JEPA/V-JEPA2). Remaining refinements:
-GGUF `TQ1_0`/`I2_S` ternary variants + PrismML's exact `Q2_0` fork spec; true multi-chain SGLD via
-on-device RNG; and loading a *real* downloaded checkpoint of each (weights + tokenizer/config).
+**All 5 families run, and three are now validated against a real downloaded checkpoint:**
+
+| Model | Params | Reference | Agreement |
+|---|---|---|---|
+| SmolLM2-135M | 135M | numpy | 1.4e-6 |
+| Liquid LFM2-350M | 350M | transformers | 4.7e-6 |
+| **PrismML Ternary Bonsai-27B** | **27B** | **their llama.cpp fork** | **7.8e-4** |
+
+Remaining: GGUF `TQ1_0`/`I2_S` ternary variants; true multi-chain SGLD via on-device RNG; Bonsai's
+4-bit HQQ **vision tower** (text path is done); and a KV/recurrent-state cache so Bonsai decodes
+incrementally instead of re-prefilling.
+
+**Speed, honestly.** Correctness is not yet competitive with speed. On the same M5 Max, Bonsai-27B:
+
+| | Ferric | llama.cpp (Metal) |
+|---|---|---|
+| load | 10 s | 0.25 s (mmap) |
+| prefill | ~500 ms/token | 15.6 ms/token |
+| decode | re-prefills (no cache) | 22 ms/token |
+
+That is ~32× off, and the causes are known rather than mysterious: `matmul_q2_0` is an untiled
+one-thread-per-output kernel, every op is its own dispatch (the fusion compiler isn't applied to this
+path yet), there's no KV/recurrent-state cache, and load re-uploads instead of mmap-ing. None of these
+is architectural — but until they're closed, the honest claim is **"Ferric runs Bonsai-27B correctly,"
+not "Ferric runs it well."**
+
+### Bonsai-27B: the two conventions that only the fork's source reveals
+The GGUF is written to match PrismML's llama.cpp fork, not the HF reference. Both of these produce
+plausible-looking but wrong numbers if assumed from the HF model code:
+1. **`ssm_a` is stored already as `-exp(A_log)`** → the decay gate is a plain multiply.
+2. **V/Z/beta/alpha/conv-V/out_proj heads are pre-permuted to *tiled* order**, because ggml
+   broadcasts q/k across v heads with `head % n_k_heads`. HF keeps grouped order and uses
+   `repeat_interleave`. Loading GGUF weights therefore *requires* the tiled broadcast.
+
+Text-only inference is exact under standard partial RoPE: the checkpoint uses interleaved MRoPE
+(sections `[11,11,10,0]`), but for text all position components are equal, so MRoPE collapses to
+ordinary RoPE over the first 64 of each head's 256 dims.
 
 ## Device coverage — CPU / GPU / NPU (honest)
 `sched::detect_devices()` + `examples/devices.rs` enumerate and use everything present:
