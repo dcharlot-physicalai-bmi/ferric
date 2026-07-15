@@ -49,8 +49,9 @@ impl Context {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
                 required_features: wgpu::Features::empty(),
-                // downlevel defaults keep us inside the WebGPU baseline → the same limits hold in a browser
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // request the adapter's real limits: native gets big buffers (big models); in a
+                // browser this resolves to the WebGPU baseline, so cross-fabric portability holds.
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             })

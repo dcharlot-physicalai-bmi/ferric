@@ -1,8 +1,0 @@
-# Ferric is self-contained: every dependency's source lives in vendor/ (in-repo). We build only from
-# source we own and can patch. No crates.io reliance. Strategic crates (wgpu, naga, …) get promoted to
-# first-class Ferric-maintained forks over time; the rest ride along, patchable in place.
-[source.crates-io]
-replace-with = "vendored-sources"
-
-[source.vendored-sources]
-directory = "vendor"
