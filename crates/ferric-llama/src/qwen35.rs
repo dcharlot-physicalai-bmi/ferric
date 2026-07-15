@@ -104,6 +104,24 @@ pub struct GdnW {
 
 pub enum Mixer { Attn(AttnW), Gdn(GdnW) }
 
+/// Per-layer carried state. Attention layers keep the usual K/V history; gated-delta-net layers keep
+/// the recurrent state plus the last `conv_kernel-1` conv inputs (the short conv's receptive field).
+/// With both, generating token N costs one step instead of re-running the whole prefix.
+enum LayerCache {
+    Attn { k: Tensor, v: Tensor },   // [S, n_kv·head_dim]
+    Gdn { state: Tensor, conv: Tensor }, // state [n_v_heads, dv, dk]; conv [conv_kernel-1, conv_dim]
+}
+
+#[derive(Default)]
+pub struct Cache {
+    pub pos: usize,
+    layers: Vec<Option<LayerCache>>,
+}
+
+impl Cache {
+    pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, layers: (0..cfg.n_layer).map(|_| None).collect() } }
+}
+
 pub struct Layer {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
@@ -209,7 +227,7 @@ impl Qwen35 {
         rot.cat(&x3.narrow(2, n_rot, hd - n_rot), 2).reshape(&[t, n_heads * hd])
     }
 
-    fn attn(&self, h: &Tensor, w: &AttnW, offset: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, w: &AttnW, cache: &mut Option<LayerCache>, offset: usize) -> Tensor {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
         // One projection emits query and gate interleaved per head: [t, nh, 2·hd].
         let qf = h.matmul_q2_0(&w.wq).reshape(&[t, nh, hd * 2]);
@@ -223,11 +241,22 @@ impl Qwen35 {
         let q = self.rope_partial(&q, nh, offset);
         let k = self.rope_partial(&k, nkv, offset);
 
-        let o = nn::causal_attention(&q, &k, &v, nh, nkv);
+        // Append this step's K/V to the history, then attend over all of it.
+        let (kc, vc) = match cache.take() {
+            Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&k, 0), pv.cat(&v, 0)),
+            _ => (k, v),
+        };
+        let o = if t == 1 {
+            nn::decode_attention(&q, &kc, &vc, nh, nkv)
+        } else {
+            // Prefill: q and the history are the same span, so the causal mask applies as usual.
+            nn::causal_attention(&q, &kc, &vc, nh, nkv)
+        };
+        *cache = Some(LayerCache::Attn { k: kc, v: vc });
         o.mul(&gate.sigmoid()).matmul_q2_0(&w.wo)
     }
 
-    fn gdn(&self, h: &Tensor, w: &GdnW) -> Tensor {
+    fn gdn(&self, h: &Tensor, w: &GdnW, cache: &mut Option<LayerCache>) -> Tensor {
         let c = &self.cfg;
         let (t, nk, nv) = (h.shape[0], c.n_k_heads, c.n_v_heads);
         let (dk, dv, kd) = (c.head_k_dim, c.head_v_dim(), c.key_dim());
@@ -235,7 +264,17 @@ impl Qwen35 {
         // conv over the whole fused q|k|v, then split — the conv is causal and depthwise, so
         // splitting after it is identical to convolving each part separately.
         let qkv = h.matmul_q2_0(&w.wqkv);
-        let conv = qkv.depthwise_conv1d_causal(&w.conv1d, c.conv_kernel).silu();
+        // The short conv looks back conv_kernel-1 steps, so a single new token can't be convolved
+        // alone: prepend the carried tail (zeros at the start of a sequence, which is exactly the
+        // causal zero-padding the standalone conv applies) and keep only the new rows.
+        let pad = c.conv_kernel - 1;
+        let (prev_conv, prev_state) = match cache.take() {
+            Some(LayerCache::Gdn { state, conv }) => (conv, Some(state)),
+            _ => (Tensor::zeros(&self.ctx, &[pad, qkv.shape[1]]), None),
+        };
+        let cin = prev_conv.cat(&qkv, 0);
+        let conv = cin.depthwise_conv1d_causal(&w.conv1d, c.conv_kernel).narrow(0, pad, t).contiguous().silu();
+        let conv_tail = cin.narrow(0, cin.shape[0] - pad, pad).contiguous();
 
         // l2norm (not RMSNorm) over head_k_dim, then fold the recurrence's 1/√dv into q.
         let q = conv.narrow(1, 0, kd).reshape(&[t, nk, dk]).l2norm(c.eps);
@@ -253,7 +292,8 @@ impl Qwen35 {
         let beta = h.matmul_q2_0(&w.beta).sigmoid();
         let gb = alpha.reshape(&[t, nv, 1]).cat(&beta.reshape(&[t, nv, 1]), 2);
 
-        let o = q.gated_delta_rule(&k, &v, &gb, nv, dk, dv);
+        let (o, state) = q.gated_delta_rule_stateful(&k, &v, &gb, nv, dk, dv, prev_state.as_ref());
+        *cache = Some(LayerCache::Gdn { state, conv: conv_tail });
 
         // gated RMSNorm over head_v_dim, gated by silu(z)
         let z = h.matmul_q2_0(&w.wz).reshape(&[t, nv, dv]);
@@ -264,7 +304,7 @@ impl Qwen35 {
         h.matmul_q2_0(&l.ffn_gate).silu().mul(&h.matmul_q2_0(&l.ffn_up)).matmul_q2_0(&l.ffn_down)
     }
 
-    /// Prefill forward over `tokens` → logits [T, n_vocab].
+    /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).
     pub fn forward(&self, tokens: &[u32]) -> Tensor {
         self.forward_upto(tokens, self.cfg.n_layer)
     }
@@ -272,17 +312,29 @@ impl Qwen35 {
     /// Forward through the first `n` layers (then final norm + head) — `n < n_layer` is how the
     /// per-layer comparison against llama.cpp is done.
     pub fn forward_upto(&self, tokens: &[u32], n: usize) -> Tensor {
+        let mut cache = Cache::new(&self.cfg);
+        self.forward_cached(tokens, &mut cache, n)
+    }
+
+    /// Feed `tokens` through the model, carrying every layer's state in `cache`. Call it once with
+    /// the prompt, then once per generated token — the incremental result is identical to
+    /// re-running the whole prefix, because both the attention K/V and the gated-delta-net
+    /// recurrence resume exactly where they left off.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache, n: usize) -> Tensor {
         let mut x = self.embed(tokens);
-        for (_il, l) in self.layers.iter().enumerate().take(n) {
+        let pos = cache.pos;
+        for (il, l) in self.layers.iter().enumerate().take(n) {
             let h = x.rmsnorm(&l.attn_norm, self.cfg.eps);
+            let lc = &mut cache.layers[il];
             let y = match &l.mixer {
-                Mixer::Attn(w) => self.attn(&h, w, 0),
-                Mixer::Gdn(w) => self.gdn(&h, w),
+                Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                Mixer::Gdn(w) => self.gdn(&h, w, lc),
             };
             x = x.add(&y);
             let r = x.clone();
             x = self.ffn(&x.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&r);
         }
+        cache.pos += tokens.len();
         x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head)
     }
 }

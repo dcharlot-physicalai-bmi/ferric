@@ -271,15 +271,27 @@ impl Tensor {
     /// self = q [T,H,dk] (expected L2-normed and scaled), k [T,H,dk], v [T,H,dv], gb [T,H,2] = (g, β)
     /// where the decay is `exp(g)`. Returns [T,H,dv]. One thread owns a column S[:,j] and walks T.
     pub fn gated_delta_rule(&self, k: &Tensor, v: &Tensor, gb: &Tensor, h: usize, dk: usize, dv: usize) -> Tensor {
+        self.gated_delta_rule_stateful(k, v, gb, h, dk, dv, None).0
+    }
+
+    /// Gated delta rule that can **resume from a carried state** and returns the evolved one —
+    /// what turns generation from re-running the whole prefix per token into a single step.
+    /// `state` is `[H, dv, dk]`; `None` starts from zero. Returns `(out [T,H,dv], state)`.
+    pub fn gated_delta_rule_stateful(&self, k: &Tensor, v: &Tensor, gb: &Tensor, h: usize, dk: usize, dv: usize, state: Option<&Tensor>) -> (Tensor, Tensor) {
         assert!(dk <= 128, "gated_delta_rule: head_k_dim ≤ 128");
         let (q, k, v, gb) = (self.contiguous(), k.contiguous(), v.contiguous(), gb.contiguous());
         let t = q.numel() / (h * dk);
         let out = empty(&self.ctx, t * h * dv);
+        // The kernel reads and writes state in place, so hand it a buffer it owns either way.
+        let st = match state {
+            Some(s) => s.contiguous(),
+            None => Tensor::zeros(&self.ctx, &[h, dv, dk]),
+        };
         run(&self.ctx, GATED_DELTA_WGSL, "gdn",
-            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), gb.buf.as_ref(), &out,
-              &u32buf(&self.ctx, &[t as u32, h as u32, dk as u32, dv as u32])],
+            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), gb.buf.as_ref(), &out, st.buf.as_ref(),
+              &u32buf(&self.ctx, &[t as u32, h as u32, dk as u32, dv as u32, state.is_some() as u32])],
             groups(h * dv));
-        Tensor::from_parts(&self.ctx, out, vec![t, h, dv])
+        (Tensor::from_parts(&self.ctx, out, vec![t, h, dv]), st)
     }
 
     /// 3D rotary position embedding (V-JEPA 2): head_dim split into 3 groups (temporal/height/width),
@@ -751,15 +763,23 @@ const GATED_DELTA_WGSL: &str = r#"
 @group(0) @binding(2) var<storage,read>        v:  array<f32>;   // [T,H,dv]
 @group(0) @binding(3) var<storage,read>        gb: array<f32>;   // [T,H,2] = (g, beta)
 @group(0) @binding(4) var<storage,read_write>  out: array<f32>;  // [T,H,dv]
-@group(0) @binding(5) var<storage,read>        info: array<u32>; // T,H,dk,dv
+@group(0) @binding(5) var<storage,read_write>  state: array<f32>; // [H,dv,dk] — carried across calls
+@group(0) @binding(6) var<storage,read>        info: array<u32>; // T,H,dk,dv,load_state
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     let t_len = info[0]; let h = info[1]; let dk = info[2]; let dv = info[3];
+    let load_state = info[4];
     if (idx >= h * dv) { return; }
     let head = idx / dv; let j = idx % dv;   // this thread owns state column S[:, j]
+    let sbase = (head * dv + j) * dk;
     var s: array<f32, 128>;
-    for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = 0.0; }
+    // Resume from the carried state (incremental decode) or start fresh (prefill).
+    if (load_state == 1u) {
+        for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = state[sbase + i]; }
+    } else {
+        for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = 0.0; }
+    }
     for (var t: u32 = 0u; t < t_len; t = t + 1u) {
         let gbase = (t * h + head) * 2u;
         let decay = exp(gb[gbase]);
@@ -774,6 +794,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i: u32 = 0u; i < dk; i = i + 1u) { s[i] = s[i] + k[kb + i] * delta; o = o + s[i] * q[kb + i]; }
         out[(t * h + head) * dv + j] = o;
     }
+    // Hand the evolved state back so the next call can continue the sequence.
+    for (var i: u32 = 0u; i < dk; i = i + 1u) { state[sbase + i] = s[i]; }
 }
 "#;
 

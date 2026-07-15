@@ -303,10 +303,14 @@ impl Tensor {
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, grid_w as u32])],
                 (grid_w as u32, grid_h as u32, 1));
         } else {
+            // 2D for the same reason as split-K: one row of the grid tops out at 65535 workgroups.
+            let wg = n.div_ceil(64);
+            let gw = wg.min(32768);
+            let gh = wg.div_ceil(gw);
             run(&self.ctx, MATMUL_Q2_0_FLAT_WGSL, "matmul_q2_0_flat",
                 &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
-                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, 0])],
-                groups(n));
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
+                (gw as u32, gh as u32, 1));
         }
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
@@ -333,15 +337,18 @@ fn q2_0_split_k(n_out: usize) -> bool {
 
 /// One thread per output element, walking all of K itself. No barriers, but a long dependent
 /// accumulate chain and only `rows·out` threads in flight.
+///
+/// Dispatched 2D: a 1D grid caps at 65535 workgroups = 4.19M threads, which a real LM head blows
+/// straight through (17 tokens × 248320 vocab = 4.22M outputs → 65960 workgroups).
 const MATMUL_Q2_0_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<f32>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
 @group(0) @binding(2) var<storage,read>        scales: array<u32>;
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
-@group(0) @binding(4) var<uniform>             info:   vec4<u32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;  // rows, out, in, threads_per_grid_row
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
     if (idx >= rows * o_dim) { return; }
     let o = idx % o_dim; let r = idx / o_dim;
     let nblk = in_dim / 128u;

@@ -97,24 +97,61 @@ async fn run() {
     }
     assert!(finite, "non-finite logits");
 
-    // `--gen N` — greedy continuation. Re-prefills each step (no KV/recurrent-state cache yet), so
-    // cost grows with the sequence; it demonstrates the model, not the decode speed.
+    // `--gen N` — greedy continuation using the KV + recurrent-state cache: prompt once, then one
+    // token per step. `--reprefill` forces the naive path (re-run the whole prefix each token),
+    // which must produce identical text — that equivalence is the cache's correctness test.
     if let Some(p) = args.iter().position(|a| a == "--gen") {
         let n: usize = args[p + 1].parse().unwrap();
-        let mut seq = ids.clone();
-        print!("\ngenerating: ");
-        for &i in &ids { print!("{}", detok(vocab.get(i as usize).map(|s| s.as_str()).unwrap_or("?"))); }
+        let reprefill = args.iter().any(|a| a == "--reprefill");
         use std::io::Write;
+        let argmax = |row: &[f32]| (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+
+        print!("\ngenerating ({}): ", if reprefill { "re-prefill each token" } else { "cached decode" });
+        for &i in &ids { print!("{}", detok(vocab.get(i as usize).map(|s| s.as_str()).unwrap_or("?"))); }
         std::io::stdout().flush().ok();
+
+        let mut seq = ids.clone();
         let t0 = std::time::Instant::now();
-        for _ in 0..n {
-            let v = m.forward(&seq).to_vec().await;
-            let row = &v[(seq.len() - 1) * c.n_vocab..];
-            let next = (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+        let mut cache = ferric_llama::qwen35::Cache::new(c);
+        let mut prompt_ms = 0.0;
+        for step in 0..n {
+            let logits = if reprefill {
+                m.forward(&seq)
+            } else if step == 0 {
+                m.forward_cached(&ids, &mut cache, c.n_layer)
+            } else {
+                m.forward_cached(&seq[seq.len() - 1..], &mut cache, c.n_layer)
+            };
+            let v = logits.to_vec().await;
+            let rows = if reprefill || step == 0 { seq.len().min(ids.len().max(1)) } else { 1 };
+            let _ = rows;
+            let row = &v[v.len() - c.n_vocab..]; // last position's logits
+            let next = argmax(row);
+            if step == 0 { prompt_ms = t0.elapsed().as_secs_f64() * 1e3; }
             print!("{}", detok(vocab.get(next as usize).map(|s| s.as_str()).unwrap_or("?")));
             std::io::stdout().flush().ok();
             seq.push(next);
         }
-        println!("\n  ({} tokens in {:?})", n, t0.elapsed());
+        let total = t0.elapsed().as_secs_f64();
+        let decode_ms = (total * 1e3 - prompt_ms) / (n - 1).max(1) as f64;
+        println!("\n  {n} tokens in {:.2}s · prompt {:.0}ms · {:.0} ms/token after", total, prompt_ms, decode_ms);
+        println!("  ids: {:?}", &seq[ids.len()..]);
+
+        // `--verify-cache` — the cache is only correct if carrying state is indistinguishable from
+        // re-running the prefix. Generate both ways and require identical tokens.
+        if args.iter().any(|a| a == "--verify-cache") && !reprefill {
+            let mut naive = ids.clone();
+            let t1 = std::time::Instant::now();
+            for _ in 0..n {
+                let v = m.forward(&naive).to_vec().await;
+                naive.push(argmax(&v[v.len() - c.n_vocab..]));
+            }
+            let slow = t1.elapsed().as_secs_f64();
+            let same = naive[ids.len()..] == seq[ids.len()..];
+            println!("\n  re-prefill path: {:.2}s → {:?}", slow, &naive[ids.len()..]);
+            println!("{} cached decode == re-prefill (identical {n} tokens) · {:.1}× faster",
+                if same { "✅" } else { "❌" }, slow / total);
+            assert!(same, "cached decode diverged from re-prefill");
+        }
     }
 }
