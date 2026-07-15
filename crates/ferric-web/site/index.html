@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ferric — one pure-Rust AI stack, every fabric</title>
-<meta name="description" content="Ferric is a pure-Rust AI compute ecosystem that runs the same code on a datacenter GPU, a laptop, and a browser tab — with a full transformer, an ONNX importer, and a safetensors loader. Try it live on WebGPU.">
+<meta name="description" content="Ferric is a pure-Rust AI compute ecosystem: trains and runs real models (SmolLM2, Liquid AI LFM2) on CPU, GPU and the Apple Neural Engine, down to ternary, from a datacenter to a browser tab. Try it live on WebGPU.">
 <style>
   :root{
     --bg:#080b12; --bg2:#0b0f19; --panel:#101728; --panel2:#0c1220; --line:#1c2540;
@@ -102,7 +102,7 @@
 </div></nav>
 
 <header class="hero" id="top"><div class="wrap">
-  <span class="badge"><span class="dot"></span> one kernel — bit-identical on native GPU &amp; browser WebGPU</span>
+  <span class="badge"><span class="dot"></span> runs real models on CPU + GPU + the Neural Engine — one Rust stack</span>
   <h1>One pure-Rust AI stack.<br><span class="g">Every fabric.</span></h1>
   <p class="lede">Ferric runs the <b>same code</b> on a datacenter GPU, a laptop, an edge robot, and a browser tab — a complete transformer, an ONNX importer, and a safetensors loader, with <b>no Python or C++ in the hot path</b>.</p>
   <div class="cta">
@@ -114,34 +114,36 @@
 <section id="what"><div class="wrap">
   <p class="eyebrow">What it is</p>
   <h2>A single Rust ecosystem for AI compute — cloud, local, and browser.</h2>
-  <p class="big">Browser AI today is JavaScript and C++-WASM; Rust's AI story is fragmented and weak in the browser. Ferric is the missing piece: build directly on the portable GPU layer (<span class="mono">wgpu</span>), own the kernels, the model runtime, weight loading, and browser packaging — one coherent stack where a model defined once runs, and computes the same, everywhere. Every result below is validated against an independent reference and builds fully offline from vendored source.</p>
+  <p class="big">Browser AI today is JavaScript and C++-WASM; Rust's AI story is fragmented and weak in the browser. Ferric is the missing piece: build directly on the portable GPU layer (<span class="mono">wgpu</span>), own the kernels, the model runtime, weight loading, and browser packaging — one coherent stack where a model defined once runs, and computes the same, everywhere. Every result below is validated against an independent reference (CPU, <span class="mono">numpy</span>, <span class="mono">onnxruntime</span>, or HF <span class="mono">transformers</span>) and builds fully offline from vendored source.</p>
 </div></section>
 
 <section id="proof"><div class="wrap">
   <p class="eyebrow">Proven</p>
-  <h2>Not a plan — a working transformer.</h2>
-  <p class="muted">Each milestone checked against a CPU reference, <span class="mono">onnxruntime</span>, or <span class="mono">numpy</span>.</p>
+  <h2>Not a plan — it runs real models.</h2>
+  <p class="muted">Every number below is checked against an independent reference — a CPU implementation, <span class="mono">numpy</span>, <span class="mono">onnxruntime</span>, or Hugging Face <span class="mono">transformers</span>.</p>
   <div class="grid">
+    <div class="card"><h3>Runs real models</h3><div class="num">2</div><p><b>SmolLM2-135M</b> matches <span class="mono">numpy</span> 1.4e-6; <b>Liquid AI LFM2-350M</b> (novel conv-hybrid) matches <span class="mono">transformers</span> 4.7e-6.</p></div>
+    <div class="card"><h3>Generates real text</h3><div class="num">✓</div><p>Exact GPT-2 tokenizer (HF token-for-token) + O(S) KV-cache decode — end to end.</p></div>
+    <div class="card"><h3>Runs on the NPU</h3><div class="num">ANE</div><p>WebNN(npu) → CoreML → <b>Apple Neural Engine</b>, matching CPU to fp16. Plus every GPU + all CPU cores.</p></div>
     <div class="card"><h3>Cross-fabric core</h3><div class="num">7.15e-7</div><p>One matmul kernel, native Metal vs browser WebGPU — bit-identical.</p></div>
-    <div class="card"><h3>Full transformer LM</h3><div class="num">1.9e-6</div><p>Embed → RoPE GQA attention → RMSNorm → SwiGLU, stacked, matched to CPU.</p></div>
-    <div class="card"><h3>KV-cache generation</h3><div class="num">exact</div><p>Autoregressive decode, identical to a full recompute — token by token.</p></div>
-    <div class="card"><h3>ONNX importer</h3><div class="num">~22 ops</div><p>Real graphs incl. SmolVLA components, matching <span class="mono">onnxruntime</span>.</p></div>
-    <div class="card"><h3>Llama / SmolLM bridge</h3><div class="num">1.2e-6</div><p>Loads an HF safetensors checkpoint (GQA, tied embeddings), matched to <span class="mono">numpy</span>.</p></div>
-    <div class="card"><h3>General tensor runtime</h3><div class="num">N-D</div><p>Arbitrary rank, strided views, broadcasting, any-axis reductions, batched matmul — vs a CPU ref.</p></div>
-    <div class="card"><h3>It trains</h3><div class="num">grad ✓</div><p>Reverse-mode autograd; an MLP fit on the GPU, gradients checked to 1.5e-5.</p></div>
-    <div class="card"><h3>Self-reliant</h3><div class="num">offline</div><p>Strategic deps (<span class="mono">wgpu</span>, <span class="mono">naga</span>) forked in-tree; the whole build vendors.</p></div>
+    <div class="card"><h3>It trains</h3><div class="num">100%</div><p>Reverse-mode autograd — an MLP <i>and</i> a transformer (through attention) trained on the GPU.</p></div>
+    <div class="card"><h3>Down to ternary</h3><div class="num">1.58-bit</div><p>f16/bf16, int8/int4 weight-only, and <b>ternary</b> (BitNet/PrismML) — 1/16 the memory.</p></div>
+    <div class="card"><h3>Five architectures</h3><div class="num">5</div><p>Ternary LLMs, Liquid LFM2, EBMs, JEPA/V-JEPA2, Llama — plus ONNX + GGUF ingest.</p></div>
+    <div class="card"><h3>Fusion compiler</h3><div class="num">codegen</div><p>Elementwise DAGs → one generated WGSL kernel (SSA+CSE), and activations fused into matmul.</p></div>
   </div>
 </div></section>
 
 <section id="crates"><div class="wrap">
   <p class="eyebrow">The stack</p>
-  <h2>Six crates, published on crates.io.</h2>
+  <h2>Eight crates, published on crates.io.</h2>
   <div style="margin-top:20px">
     <div class="crate"><code>ferric-core</code><span>The <span class="mono">wgpu</span> Context + the cross-fabric transformer kernel set.</span><a href="https://crates.io/crates/ferric-core" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-tensor</code><span>The general N-D tensor runtime — strided views, broadcasting, reductions, batched matmul — with autograd for training.</span><a href="https://crates.io/crates/ferric-tensor" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-onnx</code><span>A pure-Rust ONNX importer that runs graphs on Ferric tensor ops.</span><a href="https://crates.io/crates/ferric-onnx" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-load</code><span>A safetensors reader — fp16/bf16 dequant — how real checkpoints enter.</span><a href="https://crates.io/crates/ferric-load" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-llama</code><span>Maps a Llama/SmolLM safetensors checkpoint onto the kernels and runs it.</span><a href="https://crates.io/crates/ferric-llama" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-gguf</code><span>GGUF reader — F32/F16/Q8_0/Q4_0/Q4_K + <b>TQ2_0 ternary</b>: the llama.cpp/HF corpus.</span><a href="https://crates.io/crates/ferric-gguf" target="_blank">crates.io ↗</a></div>
+    <div class="crate"><code>ferric-tokenizer</code><span>Byte-level BPE with the exact GPT-2 pre-tokenizer — HF token-for-token.</span><a href="https://crates.io/crates/ferric-tokenizer" target="_blank">crates.io ↗</a></div>
     <div class="crate"><code>ferric-web</code><span>The same core compiled to WASM, running on browser WebGPU.</span><a href="https://crates.io/crates/ferric-web" target="_blank">crates.io ↗</a></div>
   </div>
 </div></section>
