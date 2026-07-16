@@ -305,7 +305,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        if q2_0_split_k(n) {
+        if q2_0_split_k(rows, w.rows) {
             // One workgroup per output element, laid out 2D because rows·out overruns the 65535
             // per-dimension cap (e.g. 5 tokens × 17408 outputs).
             let grid_w = n.min(32768);
@@ -340,19 +340,28 @@ impl Tensor {
 ///   gdn qkv  5120→10240,  1 token   flat 0.64 ms → split-K 0.34 ms   (1.9× faster)
 ///   gdn qkv  5120→10240,  5 tokens  flat 0.90 ms → split-K 1.46 ms   (1.6× slower)
 ///
-/// Flat gives one thread per output, so a small output count (decode, one token) leaves the GPU
-/// starved and split-K's 64×-more-threads wins. Once the output count is large, flat already
-/// saturates and split-K's barriers are pure overhead. Measured with vec4 activation loads in both:
-///   1 token  ffn_down (n=  5120) → split-K 0.19 ms vs flat 0.42   (split-K 2.2× faster)
-///   1 token  attn q   (n= 12288) → split-K 0.16 ms vs flat 0.18
-///   1 token  ffn_gate (n= 17408) → flat     0.50 ms vs split-K 0.58
-///   5 tokens lm_head  (n=1.2M)   → flat     9.30 ms vs split-K 18.70 (flat 2× faster)
-/// `FERRIC_Q2_0_KERNEL=flat|splitk|trans` forces one, for benchmarking.
-fn q2_0_split_k(n_out: usize) -> bool {
+/// Flat gives one thread per output; split-K gives a whole workgroup (64× the threads) per output,
+/// paid for with a barrier reduction. The deciding factor is **rows** (tokens in flight), which the
+/// per-shape microbenchmarks obscured — those 0.2 ms decode matmuls swing 3× run-to-run (clock ramp,
+/// contention), so the selector was tuned on whole-model ms/token instead:
+///   decode, rows=1 → split-K wins on every shape but the LM head (168 vs 179 ms/tok all-split-K)
+///   prefill, rows≥4 → flat wins for large matmuls; the rows already fill the machine, barriers cost
+/// So: at decode (few rows) use split-K broadly; at prefill fall back to the output-count threshold.
+/// `FERRIC_Q2_0_KERNEL=flat|splitk|trans` forces one; `FERRIC_Q2_0_SPLITK_MAX` overrides the
+/// prefill threshold for sweeps.
+fn q2_0_split_k(rows: usize, n_out: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
         Ok("flat") | Ok("trans") => false,
         Ok("splitk") => true,
-        _ => n_out < 16384,
+        _ => {
+            let thresh = std::env::var("FERRIC_Q2_0_SPLITK_MAX").ok().and_then(|s| s.parse().ok());
+            if rows <= 2 {
+                // decode: enough K-parallelism to matter, and even the 248320-wide LM head prefers it
+                n_out < thresh.unwrap_or(1 << 20)
+            } else {
+                n_out < thresh.unwrap_or(16384)
+            }
+        }
     }
 }
 

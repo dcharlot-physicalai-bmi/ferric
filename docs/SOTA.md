@@ -70,10 +70,10 @@ Bonsai's 4-bit HQQ **vision tower** (the text path is done).
 |---|---|---|---|
 | load | 10 s | 2.5 s | 0.25 s (mmap) |
 | prompt (5 tok) | 2.5 s | **0.38 s** | 0.08 s |
-| decode | re-prefilled (288 ms/tok) | **cached+batched+fused — 179 ms/tok** | 22 ms/tok |
+| decode | re-prefilled (288 ms/tok) | **cached+batched+fused — 171 ms/tok** | 22 ms/tok |
 | Q2_0 matmul (cold) | ~70 GB/s | **~101–186 GB/s** | — (ceiling: 325 GB/s) |
 
-Decode is ~179 ms/token against llama.cpp's 22 ms — ~8× off (was ~32×). The honest claim stays
+Decode is ~171 ms/token against llama.cpp's 22 ms — ~8× off (was ~32×). The honest claim stays
 **"Ferric runs Bonsai-27B correctly,"** not that it matches llama.cpp's speed.
 
 ### What the perf work actually taught (measured, not assumed)
