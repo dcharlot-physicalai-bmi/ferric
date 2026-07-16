@@ -1,0 +1,101 @@
+<!doctype html><html lang=en><head><meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Ferric · a ternary LLM in your browser</title>
+<style>
+  :root { --bg:#0b0e14; --fg:#e6e6e6; --dim:#8a93a6; --accent:#e5b567; --card:#131822; --line:#232a38; }
+  @media (prefers-color-scheme:light){ :root{ --bg:#f7f8fa; --fg:#1a1d24; --dim:#5a6270; --accent:#b6883a; --card:#fff; --line:#e2e6ee; } }
+  * { box-sizing:border-box; } html,body{ margin:0; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:820px; margin:0 auto; padding:clamp(20px,5vw,56px) 20px 80px; }
+  h1 { font-size:clamp(24px,4vw,34px); line-height:1.15; margin:0 0 6px; letter-spacing:-.02em; }
+  .sub { color:var(--dim); margin:0 0 28px; }
+  .accent { color:var(--accent); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin:16px 0; }
+  label { font-size:13px; color:var(--dim); display:block; margin-bottom:6px; }
+  textarea,input { width:100%; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:9px; padding:11px 13px; font:inherit; }
+  textarea { resize:vertical; min-height:52px; }
+  .row { display:flex; gap:12px; align-items:end; flex-wrap:wrap; margin-top:12px; }
+  .row > div { flex:1; min-width:120px; }
+  button { background:var(--accent); color:#0b0e14; border:0; border-radius:9px; padding:11px 22px; font:600 15px/1 inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #out { white-space:pre-wrap; word-break:break-word; min-height:96px; font-size:17px; }
+  #out .prompt { color:var(--dim); }
+  #cursor { display:inline-block; width:8px; height:19px; background:var(--accent); vertical-align:-3px; animation:blink 1s steps(2) infinite; }
+  @keyframes blink { 0%,50%{opacity:1} 50.01%,100%{opacity:0} }
+  .status { color:var(--dim); font-size:13px; min-height:18px; margin-top:10px; }
+  .stats { display:flex; gap:22px; flex-wrap:wrap; margin-top:12px; font-size:13px; color:var(--dim); }
+  .stats b { color:var(--fg); font-variant-numeric:tabular-nums; }
+  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; }
+  .bar>i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  code { background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:1px 5px; font-size:13px; }
+  a { color:var(--accent); }
+  footer { color:var(--dim); font-size:13px; margin-top:32px; }
+</style></head><body><div class=wrap>
+  <h1>A <span class=accent>ternary LLM</span>, running in this browser tab.</h1>
+  <p class=sub>PrismML <b>Ternary Bonsai 1.7B</b> — every weight is <span class=accent>−1, 0, or +1</span> — executing on your GPU via WebGPU. The exact same pure-Rust code (Ferric) runs this natively and here in WASM. Nothing is sent to a server; the model downloads once and inference is local.</p>
+
+  <div class=card>
+    <label for=prompt>Prompt</label>
+    <textarea id=prompt>The three laws of robotics are</textarea>
+    <div class=row>
+      <div style="flex:0 0 96px"><label for=steps>Tokens</label><input id=steps type=number value=48 min=1 max=256></div>
+      <div style="flex:0 0 auto"><button id=go>Generate</button></div>
+    </div>
+    <div class=bar id=barwrap style=display:none><i id=bar></i></div>
+    <div class=status id=status>Click Generate — first run downloads the ~442&nbsp;MB model (cached after).</div>
+  </div>
+
+  <div class=card>
+    <div id=out><span class=prompt></span><span id=gen></span><span id=cursor style=display:none></span></div>
+    <div class=stats id=stats></div>
+  </div>
+
+  <footer>
+    Model: <a href="https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf">prism-ml/Ternary-Bonsai-1.7B</a> ·
+    Engine: <a href="https://github.com/dcharlot-physicalai-bmi/ferric">Ferric</a> (pure Rust, one codebase native + browser) ·
+    Q2_0 ternary weights stay packed on the GPU at 2.125 bits/weight.
+  </footer>
+</div>
+<script type=module>
+import init, { bonsai_stream } from './pkg/ferric_web.js';
+const MODEL = new URLSearchParams(location.search).get('model')
+  || 'https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/main/Ternary-Bonsai-1.7B-Q2_0.gguf';
+const $ = id => document.getElementById(id);
+let modelBytes = null, ready = false;
+
+async function ensureInit(){ if(ready) return; await init(); ready = true; }
+
+async function fetchModel(){
+  if(modelBytes) return modelBytes;
+  $('barwrap').style.display='block';
+  const r = await fetch(MODEL);
+  const total = +r.headers.get('content-length') || 463290464;
+  const reader = r.body.getReader(); const chunks=[]; let got=0;
+  for(;;){ const {done,value}=await reader.read(); if(done) break; chunks.push(value); got+=value.length;
+    $('bar').style.width = (100*got/total).toFixed(1)+'%';
+    $('status').textContent = `downloading model… ${(got/1048576|0)} / ${(total/1048576|0)} MB`; }
+  const buf = new Uint8Array(got); let o=0; for(const c of chunks){ buf.set(c,o); o+=c.length; }
+  modelBytes = buf; $('barwrap').style.display='none'; return buf;
+}
+
+$('go').onclick = async () => {
+  const btn=$('go'); btn.disabled=true;
+  try {
+    if(!navigator.gpu){ $('status').textContent='This browser has no WebGPU. Try Chrome/Edge 113+ or Safari 18+.'; btn.disabled=false; return; }
+    await ensureInit();
+    const bytes = await fetchModel();
+    const prompt = $('prompt').value, steps = Math.max(1, Math.min(256, +$('steps').value||48));
+    $('out').querySelector('.prompt').textContent = prompt;
+    $('gen').textContent=''; $('cursor').style.display='inline-block';
+    const onEvt = (kind, payload) => {
+      if(kind==='status') $('status').textContent = payload;
+      else if(kind==='token') $('gen').textContent += payload;
+      else if(kind==='done'){ const s=JSON.parse(payload);
+        $('stats').innerHTML = `<span>backend <b>${s.backend}</b></span><span>load <b>${s.load_ms|0}ms</b></span><span>prompt <b>${s.prompt_ms|0}ms</b></span><span>decode <b>${s.decode_ms.toFixed(1)} ms/tok</b></span><span><b>${(1000/s.decode_ms).toFixed(0)}</b> tok/s</span>`;
+        $('status').textContent = 'done · fully local, on your GPU'; }
+    };
+    await bonsai_stream(bytes, prompt, steps, onEvt);
+  } catch(e){ $('status').textContent = 'error: '+(e.message||e); }
+  finally { $('cursor').style.display='none'; btn.disabled=false; }
+};
+</script></body></html>

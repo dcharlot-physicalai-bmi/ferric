@@ -1,2 +1,4 @@
 bonsai-1.7b.gguf
 *.gguf
+site/pkg/
+site/bonsai-1.7b.gguf

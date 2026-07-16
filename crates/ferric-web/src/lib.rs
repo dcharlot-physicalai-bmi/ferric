@@ -91,18 +91,7 @@ pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> st
 
     let t_load = js_sys::Date::now();
     let g = parse(model).map_err(err)?;
-
-    // Exact BPE from the tokenizer embedded in the GGUF.
-    let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
-        Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
-        _ => return Err(err("no tokens".into())),
-    };
-    let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
-    let merges: Vec<(String, String)> = match g.metadata().get("tokenizer.ggml.merges") {
-        Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),
-        _ => return Err(err("no merges".into())),
-    };
-    let bpe = Bpe::new(vocab, &merges);
+    let (bpe, toks) = build_bpe(&g)?;
     let u2b = gpt2_byte_decoder();
     let detok = |ids: &[u32]| -> String {
         let s: String = ids.iter().map(|&i| toks.get(i as usize).cloned().unwrap_or_default()).collect();
@@ -138,6 +127,80 @@ pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> st
         "{{\"backend\":\"{:?}\",\"adapter\":\"{}\",\"layers\":{},\"vocab\":{},\"prompt\":\"{}\",\"text\":\"{}\",\"load_ms\":{:.0},\"prompt_ms\":{:.0},\"decode_ms\":{:.1}}}",
         ctx.backend, ctx.adapter_name, c.n_layer, c.n_vocab, esc(&prompt), esc(&text), load_ms, prompt_ms, decode_ms
     ))
+}
+
+/// Streaming variant: same model, but invokes `on_token(text)` as each token is produced and
+/// `on_token` may also carry progress. Returns final JSON stats. `on_token` is a JS function
+/// `(kind: string, payload: string) => void` — kind ∈ {"status","token","done"}.
+#[wasm_bindgen]
+pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    let err = |e: String| JsValue::from_str(&e);
+    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(kind), &JsValue::from_str(payload)); };
+
+    emit("status", "parsing model…");
+    let t_load = js_sys::Date::now();
+    let g = parse(model).map_err(err)?;
+    let (bpe, toks) = build_bpe(&g)?;
+    let u2b = gpt2_byte_decoder();
+    let detok = |ids: &[u32]| -> String {
+        let s: String = ids.iter().map(|&i| toks.get(i as usize).cloned().unwrap_or_default()).collect();
+        String::from_utf8_lossy(&s.chars().filter_map(|c| u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
+    };
+
+    emit("status", "uploading weights to GPU…");
+    let ctx = Arc::new(Context::new().await.map_err(err)?);
+    let m = Qwen3::load(&ctx, &g).map_err(err)?;
+    let c = &m.cfg;
+    let load_ms = js_sys::Date::now() - t_load;
+    emit("status", &format!("ready · {} layers · {:?} · {:.0}ms", c.n_layer, ctx.backend, load_ms));
+
+    let ids = bpe.encode(&prompt);
+    if ids.is_empty() { return Err(err("prompt encoded to zero tokens".into())); }
+
+    let mut cache = Cache::new(c);
+    let mut seq = ids.clone();
+    let argmax = |row: &[f32]| (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+    let t_prompt = js_sys::Date::now();
+    let mut prompt_ms = 0.0;
+    // Detokenize the whole generated run each step and emit the new suffix — robust to BPE tokens
+    // that split a multi-byte UTF-8 char across steps (the partial simply completes next step).
+    let mut emitted = String::new();
+    for step in 0..steps {
+        let logits = if step == 0 { m.forward_cached(&ids, &mut cache) } else { m.forward_cached(&seq[seq.len() - 1..], &mut cache) };
+        let v = logits.to_vec().await;
+        let next = argmax(&v[v.len() - c.n_vocab..]);
+        if step == 0 { prompt_ms = js_sys::Date::now() - t_prompt; }
+        seq.push(next);
+        let full = detok(&seq[ids.len()..]);
+        if let Some(delta) = full.strip_prefix(&emitted) {
+            if !delta.is_empty() { emit("token", delta); }
+        }
+        emitted = full;
+        if next == 151645 || next == 151643 { break; }
+    }
+    let decode_ms = (js_sys::Date::now() - t_prompt - prompt_ms) / (steps.max(1) as f64);
+    let stats = format!(
+        "{{\"backend\":\"{:?}\",\"layers\":{},\"vocab\":{},\"load_ms\":{:.0},\"prompt_ms\":{:.0},\"decode_ms\":{:.1}}}",
+        ctx.backend, c.n_layer, c.n_vocab, load_ms, prompt_ms, decode_ms
+    );
+    emit("done", &stats);
+    Ok(stats)
+}
+
+/// Build the exact BPE (+ the raw token strings for detok) from a GGUF's embedded tokenizer.
+fn build_bpe(g: &impl GgufSource) -> std::result::Result<(Bpe, Vec<String>), JsValue> {
+    let err = |e: &str| JsValue::from_str(e);
+    let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
+        Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
+        _ => return Err(err("no tokens")),
+    };
+    let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+    let merges: Vec<(String, String)> = match g.metadata().get("tokenizer.ggml.merges") {
+        Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),
+        _ => return Err(err("no merges")),
+    };
+    Ok((Bpe::new(vocab, &merges), toks))
 }
 
 /// GPT-2 byte↔printable-unicode map, inverted — vocab entry chars back to raw bytes.
