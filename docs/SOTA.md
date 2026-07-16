@@ -44,9 +44,13 @@ Apple unified memory to skip the copy+repack that costs Ferric ~1.8 s warm. Clos
 work Ferric hasn't done: subgroup-level GEMV reductions, and a GPU-consumable on-disk layout so
 weights can be mapped rather than repacked.
 
-**Browser ceiling.** The moat is one codebase native↔browser, but WebGPU's per-buffer and total
-memory limits cap what runs in a tab — a 7 GB model doesn't. The browser path is proven on smaller
-models; a >4 GB model in-browser needs weight streaming/sharding Ferric doesn't have yet.
+**Browser ceiling.** The moat is one codebase native↔browser, and it is now demonstrated on a *real*
+model: **PrismML Ternary Bonsai 1.7B (Qwen3 dense, ternary Q2_0) generates in a browser tab on
+WebGPU** — the same `Qwen3` Rust code as native, fed a fetched `Vec<u8>` via `GgufSource`. Verified in
+headless Chrome: coherent output, **19.7 ms/token (~50 tok/s)**, load 279 ms. No mainstream project
+runs a ternary hybrid-family LLM in a tab. The remaining ceiling is size: WebGPU per-buffer/total
+memory limits cap what fits, so the 7 GB 27B needs weight streaming/sharding Ferric doesn't have yet
+(1.7B/4B are fine).
 
 *Closed since this section was first written:* GGUF + k-quants (Q4_K/Q6_K) and PrismML ternary
 (Q1_0/Q2_0/TQ2_0); an exact GPT-2/BPE tokenizer; the elementwise+matmul-epilogue **fusion compiler**
