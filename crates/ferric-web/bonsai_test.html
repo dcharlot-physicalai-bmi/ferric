@@ -1,0 +1,14 @@
+<!doctype html><meta charset=utf8><body><pre id=o>loading…</pre>
+<script type=module>
+import init, { bonsai_generate } from './pkg/ferric_web.js';
+const log = m => document.getElementById('o').textContent = m;
+window.__run = async () => {
+  await init();
+  if (!navigator.gpu) return 'NO_WEBGPU';
+  log('fetching model…');
+  const buf = new Uint8Array(await (await fetch('./bonsai-1.7b.gguf')).arrayBuffer());
+  log('generating… ('+buf.length+' bytes)');
+  const r = await bonsai_generate(buf, 'The capital of France is', 20);
+  log(r); return r;
+};
+</script></body>

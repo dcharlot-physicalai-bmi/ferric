@@ -1,7 +1,11 @@
 //! Ferric web — proves the SAME pure-Rust kernels (ferric-core) run in the browser on WebGPU.
 //! The matmul WGSL, the Context, the readback — all identical to native; only the target changes.
 use ferric_core::{demo, matmul_cpu, max_abs_diff, Context};
+use ferric_gguf::{parse, GgufSource, Meta};
+use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_tensor::Tensor;
+use ferric_tokenizer::Bpe;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
@@ -74,4 +78,76 @@ pub async fn ferric_lm_demo(prompt: String, steps: usize) -> std::result::Result
         "{{\"backend\":\"{:?}\",\"adapter\":\"{}\",\"prompt\":[{}],\"generated\":[{}],\"layers\":{},\"vocab\":{},\"logit_diff\":{:.3e},\"ms\":{:.1}}}",
         ctx.backend, ctx.adapter_name, js(&ids), js(&generated), demo::N_LAYERS, demo::VOCAB, diff, ms
     ))
+}
+
+/// **The moat, demonstrated.** Runs a real PrismML Ternary Bonsai (Qwen3 dense, Q2_0) *entirely in
+/// the browser tab* on WebGPU — the exact same `Qwen3` code that runs natively, compiled to wasm32.
+/// `model` is the fetched .gguf bytes; greedily continues `prompt` for `steps` tokens.
+/// Returns JSON {backend, adapter, layers, vocab, prompt, text, load_ms, prompt_ms, decode_ms}.
+#[wasm_bindgen]
+pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    let err = |e: String| JsValue::from_str(&e);
+
+    let t_load = js_sys::Date::now();
+    let g = parse(model).map_err(err)?;
+
+    // Exact BPE from the tokenizer embedded in the GGUF.
+    let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
+        Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
+        _ => return Err(err("no tokens".into())),
+    };
+    let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+    let merges: Vec<(String, String)> = match g.metadata().get("tokenizer.ggml.merges") {
+        Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),
+        _ => return Err(err("no merges".into())),
+    };
+    let bpe = Bpe::new(vocab, &merges);
+    let u2b = gpt2_byte_decoder();
+    let detok = |ids: &[u32]| -> String {
+        let s: String = ids.iter().map(|&i| toks.get(i as usize).cloned().unwrap_or_default()).collect();
+        String::from_utf8_lossy(&s.chars().filter_map(|c| u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
+    };
+
+    let ctx = Arc::new(Context::new().await.map_err(err)?);
+    let m = Qwen3::load(&ctx, &g).map_err(err)?;
+    let c = &m.cfg;
+    let load_ms = js_sys::Date::now() - t_load;
+
+    let ids = bpe.encode(&prompt);
+    if ids.is_empty() { return Err(err("prompt encoded to zero tokens".into())); }
+
+    let mut cache = Cache::new(c);
+    let mut seq = ids.clone();
+    let argmax = |row: &[f32]| (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+
+    let t_prompt = js_sys::Date::now();
+    let mut prompt_ms = 0.0;
+    for step in 0..steps {
+        let logits = if step == 0 { m.forward_cached(&ids, &mut cache) } else { m.forward_cached(&seq[seq.len() - 1..], &mut cache) };
+        let v = logits.to_vec().await;
+        let next = argmax(&v[v.len() - c.n_vocab..]);
+        if step == 0 { prompt_ms = js_sys::Date::now() - t_prompt; }
+        seq.push(next);
+        if next == 151645 || next == 151643 { break; }
+    }
+    let decode_ms = (js_sys::Date::now() - t_prompt - prompt_ms) / (steps.max(1) as f64);
+    let text = detok(&seq);
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    Ok(format!(
+        "{{\"backend\":\"{:?}\",\"adapter\":\"{}\",\"layers\":{},\"vocab\":{},\"prompt\":\"{}\",\"text\":\"{}\",\"load_ms\":{:.0},\"prompt_ms\":{:.0},\"decode_ms\":{:.1}}}",
+        ctx.backend, ctx.adapter_name, c.n_layer, c.n_vocab, esc(&prompt), esc(&text), load_ms, prompt_ms, decode_ms
+    ))
+}
+
+/// GPT-2 byte↔printable-unicode map, inverted — vocab entry chars back to raw bytes.
+fn gpt2_byte_decoder() -> HashMap<char, u8> {
+    let mut m = HashMap::new();
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        let printable = (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
+        let c = if printable { b } else { let c = 256 + n; n += 1; c };
+        m.insert(char::from_u32(c).unwrap(), b as u8);
+    }
+    m
 }
