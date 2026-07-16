@@ -68,15 +68,13 @@ Bonsai's 4-bit HQQ **vision tower** (the text path is done).
 
 | | Ferric (first run) | Ferric (now) | llama.cpp (Metal) |
 |---|---|---|---|
-| load | 10 s | 6 s | 0.25 s (mmap) |
-| prefill (5 tok) | 2.5 s | **1.35 s** | 0.08 s |
-| decode | re-prefilled (17.3 s / 12 tok) | **cached — 3.8 s / 12 tok** | 0.26 s / 12 tok |
+| load | 10 s | 4 s | 0.25 s (mmap) |
+| prompt (5 tok) | 2.5 s | **0.53 s** | 0.08 s |
+| decode | re-prefilled (17.3 s / 12 tok) | **cached — 3.5 s / 12 tok** | 0.26 s / 12 tok |
+| Q2_0 matmul (cold) | ~70 GB/s | **~101–186 GB/s** | — (ceiling: 325 GB/s) |
 
-Decode is ~290 ms/token against llama.cpp's 22 ms — still ~13× off (was ~32×). The remaining causes
-are known: every op is its own dispatch (the fusion compiler isn't applied to this path yet), the KV
-cache re-concatenates rather than writing into a reserved buffer, and load re-uploads instead of
-mmap-ing. The honest claim stays **"Ferric runs Bonsai-27B correctly,"** not that it matches
-llama.cpp's speed.
+Decode is ~268 ms/token against llama.cpp's 22 ms — ~12× off (was ~32×). The honest claim stays
+**"Ferric runs Bonsai-27B correctly,"** not that it matches llama.cpp's speed.
 
 ### What the perf work actually taught (measured, not assumed)
 1. **The 34-byte Q2_0 block is hostile to a GPU.** `f16 d` + 32 code bytes isn't a multiple of 4, so
@@ -104,11 +102,27 @@ llama.cpp's speed.
 6. **Per-dispatch overhead is real but not the story:** ~0.06 ms for a trivial op × ~640 ops/token
    ≈ 38 ms, about 13% of decode.
 
-**So the remaining 13× is DRAM throughput, not kernel cleverness.** We stream 7.17 GB/token at
-~30–70 GB/s; llama.cpp's Metal kernels hit ~326 GB/s (≈90% of roofline) and so decode in 22 ms.
-Closing that needs the things a mature kernel does — more outputs per thread, simdgroup reductions,
-vectorized f32 activation loads — not another selector tweak. Measured, not assumed, is the rule:
-three separate conclusions here died on contact with a correct measurement.
+7. **Find the wall before climbing it.** A shader that only reads (512 MB buffer, far bigger than
+   any cache) hits **239 GB/s scalar / 325 GB/s vec4** — llama.cpp streams Bonsai at ~326 GB/s, so
+   WGSL reaches the same roofline and the memory path was never our wall. Our matmul sat at 22% of
+   bandwidth *and* 22% of ALU: at 22% of both, it was **latency-bound**, and the fix had to be in the
+   inner loop.
+8. **It was the activation loads, not the weights.** The scalar form issues 16 `x` loads per code
+   word — 5120 per output against 320 code loads — so `x` dominated the instruction stream and
+   starved the kernel of issue slots. Reading `x` as `vec4<f32>` and reducing each 4 weights with
+   `dot()` took the cold LM head from **70.5 → 101 GB/s** (1 token) and **80.9 → 181 GB/s**
+   (5 tokens); `ffn_gate` @5 tokens 77.5 → **186.5 GB/s**. From 22% to ~57% of roofline.
+9. **The textbook fix lost.** Output-major (transposed) weights make adjacent threads read adjacent
+   words — and measured *worse* (cold LM head 70.5 → 49.1 GB/s). Row-major already works because each
+   thread streams 1280 contiguous bytes and consumes whole cache lines on its own; coalescing across
+   threads buys nothing, while output-major scatters each thread's own stream ~1 MB per step.
+
+**Where decode time goes now** (~268 ms/token): ~110 ms matmuls, ~14 ms gated-delta-net
+(`examples/bench_gdn` — measured, because it was the natural suspect and is *not* the bottleneck),
+~38 ms dispatch overhead, and the balance spread across ~640 small ops. Nothing dominates any more,
+so the next lever is **fusion and buffer pooling** — fewer, bigger dispatches — not another kernel
+tweak. Measured-not-assumed is the rule here: five separate conclusions in this section died on
+contact with a correct measurement, including two of the "obvious" optimizations.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
