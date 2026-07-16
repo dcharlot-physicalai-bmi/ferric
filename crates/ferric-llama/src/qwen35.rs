@@ -82,19 +82,21 @@ impl Cfg {
 }
 
 pub struct AttnW {
-    pub wq: Q2_0Weights, // [n_head·head_dim·2, n_embd] — query and gate, interleaved per head
-    pub wk: Q2_0Weights,
-    pub wv: Q2_0Weights,
+    pub wqkv: Q2_0Weights, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
+    pub q_out: usize,      // n_head·head_dim·2 (query and gate, interleaved per head)
+    pub kv_out: usize,     // n_head_kv·head_dim (each of k and v)
     pub wo: Q2_0Weights,
     pub q_norm: Tensor,
     pub k_norm: Tensor,
 }
 
 pub struct GdnW {
-    pub wqkv: Q2_0Weights, // [2·key_dim + d_inner, n_embd]
-    pub wz: Q2_0Weights,   // [d_inner, n_embd]
-    pub beta: Q2_0Weights, // [n_v_heads, n_embd]
-    pub alpha: Q2_0Weights,
+    // in_proj = qkv | z | alpha | beta stacked: the four projections all read the same h, so one
+    // fused matmul replaces four (48 GDN layers × 4 → 1).
+    pub in_proj: Q2_0Weights,
+    pub qkv_out: usize, // 2·key_dim + d_inner
+    pub z_out: usize,   // d_inner
+    pub ba_out: usize,  // n_v_heads (each of alpha, beta)
     pub conv1d: Tensor,  // [conv_dim, L]
     pub dt_bias: Tensor, // [n_v_heads]
     pub a: Tensor,       // [n_v_heads] — already -exp(A_log)
@@ -125,8 +127,8 @@ impl Cache {
 pub struct Layer {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
-    pub ffn_gate: Q2_0Weights,
-    pub ffn_up: Q2_0Weights,
+    pub ffn_gate_up: Q2_0Weights, // gate stacked over up: one matmul, then split
+    pub ffn_gate_out: usize,      // where gate ends / up begins in the fused output
     pub ffn_down: Q2_0Weights,
     pub mixer: Mixer,
 }
@@ -151,6 +153,26 @@ fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Weights, Strin
     Ok(Q2_0Weights::from_bytes(ctx, &g.raw(name)?, out, inn))
 }
 
+/// Stack several same-input `[out, in]` weights along the output dim into one `[Σout, in]`.
+/// Q2_0 is row-major (each output row is a contiguous run of 34-byte blocks), so stacking outputs
+/// is literally concatenating the raw byte streams — no repacking. One fused matmul over the group
+/// beats the separate ones at decode width (1.79× measured on gate+up), because a lone-token GEMV
+/// is occupancy-starved and merging the output counts fills the machine.
+fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result<Q2_0Weights, String> {
+    let mut inn = None;
+    let mut out = 0usize;
+    let mut raw = Vec::new();
+    for &name in names {
+        let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        if t.ggml_type != 42 { return Err(format!("{name}: expected Q2_0 (42), got {}", t.ggml_type)); }
+        let i = t.dims[0] as usize;
+        if *inn.get_or_insert(i) != i { return Err(format!("{name}: input dim differs")); }
+        out += t.dims[1] as usize;
+        raw.extend(g.raw(name)?);
+    }
+    Ok(Q2_0Weights::from_bytes(ctx, &raw, out, inn.unwrap()))
+}
+
 fn f32t(ctx: &Arc<Context>, g: &GgufFile, name: &str, shape: &[usize]) -> Result<Tensor, String> {
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, shape))
 }
@@ -165,10 +187,10 @@ impl Qwen35 {
             let b = |s: &str| format!("blk.{il}.{s}");
             let mixer = if cfg.is_recurrent(il) {
                 Mixer::Gdn(GdnW {
-                    wqkv: q2(ctx, g, &b("attn_qkv.weight"))?,
-                    wz: q2(ctx, g, &b("attn_gate.weight"))?,
-                    beta: q2(ctx, g, &b("ssm_beta.weight"))?,
-                    alpha: q2(ctx, g, &b("ssm_alpha.weight"))?,
+                    in_proj: q2_cat(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
+                    qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
+                    z_out: g.tensor(&b("attn_gate.weight")).ok_or("no attn_gate")?.dims[1] as usize,
+                    ba_out: g.tensor(&b("ssm_alpha.weight")).ok_or("no ssm_alpha")?.dims[1] as usize,
                     conv1d: f32t(ctx, g, &b("ssm_conv1d.weight"), &[conv_dim, cfg.conv_kernel])?,
                     dt_bias: f32t(ctx, g, &b("ssm_dt.bias"), &[cfg.n_v_heads])?,
                     a: f32t(ctx, g, &b("ssm_a"), &[cfg.n_v_heads])?,
@@ -177,9 +199,9 @@ impl Qwen35 {
                 })
             } else {
                 Mixer::Attn(AttnW {
-                    wq: q2(ctx, g, &b("attn_q.weight"))?,
-                    wk: q2(ctx, g, &b("attn_k.weight"))?,
-                    wv: q2(ctx, g, &b("attn_v.weight"))?,
+                    wqkv: q2_cat(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                    q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
+                    kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
                     wo: q2(ctx, g, &b("attn_output.weight"))?,
                     q_norm: f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?,
@@ -188,8 +210,8 @@ impl Qwen35 {
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 post_norm: f32t(ctx, g, &b("post_attention_norm.weight"), &[cfg.n_embd])?,
-                ffn_gate: q2(ctx, g, &b("ffn_gate.weight"))?,
-                ffn_up: q2(ctx, g, &b("ffn_up.weight"))?,
+                ffn_gate_up: q2_cat(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+                ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
                 ffn_down: q2(ctx, g, &b("ffn_down.weight"))?,
                 mixer,
             });
@@ -229,14 +251,15 @@ impl Qwen35 {
 
     fn attn(&self, h: &Tensor, w: &AttnW, cache: &mut Option<LayerCache>, offset: usize) -> Tensor {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
-        // One projection emits query and gate interleaved per head: [t, nh, 2·hd].
-        let qf = h.matmul_q2_0(&w.wq).reshape(&[t, nh, hd * 2]);
+        let nkv = self.cfg.n_head_kv;
+        // One fused matmul emits [q_and_gate | k | v]; split it back out.
+        let qkv = h.matmul_q2_0(&w.wqkv);
+        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[t, nh, hd * 2]);
         let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
         let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[t, nh * hd]);
 
-        let nkv = self.cfg.n_head_kv;
-        let k = h.matmul_q2_0(&w.wk).reshape(&[t, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[t, nkv * hd]);
-        let v = h.matmul_q2_0(&w.wv);
+        let k = qkv.narrow(1, w.q_out, w.kv_out).reshape(&[t, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[t, nkv * hd]);
+        let v = qkv.narrow(1, w.q_out + w.kv_out, w.kv_out).contiguous();
 
         let q = self.rope_partial(&q, nh, offset);
         let k = self.rope_partial(&k, nkv, offset);
@@ -261,9 +284,17 @@ impl Qwen35 {
         let (t, nk, nv) = (h.shape[0], c.n_k_heads, c.n_v_heads);
         let (dk, dv, kd) = (c.head_k_dim, c.head_v_dim(), c.key_dim());
 
+        // One fused matmul emits [qkv | z | alpha | beta]; split it back out. qkv feeds the conv,
+        // the rest are used as-is.
+        let proj = h.matmul_q2_0(&w.in_proj);
+        let (qo, zo, bo) = (w.qkv_out, w.z_out, w.ba_out);
+        let qkv = proj.narrow(1, 0, qo).contiguous();
+        let z = proj.narrow(1, qo, zo);
+        let alpha_raw = proj.narrow(1, qo + zo, bo);
+        let beta_raw = proj.narrow(1, qo + zo + bo, bo);
+
         // conv over the whole fused q|k|v, then split — the conv is causal and depthwise, so
         // splitting after it is identical to convolving each part separately.
-        let qkv = h.matmul_q2_0(&w.wqkv);
         // The short conv looks back conv_kernel-1 steps, so a single new token can't be convolved
         // alone: prepend the carried tail (zeros at the start of a sequence, which is exactly the
         // causal zero-padding the standalone conv applies) and keep only the new rows.
@@ -288,20 +319,25 @@ impl Qwen35 {
         let (q, k) = (tile(&q), tile(&k));
 
         // g = ssm_a · softplus(alpha + dt_bias) ; β = sigmoid(beta). Packed as [T, nv, 2] for the kernel.
-        let alpha = h.matmul_q2_0(&w.alpha).add(&w.dt_bias.reshape(&[1, nv])).softplus().mul(&w.a.reshape(&[1, nv]));
-        let beta = h.matmul_q2_0(&w.beta).sigmoid();
+        let alpha = alpha_raw.add(&w.dt_bias.reshape(&[1, nv])).softplus().mul(&w.a.reshape(&[1, nv]));
+        let beta = beta_raw.sigmoid();
         let gb = alpha.reshape(&[t, nv, 1]).cat(&beta.reshape(&[t, nv, 1]), 2);
 
         let (o, state) = q.gated_delta_rule_stateful(&k, &v, &gb, nv, dk, dv, prev_state.as_ref());
         *cache = Some(LayerCache::Gdn { state, conv: conv_tail });
 
         // gated RMSNorm over head_v_dim, gated by silu(z)
-        let z = h.matmul_q2_0(&w.wz).reshape(&[t, nv, dv]);
+        let z = z.reshape(&[t, nv, dv]);
         o.rmsnorm(&w.norm, c.eps).mul(&z.silu()).reshape(&[t, c.d_inner]).matmul_q2_0(&w.out)
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
-        h.matmul_q2_0(&l.ffn_gate).silu().mul(&h.matmul_q2_0(&l.ffn_up)).matmul_q2_0(&l.ffn_down)
+        // One matmul emits [gate | up]; split, SwiGLU, project down.
+        let gu = h.matmul_q2_0(&l.ffn_gate_up);
+        let d = l.ffn_gate_out;
+        let gate = gu.narrow(1, 0, d);
+        let up = gu.narrow(1, d, d);
+        gate.silu().mul(&up).matmul_q2_0(&l.ffn_down)
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).
