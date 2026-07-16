@@ -261,16 +261,28 @@ impl Q2_0Weights {
     pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q2_0Weights {
         assert_eq!(cols % 128, 0, "Q2_0 rows must be a multiple of 128");
         assert_eq!(bytes.len(), rows * (cols / 128) * 34, "unexpected Q2_0 byte length");
-        let nblk = rows * (cols / 128);
+        let bpr = cols / 128; // blocks per output row
+        let nblk = rows * bpr;
         let mut codes: Vec<u32> = vec![0; nblk * 8];
         let mut scales: Vec<u32> = vec![0; nblk.div_ceil(2)];
+        // **Output-major (transposed) layout.** In a GEMV every weight byte is read exactly once, so
+        // the only way to coalesce is for adjacent *threads* to read adjacent bytes — and adjacent
+        // threads own adjacent outputs. Indexing by [word][output] rather than [output][word] lets a
+        // 32-wide SIMD group sweep one contiguous run while each thread still owns a whole output:
+        // no reduction, no barriers, full work per thread. Row-major forces a choice between the
+        // two — threads-per-output land 1280 B apart, and split-K coalesces but leaves ~5 words per
+        // thread against a 6-barrier tree. Both measured ~70 GB/s against a 325 GB/s ceiling.
+        let transposed = q2_0_transposed();
         for b in 0..nblk {
             let src = &bytes[b * 34..b * 34 + 34];
+            let (o, blk) = (b / bpr, b % bpr); // this block belongs to output o
             let d = u16::from_le_bytes([src[0], src[1]]) as u32;
-            scales[b / 2] |= d << (16 * (b % 2));
+            let si = if transposed { blk * rows + o } else { b };
+            scales[si / 2] |= d << (16 * (si % 2));
             for w in 0..8 {
                 let c = &src[2 + w * 4..2 + w * 4 + 4];
-                codes[b * 8 + w] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let ci = if transposed { (blk * 8 + w) * rows + o } else { b * 8 + w };
+                codes[ci] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }
         }
         let mk = |label, data: &[u32]| {
@@ -307,7 +319,12 @@ impl Tensor {
             let wg = n.div_ceil(64);
             let gw = wg.min(32768);
             let gh = wg.div_ceil(gw);
-            run(&self.ctx, MATMUL_Q2_0_FLAT_WGSL, "matmul_q2_0_flat",
+            let (wgsl, label) = if q2_0_transposed() {
+                (MATMUL_Q2_0_TRANS_WGSL, "matmul_q2_0_trans")
+            } else {
+                (MATMUL_Q2_0_FLAT_WGSL, "matmul_q2_0_flat")
+            };
+            run(&self.ctx, wgsl, label,
                 &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
                 (gw as u32, gh as u32, 1));
@@ -324,28 +341,78 @@ impl Tensor {
 ///   gdn qkv  5120→10240,  5 tokens  flat 0.90 ms → split-K 1.46 ms   (1.6× slower)
 ///
 /// Flat gives one thread per output, so a small output count (decode, one token) leaves the GPU
-/// starved and split-K's 64×-more-threads wins. Once the output count is large (prefill), flat
-/// already saturates and split-K's barriers are pure overhead. The crossover moved to ~32K outputs
-/// once split-K became coalesced; 32768 is the value that separates the real cases:
-///   1 token  ffn_gate  (n= 17408) → split-K 0.74 ms vs flat 0.84
-///   1 token  lm_head   (n=248320) → flat     4.79 ms vs split-K 5.05
-///   5 tokens gdn qkv   (n= 51200) → flat     0.89 ms vs split-K 0.99
-/// `FERRIC_Q2_0_KERNEL=flat|splitk` forces one, for benchmarking.
+/// starved and split-K's 64×-more-threads wins. Once the output count is large, flat already
+/// saturates and split-K's barriers are pure overhead. Measured with vec4 activation loads in both:
+///   1 token  ffn_down (n=  5120) → split-K 0.19 ms vs flat 0.42   (split-K 2.2× faster)
+///   1 token  attn q   (n= 12288) → split-K 0.16 ms vs flat 0.18
+///   1 token  ffn_gate (n= 17408) → flat     0.50 ms vs split-K 0.58
+///   5 tokens lm_head  (n=1.2M)   → flat     9.30 ms vs split-K 18.70 (flat 2× faster)
+/// `FERRIC_Q2_0_KERNEL=flat|splitk|trans` forces one, for benchmarking.
 fn q2_0_split_k(n_out: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
-        Ok("flat") => false,
+        Ok("flat") | Ok("trans") => false,
         Ok("splitk") => true,
-        _ => n_out < 32768,
+        _ => n_out < 16384,
     }
 }
+
+/// Whether weights are uploaded output-major. This is a *layout* choice made at upload, so the
+/// kernel must agree with it.
+///
+/// **Not the default: measured slower.** Output-major makes adjacent threads read adjacent words,
+/// which is the textbook GEMV fix — but it *lost* (cold LM head 70.5 → 49.1 GB/s). Row-major is
+/// already fine here because each thread streams 1280 contiguous bytes and consumes whole cache
+/// lines on its own; coalescing across threads buys nothing, while output-major scatters each
+/// thread's own stream ~1 MB per step. Kept behind `FERRIC_Q2_0_KERNEL=trans` as evidence.
+fn q2_0_transposed() -> bool { matches!(std::env::var("FERRIC_Q2_0_KERNEL").as_deref(), Ok("trans")) }
+
+/// Output-major GEMV: one thread per output, walking all of K. Adjacent threads read adjacent
+/// words, so a SIMD group's loads coalesce into one contiguous run — the property split-K bought
+/// with barriers, obtained here for free from the layout.
+const MATMUL_Q2_0_TRANS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;   // [word][output]
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;   // [block][output], f16 x2 per u32
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;    // rows, out, in, threads_per_grid_row
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;   // adjacent idx → adjacent o → adjacent addresses
+    let nblk = in_dim / 128u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let si = blk * o_dim + o;
+        let sw = unpack2x16float(scales[si >> 1u]);
+        let d = select(sw.y, sw.x, (si & 1u) == 0u);
+        let xbase = r * in_dim + blk * 128u;
+        var bacc = 0.0;
+        for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+            let word = codes[(blk * 8u + w) * o_dim + o];   // coalesced across threads
+            let xb = xbase + w * 16u;
+            for (var b: u32 = 0u; b < 16u; b = b + 1u) {
+                bacc = bacc + x[xb + b] * f32(i32((word >> (2u * b)) & 3u) - 1);
+            }
+        }
+        acc = acc + bacc * d;   // block scale is constant over the 128-group
+    }
+    out[idx] = acc;
+}
+"#;
 
 /// One thread per output element, walking all of K itself. No barriers, but a long dependent
 /// accumulate chain and only `rows·out` threads in flight.
 ///
 /// Dispatched 2D: a 1D grid caps at 65535 workgroups = 4.19M threads, which a real LM head blows
 /// straight through (17 tokens × 248320 vocab = 4.22M outputs → 65960 workgroups).
+/// `x` is read as `vec4<f32>`, four activations per load, and each group of four weights is reduced
+/// with `dot()`. The scalar form issues **16 x-loads per code word** — 5120 per output against only
+/// 320 code loads — so the activation loads, not the weights, dominate the instruction stream.
+/// Every thread in a wave reads the same `x` (same token), so these all hit cache; the cost is
+/// issue slots, not bandwidth, which is exactly what a latency-bound kernel cannot afford.
 const MATMUL_Q2_0_FLAT_WGSL: &str = r#"
-@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
 @group(0) @binding(2) var<storage,read>        scales: array<u32>;
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
@@ -362,13 +429,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sw = unpack2x16float(scales[bi >> 1u]);
         let d = select(sw.y, sw.x, (bi & 1u) == 0u);
         let cbase = bi * 8u;
-        let xbase = r * in_dim + blk * 128u;
+        let xq = (r * in_dim + blk * 128u) >> 2u;   // vec4 index of this 128-group
         var bacc = 0.0;
         for (var w: u32 = 0u; w < 8u; w = w + 1u) {
-            let word = codes[cbase + w];
-            let xb = xbase + w * 16u;
-            for (var b: u32 = 0u; b < 16u; b = b + 1u) {
-                bacc = bacc + x[xb + b] * f32(i32((word >> (2u * b)) & 3u) - 1);
+            let word = codes[cbase + w];            // 16 codes
+            for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+                let s = 8u * q;                     // codes 4q..4q+3 sit at bit offsets 8q..8q+6
+                let cv = vec4<f32>(
+                    f32(i32((word >> s) & 3u) - 1),
+                    f32(i32((word >> (s + 2u)) & 3u) - 1),
+                    f32(i32((word >> (s + 4u)) & 3u) - 1),
+                    f32(i32((word >> (s + 6u)) & 3u) - 1));
+                bacc = bacc + dot(x[xq + w * 4u + q], cv);   // w = (q−1)·d
             }
         }
         acc = acc + bacc * d;
@@ -385,7 +457,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // one. Splitting K gives 64× the parallelism and shortens each chain by 64×, and it makes adjacent
 // threads read adjacent code words instead of rows 1360 B apart.
 const MATMUL_Q2_0_SPLITK_WGSL: &str = r#"
-@group(0) @binding(0) var<storage,read>        x:      array<f32>;  // [rows, in]
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>; // [rows, in], 4/load
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;  // 8 u32/block, 16 codes per word
 @group(0) @binding(2) var<storage,read>        scales: array<u32>;  // f16/block, 2 packed per u32
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;  // [rows, out]
@@ -420,11 +492,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             let sw = unpack2x16float(scales[bi >> 1u]);
             let d = select(sw.y, sw.x, (bi & 1u) == 0u);
             let word = codes[wbase + w];        // coalesced; one load feeds 16 weights
-            let xb = r * in_dim + blk * 128u + (w & 7u) * 16u;
+            // Read x four at a time and reduce with dot(): the scalar form issues 16 activation
+            // loads per code word, which dominates the instruction stream and starves a
+            // latency-bound kernel of issue slots.
+            let xq = (r * in_dim + blk * 128u + (w & 7u) * 16u) >> 2u;
             var bacc = 0.0;
-            for (var b: u32 = 0u; b < 16u; b = b + 1u) {
-                let code = (word >> (2u * b)) & 3u;
-                bacc = bacc + x[xb + b] * f32(i32(code) - 1);   // w = (q−1)·d
+            for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+                let s = 8u * q;                 // codes 4q..4q+3 sit at bit offsets 8q..8q+6
+                let cv = vec4<f32>(
+                    f32(i32((word >> s) & 3u) - 1),
+                    f32(i32((word >> (s + 2u)) & 3u) - 1),
+                    f32(i32((word >> (s + 4u)) & 3u) - 1),
+                    f32(i32((word >> (s + 6u)) & 3u) - 1));
+                bacc = bacc + dot(x[xq + q], cv);   // w = (q−1)·d
             }
             acc = acc + bacc * d;   // the scale is constant across the 128-group
         }

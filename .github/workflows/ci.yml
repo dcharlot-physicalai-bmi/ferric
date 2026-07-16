@@ -76,6 +76,8 @@ jobs:
           cargo run -p ferric-tensor --example gdn_state
           cargo run -p ferric-tensor --example overhead
           cargo run -p ferric-tensor --example bandwidth
+          cargo run -p ferric-tensor --example bench_gdn
+          FERRIC_Q2_0_KERNEL=trans cargo run -p ferric-tensor --example q2_0
           cargo run -p ferric-tensor --example q2_0
           FERRIC_Q2_0_KERNEL=flat cargo run -p ferric-tensor --example q2_0
           FERRIC_Q2_0_KERNEL=splitk cargo run -p ferric-tensor --example q2_0
