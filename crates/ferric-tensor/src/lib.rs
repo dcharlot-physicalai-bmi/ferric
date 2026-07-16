@@ -519,6 +519,22 @@ fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> wgpu::ComputePipeline
         }).clone()
     })
 }
+thread_local! {
+    // Diagnostics: how many dispatches issued, and how many actual queue submits they cost.
+    // With batching those diverge — one submit can carry hundreds of dispatches.
+    static DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // When Some, run() records dispatches into this encoder instead of submitting each one. The
+    // Vec retains every bind group (and through it, the buffers) referenced by a recorded-but-
+    // unsubmitted pass — otherwise an intermediate tensor dropped mid-batch would free a buffer the
+    // encoder still points at, which wgpu rejects at submit as an invalid resource.
+    static BATCH: std::cell::RefCell<Option<(wgpu::CommandEncoder, Vec<wgpu::BindGroup>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// (dispatches, submits) issued so far on this thread.
+pub fn op_counters() -> (u64, u64) { (DISPATCHES.with(|c| c.get()), SUBMITS.with(|c| c.get())) }
+pub fn reset_op_counters() { DISPATCHES.with(|c| c.set(0)); SUBMITS.with(|c| c.set(0)); }
+
 fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32, u32, u32)) {
     let pipe = pipeline_for(ctx, wgsl, label);
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
@@ -526,16 +542,53 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
     });
-    let mut enc = ctx.device.create_command_encoder(&Default::default());
-    {
+    DISPATCHES.with(|c| c.set(c.get() + 1));
+    let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
         pass.set_pipeline(&pipe);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
+    };
+    // If a batch is open, append to it (retaining the bind group) and defer the submit; otherwise
+    // submit this op alone. `bg` comes back out when unbatched so it can be recorded standalone.
+    let bg = BATCH.with(|b| {
+        if let Some((enc, keep)) = b.borrow_mut().as_mut() { record(enc, &bg); keep.push(bg); None } else { Some(bg) }
+    });
+    if let Some(bg) = bg {
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        record(&mut enc, &bg);
+        ctx.queue.submit([enc.finish()]);
+        SUBMITS.with(|c| c.set(c.get() + 1));
     }
-    ctx.queue.submit([enc.finish()]);
+}
+
+/// Batch every dispatch issued inside `f` into a single command submission. Ops still run in issue
+/// order (compute passes on one queue execute serially), so results are identical — this only
+/// removes the per-op encoder+submit overhead, which dominates when a forward pass issues hundreds
+/// of small kernels. Buffers read inside `f` (`to_vec`) flush the batch first, so reads stay correct.
+pub fn batch<R>(ctx: &Arc<Context>, f: impl FnOnce() -> R) -> R {
+    // Re-entrant safe: an inner batch() just joins the outer one.
+    let outermost = BATCH.with(|b| {
+        if b.borrow().is_some() { false } else {
+            *b.borrow_mut() = Some((ctx.device.create_command_encoder(&Default::default()), Vec::new())); true
+        }
+    });
+    let r = f();
+    if outermost {
+        if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
+            ctx.queue.submit([enc.finish()]);
+            SUBMITS.with(|c| c.set(c.get() + 1));
+        }
+    }
+    r
 }
 async fn readback(ctx: &Context, buf: &wgpu::Buffer, n: usize) -> Vec<f32> {
+    // A read must see all prior compute, so flush any open batch first — otherwise the copy below
+    // would be submitted ahead of the deferred dispatches and read stale data.
+    if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
+        ctx.queue.submit([enc.finish()]);
+        SUBMITS.with(|c| c.set(c.get() + 1));
+    }
     let bytes = (n * 4) as u64;
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("staging"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,

@@ -321,20 +321,27 @@ impl Qwen35 {
     /// re-running the whole prefix, because both the attention K/V and the gated-delta-net
     /// recurrence resume exactly where they left off.
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache, n: usize) -> Tensor {
+        // Batch each layer's ~10 dispatches into one submission — cutting ~640 submits/token to
+        // ~70 and removing most of the per-op encoder+submit overhead (measured ~38 ms/token).
+        // Batching is *per layer*, not whole-forward: one command buffer must retain every bind
+        // group it records until submit, and holding all 640 across 64 layers exhausts the driver's
+        // per-submission resource budget. Ops still run in issue order, so the result is identical.
         let mut x = self.embed(tokens);
         let pos = cache.pos;
         for (il, l) in self.layers.iter().enumerate().take(n) {
-            let h = x.rmsnorm(&l.attn_norm, self.cfg.eps);
             let lc = &mut cache.layers[il];
-            let y = match &l.mixer {
-                Mixer::Attn(w) => self.attn(&h, w, lc, pos),
-                Mixer::Gdn(w) => self.gdn(&h, w, lc),
-            };
-            x = x.add(&y);
-            let r = x.clone();
-            x = self.ffn(&x.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&r);
+            let xin = &x;
+            x = ferric_tensor::batch(&self.ctx, || {
+                let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
+                let y = match &l.mixer {
+                    Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                    Mixer::Gdn(w) => self.gdn(&h, w, lc),
+                };
+                let xy = xin.add(&y);
+                self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
+            });
         }
         cache.pos += tokens.len();
-        x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head)
+        ferric_tensor::batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head))
     }
 }
