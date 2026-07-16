@@ -127,12 +127,24 @@ Decode is ~179 ms/token against llama.cpp's 22 ms — ~8× off (was ~32×). The 
     the forward splits the result with zero-copy narrows. Gate+up alone measured **1.79×** as one
     [5120→34816] vs two [5120→17408]; end to end decode went **288 → 179 ms/token**, logits unchanged.
 
-**Where decode time goes now** (~179 ms/token): the matmuls dominate, then gated-delta-net (~14 ms,
-`examples/bench_gdn`), then the balance across small elementwise ops that are still one dispatch each.
-The next lever is genuine *kernel* fusion (norm+matmul, the elementwise residual chains) — fewer,
-bigger kernels rather than fewer submits. Measured-not-assumed is the rule here: several confident
-conclusions in this section died on contact with a correct measurement, including two "obvious"
-optimizations and the theory that the gated-delta-net kernel was the bottleneck.
+**Where decode time goes now** (~180 ms/token, measured with the built-in `FERRIC_PROFILE` timer —
+one sync'd submit per category, so it attributes GPU work not op count):
+
+| category | share | what it is |
+|---|---|---|
+| FFN (64 layers) | 44% | gate+up matmul, down matmul, SwiGLU |
+| GDN mixer (48 layers) | 41% | in_proj + out matmuls, conv, gates, the recurrence |
+| attention (16 layers) | 14% | q/k/v + out matmuls, decode-attention |
+| lm_head + embed | ~1.5% | negligible — the 338 MB head is one matmul over one token |
+
+This **corrects an earlier guess in this doc** ("gated-delta-net ~14 ms, matmuls dominate ~110 ms").
+The recurrence kernel is minor; FFN and the GDN mixer cost about the same, and both are dominated by
+their Q2_0 matmuls, which at these decode shapes run ~57 GB/s effective (below the 100–186 GB/s the
+same kernels hit in isolation — the small GDN/attn matmuls and the elementwise ops between them drag
+the average down). So the next lever is still matmul throughput at decode width, plus folding the
+between-matmul elementwise ops into kernel epilogues. Measured-not-assumed is the rule: several
+confident conclusions in this section died on contact with a correct measurement — including this
+breakdown, two "obvious" optimizations, and the theory that the recurrence kernel was the bottleneck.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent

@@ -127,11 +127,12 @@ async fn run() {
             let _ = rows;
             let row = &v[v.len() - c.n_vocab..]; // last position's logits
             let next = argmax(row);
-            if step == 0 { prompt_ms = t0.elapsed().as_secs_f64() * 1e3; }
+            if step == 0 { prompt_ms = t0.elapsed().as_secs_f64() * 1e3; ferric_tensor::prof_report(); }
             print!("{}", detok(vocab.get(next as usize).map(|s| s.as_str()).unwrap_or("?")));
             std::io::stdout().flush().ok();
             seq.push(next);
         }
+        ferric_tensor::prof_report(); // accumulated over the decode steps
         let total = t0.elapsed().as_secs_f64();
         let decode_ms = (total * 1e3 - prompt_ms) / (n - 1).max(1) as f64;
         println!("\n  {n} tokens in {:.2}s · prompt {:.0}ms · {:.0} ms/token after", total, prompt_ms, decode_ms);

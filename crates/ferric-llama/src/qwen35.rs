@@ -362,22 +362,44 @@ impl Qwen35 {
         // Batching is *per layer*, not whole-forward: one command buffer must retain every bind
         // group it records until submit, and holding all 640 across 64 layers exhausts the driver's
         // per-submission resource budget. Ops still run in issue order, so the result is identical.
+        use ferric_tensor::{batch, prof};
         let mut x = self.embed(tokens);
+        prof(&self.ctx, "embed");
         let pos = cache.pos;
+        // FERRIC_PROFILE splits each layer into per-category submissions so the sync'd timer can
+        // attribute time (mixer vs ffn); otherwise the whole layer is one batch (fewer submits).
+        let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         for (il, l) in self.layers.iter().enumerate().take(n) {
             let lc = &mut cache.layers[il];
             let xin = &x;
-            x = ferric_tensor::batch(&self.ctx, || {
-                let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
-                let y = match &l.mixer {
-                    Mixer::Attn(w) => self.attn(&h, w, lc, pos),
-                    Mixer::Gdn(w) => self.gdn(&h, w, lc),
-                };
+            if profiling {
+                // One submit per category (mixer, then ffn) so the sync'd timer attributes GPU work,
+                // not op count. Eager-per-op would over-charge whichever region has the most small
+                // dispatches; per-category batching keeps the split honest.
+                let is_attn = matches!(l.mixer, Mixer::Attn(_));
+                let y = batch(&self.ctx, || {
+                    let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
+                    match &l.mixer { Mixer::Attn(w) => self.attn(&h, w, lc, pos), Mixer::Gdn(w) => self.gdn(&h, w, lc) }
+                });
+                prof(&self.ctx, if is_attn { "attn" } else { "gdn" });
                 let xy = xin.add(&y);
-                self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
-            });
+                x = batch(&self.ctx, || self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy));
+                prof(&self.ctx, "ffn");
+            } else {
+                x = batch(&self.ctx, || {
+                    let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
+                    let y = match &l.mixer {
+                        Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                        Mixer::Gdn(w) => self.gdn(&h, w, lc),
+                    };
+                    let xy = xin.add(&y);
+                    self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
+                });
+            }
         }
         cache.pos += tokens.len();
-        ferric_tensor::batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head))
+        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head));
+        prof(&self.ctx, "lm_head");
+        out
     }
 }

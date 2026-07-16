@@ -1095,3 +1095,44 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     }
 }
 "#;
+
+// ---- lightweight GPU profiler: force a device sync, then attribute the elapsed wall time to a
+// named bucket. Off unless FERRIC_PROFILE is set. Perturbs timing (it serializes the pipeline), so
+// it measures *where* work is, not the fastest achievable — exactly what's needed to pick a target.
+thread_local! {
+    static PROF: std::cell::RefCell<(std::collections::BTreeMap<String, f64>, Option<std::time::Instant>)>
+        = std::cell::RefCell::new((std::collections::BTreeMap::new(), None));
+}
+
+/// Block until the GPU has finished all submitted work.
+pub fn device_sync(ctx: &Context) { let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely()); }
+
+/// Sync, then charge the time since the previous mark to `label`. First call in a region just
+/// starts the clock. No-op unless FERRIC_PROFILE is set.
+pub fn prof(ctx: &Context, label: &str) {
+    if std::env::var("FERRIC_PROFILE").is_err() { return; }
+    device_sync(ctx);
+    PROF.with(|c| {
+        let mut b = c.borrow_mut();
+        let now = std::time::Instant::now();
+        if let Some(prev) = b.1 {
+            let dt = now.duration_since(prev).as_secs_f64() * 1e3;
+            *b.0.entry(label.to_string()).or_insert(0.0) += dt;
+        }
+        b.1 = Some(now);
+    });
+}
+
+/// Print the accumulated buckets (descending) and reset. No-op unless FERRIC_PROFILE is set.
+pub fn prof_report() {
+    if std::env::var("FERRIC_PROFILE").is_err() { return; }
+    PROF.with(|c| {
+        let mut b = c.borrow_mut();
+        let mut v: Vec<_> = b.0.iter().map(|(k, &t)| (k.clone(), t)).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let total: f64 = v.iter().map(|(_, t)| t).sum();
+        eprintln!("  ── profile (ms, {total:.1} total) ──");
+        for (k, t) in v { eprintln!("    {k:<16} {t:8.1}  {:4.1}%", 100.0 * t / total); }
+        b.0.clear(); b.1 = None;
+    });
+}
