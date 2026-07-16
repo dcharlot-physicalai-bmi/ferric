@@ -96,9 +96,12 @@ Decode is ~268 ms/token against llama.cpp's 22 ms — ~12× off (was ~32×). The
    always cold from DRAM. Coalescing the split-K loads (stride by *word*, not by block) won 30–40% on
    the bench — `gdn qkv` @1 token 0.34 → 0.24 ms — and **zero** end-to-end (295 → 301 ms/token, noise).
    The only honest shape here is the 338 MB LM head, far too big to cache: cold, both kernels land at
-   ~66–70 GB/s. In the cold-streaming regime the kernel choice barely matters — we're DRAM-bound.
-   A `vec4<u32>` variant (64 codes/load) was tried and is *worse*: it cuts work units 4×, wrecking
-   load balance, and Apple already coalesces consecutive `u32` loads.
+   ~66–70 GB/s. *(This item originally concluded "so we're DRAM-bound" — **wrong**, and disproved by
+   items 7–8 below: we were latency-bound the whole time, and the same cold LM head now runs at 101
+   GB/s. Coalescing genuinely didn't matter; the reason wasn't the one stated.)*
+   A `vec4<u32>` variant on the *codes* was tried and is *worse*: it cuts work units 4×, wrecking
+   load balance, and Apple already coalesces consecutive `u32` loads. (vec4 on the *activations* is a
+   different matter entirely — see item 8.)
 6. **Per-dispatch overhead is real but not the story:** ~0.06 ms for a trivial op × ~640 ops/token
    ≈ 38 ms, about 13% of decode.
 
