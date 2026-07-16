@@ -31,11 +31,27 @@ FLOPS:
    + eager autograd**, all pure-Rust and self-reliant (vendored + forked deps, offline builds).
 
 ## Where Ferric is behind (be honest)
-**Raw kernel quality.** burn/CubeCL and LlamaWeb are ahead on GEMM and attention. Our matmul is a
-well-threaded but *naive* one-thread-per-output kernel (~425 GFLOP/s at 1024³ on an M5 Max — the
-"multi-thread WebGPU GEMM" tier), whereas register+workgroup tiling reaches **>1 TFLOP/s** and
-subgroup-matrix (tensor cores) more. We have no general flash-attention path, no GGUF/k-quants, no
-tokenizer, no kernel fusion, no autotuning.
+**Raw GEMM throughput for prefill/training.** burn/CubeCL and LlamaWeb are ahead on dense GEMM and
+attention. The general f32 matmul is a well-threaded but *naive* one-thread-per-output kernel
+(~425 GFLOP/s at 1024³ on an M5 Max — the "multi-thread WebGPU GEMM" tier), whereas register+workgroup
+tiling reaches **>1 TFLOP/s** and subgroup-matrix (tensor cores) more. No general flash-attention path
+yet, and no subgroup-matrix use.
+
+**Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
+The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its
+Q2_0 GEMV where Ferric's reaches ~57%, and llama.cpp's **zero-copy mmap load** (0.25 s) exploits
+Apple unified memory to skip the copy+repack that costs Ferric ~1.8 s warm. Closing either needs
+work Ferric hasn't done: subgroup-level GEMV reductions, and a GPU-consumable on-disk layout so
+weights can be mapped rather than repacked.
+
+**Browser ceiling.** The moat is one codebase native↔browser, but WebGPU's per-buffer and total
+memory limits cap what runs in a tab — a 7 GB model doesn't. The browser path is proven on smaller
+models; a >4 GB model in-browser needs weight streaming/sharding Ferric doesn't have yet.
+
+*Closed since this section was first written:* GGUF + k-quants (Q4_K/Q6_K) and PrismML ternary
+(Q1_0/Q2_0/TQ2_0); an exact GPT-2/BPE tokenizer; the elementwise+matmul-epilogue **fusion compiler**
+(`fuse.rs`, whole-graph `Lazy`); kernel **autotuning** (naive-vs-tiled GEMM, per-shape Q2_0 kernel
+choice); and projection fusion in the model itself.
 
 ## Model-family coverage (Liquid AI, PrismML, BitNet, EBM, JEPA)
 Researched the exact ops each family needs (July 2026). Most reduce to primitives Ferric already has.
