@@ -83,3 +83,4 @@ impl Llama {
 }
 
 pub mod qwen35;
+pub mod qwen3;

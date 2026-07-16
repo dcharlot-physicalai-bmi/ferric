@@ -109,7 +109,7 @@ pub enum Mixer { Attn(AttnW), Gdn(GdnW) }
 /// Per-layer carried state. Attention layers keep the usual K/V history; gated-delta-net layers keep
 /// the recurrent state plus the last `conv_kernel-1` conv inputs (the short conv's receptive field).
 /// With both, generating token N costs one step instead of re-running the whole prefix.
-enum LayerCache {
+pub(crate) enum LayerCache {
     Attn { k: Tensor, v: Tensor },   // [S, n_kv·head_dim]
     Gdn { state: Tensor, conv: Tensor }, // state [n_v_heads, dv, dk]; conv [conv_kernel-1, conv_dim]
 }
@@ -146,7 +146,7 @@ pub struct Qwen35 {
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
 /// weight — the HF linear convention, which is what `matmul_q2_0` wants.
-fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Weights, String> {
+pub(crate) fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Weights, String> {
     let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
     if t.ggml_type != 42 { return Err(format!("{name}: expected Q2_0 (42), got {}", t.ggml_type)); }
     let (inn, out) = (t.dims[0] as usize, t.dims[1] as usize);
@@ -158,7 +158,7 @@ fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Weights, Strin
 /// is literally concatenating the raw byte streams — no repacking. One fused matmul over the group
 /// beats the separate ones at decode width (1.79× measured on gate+up), because a lone-token GEMV
 /// is occupancy-starved and merging the output counts fills the machine.
-fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result<Q2_0Weights, String> {
+pub(crate) fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result<Q2_0Weights, String> {
     let mut inn = None;
     let mut out = 0usize;
     let mut raw = Vec::new();
@@ -173,7 +173,7 @@ fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result<Q2_0Weight
     Ok(Q2_0Weights::from_bytes(ctx, &raw, out, inn.unwrap()))
 }
 
-fn f32t(ctx: &Arc<Context>, g: &GgufFile, name: &str, shape: &[usize]) -> Result<Tensor, String> {
+pub(crate) fn f32t(ctx: &Arc<Context>, g: &GgufFile, name: &str, shape: &[usize]) -> Result<Tensor, String> {
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, shape))
 }
 
