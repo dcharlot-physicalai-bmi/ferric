@@ -68,12 +68,12 @@ Bonsai's 4-bit HQQ **vision tower** (the text path is done).
 
 | | Ferric (first run) | Ferric (now) | llama.cpp (Metal) |
 |---|---|---|---|
-| load | 10 s | 4 s | 0.25 s (mmap) |
-| prompt (5 tok) | 2.5 s | **0.53 s** | 0.08 s |
-| decode | re-prefilled (17.3 s / 12 tok) | **cached — 3.5 s / 12 tok** | 0.26 s / 12 tok |
+| load | 10 s | 2.5 s | 0.25 s (mmap) |
+| prompt (5 tok) | 2.5 s | **0.38 s** | 0.08 s |
+| decode | re-prefilled (17.3 s / 12 tok) | **cached+batched — 2.5 s / 12 tok** | 0.26 s / 12 tok |
 | Q2_0 matmul (cold) | ~70 GB/s | **~101–186 GB/s** | — (ceiling: 325 GB/s) |
 
-Decode is ~268 ms/token against llama.cpp's 22 ms — ~12× off (was ~32×). The honest claim stays
+Decode is ~195 ms/token against llama.cpp's 22 ms — ~9× off (was ~32×). The honest claim stays
 **"Ferric runs Bonsai-27B correctly,"** not that it matches llama.cpp's speed.
 
 ### What the perf work actually taught (measured, not assumed)
@@ -120,12 +120,13 @@ Decode is ~268 ms/token against llama.cpp's 22 ms — ~12× off (was ~32×). The
    thread streams 1280 contiguous bytes and consumes whole cache lines on its own; coalescing across
    threads buys nothing, while output-major scatters each thread's own stream ~1 MB per step.
 
-**Where decode time goes now** (~268 ms/token): ~110 ms matmuls, ~14 ms gated-delta-net
-(`examples/bench_gdn` — measured, because it was the natural suspect and is *not* the bottleneck),
-~38 ms dispatch overhead, and the balance spread across ~640 small ops. Nothing dominates any more,
-so the next lever is **fusion and buffer pooling** — fewer, bigger dispatches — not another kernel
-tweak. Measured-not-assumed is the rule here: five separate conclusions in this section died on
-contact with a correct measurement, including two of the "obvious" optimizations.
+**Where decode time goes now** (~195 ms/token, after batching removed most of the ~38 ms dispatch
+overhead by cutting ~640 submits/token to ~70): ~110 ms matmuls, ~14 ms gated-delta-net
+(`examples/bench_gdn`), and the balance across many small ops. The next lever is genuine op
+*fusion* (norm+matmul, the elementwise residual chains) — fewer, bigger *kernels*, not just fewer
+submits. Measured-not-assumed is the rule here: five separate conclusions in this section died on
+contact with a correct measurement, including two of the "obvious" optimizations and the theory that
+the gated-delta-net kernel was the decode bottleneck.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
