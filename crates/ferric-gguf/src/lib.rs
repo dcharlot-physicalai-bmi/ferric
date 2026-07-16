@@ -113,8 +113,27 @@ pub fn parse(bytes: Vec<u8>) -> Result<Gguf, String> {
     Ok(Gguf { metadata, tensors, data: bytes, data_start })
 }
 
+/// Uniform read access over a GGUF, however it's held: the eager in-memory `Gguf` (the browser path
+/// — the whole file is fetched into a `Vec<u8>`) and the lazy file-backed `GgufFile` (native, one
+/// tensor in RAM at a time) both implement it, so model loaders are written once against the trait.
+pub trait GgufSource {
+    fn metadata(&self) -> &HashMap<String, Meta>;
+    fn tensor(&self, name: &str) -> Option<&TensorInfo>;
+    fn raw(&self, name: &str) -> Result<Vec<u8>, String>;
+    fn dequant(&self, name: &str) -> Result<Vec<f32>, String>;
+}
+
 impl Gguf {
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
+
+    /// A tensor's raw on-disk bytes (packed, as stored) — the in-memory analogue of `GgufFile::raw`.
+    pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
+        let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        let n: usize = t.dims.iter().product::<u64>() as usize;
+        let sz = type_size(t.ggml_type, n)?;
+        let start = self.data_start + t.offset as usize;
+        Ok(self.data[start..start + sz].to_vec())
+    }
 
     /// Dequantize a tensor to f32 (row-major), whatever its GGUF block-quant type.
     pub fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
@@ -122,6 +141,13 @@ impl Gguf {
         let n: usize = t.dims.iter().product::<u64>() as usize;
         deq_raw(&self.data[self.data_start + t.offset as usize..], n, t.ggml_type)
     }
+}
+
+impl GgufSource for Gguf {
+    fn metadata(&self) -> &HashMap<String, Meta> { &self.metadata }
+    fn tensor(&self, name: &str) -> Option<&TensorInfo> { Gguf::tensor(self, name) }
+    fn raw(&self, name: &str) -> Result<Vec<u8>, String> { Gguf::raw(self, name) }
+    fn dequant(&self, name: &str) -> Result<Vec<f32>, String> { Gguf::dequant(self, name) }
 }
 
 /// On-disk byte size of `n` elements stored as ggml type `ty`.
@@ -206,6 +232,13 @@ impl GgufFile {
         let n: usize = t.dims.iter().product::<u64>() as usize;
         deq_raw(&self.raw(name)?, n, t.ggml_type)
     }
+}
+
+impl GgufSource for GgufFile {
+    fn metadata(&self) -> &HashMap<String, Meta> { &self.metadata }
+    fn tensor(&self, name: &str) -> Option<&TensorInfo> { GgufFile::tensor(self, name) }
+    fn raw(&self, name: &str) -> Result<Vec<u8>, String> { GgufFile::raw(self, name) }
+    fn dequant(&self, name: &str) -> Result<Vec<f32>, String> { GgufFile::dequant(self, name) }
 }
 
 fn read_prefix(f: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, String> {

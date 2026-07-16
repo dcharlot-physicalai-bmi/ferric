@@ -9,7 +9,7 @@
 //! decode is one step per token.
 use crate::qwen35::{f32t, q2, q2_cat};
 use ferric_core::Context;
-use ferric_gguf::{deq_raw, GgufFile, Meta};
+use ferric_gguf::{deq_raw, GgufSource, Meta};
 use ferric_tensor::{nn, Q2_0Weights, Tensor};
 use std::sync::Arc;
 
@@ -26,10 +26,10 @@ pub struct Cfg {
 }
 
 impl Cfg {
-    pub fn from_gguf(g: &GgufFile) -> Result<Cfg, String> {
-        let u = |k: &str| match g.metadata.get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {k}")) };
-        let f = |k: &str| match g.metadata.get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {k}")) };
-        let n_vocab = match g.metadata.get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("no tokens".into()) };
+    pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
+        let u = |k: &str| match g.metadata().get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {k}")) };
+        let f = |k: &str| match g.metadata().get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {k}")) };
+        let n_vocab = match g.metadata().get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("no tokens".into()) };
         Ok(Cfg {
             n_embd: u("qwen3.embedding_length")?,
             n_layer: u("qwen3.block_count")?,
@@ -78,7 +78,7 @@ pub struct Qwen3 {
 }
 
 impl Qwen3 {
-    pub fn load(ctx: &Arc<Context>, g: &GgufFile) -> Result<Qwen3, String> {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen3, String> {
         let cfg = Cfg::from_gguf(g)?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {

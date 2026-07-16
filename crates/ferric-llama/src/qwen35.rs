@@ -21,7 +21,8 @@
 //! rotate by the same angle and MRoPE collapses to ordinary RoPE over the first `n_rot` dims.
 
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, Meta};
+use ferric_gguf::{GgufSource, Meta};
+#[allow(unused_imports)] use ferric_gguf::GgufFile;
 use ferric_tensor::dtype::Q2_0Weights;
 use ferric_tensor::{nn, Tensor};
 use std::sync::Arc;
@@ -48,14 +49,14 @@ pub struct Cfg {
 }
 
 impl Cfg {
-    pub fn from_gguf(g: &GgufFile) -> Result<Cfg, String> {
+    pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         let u = |k: &str| -> Result<usize, String> {
-            match g.metadata.get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing metadata {k}")) }
+            match g.metadata().get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing metadata {k}")) }
         };
         let f = |k: &str| -> Result<f32, String> {
-            match g.metadata.get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing metadata {k}")) }
+            match g.metadata().get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing metadata {k}")) }
         };
-        let n_vocab = match g.metadata.get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("missing tokenizer.ggml.tokens".into()) };
+        let n_vocab = match g.metadata().get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("missing tokenizer.ggml.tokens".into()) };
         Ok(Cfg {
             n_embd: u("qwen35.embedding_length")?,
             n_layer: u("qwen35.block_count")?,
@@ -146,7 +147,7 @@ pub struct Qwen35 {
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
 /// weight — the HF linear convention, which is what `matmul_q2_0` wants.
-pub(crate) fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Weights, String> {
+pub(crate) fn q2(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Q2_0Weights, String> {
     let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
     if t.ggml_type != 42 { return Err(format!("{name}: expected Q2_0 (42), got {}", t.ggml_type)); }
     let (inn, out) = (t.dims[0] as usize, t.dims[1] as usize);
@@ -158,7 +159,7 @@ pub(crate) fn q2(ctx: &Arc<Context>, g: &GgufFile, name: &str) -> Result<Q2_0Wei
 /// is literally concatenating the raw byte streams — no repacking. One fused matmul over the group
 /// beats the separate ones at decode width (1.79× measured on gate+up), because a lone-token GEMV
 /// is occupancy-starved and merging the output counts fills the machine.
-pub(crate) fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result<Q2_0Weights, String> {
+pub(crate) fn q2_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Q2_0Weights, String> {
     let mut inn = None;
     let mut out = 0usize;
     let mut raw = Vec::new();
@@ -173,12 +174,12 @@ pub(crate) fn q2_cat(ctx: &Arc<Context>, g: &GgufFile, names: &[&str]) -> Result
     Ok(Q2_0Weights::from_bytes(ctx, &raw, out, inn.unwrap()))
 }
 
-pub(crate) fn f32t(ctx: &Arc<Context>, g: &GgufFile, name: &str, shape: &[usize]) -> Result<Tensor, String> {
+pub(crate) fn f32t(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, shape: &[usize]) -> Result<Tensor, String> {
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, shape))
 }
 
 impl Qwen35 {
-    pub fn load(ctx: &Arc<Context>, g: &GgufFile) -> Result<Qwen35, String> {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
         let cfg = Cfg::from_gguf(g)?;
         let conv_dim = cfg.key_dim() * 2 + cfg.d_inner;
 
