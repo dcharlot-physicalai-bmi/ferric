@@ -54,6 +54,12 @@ impl Context {
     /// which compute f32 as **TF32**, ~1e-2 accuracy — like PyTorch's default). The naga SPIR-V
     /// codegen bug that used to block Vulkan is worked around by let-binding the coop pointer indices.
     pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix }
+
+    /// Whether cooperative-matrix **load-from-workgroup-memory** works here. The quant-coop kernels
+    /// dequantize a weight tile into shared memory and `coopLoad` it; that's correct on Metal but
+    /// produces garbage on NVIDIA/Vulkan through our naga fork (coop-load-from-shared bug — the f32
+    /// GEMM is unaffected because it loads both operands from global storage). Metal-gated until fixed.
+    pub fn coop_shared_ok(&self) -> bool { self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal) }
 }
 
 impl Context {

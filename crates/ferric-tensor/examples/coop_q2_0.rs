@@ -8,7 +8,7 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     println!("{:?} · {} · coop={}", ctx.backend, ctx.adapter_name, ctx.coop_gemm_ok());
-    if !ctx.coop_gemm_ok() { println!("⏭  no coop"); return; }
+    if !ctx.coop_shared_ok() { println!("⏭  coop-from-shared not usable here (Metal-only; NVIDIA SPIR-V bug)"); return; }
     // prefill shape: M tokens × K in → N out (Bonsai-ish layer)
     for (m, k, n) in [(64usize, 2048usize, 2048usize), (256, 5120, 5120)] {
         let wf: Vec<f32> = (0..n * k).map(|i| ((i % 3) as f32 - 1.0) * 0.02).collect();
