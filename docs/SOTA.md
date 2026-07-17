@@ -31,11 +31,24 @@ FLOPS:
    + eager autograd**, all pure-Rust and self-reliant (vendored + forked deps, offline builds).
 
 ## Where Ferric is behind (be honest)
-**Raw GEMM throughput for prefill/training.** burn/CubeCL and LlamaWeb are ahead on dense GEMM and
-attention. The general f32 matmul is a well-threaded but *naive* one-thread-per-output kernel
-(~425 GFLOP/s at 1024³ on an M5 Max — the "multi-thread WebGPU GEMM" tier), whereas register+workgroup
-tiling reaches **>1 TFLOP/s** and subgroup-matrix (tensor cores) more. No general flash-attention path
-yet, and no subgroup-matrix use.
+**Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
+kernel at ~550–710 GFLOP/s at 1024³ on an M5 Max (thermal-dependent). Getting past that is where
+burn/CubeCL and LlamaWeb lead — but **not**, as this doc once claimed, via workgroup tiling. Measured
+across 512³–4096³, three ways:
+
+| kernel | 1024³ | 4096³ | vs naive |
+|---|---|---|---|
+| naive (1 thread/output, coalesced) | ~710 | ~450 | 1.0× |
+| register-tiled (1×8 per thread) | ~280 | ~280 | 0.6× |
+| shared-memory tiled (64×64, 4×4 micro) | ~215 | ~229 | 0.3× |
+
+On Apple Silicon the naive kernel **wins**, even at 4096³ where the 64 MB matrices blow past every
+cache: its perfect coalescing (adjacent threads → adjacent B columns) plus maximum occupancy beats
+any explicit tile, because the hardware caches already serve the data reuse that tiling exists to
+capture — and tiling's barriers + register pressure cost more than they save. The real path to
+>1 TFLOP/s here is **`simdgroup_matrix`** (Apple's tensor-core-like op), which portable WGSL does not
+expose; that, and a general flash-attention path, are the genuine gaps. The autotuner measures
+naive-vs-tiled per device and picks the winner, so a GPU where tiling *does* win still gets it.
 
 **Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
 The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its

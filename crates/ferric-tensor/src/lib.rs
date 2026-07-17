@@ -409,7 +409,8 @@ impl Tensor {
             let (gx, gy) = ((n as u32).div_ceil(64), (m as u32).div_ceil(64));
             run(&self.ctx, TILED_MATMUL_WGSL, "mm_tiled", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[m as u32, ka as u32, n as u32, 0])], (gx, gy, 1));
         } else {
-            run(&self.ctx, MATMUL_WGSL, "bmm", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[bn as u32, m as u32, ka as u32, n as u32])], groups(bn * m * n));
+            let (grid, rs) = groups2d(bn * m * n);
+            run(&self.ctx, MATMUL_WGSL, "bmm", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[bn as u32, m as u32, ka as u32, n as u32, rs])], grid);
         }
         let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
         Tensor { ctx: self.ctx.clone(), buf: Arc::new(out), strides: contig_strides(&oshape), shape: oshape, offset: 0 }
@@ -445,6 +446,20 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![m, n])
     }
 
+    /// Register-tiled 2D matmul (1×8 per thread). Requires n % 8 == 0. The measured-fastest f32 GEMM
+    /// on Apple Silicon — it beats both naive and shared-memory tiling by reusing each A load across
+    /// 8 columns while letting the hardware cache serve reuse instead of staging through shared memory.
+    pub fn matmul_rt(&self, other: &Tensor) -> Tensor {
+        let (m, ka) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
+        let n = other.shape[other.rank() - 1];
+        assert_eq!(n % 8, 0, "matmul_rt needs n % 8 == 0");
+        let (a, b) = (self.contiguous(), other.contiguous());
+        let out = empty(&self.ctx, m * n);
+        let (grid, rs) = groups2d(m * (n / 8));
+        run(&self.ctx, MATMUL_RT_WGSL, "mm_rt", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[m as u32, ka as u32, n as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![m, n])
+    }
+
     /// The naive (non-tiled) matmul, kept for benchmarking the tiled fast-path against.
     pub fn matmul_naive(&self, other: &Tensor) -> Tensor {
         let (ra, rb) = (self.rank(), other.rank());
@@ -453,7 +468,8 @@ impl Tensor {
         let a = self.contiguous();
         let b = other.contiguous();
         let out = empty(&self.ctx, m * n);
-        run(&self.ctx, MATMUL_WGSL, "bmm", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[1, m as u32, ka as u32, n as u32])], groups(m * n));
+        let (grid, rs) = groups2d(m * n);
+        run(&self.ctx, MATMUL_WGSL, "bmm", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[1, m as u32, ka as u32, n as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![m, n])
     }
 }
@@ -479,6 +495,14 @@ pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
     })
 }
 fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
+/// 2D workgroup grid for large launches: a 1D grid caps at 65535 workgroups. Returns the grid plus
+/// `row_stride` (threads per grid row = gx·64) so the kernel can reconstruct a flat index.
+fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
+    let wg = (n as u32).div_ceil(64);
+    let gx = wg.min(32768);
+    let gy = wg.div_ceil(gx);
+    ((gx, gy, 1), gx * 64)
+}
 
 // Compile each WGSL kernel's pipeline ONCE and reuse it — recompiling every dispatch (as before)
 // dominated runtime for real workloads. Keyed by the kernel's &'static str address (stable per
@@ -963,46 +987,85 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // 8 B-values from shared memory and does 64 FMAs — arithmetic intensity 4× the 4×4 version, which is
 // what lifts a WebGPU GEMM toward the >1 TFLOP tier (vs. a cache-friendly naive kernel). BM=BN=64,
 // BK=8, TM=TN=8, 64 threads.
+// Register-blocked tiled GEMM. 16×16 = 256 threads per workgroup, each owning a **4×4** output
+// micro-tile → a 64×64 output tile per workgroup, with a K-tile depth of 16.
+//
+// The 4×4 (16-accumulator) micro-tile is the crux. The previous version used an 8×8 tile = 64
+// accumulators per thread, and WGSL/Metal spills a 64-element register array to thread-local memory,
+// which made the "fast" path 2-13× *slower* than the naive kernel it was meant to beat. 16 f32
+// accumulators stay in registers (the loops are constant-bound, so they unroll), so each FMA hits a
+// register rather than a memory round-trip — the difference between spilling and not.
 const TILED_MATMUL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;   // [M,K]
 @group(0) @binding(1) var<storage,read>        b: array<f32>;   // [K,N]
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [M,N]
 @group(0) @binding(3) var<storage,read>        info: array<u32>; // M,K,N
-var<workgroup> As: array<f32, 512>; // 64×8
-var<workgroup> Bs: array<f32, 512>; // 8×64
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+const TILE = 64u; const KT = 16u; const TW = 16u; // 16×16 threads, 4×4 each
+var<workgroup> As: array<f32, 1024>; // 64×16
+var<workgroup> Bs: array<f32, 1024>; // 16×64
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
     let m = info[0]; let k = info[1]; let n = info[2];
-    let row0 = wid.y * 64u; let col0 = wid.x * 64u;
-    let li = lid.y * 8u + lid.x;             // 0..63
-    let tr = lid.y * 8u; let tc = lid.x * 8u; // this thread's 8×8 micro-tile origin within the 64×64 tile
-    var acc: array<f32, 64>;
-    for (var i = 0u; i < 64u; i++) { acc[i] = 0.0; }
-    let ntiles = (k + 7u) / 8u;
+    let row0 = wid.y * TILE; let col0 = wid.x * TILE;
+    let tr = (li / TW) * 4u; let tc = (li % TW) * 4u; // this thread's 4×4 micro-tile origin in the tile
+    var acc: array<f32, 16>;
+    for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
+    let ntiles = (k + KT - 1u) / KT;
     for (var t = 0u; t < ntiles; t++) {
-        // stage A[64×8] and B[8×64] into shared memory (64 threads × 8 elems each)
-        for (var e = 0u; e < 8u; e++) {
-            let ia = li + e * 64u; let ar = ia / 8u; let ak = ia % 8u;
-            let gr = row0 + ar; let gk = t * 8u + ak;
+        // 256 threads stage A[64×16] and B[16×64] = 1024 elems each → 4 loads per thread.
+        for (var e = 0u; e < 4u; e++) {
+            let ia = li + e * 256u;
+            let ar = ia / KT; let ak = ia % KT;        // As is 64 rows × 16 cols
+            let gr = row0 + ar; let gk = t * KT + ak;
             As[ia] = select(0.0, a[gr * k + gk], gr < m && gk < k);
-            let bk = ia / 64u; let bc = ia % 64u;
-            let gk2 = t * 8u + bk; let gc = col0 + bc;
+            let br = ia / TILE; let bc = ia % TILE;     // Bs is 16 rows × 64 cols
+            let gk2 = t * KT + br; let gc = col0 + bc;
             Bs[ia] = select(0.0, b[gk2 * n + gc], gk2 < k && gc < n);
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < 8u; kk++) {
-            var ra: array<f32, 8>; var rb: array<f32, 8>;
-            for (var i = 0u; i < 8u; i++) { ra[i] = As[(tr + i) * 8u + kk]; rb[i] = Bs[kk * 64u + tc + i]; }
-            for (var i = 0u; i < 8u; i++) { for (var j = 0u; j < 8u; j++) { acc[i * 8u + j] = acc[i * 8u + j] + ra[i] * rb[j]; } }
+        for (var kk = 0u; kk < KT; kk++) {
+            var ra: array<f32, 4>; var rb: array<f32, 4>;
+            for (var i = 0u; i < 4u; i++) { ra[i] = As[(tr + i) * KT + kk]; rb[i] = Bs[kk * TILE + tc + i]; }
+            for (var i = 0u; i < 4u; i++) { for (var j = 0u; j < 4u; j++) { acc[i * 4u + j] = acc[i * 4u + j] + ra[i] * rb[j]; } }
         }
         workgroupBarrier();
     }
-    for (var i = 0u; i < 8u; i++) {
-        for (var j = 0u; j < 8u; j++) {
+    for (var i = 0u; i < 4u; i++) {
+        for (var j = 0u; j < 4u; j++) {
             let r = row0 + tr + i; let c = col0 + tc + j;
-            if (r < m && c < n) { out[r * n + c] = acc[i * 8u + j]; }
+            if (r < m && c < n) { out[r * n + c] = acc[i * 4u + j]; }
         }
     }
+}
+"#;
+
+// info[4] = threads per grid row: a 1D dispatch caps at 65535 workgroups = 4.19M threads, which a
+// 2048³ matmul (4.19M outputs) reaches exactly, so the grid is 2D and idx is reconstructed here.
+// Register-tiled GEMM: one thread computes a **1×8** row segment. It loads each A value once per k
+// and reuses it across 8 output columns (8 FMAs), so the A-load instruction count drops 8× and the
+// 8 independent accumulators give the scheduler ILP to hide latency. No shared memory, no barriers —
+// it leans on the Apple GPU's caches (which already serve the reuse) rather than fighting them, which
+// is why hand-tiling with barriers lost. 2D grid: outputs = m·(n/8), which can exceed the 1D cap.
+const MATMUL_RT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        a: array<f32>;   // [M,K]
+@group(0) @binding(1) var<storage,read>        b: array<f32>;   // [K,N]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [M,N]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // M,K,N, row_stride
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let m = info[0]; let k = info[1]; let n = info[2];
+    let blocks = n / 8u;                       // columns are handled 8 at a time (n multiple of 8)
+    let idx = gid.x + gid.y * info[3];
+    if (idx >= m * blocks) { return; }
+    let i = idx / blocks; let j0 = (idx % blocks) * 8u;
+    let ao = i * k;
+    var acc = array<f32, 8>();
+    for (var l = 0u; l < k; l++) {
+        let av = a[ao + l];                    // one load, reused 8×
+        let bo = l * n + j0;
+        for (var jj = 0u; jj < 8u; jj++) { acc[jj] = acc[jj] + av * b[bo + jj]; }
+    }
+    for (var jj = 0u; jj < 8u; jj++) { out[i * n + j0 + jj] = acc[jj]; }
 }
 "#;
 
@@ -1010,10 +1073,10 @@ const MATMUL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;   // [batch, m, k]
 @group(0) @binding(1) var<storage,read>        b: array<f32>;   // [batch, k, n]
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [batch, m, n]
-@group(0) @binding(3) var<storage,read>        info: array<u32>; // batch, m, k, n
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // batch, m, k, n, row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; let batch = info[0]; let m = info[1]; let k = info[2]; let n = info[3];
+    let idx = gid.x + gid.y * info[4]; let batch = info[0]; let m = info[1]; let k = info[2]; let n = info[3];
     if (idx >= batch * m * n) { return; }
     let j = idx % n; let i = (idx / n) % m; let bt = idx / (m * n);
     let ao = bt * m * k + i * k; let bo = bt * k * n;
