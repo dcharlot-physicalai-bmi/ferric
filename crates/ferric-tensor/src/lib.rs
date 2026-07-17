@@ -1402,7 +1402,8 @@ impl Tensor {
     /// accumulates an 8×8 output tile across the K dimension with `coopMultiplyAdd`. Requires M,K,N
     /// multiples of 8 and `ctx.coop_matrix`; the caller falls back to the naive kernel otherwise.
     /// fp-order differs from the scalar kernels (hardware reduction), so this is a fast-path, not the
-    /// bit-identical default.
+    /// bit-identical default. **8×8 is the portable tile size**: Metal's `simdgroup_matrix<f32>` is
+    /// 8×8 only (no `simdgroup_float16x16`), so `coop_mat16x16` crashes MSL — don't use 16×16 for f32.
     pub fn matmul_coop(&self, other: &Tensor) -> Tensor {
         let (m, k) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
         let n = other.shape[other.rank() - 1];
