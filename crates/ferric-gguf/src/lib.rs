@@ -13,6 +13,7 @@ const F16T: u32 = 1;
 const Q4_0: u32 = 2;
 const Q8_0: u32 = 8;
 const Q4_K: u32 = 12;
+const Q6_K: u32 = 14;
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
 const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
 const Q2_0: u32 = 42; // PrismML ternary: {−1,0,+1}·scale, group-128 (2.125 bpw on disk)
@@ -158,6 +159,7 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q8_0 => n / 32 * 34,
         Q4_0 => n / 32 * 18,
         Q4_K => n / 256 * 144,
+        Q6_K => n / 256 * 210,
         TQ2_0 => n / 256 * 66,
         Q1_0 => n / 128 * 18,
         Q2_0 => n / 128 * 34,
@@ -173,6 +175,7 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q8_0 => deq_q8_0(raw, n),
         Q4_0 => deq_q4_0(raw, n),
         Q4_K => deq_q4_k(raw, n),
+        Q6_K => deq_q6_k(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
         Q1_0 => deq_q1_0(raw, n),
         Q2_0 => deq_q2_0(raw, n),
@@ -285,6 +288,36 @@ fn deq_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
 
 /// Q4_K super-block (256 values, 144 bytes): [f16 d, f16 dmin, u8 scales[12], u8 qs[128]].
 /// 8 sub-blocks of 32; each has a 6-bit scale & 6-bit min packed in `scales`. y = d·sc·q − dmin·m.
+/// **Q6_K** — 210-byte super-block, 256 values: `ql[128]` (low 4 bits), `qh[64]` (high 2 bits),
+/// `scales[16]` (int8), `d` (f16). Value = `d · scale · (q − 32)`, where q is the reassembled 6-bit
+/// quant. Layout follows llama.cpp exactly (two 128-value halves, 4 quant groups per half).
+fn deq_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(210).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[208..210]);
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let sc = &blk[192..208]; // int8 scales
+        let mut y = bi * 256;
+        for half in 0..2 {
+            let (qlh, qhh, sch) = (&ql[half * 64..], &qh[half * 32..], &sc[half * 8..]);
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((qlh[l] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32;
+                out[y + l] = d * sch[is] as i8 as f32 * q1 as f32;
+                out[y + l + 32] = d * sch[is + 2] as i8 as f32 * q2 as f32;
+                out[y + l + 64] = d * sch[is + 4] as i8 as f32 * q3 as f32;
+                out[y + l + 96] = d * sch[is + 6] as i8 as f32 * q4 as f32;
+            }
+            y += 128;
+        }
+    }
+    out
+}
+
 fn deq_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     let get_sc_min = |scales: &[u8], j: usize| -> (u8, u8) {

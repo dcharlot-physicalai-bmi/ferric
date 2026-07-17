@@ -1,16 +1,16 @@
-//! **Qwen3** dense transformer — the architecture PrismML's smaller Ternary Bonsai models use
-//! (1.7B / 4B), as opposed to the 27B's qwen3.5 hybrid. Full GQA every layer, QK-norm, SwiGLU,
-//! RoPE; every projection ternary in PrismML's `Q2_0` (2.125 bpw). Because it's ~450 MB packed it
-//! fits WebGPU's memory limits, so this is the model the browser path runs — the same code that
-//! runs it here compiles to wasm32 and drives WebGPU in a tab.
+//! **Qwen3** dense transformer — PrismML's smaller Ternary Bonsai models (1.7B / 4B) *and* any
+//! standard Qwen3 GGUF. Full GQA every layer, QK-norm, SwiGLU, RoPE. **Format-agnostic**: each weight
+//! loads in whatever quant the GGUF stored it (`QMatrix` over Q2_0/Q4_0/Q4_K/Q6_K/Q8_0), so this runs
+//! a PrismML ternary model *and* a genuine `Q4_K_M` model off Hugging Face — which mixes Q4_K and
+//! Q6_K, even within one qkv (see `Proj`). The ternary 1.7B is ~450 MB packed, so it fits WebGPU's
+//! memory limits and this same code compiles to wasm32 to drive a browser tab.
 //!
-//! Reuses the crate's Q2_0 loaders and the same projection-fusion + KV-cache tricks proven on the
-//! 27B: q/k/v fuse into one matmul, gate/up into another, and attention resumes from cached K/V so
-//! decode is one step per token.
-use crate::qwen35::{f32t, q2, q2_cat};
+//! Projection-fusion + KV-cache tricks proven on the 27B: q/k/v fuse into one matmul (when they share
+//! a format), gate/up into another, attention resumes from cached K/V so decode is one step per token.
+use crate::qwen35::{f32t, qm, qm_cat};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufSource, Meta};
-use ferric_tensor::{nn, Q2_0Weights, Tensor};
+use ferric_tensor::{nn, QMatrix, Tensor};
 use std::sync::Arc;
 
 pub struct Cfg {
@@ -44,18 +44,49 @@ impl Cfg {
     }
 }
 
+/// A projection that is *logically* one matmul emitting several stacked outputs (q|k|v, gate|up).
+/// If every part shares a quant format it's byte-fused into one QMatrix (the fast path); real Q4_K_M
+/// models mix formats even within qkv (V is often Q6_K while Q/K are Q4_K), so it falls back to one
+/// matmul per part, concatenated — same result, one extra dispatch.
+enum Proj {
+    Fused(QMatrix),
+    Split(Vec<QMatrix>),
+}
+impl Proj {
+    fn load(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Proj, String> {
+        let types: Vec<u32> = names.iter().map(|n| g.tensor(n).map(|t| t.ggml_type).unwrap_or(0)).collect();
+        if names.len() > 1 && types.windows(2).all(|w| w[0] == w[1]) {
+            Ok(Proj::Fused(qm_cat(ctx, g, names)?))
+        } else if names.len() == 1 {
+            Ok(Proj::Fused(qm(ctx, g, names[0])?))
+        } else {
+            Ok(Proj::Split(names.iter().map(|n| qm(ctx, g, n)).collect::<Result<_, _>>()?))
+        }
+    }
+    fn matmul(&self, x: &Tensor) -> Tensor {
+        match self {
+            Proj::Fused(w) => x.matmul_q(w),
+            Proj::Split(ws) => {
+                let mut out = x.matmul_q(&ws[0]);
+                for w in &ws[1..] { out = out.cat(&x.matmul_q(w), 1); }
+                out
+            }
+        }
+    }
+}
+
 pub struct Layer {
     attn_norm: Tensor,
     ffn_norm: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
-    wqkv: Q2_0Weights, // q | k | v stacked
+    wqkv: Proj, // q | k | v stacked (fused if same format, else separate matmuls concatenated)
     q_out: usize,
     kv_out: usize,
-    wo: Q2_0Weights,
-    ffn_gate_up: Q2_0Weights,
+    wo: QMatrix,
+    ffn_gate_up: Proj,
     ffn_gate_out: usize,
-    ffn_down: Q2_0Weights,
+    ffn_down: QMatrix,
 }
 
 /// Per-layer attention K/V history. One step per token: append, then attend over all of it.
@@ -74,7 +105,8 @@ pub struct Qwen3 {
     tok_embd: Vec<u8>, // Q2_0 rows, gathered + dequantized on the CPU (avoids parking the table on GPU)
     layers: Vec<Layer>,
     out_norm: Tensor,
-    lm_head: Q2_0Weights,
+    lm_head: QMatrix,
+    embd_type: u32,
 }
 
 impl Qwen3 {
@@ -88,31 +120,34 @@ impl Qwen3 {
                 ffn_norm: f32t(ctx, g, &b("ffn_norm.weight"), &[cfg.n_embd])?,
                 q_norm: f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?,
-                wqkv: q2_cat(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                wqkv: Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
                 q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
                 kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
-                wo: q2(ctx, g, &b("attn_output.weight"))?,
-                ffn_gate_up: q2_cat(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+                wo: qm(ctx, g, &b("attn_output.weight"))?,
+                ffn_gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
                 ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
-                ffn_down: q2(ctx, g, &b("ffn_down.weight"))?,
+                ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
             });
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         Ok(Qwen3 {
             tok_embd: g.raw("token_embd.weight")?,
             out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
-            lm_head: q2(ctx, g, head)?,
+            lm_head: qm(ctx, g, head)?,
+            embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
             cfg, ctx: ctx.clone(), layers,
         })
     }
 
     pub fn embed(&self, tokens: &[u32]) -> Tensor {
         let d = self.cfg.n_embd;
-        let row_bytes = d / 128 * 34;
+        // Gather + dequantize just the prompt's rows on the CPU, in whatever format the embedding
+        // table is stored (Q2_0/Q4_K/…) — beats parking the whole table on the GPU for a gather.
+        let row_bytes = ferric_gguf::type_size(self.embd_type, d).expect("embd type");
         let mut v = Vec::with_capacity(tokens.len() * d);
         for &t in tokens {
             let off = t as usize * row_bytes;
-            v.extend(deq_raw(&self.tok_embd[off..off + row_bytes], d, 42).expect("embed row"));
+            v.extend(deq_raw(&self.tok_embd[off..off + row_bytes], d, self.embd_type).expect("embed row"));
         }
         Tensor::from_vec(&self.ctx, &v, &[tokens.len(), d])
     }
@@ -125,7 +160,7 @@ impl Qwen3 {
     fn attn(&self, h: &Tensor, l: &Layer, cache: &mut Option<(Tensor, Tensor)>, offset: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         // One fused matmul emits [q | k | v]; split, QK-norm per head, RoPE.
-        let qkv = h.matmul_q2_0(&l.wqkv);
+        let qkv = l.wqkv.matmul(h);
         let q = qkv.narrow(1, 0, l.q_out).reshape(&[t, nh, hd]).rmsnorm(&l.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
         let k = qkv.narrow(1, l.q_out, l.kv_out).reshape(&[t, nkv, hd]).rmsnorm(&l.k_norm, self.cfg.eps).reshape(&[t, nkv * hd]);
         let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out).contiguous();
@@ -143,12 +178,12 @@ impl Qwen3 {
             nn::causal_attention(&q, &kc, &vc, nh, nkv)
         };
         *cache = Some((kc, vc));
-        o.matmul_q2_0(&l.wo)
+        o.matmul_q(&l.wo)
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
         // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-        h.matmul_q2_0(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q2_0(&l.ffn_down)
+        l.ffn_gate_up.matmul(h).swiglu(l.ffn_gate_out).matmul_q(&l.ffn_down)
     }
 
     /// Prefill (stateless): logits [T, n_vocab].
@@ -183,7 +218,7 @@ impl Qwen3 {
             }
         }
         cache.pos += tokens.len();
-        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head));
+        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head));
         prof(&self.ctx, "lm_head");
         out
     }

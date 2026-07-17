@@ -178,6 +178,29 @@ pub(crate) fn f32t(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, shape: &
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, shape))
 }
 
+/// Load a weight in **whatever packed format** the GGUF stored it (Q2_0/Q4_0/Q4_K/Q8_0) as a QMatrix.
+pub(crate) fn qm(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<ferric_tensor::QMatrix, String> {
+    let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+    let (ty, rows, cols) = (t.ggml_type, t.dims[1] as usize, t.dims[0] as usize);
+    ferric_tensor::QMatrix::from_bytes(ctx, &g.raw(name)?, ty, rows, cols)
+}
+
+/// Concatenate several same-format weights along the output dim into one QMatrix (fused qkv, gate_up).
+/// In a real GGUF every projection in a layer shares one quant format, so this just stacks their bytes.
+pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<ferric_tensor::QMatrix, String> {
+    let (mut inn, mut out, mut ty, mut raw) = (None, 0usize, None, Vec::new());
+    for &name in names {
+        let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        let this = *ty.get_or_insert(t.ggml_type);
+        if t.ggml_type != this { return Err(format!("{name}: mixed quant formats in one fused matmul")); }
+        let i = t.dims[0] as usize;
+        if *inn.get_or_insert(i) != i { return Err(format!("{name}: input dim differs")); }
+        out += t.dims[1] as usize;
+        raw.extend(g.raw(name)?);
+    }
+    ferric_tensor::QMatrix::from_bytes(ctx, &raw, ty.unwrap(), out, inn.unwrap())
+}
+
 impl Qwen35 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
         let cfg = Cfg::from_gguf(g)?;
