@@ -29,6 +29,12 @@ pub struct Context {
     /// (WebGPU baseline 128 MB; Safari 256 MB–1 GB; native GPUs much higher). A weight above this must
     /// be sharded across buffers, so packed-quant loaders split oversized tensors along output rows.
     pub max_binding: u64,
+    /// Whether `EXPERIMENTAL_COOPERATIVE_MATRIX` is enabled — the WGSL `coop_mat` types that lower to
+    /// the hardware matrix units (Metal `simdgroup_matrix`, Vulkan `KHR_cooperative_matrix` → tensor
+    /// cores / MFMA). Native-only (no browser spec yet); the path to real GEMM throughput on the
+    /// M5's matrix hardware and NVIDIA tensor cores. Kernels using it are feature-gated + fp-order
+    /// dependent, so like subgroups they stay off the bit-identical cross-fabric default path.
+    pub coop_matrix: bool,
 }
 
 /// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
@@ -56,22 +62,34 @@ impl Context {
         let info = adapter.get_info();
         // Opt into subgroups when the adapter has it (native GPUs + modern browsers); harmless to
         // omit where absent, and the flag lets kernels pick a subgroup path or the barrier fallback.
-        let want = wgpu::Features::SUBGROUP;
-        let subgroups = adapter.features().contains(want);
+        let af = adapter.features();
+        let subgroups = af.contains(wgpu::Features::SUBGROUP);
+        let coop_matrix = af.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
         let max_binding = adapter.limits().max_storage_buffer_binding_size as u64;
+        let mut want = wgpu::Features::empty();
+        if subgroups { want |= wgpu::Features::SUBGROUP; }
+        if coop_matrix { want |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX; }
+        // wgpu gates EXPERIMENTAL_* features behind an explicit acknowledgment token (WIP APIs that
+        // may have UB). We opt in only when the adapter advertises cooperative matrix.
+        let experimental = if coop_matrix {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
-                required_features: if subgroups { want } else { wgpu::Features::empty() },
+                required_features: want,
                 // request the adapter's real limits: native gets big buffers (big models); in a
                 // browser this resolves to the WebGPU baseline, so cross-fabric portability holds.
                 required_limits: adapter.limits(),
+                experimental_features: experimental,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -104,7 +122,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix: false })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {

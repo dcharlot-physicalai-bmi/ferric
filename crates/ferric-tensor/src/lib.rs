@@ -1359,3 +1359,31 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     if (lid.x == 0u) { out[0] = f32(atomicLoad(&total)); }
 }
 "#;
+
+/// Spike: an 8×8 f32 matmul C = A·B on the **hardware matrix unit** via WGSL `coop_mat` (lowers to
+/// Metal simdgroup_matrix / Vulkan cooperative-matrix → tensor cores). Proves the tensor-core path
+/// compiles + runs + is correct through our fork before building a full tiled GEMM on it. `a`/`b` are
+/// row-major 8×8; returns C (64 f32). One subgroup cooperates on the tile.
+pub async fn run_coop_matmul_test(ctx: &Arc<Context>, a: &[f32], b: &[f32]) -> Vec<f32> {
+    assert_eq!(a.len(), 64); assert_eq!(b.len(), 64);
+    let ab = Tensor::from_vec(ctx, a, &[8, 8]);
+    let bb = Tensor::from_vec(ctx, b, &[8, 8]);
+    let cb = empty(ctx, 64); // zero-initialized accumulator
+    run(ctx, COOP_MATMUL_WGSL, "coop_mm", &[ab.buf.as_ref(), bb.buf.as_ref(), &cb], (1, 1, 1));
+    readback(ctx, &cb, 64).await
+}
+
+const COOP_MATMUL_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       a: array<f32>;
+@group(0) @binding(1) var<storage,read>       b: array<f32>;
+@group(0) @binding(2) var<storage,read_write> c: array<f32>;
+@compute @workgroup_size(32)
+fn main() {
+    let ma = coopLoadT<coop_mat8x8<f32, A>>(&a[0], 8u);
+    let mb = coopLoadT<coop_mat8x8<f32, B>>(&b[0], 8u);
+    var mc = coopLoadT<coop_mat8x8<f32, C>>(&c[0], 8u);
+    mc = coopMultiplyAdd(ma, mb, mc);
+    coopStoreT(mc, &c[0], 8u);
+}
+"#;
