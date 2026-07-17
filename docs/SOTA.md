@@ -79,23 +79,25 @@ across 512³–4096³, three ways:
 | shared-memory tiled (64×64, 4×4 micro) | ~215 | ~229 | 0.3× |
 
 Among *hand-written WGSL* kernels the naive one **wins** (cross-vendor: same on the NVIDIA RTX 4050),
-because the hardware caches already serve the reuse tiling exists to capture and tiling's barriers +
-register pressure cost more than they save. **But that was never the ceiling — the matrix hardware
-was.** `matmul_coop` uses WGSL cooperative-matrix (`coop_mat8x8`, `coopMultiplyAdd`) lowering to the
-GPU's matrix unit, and on the **Apple M5 Max** (the first Apple GPU with real in-GPU matrix hardware)
-it hits **4.3 TFLOP/s — 6–7× the naive ~700 GFLOP/s**, and bit-identical to it (max\|Δ\| = 0.0e0):
+because the hardware caches already serve the reuse tiling exists to capture. **But that was never the
+ceiling — the matrix hardware was**, and it *is* reachable from portable WGSL. `matmul_coop` uses WGSL
+cooperative-matrix (`coop_mat8x8`, `coopMultiplyAdd`) lowering to the GPU's matrix unit — one kernel,
+both vendors:
 
-| 1024³ | naive ~700 GFLOP/s | shared-mem tiled ~215 | **coop_mat 4151** (5.9×) |
-| 2048³ | naive ~700 | ~229 | **coop_mat 4299** (6.1×) |
+| | naive | WGSL tiled | **coop_mat** |
+|---|---|---|---|
+| Apple M5 Max, Metal (exact f32) | ~700 GFLOP/s | ~215 | **~4300 (6×), bit-identical (0.0e0)** |
+| NVIDIA RTX 4050, Vulkan (TF32) | ~293 GFLOP/s | — | **9400 @2048³ (32×), Δ~6e-3** |
 
-This **corrects the earlier "portable WGSL can't reach tensor cores" claim** — it can, through our
-naga fork, on Metal today (`EXPERIMENTAL_COOPERATIVE_MATRIX` → MSL `simdgroup_matrix`). Caveat: the
-naga **SPIR-V backend** panics generating coop_mat code, so **Vulkan/NVIDIA is gated off** until that
-bug is fixed (`Context::coop_gemm_ok()` = Metal-only for now); the primitive path is proven on both
-(`coop_matrix=true` on the 4050), only the SPIR-V codegen blocks it. Remaining: wire coop_mat into the
-matmul selector, larger register tiles + 16×16, the quant-matmul prefill path, fix the SPIR-V backend,
-and a general flash-attention path. Still fp-order/native dependent, so it's a fast-path, not the
-bit-identical cross-fabric default.
+The M5 is the first Apple GPU with real in-GPU matrix hardware; the 4050 exposes NVIDIA tensor cores
+via `KHR_cooperative_matrix`. This **corrects the earlier "portable WGSL can't reach tensor cores"
+claim** — it reaches simdgroup_matrix AND NVIDIA tensor cores today, through our naga fork
+(`EXPERIMENTAL_COOPERATIVE_MATRIX`, `unsafe ExperimentalFeatures::enabled()` token). A naga SPIR-V
+codegen bug (coop pointer index not cached) is worked around by let-binding the indices. Precision
+differs by vendor — Metal computes exact f32, NVIDIA computes f32-coop as **TF32** (~1e-2, like
+PyTorch's default) — which, along with fp-order, is why coop stays a fast-path, not the bit-identical
+cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 + larger register
+tiles, the quant-matmul prefill path, and a general flash-attention path.
 
 **Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
 The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its
