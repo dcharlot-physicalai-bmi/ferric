@@ -447,6 +447,7 @@ impl Tensor {
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q5_K_FLAT_WGSL, "matmul_q5_k_flat")
         };
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER);
+        let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -507,6 +508,7 @@ impl Tensor {
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL, "matmul_q6_k_flat")
         };
         let src = wgsl.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY);
+        let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -561,7 +563,8 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q8_0_FLAT_WGSL, "matmul_q8_0_flat")
         };
-        run(&self.ctx, wgsl, label,
+        let src = if use_subgroup(&self.ctx) { sg_reduce(wgsl) } else { wgsl.to_string() };
+        run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
@@ -621,6 +624,7 @@ impl Tensor {
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
         };
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER);
+        let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -642,7 +646,8 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_0_FLAT_WGSL, "matmul_q4_0_flat")
         };
-        run(&self.ctx, wgsl, label,
+        let src = if use_subgroup(&self.ctx) { sg_reduce(wgsl) } else { wgsl.to_string() };
+        run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
@@ -661,7 +666,8 @@ impl Tensor {
             // per-dimension cap (e.g. 5 tokens × 17408 outputs).
             let grid_w = n.min(32768);
             let grid_h = n.div_ceil(grid_w);
-            run(&self.ctx, MATMUL_Q2_0_SPLITK_WGSL, "matmul_q2_0_splitk",
+            let src = if use_subgroup(&self.ctx) { sg_reduce(MATMUL_Q2_0_SPLITK_WGSL) } else { MATMUL_Q2_0_SPLITK_WGSL.to_string() };
+            run(&self.ctx, &src, "matmul_q2_0_splitk",
                 &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, grid_w as u32])],
                 (grid_w as u32, grid_h as u32, 1));
@@ -725,6 +731,32 @@ fn q2_0_split_k(rows: usize, n_out: usize) -> bool {
 /// lines on its own; coalescing across threads buys nothing, while output-major scatters each
 /// thread's own stream ~1 MB per step. Kept behind `FERRIC_Q2_0_KERNEL=trans` as evidence.
 fn q2_0_transposed() -> bool { matches!(std::env::var("FERRIC_Q2_0_KERNEL").as_deref(), Ok("trans")) }
+
+/// Rewrite a split-K quant-matmul kernel's final reduction from a shared-memory **barrier tree**
+/// (6 `workgroupBarrier`s over 64 lanes) into a single hardware **`subgroupAdd`** per subgroup, then
+/// a tiny combine of the (≤ a handful of) subgroup partials. All six split-K kernels share the exact
+/// signature + tail this matches, so one transform serves them all. Applied only when the device has
+/// the `subgroups` feature; `FERRIC_NO_SUBGROUP=1` forces the barrier path for A/B comparison.
+fn sg_reduce(wgsl: &str) -> String {
+    wgsl
+        .replace(
+            "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {",
+            "fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(subgroup_invocation_id) sglid: u32, @builtin(subgroup_id) sgid: u32, @builtin(num_subgroups) nsg: u32) {",
+        )
+        .replace(
+            "        partial[t] = acc;\n        workgroupBarrier();\n        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }\n        if (t == 0u) { out[idx] = partial[0]; }",
+            "        let sgsum = subgroupAdd(acc);\n        if (sglid == 0u) { partial[sgid] = sgsum; }\n        workgroupBarrier();\n        if (t == 0u) { var tot = 0.0; for (var i: u32 = 0u; i < nsg; i = i + 1u) { tot = tot + partial[i]; } out[idx] = tot; }",
+        )
+}
+
+/// Whether to use the subgroup reduction. **Opt-in** (`FERRIC_SUBGROUP=1`), NOT the default —
+/// deliberately. `subgroupAdd` reduces in hardware-cooperative order, which differs from the barrier
+/// tree's pairwise order, so a fabric with subgroups and one without produce fp-different (though
+/// argmax-identical, llama.cpp-matching) results. Ferric's distinctive moat is **bit-identical
+/// cross-fabric** output, and not every fabric exposes subgroups (e.g. Chrome/ANGLE-Metal here did
+/// not), so the deterministic barrier path is the default and subgroups are a speed opt-in for
+/// single-fabric use. Measured ~5-10% on M5; re-evaluate if a cooperative-matrix path makes it larger.
+fn use_subgroup(ctx: &Context) -> bool { ctx.subgroups && std::env::var("FERRIC_SUBGROUP").is_ok() }
 
 /// Output-major GEMV: one thread per output, walking all of K. Adjacent threads read adjacent
 /// words, so a SIMD group's loads coalesce into one contiguous run — the property split-K bought
@@ -1228,10 +1260,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         }
         partial[t] = acc;
         workgroupBarrier();
-        for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
-            if (t < s) { partial[t] = partial[t] + partial[t + s]; }
-            workgroupBarrier();
-        }
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
         if (t == 0u) { out[idx] = partial[0]; }
     }
 }

@@ -20,6 +20,11 @@ pub struct Context {
     pub queue: wgpu::Queue,
     pub backend: wgpu::Backend,
     pub adapter_name: String,
+    /// Whether the `subgroups` WGSL feature is enabled on this device — lets kernels use
+    /// `subgroupAdd`/`subgroupBroadcast` (a hardware warp op) instead of a shared-memory barrier
+    /// tree. Shipped natively (Vulkan/Metal/DX12) and in browsers (Chrome 134+); kernels that use it
+    /// must guard on this flag and keep a barrier-tree fallback for the portable floor.
+    pub subgroups: bool,
 }
 
 /// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
@@ -45,10 +50,14 @@ impl Context {
             .await
             .map_err(|e| format!("no compute adapter: {e:?}"))?;
         let info = adapter.get_info();
+        // Opt into subgroups when the adapter has it (native GPUs + modern browsers); harmless to
+        // omit where absent, and the flag lets kernels pick a subgroup path or the barrier fallback.
+        let want = wgpu::Features::SUBGROUP;
+        let subgroups = adapter.features().contains(want);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
-                required_features: wgpu::Features::empty(),
+                required_features: if subgroups { want } else { wgpu::Features::empty() },
                 // request the adapter's real limits: native gets big buffers (big models); in a
                 // browser this resolves to the WebGPU baseline, so cross-fabric portability holds.
                 required_limits: adapter.limits(),
@@ -57,7 +66,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -78,17 +87,18 @@ impl Context {
         let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
         let adapter = adapters.into_iter().nth(idx).ok_or_else(|| format!("no adapter at index {idx}"))?;
         let info = adapter.get_info();
+        let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
-                required_features: wgpu::Features::empty(),
+                required_features: if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
                 required_limits: wgpu::Limits::downlevel_defaults(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {

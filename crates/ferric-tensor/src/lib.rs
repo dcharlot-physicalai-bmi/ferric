@@ -1334,3 +1334,28 @@ pub fn prof_report() {
         b.0.clear(); b.1 = None;
     });
 }
+
+/// Spike/validation for the `subgroups` feature: 64 threads contribute their index; each subgroup
+/// sums via `subgroupAdd` (a hardware warp reduction), lane 0 of each subgroup atomic-adds its
+/// partial, thread 0 writes the total. Correct total = sum(0..64) = 2016. Confirms the primitive
+/// that will replace the split-K barrier-tree reduction. Returns out[0].
+pub async fn run_subgroup_sum_test(ctx: &Arc<Context>) -> f32 {
+    let out = empty(ctx, 1);
+    run(ctx, SUBGROUP_SUM_WGSL, "sg_sum", &[&out], (1, 1, 1));
+    readback(ctx, &out, 1).await[0]
+}
+
+const SUBGROUP_SUM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read_write> out: array<f32>;
+var<workgroup> total: atomic<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(subgroup_invocation_id) sglid: u32) {
+    if (lid.x == 0u) { atomicStore(&total, 0u); }
+    workgroupBarrier();
+    let s = subgroupAdd(lid.x);            // sum of lid.x within this subgroup
+    if (sglid == 0u) { atomicAdd(&total, s); }
+    workgroupBarrier();
+    if (lid.x == 0u) { out[0] = f32(atomicLoad(&total)); }
+}
+"#;
