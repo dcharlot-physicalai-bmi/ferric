@@ -1387,3 +1387,42 @@ fn main() {
     coopStoreT(mc, &c[0], 8u);
 }
 "#;
+
+impl Tensor {
+    /// f32 GEMM C=A·B on the **hardware matrix unit** via cooperative-matrix 8×8 tiles: one subgroup
+    /// accumulates an 8×8 output tile across the K dimension with `coopMultiplyAdd`. Requires M,K,N
+    /// multiples of 8 and `ctx.coop_matrix`; the caller falls back to the naive kernel otherwise.
+    /// fp-order differs from the scalar kernels (hardware reduction), so this is a fast-path, not the
+    /// bit-identical default.
+    pub fn matmul_coop(&self, other: &Tensor) -> Tensor {
+        let (m, k) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
+        let n = other.shape[other.rank() - 1];
+        assert!(m % 8 == 0 && k % 8 == 0 && n % 8 == 0, "matmul_coop needs M,K,N multiples of 8");
+        let (a, b) = (self.contiguous(), other.contiguous());
+        let out = empty(&self.ctx, m * n); // zeroed accumulator
+        run(&self.ctx, COOP_GEMM_WGSL, "coop_gemm",
+            &[a.buf.as_ref(), b.buf.as_ref(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+            ((n / 8) as u32, (m / 8) as u32, 1));
+        Tensor::from_parts(&self.ctx, out, vec![m, n])
+    }
+}
+
+const COOP_GEMM_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       a: array<f32>;   // [M,K] row-major
+@group(0) @binding(1) var<storage,read>       b: array<f32>;   // [K,N] row-major
+@group(0) @binding(2) var<storage,read_write> c: array<f32>;   // [M,N] (zeroed)
+@group(0) @binding(3) var<uniform>            dims: vec4<u32>; // M, K, N, _
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>) {
+    let mm = dims.x; let kk = dims.y; let nn = dims.z;
+    let trow = wid.y * 8u; let tcol = wid.x * 8u;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[trow * nn + tcol], nn);
+    for (var k: u32 = 0u; k < kk; k = k + 8u) {
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&a[trow * kk + k], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + tcol], nn);
+        acc = coopMultiplyAdd(ma, mb, acc);
+    }
+    coopStoreT(acc, &c[trow * nn + tcol], nn);
+}
+"#;
