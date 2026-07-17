@@ -734,7 +734,65 @@ impl Tensor {
         }
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
+
+    /// **Cooperative-matrix (tensor-core) Q2_0 matmul for PREFILL** — where the weight read is
+    /// amortized over many tokens and the multiply is a real GEMM. Each subgroup owns an 8×8 output
+    /// tile; per K-step it dequantizes the packed 8×8 W tile into shared memory (transposed to
+    /// [K,N]), loads it + the f32 activation tile as coop matrices, and `coopMultiplyAdd`s. This is
+    /// where the 6–32× matrix-unit speedup meets a real quantized model. Requires rows(M)%8==0 and
+    /// out(N)%8==0 (cols already %128), plus `ctx.coop_gemm_ok()`; fp-order/precision dependent
+    /// (NVIDIA TF32), so a prefill fast-path, not the deterministic default.
+    pub fn matmul_q2_0_coop(&self, w: &Q2_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(rows % 8 == 0 && w.rows % 8 == 0, "matmul_q2_0_coop needs M,N multiples of 8");
+        let out = empty(&self.ctx, rows * w.rows);
+        let nblk = (inn / 128) as u32;
+        run(&self.ctx, MATMUL_Q2_0_COOP_WGSL, "matmul_q2_0_coop",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, inn as u32, w.rows as u32, nblk])],
+            ((w.rows / 8) as u32, (rows / 8) as u32, 1));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
 }
+
+const MATMUL_Q2_0_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:      array<f32>;  // [M,K] activations
+@group(0) @binding(1) var<storage,read>       codes:  array<u32>;  // Q2_0 codes, W [N,K]
+@group(0) @binding(2) var<storage,read>       scales: array<u32>;  // Q2_0 scales
+@group(0) @binding(3) var<storage,read_write> c:      array<f32>;  // [M,N]
+@group(0) @binding(4) var<uniform>            dims:   vec4<u32>;   // M, K, N, nblk
+var<workgroup> bs: array<f32, 64>;                                 // dequantized W tile, [K,N] layout
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        // dequant the 8×8 W tile [n0..+8, k0..+8] into bs, TRANSPOSED to [k,n] row-major for role B
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u;                       // 0..64 over (n_local, k_local)
+            let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let gblk = n * nblk + (k / 128u); let j = k % 128u;
+            let sw = unpack2x16float(scales[gblk >> 1u]);
+            let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
+            let word = codes[gblk * 8u + (j >> 4u)];
+            let code = (word >> ((j & 15u) * 2u)) & 3u;
+            bs[kl * 8u + nl] = f32(i32(code) - 1) * d;  // bs[k*8+n] = W[n][k]  → B[k][n]
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
 
 /// Which `matmul_q2_0` kernel to use. The deciding factor is measured, and it is the number of
 /// *output elements* (`rows·out`) — not the K depth, as one might assume:
