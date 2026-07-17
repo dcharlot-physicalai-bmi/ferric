@@ -1,5 +1,7 @@
-//! **Qwen3** dense transformer — PrismML's smaller Ternary Bonsai models (1.7B / 4B) *and* any
-//! standard Qwen3 GGUF. Full GQA every layer, QK-norm, SwiGLU, RoPE. **Format-agnostic**: each weight
+//! **Dense Qwen-family transformer** — PrismML's Ternary Bonsai (1.7B/4B, arch `qwen3`) *and* standard
+//! `qwen3` **and `qwen2`** GGUFs off Hugging Face. GQA every layer, SwiGLU, RoPE, RMSNorm; the arch
+//! differences are handled by feature-detection: QK-norm (Qwen3 only) and QKV bias (Qwen2 only) are
+//! read from tensor presence, and all metadata keys are architecture-prefixed. **Format-agnostic**: each weight
 //! loads in whatever quant the GGUF stored it (`QMatrix` over Q2_0/Q4_0/Q4_K/Q6_K/Q8_0), so this runs
 //! a PrismML ternary model *and* a genuine `Q4_K_M` model off Hugging Face — which mixes Q4_K and
 //! Q6_K, even within one qkv (see `Proj`). The ternary 1.7B is ~450 MB packed, so it fits WebGPU's
@@ -23,23 +25,33 @@ pub struct Cfg {
     pub n_vocab: usize,
     pub eps: f32,
     pub rope_base: f32,
+    pub has_qk_norm: bool, // Qwen3 has it, Qwen2/Llama don't
+    pub qkv_bias: bool,    // Qwen2 has q/k/v biases; Qwen3/Llama don't
 }
 
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
-        let u = |k: &str| match g.metadata().get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {k}")) };
-        let f = |k: &str| match g.metadata().get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {k}")) };
+        // The metadata keys are prefixed by the architecture (qwen2.*, qwen3.*, llama.*, …). Read it
+        // once so one loader serves the whole dense Qwen/Llama family.
+        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => "qwen3".into() };
+        let u = |k: &str| match g.metadata().get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {arch}.{k}")) };
+        let f = |k: &str| match g.metadata().get(&format!("{arch}.{k}")) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {arch}.{k}")) };
         let n_vocab = match g.metadata().get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("no tokens".into()) };
+        let n_head = u("attention.head_count")?;
+        // Some arches (qwen2) omit key_length; then head_dim = embedding_length / head_count.
+        let head_dim = u("attention.key_length").unwrap_or_else(|_| u("embedding_length").unwrap_or(0) / n_head.max(1));
         Ok(Cfg {
-            n_embd: u("qwen3.embedding_length")?,
-            n_layer: u("qwen3.block_count")?,
-            n_head: u("qwen3.attention.head_count")?,
-            n_head_kv: u("qwen3.attention.head_count_kv")?,
-            head_dim: u("qwen3.attention.key_length")?,
-            n_ff: u("qwen3.feed_forward_length")?,
+            n_embd: u("embedding_length")?,
+            n_layer: u("block_count")?,
+            n_head,
+            n_head_kv: u("attention.head_count_kv")?,
+            head_dim,
+            n_ff: u("feed_forward_length")?,
             n_vocab,
-            eps: f("qwen3.attention.layer_norm_rms_epsilon")?,
-            rope_base: f("qwen3.rope.freq_base")?,
+            eps: f("attention.layer_norm_rms_epsilon")?,
+            rope_base: f("rope.freq_base")?,
+            has_qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
+            qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
         })
     }
 }
@@ -78,9 +90,10 @@ impl Proj {
 pub struct Layer {
     attn_norm: Tensor,
     ffn_norm: Tensor,
-    q_norm: Tensor,
-    k_norm: Tensor,
+    q_norm: Option<Tensor>, // QK-norm: Qwen3 only
+    k_norm: Option<Tensor>,
     wqkv: Proj, // q | k | v stacked (fused if same format, else separate matmuls concatenated)
+    qkv_bias: Option<Tensor>, // Qwen2: concatenated q|k|v bias, added after the projection
     q_out: usize,
     kv_out: usize,
     wo: QMatrix,
@@ -115,12 +128,19 @@ impl Qwen3 {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
+            let qkv_bias = if cfg.qkv_bias {
+                let mut bias = g.dequant(&b("attn_q.bias"))?;
+                bias.extend(g.dequant(&b("attn_k.bias"))?);
+                bias.extend(g.dequant(&b("attn_v.bias"))?);
+                Some(Tensor::from_vec(ctx, &bias, &[1, bias.len()]))
+            } else { None };
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 ffn_norm: f32t(ctx, g, &b("ffn_norm.weight"), &[cfg.n_embd])?,
-                q_norm: f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?,
-                k_norm: f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?,
+                q_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?) } else { None },
+                k_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?) } else { None },
                 wqkv: Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                qkv_bias,
                 q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
                 kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
                 wo: qm(ctx, g, &b("attn_output.weight"))?,
@@ -159,10 +179,16 @@ impl Qwen3 {
 
     fn attn(&self, h: &Tensor, l: &Layer, cache: &mut Option<(Tensor, Tensor)>, offset: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
-        // One fused matmul emits [q | k | v]; split, QK-norm per head, RoPE.
+        // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
         let qkv = l.wqkv.matmul(h);
-        let q = qkv.narrow(1, 0, l.q_out).reshape(&[t, nh, hd]).rmsnorm(&l.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
-        let k = qkv.narrow(1, l.q_out, l.kv_out).reshape(&[t, nkv, hd]).rmsnorm(&l.k_norm, self.cfg.eps).reshape(&[t, nkv * hd]);
+        let qkv = match &l.qkv_bias { Some(bias) => qkv.add(bias), None => qkv };
+        // QK-norm (Qwen3) normalizes each head; without it (Qwen2/Llama) q/k pass through unchanged.
+        let qn = |x: Tensor, n: usize, norm: &Option<Tensor>| match norm {
+            Some(w) => x.reshape(&[t, n, hd]).rmsnorm(w, self.cfg.eps).reshape(&[t, n * hd]),
+            None => x,
+        };
+        let q = qn(qkv.narrow(1, 0, l.q_out).contiguous(), nh, &l.q_norm);
+        let k = qn(qkv.narrow(1, l.q_out, l.kv_out).contiguous(), nkv, &l.k_norm);
         let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out).contiguous();
 
         let q = self.rope(&q, nh, offset);

@@ -52,8 +52,11 @@ FLOPS:
    Ferric** — `unsloth/Qwen3-0.6B-Q4_K_M` (which mixes Q4_K and Q6_K, even within one qkv) generates
    coherent text: *"The capital of France is Paris."* And it runs **in a browser tab** too: the same
    wasm/WebGPU path produces logits matching native Metal (argmax 12095, Σ −379147.98 both), so an
-   arbitrary standard quantized model is cross-fabric-consistent from one codebase. Nothing else
-   pure-Rust runs the standard quantized ecosystem *and* the browser from one source. (Q5_K is next.)
+   arbitrary standard quantized model is cross-fabric-consistent from one codebase. One loader serves
+   the **whole dense Qwen family** — `qwen3` (QK-norm) *and* `qwen2` (QKV bias, no QK-norm) — by
+   feature-detecting from tensor presence; `Qwen2.5-0.5B-Instruct-Q6_K` off HF generates *"…Paris. It
+   is the largest city in Europe…"* Nothing else pure-Rust runs the standard quantized ecosystem *and*
+   the browser from one source. (Llama-family arch + the older Q5_0/Q4_1 formats are the next reach.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
