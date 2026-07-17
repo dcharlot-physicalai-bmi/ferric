@@ -57,7 +57,13 @@ async fn run() {
     println!("loaded in {:?} · {} layers · d={} ff={} · {}h/{}kv × {} · vocab={}",
         t0.elapsed(), c.n_layer, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab);
 
-    let ids = bpe.encode(prompt);
+    // Prepend BOS when the tokenizer asks for it. Llama-3 sets add_bos_token=true (and degrades
+    // badly without it); Qwen sets it false. Default: add BOS when a bos id exists and add_bos isn't
+    // explicitly false — the llama.cpp convention.
+    let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
+    let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
+    let mut ids = bpe.encode(prompt);
+    if add_bos { if let Some(b) = bos_id { ids.insert(0, b); } }
 
     // `--dump`: forward the prompt ONCE and print a deterministic fingerprint of the last-position
     // logits (top-8 + a fixed probe set + a sum). This is the native (Metal) reference for the

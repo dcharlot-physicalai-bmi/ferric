@@ -265,6 +265,19 @@ impl Tensor {
         run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
+
+    /// RoPE with a per-frequency scale (`freq_scale` is `[head_dim/2]`) — Llama-3's rope-scaling, where
+    /// `rope_freqs.weight` multiplies each inverse frequency to stretch the effective context window.
+    pub fn rope_scaled(&self, freq_scale: &Tensor, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (n_heads * head_dim);
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, ROPE_SCALED_WGSL, "rope_scaled",
+            &[c.buf.as_ref(), &out, freq_scale.contiguous().buf.as_ref(),
+              &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])],
+            groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
     /// **Gated delta rule** — the linear-attention recurrence behind Qwen3-Next / Qwen3.5 (and so
     /// PrismML Bonsai-27B, whose 64 layers are 75% linear attention). Per head, a recurrent state
     /// `S [dk, dv]` evolves over the sequence:
@@ -842,6 +855,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ss = ss + v * v; }
     let inv = 1.0 / max(sqrt(ss), eps);   // eps clamps the divisor (not added under the root)
     for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv; }
+}
+"#;
+
+// Like ROPE_WGSL but each inverse frequency is multiplied by scale[c] (Llama-3 rope_freqs.weight).
+const ROPE_SCALED_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(2) var<storage,read>        scale: array<f32>; // [dh/2] per-freq multiplier
+@group(0) @binding(3) var<storage,read>        info: array<u32>;  // t, h, dh, bitcast(base), offset
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]); let off = info[4];
+    let id = gid.x; if (id >= t * h) { return; }
+    let i = id / h; let head = id % h; let half = dh / 2u;
+    let o = (i * h + head) * dh; let lb = log(base);
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let inv = exp(-2.0 * f32(c) / f32(dh) * lb) * scale[c];
+        let ang = f32(i + off) * inv; let cs = cos(ang); let sn = sin(ang);
+        let x1 = x[o + c]; let x2 = x[o + c + half];
+        out[o + c] = x1 * cs - x2 * sn;
+        out[o + c + half] = x2 * cs + x1 * sn;
+    }
 }
 "#;
 

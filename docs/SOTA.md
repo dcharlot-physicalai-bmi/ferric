@@ -56,7 +56,11 @@ FLOPS:
    the **whole dense Qwen family** — `qwen3` (QK-norm) *and* `qwen2` (QKV bias, no QK-norm) — by
    feature-detecting from tensor presence; `Qwen2.5-0.5B-Instruct-Q6_K` off HF generates *"…Paris. It
    is the largest city in Europe…"* Nothing else pure-Rust runs the standard quantized ecosystem *and*
-   the browser from one source. (Llama-family arch + the older Q5_0/Q4_1 formats are the next reach.)
+   the browser from one source. **Llama runs too**: `Llama-3.2-1B-Instruct-Q6_K` (arch `llama`)
+   generates *"The capital of France is Paris, the city…"* once two Llama-isms are handled — the
+   `rope_freqs` per-frequency RoPE scaling and, the load-bearing one, prepending **BOS** (Llama
+   collapses without it; Qwen sets `add_bos_token=false` so nothing changes there). (The older
+   non-K formats Q5_0/Q4_1 and the tiktoken pre-tokenizer edge cases are the next reach.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output

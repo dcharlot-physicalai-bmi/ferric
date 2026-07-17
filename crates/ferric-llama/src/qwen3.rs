@@ -120,6 +120,7 @@ pub struct Qwen3 {
     out_norm: Tensor,
     lm_head: QMatrix,
     embd_type: u32,
+    rope_freqs: Option<Tensor>, // Llama-3 rope-scaling factors [head_dim/2]; None for Qwen
 }
 
 impl Qwen3 {
@@ -155,6 +156,10 @@ impl Qwen3 {
             out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
             lm_head: qm(ctx, g, head)?,
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
+            rope_freqs: g.tensor("rope_freqs.weight").map(|t| {
+                let n = t.dims[0] as usize;
+                f32t(ctx, g, "rope_freqs.weight", &[n])
+            }).transpose()?,
             cfg, ctx: ctx.clone(), layers,
         })
     }
@@ -172,9 +177,13 @@ impl Qwen3 {
         Tensor::from_vec(&self.ctx, &v, &[tokens.len(), d])
     }
 
-    /// Full RoPE over head_dim (Qwen3 rotates the whole head, unlike the 27B's partial 64/256).
+    /// Full RoPE over head_dim (Qwen rotates the whole head). Llama-3 applies its per-frequency
+    /// `rope_freqs` scaling; Qwen has none, so it's plain RoPE.
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize) -> Tensor {
-        x.rope(n_heads, self.cfg.head_dim, self.cfg.rope_base, offset)
+        match &self.rope_freqs {
+            Some(fs) => x.rope_scaled(fs, n_heads, self.cfg.head_dim, self.cfg.rope_base, offset),
+            None => x.rope(n_heads, self.cfg.head_dim, self.cfg.rope_base, offset),
+        }
     }
 
     fn attn(&self, h: &Tensor, l: &Layer, cache: &mut Option<(Tensor, Tensor)>, offset: usize) -> Tensor {

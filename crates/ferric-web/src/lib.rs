@@ -103,7 +103,7 @@ pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> st
     let c = &m.cfg;
     let load_ms = js_sys::Date::now() - t_load;
 
-    let ids = bpe.encode(&prompt);
+    let ids = encode_with_bos(&g, &bpe, &prompt);
     if ids.is_empty() { return Err(err("prompt encoded to zero tokens".into())); }
 
     let mut cache = Cache::new(c);
@@ -155,7 +155,7 @@ pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_toke
     let load_ms = js_sys::Date::now() - t_load;
     emit("status", &format!("ready · {} layers · {:?} · {:.0}ms", c.n_layer, ctx.backend, load_ms));
 
-    let ids = bpe.encode(&prompt);
+    let ids = encode_with_bos(&g, &bpe, &prompt);
     if ids.is_empty() { return Err(err("prompt encoded to zero tokens".into())); }
 
     let mut cache = Cache::new(c);
@@ -201,7 +201,7 @@ pub async fn bonsai_logits(model: Vec<u8>, prompt: String) -> std::result::Resul
     let ctx = Arc::new(Context::new().await.map_err(err)?);
     let m = Qwen3::load(&ctx, &g).map_err(err)?;
     let nv = m.cfg.n_vocab;
-    let ids = bpe.encode(&prompt);
+    let ids = encode_with_bos(&g, &bpe, &prompt);
     let v = m.forward_cached(&ids, &mut Cache::new(&m.cfg)).to_vec().await;
     let row = &v[v.len() - nv..];
     let mut idx: Vec<usize> = (0..nv).collect();
@@ -227,6 +227,16 @@ fn build_bpe(g: &impl GgufSource) -> std::result::Result<(Bpe, Vec<String>), JsV
         _ => return Err(err("no merges")),
     };
     Ok((Bpe::new(vocab, &merges), toks))
+}
+
+/// Encode `prompt`, prepending BOS when the GGUF asks for it (Llama-3 does; Qwen doesn't) — Llama
+/// models degrade badly without BOS. Default: add BOS when a bos id exists and add_bos isn't false.
+fn encode_with_bos(g: &impl GgufSource, bpe: &Bpe, prompt: &str) -> Vec<u32> {
+    let bos = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
+    let add = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos.is_some() };
+    let mut ids = bpe.encode(prompt);
+    if add { if let Some(b) = bos { ids.insert(0, b); } }
+    ids
 }
 
 /// GPT-2 byte↔printable-unicode map, inverted — vocab entry chars back to raw bytes.
