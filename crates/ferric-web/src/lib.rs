@@ -188,6 +188,32 @@ pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_toke
     Ok(stats)
 }
 
+/// Cross-fabric proof: run the SAME Qwen3 forward the native binary runs, on the browser's WebGPU,
+/// and return a deterministic fingerprint of the last-position logits (top-8 + fixed probes + sum).
+/// Compared against `run_qwen3 --dump` (native Metal), this proves the moat — bit-comparable numerics
+/// for a real 1.7B ternary LLM — not just for a lone matmul.
+#[wasm_bindgen]
+pub async fn bonsai_logits(model: Vec<u8>, prompt: String) -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    let err = |e: String| JsValue::from_str(&e);
+    let g = parse(model).map_err(err)?;
+    let (bpe, _toks) = build_bpe(&g)?;
+    let ctx = Arc::new(Context::new().await.map_err(err)?);
+    let m = Qwen3::load(&ctx, &g).map_err(err)?;
+    let nv = m.cfg.n_vocab;
+    let ids = bpe.encode(&prompt);
+    let v = m.forward_cached(&ids, &mut Cache::new(&m.cfg)).to_vec().await;
+    let row = &v[v.len() - nv..];
+    let mut idx: Vec<usize> = (0..nv).collect();
+    idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+    let top: Vec<String> = idx.iter().take(8).map(|&i| format!("[{i},{:.5}]", row[i])).collect();
+    let sum: f64 = row.iter().map(|&x| x as f64).sum();
+    Ok(format!(
+        "{{\"ids\":{:?},\"argmax\":{},\"top\":[{}],\"probe\":[{:.5},{:.5},{:.5},{:.5}],\"sum\":{:.3}}}",
+        ids, idx[0], top.join(","), row[0], row[100], row[1000], row[10000], sum
+    ))
+}
+
 /// Build the exact BPE (+ the raw token strings for detok) from a GGUF's embedded tokenizer.
 fn build_bpe(g: &impl GgufSource) -> std::result::Result<(Bpe, Vec<String>), JsValue> {
     let err = |e: &str| JsValue::from_str(e);

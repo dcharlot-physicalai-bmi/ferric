@@ -58,6 +58,24 @@ async fn run() {
         t0.elapsed(), c.n_layer, c.n_embd, c.n_ff, c.n_head, c.n_head_kv, c.head_dim, c.n_vocab);
 
     let ids = bpe.encode(prompt);
+
+    // `--dump`: forward the prompt ONCE and print a deterministic fingerprint of the last-position
+    // logits (top-8 + a fixed probe set + a sum). This is the native (Metal) reference for the
+    // cross-fabric check — the browser (WebGPU) runs the SAME Qwen3 code and must reproduce it.
+    if args.iter().any(|a| a == "--dump") {
+        let v = m.forward_cached(&ids, &mut Cache::new(c)).to_vec().await;
+        let row = &v[v.len() - c.n_vocab..];
+        let mut idx: Vec<usize> = (0..c.n_vocab).collect();
+        idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+        println!("prompt ids: {ids:?}");
+        println!("top-8 (id, logit):");
+        for &i in idx.iter().take(8) { println!("  {i:>6}  {:+.5}  {:?}", row[i], detok(&[i as u32])); }
+        let sum: f64 = row.iter().map(|&x| x as f64).sum();
+        println!("probe[0,100,1000,10000]: {:+.5} {:+.5} {:+.5} {:+.5}", row[0], row[100], row[1000], row[10000]);
+        println!("argmax={} sum={:.3}", idx[0], sum);
+        return;
+    }
+
     print!("\n{prompt}");
     use std::io::Write;
     std::io::stdout().flush().ok();

@@ -16,10 +16,15 @@ how we know when we're done: each gap below is a checkbox.
 These are the axes no single competitor holds together — Ferric's moat is **capability surface**, not
 FLOPS:
 
-1. **One codebase, bit-identical native ↔ browser (validated).** No mainstream project ships *proven
-   bit-identical* native-vs-WebGPU numerics as a first-class property. Burn is the only true same-code
-   cross-platform peer and doesn't guarantee bit-exact parity; ratchet/wonnx are cross-platform but
-   inference-only; WebLLM/transformers.js/tinygrad are browser-only with no native same-code path.
+1. **One codebase, bit-identical native ↔ browser — proven on a full 1.7B LLM, not just a kernel.**
+   The same pure-Rust `Qwen3` forward, run on native Metal (`run_qwen3 --dump`) and on browser WebGPU
+   (`bonsai_logits`), produces the **same last-position logits** for PrismML Ternary Bonsai-1.7B:
+   identical argmax (12095 " Paris"), identical top-8 to 5 decimals, and an identical sum over all
+   151,669 logits (−395780.136) — the sum aggregates every logit, so any divergence anywhere would
+   show. No mainstream project ships *proven* native-vs-WebGPU parity as a first-class property. Burn
+   is the only true same-code cross-platform peer and doesn't guarantee bit-exact parity;
+   ratchet/wonnx are cross-platform but inference-only; WebLLM/transformers.js/tinygrad are
+   browser-only with no native same-code path.
 2. **Training that actually trains transformers, *inside* the cross-fabric runtime.** The set
    {trains transformers} ∩ {same code native+browser} ∩ {heterogeneous scheduler} is currently
    occupied by **no one**. Every browser engine (WebLLM, transformers.js, ratchet, wonnx) is
