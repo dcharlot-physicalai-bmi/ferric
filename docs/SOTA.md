@@ -189,12 +189,32 @@ one sync'd submit per category, so it attributes GPU work not op count):
 
 This **corrects an earlier guess in this doc** ("gated-delta-net ~14 ms, matmuls dominate ~110 ms").
 The recurrence kernel is minor; FFN and the GDN mixer cost about the same, and both are dominated by
-their Q2_0 matmuls, which at these decode shapes run ~57 GB/s effective (below the 100–186 GB/s the
-same kernels hit in isolation — the small GDN/attn matmuls and the elementwise ops between them drag
-the average down). So the next lever is still matmul throughput at decode width, plus folding the
-between-matmul elementwise ops into kernel epilogues. Measured-not-assumed is the rule: several
-confident conclusions in this section died on contact with a correct measurement — including this
-breakdown, two "obvious" optimizations, and the theory that the recurrence kernel was the bottleneck.
+their Q2_0 matmuls, which at these decode shapes run ~57 GB/s effective. Measured-not-assumed is the
+rule: several confident conclusions in this section died on contact with a correct measurement.
+
+**A second machine changed the picture — and the tooling.** An NVIDIA RTX 4050 (Vulkan) is far less
+thermally noisy than the M5 Max (±1 ms vs ±30 ms run-to-run), so it's now the machine decode work is
+*measured* on. Bonsai-**1.7B** (Qwen3 dense) there:
+
+| | before | after fused attention | note |
+|---|---|---|---|
+| decode | 35 ms/tok | **32 ms/tok** | fused single-query attention, ~9% |
+
+Profiling the 1.7B decode on the 4050 (attention in *every* layer, unlike the 27B hybrid) showed
+**attention at 54%** — because `decode_attention` composed ~12 dispatches (reshape/permute/contiguous/
+broadcast/matmul/softmax/matmul) with intermediate tensors. `fused_decode_attention` collapses that to
+**one workgroup-per-head kernel** (scores → softmax → weighted-V in shared memory, validated == the
+composed path to ~1e-8); attention dropped to 49% and decode to 32 ms. SwiGLU was also fused
+(silu·mul → one kernel) — correct, but a single-dispatch saving is below the ~1 ms resolution.
+
+The honest read: at batch-1 decode every op is a tiny GEMV that underfills the GPU, so decode is
+**dispatch/latency-bound on a long dependent chain** (~15 kernels/layer × 28–64 layers), not
+bandwidth-bound. The Q2_0 GEMV itself is already well-tuned (word-strided coalesced loads, vec4
+activations, full workgroup occupancy — an "idle-threads" worry was checked and disproved) and sits
+at ~32% of the memory roofline because on-the-fly ternary unpacking is compute-bound, which is
+inherent to the format. So the remaining levers are structural: fuse whole layers to shorten the
+dependent chain, a preallocated write-in-place KV cache (vs today's re-concatenate) for long context,
+and eventually multi-token decode — not shaving individual kernels.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
