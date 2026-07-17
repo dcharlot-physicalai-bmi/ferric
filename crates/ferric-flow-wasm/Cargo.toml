@@ -1,0 +1,18 @@
+[package]
+name = "ferric-flow-wasm"
+description = "WASM bindings for ferric-flow's live vector index — load a serialized HNSW and query it from JS (browser or a Cloudflare Worker). The edge-native, in-Worker replacement for a managed vector DB."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["wasm", "rag", "vector", "hnsw", "edge"]
+categories = ["wasm", "science"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ferric-flow = { path = "../ferric-flow", version = "0.1" }
+wasm-bindgen = "0.2"

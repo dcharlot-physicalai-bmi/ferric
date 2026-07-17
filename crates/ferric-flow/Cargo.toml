@@ -1,0 +1,18 @@
+[package]
+name = "ferric-flow"
+description = "Ferric incremental dataflow — a pure-Rust reimplementation of the Differential Dataflow core (the (data, diff) change model). Operators (map/filter/join/reduce) refresh results by computing only the change, bit-identical to a full recompute and touching only the affected keys. The live-data / RAG / MCP substrate for the Institute, native to Ferric and wasm/edge-ready (no long-lived Python engine)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["dataflow", "incremental", "streaming", "rag", "differential"]
+categories = ["data-structures", "science"]
+
+[dependencies]
+
+# The library itself is std-only and wasm-clean. serde_json is a DEV-only dep, used solely by the
+# corpus_rag example to load the real-corpus embedding fixture — it never touches the shipped crate.
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,5 @@
+name = "ferric-flow-poc"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+# Local proof only — never deployed. `wrangler dev` bundles the .wasm import as a WebAssembly.Module.

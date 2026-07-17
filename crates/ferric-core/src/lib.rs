@@ -49,13 +49,11 @@ impl Tensor {
 }
 
 impl Context {
-    /// Whether the cooperative-matrix GEMM path is safe to run here. The feature is exposed on Metal
-    /// AND Vulkan, but our naga fork's **SPIR-V backend** currently panics generating coop_mat code
-    /// (index expression not cached in the pointer bounds-check), so Vulkan/NVIDIA is gated off until
-    /// that's fixed. Metal (MSL backend) works — 6× GEMM on the M5's matrix unit.
-    pub fn coop_gemm_ok(&self) -> bool {
-        self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_FORCE").is_ok())
-    }
+    /// Whether the cooperative-matrix GEMM path runs here. Works on **both** Metal (MSL →
+    /// simdgroup_matrix, exact f32) and Vulkan (SPIR-V → KHR_cooperative_matrix → NVIDIA tensor cores,
+    /// which compute f32 as **TF32**, ~1e-2 accuracy — like PyTorch's default). The naga SPIR-V
+    /// codegen bug that used to block Vulkan is worked around by let-binding the coop pointer indices.
+    pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix }
 }
 
 impl Context {

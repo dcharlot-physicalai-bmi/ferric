@@ -21,9 +21,10 @@ async fn run() {
         let _ = a.matmul_coop(&b).to_vec().await; // warm
         let ct = bench(&|| a.matmul_coop(&b));
         let nt = bench(&|| a.matmul_naive(&b));
-        println!("  {d}³: coop {:>7.1} GFLOP/s   naive {:>7.1}   coop/naive {:.2}×   max|Δ|={:.1e}",
+        let prec = if e < 1e-4 { "exact f32" } else { "TF32" };
+        println!("  {d}³: coop {:>7.1} GFLOP/s   naive {:>7.1}   coop/naive {:.2}×   max|Δ|={:.1e} ({prec})",
             flop / ct / 1e9, flop / nt / 1e9, nt / ct, e);
-        assert!(e < 1e-2, "coop != naive");
+        assert!(e < 6e-2, "coop diverged beyond TF32 tolerance");
     }
-    println!("✅ cooperative-matrix GEMM validated + benchmarked on the hardware matrix unit");
+    println!("✅ cooperative-matrix GEMM on the hardware matrix unit — Metal exact f32, NVIDIA TF32");
 }
