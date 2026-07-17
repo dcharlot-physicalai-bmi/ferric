@@ -16,15 +16,24 @@ how we know when we're done: each gap below is a checkbox.
 These are the axes no single competitor holds together — Ferric's moat is **capability surface**, not
 FLOPS:
 
-1. **One codebase, bit-identical native ↔ browser — proven on a full 1.7B LLM, not just a kernel.**
-   The same pure-Rust `Qwen3` forward, run on native Metal (`run_qwen3 --dump`) and on browser WebGPU
-   (`bonsai_logits`), produces the **same last-position logits** for PrismML Ternary Bonsai-1.7B:
-   identical argmax (12095 " Paris"), identical top-8 to 5 decimals, and an identical sum over all
-   151,669 logits (−395780.136) — the sum aggregates every logit, so any divergence anywhere would
-   show. No mainstream project ships *proven* native-vs-WebGPU parity as a first-class property. Burn
-   is the only true same-code cross-platform peer and doesn't guarantee bit-exact parity;
-   ratchet/wonnx are cross-platform but inference-only; WebLLM/transformers.js/tinygrad are
-   browser-only with no native same-code path.
+1. **One codebase across three fabrics and two GPU vendors — proven on a full 1.7B LLM.** The same
+   pure-Rust `Qwen3` forward runs PrismML Ternary Bonsai-1.7B and produces the same last-position
+   logits on **Apple Metal** (`run_qwen3 --dump`), **browser WebGPU** (`bonsai_logits`), and **NVIDIA
+   Vulkan** (`run_qwen3 --dump` on an RTX 4050):
+
+   | | Apple Metal | browser WebGPU | NVIDIA Vulkan |
+   |---|---|---|---|
+   | argmax | 12095 " Paris" | 12095 | 12095 |
+   | top logit | +17.94083 | +17.94083 | +17.94083 |
+   | Σ all 151,669 logits | −395780.136 | −395780.136 | −395780.119 |
+
+   Metal and WebGPU (both on Apple) are **bit-identical**; NVIDIA/Vulkan agrees to **fp32 rounding**
+   (~1e-5 per logit — the sum differs by 0.017 across 151,669 terms, i.e. floating-point accumulation
+   order on a different vendor's shader compiler, not a bug), with identical argmax and top-8 ranking.
+   No mainstream project ships *proven* same-code parity across vendors like this. Burn is the only
+   true same-code cross-platform peer and doesn't guarantee bit-exact parity; ratchet/wonnx are
+   cross-platform but inference-only; WebLLM/transformers.js/tinygrad are browser-only with no native
+   same-code path.
 2. **Training that actually trains transformers, *inside* the cross-fabric runtime.** The set
    {trains transformers} ∩ {same code native+browser} ∩ {heterogeneous scheduler} is currently
    occupied by **no one**. Every browser engine (WebLLM, transformers.js, ratchet, wonnx) is
@@ -47,13 +56,16 @@ across 512³–4096³, three ways:
 | register-tiled (1×8 per thread) | ~280 | ~280 | 0.6× |
 | shared-memory tiled (64×64, 4×4 micro) | ~215 | ~229 | 0.3× |
 
-On Apple Silicon the naive kernel **wins**, even at 4096³ where the 64 MB matrices blow past every
-cache: its perfect coalescing (adjacent threads → adjacent B columns) plus maximum occupancy beats
-any explicit tile, because the hardware caches already serve the data reuse that tiling exists to
-capture — and tiling's barriers + register pressure cost more than they save. The real path to
->1 TFLOP/s here is **`simdgroup_matrix`** (Apple's tensor-core-like op), which portable WGSL does not
-expose; that, and a general flash-attention path, are the genuine gaps. The autotuner measures
-naive-vs-tiled per device and picks the winner, so a GPU where tiling *does* win still gets it.
+The naive kernel **wins**, even at 4096³ where the 64 MB matrices blow past every cache: its perfect
+coalescing (adjacent threads → adjacent B columns) plus maximum occupancy beats any explicit tile,
+because the hardware caches already serve the data reuse that tiling exists to capture — and tiling's
+barriers + register pressure cost more than they save. **Confirmed cross-vendor** on an NVIDIA RTX
+4050 (Vulkan), naive wins at every size too (reg-tiled only reaches parity at 4096³, where the
+matrices finally exceed even NVIDIA's L2); shared-memory tiling is worst on both vendors. So this is
+not an Apple quirk — a hand-written WGSL tile doesn't beat coalesced-naive-plus-hardware-cache on
+either stack. The real path to >1 TFLOP/s is cooperative-matrix / `simdgroup_matrix` (tensor-core-like
+ops), which portable WGSL doesn't yet expose; that, and a general flash-attention path, are the
+genuine gaps. The autotuner measures naive-vs-tiled per device and picks the winner regardless.
 
 **Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
 The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its
