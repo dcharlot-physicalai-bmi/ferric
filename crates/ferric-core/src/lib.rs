@@ -25,6 +25,10 @@ pub struct Context {
     /// tree. Shipped natively (Vulkan/Metal/DX12) and in browsers (Chrome 134+); kernels that use it
     /// must guard on this flag and keep a barrier-tree fallback for the portable floor.
     pub subgroups: bool,
+    /// `maxStorageBufferBindingSize` for this device — the ceiling on a single bound storage buffer
+    /// (WebGPU baseline 128 MB; Safari 256 MB–1 GB; native GPUs much higher). A weight above this must
+    /// be sharded across buffers, so packed-quant loaders split oversized tensors along output rows.
+    pub max_binding: u64,
 }
 
 /// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
@@ -54,6 +58,7 @@ impl Context {
         // omit where absent, and the flag lets kernels pick a subgroup path or the barrier fallback.
         let want = wgpu::Features::SUBGROUP;
         let subgroups = adapter.features().contains(want);
+        let max_binding = adapter.limits().max_storage_buffer_binding_size as u64;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
@@ -66,7 +71,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -88,6 +93,7 @@ impl Context {
         let adapter = adapters.into_iter().nth(idx).ok_or_else(|| format!("no adapter at index {idx}"))?;
         let info = adapter.get_info();
         let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
+        let max_binding = wgpu::Limits::downlevel_defaults().max_storage_buffer_binding_size as u64;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
@@ -98,7 +104,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {

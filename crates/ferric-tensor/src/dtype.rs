@@ -342,13 +342,41 @@ impl Q4_0Weights {
 /// makes a model loader format-agnostic: build a `QMatrix` per weight from its ggml type, and the
 /// same forward code runs a Q2_0 ternary model, a Q4_K_M model, a Q8_0 model, … — each with its
 /// weights dequantized inside the matmul, never expanded to f32.
-pub enum QMatrix {
+/// One packed-quant weight shard that fits in a single GPU storage buffer.
+pub enum QShard {
     Q2_0(Q2_0Weights),
     Q4_0(Q4_0Weights),
     Q4_K(Q4_KWeights),
     Q5_K(Q5_KWeights),
     Q6_K(Q6_KWeights),
     Q8_0(Q8_0Weights),
+}
+
+impl QShard {
+    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes() } }
+    fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
+        Ok(match ggml_type {
+            2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
+            8 => QShard::Q8_0(Q8_0Weights::from_bytes(ctx, bytes, rows, cols)),
+            12 => QShard::Q4_K(Q4_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            13 => QShard::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            14 => QShard::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
+            other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
+        })
+    }
+}
+
+/// A packed-quant weight matrix of any supported GGUF format, **sharded across GPU buffers** so a
+/// tensor larger than `maxStorageBufferBindingSize` (WebGPU baseline 128 MB) still loads — the split
+/// is along output rows, and `matmul_q` runs each shard and concatenates, which is exact (`cat`). This
+/// is what lets big-vocab LM heads / embeddings and larger models run in a browser tab. One shard is
+/// the common case (no overhead); sharding kicks in only for oversized weights.
+pub struct QMatrix {
+    shards: Vec<QShard>,
+    rows: usize,
+    cols: usize,
 }
 
 impl QMatrix {
@@ -364,33 +392,51 @@ impl QMatrix {
             _ => None,
         }
     }
-    /// Build from raw GGUF block bytes for an [out(rows), in(cols)] weight.
+    /// Build from raw GGUF block bytes for an [out(rows), in(cols)] weight, sharding along rows so no
+    /// shard's buffers exceed the device's binding limit. The derived (codes/scales/aux) buffers are
+    /// each ≤ the raw block bytes, so bounding raw shard bytes bounds every buffer.
     pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QMatrix, String> {
-        Ok(match ggml_type {
-            2 => QMatrix::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
-            8 => QMatrix::Q8_0(Q8_0Weights::from_bytes(ctx, bytes, rows, cols)),
-            12 => QMatrix::Q4_K(Q4_KWeights::from_bytes(ctx, bytes, rows, cols)),
-            13 => QMatrix::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
-            14 => QMatrix::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
-            42 => QMatrix::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
-            other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
-        })
+        let row_bytes = if rows == 0 { 0 } else { bytes.len() / rows };
+        // Effective per-shard byte budget: the device limit, or a smaller test override, with headroom.
+        let limit = std::env::var("FERRIC_MAX_BINDING").ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| (ctx.max_binding as usize).saturating_sub(1 << 20).max(1 << 20));
+        let max_rows = if row_bytes == 0 { rows } else { (limit / row_bytes).max(1) };
+        let mut shards = Vec::new();
+        let mut r0 = 0;
+        while r0 < rows {
+            let n = (rows - r0).min(max_rows);
+            shards.push(QShard::build(ctx, &bytes[r0 * row_bytes..(r0 + n) * row_bytes], ggml_type, n, cols)?);
+            r0 += n;
+        }
+        if shards.is_empty() { shards.push(QShard::build(ctx, bytes, ggml_type, rows, cols)?); }
+        Ok(QMatrix { shards, rows, cols })
     }
-    pub fn rows(&self) -> usize { match self { QMatrix::Q2_0(w) => w.rows, QMatrix::Q4_0(w) => w.rows, QMatrix::Q4_K(w) => w.rows, QMatrix::Q5_K(w) => w.rows, QMatrix::Q6_K(w) => w.rows, QMatrix::Q8_0(w) => w.rows } }
-    pub fn cols(&self) -> usize { match self { QMatrix::Q2_0(w) => w.cols, QMatrix::Q4_0(w) => w.cols, QMatrix::Q4_K(w) => w.cols, QMatrix::Q5_K(w) => w.cols, QMatrix::Q6_K(w) => w.cols, QMatrix::Q8_0(w) => w.cols } }
-    pub fn nbytes(&self) -> usize { match self { QMatrix::Q2_0(w) => w.nbytes(), QMatrix::Q4_0(w) => w.nbytes(), QMatrix::Q4_K(w) => w.nbytes(), QMatrix::Q5_K(w) => w.nbytes(), QMatrix::Q6_K(w) => w.nbytes(), QMatrix::Q8_0(w) => w.nbytes() } }
+    pub fn rows(&self) -> usize { self.rows }
+    pub fn cols(&self) -> usize { self.cols }
+    pub fn nbytes(&self) -> usize { self.shards.iter().map(|s| s.nbytes()).sum() }
+    pub fn n_shards(&self) -> usize { self.shards.len() }
 }
 
 impl Tensor {
     /// y = x·Wᵀ for a packed weight of any supported format (dispatches to the format's kernel).
     pub fn matmul_q(&self, w: &QMatrix) -> Tensor {
+        if w.shards.len() == 1 { return self.matmul_qshard(&w.shards[0]); }
+        // Sharded weight: each shard produces [rows, shard_out]; concatenate along the output dim.
+        let mut acc: Option<Tensor> = None;
+        for sh in &w.shards {
+            let o = self.matmul_qshard(sh);
+            acc = Some(match acc { None => o, Some(prev) => prev.cat(&o, 1) });
+        }
+        acc.unwrap()
+    }
+    fn matmul_qshard(&self, w: &QShard) -> Tensor {
         match w {
-            QMatrix::Q2_0(w) => self.matmul_q2_0(w),
-            QMatrix::Q4_0(w) => self.matmul_q4_0(w),
-            QMatrix::Q4_K(w) => self.matmul_q4_k(w),
-            QMatrix::Q5_K(w) => self.matmul_q5_k(w),
-            QMatrix::Q6_K(w) => self.matmul_q6_k(w),
-            QMatrix::Q8_0(w) => self.matmul_q8_0(w),
+            QShard::Q2_0(w) => self.matmul_q2_0(w),
+            QShard::Q4_0(w) => self.matmul_q4_0(w),
+            QShard::Q4_K(w) => self.matmul_q4_k(w),
+            QShard::Q5_K(w) => self.matmul_q5_k(w),
+            QShard::Q6_K(w) => self.matmul_q6_k(w),
+            QShard::Q8_0(w) => self.matmul_q8_0(w),
         }
     }
 }
