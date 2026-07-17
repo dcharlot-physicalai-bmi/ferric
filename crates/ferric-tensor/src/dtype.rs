@@ -669,12 +669,37 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
         };
+        // Prefill tensor-core fast-path (opt-in, Metal), same discipline as Q2_0.
+        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+            return self.matmul_q4_k_coop(w);
+        }
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER);
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+
+    /// Cooperative-matrix Q4_K prefill matmul — dequant an 8×8 Q4_K tile (super-block scale/min +
+    /// nibble) into shared memory, then feed the matrix unit. Brings tensor-core prompt processing to
+    /// the *default* llama.cpp format. Same coop tiling as Q2_0; only the dequant differs.
+    pub fn matmul_q4_k_coop(&self, w: &Q4_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0, "matmul_q4_k_coop needs N (out) a multiple of 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        let nblk = (inn / 256) as u32;
+        let src = MATMUL_Q4_K_COOP_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q4_k_coop",
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, nblk])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
     }
 
     /// y = x·Wᵀ where W is a packed **Q4_0** [out, in] weight, dequantized per-block inside the kernel.
@@ -804,6 +829,45 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             let word = codes[gblk * 8u + (j >> 4u)];
             let code = (word >> ((j & 15u) * 2u)) & 3u;
             bs[kl * 8u + nl] = f32(i32(code) - 1) * d;  // bs[k*8+n] = W[n][k]  → B[k][n]
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
+
+const MATMUL_Q4_K_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:      array<f32>;  // [M,K]
+@group(0) @binding(1) var<storage,read>       codes:  array<u32>;  // Q4_K codes, W [N,K]
+@group(0) @binding(2) var<storage,read>       aux:    array<u32>;  // Q4_K aux (d|dmin, scales)
+@group(0) @binding(3) var<storage,read_write> c:      array<f32>;  // [M,N]
+@group(0) @binding(4) var<uniform>            dims:   vec4<u32>;   // M, K, N, nblk(=K/256)
+var<workgroup> bs: array<f32, 64>;
+__HELPERS__
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let gblk = n * nblk + (k / 256u); let v = k % 256u;   // super-block index, value in block
+            let s = v / 32u; let l = v % 32u;                     // sub-block, position
+            let ab = gblk * 4u;
+            let dd = unpack2x16float(aux[ab]); let sm = scmin(ab, s);
+            let ds = dd.x * f32(sm.x); let mm = dd.y * f32(sm.y);
+            let word = codes[gblk * 32u + 8u * (s >> 1u) + (l >> 2u)];
+            let sh = 8u * (l & 3u) + select(0u, 4u, (s & 1u) == 1u);
+            let nib = (word >> sh) & 0xFu;
+            bs[kl * 8u + nl] = ds * f32(nib) - mm;
         }
         workgroupBarrier();
         let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
