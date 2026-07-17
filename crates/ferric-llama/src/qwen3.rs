@@ -160,19 +160,32 @@ impl Qwen3 {
 
     /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step.
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
-        use ferric_tensor::batch;
+        use ferric_tensor::{batch, prof};
+        let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         let mut x = self.embed(tokens);
+        prof(&self.ctx, "embed");
         let pos = cache.pos;
         for (il, l) in self.layers.iter().enumerate() {
             let lc = &mut cache.kv[il];
             let xin = &x;
-            x = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos);
+            if profiling {
+                // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
+                let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos));
+                prof(&self.ctx, "attn");
                 let xy = xin.add(&y);
-                self.ffn(&xy.rmsnorm(&l.ffn_norm, self.cfg.eps), l).add(&xy)
-            });
+                x = batch(&self.ctx, || self.ffn(&xy.rmsnorm(&l.ffn_norm, self.cfg.eps), l).add(&xy));
+                prof(&self.ctx, "ffn");
+            } else {
+                x = batch(&self.ctx, || {
+                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos);
+                    let xy = xin.add(&y);
+                    self.ffn(&xy.rmsnorm(&l.ffn_norm, self.cfg.eps), l).add(&xy)
+                });
+            }
         }
         cache.pos += tokens.len();
-        batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head))
+        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head));
+        prof(&self.ctx, "lm_head");
+        out
     }
 }

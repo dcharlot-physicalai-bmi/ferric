@@ -90,11 +90,13 @@ async fn run() {
         let v = logits.to_vec().await;
         let next = argmax(&v[v.len() - c.n_vocab..]);
         if step == 0 { prompt_ms = t1.elapsed().as_secs_f64() * 1e3; }
+        if step == 0 { ferric_tensor::prof_report(); } // prompt-step breakdown
         print!("{}", detok(&[next]));
         std::io::stdout().flush().ok();
         seq.push(next);
         if next == 151645 || next == 151643 { break; } // im_end / endoftext
     }
+    ferric_tensor::prof_report(); // decode-step breakdown (accumulated)
     let decode_ms = (t1.elapsed().as_secs_f64() * 1e3 - prompt_ms) / (n - 1).max(1) as f64;
     println!("\n\n  prompt {:.0}ms · {:.0} ms/token", prompt_ms, decode_ms);
 }
