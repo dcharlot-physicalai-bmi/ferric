@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ferric — one pure-Rust AI stack, every fabric</title>
-<meta name="description" content="Ferric is a pure-Rust AI compute ecosystem: trains and runs real models (SmolLM2, Liquid AI LFM2) on CPU, GPU and the Apple Neural Engine, down to ternary, from a datacenter to a browser tab. Try it live on WebGPU.">
+<meta name="description" content="Ferric is a pure-Rust AI compute ecosystem: it runs a real ternary LLM (PrismML Bonsai) in your browser on WebGPU at ~50 tok/s, trains and runs real models on CPU, GPU and the Apple Neural Engine, down to 1.58-bit — the same code from a datacenter to a browser tab.">
 <style>
   :root{
     --bg:#080b12; --bg2:#0b0f19; --panel:#101728; --panel2:#0c1220; --line:#1c2540;
@@ -97,7 +97,7 @@
   <a class="link" href="#what">What</a>
   <a class="link" href="#proof">Proof</a>
   <a class="link" href="#crates">Crates</a>
-  <a class="link" href="#play">Playground</a>
+  <a class="link" href="/bonsai">Live LLM</a>
   <a class="btn ghost" href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
 </div></nav>
 
@@ -106,7 +106,7 @@
   <h1>One pure-Rust AI stack.<br><span class="g">Every fabric.</span></h1>
   <p class="lede">Ferric runs the <b>same code</b> on a datacenter GPU, a laptop, an edge robot, and a browser tab — a complete transformer, an ONNX importer, and a safetensors loader, with <b>no Python or C++ in the hot path</b>.</p>
   <div class="cta">
-    <a class="btn" href="#play">Run it live ▸</a>
+    <a class="btn" href="/bonsai">Run a ternary LLM in your browser ▸</a>
     <a class="btn ghost" href="https://crates.io/crates/ferric-core" target="_blank">crates.io</a>
   </div>
 </div></header>
@@ -122,6 +122,7 @@
   <h2>Not a plan — it runs real models.</h2>
   <p class="muted">Every number below is checked against an independent reference — a CPU implementation, <span class="mono">numpy</span>, <span class="mono">onnxruntime</span>, or Hugging Face <span class="mono">transformers</span>.</p>
   <div class="grid">
+    <a class="card" href="/bonsai" style="grid-column:1/-1;display:block;border-color:var(--gold)"><h3 style="color:var(--gold)">A ternary LLM, live in your browser ▸</h3><div class="num">27B → 1.7B</div><p style="color:var(--dim)"><b>PrismML Ternary Bonsai</b> (every weight −1/0/+1) runs on your GPU via WebGPU — the 27B validated against PrismML's own llama.cpp fork to <span class="mono">7.8e-4</span>, the 1.7B streaming in a tab at <b>~50 tok/s</b>. Same pure-Rust code, native and browser. Click to run it — nothing leaves your machine.</p></a>
     <div class="card"><h3>Runs real models</h3><div class="num">2</div><p><b>SmolLM2-135M</b> matches <span class="mono">numpy</span> 1.4e-6; <b>Liquid AI LFM2-350M</b> (novel conv-hybrid) matches <span class="mono">transformers</span> 4.7e-6.</p></div>
     <div class="card"><h3>Generates real text</h3><div class="num">✓</div><p>Exact GPT-2 tokenizer (HF token-for-token) + O(S) KV-cache decode — end to end.</p></div>
     <div class="card"><h3>Runs on the NPU</h3><div class="num">ANE</div><p>WebNN(npu) → CoreML → <b>Apple Neural Engine</b>, matching CPU to fp16. Plus every GPU + all CPU cores.</p></div>
