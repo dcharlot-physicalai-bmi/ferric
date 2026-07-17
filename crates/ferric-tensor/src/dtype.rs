@@ -338,7 +338,65 @@ impl Q4_0Weights {
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 18 }
 }
 
+/// **Q4_K** weights held packed on the GPU — the *default* llama.cpp quant (`Q4_K_M`), so the single
+/// most common format on Hugging Face. A 144-byte super-block holds 256 values: `f16 d`, `f16 dmin`,
+/// 12 bytes of 8 six-bit (scale, min) pairs, and 128 bytes of 4-bit quants; value =
+/// `d·scaleₛ·q − dmin·minₛ` for its sub-block s. Native packed matmul (dequant in-kernel) instead of
+/// dequant-to-f32. To stay within WebGPU's 4-storage-buffer baseline, d/dmin + the 12 scale bytes are
+/// packed together into one `aux` buffer (4 u32/block); the 128 quant bytes are `codes` (32 u32/block).
+pub struct Q4_KWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 32 u32 per block (128 quant bytes)
+    aux: Arc<wgpu::Buffer>,   // 4 u32 per block: [d|dmin<<16, scale bytes 0..4, 4..8, 8..12]
+    pub rows: usize,
+    pub cols: usize,          // multiple of 256
+}
+
+impl Q4_KWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q4_KWeights {
+        assert_eq!(cols % 256, 0, "Q4_K cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 144, "unexpected Q4_K byte length");
+        let nblk = rows * (cols / 256);
+        let mut codes: Vec<u32> = vec![0; nblk * 32];
+        let mut aux: Vec<u32> = vec![0; nblk * 4];
+        for b in 0..nblk {
+            let src = &bytes[b * 144..b * 144 + 144];
+            // aux[0] = d | dmin<<16 (both already f16 bit patterns); aux[1..4] = the 12 scale bytes.
+            aux[b * 4] = u16::from_le_bytes([src[0], src[1]]) as u32 | ((u16::from_le_bytes([src[2], src[3]]) as u32) << 16);
+            for w in 0..3 { aux[b * 4 + 1 + w] = u32::from_le_bytes([src[4 + w * 4], src[5 + w * 4], src[6 + w * 4], src[7 + w * 4]]); }
+            for w in 0..32 { codes[b * 32 + w] = u32::from_le_bytes([src[16 + w * 4], src[17 + w * 4], src[18 + w * 4], src[19 + w * 4]]); }
+        }
+        let mk = |label, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Q4_KWeights { ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 144 }
+}
+
 impl Tensor {
+    /// y = x·Wᵀ where W is a packed **Q4_K** [out, in] weight, dequantized per-super-block in-kernel.
+    pub fn matmul_q4_k(&self, w: &Q4_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_K_SPLITK_WGSL, "matmul_q4_k_splitk")
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
+        };
+        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER);
+        run(&self.ctx, &src, label,
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+
     /// y = x·Wᵀ where W is a packed **Q4_0** [out, in] weight, dequantized per-block inside the kernel.
     /// Same rows-aware flat/split-K selection as Q2_0. x [rows, in] → [rows, out].
     pub fn matmul_q4_0(&self, w: &Q4_0Weights) -> Tensor {
@@ -483,6 +541,90 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 320 code loads — so the activation loads, not the weights, dominate the instruction stream.
 /// Every thread in a wave reads the same `x` (same token), so these all hit cache; the cost is
 /// issue slots, not bandwidth, which is exactly what a latency-bound kernel cannot afford.
+// Q4_K super-block = 256 values / 8 sub-blocks. Shared preamble: extract a sub-block's 6-bit
+// (scale, min) from the 12 packed scale bytes, and dequant value = d·scaleₛ·q − dmin·minₛ.
+const Q4_K_HELPERS: &str = r#"
+fn scbyte(base: u32, i: u32) -> u32 { return (aux[base + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn scmin(base: u32, j: u32) -> vec2<u32> {
+    if (j < 4u) { return vec2<u32>(scbyte(base, j) & 63u, scbyte(base, j + 4u) & 63u); }
+    let a = scbyte(base, j + 4u); let lo = scbyte(base, j - 4u); let hi = scbyte(base, j);
+    return vec2<u32>((a & 0x0Fu) | ((lo >> 6u) << 4u), (a >> 4u) | ((hi >> 6u) << 4u));
+}
+"#;
+
+// Inner sub-block accumulate, vectorized: one u32 code-word feeds 4 quants, read against a vec4 of
+// activations. Per sub-block s (32 values = 8 words): contribution = d·scaleₛ·Σ(x·q) − dmin·minₛ·Σx.
+const Q4_K_INNER: &str = r#"
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+"#;
+
+const MATMUL_Q4_K_FLAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;  // 32 u32/block (128 quant bytes)
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;  // 4 u32/block: d|dmin, 12 scale bytes
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, row_stride
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+__INNER__
+        }
+    }
+    out[idx] = acc;
+}
+"#;
+
+const MATMUL_Q4_K_SPLITK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, grid_w
+var<workgroup> partial: array<f32, 64>;
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    let idx = wg.x + wg.y * info.w; let t = lid.x;
+    if (idx < rows * o_dim) {
+        let o = idx % o_dim; let r = idx / o_dim;
+        let nblk = in_dim / 256u;
+        var acc = 0.0;
+        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+            let bi = o * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+            let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+            let xbb = r * in_dim + blk * 256u;
+            for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+__INNER__
+            }
+        }
+        partial[t] = acc;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+        if (t == 0u) { out[idx] = partial[0]; }
+    }
+}
+"#;
+
 // Q4_0 block = 32 values, 4 u32 code-words + f16 scale. Byte j's low nibble is value j, high nibble
 // is value j+16 (llama.cpp layout); value = (nibble − 8)·d. Per word (4 bytes) that's 4 low + 4 high
 // activations, two vec4 dots. x is bound as vec4<f32> for coalesced 4-at-a-time activation loads.

@@ -83,6 +83,7 @@ jobs:
           FERRIC_Q2_0_KERNEL=trans cargo run -p ferric-tensor --example q2_0
           cargo run -p ferric-tensor --example q2_0
           cargo run -p ferric-tensor --example q4_0
+          cargo run -p ferric-tensor --example q4_k
           FERRIC_Q2_0_KERNEL=flat cargo run -p ferric-tensor --example q2_0
           FERRIC_Q2_0_KERNEL=splitk cargo run -p ferric-tensor --example q2_0
           cargo run -p ferric-tensor --example fusion
