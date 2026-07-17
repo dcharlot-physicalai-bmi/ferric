@@ -8,7 +8,7 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     println!("{:?} · {} · coop_matrix={}", ctx.backend, ctx.adapter_name, ctx.coop_matrix);
-    if !ctx.coop_matrix { println!("⏭  no cooperative matrix"); return; }
+    if !ctx.coop_gemm_ok() { println!("⏭  coop GEMM not usable here (Vulkan SPIR-V backend bug)"); return; }
     for &d in &[512usize, 1024, 2048] {
         let a = Tensor::from_vec(&ctx, &seq(d * d, 1.0), &[d, d]);
         let b = Tensor::from_vec(&ctx, &seq(d * d, 2.0), &[d, d]);

@@ -49,6 +49,14 @@ impl Tensor {
 }
 
 impl Context {
+    /// Whether the cooperative-matrix GEMM path is safe to run here. The feature is exposed on Metal
+    /// AND Vulkan, but our naga fork's **SPIR-V backend** currently panics generating coop_mat code
+    /// (index expression not cached in the pointer bounds-check), so Vulkan/NVIDIA is gated off until
+    /// that's fixed. Metal (MSL backend) works — 6× GEMM on the M5's matrix unit.
+    pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal) }
+}
+
+impl Context {
     /// Acquire the best available compute device on this fabric (native GPU or browser WebGPU).
     pub async fn new() -> Result<Self> {
         let instance = wgpu::Instance::default();

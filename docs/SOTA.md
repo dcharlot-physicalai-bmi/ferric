@@ -78,16 +78,24 @@ across 512³–4096³, three ways:
 | register-tiled (1×8 per thread) | ~280 | ~280 | 0.6× |
 | shared-memory tiled (64×64, 4×4 micro) | ~215 | ~229 | 0.3× |
 
-The naive kernel **wins**, even at 4096³ where the 64 MB matrices blow past every cache: its perfect
-coalescing (adjacent threads → adjacent B columns) plus maximum occupancy beats any explicit tile,
-because the hardware caches already serve the data reuse that tiling exists to capture — and tiling's
-barriers + register pressure cost more than they save. **Confirmed cross-vendor** on an NVIDIA RTX
-4050 (Vulkan), naive wins at every size too (reg-tiled only reaches parity at 4096³, where the
-matrices finally exceed even NVIDIA's L2); shared-memory tiling is worst on both vendors. So this is
-not an Apple quirk — a hand-written WGSL tile doesn't beat coalesced-naive-plus-hardware-cache on
-either stack. The real path to >1 TFLOP/s is cooperative-matrix / `simdgroup_matrix` (tensor-core-like
-ops), which portable WGSL doesn't yet expose; that, and a general flash-attention path, are the
-genuine gaps. The autotuner measures naive-vs-tiled per device and picks the winner regardless.
+Among *hand-written WGSL* kernels the naive one **wins** (cross-vendor: same on the NVIDIA RTX 4050),
+because the hardware caches already serve the reuse tiling exists to capture and tiling's barriers +
+register pressure cost more than they save. **But that was never the ceiling — the matrix hardware
+was.** `matmul_coop` uses WGSL cooperative-matrix (`coop_mat8x8`, `coopMultiplyAdd`) lowering to the
+GPU's matrix unit, and on the **Apple M5 Max** (the first Apple GPU with real in-GPU matrix hardware)
+it hits **4.3 TFLOP/s — 6–7× the naive ~700 GFLOP/s**, and bit-identical to it (max\|Δ\| = 0.0e0):
+
+| 1024³ | naive ~700 GFLOP/s | shared-mem tiled ~215 | **coop_mat 4151** (5.9×) |
+| 2048³ | naive ~700 | ~229 | **coop_mat 4299** (6.1×) |
+
+This **corrects the earlier "portable WGSL can't reach tensor cores" claim** — it can, through our
+naga fork, on Metal today (`EXPERIMENTAL_COOPERATIVE_MATRIX` → MSL `simdgroup_matrix`). Caveat: the
+naga **SPIR-V backend** panics generating coop_mat code, so **Vulkan/NVIDIA is gated off** until that
+bug is fixed (`Context::coop_gemm_ok()` = Metal-only for now); the primitive path is proven on both
+(`coop_matrix=true` on the 4050), only the SPIR-V codegen blocks it. Remaining: wire coop_mat into the
+matmul selector, larger register tiles + 16×16, the quant-matmul prefill path, fix the SPIR-V backend,
+and a general flash-attention path. Still fp-order/native dependent, so it's a fast-path, not the
+bit-identical cross-fabric default.
 
 **Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
 The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its
