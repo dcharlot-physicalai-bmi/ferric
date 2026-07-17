@@ -316,6 +316,26 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![t, ch])
     }
 
+    /// **Fused single-query attention** (the decode step). `self`=q [1, nh·dh], k/v [S, nkv·dh].
+    /// One workgroup per query head runs the whole head in one pass — scores, softmax, and the
+    /// weighted V-sum — with no intermediate tensors. Replaces the ~12-dispatch composed path
+    /// (reshape/permute/contiguous/broadcast/matmul/softmax/matmul), which dominates decode when a
+    /// model has attention in every layer. Requires S ≤ 2048 (scores live in shared memory);
+    /// `nn::decode_attention` falls back to the composed path above that. Returns [1, nh·dh].
+    pub fn fused_decode_attention(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize) -> Tensor {
+        let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
+        let s = k.numel() / (nkv * dh);
+        assert!(dh <= 128, "fused_decode_attention: head_dim ≤ 128");
+        assert!(s <= 2048, "fused_decode_attention: S ≤ 2048");
+        let out = empty(&self.ctx, nh * dh);
+        let scale = 1.0 / (dh as f32).sqrt();
+        run(&self.ctx, FUSED_ATTN_WGSL, "fattn",
+            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &out,
+              &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, s as u32, scale.to_bits(), 0, 0, 0])],
+            (nh as u32, 1, 1));
+        Tensor::from_parts(&self.ctx, out, vec![1, nh * dh])
+    }
+
     /// y = x·Wᵀ where x is [rows,in] and W is stored [out,in] (HF linear convention) — computed
     /// directly, without materializing Wᵀ. Essential for big tied LM heads (avoids a huge transpose).
     pub fn matmul_bt(&self, w: &Tensor) -> Tensor {
@@ -995,6 +1015,59 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // which made the "fast" path 2-13× *slower* than the naive kernel it was meant to beat. 16 f32
 // accumulators stay in registers (the loops are constant-bound, so they unroll), so each FMA hits a
 // register rather than a memory round-trip — the difference between spilling and not.
+// Fused single-query attention, one workgroup (128 threads) per query head. GQA: query head h reads
+// key/value head h/(nh/nkv). Three phases through shared memory — no per-key barrier, no intermediate
+// tensors: (1) each thread computes scores for its slice of the S keys (full dh-dot), (2) a parallel
+// max+exp+sum softmax over the shared scores, (3) each thread accumulates the weighted-V for its
+// slice of the dh output dims. S ≤ 2048 so scores fit in shared memory.
+const FUSED_ATTN_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        q:   array<f32>;   // [nh·dh]
+@group(0) @binding(1) var<storage,read>        k:   array<f32>;   // [S, nkv·dh]
+@group(0) @binding(2) var<storage,read>        v:   array<f32>;   // [S, nkv·dh]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;   // [nh·dh]
+struct Info { a: vec4<u32>, b: vec4<u32> }         // a = (nh,nkv,dh,S); b.x = scale bits
+@group(0) @binding(4) var<uniform>             info: Info;
+var<workgroup> qs: array<f32, 128>;        // this head's query
+var<workgroup> sc: array<f32, 2048>;       // scores over the S keys
+var<workgroup> red: array<f32, 128>;       // reduction scratch
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nh = info.a.x; let nkv = info.a.y; let dh = info.a.z; let s = info.a.w;
+    let scale = bitcast<f32>(info.b.x);
+    let head = wg.x; let t = lid.x;
+    let g = nh / nkv; let kvh = head / g;
+    let qbase = head * dh; let kvbase = kvh * dh;
+    // load this head's query into shared
+    if (t < dh) { qs[t] = q[qbase + t]; }
+    workgroupBarrier();
+    // phase 1: scores[i] = scale · (q · k[i])  for each key i, striped across threads
+    for (var i = t; i < s; i = i + 128u) {
+        var dot = 0.0;
+        let kb = i * nkv * dh + kvbase;
+        for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
+        sc[i] = dot * scale;
+    }
+    workgroupBarrier();
+    // phase 2: softmax over sc[0..s] — parallel max, then parallel sum of exp
+    var m = -3.0e38;
+    for (var i = t; i < s; i = i + 128u) { m = max(m, sc[i]); }
+    red[t] = m; workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
+    let mx = red[0]; workgroupBarrier();
+    var ssum = 0.0;
+    for (var i = t; i < s; i = i + 128u) { let e = exp(sc[i] - mx); sc[i] = e; ssum = ssum + e; }
+    red[t] = ssum; workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
+    let denom = red[0]; workgroupBarrier();
+    // phase 3: out[d] = (Σ_i prob[i]·v[i,d]) / denom  — each thread owns output dim d
+    if (t < dh) {
+        var acc = 0.0;
+        for (var i = 0u; i < s; i = i + 1u) { acc = acc + sc[i] * v[i * nkv * dh + kvbase + t]; }
+        out[head * dh + t] = acc / denom;
+    }
+}
+"#;
+
 const TILED_MATMUL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;   // [M,K]
 @group(0) @binding(1) var<storage,read>        b: array<f32>;   // [K,N]
