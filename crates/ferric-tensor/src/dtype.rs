@@ -346,6 +346,7 @@ pub enum QMatrix {
     Q2_0(Q2_0Weights),
     Q4_0(Q4_0Weights),
     Q4_K(Q4_KWeights),
+    Q5_K(Q5_KWeights),
     Q6_K(Q6_KWeights),
     Q8_0(Q8_0Weights),
 }
@@ -357,6 +358,7 @@ impl QMatrix {
             2 => Some((32, 18)),   // Q4_0
             8 => Some((32, 34)),   // Q8_0
             12 => Some((256, 144)),// Q4_K
+            13 => Some((256, 176)),// Q5_K
             14 => Some((256, 210)),// Q6_K
             42 => Some((128, 34)), // Q2_0
             _ => None,
@@ -368,14 +370,15 @@ impl QMatrix {
             2 => QMatrix::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
             8 => QMatrix::Q8_0(Q8_0Weights::from_bytes(ctx, bytes, rows, cols)),
             12 => QMatrix::Q4_K(Q4_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            13 => QMatrix::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
             14 => QMatrix::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
             42 => QMatrix::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
             other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
         })
     }
-    pub fn rows(&self) -> usize { match self { QMatrix::Q2_0(w) => w.rows, QMatrix::Q4_0(w) => w.rows, QMatrix::Q4_K(w) => w.rows, QMatrix::Q6_K(w) => w.rows, QMatrix::Q8_0(w) => w.rows } }
-    pub fn cols(&self) -> usize { match self { QMatrix::Q2_0(w) => w.cols, QMatrix::Q4_0(w) => w.cols, QMatrix::Q4_K(w) => w.cols, QMatrix::Q6_K(w) => w.cols, QMatrix::Q8_0(w) => w.cols } }
-    pub fn nbytes(&self) -> usize { match self { QMatrix::Q2_0(w) => w.nbytes(), QMatrix::Q4_0(w) => w.nbytes(), QMatrix::Q4_K(w) => w.nbytes(), QMatrix::Q6_K(w) => w.nbytes(), QMatrix::Q8_0(w) => w.nbytes() } }
+    pub fn rows(&self) -> usize { match self { QMatrix::Q2_0(w) => w.rows, QMatrix::Q4_0(w) => w.rows, QMatrix::Q4_K(w) => w.rows, QMatrix::Q5_K(w) => w.rows, QMatrix::Q6_K(w) => w.rows, QMatrix::Q8_0(w) => w.rows } }
+    pub fn cols(&self) -> usize { match self { QMatrix::Q2_0(w) => w.cols, QMatrix::Q4_0(w) => w.cols, QMatrix::Q4_K(w) => w.cols, QMatrix::Q5_K(w) => w.cols, QMatrix::Q6_K(w) => w.cols, QMatrix::Q8_0(w) => w.cols } }
+    pub fn nbytes(&self) -> usize { match self { QMatrix::Q2_0(w) => w.nbytes(), QMatrix::Q4_0(w) => w.nbytes(), QMatrix::Q4_K(w) => w.nbytes(), QMatrix::Q5_K(w) => w.nbytes(), QMatrix::Q6_K(w) => w.nbytes(), QMatrix::Q8_0(w) => w.nbytes() } }
 }
 
 impl Tensor {
@@ -385,9 +388,69 @@ impl Tensor {
             QMatrix::Q2_0(w) => self.matmul_q2_0(w),
             QMatrix::Q4_0(w) => self.matmul_q4_0(w),
             QMatrix::Q4_K(w) => self.matmul_q4_k(w),
+            QMatrix::Q5_K(w) => self.matmul_q5_k(w),
             QMatrix::Q6_K(w) => self.matmul_q6_k(w),
             QMatrix::Q8_0(w) => self.matmul_q8_0(w),
         }
+    }
+}
+
+/// **Q5_K** weights held packed on the GPU — llama.cpp's 5-bit K-quant (`Q5_K_M` is a common
+/// higher-quality choice). Same super-block as Q4_K plus a 32-byte `qh` array giving each quant a 5th
+/// (high) bit: value = `d·scaleₛ·(nibble + 16·qh_bit) − dmin·minₛ`. codes = qs|qh (40 u32/block);
+/// aux = d/dmin + 12 scale bytes (4 u32/block), identical to Q4_K.
+pub struct Q5_KWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 40 u32/block: 32 words qs, then 8 words qh
+    aux: Arc<wgpu::Buffer>,   // 4 u32/block: d|dmin, 12 scale bytes
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Q5_KWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q5_KWeights {
+        assert_eq!(cols % 256, 0, "Q5_K cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 176, "unexpected Q5_K byte length");
+        let nblk = rows * (cols / 256);
+        let mut codes: Vec<u32> = vec![0; nblk * 40];
+        let mut aux: Vec<u32> = vec![0; nblk * 4];
+        let word = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        for b in 0..nblk {
+            let src = &bytes[b * 176..b * 176 + 176]; // d,dmin,scales[12],qh[32],qs[128]
+            aux[b * 4] = u16::from_le_bytes([src[0], src[1]]) as u32 | ((u16::from_le_bytes([src[2], src[3]]) as u32) << 16);
+            for w in 0..3 { aux[b * 4 + 1 + w] = word(src, 4 + w * 4); }        // 12 scale bytes
+            for w in 0..32 { codes[b * 40 + w] = word(src, 48 + w * 4); }        // qs (128 bytes)
+            for w in 0..8 { codes[b * 40 + 32 + w] = word(src, 16 + w * 4); }    // qh (32 bytes)
+        }
+        let mk = |label, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Q5_KWeights { ctx: ctx.clone(), codes: mk("q5k.codes", &codes), aux: mk("q5k.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 176 }
+}
+
+impl Tensor {
+    /// y = x·Wᵀ where W is a packed **Q5_K** [out, in] weight, dequantized per-super-block in-kernel.
+    pub fn matmul_q5_k(&self, w: &Q5_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_K_SPLITK_WGSL, "matmul_q5_k_splitk")
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q5_K_FLAT_WGSL, "matmul_q5_k_flat")
+        };
+        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER);
+        run(&self.ctx, &src, label,
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
 }
 
@@ -732,6 +795,79 @@ const Q4_K_INNER: &str = r#"
                 let xw = x[xv + w];
                 acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
             }
+"#;
+
+// Q5_K inner: like Q4_K but each 4-bit quant gains a 5th bit from qh (word codes[qh_base+w], bit s).
+const Q5_K_INNER: &str = r#"
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb40 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let qhw = codes[cb40 + 32u + w];
+                let bit = vec4<f32>(f32((qhw >> s) & 1u), f32((qhw >> (8u + s)) & 1u), f32((qhw >> (16u + s)) & 1u), f32((qhw >> (24u + s)) & 1u)) * 16.0;
+                let q = nib + bit;
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, q) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+"#;
+
+const MATMUL_Q5_K_FLAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim; let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+__INNER__
+        }
+    }
+    out[idx] = acc;
+}
+"#;
+
+const MATMUL_Q5_K_SPLITK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;
+var<workgroup> partial: array<f32, 64>;
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    let idx = wg.x + wg.y * info.w; let t = lid.x;
+    if (idx < rows * o_dim) {
+        let o = idx % o_dim; let r = idx / o_dim; let nblk = in_dim / 256u;
+        var acc = 0.0;
+        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+            let bi = o * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
+            let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+            let xbb = r * in_dim + blk * 256u;
+            for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+__INNER__
+            }
+        }
+        partial[t] = acc;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+        if (t == 0u) { out[idx] = partial[0]; }
+    }
+}
 "#;
 
 const MATMUL_Q4_K_FLAT_WGSL: &str = r#"

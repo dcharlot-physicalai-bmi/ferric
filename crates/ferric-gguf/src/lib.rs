@@ -13,6 +13,7 @@ const F16T: u32 = 1;
 const Q4_0: u32 = 2;
 const Q8_0: u32 = 8;
 const Q4_K: u32 = 12;
+const Q5_K: u32 = 13;
 const Q6_K: u32 = 14;
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
 const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
@@ -159,6 +160,7 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q8_0 => n / 32 * 34,
         Q4_0 => n / 32 * 18,
         Q4_K => n / 256 * 144,
+        Q5_K => n / 256 * 176,
         Q6_K => n / 256 * 210,
         TQ2_0 => n / 256 * 66,
         Q1_0 => n / 128 * 18,
@@ -175,6 +177,7 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q8_0 => deq_q8_0(raw, n),
         Q4_0 => deq_q4_0(raw, n),
         Q4_K => deq_q4_k(raw, n),
+        Q5_K => deq_q5_k(raw, n),
         Q6_K => deq_q6_k(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
         Q1_0 => deq_q1_0(raw, n),
@@ -288,6 +291,37 @@ fn deq_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
 
 /// Q4_K super-block (256 values, 144 bytes): [f16 d, f16 dmin, u8 scales[12], u8 qs[128]].
 /// 8 sub-blocks of 32; each has a 6-bit scale & 6-bit min packed in `scales`. y = d·sc·q − dmin·m.
+/// **Q5_K** — 176-byte super-block, 256 values: `f16 d`, `f16 dmin`, 12 packed scale bytes (same 8
+/// six-bit (scale,min) pairs as Q4_K), `qh[32]` (one high bit per value), `qs[128]` (low 4 bits).
+/// value = `d·scaleₛ·(nibble + 16·qh_bit) − dmin·minₛ`.
+fn deq_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    let get_sc_min = |scales: &[u8], j: usize| -> (u8, u8) {
+        if j < 4 { (scales[j] & 63, scales[j + 4] & 63) }
+        else { ((scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4), (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4)) }
+    };
+    for (bi, blk) in raw.chunks_exact(176).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let dmin = rd_f16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let qs = &blk[48..176];
+        let mut y = bi * 256;
+        let (mut is, mut q) = (0usize, 0usize);
+        for jg in 0..4 {
+            let (sc1, m1) = get_sc_min(scales, is);
+            let (sc2, m2) = get_sc_min(scales, is + 1);
+            let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+            let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+            let (b1, b2) = (1u8 << (2 * jg), 1u8 << (2 * jg + 1));
+            for l in 0..32 { out[y + l] = d1 * ((qs[q + l] & 0x0F) + if qh[l] & b1 != 0 { 16 } else { 0 }) as f32 - mm1; }
+            for l in 0..32 { out[y + l + 32] = d2 * ((qs[q + l] >> 4) + if qh[l] & b2 != 0 { 16 } else { 0 }) as f32 - mm2; }
+            y += 64; q += 32; is += 2;
+        }
+    }
+    out
+}
+
 /// **Q6_K** — 210-byte super-block, 256 values: `ql[128]` (low 4 bits), `qh[64]` (high 2 bits),
 /// `scales[16]` (int8), `d` (f16). Value = `d · scale · (q − 32)`, where q is the reassembled 6-bit
 /// quant. Layout follows llama.cpp exactly (two 128-value halves, 4 quant groups per half).

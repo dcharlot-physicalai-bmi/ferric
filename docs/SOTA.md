@@ -43,10 +43,11 @@ FLOPS:
    browser tab behind one `Device` abstraction.
 4. **Portable ingest (safetensors + ONNX) + a real Llama forward + eager autograd**, all pure-Rust
    and self-reliant (vendored + forked deps, offline builds).
-5. **Runs standard quantized GGUFs end-to-end, weights never expanded to f32.** Five formats dequant
-   *inside* the matmul kernel — PrismML **Q2_0** ternary, llama.cpp **Q4_0**, **Q4_K**, **Q6_K**, and
-   **Q8_0** — each validated exact vs a dequantize-then-f32 reference and, at a 4096 GEMV,
-   **1.8–1.9× faster + ~7× lighter** than that path. A `QMatrix` unifies them behind one `matmul_q`,
+5. **Runs standard quantized GGUFs end-to-end, weights never expanded to f32.** The full common
+   spectrum dequants *inside* the matmul kernel — PrismML **Q2_0** ternary, llama.cpp **Q4_0**,
+   **Q4_K**, **Q5_K**, **Q6_K**, **Q8_0** (2-bit through 8-bit) — each validated exact vs a
+   dequantize-then-f32 reference and, at a 4096 GEMV, **1.8–1.9× faster + ~7× lighter** than that
+   path. A `QMatrix` unifies them behind one `matmul_q`,
    and the Qwen3 loader is format-agnostic, so **a genuine `Q4_K_M` model off Hugging Face runs on
    Ferric** — `unsloth/Qwen3-0.6B-Q4_K_M` (which mixes Q4_K and Q6_K, even within one qkv) generates
    coherent text: *"The capital of France is Paris."* And it runs **in a browser tab** too: the same

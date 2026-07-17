@@ -29,7 +29,7 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub use autograd::Var;
-pub use dtype::{DType, Half, QMatrix, Q2_0Weights, Q4_0Weights, Q4_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
+pub use dtype::{DType, Half, QMatrix, Q2_0Weights, Q4_0Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
