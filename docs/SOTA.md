@@ -49,8 +49,10 @@ FLOPS:
    **1.8–1.9× faster + ~7× lighter** than that path. A `QMatrix` unifies them behind one `matmul_q`,
    and the Qwen3 loader is format-agnostic, so **a genuine `Q4_K_M` model off Hugging Face runs on
    Ferric** — `unsloth/Qwen3-0.6B-Q4_K_M` (which mixes Q4_K and Q6_K, even within one qkv) generates
-   coherent text: *"The capital of France is Paris."* Nothing else pure-Rust runs the standard
-   quantized ecosystem *and* the browser path from one codebase. (Q5_K is the next format.)
+   coherent text: *"The capital of France is Paris."* And it runs **in a browser tab** too: the same
+   wasm/WebGPU path produces logits matching native Metal (argmax 12095, Σ −379147.98 both), so an
+   arbitrary standard quantized model is cross-fabric-consistent from one codebase. Nothing else
+   pure-Rust runs the standard quantized ecosystem *and* the browser from one source. (Q5_K is next.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
