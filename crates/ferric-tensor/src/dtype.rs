@@ -553,6 +553,9 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL, "matmul_q6_k_flat")
         };
+        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+            return self.matmul_q6_k_coop(w);
+        }
         let src = wgsl.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY);
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
@@ -560,7 +563,68 @@ impl Tensor {
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
+
+    /// Cooperative-matrix Q6_K prefill matmul — used by every Q4_K_M / Q5_K_M model's embed/output
+    /// tensors, so it lifts those models' prefill further. Reassembles the 6-bit quant (4 low bits
+    /// from ql, 2 high from qh) with the int8 super-block scale, dequant tile → shared → matrix unit.
+    pub fn matmul_q6_k_coop(&self, w: &Q6_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0, "matmul_q6_k_coop needs N (out) a multiple of 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        let src = MATMUL_Q6_K_COOP_WGSL.replace("__HELPERS__", Q6_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q6_k_coop",
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, (inn / 256) as u32])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
 }
+
+const MATMUL_Q6_K_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:      array<f32>;
+@group(0) @binding(1) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>       aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write> c:      array<f32>;
+@group(0) @binding(4) var<uniform>            dims:   vec4<u32>;   // M, K, N, nblk(=K/256)
+var<workgroup> bs: array<f32, 64>;
+__HELPERS__
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let gblk = n * nblk + (k / 256u); let v = k % 256u;
+            let cb = gblk * 48u; let ab = gblk * 5u;
+            let d = unpack2x16float(aux[ab]).x;
+            let hf = v / 128u; let within = v % 128u; let g = within / 32u; let l = within % 32u;
+            let is = l >> 4u; let qlo = 64u * hf; let qho = 32u * hf; let sco = 8u * hf;
+            let sc = scb(ab, sco + is + 2u * g);
+            let h = qhb(cb, qho + l);
+            let qlbyte = qlb(cb, qlo + l + (g & 1u) * 32u);
+            let nib = select(qlbyte & 0xFu, qlbyte >> 4u, g >= 2u);
+            let q = i32(nib | (((h >> (2u * g)) & 3u) << 4u)) - 32;
+            bs[kl * 8u + nl] = d * sc * f32(q);
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
 
 /// **Q8_0** weights held packed on the GPU — llama.cpp's 8-bit format (blocks of 32: `f16 scale` +
 /// 32 int8; value = int8·scale). Common for high-quality quants and for the embedding/output tensors
