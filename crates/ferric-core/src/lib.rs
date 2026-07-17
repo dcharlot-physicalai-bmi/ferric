@@ -53,7 +53,9 @@ impl Context {
     /// AND Vulkan, but our naga fork's **SPIR-V backend** currently panics generating coop_mat code
     /// (index expression not cached in the pointer bounds-check), so Vulkan/NVIDIA is gated off until
     /// that's fixed. Metal (MSL backend) works — 6× GEMM on the M5's matrix unit.
-    pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal) }
+    pub fn coop_gemm_ok(&self) -> bool {
+        self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_FORCE").is_ok())
+    }
 }
 
 impl Context {
