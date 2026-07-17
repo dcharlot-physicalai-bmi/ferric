@@ -705,6 +705,12 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        // Prefill tensor-core fast-path (opt-in, Metal): many tokens make this a real GEMM where the
+        // matrix unit's 3-4× beats the scalar dequant kernel. Decode (rows < 8) stays on the scalar
+        // path. fp-order/precision dependent, so gated behind FERRIC_COOP, never the default.
+        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+            return self.matmul_q2_0_coop(w);
+        }
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         if q2_0_split_k(rows, w.rows) {
@@ -746,14 +752,29 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(rows % 8 == 0 && w.rows % 8 == 0, "matmul_q2_0_coop needs M,N multiples of 8");
-        let out = empty(&self.ctx, rows * w.rows);
+        assert!(w.rows % 8 == 0, "matmul_q2_0_coop needs N (out) a multiple of 8");
+        // Pad the token dimension up to a multiple of 8 (the coop tile), compute, then slice back —
+        // so any prompt length works. The pad rows are wasted tiles, cheap at prefill.
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
         let nblk = (inn / 128) as u32;
         run(&self.ctx, MATMUL_Q2_0_COOP_WGSL, "matmul_q2_0_coop",
-            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
-              &unibuf(&self.ctx, &[rows as u32, inn as u32, w.rows as u32, nblk])],
-            ((w.rows / 8) as u32, (rows / 8) as u32, 1));
-        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, nblk])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+
+    /// Zero-pad row count up to `mrows` (rows ≥ current). For coop tile alignment at prefill.
+    fn pad_rows(&self, mrows: usize) -> Tensor {
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        let out = empty(&self.ctx, mrows * cols);
+        let c = self.contiguous();
+        // copy the real rows into the (zeroed) padded buffer
+        run(&self.ctx, PAD_ROWS_WGSL, "pad_rows", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[(rows * cols) as u32, 0])], groups(rows * cols));
+        Tensor::from_parts(&self.ctx, out, vec![mrows, cols])
     }
 }
 
@@ -791,6 +812,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         workgroupBarrier();
     }
     coopStoreT(acc, &c[ci], nn);
+}
+"#;
+
+const PAD_ROWS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       inp: array<f32>;
+@group(0) @binding(1) var<storage,read_write> out: array<f32>;
+@group(0) @binding(2) var<storage,read>       info: array<u32>; // n_real
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= info[0]) { return; }
+    out[i] = inp[i];   // extra rows stay zero (empty() buffer is zeroed)
 }
 "#;
 
