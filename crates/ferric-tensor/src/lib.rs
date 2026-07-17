@@ -29,7 +29,7 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub use autograd::Var;
-pub use dtype::{DType, Half, Q2_0Weights, QRow, QTensor, Ternary};
+pub use dtype::{DType, Half, Q2_0Weights, Q4_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
@@ -168,11 +168,12 @@ impl Tensor {
         }
         let n = self.numel();
         let out = empty(&self.ctx, n);
-        // info: [rank, n, offset, shape..., strides...]
-        let mut info = vec![self.rank() as u32, n as u32, self.offset as u32];
+        // info: [rank, n, offset, row_stride, shape..., strides...]; 2D grid so n can exceed 4.19M.
+        let (grid, rs) = groups2d(n);
+        let mut info = vec![self.rank() as u32, n as u32, self.offset as u32, rs];
         info.extend(self.shape.iter().map(|&x| x as u32));
         info.extend(self.strides.iter().map(|&x| x as u32));
-        run(&self.ctx, GATHER_WGSL, "gather", &[&self.buf, &out, &u32buf(&self.ctx, &info)], groups(n));
+        run(&self.ctx, GATHER_WGSL, "gather", &[&self.buf, &out, &u32buf(&self.ctx, &info)], grid);
         Tensor { ctx: self.ctx.clone(), buf: Arc::new(out), shape: self.shape.clone(), strides: contig_strides(&self.shape), offset: 0 }
     }
 
@@ -756,17 +757,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const GATHER_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-@group(0) @binding(2) var<storage,read>        info: array<u32>; // rank,n,offset,shape[r],strides[r]
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // rank,n,offset,row_stride,shape[r],strides[r]
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; let rank = info[0]; let n = info[1];
+    let i = gid.x + gid.y * info[3]; let rank = info[0]; let n = info[1]; // 2D grid: n can exceed 4.19M
     if (i >= n) { return; }
     var src = info[2]; var rem = i;
     for (var dd: u32 = 0u; dd < rank; dd = dd + 1u) {
         let d = rank - 1u - dd;
-        let sz = info[3u + d];
+        let sz = info[4u + d];
         let idx = rem % sz; rem = rem / sz;
-        src = src + idx * info[3u + rank + d];
+        src = src + idx * info[4u + rank + d];
     }
     out[i] = x[src];
 }

@@ -296,7 +296,70 @@ impl Q2_0Weights {
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 128) * 34 }
 }
 
+/// **Q4_0** weights held packed on the GPU — the canonical llama.cpp 4-bit format (blocks of 32:
+/// `f16 scale` + 16 nibble-bytes; value = (nibble − 8)·scale). Most quantized GGUF models on Hugging
+/// Face ship in Q4-family formats, so a *native* packed matmul (dequant in-kernel, weights never
+/// expanded to f32) is what makes Ferric fast — and 8× lighter — on the standard model ecosystem, the
+/// way `Q2_0Weights` does for ternary. Same repack-on-upload trick: the 18-byte block isn't u32-
+/// aligned, so split it into an aligned `codes` array (4 u32/block) and a separate `scales` array.
+pub struct Q4_0Weights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>,  // 4 u32 per block (16 nibble-bytes)
+    scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
+    pub rows: usize,           // out features
+    pub cols: usize,           // in features (multiple of 32)
+}
+
+impl Q4_0Weights {
+    /// Upload raw Q4_0 block bytes (exactly as they appear in the GGUF) for an [out, in] weight.
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q4_0Weights {
+        assert_eq!(cols % 32, 0, "Q4_0 cols must be a multiple of 32");
+        assert_eq!(bytes.len(), rows * (cols / 32) * 18, "unexpected Q4_0 byte length");
+        let nblk = rows * (cols / 32);
+        let mut codes: Vec<u32> = vec![0; nblk * 4];
+        let mut scales: Vec<u32> = vec![0; nblk.div_ceil(2)];
+        for b in 0..nblk {
+            let src = &bytes[b * 18..b * 18 + 18];
+            let d = u16::from_le_bytes([src[0], src[1]]) as u32;
+            scales[b / 2] |= d << (16 * (b % 2));
+            for w in 0..4 {
+                let c = &src[2 + w * 4..2 + w * 4 + 4];
+                codes[b * 4 + w] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let mk = |label, data: &[u32]| {
+            Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label), contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            }))
+        };
+        Q4_0Weights { ctx: ctx.clone(), codes: mk("q4_0.codes", &codes), scales: mk("q4_0.scales", &scales), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 18 }
+}
+
 impl Tensor {
+    /// y = x·Wᵀ where W is a packed **Q4_0** [out, in] weight, dequantized per-block inside the kernel.
+    /// Same rows-aware flat/split-K selection as Q2_0. x [rows, in] → [rows, out].
+    pub fn matmul_q4_0(&self, w: &Q4_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_0_SPLITK_WGSL, "matmul_q4_0_splitk")
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_0_FLAT_WGSL, "matmul_q4_0_flat")
+        };
+        run(&self.ctx, wgsl, label,
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+
     /// y = x·Wᵀ where W is PrismML Q2_0 ternary held PACKED on the GPU (dequantized per-block on the
     /// fly inside the kernel). x [rows, in] → [rows, out]. This is what makes a 27B ternary model fit.
     pub fn matmul_q2_0(&self, w: &Q2_0Weights) -> Tensor {
@@ -420,6 +483,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 320 code loads — so the activation loads, not the weights, dominate the instruction stream.
 /// Every thread in a wave reads the same `x` (same token), so these all hit cache; the cost is
 /// issue slots, not bandwidth, which is exactly what a latency-bound kernel cannot afford.
+// Q4_0 block = 32 values, 4 u32 code-words + f16 scale. Byte j's low nibble is value j, high nibble
+// is value j+16 (llama.cpp layout); value = (nibble − 8)·d. Per word (4 bytes) that's 4 low + 4 high
+// activations, two vec4 dots. x is bound as vec4<f32> for coalesced 4-at-a-time activation loads.
+const MATMUL_Q4_0_FLAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, row_stride
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 32u; let nwords = nblk * 4u;
+    var acc = 0.0;
+    for (var w: u32 = 0u; w < nwords; w = w + 1u) {
+        let blk = w >> 2u;
+        let bi = o * nblk + blk;
+        let sw = unpack2x16float(scales[bi >> 1u]);
+        let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+        let word = codes[o * nwords + w];
+        let xlo = (r * in_dim + blk * 32u + (w & 3u) * 4u) >> 2u;
+        let lo = vec4<f32>(f32(i32(word & 0xfu) - 8), f32(i32((word >> 8u) & 0xfu) - 8), f32(i32((word >> 16u) & 0xfu) - 8), f32(i32((word >> 24u) & 0xfu) - 8));
+        let hi = vec4<f32>(f32(i32((word >> 4u) & 0xfu) - 8), f32(i32((word >> 12u) & 0xfu) - 8), f32(i32((word >> 20u) & 0xfu) - 8), f32(i32((word >> 28u) & 0xfu) - 8));
+        acc = acc + (dot(x[xlo], lo) + dot(x[xlo + 4u], hi)) * d;
+    }
+    out[idx] = acc;
+}
+"#;
+
+const MATMUL_Q4_0_SPLITK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, grid_w
+var<workgroup> partial: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    let idx = wg.x + wg.y * info.w; let t = lid.x;
+    if (idx < rows * o_dim) {
+        let o = idx % o_dim; let r = idx / o_dim;
+        let nblk = in_dim / 32u; let nwords = nblk * 4u;
+        var acc = 0.0;
+        for (var w: u32 = t; w < nwords; w = w + 64u) {
+            let blk = w >> 2u;
+            let bi = o * nblk + blk;
+            let sw = unpack2x16float(scales[bi >> 1u]);
+            let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+            let word = codes[o * nwords + w];
+            let xlo = (r * in_dim + blk * 32u + (w & 3u) * 4u) >> 2u;
+            let lo = vec4<f32>(f32(i32(word & 0xfu) - 8), f32(i32((word >> 8u) & 0xfu) - 8), f32(i32((word >> 16u) & 0xfu) - 8), f32(i32((word >> 24u) & 0xfu) - 8));
+            let hi = vec4<f32>(f32(i32((word >> 4u) & 0xfu) - 8), f32(i32((word >> 12u) & 0xfu) - 8), f32(i32((word >> 20u) & 0xfu) - 8), f32(i32((word >> 28u) & 0xfu) - 8));
+            acc = acc + (dot(x[xlo], lo) + dot(x[xlo + 4u], hi)) * d;
+        }
+        partial[t] = acc;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+        if (t == 0u) { out[idx] = partial[0]; }
+    }
+}
+"#;
+
 const MATMUL_Q2_0_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;

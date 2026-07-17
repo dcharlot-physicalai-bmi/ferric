@@ -41,8 +41,13 @@ FLOPS:
 3. **A heterogeneous scheduler spanning CPU + GPU + cloud(TCP) + browser(WebGPU) in one graph.**
    Burn has `burn-remote`; nobody places work across local CPU/GPU, a TCP cloud worker, *and* a
    browser tab behind one `Device` abstraction.
-4. **Portable ingest (safetensors + ONNX) + a real Llama forward + int8/int4 weight-only quant matmul
-   + eager autograd**, all pure-Rust and self-reliant (vendored + forked deps, offline builds).
+4. **Portable ingest (safetensors + ONNX) + a real Llama forward + eager autograd**, all pure-Rust
+   and self-reliant (vendored + forked deps, offline builds).
+5. **Native packed-quant matmuls, weights never expanded to f32.** Q2_0 ternary (2.125 bpw) *and*
+   the canonical llama.cpp **Q4_0** (4.5 bpw) run with dequant *inside* the kernel — validated exact
+   vs a dequantize-then-f32 reference, and **1.9× faster + 7.1× lighter** than that path at a 4096
+   GEMV. Most quantized GGUFs on Hugging Face are Q4-family, so this is what makes Ferric fast on the
+   standard model ecosystem, not only on ternary. (Q4_K/Q8_0 native are the next formats.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
