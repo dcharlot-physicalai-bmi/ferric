@@ -441,6 +441,15 @@ impl Tensor {
         let bn: usize = numel(&batch);
         let a_full: Vec<usize> = batch.iter().chain([m, ka].iter()).copied().collect();
         let b_full: Vec<usize> = batch.iter().chain([kb, n].iter()).copied().collect();
+        // Cooperative-matrix (tensor-core) fast path — opt-in (`FERRIC_COOP=1`), for the f32-GEMM
+        // heavy paths (training, prefill) where the 6–32× beats naive. Not the default: coop is
+        // fp-order/precision dependent (NVIDIA TF32), so it must not silently change inference logits
+        // or the bit-identical cross-fabric guarantee. Only plain 2D GEMMs with 8-aligned dims.
+        if bn == 1 && ra == 2 && rb == 2 && m % 8 == 0 && ka % 8 == 0 && n % 8 == 0
+            && self.ctx.coop_gemm_ok() && std::env::var("FERRIC_COOP").is_ok()
+        {
+            return self.matmul_coop(other);
+        }
         let a = self.broadcast_to(&a_full).contiguous();
         let b = other.broadcast_to(&b_full).contiguous();
         let out = empty(&self.ctx, bn * m * n);

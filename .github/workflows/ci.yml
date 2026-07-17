@@ -79,6 +79,8 @@ jobs:
           cargo run -p ferric-tensor --example bandwidth
           cargo run -p ferric-tensor --example subgroup_spike
           cargo run -p ferric-tensor --example coop_spike
+          cargo run -p ferric-tensor --example coop_gemm
+          cargo run -p ferric-tensor --example coop_matmul_route
           cargo run -p ferric-tensor --example bench_fuse_mm
           cargo run -p ferric-tensor --example bench_gdn
           cargo run -p ferric-tensor --example batch
