@@ -316,6 +316,16 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![t, ch])
     }
 
+    /// Fused **SwiGLU**: `self` is a [t, 2d] tensor holding [gate | up] side by side; returns
+    /// `silu(gate) ⊙ up` as [t, d] in one kernel. Replaces the silu + mul pair in every FFN.
+    pub fn swiglu(&self, d: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (2 * d);
+        let out = empty(&self.ctx, t * d);
+        run(&self.ctx, SWIGLU_WGSL, "swiglu", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[(t * d) as u32, d as u32])], groups(t * d));
+        Tensor::from_parts(&self.ctx, out, vec![t, d])
+    }
+
     /// **Fused single-query attention** (the decode step). `self`=q [1, nh·dh], k/v [S, nkv·dh].
     /// One workgroup per query head runs the whole head in one pass — scores, softmax, and the
     /// weighted V-sum — with no intermediate tensors. Replaces the ~12-dispatch composed path
@@ -1020,6 +1030,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // tensors: (1) each thread computes scores for its slice of the S keys (full dh-dot), (2) a parallel
 // max+exp+sum softmax over the shared scores, (3) each thread accumulates the weighted-V for its
 // slice of the dh output dims. S ≤ 2048 so scores fit in shared memory.
+// gate_up is [t, 2d] laid out row-major as [gate(d) | up(d)] per row; out[i] = silu(gate)·up.
+const SWIGLU_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        gu:  array<f32>;   // [t, 2d]
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;   // [t, d]
+@group(0) @binding(2) var<storage,read>        info: array<u32>;  // n(=t·d), d
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; let n = info[0]; let d = info[1];
+    if (i >= n) { return; }
+    let row = i / d; let col = i % d;
+    let g = gu[row * 2u * d + col];
+    let u = gu[row * 2u * d + d + col];
+    out[i] = (g / (1.0 + exp(-g))) * u;   // silu(g)·u
+}
+"#;
+
 const FUSED_ATTN_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        q:   array<f32>;   // [nh·dh]
 @group(0) @binding(1) var<storage,read>        k:   array<f32>;   // [S, nkv·dh]

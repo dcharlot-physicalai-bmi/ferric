@@ -333,12 +333,8 @@ impl Qwen35 {
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
-        // One matmul emits [gate | up]; split, SwiGLU, project down.
-        let gu = h.matmul_q2_0(&l.ffn_gate_up);
-        let d = l.ffn_gate_out;
-        let gate = gu.narrow(1, 0, d);
-        let up = gu.narrow(1, d, d);
-        gate.silu().mul(&up).matmul_q2_0(&l.ffn_down)
+        // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
+        h.matmul_q2_0(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q2_0(&l.ffn_down)
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).

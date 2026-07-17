@@ -147,9 +147,8 @@ impl Qwen3 {
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
-        let gu = h.matmul_q2_0(&l.ffn_gate_up);
-        let d = l.ffn_gate_out;
-        gu.narrow(1, 0, d).silu().mul(&gu.narrow(1, d, d)).matmul_q2_0(&l.ffn_down)
+        // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
+        h.matmul_q2_0(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q2_0(&l.ffn_down)
     }
 
     /// Prefill (stateless): logits [T, n_vocab].
