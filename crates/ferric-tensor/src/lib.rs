@@ -1417,12 +1417,15 @@ enable wgpu_cooperative_matrix;
 fn main(@builtin(workgroup_id) wid: vec3<u32>) {
     let mm = dims.x; let kk = dims.y; let nn = dims.z;
     let trow = wid.y * 8u; let tcol = wid.x * 8u;
-    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[trow * nn + tcol], nn);
+    let ci = trow * nn + tcol;                    // let-bind indices so the SPIR-V backend caches them
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
     for (var k: u32 = 0u; k < kk; k = k + 8u) {
-        let ma = coopLoadT<coop_mat8x8<f32, A>>(&a[trow * kk + k], kk);
-        let mb = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + tcol], nn);
+        let ai = trow * kk + k;
+        let bi = k * nn + tcol;
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&a[ai], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&b[bi], nn);
         acc = coopMultiplyAdd(ma, mb, acc);
     }
-    coopStoreT(acc, &c[trow * nn + tcol], nn);
+    coopStoreT(acc, &c[ci], nn);
 }
 "#;
