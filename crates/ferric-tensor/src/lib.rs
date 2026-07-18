@@ -1410,12 +1410,55 @@ impl Tensor {
         assert!(m % 8 == 0 && k % 8 == 0 && n % 8 == 0, "matmul_coop needs M,K,N multiples of 8");
         let (a, b) = (self.contiguous(), other.contiguous());
         let out = empty(&self.ctx, m * n); // zeroed accumulator
-        run(&self.ctx, COOP_GEMM_WGSL, "coop_gemm",
-            &[a.buf.as_ref(), b.buf.as_ref(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
-            ((n / 8) as u32, (m / 8) as u32, 1));
+        // Register-blocked (2×2 of 8×8 tiles per workgroup) when M,N are 16-aligned: each subgroup
+        // reuses 2 A-tiles + 2 B-tiles across 4 MMAs (half the loads per MMA), so it's compute-denser.
+        if m % 16 == 0 && n % 16 == 0 {
+            run(&self.ctx, COOP_GEMM_RB_WGSL, "coop_gemm_rb",
+                &[a.buf.as_ref(), b.buf.as_ref(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+                ((n / 16) as u32, (m / 16) as u32, 1));
+        } else {
+            run(&self.ctx, COOP_GEMM_WGSL, "coop_gemm",
+                &[a.buf.as_ref(), b.buf.as_ref(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+                ((n / 8) as u32, (m / 8) as u32, 1));
+        }
         Tensor::from_parts(&self.ctx, out, vec![m, n])
     }
 }
+
+// Register-blocked coop GEMM: one workgroup owns a 16×16 output block = a 2×2 grid of 8×8 tiles, held
+// in 4 accumulators. Per K-step it loads 2 A-tiles (top/bottom 8 rows) and 2 B-tiles (left/right 8
+// cols) and issues 4 coopMultiplyAdd — reusing each loaded tile twice, halving loads per MMA.
+const COOP_GEMM_RB_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       a: array<f32>;
+@group(0) @binding(1) var<storage,read>       b: array<f32>;
+@group(0) @binding(2) var<storage,read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform>            dims: vec4<u32>;
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z;
+    let r0 = wid.y * 16u; let r1 = r0 + 8u;
+    let c0 = wid.x * 16u; let c1 = c0 + 8u;
+    var a00 = coopLoadT<coop_mat8x8<f32, C>>(&c[r0 * nn + c0], nn);
+    var a01 = coopLoadT<coop_mat8x8<f32, C>>(&c[r0 * nn + c1], nn);
+    var a10 = coopLoadT<coop_mat8x8<f32, C>>(&c[r1 * nn + c0], nn);
+    var a11 = coopLoadT<coop_mat8x8<f32, C>>(&c[r1 * nn + c1], nn);
+    for (var k: u32 = 0u; k < kk; k = k + 8u) {
+        let ma0 = coopLoadT<coop_mat8x8<f32, A>>(&a[r0 * kk + k], kk);
+        let ma1 = coopLoadT<coop_mat8x8<f32, A>>(&a[r1 * kk + k], kk);
+        let mb0 = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + c0], nn);
+        let mb1 = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + c1], nn);
+        a00 = coopMultiplyAdd(ma0, mb0, a00);
+        a01 = coopMultiplyAdd(ma0, mb1, a01);
+        a10 = coopMultiplyAdd(ma1, mb0, a10);
+        a11 = coopMultiplyAdd(ma1, mb1, a11);
+    }
+    coopStoreT(a00, &c[r0 * nn + c0], nn);
+    coopStoreT(a01, &c[r0 * nn + c1], nn);
+    coopStoreT(a10, &c[r1 * nn + c0], nn);
+    coopStoreT(a11, &c[r1 * nn + c1], nn);
+}
+"#;
 
 const COOP_GEMM_WGSL: &str = r#"
 enable wgpu_cooperative_matrix;
