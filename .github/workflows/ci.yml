@@ -84,6 +84,8 @@ jobs:
           cargo run -p ferric-tensor --example coop_q2_0
           cargo run -p ferric-tensor --example coop_q4_k
           cargo run -p ferric-tensor --example coop_q6_k
+          cargo run -p ferric-tensor --example coop_q5_k
+          cargo run -p ferric-tensor --example coop_q8_0
           cargo run -p ferric-tensor --example bench_fuse_mm
           cargo run -p ferric-tensor --example bench_gdn
           cargo run -p ferric-tensor --example batch

@@ -492,6 +492,9 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q5_K_FLAT_WGSL, "matmul_q5_k_flat")
         };
+        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+            return self.matmul_q5_k_coop(w);
+        }
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER);
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
@@ -499,7 +502,66 @@ impl Tensor {
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
+
+    /// Cooperative-matrix Q5_K prefill matmul — Q4_K plus the 5th (qh) bit. Completes Q5_K_M models.
+    pub fn matmul_q5_k_coop(&self, w: &Q5_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0, "matmul_q5_k_coop needs N a multiple of 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        let src = MATMUL_Q5_K_COOP_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q5_k_coop",
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, (inn / 256) as u32])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
 }
+
+const MATMUL_Q5_K_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:      array<f32>;
+@group(0) @binding(1) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>       aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write> c:      array<f32>;
+@group(0) @binding(4) var<uniform>            dims:   vec4<u32>;   // M, K, N, nblk(=K/256)
+var<workgroup> bs: array<f32, 64>;
+__HELPERS__
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let gblk = n * nblk + (k / 256u); let v = k % 256u;
+            let s = v / 32u; let l = v % 32u; let hi = s & 1u;
+            let ab = gblk * 4u; let cb = gblk * 40u;
+            let dd = unpack2x16float(aux[ab]); let sm = scmin(ab, s);
+            let ds = dd.x * f32(sm.x); let mm = dd.y * f32(sm.y);
+            let comp = l & 3u; let wl = l >> 2u;
+            let qsw = codes[cb + 8u * (s >> 1u) + wl];
+            let nib = (qsw >> (8u * comp + select(0u, 4u, hi == 1u))) & 0xFu;
+            let qhw = codes[cb + 32u + wl];
+            let bit = (qhw >> (8u * comp + s)) & 1u;
+            bs[kl * 8u + nl] = ds * f32(nib + bit * 16u) - mm;
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
 
 /// **Q6_K** weights held packed on the GPU — llama.cpp's 6-bit K-quant. `Q4_K_M`, the default, stores
 /// its embedding/output and some `ffn_down` tensors as Q6_K, so a real Q4_K_M model can't run without
@@ -673,13 +735,68 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q8_0_FLAT_WGSL, "matmul_q8_0_flat")
         };
+        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+            return self.matmul_q8_0_coop(w);
+        }
         let src = if use_subgroup(&self.ctx) { sg_reduce(wgsl) } else { wgsl.to_string() };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
+
+    /// Cooperative-matrix Q8_0 prefill matmul — 8-bit (int8·scale), the simplest dequant.
+    pub fn matmul_q8_0_coop(&self, w: &Q8_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0, "matmul_q8_0_coop needs N a multiple of 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_Q8_0_COOP_WGSL, "matmul_q8_0_coop",
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, (inn / 32) as u32])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
 }
+
+const MATMUL_Q8_0_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:      array<f32>;
+@group(0) @binding(1) var<storage,read>       codes:  array<u32>;  // Q8_0 int8, W [N,K]
+@group(0) @binding(2) var<storage,read>       scales: array<u32>;  // f16/block
+@group(0) @binding(3) var<storage,read_write> c:      array<f32>;
+@group(0) @binding(4) var<uniform>            dims:   vec4<u32>;   // M, K, N, nblk(=K/32)
+var<workgroup> bs: array<f32, 64>;
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let gblk = n * nblk + (k / 32u); let j = k % 32u;
+            let sw = unpack2x16float(scales[gblk >> 1u]);
+            let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
+            let word = codes[gblk * 8u + (j >> 2u)];
+            let byte = (word >> (8u * (j & 3u))) & 0xffu;
+            bs[kl * 8u + nl] = f32(i32(byte << 24u) >> 24u) * d;
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
 
 /// **Q4_K** weights held packed on the GPU — the *default* llama.cpp quant (`Q4_K_M`), so the single
 /// most common format on Hugging Face. A 144-byte super-block holds 256 values: `f16 d`, `f16 dmin`,
