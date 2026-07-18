@@ -965,21 +965,10 @@ impl Tensor {
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
         let nblk = (inn / 128) as u32;
-        let (gx, gy) = ((w.rows / 8) as u32, (mrows / 8) as u32);
-        // Cross-vendor path: dequant the tile into a GLOBAL scratch (one 64-slot region per workgroup)
-        // and coop-load from there. coop-load-from-workgroup is mis-generated on NVIDIA's SPIR-V, but
-        // coop-load-from-global works everywhere (the f32 GEMM proves it). Metal uses the faster
-        // shared path. Coop is native-only, so the extra storage buffer is fine.
-        if matches!(self.ctx.backend, wgpu::Backend::Metal) {
-            run(&self.ctx, MATMUL_Q2_0_COOP_WGSL, "matmul_q2_0_coop",
-                &[xp.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
-                  &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, nblk])], (gx, gy, 1));
-        } else {
-            let scratch = empty(&self.ctx, (gx * gy) as usize * 64);
-            run(&self.ctx, MATMUL_Q2_0_COOP_G_WGSL, "matmul_q2_0_coop_g",
-                &[xp.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out, &scratch,
-                  &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, nblk])], (gx, gy, 1));
-        }
+        run(&self.ctx, MATMUL_Q2_0_COOP_WGSL, "matmul_q2_0_coop",
+            &[xp.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, nblk])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
         let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
         if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
     }
@@ -1027,42 +1016,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
         acc = coopMultiplyAdd(ma, mb, acc);
         workgroupBarrier();
-    }
-    coopStoreT(acc, &c[ci], nn);
-}
-"#;
-
-const MATMUL_Q2_0_COOP_G_WGSL: &str = r#"
-enable wgpu_cooperative_matrix;
-@group(0) @binding(0) var<storage,read>       x:       array<f32>;
-@group(0) @binding(1) var<storage,read>       codes:   array<u32>;
-@group(0) @binding(2) var<storage,read>       scales:  array<u32>;
-@group(0) @binding(3) var<storage,read_write> c:       array<f32>;
-@group(0) @binding(4) var<storage,read_write> scratch: array<f32>;  // per-workgroup 64-slot B tile
-@group(0) @binding(5) var<uniform>            dims:    vec4<u32>;   // M, K, N, nblk(=K/128)
-@compute @workgroup_size(32)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let kk = dims.y; let nn = dims.z; let nblk = dims.w;
-    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
-    let sb = (wid.y * (nn / 8u) + wid.x) * 64u;   // this workgroup's scratch region
-    let ci = m0 * nn + n0;
-    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
-    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
-        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
-            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
-            let n = n0 + nl; let k = k0 + kl;
-            let blk = k / 128u; let j = k % 128u; let gblk = n * nblk + blk;
-            let sw = unpack2x16float(scales[gblk >> 1u]);
-            let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
-            let word = codes[gblk * 8u + (j >> 4u)];
-            let code = (word >> ((j & 15u) * 2u)) & 3u;
-            scratch[sb + kl * 8u + nl] = f32(i32(code) - 1) * d;
-        }
-        storageBarrier();
-        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
-        let mb = coopLoadT<coop_mat8x8<f32, B>>(&scratch[sb], 8u);
-        acc = coopMultiplyAdd(ma, mb, acc);
-        storageBarrier();
     }
     coopStoreT(acc, &c[ci], nn);
 }
