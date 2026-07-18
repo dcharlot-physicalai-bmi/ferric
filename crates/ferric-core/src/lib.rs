@@ -58,11 +58,13 @@ impl Context {
     /// Whether cooperative-matrix **load-from-workgroup-memory** works here. The quant-coop kernels
     /// dequantize a weight tile into shared memory and `coopLoad` it. **Measured** on an RTX 4050
     /// (Vulkan): it *runs* — and fast (3× over scalar) — but returns **garbage** (rel|Δ| = 1.0). So
-    /// the naga fork's SPIR-V `OpCooperativeMatrixLoadKHR` from the `Workgroup` storage class is
-    /// mis-generated (the f32 GEMM is unaffected: it loads both operands from `StorageBuffer`). Two
-    /// fixes for NVIDIA, both a dedicated pass: fix the naga SPIR-V workgroup coop-load, or a
-    /// dequant-whole-weight-to-global path + col-major B load (works on both, 8× transient f32). Metal
-    /// (MSL) is correct today. `FERRIC_COOP_SHARED_FORCE` overrides the gate for debugging.
+    /// on NVIDIA a coop-load of a buffer that was **written earlier in the same kernel** returns
+    /// garbage — tested both a workgroup `bs` tile AND a global scratch tile, both fail (rel|Δ| = 1.0);
+    /// the f32 GEMM is fine only because its operands are *pre-written* (loaded, never written-then-read
+    /// in one dispatch). So the real cross-vendor fix is **two-pass**: dispatch 1 dequantizes the whole
+    /// weight to a global f32 buffer, dispatch 2 runs the plain f32 coop GEMM on it (reads a pre-written
+    /// buffer, works on both — costs 8× transient f32). Or fix the naga SPIR-V coherence. Metal (MSL) is
+    /// correct today. `FERRIC_COOP_SHARED_FORCE` overrides the gate for debugging.
     pub fn coop_shared_ok(&self) -> bool {
         self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_SHARED_FORCE").is_ok())
     }
