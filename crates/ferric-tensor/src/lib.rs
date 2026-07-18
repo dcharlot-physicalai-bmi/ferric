@@ -550,7 +550,7 @@ pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
 fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 /// 2D workgroup grid for large launches: a 1D grid caps at 65535 workgroups. Returns the grid plus
 /// `row_stride` (threads per grid row = gx·64) so the kernel can reconstruct a flat index.
-fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
+pub(crate) fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
     let wg = (n as u32).div_ceil(64);
     let gx = wg.min(32768);
     let gy = wg.div_ceil(gx);

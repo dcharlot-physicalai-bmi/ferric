@@ -3,7 +3,7 @@
 //! and the path real fp16/bf16 checkpoints take. `Half` is a packed storage tensor (2 values per u32
 //! word); `dequant()` expands to a compute `Tensor`, `Tensor::to_half()` packs one down.
 
-use crate::{empty, groups, run, u32buf, unibuf, Tensor};
+use crate::{empty, groups, groups2d, run, u32buf, unibuf, Tensor};
 use ferric_core::Context;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -862,6 +862,32 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
 
+    /// **Two-pass** cooperative-matrix Q2_0 matmul for NON-Metal (NVIDIA): dispatch 1 dequantizes the
+    /// whole weight to a global f32 buffer, dispatch 2 runs the f32 coop GEMM `x·Wᵀ` on it. The coop
+    /// load then reads a *pre-written* buffer (never written-then-read in one kernel), which is the
+    /// pattern NVIDIA handles correctly. Costs 8× transient f32 for the weight — fine at prefill.
+    pub fn matmul_q2_0_coop2pass(&self, w: &Q2_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0, "coop2pass needs N a multiple of 8");
+        // dispatch 1: packed Q2_0 [N,K] → f32 [N,K]
+        let (n, k) = (w.rows, inn);
+        let wf = empty(&self.ctx, n * k);
+        let (grid, rs) = groups2d(n * k);
+        run(&self.ctx, DEQ_Q2_0_WGSL, "deq_q2_0", &[w.codes.as_ref(), w.scales.as_ref(), &wf,
+            &u32buf(&self.ctx, &[(n * k) as u32, k as u32, (k / 128) as u32, rs])], grid);
+        // dispatch 2: coop x·Wᵀ on the pre-written f32 weight
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * n);
+        run(&self.ctx, COOP_GEMM_BT_WGSL, "coop_gemm_bt", &[xp.buf.as_ref(), &wf, &out,
+            &unibuf(&self.ctx, &[mrows as u32, k as u32, n as u32, 0])],
+            ((n / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, n]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+
     /// Cooperative-matrix Q4_K prefill matmul — dequant an 8×8 Q4_K tile (super-block scale/min +
     /// nibble) into shared memory, then feed the matrix unit. Brings tensor-core prompt processing to
     /// the *default* llama.cpp format. Same coop tiling as Q2_0; only the dequant differs.
@@ -961,6 +987,12 @@ impl Tensor {
         assert!(w.rows % 8 == 0, "matmul_q2_0_coop needs N (out) a multiple of 8");
         // Pad the token dimension up to a multiple of 8 (the coop tile), compute, then slice back —
         // so any prompt length works. The pad rows are wasted tiles, cheap at prefill.
+        // Metal: the single-pass shared-tile kernel (fast, correct). Non-Metal (NVIDIA): the two-pass
+        // dequant-to-global path, since coop-load of a same-kernel-written tile returns garbage there.
+        // FERRIC_COOP_2PASS forces two-pass anywhere (to validate it on Metal).
+        if !matches!(self.ctx.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_2PASS").is_ok() {
+            return self.matmul_q2_0_coop2pass(w);
+        }
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -1055,6 +1087,51 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
         acc = coopMultiplyAdd(ma, mb, acc);
         workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
+
+// Dequant packed Q2_0 [N,K] → f32 [N,K]. One thread per element; 2D grid (N·K can exceed 4.19M).
+const DEQ_Q2_0_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(1) var<storage,read>       scales: array<u32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;   // [N,K]
+@group(0) @binding(3) var<storage,read>       info:   array<u32>;   // n_elem, K, nblk(=K/128), row_stride
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let e = gid.x + gid.y * info[3]; let ne = info[0]; let kk = info[1]; let nblk = info[2];
+    if (e >= ne) { return; }
+    let n = e / kk; let k = e % kk;
+    let blk = k / 128u; let j = k % 128u; let gblk = n * nblk + blk;
+    let sw = unpack2x16float(scales[gblk >> 1u]);
+    let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
+    let word = codes[gblk * 8u + (j >> 4u)];
+    let code = (word >> ((j & 15u) * 2u)) & 3u;
+    out[e] = f32(i32(code) - 1) * d;
+}
+"#;
+
+// f32 coop GEMM computing C = x·Wᵀ (W stored [N,K] row-major). A = x tile (row-major, coopLoadT);
+// B = W tile loaded column-major (coopLoad, stride K) so B(k,n) = W[n][k] — no transpose pass. Both
+// operands are pre-existing buffers, so the coop load is the write-free pattern NVIDIA handles.
+const COOP_GEMM_BT_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:    array<f32>;   // [M,K]
+@group(0) @binding(1) var<storage,read>       wf:   array<f32>;   // [N,K]
+@group(0) @binding(2) var<storage,read_write> c:    array<f32>;   // [M,N]
+@group(0) @binding(3) var<uniform>            dims: vec4<u32>;    // M, K, N, _
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        let ai = m0 * kk + k0; let bi = n0 * kk + k0;
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[ai], kk);
+        let mb = coopLoad<coop_mat8x8<f32, B>>(&wf[bi], kk);   // column-major → B(k,n)=W[n][k]
+        acc = coopMultiplyAdd(ma, mb, acc);
     }
     coopStoreT(acc, &c[ci], nn);
 }
