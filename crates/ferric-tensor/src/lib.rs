@@ -189,7 +189,8 @@ impl Tensor {
         info.extend(shape.iter().map(|&x| x as u32));
         info.extend(a.strides.iter().map(|&x| x as u32));
         info.extend(b.strides.iter().map(|&x| x as u32));
-        run(&self.ctx, BINARY_WGSL, "binary", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &info)], groups(n));
+        let (bgrid, brs) = groups2d(n); info.push(brs);
+        run(&self.ctx, BINARY_WGSL, "binary", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &info)], bgrid);
         Tensor { ctx: self.ctx.clone(), buf: Arc::new(out), shape: shape.clone(), strides: contig_strides(&shape), offset: 0 }
     }
     pub fn add(&self, o: &Tensor) -> Tensor { self.binary(o, 0) }
@@ -202,7 +203,8 @@ impl Tensor {
         let c = self.contiguous();
         let n = c.numel();
         let out = empty(&self.ctx, n);
-        run(&self.ctx, UNARY_WGSL, "unary", &[&c.buf, &out, &u32buf(&self.ctx, &[op, n as u32])], groups(n));
+        let (ugrid, urs) = groups2d(n);
+        run(&self.ctx, UNARY_WGSL, "unary", &[&c.buf, &out, &u32buf(&self.ctx, &[op, n as u32, urs])], ugrid);
         Tensor { ctx: self.ctx.clone(), buf: Arc::new(out), shape: c.shape, strides: c.strides, offset: 0 }
     }
     pub fn exp(&self) -> Tensor { self.unary(0) }
@@ -338,6 +340,24 @@ impl Tensor {
         let out = empty(&self.ctx, t * d);
         run(&self.ctx, SWIGLU_WGSL, "swiglu", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[(t * d) as u32, d as u32])], groups(t * d));
         Tensor::from_parts(&self.ctx, out, vec![t, d])
+    }
+
+    /// **Flash-attention prefill** (causal, GQA) — one workgroup per (query, head) runs three shared-
+    /// memory phases (scores over keys ≤ query → softmax → weighted-V), so it **never materializes the
+    /// [nh, T, T] scores matrix** the composed `causal_attention` does (268 MB at T=2048). O(T) memory
+    /// instead of O(T²). `self`=q [T, nh·dh], k/v [T, nkv·dh]. Requires T ≤ 2048 (scores in shared).
+    /// Same math as `causal_attention`.
+    pub fn flash_attention_prefill(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize) -> Tensor {
+        let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
+        let t = q.shape[0];
+        assert!(dh <= 128 && t <= 2048, "flash prefill: head_dim ≤ 128, T ≤ 2048");
+        let out = empty(&self.ctx, t * nh * dh);
+        let scale = 1.0 / (dh as f32).sqrt();
+        run(&self.ctx, FLASH_ATTN_PREFILL_WGSL, "flash_prefill",
+            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &out,
+              &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, t as u32, scale.to_bits(), 0, 0, 0])],
+            (nh as u32, t as u32, 1));
+        Tensor::from_parts(&self.ctx, out, vec![t, nh * dh])
     }
 
     /// **Fused single-query attention** (the decode step). `self`=q [1, nh·dh], k/v [S, nkv·dh].
@@ -720,7 +740,8 @@ const BINARY_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read>        info: array<u32>; // rank,op,n,offA,offB,shape[r],aStr[r],bStr[r]
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; let rank = info[0]; let op = info[1]; let n = info[2];
+    let rank = info[0]; let op = info[1]; let n = info[2];
+    let i = gid.x + gid.y * info[5u + 3u * rank];   // 2D grid: n can exceed 4.19M
     if (i >= n) { return; }
     var ia = info[3]; var ib = info[4]; var rem = i;
     for (var dd: u32 = 0u; dd < rank; dd = dd + 1u) {
@@ -747,10 +768,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const UNARY_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-@group(0) @binding(2) var<storage,read>        info: array<u32>; // op, n
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // op, n, row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; if (i >= info[1]) { return; }
+    let i = gid.x + gid.y * info[2]; if (i >= info[1]) { return; }
     let v = x[i]; var r: f32 = v;
     switch (info[0]) {
         case 0u: { r = exp(v); }
@@ -1088,6 +1109,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = gu[row * 2u * d + col];
     let u = gu[row * 2u * d + d + col];
     out[i] = (g / (1.0 + exp(-g))) * u;   // silu(g)·u
+}
+"#;
+
+// Flash prefill: grid (nh, T). Workgroup (head=wg.x, query=wg.y) attends over causal keys 0..=query.
+const FLASH_ATTN_PREFILL_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        q:   array<f32>;   // [T, nh·dh]
+@group(0) @binding(1) var<storage,read>        k:   array<f32>;   // [T, nkv·dh]
+@group(0) @binding(2) var<storage,read>        v:   array<f32>;   // [T, nkv·dh]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;   // [T, nh·dh]
+struct Info { a: vec4<u32>, b: vec4<u32> }         // a = (nh,nkv,dh,T); b.x = scale bits
+@group(0) @binding(4) var<uniform>             info: Info;
+var<workgroup> qs: array<f32, 128>;
+var<workgroup> sc: array<f32, 2048>;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nh = info.a.x; let nkv = info.a.y; let dh = info.a.z;
+    let scale = bitcast<f32>(info.b.x);
+    let head = wg.x; let qi = wg.y; let t = lid.x;
+    let g = nh / nkv; let kvh = head / g;
+    let s = qi + 1u;                          // causal: keys 0..=qi
+    let qbase = qi * nh * dh + head * dh; let kvbase = kvh * dh;
+    if (t < dh) { qs[t] = q[qbase + t]; }
+    workgroupBarrier();
+    for (var i = t; i < s; i = i + 128u) {
+        var dot = 0.0; let kb = i * nkv * dh + kvbase;
+        for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
+        sc[i] = dot * scale;
+    }
+    workgroupBarrier();
+    var m = -3.0e38;
+    for (var i = t; i < s; i = i + 128u) { m = max(m, sc[i]); }
+    red[t] = m; workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
+    let mx = red[0]; workgroupBarrier();
+    var ssum = 0.0;
+    for (var i = t; i < s; i = i + 128u) { let e = exp(sc[i] - mx); sc[i] = e; ssum = ssum + e; }
+    red[t] = ssum; workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
+    let denom = red[0]; workgroupBarrier();
+    if (t < dh) {
+        var acc = 0.0;
+        for (var i = 0u; i < s; i = i + 1u) { acc = acc + sc[i] * v[i * nkv * dh + kvbase + t]; }
+        out[qbase + t] = acc / denom;
+    }
 }
 "#;
 

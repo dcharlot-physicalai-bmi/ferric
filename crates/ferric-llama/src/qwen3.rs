@@ -207,8 +207,13 @@ impl Qwen3 {
             Some((pk, pv)) => (pk.cat(&k, 0), pv.cat(&v, 0)),
             None => (k, v),
         };
+        // decode: fused single-query; prefill: flash (O(T) memory, no [nh,T,T] matrix) up to its
+        // shared-memory limit, else the composed causal path. All three are the same math.
+        let s = kc.shape[0];
         let o = if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv)
+        } else if t == s && s <= 2048 && hd <= 128 {
+            q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
             nn::causal_attention(&q, &kc, &vc, nh, nkv)
         };
