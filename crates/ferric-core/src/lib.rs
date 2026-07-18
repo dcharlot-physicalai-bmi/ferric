@@ -59,7 +59,9 @@ impl Context {
     /// dequantize a weight tile into shared memory and `coopLoad` it; that's correct on Metal but
     /// produces garbage on NVIDIA/Vulkan through our naga fork (coop-load-from-shared bug — the f32
     /// GEMM is unaffected because it loads both operands from global storage). Metal-gated until fixed.
-    pub fn coop_shared_ok(&self) -> bool { self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal) }
+    pub fn coop_shared_ok(&self) -> bool {
+        self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_SHARED_FORCE").is_ok())
+    }
 }
 
 impl Context {
