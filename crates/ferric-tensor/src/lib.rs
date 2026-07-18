@@ -1426,7 +1426,8 @@ impl Tensor {
 }
 
 // Register-blocked coop GEMM: one workgroup owns a 16×16 output block = a 2×2 grid of 8×8 tiles, held
-// in 4 accumulators. Per K-step it loads 2 A-tiles (top/bottom 8 rows) and 2 B-tiles (left/right 8
+// in 4 accumulators. **2×2 is the measured sweet spot on the M5**: a 4×4 grid (16 accumulators + 4+4
+// operand tiles = 24 coop matrices/subgroup) spills registers and runs ~50× slower (9500 → 155 GFLOP/s). Per K-step it loads 2 A-tiles (top/bottom 8 rows) and 2 B-tiles (left/right 8
 // cols) and issues 4 coopMultiplyAdd — reusing each loaded tile twice, halving loads per MMA.
 const COOP_GEMM_RB_WGSL: &str = r#"
 enable wgpu_cooperative_matrix;
