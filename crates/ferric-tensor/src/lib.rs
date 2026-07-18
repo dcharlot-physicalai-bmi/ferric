@@ -1520,24 +1520,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>) {
     let kk = dims.y; let nn = dims.z;
     let r0 = wid.y * 16u; let r1 = r0 + 8u;
     let c0 = wid.x * 16u; let c1 = c0 + 8u;
-    var a00 = coopLoadT<coop_mat8x8<f32, C>>(&c[r0 * nn + c0], nn);
-    var a01 = coopLoadT<coop_mat8x8<f32, C>>(&c[r0 * nn + c1], nn);
-    var a10 = coopLoadT<coop_mat8x8<f32, C>>(&c[r1 * nn + c0], nn);
-    var a11 = coopLoadT<coop_mat8x8<f32, C>>(&c[r1 * nn + c1], nn);
+    // Every coop pointer index is let-bound: the forked naga SPIR-V backend panics
+    // ("Expression is not cached", write_bounds_check under the Unchecked policy) when a coopLoad/
+    // coopStore pointer arg is indexed by an inline compound expression. This is what kept the RB
+    // kernel Metal-only — MSL is unaffected; Vulkan/SPIR-V is not. Same fix as COOP_GEMM_WGSL.
+    let i00 = r0 * nn + c0; let i01 = r0 * nn + c1; let i10 = r1 * nn + c0; let i11 = r1 * nn + c1;
+    var a00 = coopLoadT<coop_mat8x8<f32, C>>(&c[i00], nn);
+    var a01 = coopLoadT<coop_mat8x8<f32, C>>(&c[i01], nn);
+    var a10 = coopLoadT<coop_mat8x8<f32, C>>(&c[i10], nn);
+    var a11 = coopLoadT<coop_mat8x8<f32, C>>(&c[i11], nn);
     for (var k: u32 = 0u; k < kk; k = k + 8u) {
-        let ma0 = coopLoadT<coop_mat8x8<f32, A>>(&a[r0 * kk + k], kk);
-        let ma1 = coopLoadT<coop_mat8x8<f32, A>>(&a[r1 * kk + k], kk);
-        let mb0 = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + c0], nn);
-        let mb1 = coopLoadT<coop_mat8x8<f32, B>>(&b[k * nn + c1], nn);
+        let ja0 = r0 * kk + k; let ja1 = r1 * kk + k; let jb0 = k * nn + c0; let jb1 = k * nn + c1;
+        let ma0 = coopLoadT<coop_mat8x8<f32, A>>(&a[ja0], kk);
+        let ma1 = coopLoadT<coop_mat8x8<f32, A>>(&a[ja1], kk);
+        let mb0 = coopLoadT<coop_mat8x8<f32, B>>(&b[jb0], nn);
+        let mb1 = coopLoadT<coop_mat8x8<f32, B>>(&b[jb1], nn);
         a00 = coopMultiplyAdd(ma0, mb0, a00);
         a01 = coopMultiplyAdd(ma0, mb1, a01);
         a10 = coopMultiplyAdd(ma1, mb0, a10);
         a11 = coopMultiplyAdd(ma1, mb1, a11);
     }
-    coopStoreT(a00, &c[r0 * nn + c0], nn);
-    coopStoreT(a01, &c[r0 * nn + c1], nn);
-    coopStoreT(a10, &c[r1 * nn + c0], nn);
-    coopStoreT(a11, &c[r1 * nn + c1], nn);
+    coopStoreT(a00, &c[i00], nn);
+    coopStoreT(a01, &c[i01], nn);
+    coopStoreT(a10, &c[i10], nn);
+    coopStoreT(a11, &c[i11], nn);
 }
 "#;
 

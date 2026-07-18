@@ -99,17 +99,28 @@ PyTorch's default) — which, along with fp-order, is why coop stays a fast-path
 cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 + larger register
 tiles.
 
-**Quant-coop is dequant-bound on NVIDIA — correctly Metal-only.** The dequant-tile→coop Q2_0 prefill
-path was measured on an RTX 4050 (Vulkan) across M = 64…2048: **correct** (rel|Δ| = 0.0 vs the scalar
-kernel — the earlier column-major coop-load garbage was fixed by transposing in the dequant so the
-load is row-major) but **exactly 1.0× at every M**. Both the coop path and the scalar split-K path
-plateau at ~1.2 TFLOP/s because reading and unpacking 2-bit weights into shared is the ceiling; the
-tensor cores (9.4 TFLOP/s on f32-coop here) sit idle waiting on dequant, and no M amortizes that away
-since dequant cost scales with the weight, not with M. So the win Metal sees (1.6–3.3× on real models,
-where its scalar quant path is the slower baseline) is not available on NVIDIA, and the `coop_shared_ok`
-Metal-only gate is a correct engineering decision, not a stopgap around a bug. The only route to
-tensor-core prefill on NVIDIA is a one-time dequant to f16 in VRAM (8× the Q2_0 footprint) feeding the
-f32/f16 coop GEMM — a prefill-throughput-vs-memory trade, not a drop-in.
+**The f32 coop GEMM now runs on NVIDIA (was silently Metal-only).** The register-blocked coop kernel
+(`COOP_GEMM_RB_WGSL`) indexed its `coopLoad`/`coopStore` pointers with inline compound expressions
+(`&c[r0*nn+c0]`). The forked naga SPIR-V backend panics on that (`write_bounds_check` → "Expression is
+not cached" under the Unchecked policy), so the kernel never compiled on Vulkan — MSL is unaffected,
+which is why it read as Metal-only. Let-binding every coop pointer index (the same fix `COOP_GEMM_WGSL`
+already had) makes it compile: **RTX 4050 now hits 21.7 TFLOP/s at 2048³ (74× naive, TF32)**, Metal
+stays exact-f32 (max|Δ| = 0.0, fingerprint unchanged). So the earlier "9.4 TFLOP/s NVIDIA" was Metal-
+confused; the real NVIDIA number is higher, and the path was compile-broken, not slow.
+
+**Two quant-coop routes, two different NVIDIA verdicts.**
+- *Shared-coop* (dequant an 8×8 tile into workgroup memory in-kernel, then `coopLoad` it): **correct**
+  on NVIDIA (rel|Δ| = 0.0) but **1.0× at every M** — both it and the scalar split-K path plateau at
+  ~1.2 TFLOP/s because unpacking 2-bit weights is the ceiling and the tensor cores idle waiting on
+  dequant. No win to gate in; `coop_shared_ok` Metal-only is correct on the merits (Metal wins only
+  because its scalar quant path is the slower baseline, 1.6–3.3× on real models).
+- *Two-pass* (dequant → f32 `[K,N]` in one dispatch, then the fast RB coop GEMM): now **compiles** and
+  is **fast** — 12× at M = 512, **32× at M = 2048** over scalar — but returns **garbage** (rel|Δ| = 1.0):
+  the RB `coopLoad` reads the dispatch-written weight as stale/zero, and a WRITE→READ barrier (same
+  *or* separate submit) does not fix it. This is a **coop-load memory-visibility gap** distinct from the
+  compile panic: CPU-uploaded operands (coop_gemm) are fine, GPU-written ones are not. If closed (likely
+  a Vulkan-memory-model `MakePointerVisible`/`NonPrivate` operand on `OpCooperativeMatrixLoadKHR`, which
+  the fork currently omits), two-pass is the real tensor-core-prefill win on NVIDIA — 12–32× at prefill M.
 
 **Unbounded exact attention (both paths default).** Both hot-path attention kernels stream their
 keys in 2048-key chunks with an **online softmax** (running max/sum + a per-thread output accumulator),

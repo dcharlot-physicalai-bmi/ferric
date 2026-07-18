@@ -880,7 +880,10 @@ impl Tensor {
         run(&self.ctx, DEQ_Q2_0_T_WGSL, "deq_q2_0_t", &[w.codes.as_ref(), w.scales.as_ref(), &wf,
             &u32buf(&self.ctx, &[(n * k) as u32, k as u32, (k / 128) as u32, n as u32, rs])], grid);
         let wf_t = Tensor::from_parts(&self.ctx, wf, vec![k, n]);
-        // dispatch 2: the proven row-major f32 coop GEMM on the pre-written weight
+        // dispatch 2: the proven row-major f32 coop GEMM on the pre-written weight. NOTE: correct on
+        // Metal; on NVIDIA the coopLoad reads this dispatch-written weight as stale/zero even with the
+        // WRITE→READ barrier (same/separate submit both fail) — a coop-load memory-visibility gap that
+        // a normal shader-read barrier doesn't cover. Tracked separately; coop2pass stays Metal-useful.
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let full = xp.matmul_coop(&wf_t);
@@ -1099,15 +1102,19 @@ const DEQ_Q2_0_T_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read>       info:   array<u32>;   // n_elem, K, nblk, N, row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let e = gid.x + gid.y * info[4]; let ne = info[0]; let kk = info[1]; let nblk = info[2]; let nn = info[3];
+    // Every storage index is let-bound before use: the forked naga SPIR-V backend panics
+    // ("Expression is not cached") when an Access index is an inline compound expression under
+    // ReadZeroSkipWrite bounds checks — the same workaround the coop GEMM uses for its coopLoad ptrs.
+    let rs = info[4]; let ne = info[0]; let kk = info[1]; let nblk = info[2]; let nn = info[3];
+    let e = gid.x + gid.y * rs;
     if (e >= ne) { return; }
     let n = e / kk; let k = e % kk;
     let blk = k / 128u; let j = k % 128u; let gblk = n * nblk + blk;
-    let sw = unpack2x16float(scales[gblk >> 1u]);
+    let si = gblk >> 1u; let sw = unpack2x16float(scales[si]);
     let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
-    let word = codes[gblk * 8u + (j >> 4u)];
+    let ci = gblk * 8u + (j >> 4u); let word = codes[ci];
     let code = (word >> ((j & 15u) * 2u)) & 3u;
-    out[k * nn + n] = f32(i32(code) - 1) * d;   // transposed write [K,N]
+    let oi = k * nn + n; out[oi] = f32(i32(code) - 1) * d;   // transposed write [K,N]
 }
 "#;
 
