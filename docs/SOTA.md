@@ -97,7 +97,23 @@ codegen bug (coop pointer index not cached) is worked around by let-binding the 
 differs by vendor — Metal computes exact f32, NVIDIA computes f32-coop as **TF32** (~1e-2, like
 PyTorch's default) — which, along with fp-order, is why coop stays a fast-path, not the bit-identical
 cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 + larger register
-tiles, the quant-matmul prefill path, and a general flash-attention path.
+tiles, and the quant-matmul prefill path on NVIDIA (Metal already ships; blocked on a diagnosed
+wgpu coop-load barrier gap).
+
+**Unbounded exact attention (both paths default).** Both hot-path attention kernels stream their
+keys in 2048-key chunks with an **online softmax** (running max/sum + a per-thread output accumulator),
+so neither ever materializes an intermediate scores tensor and neither has a context-length cap:
+- **Prefill** — `flash_attention_prefill`, one workgroup per (query, head), O(head_dim) state instead
+  of the composed path's [nh,T,T]. Measured 2.0× at T=1024 up to **12.4× at T=5000** (saves 400 MB of
+  scores); the win grows with T because the composed path is O(T²) memory traffic.
+- **Decode** — `fused_decode_attention`, one workgroup per head, replaces the ~12-dispatch composed
+  single-query path at any cache length.
+Both are **exact** (same math as the composed reference), so they are the **default**, not opt-in:
+validated across the 2048-chunk boundary (prefill T=3000/5000, decode S=2049/4096/5000 all max|Δ|~2e-7),
+all three reference models stay token-for-token identical to llama.cpp, and the 1.7B cross-fabric
+fingerprint is bit-identical. Verified end to end on a real model: a 3640-token prompt prefills
+(2 chunks) and a 2200-token generation crosses the boundary at steady throughput, neither degrading
+to the composed fallback.
 
 **Decode speed vs llama.cpp.** Bonsai-27B decodes at ~171 ms/token against llama.cpp's 22 ms (~8×).
 The gap is now dominated by two things: llama.cpp reaches ~90% of the 325 GB/s memory roofline on its
