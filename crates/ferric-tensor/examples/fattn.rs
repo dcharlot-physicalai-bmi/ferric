@@ -8,7 +8,8 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     let mut ok = true;
-    for (nh, nkv, dh, s) in [(16usize, 8usize, 128usize, 1usize), (16, 8, 128, 7), (16, 8, 128, 64), (16, 16, 64, 300), (8, 2, 96, 129)] {
+    // S=2049/4096/5000 cross the 2048-key chunk boundary — validate the online-softmax combination.
+    for (nh, nkv, dh, s) in [(16usize, 8usize, 128usize, 1usize), (16, 8, 128, 7), (16, 8, 128, 64), (16, 16, 64, 300), (8, 2, 96, 129), (16, 8, 128, 2049), (16, 16, 64, 4096), (8, 8, 64, 5000)] {
         let q = Tensor::from_vec(&ctx, &seq(nh * dh, 1.0), &[1, nh * dh]);
         let k = Tensor::from_vec(&ctx, &seq(s * nkv * dh, 2.0), &[s, nkv * dh]);
         let v = Tensor::from_vec(&ctx, &seq(s * nkv * dh, 3.0), &[s, nkv * dh]);

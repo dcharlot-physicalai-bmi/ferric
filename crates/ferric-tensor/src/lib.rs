@@ -364,13 +364,12 @@ impl Tensor {
     /// One workgroup per query head runs the whole head in one pass — scores, softmax, and the
     /// weighted V-sum — with no intermediate tensors. Replaces the ~12-dispatch composed path
     /// (reshape/permute/contiguous/broadcast/matmul/softmax/matmul), which dominates decode when a
-    /// model has attention in every layer. Requires S ≤ 2048 (scores live in shared memory);
-    /// `nn::decode_attention` falls back to the composed path above that. Returns [1, nh·dh].
+    /// model has attention in every layer. Any cache length S (keys stream in 2048-key chunks with
+    /// online softmax — O(dh) state, no S cap). Returns [1, nh·dh].
     pub fn fused_decode_attention(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize) -> Tensor {
         let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
         let s = k.numel() / (nkv * dh);
         assert!(dh <= 128, "fused_decode_attention: head_dim ≤ 128");
-        assert!(s <= 2048, "fused_decode_attention: S ≤ 2048");
         let out = empty(&self.ctx, nh * dh);
         let scale = 1.0 / (dh as f32).sqrt();
         run(&self.ctx, FUSED_ATTN_WGSL, "fattn",
@@ -1187,31 +1186,36 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     // load this head's query into shared
     if (t < dh) { qs[t] = q[qbase + t]; }
     workgroupBarrier();
-    // phase 1: scores[i] = scale · (q · k[i])  for each key i, striped across threads
-    for (var i = t; i < s; i = i + 128u) {
-        var dot = 0.0;
-        let kb = i * nkv * dh + kvbase;
-        for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
-        sc[i] = dot * scale;
+    // Stream the S keys in 2048-key chunks with online softmax (running max m_run, sum l_run,
+    // per-thread output accumulator accd) — O(dh) state, so any cache length works with no S cap.
+    var m_run = -3.0e38; var l_run = 0.0; var accd = 0.0;
+    for (var c0 = 0u; c0 < s; c0 = c0 + 2048u) {
+        let clen = min(2048u, s - c0);
+        for (var i = t; i < clen; i = i + 128u) {
+            var dot = 0.0; let kb = (c0 + i) * nkv * dh + kvbase;
+            for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
+            sc[i] = dot * scale;
+        }
+        workgroupBarrier();
+        var cm = -3.0e38;
+        for (var i = t; i < clen; i = i + 128u) { cm = max(cm, sc[i]); }
+        red[t] = cm; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
+        let m_new = max(m_run, red[0]); let corr = exp(m_run - m_new); workgroupBarrier();
+        var cs = 0.0;
+        for (var i = t; i < clen; i = i + 128u) { let e = exp(sc[i] - m_new); sc[i] = e; cs = cs + e; }
+        red[t] = cs; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
+        l_run = l_run * corr + red[0];
+        if (t < dh) {
+            var a = 0.0;
+            for (var i = 0u; i < clen; i = i + 1u) { a = a + sc[i] * v[(c0 + i) * nkv * dh + kvbase + t]; }
+            accd = accd * corr + a;
+        }
+        m_run = m_new;
+        workgroupBarrier();
     }
-    workgroupBarrier();
-    // phase 2: softmax over sc[0..s] — parallel max, then parallel sum of exp
-    var m = -3.0e38;
-    for (var i = t; i < s; i = i + 128u) { m = max(m, sc[i]); }
-    red[t] = m; workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
-    let mx = red[0]; workgroupBarrier();
-    var ssum = 0.0;
-    for (var i = t; i < s; i = i + 128u) { let e = exp(sc[i] - mx); sc[i] = e; ssum = ssum + e; }
-    red[t] = ssum; workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
-    let denom = red[0]; workgroupBarrier();
-    // phase 3: out[d] = (Σ_i prob[i]·v[i,d]) / denom  — each thread owns output dim d
-    if (t < dh) {
-        var acc = 0.0;
-        for (var i = 0u; i < s; i = i + 1u) { acc = acc + sc[i] * v[i * nkv * dh + kvbase + t]; }
-        out[head * dh + t] = acc / denom;
-    }
+    if (t < dh) { out[head * dh + t] = accd / l_run; }
 }
 "#;
 

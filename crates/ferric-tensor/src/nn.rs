@@ -40,10 +40,9 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv
 /// Composed from general ops — the KV-cache decode path, no bespoke kernel.
 pub fn decode_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
     let dh = q.shape[1] / n_heads;
-    let s = k.shape[0];
-    // Fused single-pass kernel for the common decode case (short/medium context); it collapses the
-    // ~12-dispatch composed path into one workgroup-per-head kernel. Falls back past its limits.
-    if dh <= 128 && s <= 2048 {
+    // Fused single-pass kernel collapses the ~12-dispatch composed path into one
+    // workgroup-per-head kernel; keys stream in chunks with online softmax, so any cache length works.
+    if dh <= 128 {
         return q.fused_decode_attention(k, v, n_heads, n_kv_heads, dh);
     }
     decode_attention_composed(q, k, v, n_heads, n_kv_heads)
