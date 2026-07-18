@@ -345,12 +345,12 @@ impl Tensor {
     /// **Flash-attention prefill** (causal, GQA) — one workgroup per (query, head) runs three shared-
     /// memory phases (scores over keys ≤ query → softmax → weighted-V), so it **never materializes the
     /// [nh, T, T] scores matrix** the composed `causal_attention` does (268 MB at T=2048). O(T) memory
-    /// instead of O(T²). `self`=q [T, nh·dh], k/v [T, nkv·dh]. Requires T ≤ 2048 (scores in shared).
-    /// Same math as `causal_attention`.
+    /// instead of O(T²). `self`=q [T, nh·dh], k/v [T, nkv·dh]. Any T (keys are streamed in 2048-key
+    /// chunks with online softmax); T ≤ 65535 for the dispatch grid. Same math as `causal_attention`.
     pub fn flash_attention_prefill(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize) -> Tensor {
         let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
         let t = q.shape[0];
-        assert!(dh <= 128 && t <= 2048, "flash prefill: head_dim ≤ 128, T ≤ 2048");
+        assert!(dh <= 128 && t <= 65535, "flash prefill: head_dim ≤ 128, T ≤ 65535");
         let out = empty(&self.ctx, t * nh * dh);
         let scale = 1.0 / (dh as f32).sqrt();
         run(&self.ctx, FLASH_ATTN_PREFILL_WGSL, "flash_prefill",
@@ -1112,7 +1112,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-// Flash prefill: grid (nh, T). Workgroup (head=wg.x, query=wg.y) attends over causal keys 0..=query.
+// Flash prefill: grid (nh, T). Workgroup (head=wg.x, query=wg.y) attends over causal keys 0..=query,
+// processed in chunks of 2048 with **online softmax** (running max m_run, sum l_run, per-thread output
+// accumulator accd), so any context length works with O(dh) state — never a [T,T] scores matrix, and
+// no 2048 cap. m_run/l_run stay identical across threads (both derive from shared reductions).
 const FLASH_ATTN_PREFILL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        q:   array<f32>;   // [T, nh·dh]
 @group(0) @binding(1) var<storage,read>        k:   array<f32>;   // [T, nkv·dh]
@@ -1133,27 +1136,34 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let qbase = qi * nh * dh + head * dh; let kvbase = kvh * dh;
     if (t < dh) { qs[t] = q[qbase + t]; }
     workgroupBarrier();
-    for (var i = t; i < s; i = i + 128u) {
-        var dot = 0.0; let kb = i * nkv * dh + kvbase;
-        for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
-        sc[i] = dot * scale;
+    var m_run = -3.0e38; var l_run = 0.0; var accd = 0.0;   // running online-softmax state
+    for (var c0 = 0u; c0 < s; c0 = c0 + 2048u) {
+        let clen = min(2048u, s - c0);
+        for (var i = t; i < clen; i = i + 128u) {
+            var dot = 0.0; let kb = (c0 + i) * nkv * dh + kvbase;
+            for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
+            sc[i] = dot * scale;
+        }
+        workgroupBarrier();
+        var cm = -3.0e38;
+        for (var i = t; i < clen; i = i + 128u) { cm = max(cm, sc[i]); }
+        red[t] = cm; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
+        let m_new = max(m_run, red[0]); let corr = exp(m_run - m_new); workgroupBarrier();
+        var cs = 0.0;
+        for (var i = t; i < clen; i = i + 128u) { let e = exp(sc[i] - m_new); sc[i] = e; cs = cs + e; }
+        red[t] = cs; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
+        l_run = l_run * corr + red[0];
+        if (t < dh) {
+            var a = 0.0;
+            for (var i = 0u; i < clen; i = i + 1u) { a = a + sc[i] * v[(c0 + i) * nkv * dh + kvbase + t]; }
+            accd = accd * corr + a;
+        }
+        m_run = m_new;
+        workgroupBarrier();
     }
-    workgroupBarrier();
-    var m = -3.0e38;
-    for (var i = t; i < s; i = i + 128u) { m = max(m, sc[i]); }
-    red[t] = m; workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
-    let mx = red[0]; workgroupBarrier();
-    var ssum = 0.0;
-    for (var i = t; i < s; i = i + 128u) { let e = exp(sc[i] - mx); sc[i] = e; ssum = ssum + e; }
-    red[t] = ssum; workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
-    let denom = red[0]; workgroupBarrier();
-    if (t < dh) {
-        var acc = 0.0;
-        for (var i = 0u; i < s; i = i + 1u) { acc = acc + sc[i] * v[i * nkv * dh + kvbase + t]; }
-        out[qbase + t] = acc / denom;
-    }
+    if (t < dh) { out[qbase + t] = accd / l_run; }
 }
 "#;
 

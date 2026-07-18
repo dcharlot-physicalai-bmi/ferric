@@ -293,10 +293,14 @@ impl Qwen35 {
             Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&k, 0), pv.cat(&v, 0)),
             _ => (k, v),
         };
+        let s = kc.shape[0];
         let o = if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv)
+        } else if t == s && s <= 65535 && hd <= 128 {
+            // Prefill: q and the history are the same span. Flash streams keys in chunks with
+            // online softmax — O(hd) memory, any T, same math as the composed causal path.
+            q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
-            // Prefill: q and the history are the same span, so the causal mask applies as usual.
             nn::causal_attention(&q, &kc, &vc, nh, nkv)
         };
         *cache = Some(LayerCache::Attn { k: kc, v: vc });

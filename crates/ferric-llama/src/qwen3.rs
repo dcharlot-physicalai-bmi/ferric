@@ -212,7 +212,7 @@ impl Qwen3 {
         let s = kc.shape[0];
         let o = if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv)
-        } else if t == s && s <= 2048 && hd <= 128 {
+        } else if t == s && s <= 65535 && hd <= 128 {
             q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
             nn::causal_attention(&q, &kc, &vc, nh, nkv)
