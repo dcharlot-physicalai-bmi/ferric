@@ -97,8 +97,19 @@ codegen bug (coop pointer index not cached) is worked around by let-binding the 
 differs by vendor — Metal computes exact f32, NVIDIA computes f32-coop as **TF32** (~1e-2, like
 PyTorch's default) — which, along with fp-order, is why coop stays a fast-path, not the bit-identical
 cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 + larger register
-tiles, and the quant-matmul prefill path on NVIDIA (Metal already ships; blocked on a diagnosed
-wgpu coop-load barrier gap).
+tiles.
+
+**Quant-coop is dequant-bound on NVIDIA — correctly Metal-only.** The dequant-tile→coop Q2_0 prefill
+path was measured on an RTX 4050 (Vulkan) across M = 64…2048: **correct** (rel|Δ| = 0.0 vs the scalar
+kernel — the earlier column-major coop-load garbage was fixed by transposing in the dequant so the
+load is row-major) but **exactly 1.0× at every M**. Both the coop path and the scalar split-K path
+plateau at ~1.2 TFLOP/s because reading and unpacking 2-bit weights into shared is the ceiling; the
+tensor cores (9.4 TFLOP/s on f32-coop here) sit idle waiting on dequant, and no M amortizes that away
+since dequant cost scales with the weight, not with M. So the win Metal sees (1.6–3.3× on real models,
+where its scalar quant path is the slower baseline) is not available on NVIDIA, and the `coop_shared_ok`
+Metal-only gate is a correct engineering decision, not a stopgap around a bug. The only route to
+tensor-core prefill on NVIDIA is a one-time dequant to f16 in VRAM (8× the Q2_0 footprint) feeding the
+f32/f16 coop GEMM — a prefill-throughput-vs-memory trade, not a drop-in.
 
 **Unbounded exact attention (both paths default).** Both hot-path attention kernels stream their
 keys in 2048-key chunks with an **online softmax** (running max/sum + a per-thread output accumulator),

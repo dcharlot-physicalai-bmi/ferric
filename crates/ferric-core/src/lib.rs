@@ -55,17 +55,17 @@ impl Context {
     /// codegen bug that used to block Vulkan is worked around by let-binding the coop pointer indices.
     pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix }
 
-    /// Whether cooperative-matrix **load-from-workgroup-memory** works here. The quant-coop kernels
-    /// dequantize a weight tile into shared memory and `coopLoad` it. **Measured** on an RTX 4050
-    /// (Vulkan): it *runs* — and fast (3× over scalar) — but returns **garbage** (rel|Δ| = 1.0). So
-    /// **Root-caused (5 measured hypotheses, all on an RTX 4050):** on NVIDIA a `coopLoad` reads a
-    /// buffer *written earlier by a GPU dispatch* as **stale/zero** (rel|Δ| = 1.0, coop result ≈ 0·x).
-    /// It is NOT workgroup-specific (a global scratch tile fails too), NOT write-then-read-in-one-kernel
-    /// (a two-pass separate-dispatch also fails), NOT column-major (row-major two-pass also fails). The
-    /// f32 GEMM works only because its operands are CPU-uploaded (`buffer_init`), never dispatch-written.
-    /// So it's a **wgpu/naga memory-barrier gap for `OpCooperativeMatrixLoadKHR`** — the coop read isn't
-    /// tracked, so no barrier is inserted before it on NVIDIA. A real fix needs the wgpu resource tracker
-    /// / SPIR-V, not another kernel shape. Metal (MSL) is coherent + correct today.
+    /// Whether the dequant-tile→`coopLoad` quant-coop prefill path is worth taking here. The kernels
+    /// dequantize a weight tile into shared memory and `coopLoad` it onto the matrix unit.
+    /// **Measured on an RTX 4050 (Vulkan), M = 64…2048:** it is now **correct** (rel|Δ| = 0.0 vs the
+    /// scalar kernel — the old column-major coop-load garbage was fixed by transposing in the dequant so
+    /// the load is row-major) but **exactly 1.0× at every M**. Both the coop path and the scalar split-K
+    /// path plateau at ~1.2 TFLOP/s: reading + unpacking the 2-bit weights into shared is the ceiling, so
+    /// the tensor cores (9.4 TFLOP/s on f32-coop here) sit idle waiting on dequant, and no M amortizes it
+    /// (dequant scales with the weight, not with M). So on NVIDIA there is simply **no win to gate in** —
+    /// this is Metal-only because Metal's scalar quant path is the slower baseline coop beats (1.6–3.3× on
+    /// real models), not because NVIDIA is broken. The only tensor-core-prefill route on NVIDIA is a
+    /// one-time dequant to f16 in VRAM (8× footprint) feeding the f32/f16 coop GEMM — a separate trade.
     /// `FERRIC_COOP_SHARED_FORCE` overrides the gate for debugging.
     pub fn coop_shared_ok(&self) -> bool {
         self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_SHARED_FORCE").is_ok())
