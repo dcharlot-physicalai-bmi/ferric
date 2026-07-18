@@ -58,13 +58,15 @@ impl Context {
     /// Whether cooperative-matrix **load-from-workgroup-memory** works here. The quant-coop kernels
     /// dequantize a weight tile into shared memory and `coopLoad` it. **Measured** on an RTX 4050
     /// (Vulkan): it *runs* — and fast (3× over scalar) — but returns **garbage** (rel|Δ| = 1.0). So
-    /// on NVIDIA a coop-load of a buffer that was **written earlier in the same kernel** returns
-    /// garbage — tested both a workgroup `bs` tile AND a global scratch tile, both fail (rel|Δ| = 1.0);
-    /// the f32 GEMM is fine only because its operands are *pre-written* (loaded, never written-then-read
-    /// in one dispatch). So the real cross-vendor fix is **two-pass**: dispatch 1 dequantizes the whole
-    /// weight to a global f32 buffer, dispatch 2 runs the plain f32 coop GEMM on it (reads a pre-written
-    /// buffer, works on both — costs 8× transient f32). Or fix the naga SPIR-V coherence. Metal (MSL) is
-    /// correct today. `FERRIC_COOP_SHARED_FORCE` overrides the gate for debugging.
+    /// **Root-caused (5 measured hypotheses, all on an RTX 4050):** on NVIDIA a `coopLoad` reads a
+    /// buffer *written earlier by a GPU dispatch* as **stale/zero** (rel|Δ| = 1.0, coop result ≈ 0·x).
+    /// It is NOT workgroup-specific (a global scratch tile fails too), NOT write-then-read-in-one-kernel
+    /// (a two-pass separate-dispatch also fails), NOT column-major (row-major two-pass also fails). The
+    /// f32 GEMM works only because its operands are CPU-uploaded (`buffer_init`), never dispatch-written.
+    /// So it's a **wgpu/naga memory-barrier gap for `OpCooperativeMatrixLoadKHR`** — the coop read isn't
+    /// tracked, so no barrier is inserted before it on NVIDIA. A real fix needs the wgpu resource tracker
+    /// / SPIR-V, not another kernel shape. Metal (MSL) is coherent + correct today.
+    /// `FERRIC_COOP_SHARED_FORCE` overrides the gate for debugging.
     pub fn coop_shared_ok(&self) -> bool {
         self.coop_matrix && (matches!(self.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_SHARED_FORCE").is_ok())
     }

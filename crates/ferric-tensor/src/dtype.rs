@@ -986,10 +986,10 @@ impl Tensor {
         assert!(w.rows % 8 == 0, "matmul_q2_0_coop needs N (out) a multiple of 8");
         // Pad the token dimension up to a multiple of 8 (the coop tile), compute, then slice back —
         // so any prompt length works. The pad rows are wasted tiles, cheap at prefill.
-        // Metal: the single-pass shared-tile kernel (fast, correct). Non-Metal (NVIDIA): the two-pass
-        // dequant-to-global path, since coop-load of a same-kernel-written tile returns garbage there.
-        // FERRIC_COOP_2PASS forces two-pass anywhere (to validate it on Metal).
-        if !matches!(self.ctx.backend, wgpu::Backend::Metal) || std::env::var("FERRIC_COOP_2PASS").is_ok() {
+        // `FERRIC_COOP_2PASS` selects the two-pass (dequant→f32, then row-major coop GEMM) alternative;
+        // correct + fast on Metal, but it does NOT fix NVIDIA (see coop_shared_ok — the NVIDIA coop
+        // load reads a GPU-written buffer as stale, a wgpu/naga barrier gap no kernel shape works around).
+        if std::env::var("FERRIC_COOP_2PASS").is_ok() {
             return self.matmul_q2_0_coop2pass(w);
         }
         let mrows = rows.div_ceil(8) * 8;
