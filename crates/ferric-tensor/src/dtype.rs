@@ -564,6 +564,16 @@ impl Tensor {
         }
         acc.unwrap()
     }
+    /// Fused FFN gate/up + SwiGLU when the gate_up weight is a single Q4_K shard (the common case
+    /// for Q4_K_M models). Returns `Some(silu(gate)·up)` — `[t, cols/2]` — computed in one kernel with
+    /// no `[t, 2·n_ff]` intermediate; `None` when the weight isn't a lone Q4_K shard (caller falls
+    /// back to `matmul_q(w).swiglu(n_ff)`).
+    pub fn try_matmul_swiglu(&self, w: &QMatrix) -> Option<Tensor> {
+        if w.shards.len() == 1 {
+            if let QShard::Q4_K(sh) = &w.shards[0] { return Some(self.matmul_q4_k_swiglu(sh)); }
+        }
+        None
+    }
     fn matmul_qshard(&self, w: &QShard) -> Tensor {
         match w {
             QShard::Q2_0(w) => self.matmul_q2_0(w),
@@ -1018,19 +1028,59 @@ impl Tensor {
         run(&self.ctx, DEQ_Q2_0_T_WGSL, "deq_q2_0_t", &[w.codes.as_ref(), w.scales.as_ref(), &wf,
             &u32buf(&self.ctx, &[(n * k) as u32, k as u32, (k / 128) as u32, n as u32, rs])], grid);
         let wf_t = Tensor::from_parts(&self.ctx, wf, vec![k, n]);
-        // dispatch 2: the proven row-major f32 coop GEMM on the pre-written weight. NOTE: correct on
-        // Metal; on NVIDIA the coopLoad reads this dispatch-written weight as stale/zero even with the
-        // WRITE→READ barrier (same/separate submit both fail) — a coop-load memory-visibility gap that
-        // a normal shader-read barrier doesn't cover. Tracked separately; coop2pass stays Metal-useful.
+        // dispatch 2: the exact-f32 8×8 coop GEMM. **Metal-only** — on NVIDIA the 8×8-f32 coop shape is
+        // not an enumerated config so it runs as zeros (see coop_gemm_ok / matmul_coop16). For NVIDIA
+        // tensor-core Q2_0 prefill use `matmul_q2_0_coop16` instead (f16 inputs, the supported config).
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let full = xp.matmul_coop(&wf_t);
         if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
     }
 
+    /// **NVIDIA tensor-core Q2_0 prefill**: dequant the packed weight to f32 `[K,N]` (transposed, so
+    /// the row-major coop load computes x·Wᵀ), then `matmul_coop16` (f16 inputs, f32 accumulate) on the
+    /// tensor cores. The dequant is O(weight) and the matmul O(M·weight), so it amortizes with M — the
+    /// prefill win the 8×8-f32 path couldn't deliver on NVIDIA. Mixed precision ⇒ opt-in fast path.
+    pub fn matmul_q2_0_coop16(&self, w: &Q2_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 16 == 0 && inn % 16 == 0, "coop16 needs N,K multiples of 16");
+        let (n, k) = (w.rows, inn);
+        let wf = empty(&self.ctx, k * n);
+        let (grid, rs) = groups2d(n * k);
+        run(&self.ctx, DEQ_Q2_0_T_WGSL, "deq_q2_0_t", &[w.codes.as_ref(), w.scales.as_ref(), &wf,
+            &u32buf(&self.ctx, &[(n * k) as u32, k as u32, (k / 128) as u32, n as u32, rs])], grid);
+        let wf_t = Tensor::from_parts(&self.ctx, wf, vec![k, n]);
+        let mrows = rows.div_ceil(32) * 32; // pad to 32 so the 2×2 register-blocked coop16 path applies
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let full = xp.matmul_coop16(&wf_t);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+
     /// Cooperative-matrix Q4_K prefill matmul — dequant an 8×8 Q4_K tile (super-block scale/min +
     /// nibble) into shared memory, then feed the matrix unit. Brings tensor-core prompt processing to
     /// the *default* llama.cpp format. Same coop tiling as Q2_0; only the dequant differs.
+    /// **Fused FFN gate/up + SwiGLU** for a Q4_K gate_up weight `[2·n_ff, in]`: each thread computes
+    /// both the gate row `o` and the up row `o+n_ff` (dequant inline) and writes `silu(gate)·up`
+    /// directly — the `[t, 2·n_ff]` intermediate is never materialized and the separate SwiGLU
+    /// dispatch is gone. Output `[t, n_ff]`, bit-identical to `matmul_q4_k(w).swiglu(n_ff)`.
+    pub fn matmul_q4_k_swiglu(&self, w: &Q4_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
+        let n_ff = w.rows / 2;
+        let out = empty(&self.ctx, rows * n_ff);
+        let n = rows * n_ff;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q4_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q4_k_swiglu",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, n_ff])
+    }
     pub fn matmul_q4_k_coop(&self, w: &Q4_KWeights) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
@@ -1542,6 +1592,49 @@ __INNER__
         for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
         if (t == 0u) { out[idx] = partial[0]; }
     }
+}
+"#;
+
+// Fused FFN: gate/up projection + SwiGLU in one kernel. Each thread computes the gate row (o) and
+// the up row (o+n_ff) via the same Q4_K dequant-dot, then writes silu(gate)·up — no 2·n_ff
+// intermediate, no separate SwiGLU dispatch. info.y = n_ff (the output width); the weight has 2·n_ff rows.
+const MATMUL_Q4_K_SWIGLU_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
+__HELPERS__
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    if (idx >= rows * n_ff) { return; }
+    let o = idx % n_ff; let r = idx / n_ff;
+    let nblk = in_dim / 256u;
+    let g = qk_dot(o, r, nblk, in_dim);         // gate row
+    let u = qk_dot(o + n_ff, r, nblk, in_dim);  // up row
+    out[idx] = (g / (1.0 + exp(-g))) * u;       // silu(g)·u
 }
 "#;
 
