@@ -45,7 +45,8 @@ FLOPS:
    and self-reliant (vendored + forked deps, offline builds).
 5. **Runs standard quantized GGUFs end-to-end, weights never expanded to f32.** The full common
    spectrum dequants *inside* the matmul kernel — PrismML **Q2_0** ternary, llama.cpp **Q4_0**,
-   **Q4_K**, **Q5_K**, **Q6_K**, **Q8_0** (2-bit through 8-bit) — each validated exact vs a
+   **Q4_1**, **Q5_0**, **Q5_1**, **Q4_K**, **Q5_K**, **Q6_K**, **Q8_0** (2-bit through 8-bit, symmetric
+   *and* affine, the **complete non-K family** *and* the k-quants) — each validated exact vs a
    dequantize-then-f32 reference and, at a 4096 GEMV, **1.8–1.9× faster + ~7× lighter** than that
    path. A `QMatrix` unifies them behind one `matmul_q`,
    and the Qwen3 loader is format-agnostic, so **a genuine `Q4_K_M` model off Hugging Face runs on
@@ -63,8 +64,14 @@ FLOPS:
    the browser from one source. **Llama runs too**: `Llama-3.2-1B-Instruct-Q6_K` (arch `llama`)
    generates *"The capital of France is Paris, the city…"* once two Llama-isms are handled — the
    `rope_freqs` per-frequency RoPE scaling and, the load-bearing one, prepending **BOS** (Llama
-   collapses without it; Qwen sets `add_bos_token=false` so nothing changes there). (The older
-   non-K formats Q5_0/Q4_1 and the tiktoken pre-tokenizer edge cases are the next reach.)
+   collapses without it; Qwen sets `add_bos_token=false` so nothing changes there). **The older non-K
+   formats now run too:** `Q4_1` (affine `nibble·d + m`) and `Q5_0` (symmetric 5-bit, the 5th bit
+   reassembled from a per-block `qh` inside the kernel) each dequant in-matmul, validated exact vs the
+   dequantize-then-f32 reference (max|Δ|/scale ≤ 3e-6) and faster than that path at a decode GEMV
+   (Q4_1 4.5×, Q5_0 2.3× on M5 Max) — `examples/q4_1.rs`, `examples/q5_0.rs`. **`Q5_1` completes the
+   set** (affine 5-bit = Q5_0's `qh` + Q4_1's `min`; exact ≤2.3e-6, `examples/q5_1.rs`), so the
+   **entire non-K family — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 — now runs packed**, and the format-agnostic
+   loader picks them all up automatically. (The tiktoken pre-tokenizer edge cases are the remaining reach.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
@@ -87,40 +94,34 @@ both vendors:
 | | naive | WGSL tiled | **coop_mat** |
 |---|---|---|---|
 | Apple M5 Max, Metal (exact f32) | ~700 GFLOP/s | ~215 | **~4300 (6×), bit-identical (0.0e0)** |
-| NVIDIA RTX 4050, Vulkan (TF32) | ~293 GFLOP/s | — | **9400 @2048³ (32×), Δ~6e-3** |
+| NVIDIA RTX 4050, Vulkan | ~293 GFLOP/s | — | **compiles but emits zeros — gated off (see below)** |
 
-The M5 is the first Apple GPU with real in-GPU matrix hardware; the 4050 exposes NVIDIA tensor cores
-via `KHR_cooperative_matrix`. This **corrects the earlier "portable WGSL can't reach tensor cores"
-claim** — it reaches simdgroup_matrix AND NVIDIA tensor cores today, through our naga fork
-(`EXPERIMENTAL_COOPERATIVE_MATRIX`, `unsafe ExperimentalFeatures::enabled()` token). A naga SPIR-V
-codegen bug (coop pointer index not cached) is worked around by let-binding the indices. Precision
-differs by vendor — Metal computes exact f32, NVIDIA computes f32-coop as **TF32** (~1e-2, like
-PyTorch's default) — which, along with fp-order, is why coop stays a fast-path, not the bit-identical
-cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 + larger register
-tiles.
+The M5 is the first Apple GPU with real in-GPU matrix hardware, and coop_mat reaches its
+simdgroup_matrix through our naga fork (`EXPERIMENTAL_COOPERATIVE_MATRIX`, `unsafe
+ExperimentalFeatures::enabled()`). **Metal coop is verified correct with constant operands** — a=0.01,
+b=0.02 ⇒ every output = K·2e-4, relΔ ~1e-5 across M=8…2048, square and non-square (`examples/coop_shape`).
+Because it's exact f32 it *could* even be a bit-identical path, but fp-order across vendors keeps it a
+fast-path, not the cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 +
+larger register tiles.
 
-**The f32 coop GEMM now runs on NVIDIA (was silently Metal-only).** The register-blocked coop kernel
-(`COOP_GEMM_RB_WGSL`) indexed its `coopLoad`/`coopStore` pointers with inline compound expressions
-(`&c[r0*nn+c0]`). The forked naga SPIR-V backend panics on that (`write_bounds_check` → "Expression is
-not cached" under the Unchecked policy), so the kernel never compiled on Vulkan — MSL is unaffected,
-which is why it read as Metal-only. Let-binding every coop pointer index (the same fix `COOP_GEMM_WGSL`
-already had) makes it compile: **RTX 4050 now hits 21.7 TFLOP/s at 2048³ (74× naive, TF32)**, Metal
-stays exact-f32 (max|Δ| = 0.0, fingerprint unchanged). So the earlier "9.4 TFLOP/s NVIDIA" was Metal-
-confused; the real NVIDIA number is higher, and the path was compile-broken, not slow.
+**NVIDIA cooperative matrix does NOT work yet — it compiles but computes zeros.** Correcting an earlier
+overclaim in this doc (the "9400 @2048³, 32×" and a later "21.7 TFLOP/s, 74×"): both were **zero-output
+false passes**. Two distinct naga-fork bugs stack on Vulkan:
+1. *Compile panic* — the RB kernel indexed its coop pointers with inline compound expressions
+   (`&c[r0*nn+c0]`); the SPIR-V backend panics there (`write_bounds_check` → "Expression is not cached").
+   Let-binding every coop pointer index (the fix `COOP_GEMM_WGSL` already had) makes it **compile**.
+2. *Zero output* — once compiling, every `coopLoad`/`coopMultiplyAdd`/`coopStore` chain returns **all
+   zeros** on the RTX 4050, for **both** the RB and plain 8×8 kernels, at **every** shape, even with
+   CPU-uploaded operands (so it is NOT the dispatch-write-visibility story a first pass suggested — it
+   is the coop ops themselves). A real, unfixed naga SPIR-V codegen bug for `KHR_cooperative_matrix`.
 
-**Two quant-coop routes, two different NVIDIA verdicts.**
-- *Shared-coop* (dequant an 8×8 tile into workgroup memory in-kernel, then `coopLoad` it): **correct**
-  on NVIDIA (rel|Δ| = 0.0) but **1.0× at every M** — both it and the scalar split-K path plateau at
-  ~1.2 TFLOP/s because unpacking 2-bit weights is the ceiling and the tensor cores idle waiting on
-  dequant. No win to gate in; `coop_shared_ok` Metal-only is correct on the merits (Metal wins only
-  because its scalar quant path is the slower baseline, 1.6–3.3× on real models).
-- *Two-pass* (dequant → f32 `[K,N]` in one dispatch, then the fast RB coop GEMM): now **compiles** and
-  is **fast** — 12× at M = 512, **32× at M = 2048** over scalar — but returns **garbage** (rel|Δ| = 1.0):
-  the RB `coopLoad` reads the dispatch-written weight as stale/zero, and a WRITE→READ barrier (same
-  *or* separate submit) does not fix it. This is a **coop-load memory-visibility gap** distinct from the
-  compile panic: CPU-uploaded operands (coop_gemm) are fine, GPU-written ones are not. If closed (likely
-  a Vulkan-memory-model `MakePointerVisible`/`NonPrivate` operand on `OpCooperativeMatrixLoadKHR`, which
-  the fork currently omits), two-pass is the real tensor-core-prefill win on NVIDIA — 12–32× at prefill M.
+The reason this survived so long: `coop_gemm.rs` validated coop vs naive with sin inputs that cancel to
+~1e-2 under an *absolute* 6e-2 threshold, so an all-zero result "passed". The check is now **relative**
+(a zero result scores relΔ≈1.0 and fails), and `coop_gemm_ok()` is **gated to Metal** so no caller can
+pick up the broken NVIDIA path. **This does not touch cross-fabric model parity** — the real 1.7B runs
+the scalar quant matmul on every fabric, never coop, so the NVIDIA/Vulkan fingerprint (Σ −395780.119,
+argmax 12095) stands. Tensor-core prefill on NVIDIA (the two-pass dequant→f32→coop route measured at a
+would-be 12–32×) is real *throughput* but blocked on bug #2; it lands only once the coop ops compute.
 
 **Unbounded exact attention (both paths default).** Both hot-path attention kernels stream their
 keys in 2048-key chunks with an **online softmax** (running max/sum + a per-thread output accumulator),

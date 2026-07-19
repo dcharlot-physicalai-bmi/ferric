@@ -49,11 +49,20 @@ impl Tensor {
 }
 
 impl Context {
-    /// Whether the cooperative-matrix GEMM path runs here. Works on **both** Metal (MSL →
-    /// simdgroup_matrix, exact f32) and Vulkan (SPIR-V → KHR_cooperative_matrix → NVIDIA tensor cores,
-    /// which compute f32 as **TF32**, ~1e-2 accuracy — like PyTorch's default). The naga SPIR-V
-    /// codegen bug that used to block Vulkan is worked around by let-binding the coop pointer indices.
-    pub fn coop_gemm_ok(&self) -> bool { self.coop_matrix }
+    /// Whether the cooperative-matrix GEMM path produces **correct** results here. Metal only.
+    /// Metal (MSL → simdgroup_matrix) is exact f32 — verified with constant operands (a=0.01, b=0.02,
+    /// every output = K·2e-4, relΔ ~1e-5 across M=8…2048, square and non-square). On Vulkan the kernel
+    /// now *compiles* (after let-binding the coop pointer indices to dodge the naga "Expression is not
+    /// cached" panic) but every `coopLoad`/`coopMultiplyAdd`/`coopStore` chain returns **all zeros** on
+    /// the RTX 4050 — both the RB and plain 8×8 kernels, at every shape. A separate, unfixed naga
+    /// SPIR-V codegen bug for KHR_cooperative_matrix, distinct from the compile panic. The old
+    /// "9.4/21.7 TFLOP/s on NVIDIA" numbers were zero-output false passes: coop_gemm.rs validated coop
+    /// vs naive with sin inputs that cancel to ~1e-2 under a 6e-2 threshold, so an all-zero result
+    /// "passed". Gated off on Vulkan until the coop ops actually compute. (The cross-fabric MODEL parity
+    /// is unaffected — it runs the scalar quant matmul, never coop.)
+    pub fn coop_gemm_ok(&self) -> bool {
+        self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal)
+    }
 
     /// Whether the dequant-tile→`coopLoad` quant-coop prefill path is worth taking here. The kernels
     /// dequantize a weight tile into shared memory and `coopLoad` it onto the matrix unit.
