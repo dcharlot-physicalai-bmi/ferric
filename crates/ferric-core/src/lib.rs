@@ -35,6 +35,10 @@ pub struct Context {
     /// M5's matrix hardware and NVIDIA tensor cores. Kernels using it are feature-gated + fp-order
     /// dependent, so like subgroups they stay off the bit-identical cross-fabric default path.
     pub coop_matrix: bool,
+    /// Whether `SHADER_F16` is enabled — `enable f16;` + `array<f16>` in WGSL. Required for the NVIDIA
+    /// tensor-core coop path: the RTX 4050 (and Intel) enumerate only f16-input cooperative-matrix
+    /// configs (A/B = f16, C = f32), never f32×f32, so mixed-precision coop needs native f16 storage.
+    pub shader_f16: bool,
 }
 
 /// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
@@ -62,6 +66,15 @@ impl Context {
     /// is unaffected — it runs the scalar quant matmul, never coop.)
     pub fn coop_gemm_ok(&self) -> bool {
         self.coop_matrix && matches!(self.backend, wgpu::Backend::Metal)
+    }
+
+    /// Whether the **16×16 f16-input** cooperative-matrix path is usable (NVIDIA tensor cores / Intel
+    /// XMX). Those vendors enumerate only f16 A/B configs (A=B=f16, C=f32), never f32×f32, and at
+    /// 16×16 (NVIDIA) — so the Metal 8×8-f32 kernel matches no supported config there and runs as
+    /// zeros. This path converts A/B to f16 and uses `coop_mat16x16<f16>` with an f32 accumulator.
+    /// Vulkan-only (Metal keeps the exact-f32 8×8 path); needs both coop matrix and f16.
+    pub fn coop16_ok(&self) -> bool {
+        self.coop_matrix && self.shader_f16 && matches!(self.backend, wgpu::Backend::Vulkan)
     }
 
     /// Whether the dequant-tile→`coopLoad` quant-coop prefill path is worth taking here. The kernels
@@ -98,10 +111,12 @@ impl Context {
         let af = adapter.features();
         let subgroups = af.contains(wgpu::Features::SUBGROUP);
         let coop_matrix = af.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        let shader_f16 = af.contains(wgpu::Features::SHADER_F16);
         let max_binding = adapter.limits().max_storage_buffer_binding_size as u64;
         let mut want = wgpu::Features::empty();
         if subgroups { want |= wgpu::Features::SUBGROUP; }
         if coop_matrix { want |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX; }
+        if shader_f16 { want |= wgpu::Features::SHADER_F16; }
         // wgpu gates EXPERIMENTAL_* features behind an explicit acknowledgment token (WIP APIs that
         // may have UB). We opt in only when the adapter advertises cooperative matrix.
         let experimental = if coop_matrix {
@@ -122,7 +137,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix, shader_f16 })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -155,7 +170,7 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix: false })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix: false, shader_f16: false })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {

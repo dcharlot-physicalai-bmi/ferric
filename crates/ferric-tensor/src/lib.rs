@@ -29,7 +29,7 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub use autograd::Var;
-pub use dtype::{DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
+pub use dtype::{DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
@@ -78,6 +78,13 @@ impl Tensor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
         Tensor { ctx: ctx.clone(), buf: Arc::new(buf), shape: shape.to_vec(), strides: contig_strides(shape), offset: 0 }
+    }
+
+    /// A contiguous [shape] view over a shared GPU buffer (offset 0). The buffer may be **larger**
+    /// than `numel(shape)` — e.g. a preallocated KV cache; the kernel reads only the first
+    /// `numel(shape)` elements. This is what lets the cache grow-in-place without re-copying.
+    pub fn from_arc(ctx: &Arc<Context>, buf: Arc<wgpu::Buffer>, shape: &[usize]) -> Tensor {
+        Tensor { ctx: ctx.clone(), buf, shape: shape.to_vec(), strides: contig_strides(shape), offset: 0 }
     }
     pub fn zeros(ctx: &Arc<Context>, shape: &[usize]) -> Tensor { Self::from_vec(ctx, &vec![0.0; numel(shape)], shape) }
     /// Wrap a freshly-computed contiguous device buffer as a tensor (crate-internal).
@@ -246,6 +253,25 @@ impl Tensor {
         let out = empty(&self.ctx, c.numel());
         run(&self.ctx, RMSNORM_WGSL, "rmsnorm", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
+    /// Fused residual-add + RMSNorm: returns `(sum, rmsnorm(sum)·weight)` where `sum = self + other`.
+    /// Every transformer layer boundary does exactly `xy = x + y; xy.rmsnorm(w)` and needs *both* the
+    /// sum (as the next residual) and its norm (as the next block's input) — so folding the add into
+    /// the norm kernel removes one dispatch per layer from the latency-bound decode chain, with output
+    /// **bit-identical** to `self.add(other).rmsnorm(w)` (same f32 ops, same order).
+    pub fn add_rmsnorm(&self, other: &Tensor, weight: &Tensor, eps: f32) -> (Tensor, Tensor) {
+        let a = self.contiguous();
+        let b = other.contiguous();
+        assert_eq!(a.shape, b.shape, "add_rmsnorm: shape mismatch {:?} vs {:?}", a.shape, b.shape);
+        let d = *a.shape.last().unwrap();
+        let rows = a.numel() / d;
+        let sumo = empty(&self.ctx, a.numel());
+        let normo = empty(&self.ctx, a.numel());
+        run(&self.ctx, ADD_RMSNORM_WGSL, "add_rmsnorm",
+            &[a.buf.as_ref(), b.buf.as_ref(), weight.contiguous().buf.as_ref(), &sumo, &normo,
+              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+        (Tensor::from_parts(&self.ctx, sumo, a.shape.clone()), Tensor::from_parts(&self.ctx, normo, a.shape.clone()))
     }
     /// L2 normalize over the last dim: `x / max(√Σx², eps)`. Distinct from RMSNorm — no mean, no
     /// learned weight, and eps clamps the divisor rather than being added under the root. This is
@@ -543,6 +569,65 @@ impl Tensor {
         let (grid, rs) = groups2d(m * n);
         run(&self.ctx, MATMUL_WGSL, "bmm", &[&a.buf, &b.buf, &out, &u32buf(&self.ctx, &[1, m as u32, ka as u32, n as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![m, n])
+    }
+}
+
+// A tiny copy kernel: dst[dst_off + i] = src[i]. Used to append K/V rows into a preallocated cache
+// buffer in place. Dispatched through `run()`, so it inherits batch ordering + buffer retention.
+const KV_WRITE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       src: array<f32>;
+@group(0) @binding(1) var<storage,read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform>            info: vec4<u32>;   // dst_off, n, grid_w, _
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info.z;
+    if (i < info.y) { dst[info.x + i] = src[i]; }
+}
+"#;
+fn write_rows(ctx: &Context, dst: &wgpu::Buffer, dst_off: usize, src: &Tensor) {
+    let src = src.contiguous();
+    let n = src.numel();
+    if n == 0 { return; }
+    let (grid, rs) = groups2d(n);
+    run(ctx, KV_WRITE_WGSL, "kv_write", &[&src.buf, dst, &unibuf(ctx, &[dst_off as u32, n as u32, rs, 0])], grid);
+}
+
+/// A **grow-in-place K/V cache buffer**. Instead of re-concatenating the whole history every decode
+/// step (`pk.cat(&k, 0)` — O(len) copy per step, O(T²) total), this preallocates and appends only the
+/// new rows into a capacity buffer that doubles when full — amortized O(1) rows copied per step, so a
+/// long generation is O(T) not O(T²). Attention reads a zero-copy [len, width] view of the buffer.
+/// The stored data is byte-identical to the concatenated tensor, so logits are unchanged.
+#[derive(Default)]
+pub struct KvBuf {
+    buf: Option<Arc<wgpu::Buffer>>,
+    len: usize,   // filled rows
+    cap: usize,   // capacity rows
+    width: usize, // row width in elements
+}
+impl KvBuf {
+    pub fn len(&self) -> usize { self.len }
+    /// Append `src` ([t, width]) rows in place, growing (doubling) if needed, and return a contiguous
+    /// [len, width] view over the cache buffer covering all rows so far.
+    pub fn append(&mut self, ctx: &Arc<Context>, src: &Tensor) -> Tensor {
+        assert_eq!(src.rank(), 2, "KvBuf::append expects a 2D [t, width] tensor");
+        let (t, width) = (src.shape[0], src.shape[1]);
+        if self.width == 0 { self.width = width; }
+        assert_eq!(width, self.width, "KvBuf width changed");
+        let need = self.len + t;
+        if self.cap < need {
+            let new_cap = need.max(self.cap * 2).max(64);
+            let nb = Arc::new(empty(ctx, new_cap * width));
+            if self.len > 0 {
+                // carry the existing rows into the bigger buffer (amortized — happens log(T) times)
+                let old = Tensor::from_arc(ctx, self.buf.clone().unwrap(), &[self.len, width]);
+                write_rows(ctx, &nb, 0, &old);
+            }
+            self.buf = Some(nb);
+            self.cap = new_cap;
+        }
+        write_rows(ctx, self.buf.as_ref().unwrap(), self.len * width, src);
+        self.len = need;
+        Tensor::from_arc(ctx, self.buf.clone().unwrap(), &[self.len, width])
     }
 }
 
@@ -868,6 +953,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = ms + v * v; }
     let inv = 1.0 / sqrt(ms / f32(d) + eps);
     for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv * weight[j]; }
+}
+"#;
+
+// Fused (a+b) then RMSNorm — one workgroup-thread per row, two outputs (the sum and its norm).
+const ADD_RMSNORM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        a: array<f32>;
+@group(0) @binding(1) var<storage,read>        b: array<f32>;
+@group(0) @binding(2) var<storage,read>        weight: array<f32>;
+@group(0) @binding(3) var<storage,read_write>  sumo:  array<f32>;   // a + b (the next residual)
+@group(0) @binding(4) var<storage,read_write>  normo: array<f32>;   // rmsnorm(a+b)·weight
+@group(0) @binding(5) var<storage,read>        info: array<u32>;    // rows, d, bitcast(eps)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    if (row >= rows) { return; }
+    let base = row * d;
+    var ms = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let s = a[base + j] + b[base + j]; sumo[base + j] = s; ms = ms + s * s; }
+    let inv = 1.0 / sqrt(ms / f32(d) + eps);
+    for (var j: u32 = 0u; j < d; j = j + 1u) { normo[base + j] = (a[base + j] + b[base + j]) * inv * weight[j]; }
 }
 "#;
 
@@ -1503,7 +1608,52 @@ impl Tensor {
         }
         Tensor::from_parts(&self.ctx, out, vec![m, n])
     }
+
+    /// **NVIDIA / Intel tensor-core GEMM** (`coop16_ok()` fabrics). Those vendors enumerate only
+    /// f16-input cooperative-matrix configs (A=B=f16, C=f32) at 16×16 — never the 8×8 f32 the Metal
+    /// path uses — so this converts A,B to f16 and accumulates in f32 on the matrix unit. Mixed
+    /// precision → NOT bit-identical (f16 rounding on the inputs), an opt-in fast path. C=A·B.
+    pub fn matmul_coop16(&self, other: &Tensor) -> Tensor {
+        let (m, k) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
+        let n = other.shape[other.rank() - 1];
+        assert!(m % 16 == 0 && k % 16 == 0 && n % 16 == 0, "matmul_coop16 needs M,K,N multiples of 16");
+        let ah = self.contiguous().to_half(dtype::DType::F16);
+        let bh = other.contiguous().to_half(dtype::DType::F16);
+        let out = empty(&self.ctx, m * n); // zeroed f32 accumulator
+        run(&self.ctx, COOP_GEMM16_WGSL, "coop_gemm16",
+            &[ah.buffer(), bh.buffer(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+            ((n / 16) as u32, (m / 16) as u32, 1));
+        Tensor::from_parts(&self.ctx, out, vec![m, n])
+    }
 }
+
+// 16×16 f16-input coop GEMM for NVIDIA tensor cores / Intel XMX: one workgroup (one subgroup, 32
+// lanes) owns a 16×16 output tile, streams K in steps of 16 loading f16 A/B tiles, accumulates in an
+// f32 coop matrix. This is the ONLY coop shape/type those vendors support (verified by querying
+// VkCooperativeMatrixPropertiesKHR: A=B=f16, C=f32, M=N=K=16); the 8×8-f32 kernel matches nothing
+// there and executes as zeros. Metal keeps the exact-f32 8×8 path.
+const COOP_GEMM16_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+@group(0) @binding(0) var<storage,read>       a: array<f16>;   // [M,K] row-major f16
+@group(0) @binding(1) var<storage,read>       b: array<f16>;   // [K,N] row-major f16
+@group(0) @binding(2) var<storage,read_write> c: array<f32>;   // [M,N] f32 (zeroed)
+@group(0) @binding(3) var<uniform>            dims: vec4<u32>; // M, K, N, _
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z;
+    let trow = wid.y * 16u; let tcol = wid.x * 16u;
+    let ci = trow * nn + tcol;                    // let-bind coop pointer indices (naga SPIR-V caching)
+    var acc = coopLoadT<coop_mat16x16<f32, C>>(&c[ci], nn);
+    for (var k: u32 = 0u; k < kk; k = k + 16u) {
+        let ai = trow * kk + k; let bi = k * nn + tcol;
+        let ma = coopLoadT<coop_mat16x16<f16, A>>(&a[ai], kk);
+        let mb = coopLoadT<coop_mat16x16<f16, B>>(&b[bi], nn);
+        acc = coopMultiplyAdd(ma, mb, acc);
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
 
 // Register-blocked coop GEMM: one workgroup owns a 16×16 output block = a 2×2 grid of 8×8 tiles, held
 // in 4 accumulators. **2×2 is the measured sweet spot on the M5**: a 4×4 grid (16 accumulators + 4+4
