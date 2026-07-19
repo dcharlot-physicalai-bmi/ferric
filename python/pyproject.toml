@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ferric"
+version = "0.1.0"
+description = "Ferric — a pure-Rust cross-fabric AI runtime, adoptable from Python. Deterministic, on-device or server-side, with schema-constrained structured output."
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["llm", "inference", "gguf", "structured-output", "guided-decoding", "openai", "rust"]
+
+[project.urls]
+Homepage = "https://physicalai-bmi.org"
+Repository = "https://github.com/dcharlot-physicalai-bmi/ferric"
