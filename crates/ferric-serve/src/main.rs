@@ -7,6 +7,7 @@
 //!
 //! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
 mod guide;
+mod mcp;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
@@ -189,13 +190,29 @@ fn main() {
     let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--port N] [--name S]"); std::process::exit(1); });
     let mut port = 8080u16;
     let mut name = "ferric".to_string();
+    let mut mcp_cmds: Vec<String> = Vec::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
+            "--mcp" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(c.clone()); } i += 2; }
             _ => i += 1,
         }
+    }
+    // Connect any configured MCP servers (JSON-RPC over stdio) and discover their tools.
+    let mut mcps = mcp::McpSet::default();
+    for c in &mcp_cmds {
+        match mcp::Mcp::connect(c) {
+            Ok(m) => { eprintln!("ferric-serve: mcp '{}' connected — {} tools: {:?}", m.label, m.tools.len(), m.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>()); mcps.0.push(m); }
+            Err(e) => eprintln!("ferric-serve: mcp '{c}' failed: {e}"),
+        }
+    }
+    if args.iter().any(|a| a == "--mcp-test") {
+        // Verify the MCP client mechanics: list tools, and call `add(2,3)` if present.
+        eprintln!("ferric-serve: --mcp-test, {} tool(s) advertised", mcps.openai_tools().len());
+        if mcps.has("add") { eprintln!("  add(2,3) = {:?}", mcps.call("add", &json!({"a": 2, "b": 3}))); }
+        return;
     }
     let resolved = resolve_model(path);
     eprintln!("ferric-serve: loading {resolved} …");
@@ -207,18 +224,20 @@ fn main() {
         eprintln!("\nferric-serve: --once ok ({p} prompt + {g} gen tokens): {t:?}");
         return;
     }
-    eprintln!("ferric-serve: {} ({} layers, vocab {}) on {:?} — http://127.0.0.1:{port}/v1",
-        name, eng.model.cfg.n_layer, eng.model.cfg.n_vocab, eng.ctx.backend);
+    let mcps = std::cell::RefCell::new(mcps);
+    eprintln!("ferric-serve: {} ({} layers, vocab {}) on {:?}{} — http://127.0.0.1:{port}/v1",
+        name, eng.model.cfg.n_layer, eng.model.cfg.n_vocab, eng.ctx.backend,
+        if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("bind :{port}: {e}"));
     for stream in listener.incoming() {
         if let Ok(s) = stream {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&eng, s)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&eng, &mcps, s)));
             if r.is_err() { eprintln!("ferric-serve: handler panicked (recovered)"); }
         }
     }
 }
 
-fn handle(eng: &Engine, mut stream: TcpStream) {
+fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, mut stream: TcpStream) {
     let (method, path, body) = match read_request(&mut stream) { Some(r) => r, None => return };
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => write_json(&mut stream, 200, &json!({"status": "ok"})),
@@ -226,7 +245,7 @@ fn handle(eng: &Engine, mut stream: TcpStream) {
             "object": "list",
             "data": [{"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"}]
         })),
-        ("POST", "/v1/chat/completions") => chat(eng, &mut stream, &body),
+        ("POST", "/v1/chat/completions") => chat(eng, mcps, &mut stream, &body),
         ("POST", "/v1/completions") => completions(eng, &mut stream, &body),
         _ => write_json(&mut stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}})),
     }
@@ -291,42 +310,74 @@ fn parse_tool_calls(text: &str) -> Vec<Value> {
     calls
 }
 
-fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
+fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {
+    let tp = hermes_tool_prompt(tools);
+    match messages.first_mut() {
+        Some(first) if first["role"] == "system" => {
+            let merged = format!("{}\n\n{tp}", first["content"].as_str().unwrap_or(""));
+            first["content"] = json!(merged);
+        }
+        _ => messages.insert(0, json!({"role": "system", "content": tp})),
+    }
+}
+
+fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
     let empty = vec![];
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
     let streaming = req["stream"].as_bool().unwrap_or(false);
-    // If the caller advertised tools, prepend/merge a Hermes tool system prompt.
-    let tools = req["tools"].as_array().cloned().unwrap_or_default();
+    // Advertised tools = caller's + every connected MCP server's.
+    let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
+    tools.extend(mcps.borrow().openai_tools());
     let has_tools = !tools.is_empty();
+    let id = "chatcmpl-ferric".to_string();
+
     if has_tools {
-        let tp = hermes_tool_prompt(&tools);
-        if let Some(first) = messages.first_mut() {
-            if first["role"] == "system" {
-                let merged = format!("{}\n\n{tp}", first["content"].as_str().unwrap_or(""));
-                first["content"] = json!(merged);
-            } else {
-                messages.insert(0, json!({"role": "system", "content": tp}));
+        inject_tools(&mut messages, &tools);
+        // Server-side agent loop: generate → parse tool_calls → execute the MCP-owned ones and feed
+        // results back → repeat. Non-MCP tool calls are returned to the client (standard OpenAI flow).
+        let (mut ptok, mut gtok) = (0usize, 0usize);
+        let (mut out_text, mut out_calls) = (String::new(), Vec::new());
+        for _round in 0..4 {
+            let prompt = eng.chat_ids(&messages);
+            let (text, p, g) = eng.generate(&prompt, max_tokens, None, |_| {});
+            ptok += p; gtok += g;
+            let calls = parse_tool_calls(&text);
+            let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
+            if mcp_calls.is_empty() { out_text = text; out_calls = calls; break; }
+            messages.push(json!({"role": "assistant", "content": text}));
+            for c in &mcp_calls {
+                let name = c["function"]["name"].as_str().unwrap_or("");
+                let args: Value = serde_json::from_str(c["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_else(|_| json!({}));
+                let result = mcps.borrow_mut().call(name, &args).unwrap_or_else(|e| format!("error: {e}"));
+                eprintln!("ferric-serve: mcp call {name}({args}) -> {result}");
+                messages.push(json!({"role": "user", "content": format!("<tool_response>\n{{\"name\": \"{name}\", \"content\": {}}}\n</tool_response>", serde_json::to_string(&result).unwrap_or_default())}));
             }
-        } else {
-            messages.insert(0, json!({"role": "system", "content": tp}));
         }
+        let (message, finish) = if !out_calls.is_empty() {
+            (json!({"role": "assistant", "content": Value::Null, "tool_calls": out_calls}), "tool_calls")
+        } else {
+            (json!({"role": "assistant", "content": out_text}), "stop")
+        };
+        return write_json(stream, 200, &json!({
+            "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
+        }));
     }
-    // Guided decoding: OpenAI `response_format`. `json_schema` compiles the schema to a template
-    // (declaration key order); `json_object` forces well-formed JSON. `sch_prog` outlives the guide.
+
+    // No tools → optional guided decoding + streaming.
     let rf = req["response_format"]["type"].as_str().unwrap_or("");
     let sch_prog = if rf == "json_schema" { guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
     let guide = if let Some(prog) = &sch_prog { Some(guide::Guide::Schema(guide::Schema::new(prog))) }
         else if rf == "json_object" || rf == "json_schema" { Some(guide::Guide::Json(guide::Json::object())) }
         else { None };
     let prompt = eng.chat_ids(&messages);
-    let id = format!("chatcmpl-ferric-{}", prompt.len());
     if streaming {
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
-        // The closure borrows `stream` mutably only for the duration of generate(); it's free after.
         eng.generate(&prompt, max_tokens, guide, |delta| {
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
                 "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]}));
@@ -336,15 +387,9 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         let _ = stream.write_all(b"data: [DONE]\n\n");
     } else {
         let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, guide, |_| {});
-        let tool_calls = if has_tools { parse_tool_calls(&text) } else { Vec::new() };
-        let (message, finish) = if !tool_calls.is_empty() {
-            (json!({"role": "assistant", "content": Value::Null, "tool_calls": tool_calls}), "tool_calls")
-        } else {
-            (json!({"role": "assistant", "content": text}), "stop")
-        };
         write_json(stream, 200, &json!({
             "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
         }));
     }
