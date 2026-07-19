@@ -71,7 +71,11 @@ FLOPS:
    (Q4_1 4.5×, Q5_0 2.3× on M5 Max) — `examples/q4_1.rs`, `examples/q5_0.rs`. **`Q5_1` completes the
    set** (affine 5-bit = Q5_0's `qh` + Q4_1's `min`; exact ≤2.3e-6, `examples/q5_1.rs`), so the
    **entire non-K family — Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 — now runs packed**, and the format-agnostic
-   loader picks them all up automatically. (The tiktoken pre-tokenizer edge cases are the remaining reach.)
+   loader picks them all up automatically. The **pre-tokenizer is verified**, too: the hand-rolled
+   GPT-2/SmolLM ByteLevel scheme (contractions, individual-digit split, multi-space, punctuation runs)
+   encodes **6/6 identical to the HF-`tokenizers` reference** on the edge-case set — `cargo run -p
+   ferric-tokenizer --example verify_tok`. (Full tiktoken/cl100k `\p{N}{1,3}` grouping is a separate
+   regex the GPT-2-family GGUF models Ferric runs don't use.)
 
 ## Where Ferric is behind (be honest)
 **Raw GEMM throughput for prefill/training.** The general f32 matmul is a one-thread-per-output
@@ -93,8 +97,8 @@ both vendors:
 
 | | naive | WGSL tiled | **coop_mat** |
 |---|---|---|---|
-| Apple M5 Max, Metal (exact f32) | ~700 GFLOP/s | ~215 | **~4300 (6×), bit-identical (0.0e0)** |
-| NVIDIA RTX 4050, Vulkan | ~293 GFLOP/s | — | **compiles but emits zeros — gated off (see below)** |
+| Apple M5 Max, Metal (exact f32, 8×8) | ~700 GFLOP/s | ~215 | **~4300 (6×), bit-identical (0.0e0)** |
+| NVIDIA RTX 4050, Vulkan (f16 in, f32 acc, 16×16) | ~293 GFLOP/s | — | **works — `matmul_coop16`, correct (relΔ 1.2e-2, f16), see below** |
 
 The M5 is the first Apple GPU with real in-GPU matrix hardware, and coop_mat reaches its
 simdgroup_matrix through our naga fork (`EXPERIMENTAL_COOPERATIVE_MATRIX`, `unsafe
@@ -104,16 +108,32 @@ Because it's exact f32 it *could* even be a bit-identical path, but fp-order acr
 fast-path, not the cross-fabric default. Remaining: wire coop_mat into the matmul selector, 16×16 +
 larger register tiles.
 
-**NVIDIA cooperative matrix does NOT work yet — it compiles but computes zeros.** Correcting an earlier
-overclaim in this doc (the "9400 @2048³, 32×" and a later "21.7 TFLOP/s, 74×"): both were **zero-output
-false passes**. Two distinct naga-fork bugs stack on Vulkan:
-1. *Compile panic* — the RB kernel indexed its coop pointers with inline compound expressions
-   (`&c[r0*nn+c0]`); the SPIR-V backend panics there (`write_bounds_check` → "Expression is not cached").
-   Let-binding every coop pointer index (the fix `COOP_GEMM_WGSL` already had) makes it **compile**.
-2. *Zero output* — once compiling, every `coopLoad`/`coopMultiplyAdd`/`coopStore` chain returns **all
-   zeros** on the RTX 4050, for **both** kernels, at **every** shape, even with CPU-uploaded operands.
+**NVIDIA cooperative matrix now WORKS — via a 16×16 f16-input path (`matmul_coop16`).** The story got
+here the hard way, and the intermediate states are worth recording because they were each briefly
+wrong in this doc:
+- An earlier "9400 @2048³, 32×" and a later "21.7 TFLOP/s, 74×" were **zero-output false passes** —
+  `coop_gemm.rs` validated coop vs naive with sin inputs that cancel to ~1e-2 under an *absolute* 6e-2
+  threshold, so an all-zero result "passed". Fixed: the check is now **relative** (a zero scores
+  relΔ≈1.0 and fails), plus a constant-operand regression test (`examples/coop_shape`).
+- The f32 8×8 kernel (`matmul_coop`) is **correct on Metal, all-zeros on NVIDIA**. Root cause, found by
+  querying `VkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` on the 4050: it enumerates 15 configs
+  and **none is f32×f32**; the usable float config is **M16 N16 K16, A=B=f16, C=f32, scope=Subgroup**.
+  `coop_mat8x8<f32>` matches nothing there, so the driver runs it as undefined → zeros. (Metal's
+  `simdgroup_matrix<f32>` needs exactly 8×8 f32 — hence correct there, zero here, same kernel.) Three
+  codegen theories (SPIR-V version header <1.6, missing `NonPrivatePointer` memory operand, bounds
+  checks) were each tested on hardware and **rejected** — the module is valid; it was always the shape.
+- The fix: **`matmul_coop16`** converts A,B to f16 and runs `coop_mat16x16<f16>` with an f32
+  accumulator. Verified on the 4050 — correct (constant-operand relΔ ~4e-4, vs-naive relΔ 1.2e-2 =
+  f16-input precision), non-zero at every shape, ~1.7 TFLOP/s single-tile (unoptimized). Mixed
+  precision ⇒ **not bit-identical, an opt-in fast path** (`coop16_ok` = coop_matrix && shader_f16 &&
+  Vulkan), which is exactly how tensor cores are meant to be driven. Metal keeps the exact-f32 8×8 path.
 
-**Root cause of #2 (2026-07-19): a shape-support mismatch, NOT a codegen bug.** Dumped the emitted
+Cross-fabric MODEL parity is untouched throughout — the 1.7B runs the scalar quant matmul on every
+fabric, never coop, so the NVIDIA/Vulkan fingerprint (argmax 12095) stands. Next on coop16: register-
+blocking (2×2 of 16×16) + wiring into the two-pass quant prefill for the real 12–32× tensor-core prefill
+on NVIDIA. Historical detail on the ruled-out codegen theories follows.
+
+**(Superseded) The zero-output codegen investigation.** Dumped the emitted
 SPIR-V (via a standalone naga project — the offline vendor tree can't add wgsl-in/spv-out deps, but
 SPIR-V codegen is GPU-independent) and ran spirv-dis/spirv-val. Three codegen theories were chased on
 the box and **rejected**: (a) the SPIR-V *version header* — coop needs ≥1.6 and the fork emits a 1.0
@@ -289,6 +309,16 @@ broadcast/matmul/softmax/matmul) with intermediate tensors. `fused_decode_attent
 **one workgroup-per-head kernel** (scores → softmax → weighted-V in shared memory, validated == the
 composed path to ~1e-8); attention dropped to 49% and decode to 32 ms. SwiGLU was also fused
 (silu·mul → one kernel) — correct, but a single-dispatch saving is below the ~1 ms resolution.
+**`add_rmsnorm` fusion (2026-07-19) confirms the same ceiling.** Every layer does `xy = x + y;
+xy.rmsnorm(w)` and needs both the sum (next residual) and its norm (next block input); a fused kernel
+emits both, removing one dispatch/layer (`Tensor::add_rmsnorm`, used at the FFN boundary in
+`qwen3.rs`). Output is **bit-identical** — token-for-token identical to llama.cpp on all three models —
+but the measured decode delta is **within noise** (27 vs 28 / 30 vs 30 ms/tok, controlled interleaved,
+Qwen3-0.6B, N=800). The lesson, re-confirmed: at batch-1 decode the per-dispatch overhead is already
+small, so shaving *one* dispatch/layer does nothing measurable. Meaningful fusion gains require
+collapsing the *whole* matmul→norm→residual chain into a megakernel (many dispatches → one), not
+one-op-at-a-time — the real, deeper undertaking. `add_rmsnorm` is kept because it's correct, free of
+downside, and composes toward that megafusion, not because it is on its own a win.
 
 The honest read: at batch-1 decode every op is a tiny GEMV that underfills the GPU, so decode is
 **dispatch/latency-bound on a long dependent chain** (~15 kernels/layer × 28–64 layers), not
