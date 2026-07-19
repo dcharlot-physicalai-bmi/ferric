@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ferric — guided decoding in the browser</title>
+<body style="font:14px system-ui;max-width:60ch;margin:2rem auto">
+<h3>Ferric guided decoding on WebGPU</h3>
+<div id="status">loading…</div>
+<pre id="gen" style="background:#111;color:#0f0;padding:1rem;white-space:pre-wrap"></pre>
+<script type="module">
+import init, { bonsai_generate_json } from './pkg/ferric_web.js';
+const log = (...a) => console.log('FERRIC>', ...a);
+const $ = id => document.getElementById(id);
+try {
+  await init();
+  log('webgpu', !!navigator.gpu);
+  $('status').textContent = 'fetching model…';
+  const model = new Uint8Array(await (await fetch('./model.gguf')).arrayBuffer());
+  log('model bytes', model.length);
+  const schema = JSON.stringify({ type: 'object', properties: {
+    name: { type: 'string' }, age: { type: 'integer' }, city: { type: 'string' }, active: { type: 'boolean' }
+  }});
+  const onTok = (kind, payload) => {
+    if (kind === 'status') $('status').textContent = payload;
+    if (kind === 'token') $('gen').textContent += payload;
+  };
+  const out = await bonsai_generate_json(model, 'Give a fictional person as JSON.', 80, schema, onTok);
+  $('status').textContent = 'done';
+  // validate: parses + exactly the schema keys/types
+  let ok = false;
+  try {
+    const o = JSON.parse(out);
+    ok = typeof o.name === 'string' && Number.isInteger(o.age) && typeof o.city === 'string' && typeof o.active === 'boolean';
+  } catch (e) { ok = false; }
+  log(ok ? 'RESULT_OK' : 'RESULT_BAD', JSON.stringify(out));
+} catch (e) {
+  log('ERROR', String(e && e.message || e));
+  $('status').textContent = 'error: ' + e;
+}
+</script>
+</body>
