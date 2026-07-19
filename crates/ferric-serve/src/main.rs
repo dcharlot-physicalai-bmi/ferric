@@ -189,20 +189,22 @@ fn main() {
     let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--port N] [--name S]"); std::process::exit(1); });
     let mut port = 8080u16;
     let mut name = "ferric".to_string();
-    let mut mcp_cmds: Vec<String> = Vec::new();
+    let mut mcp_cmds: Vec<(String, String)> = Vec::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
-            "--mcp" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(c.clone()); } i += 2; }
+            "--mcp" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("stdio".to_string(), c.clone())); } i += 2; }
+            "--mcp-http" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("http".to_string(), c.clone())); } i += 2; }
             _ => i += 1,
         }
     }
-    // Connect any configured MCP servers (JSON-RPC over stdio) and discover their tools.
+    // Connect any configured MCP servers (stdio subprocess or remote Streamable-HTTP) + discover tools.
     let mut mcps = mcp::McpSet::default();
-    for c in &mcp_cmds {
-        match mcp::Mcp::connect(c) {
+    for (kind, c) in &mcp_cmds {
+        let r = if kind == "http" { mcp::Mcp::connect_http(c) } else { mcp::Mcp::connect(c) };
+        match r {
             Ok(m) => { eprintln!("ferric-serve: mcp '{}' connected — {} tools: {:?}", m.label, m.tools.len(), m.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>()); mcps.0.push(m); }
             Err(e) => eprintln!("ferric-serve: mcp '{c}' failed: {e}"),
         }
