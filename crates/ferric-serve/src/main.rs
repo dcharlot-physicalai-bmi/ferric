@@ -175,13 +175,88 @@ fn handle(eng: &Engine, mut stream: TcpStream) {
     }
 }
 
+/// Hermes/qwen tool-calling system prompt — advertise the OpenAI `tools` as `<tools>…</tools>` and
+/// ask for `<tool_call>{"name":…,"arguments":…}</tool_call>` back (the format Qwen/Hermes models are
+/// trained on, and the one vLLM's `hermes`/`qwen25` parsers expect).
+fn hermes_tool_prompt(tools: &[Value]) -> String {
+    let mut s = String::from("You are a function-calling AI. You are given function signatures inside <tools></tools>. \
+        To call a function, emit a JSON object {\"name\": <name>, \"arguments\": <args>} inside <tool_call></tool_call> tags. \
+        You may emit multiple <tool_call> blocks. Only call a function when it is needed.\n<tools>\n");
+    for t in tools { s.push_str(&t.to_string()); s.push('\n'); }
+    s.push_str("</tools>");
+    s
+}
+
+/// One `{"name":…,"arguments":…}` JSON object → an OpenAI tool_call (arguments as a JSON *string*).
+fn push_call(calls: &mut Vec<Value>, v: &Value) {
+    let name = v["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() { return; }
+    let args = v.get("arguments").map(|a| a.to_string()).unwrap_or_else(|| "{}".into());
+    let id = format!("call_{}", calls.len());
+    calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}}));
+}
+
+/// Top-level balanced `{…}` spans in `s` (string-aware, so braces inside JSON strings don't confuse it).
+fn balanced_objects(s: &str) -> Vec<&str> {
+    let (b, mut out, mut depth, mut start, mut in_str, mut esc) = (s.as_bytes(), Vec::new(), 0i32, 0usize, false, false);
+    for (i, &c) in b.iter().enumerate() {
+        if in_str { if esc { esc = false; } else if c == b'\\' { esc = true; } else if c == b'"' { in_str = false; } continue; }
+        match c {
+            b'"' => in_str = true,
+            b'{' => { if depth == 0 { start = i; } depth += 1; }
+            b'}' => { depth -= 1; if depth == 0 { out.push(&s[start..=i]); } }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Scan generated text for tool calls → OpenAI-shaped tool_calls. Pass 1: well-formed
+/// `<tool_call>{json}</tool_call>` tags (Hermes emits **multiple concatenated tags**, not an array).
+/// Pass 2 (fallback — reasoning models leak/mangle the tags): any balanced `{…}` object carrying both
+/// `name` and `arguments`. Only reached when no clean tag pair parsed, so it won't eat normal content.
+fn parse_tool_calls(text: &str) -> Vec<Value> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(a) = rest.find("<tool_call>") {
+        let after = &rest[a + "<tool_call>".len()..];
+        let Some(b) = after.find("</tool_call>") else { break };
+        if let Ok(v) = serde_json::from_str::<Value>(after[..b].trim()) { push_call(&mut calls, &v); }
+        rest = &after[b + "</tool_call>".len()..];
+    }
+    if calls.is_empty() {
+        for obj in balanced_objects(text) {
+            if let Ok(v) = serde_json::from_str::<Value>(obj) {
+                if v.get("name").is_some() && v.get("arguments").is_some() { push_call(&mut calls, &v); }
+            }
+        }
+    }
+    calls
+}
+
 fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
     let empty = vec![];
-    let messages = req["messages"].as_array().unwrap_or(&empty);
+    let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
     let streaming = req["stream"].as_bool().unwrap_or(false);
-    let prompt = eng.chat_ids(messages);
+    // If the caller advertised tools, prepend/merge a Hermes tool system prompt.
+    let tools = req["tools"].as_array().cloned().unwrap_or_default();
+    let has_tools = !tools.is_empty();
+    if has_tools {
+        let tp = hermes_tool_prompt(&tools);
+        if let Some(first) = messages.first_mut() {
+            if first["role"] == "system" {
+                let merged = format!("{}\n\n{tp}", first["content"].as_str().unwrap_or(""));
+                first["content"] = json!(merged);
+            } else {
+                messages.insert(0, json!({"role": "system", "content": tp}));
+            }
+        } else {
+            messages.insert(0, json!({"role": "system", "content": tp}));
+        }
+    }
+    let prompt = eng.chat_ids(&messages);
     let id = format!("chatcmpl-ferric-{}", prompt.len());
     if streaming {
         write_sse_headers(stream);
@@ -197,9 +272,15 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         let _ = stream.write_all(b"data: [DONE]\n\n");
     } else {
         let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, |_| {});
+        let tool_calls = if has_tools { parse_tool_calls(&text) } else { Vec::new() };
+        let (message, finish) = if !tool_calls.is_empty() {
+            (json!({"role": "assistant", "content": Value::Null, "tool_calls": tool_calls}), "tool_calls")
+        } else {
+            (json!({"role": "assistant", "content": text}), "stop")
+        };
         write_json(stream, 200, &json!({
             "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
         }));
     }
