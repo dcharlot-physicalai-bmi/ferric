@@ -317,3 +317,104 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
     }
     m
 }
+
+/// **Stateful model handle** — load a GGUF ONCE (weights uploaded to the GPU once), then generate
+/// many times. The per-call `bonsai_*` functions reload every call (fine for a one-shot demo, far too
+/// slow for an app); the AI SDK provider and any real workload should hold a `FerricModel`.
+#[wasm_bindgen]
+pub struct FerricModel {
+    ctx: Arc<Context>,
+    model: Qwen3,
+    bpe: Bpe,
+    toks: Vec<String>,
+    u2b: HashMap<char, u8>,
+    token_bytes: Vec<Option<Vec<u8>>>,
+    add_bos: bool,
+    bos_id: Option<u32>,
+}
+
+#[wasm_bindgen]
+impl FerricModel {
+    /// Load a GGUF and upload weights to the GPU once. Reuse the returned handle for every generation.
+    pub async fn load(model: Vec<u8>) -> std::result::Result<FerricModel, JsValue> {
+        console_error_panic_hook::set_once();
+        let err = |e: String| JsValue::from_str(&e);
+        let g = parse(model).map_err(err)?;
+        let (bpe, toks) = build_bpe(&g)?;
+        let u2b = gpt2_byte_decoder();
+        let token_bytes: Vec<Option<Vec<u8>>> = toks.iter().map(|t| {
+            let mut b = Vec::with_capacity(t.len());
+            for ch in t.chars() { match u2b.get(&ch) { Some(&x) => b.push(x), None => return None } }
+            Some(b)
+        }).collect();
+        let bos_id = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
+        let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
+        let ctx = Arc::new(Context::new().await.map_err(err)?);
+        let model = Qwen3::load(&ctx, &g).map_err(err)?;
+        Ok(FerricModel { ctx, model, bpe, toks, u2b, token_bytes, add_bos, bos_id })
+    }
+
+    /// `#layers · backend` — a small readiness string for the UI.
+    pub fn info(&self) -> String { format!("{} layers · {:?}", self.model.cfg.n_layer, self.ctx.backend) }
+
+    fn detok(&self, ids: &[u32]) -> String {
+        let s: String = ids.iter().map(|&i| self.toks.get(i as usize).cloned().unwrap_or_default()).collect();
+        String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
+    }
+    fn encode(&self, prompt: &str) -> Vec<u32> {
+        let mut ids = self.bpe.encode(prompt);
+        if self.add_bos { if let Some(b) = self.bos_id { ids.insert(0, b); } }
+        ids
+    }
+
+    /// Guided generation: `schema` (a JSON-Schema string) → schema-conformant, else json_object.
+    pub async fn generate_json(&self, prompt: String, steps: usize, schema: String, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
+        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(k), &JsValue::from_str(p)); };
+        let sch = ferric_agent::guide::compile_str(&schema);
+        let mut guide = match &sch {
+            Some(p) => ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(p)),
+            None => ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object()),
+        };
+        self.run(&prompt, steps, Some(&mut guide), &emit).await
+    }
+
+    /// Free-form generation (greedy).
+    pub async fn generate(&self, prompt: String, steps: usize, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
+        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(k), &JsValue::from_str(p)); };
+        self.run(&prompt, steps, None, &emit).await
+    }
+}
+
+impl FerricModel {
+    async fn run(&self, prompt: &str, steps: usize, mut guide: Option<&mut ferric_agent::guide::Guide<'_>>, emit: &dyn Fn(&str, &str)) -> std::result::Result<String, JsValue> {
+        let c = &self.model.cfg;
+        let ids = self.encode(prompt);
+        if ids.is_empty() { return Err(JsValue::from_str("prompt encoded to zero tokens")); }
+        let eos = |t: u32| t == 151645 || t == 151643;
+        let mut cache = Cache::new(c);
+        let mut seq = ids.clone();
+        let mut emitted = String::new();
+        for step in 0..steps {
+            let logits = if step == 0 { self.model.forward_cached(&ids, &mut cache) } else { self.model.forward_cached(&seq[seq.len() - 1..], &mut cache) };
+            let v = logits.to_vec().await;
+            let row = &v[v.len() - c.n_vocab..];
+            let next = if let Some(g) = guide.as_deref() {
+                let can_stop = g.can_stop();
+                let (mut best, mut bl) = (None, f32::NEG_INFINITY);
+                for i in 0..c.n_vocab {
+                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&ch| a.step(ch)) } _ => false } };
+                    if ok && row[i] > bl { bl = row[i]; best = Some(i as u32); }
+                }
+                match best { Some(t) => t, None => break }
+            } else { (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32 };
+            if eos(next) { break; }
+            if let Some(g) = guide.as_deref_mut() { if let Some(b) = &self.token_bytes[next as usize] { for &ch in b { g.step(ch); } } }
+            seq.push(next);
+            let full = self.detok(&seq[ids.len()..]);
+            if let Some(d) = full.strip_prefix(&emitted) { if !d.is_empty() { emit("token", d); } }
+            emitted = full;
+        }
+        emit("done", &emitted);
+        Ok(emitted)
+    }
+}
