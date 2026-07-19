@@ -6,6 +6,7 @@
 //!   cargo run -p ferric-serve --release -- <model.gguf> [--port 8080] [--name my-model]
 //!
 //! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
+mod guide;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
@@ -40,6 +41,9 @@ struct Engine {
     add_bos: bool,
     eos: Vec<u32>,
     name: String,
+    /// Raw bytes each token decodes to (for guided decoding); `None` for special/non-text tokens,
+    /// which are disallowed under a constraint (except EOS, handled separately).
+    token_bytes: Vec<Option<Vec<u8>>>,
 }
 
 impl Engine {
@@ -67,7 +71,15 @@ impl Engine {
         if let Some(e) = im_end { if !eos.contains(&e) { eos.push(e); } }
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
         let model = Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}"));
-        Engine { ctx, model, bpe, tokens, u2b: byte_decoder(), im_start, im_end, bos_id, add_bos, eos, name }
+        let u2b = byte_decoder();
+        // Precompute each token's raw bytes (chars → bytes via u2b). A token containing any char not in
+        // the byte map is a special token (e.g. <|im_end|>) → None → disallowed under a constraint.
+        let token_bytes: Vec<Option<Vec<u8>>> = tokens.iter().map(|t| {
+            let mut b = Vec::with_capacity(t.len());
+            for c in t.chars() { match u2b.get(&c) { Some(&x) => b.push(x), None => return None } }
+            Some(b)
+        }).collect();
+        Engine { ctx, model, bpe, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes }
     }
 
     fn detok(&self, ids: &[u32]) -> String {
@@ -101,7 +113,7 @@ impl Engine {
 
     /// Greedy decode (temperature ignored for now — determinism is the point). Calls `on_delta` with
     /// each newly-decoded text fragment for streaming. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<guide::Json>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
         let mut cache = Cache::new(&self.model.cfg);
         let n_vocab = self.model.cfg.n_vocab;
         let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
@@ -111,8 +123,21 @@ impl Engine {
             let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*gen.last().unwrap()] };
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
-            let next = argmax(&v[v.len() - n_vocab..]);
+            let row = &v[v.len() - n_vocab..];
+            // Guided decoding: pick the highest-logit token whose bytes keep the JSON valid (EOS only
+            // once the value is complete). Most tokens reject on their first byte, so the scan is cheap.
+            let next = if let Some(g) = guide.as_ref() {
+                let can_stop = g.can_stop();
+                let (mut best, mut best_l) = (None, f32::NEG_INFINITY);
+                for i in 0..n_vocab {
+                    let ok = if self.eos.contains(&(i as u32)) { can_stop }
+                        else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&c| a.step(c)) } _ => false } };
+                    if ok && row[i] > best_l { best_l = row[i]; best = Some(i as u32); }
+                }
+                match best { Some(t) => t, None => break }
+            } else { argmax(row) };
             if self.eos.contains(&next) { break; }
+            if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
             gen.push(next);
             // Re-detok the whole generation and emit only the new suffix (handles multi-byte UTF-8).
             let full = self.detok(&gen);
@@ -178,7 +203,7 @@ fn main() {
     if args.iter().any(|a| a == "--once") {
         // Smoke test: one chat turn straight through the pipeline, no HTTP.
         let msgs = vec![json!({"role": "user", "content": "Hi"})];
-        let (t, p, g) = eng.generate(&eng.chat_ids(&msgs), 16, |d| eprint!("{d}"));
+        let (t, p, g) = eng.generate(&eng.chat_ids(&msgs), 16, None, |d| eprint!("{d}"));
         eprintln!("\nferric-serve: --once ok ({p} prompt + {g} gen tokens): {t:?}");
         return;
     }
@@ -288,6 +313,9 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
             messages.insert(0, json!({"role": "system", "content": tp}));
         }
     }
+    // Guided decoding: OpenAI `response_format: {type: "json_object"|"json_schema"}` → force valid JSON.
+    let rf = req["response_format"]["type"].as_str().unwrap_or("");
+    let guide = if rf == "json_object" || rf == "json_schema" { Some(guide::Json::object()) } else { None };
     let prompt = eng.chat_ids(&messages);
     let id = format!("chatcmpl-ferric-{}", prompt.len());
     if streaming {
@@ -295,7 +323,7 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
         // The closure borrows `stream` mutably only for the duration of generate(); it's free after.
-        eng.generate(&prompt, max_tokens, |delta| {
+        eng.generate(&prompt, max_tokens, guide, |delta| {
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
                 "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]}));
         });
@@ -303,7 +331,7 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
         let _ = stream.write_all(b"data: [DONE]\n\n");
     } else {
-        let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, |_| {});
+        let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, guide, |_| {});
         let tool_calls = if has_tools { parse_tool_calls(&text) } else { Vec::new() };
         let (message, finish) = if !tool_calls.is_empty() {
             (json!({"role": "assistant", "content": Value::Null, "tool_calls": tool_calls}), "tool_calls")
@@ -325,7 +353,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.bpe.encode(prompt_text));
-    let (text, ptok, gtok) = eng.generate(&ids, max_tokens, |_| {});
+    let (text, ptok, gtok) = eng.generate(&ids, max_tokens, None, |_| {});
     write_json(stream, 200, &json!({
         "id": format!("cmpl-ferric-{}", ids.len()), "object": "text_completion", "created": now_unix(), "model": eng.name,
         "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
