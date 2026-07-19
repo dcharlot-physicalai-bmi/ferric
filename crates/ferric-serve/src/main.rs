@@ -6,7 +6,6 @@
 //!   cargo run -p ferric-serve --release -- <model.gguf> [--port 8080] [--name my-model]
 //!
 //! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
-mod guide;
 mod mcp;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
@@ -114,7 +113,7 @@ impl Engine {
 
     /// Greedy decode (temperature ignored for now — determinism is the point). Calls `on_delta` with
     /// each newly-decoded text fragment for streaming. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
         let mut cache = Cache::new(&self.model.cfg);
         let n_vocab = self.model.cfg.n_vocab;
         let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
@@ -251,67 +250,8 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, mut stream: TcpS
     }
 }
 
-/// Hermes/qwen tool-calling system prompt — advertise the OpenAI `tools` as `<tools>…</tools>` and
-/// ask for `<tool_call>{"name":…,"arguments":…}</tool_call>` back (the format Qwen/Hermes models are
-/// trained on, and the one vLLM's `hermes`/`qwen25` parsers expect).
-fn hermes_tool_prompt(tools: &[Value]) -> String {
-    let mut s = String::from("You are a function-calling AI. You are given function signatures inside <tools></tools>. \
-        To call a function, emit a JSON object {\"name\": <name>, \"arguments\": <args>} inside <tool_call></tool_call> tags. \
-        You may emit multiple <tool_call> blocks. Only call a function when it is needed.\n<tools>\n");
-    for t in tools { s.push_str(&t.to_string()); s.push('\n'); }
-    s.push_str("</tools>");
-    s
-}
-
-/// One `{"name":…,"arguments":…}` JSON object → an OpenAI tool_call (arguments as a JSON *string*).
-fn push_call(calls: &mut Vec<Value>, v: &Value) {
-    let name = v["name"].as_str().unwrap_or("").to_string();
-    if name.is_empty() { return; }
-    let args = v.get("arguments").map(|a| a.to_string()).unwrap_or_else(|| "{}".into());
-    let id = format!("call_{}", calls.len());
-    calls.push(json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}}));
-}
-
-/// Top-level balanced `{…}` spans in `s` (string-aware, so braces inside JSON strings don't confuse it).
-fn balanced_objects(s: &str) -> Vec<&str> {
-    let (b, mut out, mut depth, mut start, mut in_str, mut esc) = (s.as_bytes(), Vec::new(), 0i32, 0usize, false, false);
-    for (i, &c) in b.iter().enumerate() {
-        if in_str { if esc { esc = false; } else if c == b'\\' { esc = true; } else if c == b'"' { in_str = false; } continue; }
-        match c {
-            b'"' => in_str = true,
-            b'{' => { if depth == 0 { start = i; } depth += 1; }
-            b'}' => { depth -= 1; if depth == 0 { out.push(&s[start..=i]); } }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Scan generated text for tool calls → OpenAI-shaped tool_calls. Pass 1: well-formed
-/// `<tool_call>{json}</tool_call>` tags (Hermes emits **multiple concatenated tags**, not an array).
-/// Pass 2 (fallback — reasoning models leak/mangle the tags): any balanced `{…}` object carrying both
-/// `name` and `arguments`. Only reached when no clean tag pair parsed, so it won't eat normal content.
-fn parse_tool_calls(text: &str) -> Vec<Value> {
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(a) = rest.find("<tool_call>") {
-        let after = &rest[a + "<tool_call>".len()..];
-        let Some(b) = after.find("</tool_call>") else { break };
-        if let Ok(v) = serde_json::from_str::<Value>(after[..b].trim()) { push_call(&mut calls, &v); }
-        rest = &after[b + "</tool_call>".len()..];
-    }
-    if calls.is_empty() {
-        for obj in balanced_objects(text) {
-            if let Ok(v) = serde_json::from_str::<Value>(obj) {
-                if v.get("name").is_some() && v.get("arguments").is_some() { push_call(&mut calls, &v); }
-            }
-        }
-    }
-    calls
-}
-
 fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {
-    let tp = hermes_tool_prompt(tools);
+    let tp = ferric_agent::tools::hermes_prompt(tools);
     match messages.first_mut() {
         Some(first) if first["role"] == "system" => {
             let merged = format!("{}\n\n{tp}", first["content"].as_str().unwrap_or(""));
@@ -343,7 +283,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
             let prompt = eng.chat_ids(&messages);
             let (text, p, g) = eng.generate(&prompt, max_tokens, None, |_| {});
             ptok += p; gtok += g;
-            let calls = parse_tool_calls(&text);
+            let calls = ferric_agent::tools::parse_tool_calls(&text);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
             if mcp_calls.is_empty() { out_text = text; out_calls = calls; break; }
             messages.push(json!({"role": "assistant", "content": text}));
@@ -369,9 +309,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
 
     // No tools → optional guided decoding + streaming.
     let rf = req["response_format"]["type"].as_str().unwrap_or("");
-    let sch_prog = if rf == "json_schema" { guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
-    let guide = if let Some(prog) = &sch_prog { Some(guide::Guide::Schema(guide::Schema::new(prog))) }
-        else if rf == "json_object" || rf == "json_schema" { Some(guide::Guide::Json(guide::Json::object())) }
+    let sch_prog = if rf == "json_schema" { ferric_agent::guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
+    let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
+        else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
         else { None };
     let prompt = eng.chat_ids(&messages);
     if streaming {
