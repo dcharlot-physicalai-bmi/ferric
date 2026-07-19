@@ -128,6 +128,37 @@ impl Engine {
 
 fn now_unix() -> u64 { 1_700_000_000 } // static stamp (no wall clock needed for the API contract)
 
+/// Resolve a model spec to a local GGUF path. Accepts a local file, or a HuggingFace ref
+/// `owner/repo[:file.gguf]` — downloads (and caches under ~/.cache/ferric/hub) via `curl` so
+/// `ferric-serve unsloth/Qwen3-0.6B-GGUF` just works with no manual download. curl keeps us dep-light
+/// (no reqwest/hf-hub to vendor); a pure-Rust HTTPS client is the follow-up when the vendor tree grows.
+fn resolve_model(spec: &str) -> String {
+    if std::path::Path::new(spec).exists() { return spec.to_string(); }
+    let (repo, file) = match spec.split_once(':') { Some((r, f)) => (r.to_string(), Some(f.to_string())), None => (spec.to_string(), None) };
+    if !repo.contains('/') { eprintln!("ferric-serve: '{spec}' is neither a local file nor an HF repo (owner/repo)"); std::process::exit(1); }
+    let file = file.unwrap_or_else(|| pick_gguf(&repo));
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = format!("{home}/.cache/ferric/hub/{}", repo.replace('/', "_"));
+    std::fs::create_dir_all(&dir).ok();
+    let dest = format!("{dir}/{}", file.rsplit('/').next().unwrap_or(&file));
+    if std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) { eprintln!("ferric-serve: cached {dest}"); return dest; }
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+    eprintln!("ferric-serve: downloading {url}");
+    let ok = std::process::Command::new("curl").args(["-L", "-f", "--progress-bar", "-C", "-", "-o", &dest, &url]).status().map(|s| s.success()).unwrap_or(false);
+    if !ok { eprintln!("ferric-serve: download failed ({url})"); std::process::exit(1); }
+    dest
+}
+
+/// Query the HF model API for a repo's file list and pick a GGUF (prefer Q4_K_M, else the first).
+fn pick_gguf(repo: &str) -> String {
+    let out = std::process::Command::new("curl").args(["-sL", "-f", &format!("https://huggingface.co/api/models/{repo}")]).output();
+    let v: Value = out.ok().and_then(|o| serde_json::from_slice(&o.stdout).ok()).unwrap_or(Value::Null);
+    let files: Vec<String> = v["siblings"].as_array().map(|a| a.iter().filter_map(|s| s["rfilename"].as_str().map(String::from)).collect()).unwrap_or_default();
+    let ggufs: Vec<&String> = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).collect();
+    let pick = ggufs.iter().find(|f| f.contains("Q4_K_M")).or_else(|| ggufs.first()).cloned();
+    match pick { Some(f) => { eprintln!("ferric-serve: picked {f} from {repo}"); f.clone() } None => { eprintln!("ferric-serve: no .gguf found in {repo} (specify owner/repo:file.gguf)"); std::process::exit(1); } }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--port N] [--name S]"); std::process::exit(1); });
@@ -141,8 +172,9 @@ fn main() {
             _ => i += 1,
         }
     }
-    eprintln!("ferric-serve: loading {path} …");
-    let eng = Engine::load(path, name.clone());
+    let resolved = resolve_model(path);
+    eprintln!("ferric-serve: loading {resolved} …");
+    let eng = Engine::load(&resolved, name.clone());
     if args.iter().any(|a| a == "--once") {
         // Smoke test: one chat turn straight through the pipeline, no HTTP.
         let msgs = vec![json!({"role": "user", "content": "Hi"})];
