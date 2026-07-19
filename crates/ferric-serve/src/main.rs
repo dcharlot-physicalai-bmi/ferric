@@ -44,6 +44,11 @@ struct Engine {
     /// Raw bytes each token decodes to (for guided decoding); `None` for special/non-text tokens,
     /// which are disallowed under a constraint (except EOS, handled separately).
     token_bytes: Vec<Option<Vec<u8>>>,
+    /// (special-token string, id), longest first — for special-token-aware tokenization of a
+    /// rendered chat template (so `<|im_start|>` etc. encode to their id, not BPE'd text).
+    specials: Vec<(String, u32)>,
+    /// The GGUF `chat_template` string (used only to detect the model's template family).
+    template: String,
 }
 
 impl Engine {
@@ -79,7 +84,90 @@ impl Engine {
             for c in t.chars() { match u2b.get(&c) { Some(&x) => b.push(x), None => return None } }
             Some(b)
         }).collect();
-        Engine { ctx, model, bpe, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes }
+        // Special (control) tokens for template-aware tokenization: prefer the GGUF token_type array
+        // (3 = CONTROL); else fall back to the reliable `<|…|>` pattern (ChatML/Llama-3 style).
+        let ttypes: Vec<i64> = match g.metadata.get("tokenizer.ggml.token_type") {
+            Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::I(v) = m { *v } else if let Meta::U(v) = m { *v as i64 } else { 0 }).collect(),
+            _ => Vec::new(),
+        };
+        let mut specials: Vec<(String, u32)> = tokens.iter().enumerate().filter_map(|(i, t)| {
+            // Union: token_type CONTROL(3) or USER_DEFINED(4) (Llama-3's <|…|> tokens are 4!), OR the
+            // reliable angle-bracket control patterns — so no template's special tokens get BPE'd.
+            let is_ctrl = matches!(ttypes.get(i), Some(&3) | Some(&4))
+                || (t.starts_with("<|") && t.ends_with("|>"))
+                || matches!(t.as_str(), "<s>" | "</s>" | "<bos>" | "<eos>" | "<pad>" | "<unk>" | "<mask>" | "<start_of_turn>" | "<end_of_turn>");
+            if is_ctrl && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
+        }).collect();
+        specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
+        let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        Engine { ctx, model, bpe, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
+    }
+
+    /// Split `text` on control tokens (longest match) and encode: control tokens → their id, the text
+    /// between → byte-level BPE. Lets a rendered chat template carry literal `<|im_start|>` etc.
+    fn encode_special(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut rest = text;
+        'outer: while !rest.is_empty() {
+            // find the earliest special-token occurrence
+            let mut best: Option<(usize, &str, u32)> = None;
+            for (s, id) in &self.specials {
+                if let Some(pos) = rest.find(s.as_str()) {
+                    if best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
+                }
+            }
+            match best {
+                Some((pos, s, id)) => {
+                    if pos > 0 { ids.extend(self.bpe.encode(&rest[..pos])); }
+                    ids.push(id);
+                    rest = &rest[pos + s.len()..];
+                }
+                None => { ids.extend(self.bpe.encode(rest)); break 'outer; }
+            }
+        }
+        ids
+    }
+
+    /// Is this control token in the model's vocab?
+    fn has(&self, s: &str) -> bool { self.specials.iter().any(|(t, _)| t == s) }
+
+    /// Detect the chat family from the control tokens actually present in the vocab (robust even when
+    /// the GGUF omits `tokenizer.ggml.chat_template`).
+    fn has_chat_family(&self) -> bool {
+        self.has("<|im_start|>") || self.has("<|start_header_id|>") || self.has("<start_of_turn>") || (self.has("<|assistant|>") && self.has("<|end|>"))
+    }
+
+    /// Render the chat template to a string (special tokens as literal text), family-detected from the
+    /// vocab. Covers ChatML (Qwen/Yi/…), Llama-3, Gemma, Phi-3; else a generic fallback.
+    fn render_chat(&self, messages: &[Value]) -> String {
+        let m = |v: &Value| (v["role"].as_str().unwrap_or("user").to_string(), v["content"].as_str().unwrap_or("").to_string());
+        if self.has("<|start_header_id|>") { // Llama-3
+            let mut s = String::from("<|begin_of_text|>");
+            for v in messages { let (r, c) = m(v); s.push_str(&format!("<|start_header_id|>{r}<|end_header_id|>\n\n{c}<|eot_id|>")); }
+            s.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            s
+        } else if self.has("<start_of_turn>") { // Gemma (roles user/model, no system → fold into first user)
+            let mut s = String::new();
+            let mut sys = String::new();
+            for v in messages { let (r, c) = m(v);
+                if r == "system" { sys = c; continue; }
+                let role = if r == "assistant" { "model" } else { "user" };
+                let body = if role == "user" && !sys.is_empty() { let b = format!("{sys}\n\n{c}"); sys.clear(); b } else { c };
+                s.push_str(&format!("<start_of_turn>{role}\n{body}<end_of_turn>\n"));
+            }
+            s.push_str("<start_of_turn>model\n");
+            s
+        } else if self.has("<|assistant|>") && self.has("<|end|>") { // Phi-3
+            let mut s = String::new();
+            for v in messages { let (r, c) = m(v); s.push_str(&format!("<|{r}|>\n{c}<|end|>\n")); }
+            s.push_str("<|assistant|>\n");
+            s
+        } else { // ChatML (default — Qwen and most GGUF chat models)
+            let mut s = String::new();
+            for v in messages { let (r, c) = m(v); s.push_str(&format!("<|im_start|>{r}\n{c}<|im_end|>\n")); }
+            s.push_str("<|im_start|>assistant\n");
+            s
+        }
     }
 
     fn detok(&self, ids: &[u32]) -> String {
@@ -87,28 +175,20 @@ impl Engine {
         String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
     }
 
-    /// Build the prompt token stream from OpenAI `messages` using the ChatML template (Qwen/most
-    /// GGUF chat models). Special tokens are inserted by id; text is byte-level BPE-encoded between them.
+    /// Build the prompt token stream from OpenAI `messages`: render the model's own chat template
+    /// (family-detected from the GGUF) to a string, then tokenize special-token-aware. The template
+    /// is self-contained (it carries its own BOS, e.g. Llama-3's `<|begin_of_text|>`), so BOS is not
+    /// prepended separately. Byte-identical to the old hardcoded path for ChatML models.
     fn chat_ids(&self, messages: &[Value]) -> Vec<u32> {
-        let mut ids = Vec::new();
-        if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
-        let (Some(s), Some(e)) = (self.im_start, self.im_end) else {
-            // No ChatML special tokens — fall back to concatenated text.
+        if !self.has_chat_family() {
+            // No recognized chat family in the vocab → a base model — plain concatenation.
             let text: String = messages.iter().map(|m| format!("{}: {}\n", m["role"].as_str().unwrap_or("user"), m["content"].as_str().unwrap_or(""))).collect();
+            let mut ids = Vec::new();
+            if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
             ids.extend(self.bpe.encode(&text));
             return ids;
-        };
-        for m in messages {
-            let role = m["role"].as_str().unwrap_or("user");
-            let content = m["content"].as_str().unwrap_or("");
-            ids.push(s);
-            ids.extend(self.bpe.encode(&format!("{role}\n{content}")));
-            ids.push(e);
-            ids.extend(self.bpe.encode("\n"));
         }
-        ids.push(s);
-        ids.extend(self.bpe.encode("assistant\n"));
-        ids
+        self.encode_special(&self.render_chat(messages))
     }
 
     /// Greedy decode (temperature ignored for now — determinism is the point). Calls `on_delta` with
