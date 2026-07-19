@@ -1,0 +1,28 @@
+<!doctype html><meta charset="utf-8"><title>Ferric × Vercel AI SDK</title>
+<body style="font:14px system-ui;max-width:60ch;margin:2rem auto">
+<h3>Ferric as a Vercel AI SDK provider — on-device generateObject</h3>
+<div id="status">loading…</div>
+<pre id="out" style="background:#111;color:#0f0;padding:1rem;white-space:pre-wrap"></pre>
+<script type="module">
+import { generateObject } from 'https://esm.sh/ai@5';
+import { z } from 'https://esm.sh/zod@3';
+import { ferric, ensureReady } from './ferric-provider.js';
+const log = (...a) => console.log('FERRIC>', ...a);
+const $ = id => document.getElementById(id);
+try {
+  await ensureReady();
+  log('webgpu', !!navigator.gpu);
+  $('status').textContent = 'fetching model…';
+  const model = new Uint8Array(await (await fetch('./model.gguf')).arrayBuffer());
+  log('model bytes', model.length);
+  $('status').textContent = 'generateObject through the AI SDK (guided, on-device)…';
+  const { object } = await generateObject({
+    model: ferric(model, { steps: 80 }),
+    schema: z.object({ name: z.string(), age: z.number().int(), city: z.string(), active: z.boolean() }),
+    prompt: 'Give a fictional person.',
+  });
+  $('out').textContent = JSON.stringify(object, null, 2);
+  const ok = typeof object.name === 'string' && Number.isInteger(object.age) && typeof object.city === 'string' && typeof object.active === 'boolean';
+  log(ok ? 'RESULT_OK' : 'RESULT_BAD', JSON.stringify(object));
+} catch (e) { log('ERROR', String(e && e.message || e)); $('status').textContent = 'error: ' + e; }
+</script></body>
