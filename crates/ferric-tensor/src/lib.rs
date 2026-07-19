@@ -1620,12 +1620,59 @@ impl Tensor {
         let ah = self.contiguous().to_half(dtype::DType::F16);
         let bh = other.contiguous().to_half(dtype::DType::F16);
         let out = empty(&self.ctx, m * n); // zeroed f32 accumulator
-        run(&self.ctx, COOP_GEMM16_WGSL, "coop_gemm16",
-            &[ah.buffer(), bh.buffer(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
-            ((n / 16) as u32, (m / 16) as u32, 1));
+        // Register-blocked (2×2 of 16×16 tiles / workgroup) when M,N are 32-aligned — each subgroup
+        // reuses 2 A-tiles + 2 B-tiles across 4 MMAs, ~halving loads per MMA. Else the single-tile path.
+        if m % 32 == 0 && n % 32 == 0 {
+            run(&self.ctx, COOP_GEMM16_RB_WGSL, "coop_gemm16_rb",
+                &[ah.buffer(), bh.buffer(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+                ((n / 32) as u32, (m / 32) as u32, 1));
+        } else {
+            run(&self.ctx, COOP_GEMM16_WGSL, "coop_gemm16",
+                &[ah.buffer(), bh.buffer(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
+                ((n / 16) as u32, (m / 16) as u32, 1));
+        }
         Tensor::from_parts(&self.ctx, out, vec![m, n])
     }
 }
+
+// Register-blocked 16×16 f16 coop GEMM: one workgroup (subgroup) owns a 32×32 output block = 2×2 grid
+// of 16×16 tiles in 4 f32 accumulators. Per K-step loads 2 A-tiles (top/bottom 16 rows) + 2 B-tiles
+// (left/right 16 cols) and issues 4 coopMultiplyAdd, reusing each loaded tile twice. Same shape lesson
+// as the Metal f32 RB (2×2 sweet spot); f16 A/B, f32 accumulate — the NVIDIA tensor-core config.
+const COOP_GEMM16_RB_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+@group(0) @binding(0) var<storage,read>       a: array<f16>;
+@group(0) @binding(1) var<storage,read>       b: array<f16>;
+@group(0) @binding(2) var<storage,read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform>            dims: vec4<u32>;
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>) {
+    let kk = dims.y; let nn = dims.z;
+    let r0 = wid.y * 32u; let r1 = r0 + 16u;
+    let c0 = wid.x * 32u; let c1 = c0 + 16u;
+    let i00 = r0 * nn + c0; let i01 = r0 * nn + c1; let i10 = r1 * nn + c0; let i11 = r1 * nn + c1;
+    var a00 = coopLoadT<coop_mat16x16<f32, C>>(&c[i00], nn);
+    var a01 = coopLoadT<coop_mat16x16<f32, C>>(&c[i01], nn);
+    var a10 = coopLoadT<coop_mat16x16<f32, C>>(&c[i10], nn);
+    var a11 = coopLoadT<coop_mat16x16<f32, C>>(&c[i11], nn);
+    for (var k: u32 = 0u; k < kk; k = k + 16u) {
+        let ja0 = r0 * kk + k; let ja1 = r1 * kk + k; let jb0 = k * nn + c0; let jb1 = k * nn + c1;
+        let ma0 = coopLoadT<coop_mat16x16<f16, A>>(&a[ja0], kk);
+        let ma1 = coopLoadT<coop_mat16x16<f16, A>>(&a[ja1], kk);
+        let mb0 = coopLoadT<coop_mat16x16<f16, B>>(&b[jb0], nn);
+        let mb1 = coopLoadT<coop_mat16x16<f16, B>>(&b[jb1], nn);
+        a00 = coopMultiplyAdd(ma0, mb0, a00);
+        a01 = coopMultiplyAdd(ma0, mb1, a01);
+        a10 = coopMultiplyAdd(ma1, mb0, a10);
+        a11 = coopMultiplyAdd(ma1, mb1, a11);
+    }
+    coopStoreT(a00, &c[i00], nn);
+    coopStoreT(a01, &c[i01], nn);
+    coopStoreT(a10, &c[i10], nn);
+    coopStoreT(a11, &c[i11], nn);
+}
+"#;
 
 // 16×16 f16-input coop GEMM for NVIDIA tensor cores / Intel XMX: one workgroup (one subgroup, 32
 // lanes) owns a 16×16 output tile, streams K in steps of 16 loading f16 A/B tiles, accumulates in an
