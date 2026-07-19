@@ -2,8 +2,13 @@
 //! every input maps losslessly to tokens and back — `decode(encode(x)) == x` for arbitrary bytes.
 //! Loads the standard `vocab.json` + `merges.txt` pair. No GPU, compiles clean to wasm32.
 //!
-//! (Pre-tokenization here is a simple whitespace-aware split rather than GPT-2's full regex; it's
-//! lossless and correct BPE — exact GPT-2 token-for-token parity would swap in the regex pre-tokenizer.)
+//! Pre-tokenization is the full HF SmolLM/GPT-2 ByteLevel scheme — a `Digits(individual)` split
+//! followed by the GPT-2 regex (contractions, leading-space attach, multi-space runs, punctuation
+//! runs), hand-rolled in `pretokenize()` to match HF `tokenizers` token-for-token. Verified against a
+//! reference id-set: `cargo run -p ferric-tokenizer --example verify_tok` (6/6 identical, incl. the
+//! edge cases — "don't"/"it's", "3.14"→3·.·1·4, multi-space, punctuation). (Full tiktoken/cl100k —
+//! `\p{N}{1,3}` number grouping, case-insensitive contractions — is a separate regex Ferric's target
+//! GGUF models, GPT-2-family all, don't use.)
 
 use std::collections::HashMap;
 
@@ -156,11 +161,18 @@ fn pretokenize(text: &str) -> Vec<String> {
                 let mut e = j; while e < n && pred(f[e]) { e += 1; }
                 out.push(f[i..e].iter().collect()); i = e; continue;
             }
-            // whitespace run (reached only when the space isn't a single space before content):
-            // if content follows, the last space joins it (leave it); otherwise emit the whole run.
+            // whitespace run. The ByteLevel `\s+(?!\S)|\s+` + ` ?\p{L}+` rules attach only a trailing
+            // SPACE (0x20) to the following word; other whitespace (\n, \t) is its own run. A single
+            // space directly before content is already handled by the `sp` branch above, so the
+            // "last char joins next word" split only fires for a genuine ≥2-space run — guarding on
+            // `e-1 > i` and `== ' '`. (The old unconditional `i = e-1` looped forever on a bare "\n",
+            // where e-1 == i, emitting empty strings until OOM — any text with a newline crashed.)
             let mut e = i; while e < n && f[e].is_whitespace() { e += 1; }
-            if e < n { out.push(f[i..e - 1].iter().collect()); i = e - 1; } // ≥2 spaces before content
-            else { out.push(f[i..e].iter().collect()); i = e; }            // run at fragment end
+            if e < n && f[e - 1] == ' ' && e - 1 > i {
+                out.push(f[i..e - 1].iter().collect()); i = e - 1; // last space joins the next word
+            } else {
+                out.push(f[i..e].iter().collect()); i = e;
+            }
         }
     }
     if out.is_empty() { out.push(String::new()); }

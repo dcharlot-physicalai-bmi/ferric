@@ -1,0 +1,25 @@
+[package]
+name = "ferric-serve"
+description = "OpenAI-compatible HTTP server for Ferric — the adoption on-ramp (drop-in /v1/chat/completions over the pure-Rust cross-fabric runtime)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["llm", "openai", "server", "inference", "ai"]
+categories = ["web-programming", "science"]
+
+[[bin]]
+name = "ferric-serve"
+path = "src/main.rs"
+
+[dependencies]
+ferric-core = { path = "../ferric-core", version = "0.1" }
+ferric-tensor = { path = "../ferric-tensor", version = "0.1" }
+ferric-gguf = { path = "../ferric-gguf", version = "0.1" }
+ferric-llama = { path = "../ferric-llama", version = "0.1" }
+ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pollster = "0.4"
