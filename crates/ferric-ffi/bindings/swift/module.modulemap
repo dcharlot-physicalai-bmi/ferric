@@ -1,0 +1,5 @@
+module CFerric {
+    header "libferric.h"
+    link "ferric"
+    export *
+}
