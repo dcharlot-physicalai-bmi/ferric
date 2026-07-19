@@ -191,12 +191,15 @@ impl Engine {
         self.encode_special(&self.render_chat(messages))
     }
 
-    /// Greedy decode (temperature ignored for now — determinism is the point). Calls `on_delta` with
-    /// each newly-decoded text fragment for streaming. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    /// Decode. `temperature` 0 → greedy argmax (deterministic — the default). >0 → top-p sampling
+    /// with a **fixed-seed** RNG, so even sampled output is reproducible (on-brand for the moat).
+    /// Guided decoding always stays argmax (deterministic structured output). Calls `on_delta` per
+    /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
+    fn generate(&self, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
         let mut cache = Cache::new(&self.model.cfg);
         let n_vocab = self.model.cfg.n_vocab;
         let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D; // deterministic seed → reproducible sampling
         let mut gen: Vec<u32> = Vec::new();
         let mut emitted = String::new();
         for step in 0..max_tokens {
@@ -215,7 +218,7 @@ impl Engine {
                     if ok && row[i] > best_l { best_l = row[i]; best = Some(i as u32); }
                 }
                 match best { Some(t) => t, None => break }
-            } else { argmax(row) };
+            } else if temperature > 0.0 { sample_top_p(row, temperature, 0.95, &mut rng) } else { argmax(row) };
             if self.eos.contains(&next) { break; }
             if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
             gen.push(next);
@@ -232,6 +235,25 @@ impl Engine {
 }
 
 fn now_unix() -> u64 { 1_700_000_000 } // static stamp (no wall clock needed for the API contract)
+
+/// Top-p (nucleus) sampling from `row` at `temperature`, using a xorshift RNG. Small models loop badly
+/// at temperature 0; this makes them usable while staying reproducible (the RNG is fixed-seeded).
+fn sample_top_p(row: &[f32], temp: f32, top_p: f32, rng: &mut u64) -> u32 {
+    let maxl = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let probs: Vec<f32> = row.iter().map(|&l| ((l - maxl) / temp).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    let mut idx: Vec<usize> = (0..row.len()).collect();
+    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    // nucleus: smallest set whose probability mass ≥ top_p
+    let (mut cum, mut cut) = (0.0f32, idx.len());
+    for (k, &i) in idx.iter().enumerate() { cum += probs[i] / sum; if cum >= top_p { cut = k + 1; break; } }
+    // xorshift64 → r in [0, nucleus mass)
+    *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+    let r = (*rng >> 11) as f32 / (1u64 << 53) as f32 * cum;
+    let (mut acc, mut pick) = (0.0f32, idx[0]);
+    for &i in &idx[..cut] { acc += probs[i] / sum; if acc >= r { pick = i; break; } }
+    pick as u32
+}
 
 /// Resolve a model spec to a local GGUF path. Accepts a local file, or a HuggingFace ref
 /// `owner/repo[:file.gguf]` — downloads (and caches under ~/.cache/ferric/hub) via `curl` so
@@ -301,7 +323,7 @@ fn main() {
     if args.iter().any(|a| a == "--once") {
         // Smoke test: one chat turn straight through the pipeline, no HTTP.
         let msgs = vec![json!({"role": "user", "content": "Hi"})];
-        let (t, p, g) = eng.generate(&eng.chat_ids(&msgs), 16, None, |d| eprint!("{d}"));
+        let (t, p, g) = eng.generate(&eng.chat_ids(&msgs), 16, 0.0, None, |d| eprint!("{d}"));
         eprintln!("\nferric-serve: --once ok ({p} prompt + {g} gen tokens): {t:?}");
         return;
     }
@@ -348,6 +370,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     let empty = vec![];
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
+    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
     let streaming = req["stream"].as_bool().unwrap_or(false);
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
@@ -363,7 +386,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         let (mut out_text, mut out_calls) = (String::new(), Vec::new());
         for _round in 0..4 {
             let prompt = eng.chat_ids(&messages);
-            let (text, p, g) = eng.generate(&prompt, max_tokens, None, |_| {});
+            let (text, p, g) = eng.generate(&prompt, max_tokens, temperature, None, |_| {});
             ptok += p; gtok += g;
             let calls = ferric_agent::tools::parse_tool_calls(&text);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
@@ -400,7 +423,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
-        eng.generate(&prompt, max_tokens, guide, |delta| {
+        eng.generate(&prompt, max_tokens, temperature, guide, |delta| {
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
                 "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]}));
         });
@@ -408,7 +431,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
         let _ = stream.write_all(b"data: [DONE]\n\n");
     } else {
-        let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, guide, |_| {});
+        let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, temperature, guide, |_| {});
         write_json(stream, 200, &json!({
             "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
@@ -421,10 +444,11 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
     let prompt_text = req["prompt"].as_str().unwrap_or("");
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
+    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.bpe.encode(prompt_text));
-    let (text, ptok, gtok) = eng.generate(&ids, max_tokens, None, |_| {});
+    let (text, ptok, gtok) = eng.generate(&ids, max_tokens, temperature, None, |_| {});
     write_json(stream, 200, &json!({
         "id": format!("cmpl-ferric-{}", ids.len()), "object": "text_completion", "created": now_unix(), "model": eng.name,
         "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
