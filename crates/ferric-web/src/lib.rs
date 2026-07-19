@@ -188,6 +188,73 @@ pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_toke
     Ok(stats)
 }
 
+/// **Guided decoding in the browser** — the moat as a live demo. Runs the same Qwen3-on-WebGPU
+/// generation but constrains the sampler with `ferric_agent::guide` (the exact code the native server
+/// uses), so the output is guaranteed valid JSON — schema-conformant if `schema` is a JSON-Schema
+/// string, else a well-formed JSON object. Because it masks the same logits, an on-device browser tab
+/// and the datacenter produce the *same deterministic* constrained output. Streams deltas via
+/// `on_token(kind, payload)` (kind ∈ {"status","token","done"}); returns the final JSON string.
+#[wasm_bindgen]
+pub async fn bonsai_generate_json(model: Vec<u8>, prompt: String, steps: usize, schema: String, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    let err = |e: String| JsValue::from_str(&e);
+    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(kind), &JsValue::from_str(payload)); };
+    emit("status", "parsing model…");
+    let g = parse(model).map_err(err)?;
+    let (bpe, toks) = build_bpe(&g)?;
+    let u2b = gpt2_byte_decoder();
+    let detok = |ids: &[u32]| -> String {
+        let s: String = ids.iter().map(|&i| toks.get(i as usize).cloned().unwrap_or_default()).collect();
+        String::from_utf8_lossy(&s.chars().filter_map(|c| u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
+    };
+    // Each token's raw bytes (None = special token → disallowed under the constraint, except EOS).
+    let token_bytes: Vec<Option<Vec<u8>>> = toks.iter().map(|t| {
+        let mut b = Vec::with_capacity(t.len());
+        for ch in t.chars() { match u2b.get(&ch) { Some(&x) => b.push(x), None => return None } }
+        Some(b)
+    }).collect();
+
+    emit("status", "uploading weights to GPU…");
+    let ctx = Arc::new(Context::new().await.map_err(err)?);
+    let m = Qwen3::load(&ctx, &g).map_err(err)?;
+    let c = &m.cfg;
+    emit("status", &format!("ready · {:?}", ctx.backend));
+
+    let sch_prog = ferric_agent::guide::compile_str(&schema);
+    let mut guide = match &sch_prog {
+        Some(prog) => ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog)),
+        None => ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object()),
+    };
+    let eos = |t: u32| t == 151645 || t == 151643;
+    let ids = encode_with_bos(&g, &bpe, &prompt);
+    if ids.is_empty() { return Err(err("prompt encoded to zero tokens".into())); }
+    let mut cache = Cache::new(c);
+    let mut seq = ids.clone();
+    let mut emitted = String::new();
+    for step in 0..steps {
+        let logits = if step == 0 { m.forward_cached(&ids, &mut cache) } else { m.forward_cached(&seq[seq.len() - 1..], &mut cache) };
+        let v = logits.to_vec().await;
+        let row = &v[v.len() - c.n_vocab..];
+        // Masked argmax: highest-logit token whose bytes keep the JSON valid (EOS only once complete).
+        let can_stop = guide.can_stop();
+        let (mut best, mut best_l) = (None, f32::NEG_INFINITY);
+        for i in 0..c.n_vocab {
+            let ok = if eos(i as u32) { can_stop }
+                else { match &token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = guide; b.iter().all(|&ch| a.step(ch)) } _ => false } };
+            if ok && row[i] > best_l { best_l = row[i]; best = Some(i as u32); }
+        }
+        let next = match best { Some(t) => t, None => break };
+        if eos(next) { break; }
+        if let Some(b) = &token_bytes[next as usize] { for &ch in b { guide.step(ch); } }
+        seq.push(next);
+        let full = detok(&seq[ids.len()..]);
+        if let Some(delta) = full.strip_prefix(&emitted) { if !delta.is_empty() { emit("token", delta); } }
+        emitted = full;
+    }
+    emit("done", &emitted);
+    Ok(emitted)
+}
+
 /// Cross-fabric proof: run the SAME Qwen3 forward the native binary runs, on the browser's WebGPU,
 /// and return a deterministic fingerprint of the last-position logits (top-8 + fixed probes + sum).
 /// Compared against `run_qwen3 --dump` (native Metal), this proves the moat — bit-comparable numerics

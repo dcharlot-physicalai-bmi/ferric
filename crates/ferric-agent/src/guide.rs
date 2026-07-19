@@ -143,6 +143,13 @@ pub fn compile(schema: &serde_json::Value) -> Option<Vec<Item>> {
     Some(prog)
 }
 
+/// Compile from a JSON-Schema *string* — convenience for callers that don't pull in serde_json
+/// (e.g. the WASM/browser binding). Empty/invalid/non-object → None (caller falls back to json_object).
+pub fn compile_str(schema_json: &str) -> Option<Vec<Item>> {
+    if schema_json.trim().is_empty() { return None; }
+    compile(&serde_json::from_str::<serde_json::Value>(schema_json).ok()?)
+}
+
 fn value_items(sub: &serde_json::Value, prog: &mut Vec<Item>) {
     if let Some(opts) = sub["enum"].as_array() {
         // enum of literals → each option as its exact JSON token bytes.
