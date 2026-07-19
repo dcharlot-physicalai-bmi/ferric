@@ -566,16 +566,53 @@ impl Tensor {
     }
     /// Fused FFN gate/up + SwiGLU when the gate_up weight is a single Q4_K shard (the common case
     /// for Q4_K_M models). Returns `Some(silu(gate)·up)` — `[t, cols/2]` — computed in one kernel with
-    /// no `[t, 2·n_ff]` intermediate; `None` when the weight isn't a lone Q4_K shard (caller falls
-    /// back to `matmul_q(w).swiglu(n_ff)`).
+    /// no `[t, 2·n_ff]` intermediate; `None` when the weight isn't a lone Q4_K/Q5_K/Q6_K shard
+    /// (caller falls back to `matmul_q(w).swiglu(n_ff)`).
     pub fn try_matmul_swiglu(&self, w: &QMatrix) -> Option<Tensor> {
         if w.shards.len() == 1 {
-            if let QShard::Q4_K(sh) = &w.shards[0] { return Some(self.matmul_q4_k_swiglu(sh)); }
+            match &w.shards[0] {
+                QShard::Q4_K(sh) => return Some(self.matmul_q4_k_swiglu(sh)),
+                QShard::Q5_K(sh) => return Some(self.matmul_q5_k_swiglu(sh)),
+                QShard::Q6_K(sh) => return Some(self.matmul_q6_k_swiglu(sh)),
+                _ => {}
+            }
         }
         None
     }
+    /// Full FFN in one dispatch when gate_up is a lone Q4_K shard and down a lone Q6_K shard (the
+    /// Qwen3 Q4_K_M layout) and n_ff/n_embd are 256-block-aligned.
+    ///
+    /// MEASURED NEGATIVE, so OPT-IN (set `FERRIC_MEGA`): correct (token-for-token identical), but the
+    /// one-workgroup-per-token design underfills the GPU at decode and runs **~2× slower** than the
+    /// staged fused-SwiGLU + down path (46 vs ~25 ms/tok, Qwen3-0.6B-Q4_K_M, interleaved). The
+    /// dispatch/intermediate-traffic saved is dwarfed by the occupancy lost. Kept, off by default, as
+    /// a documented experiment — a batched/multi-workgroup redesign would be needed to make it pay.
+    pub fn try_ffn_mega(&self, gate_up: &QMatrix, down: &QMatrix, n_ff: usize) -> Option<Tensor> {
+        if std::env::var("FERRIC_MEGA").is_err() { return None; }
+        if gate_up.shards.len() != 1 || down.shards.len() != 1 { return None; }
+        let gu = match &gate_up.shards[0] { QShard::Q4_K(w) => w, _ => return None };
+        let dn = match &down.shards[0] { QShard::Q6_K(w) => w, _ => return None };
+        if gu.rows != 2 * n_ff || dn.cols != n_ff || n_ff % 256 != 0 || dn.rows % 256 != 0 { return None; }
+        Some(self.ffn_mega_q4k_q6k(gu, dn, n_ff))
+    }
+    pub fn ffn_mega_q4k_q6k(&self, gu: &Q4_KWeights, dn: &Q6_KWeights, n_ff: usize) -> Tensor {
+        let x = self.contiguous();
+        let (rows, n_embd) = (x.shape[0], x.shape[1]);
+        assert_eq!(n_embd, gu.cols, "gate_up in dim mismatch");
+        assert_eq!(dn.rows, n_embd, "down out dim must equal n_embd");
+        assert_eq!(dn.cols, n_ff, "down in dim must equal n_ff");
+        let out = empty(&self.ctx, rows * n_embd);
+        let src = FFN_MEGA_Q4K_Q6K_WGSL.replace("__NFF__", &n_ff.to_string());
+        run(&self.ctx, &src, "ffn_mega_q4k_q6k",
+            &[x.buf.as_ref(), gu.codes.as_ref(), gu.aux.as_ref(), dn.codes.as_ref(), dn.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, n_ff as u32, n_embd as u32, 0])],
+            (rows as u32, 1, 1));
+        Tensor::from_parts(&self.ctx, out, vec![rows, n_embd])
+    }
     fn matmul_qshard(&self, w: &QShard) -> Tensor {
         match w {
+            // Opt-in NVIDIA tensor-core prefill (`FERRIC_COOP16`): a multi-row (prefill) Q2_0 matmul on
+            // (matmul_q2_0 itself carries the opt-in coop16 prefill fast-path — see there.)
             QShard::Q2_0(w) => self.matmul_q2_0(w),
             QShard::Q4_0(w) => self.matmul_q4_0(w),
             QShard::Q4_1(w) => self.matmul_q4_1(w),
@@ -1081,6 +1118,42 @@ impl Tensor {
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, n_ff])
     }
+    /// Fused gate/up + SwiGLU for a Q5_K gate_up weight (Q5_K_M FFNs). Same whole-block fusion as
+    /// `matmul_q4_k_swiglu`, plus the 5th (qh) bit per quant.
+    pub fn matmul_q5_k_swiglu(&self, w: &Q5_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
+        let n_ff = w.rows / 2;
+        let out = empty(&self.ctx, rows * n_ff);
+        let n = rows * n_ff;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q5_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q5_k_swiglu",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, n_ff])
+    }
+    /// Fused gate/up + SwiGLU for a Q6_K gate_up weight (Q6_K FFNs). Same whole-block fusion; Q6_K
+    /// x is a plain f32 array (not vec4-packed).
+    pub fn matmul_q6_k_swiglu(&self, w: &Q6_KWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
+        let n_ff = w.rows / 2;
+        let out = empty(&self.ctx, rows * n_ff);
+        let n = rows * n_ff;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q6_K_SWIGLU_WGSL.replace("__HELPERS__", Q6_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q6_k_swiglu",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, n_ff])
+    }
     pub fn matmul_q4_k_coop(&self, w: &Q4_KWeights) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
@@ -1199,6 +1272,11 @@ impl Tensor {
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q2_0_coop(w);
         }
+        // NOTE: a model-facing coop16 hook (route prefill Q2_0 through matmul_q2_0_coop16 on Vulkan)
+        // was prototyped here but NOT shipped: it dequants each weight to f32 [K,N] per call, and one
+        // batched forward keeps ~140 such buffers live (~4.6 GB) → OOMs a 6 GB card before completing,
+        // so it can't be validated end-to-end. Needs f16 weight caching (dequant once at load, reuse)
+        // — the kernel + microbenchmark (matmul_q2_0_coop16, up to 6.2×) are proven; wiring waits on that.
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         if q2_0_split_k(rows, w.rows) {
@@ -1635,6 +1713,181 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = qk_dot(o, r, nblk, in_dim);         // gate row
     let u = qk_dot(o + n_ff, r, nblk, in_dim);  // up row
     out[idx] = (g / (1.0 + exp(-g))) * u;       // silu(g)·u
+}
+"#;
+
+// Fused FFN gate/up + SwiGLU for Q5_K — Q4_K plus the 5th (qh) bit per quant.
+const MATMUL_Q5_K_SWIGLU_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
+__HELPERS__
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb40 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let qhw = codes[cb40 + 32u + w];
+                let bit = vec4<f32>(f32((qhw >> s) & 1u), f32((qhw >> (8u + s)) & 1u), f32((qhw >> (16u + s)) & 1u), f32((qhw >> (24u + s)) & 1u)) * 16.0;
+                let q = nib + bit;
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, q) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    if (idx >= rows * n_ff) { return; }
+    let o = idx % n_ff; let r = idx / n_ff;
+    let nblk = in_dim / 256u;
+    let g = qk_dot(o, r, nblk, in_dim);
+    let u = qk_dot(o + n_ff, r, nblk, in_dim);
+    out[idx] = (g / (1.0 + exp(-g))) * u;
+}
+"#;
+
+// Fused FFN gate/up + SwiGLU for Q6_K — x is a plain f32 array; 6-bit reassembly per Q6_K_BODY.
+const MATMUL_Q6_K_SWIGLU_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
+__HELPERS__
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk;
+        let cb = bi * 48u; let ab = bi * 5u;
+        let d = unpack2x16float(aux[ab]).x;
+        let xbb = r * in_dim + blk * 256u;
+        for (var hf: u32 = 0u; hf < 2u; hf = hf + 1u) {
+            let qlo = 64u * hf; let qho = 32u * hf; let sco = 8u * hf; let xh = xbb + 128u * hf;
+            for (var l: u32 = 0u; l < 32u; l = l + 1u) {
+                let is = l >> 4u; let h = qhb(cb, qho + l);
+                let q1 = i32((qlb(cb, qlo + l) & 0xFu) | ((h & 3u) << 4u)) - 32;
+                let q2 = i32((qlb(cb, qlo + l + 32u) & 0xFu) | (((h >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((qlb(cb, qlo + l) >> 4u) | (((h >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((qlb(cb, qlo + l + 32u) >> 4u) | (((h >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + x[xh + l]        * d * scb(ab, sco + is)      * f32(q1);
+                acc = acc + x[xh + 32u + l]  * d * scb(ab, sco + is + 2u) * f32(q2);
+                acc = acc + x[xh + 64u + l]  * d * scb(ab, sco + is + 4u) * f32(q3);
+                acc = acc + x[xh + 96u + l]  * d * scb(ab, sco + is + 6u) * f32(q4);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    if (idx >= rows * n_ff) { return; }
+    let o = idx % n_ff; let r = idx / n_ff;
+    let nblk = in_dim / 256u;
+    let g = qk_dot(o, r, nblk, in_dim);
+    let u = qk_dot(o + n_ff, r, nblk, in_dim);
+    out[idx] = (g / (1.0 + exp(-g))) * u;
+}
+"#;
+
+// FULL FFN megakernel (spike): gate/up (Q4_K) + SwiGLU + down (Q6_K) in ONE dispatch. One workgroup
+// per token computes the whole FFN — the n_ff-wide SwiGLU activation lives in workgroup shared memory
+// (`hff`) and is never written to global, so the down projection reads it from fast on-chip memory and
+// the [t, n_ff] intermediate + a whole dispatch vanish. The trade: one workgroup/token underfills the
+// GPU at decode. Whether locality+fewer-dispatches beats the occupancy loss is a measured question.
+// __NFF__ = n_ff (constant workgroup-array size, stamped at dispatch).
+const FFN_MEGA_Q4K_Q6K_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:        array<vec4<f32>>;  // [rows, n_embd]
+@group(0) @binding(1) var<storage,read>        gu_codes: array<u32>;         // Q4_K gate_up [2n_ff, n_embd]
+@group(0) @binding(2) var<storage,read>        gu_aux:   array<u32>;
+@group(0) @binding(3) var<storage,read>        dn_codes: array<u32>;         // Q6_K down [n_embd, n_ff]
+@group(0) @binding(4) var<storage,read>        dn_aux:   array<u32>;
+@group(0) @binding(5) var<storage,read_write>  out:      array<f32>;          // [rows, n_embd]
+@group(0) @binding(6) var<uniform>             info:     vec4<u32>;           // rows, n_ff, n_embd, _
+var<workgroup> hff: array<f32, __NFF__>;
+// Q4_K gate_up dequant-dot (row o_row of gate_up against token r), vec4 over x.
+fn gu_scbyte(base: u32, i: u32) -> u32 { return (gu_aux[base + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn gu_scmin(base: u32, j: u32) -> vec2<u32> {
+    if (j < 4u) { return vec2<u32>(gu_scbyte(base, j) & 63u, gu_scbyte(base, j + 4u) & 63u); }
+    let a = gu_scbyte(base, j + 4u); let lo = gu_scbyte(base, j - 4u); let hi = gu_scbyte(base, j);
+    return vec2<u32>((a & 0x0Fu) | ((lo >> 6u) << 4u), (a >> 4u) | ((hi >> 6u) << 4u));
+}
+fn gu_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(gu_aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = gu_scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = gu_codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+// Q6_K down dequant-dot (row o_row of down against the shared hff vector), scalar over hff.
+fn dn_qlb(cb: u32, i: u32) -> u32 { return (dn_codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn dn_qhb(cb: u32, i: u32) -> u32 { return (dn_codes[cb + 32u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn dn_scb(ab: u32, i: u32) -> f32 { let b = (dn_aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; return f32(i32(b << 24u) >> 24u); }
+fn dn_dot(o_row: u32, nblk: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let cb = bi * 48u; let ab = bi * 5u;
+        let d = unpack2x16float(dn_aux[ab]).x;
+        let xbb = blk * 256u;
+        for (var hf: u32 = 0u; hf < 2u; hf = hf + 1u) {
+            let qlo = 64u * hf; let qho = 32u * hf; let sco = 8u * hf; let xh = xbb + 128u * hf;
+            for (var l: u32 = 0u; l < 32u; l = l + 1u) {
+                let is = l >> 4u; let h = dn_qhb(cb, qho + l);
+                let q1 = i32((dn_qlb(cb, qlo + l) & 0xFu) | ((h & 3u) << 4u)) - 32;
+                let q2 = i32((dn_qlb(cb, qlo + l + 32u) & 0xFu) | (((h >> 2u) & 3u) << 4u)) - 32;
+                let q3 = i32((dn_qlb(cb, qlo + l) >> 4u) | (((h >> 4u) & 3u) << 4u)) - 32;
+                let q4 = i32((dn_qlb(cb, qlo + l + 32u) >> 4u) | (((h >> 6u) & 3u) << 4u)) - 32;
+                acc = acc + hff[xh + l]        * d * dn_scb(ab, sco + is)      * f32(q1);
+                acc = acc + hff[xh + 32u + l]  * d * dn_scb(ab, sco + is + 2u) * f32(q2);
+                acc = acc + hff[xh + 64u + l]  * d * dn_scb(ab, sco + is + 4u) * f32(q3);
+                acc = acc + hff[xh + 96u + l]  * d * dn_scb(ab, sco + is + 6u) * f32(q4);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wg.x; let tid = lid.x;
+    let n_ff = info.y; let n_embd = info.z;
+    let nblk_e = n_embd / 256u; let nblk_f = n_ff / 256u;
+    for (var j: u32 = tid; j < n_ff; j = j + 256u) {
+        let g = gu_dot(j, row, nblk_e, n_embd);
+        let u = gu_dot(j + n_ff, row, nblk_e, n_embd);
+        hff[j] = (g / (1.0 + exp(-g))) * u;
+    }
+    workgroupBarrier();
+    for (var k: u32 = tid; k < n_embd; k = k + 256u) {
+        out[row * n_embd + k] = dn_dot(k, nblk_f);
+    }
 }
 "#;
 
