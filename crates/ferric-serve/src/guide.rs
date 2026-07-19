@@ -124,9 +124,197 @@ impl Json {
     }
 }
 
+// ===== JSON-Schema-conformant decoding =====
+// A schema compiles to a flat template: fixed structural literals (`{"key":`, `,"key":`, `}`) with
+// typed value slots between them, properties emitted in declaration order (compact, no free
+// whitespace). This covers the dominant "extract these fields" contract (Pydantic-style models):
+// object with scalar/enum/nested-object properties; arrays and unknown types fall back to a free
+// JSON value (embedded `Json`). The acceptor (`Schema`) is Copy — it borrows the compiled program.
+
+/// One template element: a fixed literal to emit, or a typed value slot.
+#[derive(Clone)]
+pub enum Item { Lit(Vec<u8>), Str, Int, Num, Bool, Enum(Vec<Vec<u8>>), Any }
+
+/// Compile a JSON-Schema object to a template. Returns None if it isn't a supported object schema.
+pub fn compile(schema: &serde_json::Value) -> Option<Vec<Item>> {
+    if schema["type"].as_str()? != "object" { return None; }
+    let mut prog = Vec::new();
+    compile_object(schema, &mut prog);
+    Some(prog)
+}
+
+fn value_items(sub: &serde_json::Value, prog: &mut Vec<Item>) {
+    if let Some(opts) = sub["enum"].as_array() {
+        // enum of literals → each option as its exact JSON token bytes.
+        let bytes: Vec<Vec<u8>> = opts.iter().map(|o| serde_json::to_vec(o).unwrap_or_default()).collect();
+        prog.push(Item::Enum(bytes));
+        return;
+    }
+    match sub["type"].as_str().unwrap_or("") {
+        "string" => prog.push(Item::Str),
+        "integer" => prog.push(Item::Int),
+        "number" => prog.push(Item::Num),
+        "boolean" => prog.push(Item::Bool),
+        "object" => compile_object(sub, prog),
+        _ => prog.push(Item::Any), // array / null / unknown → free JSON value
+    }
+}
+
+fn compile_object(schema: &serde_json::Value, prog: &mut Vec<Item>) {
+    let empty = serde_json::Map::new();
+    let props = schema["properties"].as_object().unwrap_or(&empty);
+    if props.is_empty() { prog.push(Item::Lit(b"{}".to_vec())); return; }
+    for (i, (key, sub)) in props.iter().enumerate() {
+        let head = if i == 0 { format!("{{{}:", serde_json::to_string(key).unwrap()) } else { format!(",{}:", serde_json::to_string(key).unwrap()) };
+        prog.push(Item::Lit(head.into_bytes()));
+        value_items(sub, prog);
+    }
+    prog.push(Item::Lit(b"}".to_vec()));
+}
+
+#[derive(Clone, Copy)]
+enum Val { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize), Any(Json) } // Str(u8): 0 body,1 esc,2..=5 in \u
+
+#[derive(Clone, Copy)]
+pub struct Schema<'a> { prog: &'a [Item], pos: usize, loff: usize, val: Val }
+
+impl<'a> Schema<'a> {
+    pub fn new(prog: &'a [Item]) -> Self { Schema { prog, pos: 0, loff: 0, val: Val::Fresh } }
+    pub fn can_stop(&self) -> bool { self.pos >= self.prog.len() }
+
+    fn advance(&mut self) { self.pos += 1; self.loff = 0; self.val = Val::Fresh; }
+
+    pub fn step(&mut self, b: u8) -> bool {
+        if self.pos >= self.prog.len() { return false; }
+        match &self.prog[self.pos] {
+            Item::Lit(bytes) => {
+                if self.loff < bytes.len() && bytes[self.loff] == b { self.loff += 1; if self.loff == bytes.len() { self.advance(); } true } else { false }
+            }
+            Item::Str => self.step_str(b),
+            Item::Int => self.step_num(b, true),
+            Item::Num => self.step_num(b, false),
+            Item::Bool => self.step_bool(b),
+            Item::Enum(opts) => self.step_enum(b, opts),
+            Item::Any => self.step_any(b),
+        }
+    }
+
+    fn step_str(&mut self, b: u8) -> bool {
+        match self.val {
+            Val::Fresh => { if b == b'"' { self.val = Val::Str(0); true } else { false } }
+            Val::Str(0) => { if b == b'"' { self.advance(); true } else if b == b'\\' { self.val = Val::Str(1); true } else if b < 0x20 { false } else { true } }
+            Val::Str(1) => { if matches!(b, b'"'|b'\\'|b'/'|b'b'|b'f'|b'n'|b'r'|b't') { self.val = Val::Str(0); true } else if b == b'u' { self.val = Val::Str(2); true } else { false } }
+            Val::Str(n) => { if b.is_ascii_hexdigit() { self.val = if n == 5 { Val::Str(0) } else { Val::Str(n + 1) }; true } else { false } }
+            _ => false,
+        }
+    }
+
+    fn step_num(&mut self, b: u8, int_only: bool) -> bool {
+        let st = match self.val { Val::Num(s) => s, Val::Fresh => { // start
+            let s = match b { b'-' => NumSt::Neg, b'0' => NumSt::IntZero, b'1'..=b'9' => NumSt::Int, _ => return false };
+            self.val = Val::Num(s); return true;
+        } _ => return false };
+        let dig = b.is_ascii_digit();
+        let next = match st {
+            NumSt::Neg => if b == b'0' { Some(NumSt::IntZero) } else if (b'1'..=b'9').contains(&b) { Some(NumSt::Int) } else { None },
+            NumSt::IntZero => if !int_only && b == b'.' { Some(NumSt::Dot) } else if !int_only && (b == b'e' || b == b'E') { Some(NumSt::Exp) } else { None },
+            NumSt::Int => if dig { Some(NumSt::Int) } else if !int_only && b == b'.' { Some(NumSt::Dot) } else if !int_only && (b == b'e' || b == b'E') { Some(NumSt::Exp) } else { None },
+            NumSt::Dot => if dig { Some(NumSt::Frac) } else { None },
+            NumSt::Frac => if dig { Some(NumSt::Frac) } else if b == b'e' || b == b'E' { Some(NumSt::Exp) } else { None },
+            NumSt::Exp => if b == b'+' || b == b'-' { Some(NumSt::ExpSign) } else if dig { Some(NumSt::ExpDig) } else { None },
+            NumSt::ExpSign => if dig { Some(NumSt::ExpDig) } else { None },
+            NumSt::ExpDig => if dig { Some(NumSt::ExpDig) } else { None },
+        };
+        match next {
+            Some(s2) => { self.val = Val::Num(s2); true }
+            None if st.completable() => { self.advance(); self.step(b) } // number ended — reprocess byte against next item
+            None => false,
+        }
+    }
+
+    fn step_bool(&mut self, b: u8) -> bool {
+        let (kind, m) = match self.val { Val::Bool(k, m) => (k, m), Val::Fresh => {
+            match b { b't' => { self.val = Val::Bool(0, 1); return true } b'f' => { self.val = Val::Bool(1, 1); return true } _ => return false }
+        } _ => return false };
+        let word: &[u8] = if kind == 0 { b"true" } else { b"false" };
+        if (m as usize) < word.len() && word[m as usize] == b {
+            let nm = m + 1; if nm as usize == word.len() { self.advance(); } else { self.val = Val::Bool(kind, nm); } true
+        } else { false }
+    }
+
+    fn step_enum(&mut self, b: u8, opts: &[Vec<u8>]) -> bool {
+        let (mut mask, off) = match self.val { Val::Enum(m, o) => (m, o), Val::Fresh => ((1u64 << opts.len().min(64)) - 1, 0), _ => return false };
+        // keep only options whose byte `off` == b
+        let mut any = false;
+        for (i, o) in opts.iter().enumerate().take(64) {
+            if mask & (1 << i) != 0 { if off < o.len() && o[off] == b { any = true; } else { mask &= !(1 << i); } }
+        }
+        if !any { return false; }
+        let noff = off + 1;
+        // if any surviving option is fully matched at noff, that option completes the value
+        let done = opts.iter().enumerate().take(64).any(|(i, o)| mask & (1 << i) != 0 && o.len() == noff);
+        if done { self.advance(); } else { self.val = Val::Enum(mask, noff); }
+        true
+    }
+
+    fn step_any(&mut self, b: u8) -> bool {
+        let mut j = match self.val { Val::Any(j) => j, Val::Fresh => Json::new(), _ => return false };
+        if !j.step(b) {
+            // value may have ended (e.g. a number closed by the next literal) — if complete, reprocess.
+            if j.can_stop() { self.advance(); return self.step(b); }
+            return false;
+        }
+        // a complete top-level value in the embedded acceptor → this slot is done, but Json can't tell
+        // mid-stream for objects/strings; it reports can_stop after closing. Advance when it can stop AND
+        // the char just consumed closed it (handled by re-entry above for numbers). For strings/objects,
+        // detect completion:
+        if j.can_stop() { self.advance(); } else { self.val = Val::Any(j); }
+        true
+    }
+}
+
+/// A guided-decoding constraint: free-form-but-valid JSON, or schema-conformant JSON.
+#[derive(Clone, Copy)]
+pub enum Guide<'a> { Json(Json), Schema(Schema<'a>) }
+impl<'a> Guide<'a> {
+    pub fn step(&mut self, b: u8) -> bool { match self { Guide::Json(j) => j.step(b), Guide::Schema(s) => s.step(b) } }
+    pub fn can_stop(&self) -> bool { match self { Guide::Json(j) => j.can_stop(), Guide::Schema(s) => s.can_stop() } }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Json;
+    use super::{compile, Json, Schema};
+    fn sch_accepts(schema: &str, out: &str) -> bool {
+        let v: serde_json::Value = serde_json::from_str(schema).unwrap();
+        let prog = compile(&v).expect("compile");
+        let mut s = Schema::new(&prog);
+        for &b in out.as_bytes() { if !s.step(b) { return false; } }
+        s.can_stop()
+    }
+    #[test]
+    fn schema_object() {
+        let sc = r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}}}"#;
+        assert!(sch_accepts(sc, r#"{"name":"Bob","age":42}"#));
+        assert!(!sch_accepts(sc, r#"{"name":"Bob","age":4.2}"#));   // integer slot rejects a float
+        assert!(!sch_accepts(sc, r#"{"age":42,"name":"Bob"}"#));    // wrong key order
+        assert!(!sch_accepts(sc, r#"{"name":"Bob"}"#));             // missing required field
+        assert!(!sch_accepts(sc, r#"{"name":42,"age":42}"#));       // string slot rejects a number
+    }
+    #[test]
+    fn schema_enum_and_types() {
+        let sc = r#"{"type":"object","properties":{"color":{"enum":["red","green"]},"ok":{"type":"boolean"},"n":{"type":"number"}}}"#;
+        assert!(sch_accepts(sc, r#"{"color":"red","ok":true,"n":-3.5e2}"#));
+        assert!(sch_accepts(sc, r#"{"color":"green","ok":false,"n":0}"#));
+        assert!(!sch_accepts(sc, r#"{"color":"blue","ok":true,"n":1}"#)); // not in enum
+        assert!(!sch_accepts(sc, r#"{"color":"red","ok":yes,"n":1}"#));   // bad boolean
+    }
+    #[test]
+    fn schema_nested() {
+        let sc = r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"object","properties":{"c":{"type":"string"}}}}}"#;
+        assert!(sch_accepts(sc, r#"{"a":1,"b":{"c":"hi"}}"#));
+        assert!(!sch_accepts(sc, r#"{"a":1,"b":{"c":9}}"#)); // nested string slot rejects number
+    }
+
     fn accepts(s: &str) -> bool {
         let mut j = Json::new();
         for &b in s.as_bytes() { if !j.step(b) { return false; } }

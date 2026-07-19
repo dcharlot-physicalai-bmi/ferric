@@ -113,7 +113,7 @@ impl Engine {
 
     /// Greedy decode (temperature ignored for now — determinism is the point). Calls `on_delta` with
     /// each newly-decoded text fragment for streaming. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<guide::Json>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    fn generate(&self, prompt: &[u32], max_tokens: usize, mut guide: Option<guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
         let mut cache = Cache::new(&self.model.cfg);
         let n_vocab = self.model.cfg.n_vocab;
         let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
@@ -313,9 +313,13 @@ fn chat(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
             messages.insert(0, json!({"role": "system", "content": tp}));
         }
     }
-    // Guided decoding: OpenAI `response_format: {type: "json_object"|"json_schema"}` → force valid JSON.
+    // Guided decoding: OpenAI `response_format`. `json_schema` compiles the schema to a template
+    // (declaration key order); `json_object` forces well-formed JSON. `sch_prog` outlives the guide.
     let rf = req["response_format"]["type"].as_str().unwrap_or("");
-    let guide = if rf == "json_object" || rf == "json_schema" { Some(guide::Json::object()) } else { None };
+    let sch_prog = if rf == "json_schema" { guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
+    let guide = if let Some(prog) = &sch_prog { Some(guide::Guide::Schema(guide::Schema::new(prog))) }
+        else if rf == "json_object" || rf == "json_schema" { Some(guide::Guide::Json(guide::Json::object())) }
+        else { None };
     let prompt = eng.chat_ids(&messages);
     let id = format!("chatcmpl-ferric-{}", prompt.len());
     if streaming {
