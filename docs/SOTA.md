@@ -111,17 +111,29 @@ false passes**. Two distinct naga-fork bugs stack on Vulkan:
    (`&c[r0*nn+c0]`); the SPIR-V backend panics there (`write_bounds_check` → "Expression is not cached").
    Let-binding every coop pointer index (the fix `COOP_GEMM_WGSL` already had) makes it **compile**.
 2. *Zero output* — once compiling, every `coopLoad`/`coopMultiplyAdd`/`coopStore` chain returns **all
-   zeros** on the RTX 4050, for **both** the RB and plain 8×8 kernels, at **every** shape, even with
-   CPU-uploaded operands (so it is NOT the dispatch-write-visibility story a first pass suggested — it
-   is the coop ops themselves). A real, unfixed naga SPIR-V codegen bug for `KHR_cooperative_matrix`.
+   zeros** on the RTX 4050, for **both** kernels, at **every** shape, even with CPU-uploaded operands.
 
-The reason this survived so long: `coop_gemm.rs` validated coop vs naive with sin inputs that cancel to
+**Root cause of #2 (2026-07-19): a shape-support mismatch, NOT a codegen bug.** Dumped the emitted
+SPIR-V (via a standalone naga project — the offline vendor tree can't add wgsl-in/spv-out deps, but
+SPIR-V codegen is GPU-independent) and ran spirv-dis/spirv-val. Three codegen theories were chased on
+the box and **rejected**: (a) the SPIR-V *version header* — coop needs ≥1.6 and the fork emits a 1.0
+header when `lang_version` is low, which fails spirv-val; a genuine fork bug, but wgpu already passes
+1.6 for a Vulkan-1.3 device, so fixing it changed nothing; (b) the coop load/store lack a
+`NonPrivatePointer` memory operand under the (mandatory) Vulkan memory model — adding it, still zeros;
+(c) bounds-checking zeroing the access — wgpu uses `Restrict`, and forcing `Unchecked` didn't help. The
+module is **valid** and the feature is present, which leaves the shape: **NVIDIA's KHR_cooperative_matrix
+enumerates specific configs (typically 16×16×16); the kernel hardcodes 8×8 because that is what Metal's
+`simdgroup_matrix<f32>` requires. An unsupported shape compiles but executes as undefined → zeros.** The
+fix is a **separate 16×16 Vulkan/NVIDIA coop path** (keeping 8×8 for Metal) — a real kernel effort, not
+a naga patch. All exploratory fork edits were reverted.
+
+The false pass survived because `coop_gemm.rs` validated coop vs naive with sin inputs that cancel to
 ~1e-2 under an *absolute* 6e-2 threshold, so an all-zero result "passed". The check is now **relative**
 (a zero result scores relΔ≈1.0 and fails), and `coop_gemm_ok()` is **gated to Metal** so no caller can
 pick up the broken NVIDIA path. **This does not touch cross-fabric model parity** — the real 1.7B runs
-the scalar quant matmul on every fabric, never coop, so the NVIDIA/Vulkan fingerprint (Σ −395780.119,
-argmax 12095) stands. Tensor-core prefill on NVIDIA (the two-pass dequant→f32→coop route measured at a
-would-be 12–32×) is real *throughput* but blocked on bug #2; it lands only once the coop ops compute.
+the scalar quant matmul on every fabric, never coop, so the NVIDIA/Vulkan fingerprint (argmax 12095)
+stands. Tensor-core prefill on NVIDIA (the two-pass dequant→f32→coop route, a would-be 12–32×) needs the
+16×16 path first.
 
 **Unbounded exact attention (both paths default).** Both hot-path attention kernels stream their
 keys in 2048-key chunks with an **online softmax** (running max/sum + a per-thread output accumulator),
@@ -284,8 +296,20 @@ bandwidth-bound. The Q2_0 GEMV itself is already well-tuned (word-strided coales
 activations, full workgroup occupancy — an "idle-threads" worry was checked and disproved) and sits
 at ~32% of the memory roofline because on-the-fly ternary unpacking is compute-bound, which is
 inherent to the format. So the remaining levers are structural: fuse whole layers to shorten the
-dependent chain, a preallocated write-in-place KV cache (vs today's re-concatenate) for long context,
-and eventually multi-token decode — not shaving individual kernels.
+dependent chain and eventually multi-token decode — not shaving individual kernels.
+
+**Write-in-place KV cache — shipped (dense Qwen/Llama path).** The per-layer cache used to
+`pk.cat(&k, 0)` every step, re-copying the *entire* K/V history (O(len) per step → O(T²) over a
+generation). It now appends the new rows into a preallocated `KvBuf` that doubles when full (amortized
+O(1) rows copied per step; attention reads a zero-copy `[len, width]` view), so a long generation is
+O(T). The stored bytes are identical, so it's **exactly correctness-preserving** — token-for-token
+identical to llama.cpp on all three validation models *and* across a buffer doubling (N=100 crosses
+64→128). **Measured** (controlled interleaved A/B, Qwen3-0.6B-Q4_K_M, M5 Max): ~3% faster at N=800
+(28–30 vs 29–31 ms/tok), and the gap widens with context since the removed `cat` cost is O(len). Honest
+scale: decode stays dominated by attention compute over the growing KV and the dispatch chain, so this
+removes a real but non-dominant term — the win is modest at these sizes and grows for long context /
+larger models. `KvBuf` lives in `ferric-tensor` (an append compute-kernel through the batch machinery,
+so ordering + buffer retention come for free); `qwen35`'s GDN-hybrid cache is untouched.
 
 ### The cache: state carry is the whole game
 Both halves of the hybrid resume. Attention keeps K/V; the gated delta net carries its recurrent
