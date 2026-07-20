@@ -30,6 +30,7 @@ pub struct Cfg {
     pub qkv_bias: bool,    // Qwen2 has q/k/v biases; Qwen3/Llama don't
     pub is_gemma: bool,    // Gemma: (1+w) norms, √d embed scale, post-attn/post-ffn norms, gelu, per-layer rope
     pub embd_scale: f32,   // Gemma scales token embeddings by √n_embd; 1.0 otherwise
+    pub sliding_window: usize, // Gemma local layers attend to the last `sliding_window` tokens (0 = full)
 }
 
 impl Cfg {
@@ -59,6 +60,7 @@ impl Cfg {
             qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
             is_gemma,
             embd_scale: if is_gemma { (n_embd as f32).sqrt() } else { 1.0 },
+            sliding_window: u("attention.sliding_window").unwrap_or(0),
         })
     }
 }
@@ -121,6 +123,7 @@ pub struct Layer {
     post_attn_norm: Option<Tensor>, // Gemma: normalizes the attn output before the residual add
     post_ffn_norm: Option<Tensor>,  // Gemma: normalizes the ffn output before the residual add
     rope_base: f32,                 // per-layer RoPE θ (Gemma alternates local 1e4 / global 1e6)
+    window: usize,                  // sliding-window size for this layer (0 = full attention)
 }
 
 /// Per-layer attention K/V history. One step per token: append the new K/V into a grow-in-place
@@ -180,8 +183,11 @@ impl Qwen3 {
             } else {
                 (Proj::load(ctx, g, &[&b("ffn_up.weight")])?, cfg.n_ff)
             };
-            // Gemma alternates attention: 1 global layer every 6 (θ=rope_base=1e6), the rest local (θ=1e4).
-            let rope_base = if cfg.is_gemma && il % 6 != 5 { 10000.0 } else { cfg.rope_base };
+            // Gemma alternates attention: 1 global layer every 6 (full attn, θ=rope_base=1e6), the rest
+            // local (sliding-window, θ=1e4). Non-Gemma layers are always full causal (window 0).
+            let is_local = cfg.is_gemma && il % 6 != 5;
+            let rope_base = if is_local { 10000.0 } else { cfg.rope_base };
+            let window = if is_local { cfg.sliding_window } else { 0 };
             layers.push(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
                 ffn_norm: nrm(&b("ffn_norm.weight"), cfg.n_embd)?,
@@ -198,6 +204,7 @@ impl Qwen3 {
                 post_attn_norm: if cfg.is_gemma { Some(nrm(&b("post_attention_norm.weight"), cfg.n_embd)?) } else { None },
                 post_ffn_norm: if cfg.is_gemma { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
                 rope_base,
+                window,
             });
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
@@ -262,7 +269,13 @@ impl Qwen3 {
         // decode: fused single-query; prefill: flash (O(T) memory, no [nh,T,T] matrix) up to its
         // shared-memory limit, else the composed causal path. All three are the same math.
         let s = kc.shape[0];
-        let o = if t == 1 {
+        // FERRIC_NOWINDOW disables the sliding window (attends to all keys) — for A/B-ing its effect.
+        let win = if std::env::var("FERRIC_NOWINDOW").is_ok() { 0 } else { l.window };
+        let o = if win > 0 {
+            // Sliding-window (Gemma local layer): the query attends only to the last `window` keys.
+            if t == 1 { nn::decode_attention_win(&q, &kc, &vc, nh, nkv, win) }
+            else { nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win) }
+        } else if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv)
         } else if t == s && s <= 65535 && hd <= 128 {
             q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
