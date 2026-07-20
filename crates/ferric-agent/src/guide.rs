@@ -133,7 +133,7 @@ impl Json {
 
 /// One template element: a fixed literal to emit, or a typed value slot.
 #[derive(Clone)]
-pub enum Item { Lit(Vec<u8>), Str, Int, Num, Bool, Enum(Vec<Vec<u8>>), Any }
+pub enum Item { Lit(Vec<u8>), Str, Int, Num, Bool, Enum(Vec<Vec<u8>>), Any, Arr(Box<Item>) }
 
 /// Compile a JSON-Schema object to a template. Returns None if it isn't a supported object schema.
 pub fn compile(schema: &serde_json::Value) -> Option<Vec<Item>> {
@@ -163,7 +163,27 @@ fn value_items(sub: &serde_json::Value, prog: &mut Vec<Item>) {
         "number" => prog.push(Item::Num),
         "boolean" => prog.push(Item::Bool),
         "object" => compile_object(sub, prog),
-        _ => prog.push(Item::Any), // array / null / unknown → free JSON value
+        // Typed array of a scalar/enum element → enforce `[`, elements, commas, `]`. Arrays of objects
+        // or nested arrays (no single-Item element) fall back to a free JSON value.
+        "array" => match scalar_item(&sub["items"]) {
+            Some(el) => prog.push(Item::Arr(Box::new(el))),
+            None => prog.push(Item::Any),
+        },
+        _ => prog.push(Item::Any), // null / unknown → free JSON value
+    }
+}
+
+/// A sub-schema that compiles to a single scalar/enum `Item` (the allowed element of a typed array).
+fn scalar_item(sub: &serde_json::Value) -> Option<Item> {
+    if let Some(opts) = sub["enum"].as_array() {
+        return Some(Item::Enum(opts.iter().map(|o| serde_json::to_vec(o).unwrap_or_default()).collect()));
+    }
+    match sub["type"].as_str().unwrap_or("") {
+        "string" => Some(Item::Str),
+        "integer" => Some(Item::Int),
+        "number" => Some(Item::Num),
+        "boolean" => Some(Item::Bool),
+        _ => None,
     }
 }
 
@@ -180,7 +200,15 @@ fn compile_object(schema: &serde_json::Value, prog: &mut Vec<Item>) {
 }
 
 #[derive(Clone, Copy)]
-enum Val { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize), Any(Json) } // Str(u8): 0 body,1 esc,2..=5 in \u
+enum Val { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize), Any(Json), Arr(u8, ArrElem) } // Str(u8): 0 body,1 esc,2..=5 in \u; Arr(phase, element-substate)
+
+/// In-progress state of the current element inside a typed array (mirrors the scalar `Val` variants,
+/// but non-recursive so `Val::Arr` stays `Copy`). Enum's option list lives in the array's `Item`.
+#[derive(Clone, Copy)]
+enum ArrElem { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize) }
+
+/// Outcome of feeding a byte to a typed-array element acceptor.
+enum EO { Reject, Consumed, Completed, EndedBefore } // EndedBefore: byte isn't the element's (number closed by lookahead) — reprocess as structural
 
 #[derive(Clone, Copy)]
 pub struct Schema<'a> { prog: &'a [Item], pos: usize, loff: usize, val: Val }
@@ -203,6 +231,36 @@ impl<'a> Schema<'a> {
             Item::Bool => self.step_bool(b),
             Item::Enum(opts) => self.step_enum(b, opts),
             Item::Any => self.step_any(b),
+            Item::Arr(elem) => self.step_arr(elem, b),
+        }
+    }
+
+    /// Typed array: `[` (elem (`,` elem)*)? `]`, each elem constrained to `elem`'s scalar/enum type.
+    /// Phases: 0 need `[`, 1 after `[` (elem or `]`), 2 in elem, 3 after elem (`,` or `]`), 4 after `,`.
+    fn step_arr(&mut self, elem: &Item, b: u8) -> bool {
+        let (phase, mut ev) = match self.val { Val::Arr(p, e) => (p, e), Val::Fresh => (0u8, ArrElem::Fresh), _ => return false };
+        match phase {
+            0 => if b == b'[' { self.val = Val::Arr(1, ArrElem::Fresh); true } else { false },
+            1 | 4 => {
+                if phase == 1 && b == b']' { self.advance(); return true; } // empty array (only right after `[`)
+                match step_elem(elem, &mut ev, b) {
+                    EO::Consumed => { self.val = Val::Arr(2, ev); true }
+                    EO::Completed => { self.val = Val::Arr(3, ArrElem::Fresh); true }
+                    EO::Reject | EO::EndedBefore => false,
+                }
+            }
+            2 => match step_elem(elem, &mut ev, b) {
+                EO::Consumed => { self.val = Val::Arr(2, ev); true }
+                EO::Completed => { self.val = Val::Arr(3, ArrElem::Fresh); true }
+                EO::EndedBefore => { self.val = Val::Arr(3, ArrElem::Fresh); self.step_arr(elem, b) } // number closed — reprocess byte as `,`/`]`
+                EO::Reject => false,
+            },
+            3 => {
+                if b == b',' { self.val = Val::Arr(4, ArrElem::Fresh); true }
+                else if b == b']' { self.advance(); true }
+                else { false }
+            }
+            _ => false,
         }
     }
 
@@ -280,6 +338,59 @@ impl<'a> Schema<'a> {
     }
 }
 
+/// Feed one byte to a typed-array element acceptor (`item` is Str/Int/Num/Bool/Enum), tracking the
+/// element's in-progress state in `ev`. Mirrors the scalar `Schema` steppers but reports completion
+/// (via `EO`) instead of advancing the program, so the array loop owns the repetition.
+fn step_elem(item: &Item, ev: &mut ArrElem, b: u8) -> EO {
+    match item {
+        Item::Str => match *ev {
+            ArrElem::Fresh => if b == b'"' { *ev = ArrElem::Str(0); EO::Consumed } else { EO::Reject },
+            ArrElem::Str(0) => if b == b'"' { EO::Completed } else if b == b'\\' { *ev = ArrElem::Str(1); EO::Consumed } else if b < 0x20 { EO::Reject } else { EO::Consumed },
+            ArrElem::Str(1) => if matches!(b, b'"'|b'\\'|b'/'|b'b'|b'f'|b'n'|b'r'|b't') { *ev = ArrElem::Str(0); EO::Consumed } else if b == b'u' { *ev = ArrElem::Str(2); EO::Consumed } else { EO::Reject },
+            ArrElem::Str(n) => if b.is_ascii_hexdigit() { *ev = if n == 5 { ArrElem::Str(0) } else { ArrElem::Str(n + 1) }; EO::Consumed } else { EO::Reject },
+            _ => EO::Reject,
+        },
+        Item::Int | Item::Num => {
+            let int_only = matches!(item, Item::Int);
+            match *ev {
+                ArrElem::Fresh => { let s = match b { b'-' => NumSt::Neg, b'0' => NumSt::IntZero, b'1'..=b'9' => NumSt::Int, _ => return EO::Reject }; *ev = ArrElem::Num(s); EO::Consumed }
+                ArrElem::Num(st) => {
+                    let dig = b.is_ascii_digit();
+                    let next = match st {
+                        NumSt::Neg => if b == b'0' { Some(NumSt::IntZero) } else if (b'1'..=b'9').contains(&b) { Some(NumSt::Int) } else { None },
+                        NumSt::IntZero => if !int_only && b == b'.' { Some(NumSt::Dot) } else if !int_only && (b == b'e' || b == b'E') { Some(NumSt::Exp) } else { None },
+                        NumSt::Int => if dig { Some(NumSt::Int) } else if !int_only && b == b'.' { Some(NumSt::Dot) } else if !int_only && (b == b'e' || b == b'E') { Some(NumSt::Exp) } else { None },
+                        NumSt::Dot => if dig { Some(NumSt::Frac) } else { None },
+                        NumSt::Frac => if dig { Some(NumSt::Frac) } else if b == b'e' || b == b'E' { Some(NumSt::Exp) } else { None },
+                        NumSt::Exp => if b == b'+' || b == b'-' { Some(NumSt::ExpSign) } else if dig { Some(NumSt::ExpDig) } else { None },
+                        NumSt::ExpSign => if dig { Some(NumSt::ExpDig) } else { None },
+                        NumSt::ExpDig => if dig { Some(NumSt::ExpDig) } else { None },
+                    };
+                    match next { Some(s2) => { *ev = ArrElem::Num(s2); EO::Consumed } None if st.completable() => EO::EndedBefore, None => EO::Reject }
+                }
+                _ => EO::Reject,
+            }
+        }
+        Item::Bool => match *ev {
+            ArrElem::Fresh => match b { b't' => { *ev = ArrElem::Bool(0, 1); EO::Consumed } b'f' => { *ev = ArrElem::Bool(1, 1); EO::Consumed } _ => EO::Reject },
+            ArrElem::Bool(k, m) => { let word: &[u8] = if k == 0 { b"true" } else { b"false" }; if (m as usize) < word.len() && word[m as usize] == b { let nm = m + 1; if nm as usize == word.len() { EO::Completed } else { *ev = ArrElem::Bool(k, nm); EO::Consumed } } else { EO::Reject } }
+            _ => EO::Reject,
+        },
+        Item::Enum(opts) => {
+            let (mask, off) = match *ev { ArrElem::Enum(m, o) => (m, o), ArrElem::Fresh => ((1u64 << opts.len().min(64)) - 1, 0), _ => return EO::Reject };
+            let mut m2 = mask; let mut any = false;
+            for (i, o) in opts.iter().enumerate().take(64) {
+                if m2 & (1 << i) != 0 { if off < o.len() && o[off] == b { any = true; } else { m2 &= !(1 << i); } }
+            }
+            if !any { return EO::Reject; }
+            let noff = off + 1;
+            let done = opts.iter().enumerate().take(64).any(|(i, o)| m2 & (1 << i) != 0 && o.len() == noff);
+            if done { EO::Completed } else { *ev = ArrElem::Enum(m2, noff); EO::Consumed }
+        }
+        _ => EO::Reject,
+    }
+}
+
 /// A guided-decoding constraint: free-form-but-valid JSON, or schema-conformant JSON.
 #[derive(Clone, Copy)]
 pub enum Guide<'a> { Json(Json), Schema(Schema<'a>) }
@@ -320,6 +431,25 @@ mod tests {
         let sc = r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"object","properties":{"c":{"type":"string"}}}}}"#;
         assert!(sch_accepts(sc, r#"{"a":1,"b":{"c":"hi"}}"#));
         assert!(!sch_accepts(sc, r#"{"a":1,"b":{"c":9}}"#)); // nested string slot rejects number
+    }
+    #[test]
+    fn schema_typed_arrays() {
+        let sc = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"}},"nums":{"type":"array","items":{"type":"integer"}}}}"#;
+        assert!(sch_accepts(sc, r#"{"tags":["a","bb","c"],"nums":[1,2,30]}"#));
+        assert!(sch_accepts(sc, r#"{"tags":[],"nums":[]}"#));            // empty arrays
+        assert!(sch_accepts(sc, r#"{"tags":["x"],"nums":[-5]}"#));
+        assert!(!sch_accepts(sc, r#"{"tags":["a",1],"nums":[]}"#));      // string array rejects a number element
+        assert!(!sch_accepts(sc, r#"{"tags":[],"nums":[1,2.5]}"#));      // integer array rejects a float
+        assert!(!sch_accepts(sc, r#"{"tags":["a",],"nums":[]}"#));       // trailing comma rejected
+        assert!(!sch_accepts(sc, r#"{"tags":"a","nums":[]}"#));          // array slot rejects a bare string
+        assert!(!sch_accepts(sc, r#"{"tags":[,"nums":[]}"#));            // leading comma / no element
+    }
+    #[test]
+    fn schema_array_of_enum_and_bool() {
+        let sc = r#"{"type":"object","properties":{"flags":{"type":"array","items":{"type":"boolean"}},"cols":{"type":"array","items":{"enum":["r","g","b"]}}}}"#;
+        assert!(sch_accepts(sc, r#"{"flags":[true,false,true],"cols":["r","b"]}"#));
+        assert!(!sch_accepts(sc, r#"{"flags":[true,1],"cols":["r"]}"#));  // bool array rejects a number
+        assert!(!sch_accepts(sc, r#"{"flags":[],"cols":["x"]}"#));        // enum array rejects out-of-set
     }
 
     fn accepts(s: &str) -> bool {
