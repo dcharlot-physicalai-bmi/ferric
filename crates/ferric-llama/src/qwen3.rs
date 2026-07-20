@@ -2,7 +2,8 @@
 //! `qwen3` **and `qwen2`** GGUFs off Hugging Face. GQA every layer, SwiGLU, RoPE, RMSNorm; the arch
 //! differences are handled by feature-detection: QK-norm (Qwen3 only) and QKV bias (Qwen2 only) are
 //! read from tensor presence, and all metadata keys are architecture-prefixed. **Format-agnostic**: each weight
-//! loads in whatever quant the GGUF stored it (`QMatrix` over Q2_0/Q4_0/Q4_K/Q6_K/Q8_0), so this runs
+//! loads in whatever quant the GGUF stored it (`QMatrix` over Q2_0/Q4_0/Q4_K/Q6_K/Q8_0 natively, plus a
+//! dequant-to-f32 dense fallback for IQ4_XS/IQ4_NL and other kernel-less types), so this runs
 //! a PrismML ternary model *and* a genuine `Q4_K_M` model off Hugging Face — which mixes Q4_K and
 //! Q6_K, even within one qkv (see `Proj`). The ternary 1.7B is ~450 MB packed, so it fits WebGPU's
 //! memory limits and this same code compiles to wasm32 to drive a browser tab.
@@ -12,7 +13,7 @@
 use crate::qwen35::{f32t, qm, qm_cat};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufSource, Meta};
-use ferric_tensor::{nn, QMatrix, Tensor};
+use ferric_tensor::{nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
 pub struct Cfg {
@@ -85,6 +86,17 @@ impl Proj {
             }
         }
     }
+    /// gate_up projection + SwiGLU. When gate|up is one fused Q4_K/Q5_K/Q6_K weight, one fused kernel
+    /// does both (no [t, 2·n_ff] intermediate); otherwise the plain matmul + SwiGLU. Same result either way.
+    fn gate_up_swiglu(&self, x: &Tensor, n_ff: usize) -> Tensor {
+        // FERRIC_NOFUSE forces the un-fused path — for controlled A/B of the fusion, same binary.
+        if std::env::var("FERRIC_NOFUSE").is_err() {
+            if let Proj::Fused(w) = self {
+                if let Some(o) = x.try_matmul_swiglu(w) { return o; }
+            }
+        }
+        self.matmul(x).swiglu(n_ff)
+    }
 }
 
 pub struct Layer {
@@ -102,14 +114,15 @@ pub struct Layer {
     ffn_down: QMatrix,
 }
 
-/// Per-layer attention K/V history. One step per token: append, then attend over all of it.
+/// Per-layer attention K/V history. One step per token: append the new K/V into a grow-in-place
+/// `KvBuf` (no O(len) re-concatenate), then attend over the [len, width] view of all of it.
 #[derive(Default)]
 pub struct Cache {
     pub pos: usize,
-    kv: Vec<Option<(Tensor, Tensor)>>,
+    kv: Vec<(KvBuf, KvBuf)>,
 }
 impl Cache {
-    pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| None).collect() } }
+    pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() } }
 }
 
 pub struct Qwen3 {
@@ -186,7 +199,7 @@ impl Qwen3 {
         }
     }
 
-    fn attn(&self, h: &Tensor, l: &Layer, cache: &mut Option<(Tensor, Tensor)>, offset: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, l: &Layer, cache: &mut (KvBuf, KvBuf), offset: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
         let qkv = l.wqkv.matmul(h);
@@ -203,10 +216,10 @@ impl Qwen3 {
         let q = self.rope(&q, nh, offset);
         let k = self.rope(&k, nkv, offset);
 
-        let (kc, vc) = match cache.take() {
-            Some((pk, pv)) => (pk.cat(&k, 0), pv.cat(&v, 0)),
-            None => (k, v),
-        };
+        // Append the new K/V rows into the grow-in-place cache and read a view over all rows so far.
+        // Byte-identical to the old `pk.cat(&k, 0)`, but without re-copying the history each step.
+        let kc = cache.0.append(&self.ctx, &k);
+        let vc = cache.1.append(&self.ctx, &v);
         // decode: fused single-query; prefill: flash (O(T) memory, no [nh,T,T] matrix) up to its
         // shared-memory limit, else the composed causal path. All three are the same math.
         let s = kc.shape[0];
@@ -217,13 +230,17 @@ impl Qwen3 {
         } else {
             nn::causal_attention(&q, &kc, &vc, nh, nkv)
         };
-        *cache = Some((kc, vc));
         o.matmul_q(&l.wo)
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
-        // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-        l.ffn_gate_up.matmul(h).swiglu(l.ffn_gate_out).matmul_q(&l.ffn_down)
+        // Whole-FFN megakernel (gate_up Q4_K + SwiGLU + down Q6_K in one dispatch), OPT-IN via
+        // FERRIC_MEGA — correct but ~2× slower at decode (occupancy-bound); off by default.
+        if let Proj::Fused(gu) = &l.ffn_gate_up {
+            if let Some(o) = h.try_ffn_mega(gu, &l.ffn_down, l.ffn_gate_out) { return o; }
+        }
+        // staged: gate_up + SwiGLU (one fused kernel when gate|up is a k-quant) → down projection.
+        l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out).matmul_q(&l.ffn_down)
     }
 
     /// Prefill (stateless): logits [T, n_vocab].
@@ -246,14 +263,14 @@ impl Qwen3 {
                 // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
                 let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos));
                 prof(&self.ctx, "attn");
-                let xy = xin.add(&y);
-                x = batch(&self.ctx, || self.ffn(&xy.rmsnorm(&l.ffn_norm, self.cfg.eps), l).add(&xy));
+                x = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l).add(&xy) });
                 prof(&self.ctx, "ffn");
             } else {
                 x = batch(&self.ctx, || {
                     let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos);
-                    let xy = xin.add(&y);
-                    self.ffn(&xy.rmsnorm(&l.ffn_norm, self.cfg.eps), l).add(&xy)
+                    // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
+                    let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
+                    self.ffn(&xy_n, l).add(&xy)
                 });
             }
         }

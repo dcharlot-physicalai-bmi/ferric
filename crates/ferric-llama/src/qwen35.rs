@@ -182,13 +182,19 @@ pub(crate) fn f32t(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, shape: &
 pub(crate) fn qm(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<ferric_tensor::QMatrix, String> {
     let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
     let (ty, rows, cols) = (t.ggml_type, t.dims[1] as usize, t.dims[0] as usize);
-    ferric_tensor::QMatrix::from_bytes(ctx, &g.raw(name)?, ty, rows, cols)
+    // Native packed kernel if we have one; otherwise dequantize to f32 and run the dense fallback
+    // (e.g. IQ4_XS/IQ4_NL — the quant is decoded, just not matmul'd in packed form).
+    if ferric_tensor::QMatrix::block_bytes(ty).is_some() {
+        ferric_tensor::QMatrix::from_bytes(ctx, &g.raw(name)?, ty, rows, cols)
+    } else {
+        Ok(ferric_tensor::QMatrix::from_dense(ctx, &g.dequant(name)?, rows, cols))
+    }
 }
 
 /// Concatenate several same-format weights along the output dim into one QMatrix (fused qkv, gate_up).
 /// In a real GGUF every projection in a layer shares one quant format, so this just stacks their bytes.
 pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<ferric_tensor::QMatrix, String> {
-    let (mut inn, mut out, mut ty, mut raw) = (None, 0usize, None, Vec::new());
+    let (mut inn, mut out, mut ty) = (None, 0usize, None);
     for &name in names {
         let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
         let this = *ty.get_or_insert(t.ggml_type);
@@ -196,9 +202,19 @@ pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) ->
         let i = t.dims[0] as usize;
         if *inn.get_or_insert(i) != i { return Err(format!("{name}: input dim differs")); }
         out += t.dims[1] as usize;
-        raw.extend(g.raw(name)?);
     }
-    ferric_tensor::QMatrix::from_bytes(ctx, &raw, ty.unwrap(), out, inn.unwrap())
+    let (ty, inn) = (ty.unwrap(), inn.unwrap());
+    // Concatenate along the output dim: for the packed path stack raw block bytes; for the dense
+    // fallback stack the dequantized row-major [out_i, inn] blocks — both yield the fused [out, inn].
+    if ferric_tensor::QMatrix::block_bytes(ty).is_some() {
+        let mut raw = Vec::new();
+        for &name in names { raw.extend(g.raw(name)?); }
+        ferric_tensor::QMatrix::from_bytes(ctx, &raw, ty, out, inn)
+    } else {
+        let mut f = Vec::new();
+        for &name in names { f.extend(g.dequant(name)?); }
+        Ok(ferric_tensor::QMatrix::from_dense(ctx, &f, out, inn))
+    }
 }
 
 impl Qwen35 {

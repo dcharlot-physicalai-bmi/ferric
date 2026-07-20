@@ -1,5 +1,7 @@
 //! Pure-Rust reader for the llama.cpp **GGUF** container + dequantizers for the common block-quant
-//! formats (F32, F16, Q8_0, Q4_0, and the k-quant **Q4_K**). GGUF is how the entire llama.cpp / HF
+//! formats: F32, F16, Q8_0, the legacy Q4_0/Q4_1/Q5_0/Q5_1, the k-quants **Q4_K/Q5_K/Q6_K**, the
+//! non-linear codebook quants **IQ4_NL/IQ4_XS**, and BitNet-style ternary (TQ2_0 + PrismML Q1_0/Q2_0).
+//! GGUF is how the entire llama.cpp / HF
 //! quantized-model corpus ships — including Liquid AI's LFM2 and BitNet — so this is the ingest path
 //! that lets Ferric run those models. Dequant here is CPU-side (I/O layer); a fused on-GPU dequant
 //! matmul is the perf follow-up.
@@ -11,10 +13,15 @@ use std::collections::HashMap;
 const F32: u32 = 0;
 const F16T: u32 = 1;
 const Q4_0: u32 = 2;
+const Q4_1: u32 = 3; // 4-bit affine: value = nibble·d + m (f16 d, f16 min per 32-block)
+const Q5_0: u32 = 6; // 5-bit symmetric: value = ((nibble | 5th-bit) − 16)·d (f16 d, u32 qh per 32-block)
+const Q5_1: u32 = 7; // 5-bit affine: value = (nibble | 5th-bit)·d + m (f16 d, f16 min, u32 qh per 32-block)
 const Q8_0: u32 = 8;
 const Q4_K: u32 = 12;
 const Q5_K: u32 = 13;
 const Q6_K: u32 = 14;
+const IQ4_NL: u32 = 20; // 4-bit non-linear codebook, group-32 (kvalues_iq4nl)
+const IQ4_XS: u32 = 23; // 4-bit non-linear codebook, 256-super-block w/ 6-bit sub-scales
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
 const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
 const Q2_0: u32 = 42; // PrismML ternary: {−1,0,+1}·scale, group-128 (2.125 bpw on disk)
@@ -159,9 +166,14 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         F16T => n * 2,
         Q8_0 => n / 32 * 34,
         Q4_0 => n / 32 * 18,
+        Q4_1 => n / 32 * 20,
+        Q5_0 => n / 32 * 22,
+        Q5_1 => n / 32 * 24,
         Q4_K => n / 256 * 144,
         Q5_K => n / 256 * 176,
         Q6_K => n / 256 * 210,
+        IQ4_NL => n / 32 * 18,
+        IQ4_XS => n / 256 * 136,
         TQ2_0 => n / 256 * 66,
         Q1_0 => n / 128 * 18,
         Q2_0 => n / 128 * 34,
@@ -176,9 +188,14 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         F16T => raw[..n * 2].chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
         Q8_0 => deq_q8_0(raw, n),
         Q4_0 => deq_q4_0(raw, n),
+        Q4_1 => deq_q4_1(raw, n),
+        Q5_0 => deq_q5_0(raw, n),
+        Q5_1 => deq_q5_1(raw, n),
         Q4_K => deq_q4_k(raw, n),
         Q5_K => deq_q5_k(raw, n),
         Q6_K => deq_q6_k(raw, n),
+        IQ4_NL => deq_iq4_nl(raw, n),
+        IQ4_XS => deq_iq4_xs(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
         Q1_0 => deq_q1_0(raw, n),
         Q2_0 => deq_q2_0(raw, n),
@@ -289,6 +306,60 @@ fn deq_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Q4_1: blocks of 32 → [f16 d, f16 min, u8 qs[16]] (20 bytes). x = nibble·d + m (no −8), low
+/// nibbles then high. The affine (min-offset) sibling of Q4_0 — better for asymmetric weights.
+fn deq_q4_1(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(20).take(n / 32).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let m = rd_f16(&blk[2..4]);
+        for i in 0..16 {
+            let byte = blk[4 + i];
+            out[bi * 32 + i] = (byte & 0x0F) as f32 * d + m;
+            out[bi * 32 + i + 16] = (byte >> 4) as f32 * d + m;
+        }
+    }
+    out
+}
+
+/// Q5_0: blocks of 32 → [f16 d, u32 qh, u8 qs[16]] (22 bytes). Each value is a 5-bit signed code:
+/// the low 4 bits from a `qs` nibble, the 5th (high) bit from `qh` — bit i for value i, bit i+16 for
+/// value i+16 — reassembled and offset: x = ((nibble | (bit<<4)) − 16)·d. (llama.cpp ggml layout.)
+fn deq_q5_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(22).take(n / 32).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        for i in 0..16 {
+            let byte = blk[6 + i];
+            let xh0 = ((qh >> i) & 1) << 4;
+            let xh1 = ((qh >> (i + 16)) & 1) << 4;
+            out[bi * 32 + i] = (((byte & 0x0F) as u32 | xh0) as i32 - 16) as f32 * d;
+            out[bi * 32 + i + 16] = (((byte >> 4) as u32 | xh1) as i32 - 16) as f32 * d;
+        }
+    }
+    out
+}
+
+/// Q5_1: blocks of 32 → [f16 d, f16 min, u32 qh, u8 qs[16]] (24 bytes). The affine sibling of Q5_0:
+/// value = (nibble | (5th-bit<<4))·d + m (no −16). 5th bit i for value i, bit i+16 for value i+16.
+fn deq_q5_1(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(24).take(n / 32).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let m = rd_f16(&blk[2..4]);
+        let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+        for i in 0..16 {
+            let byte = blk[8 + i];
+            let xh0 = ((qh >> i) & 1) << 4;
+            let xh1 = ((qh >> (i + 16)) & 1) << 4;
+            out[bi * 32 + i] = ((byte & 0x0F) as u32 | xh0) as f32 * d + m;
+            out[bi * 32 + i + 16] = ((byte >> 4) as u32 | xh1) as f32 * d + m;
+        }
+    }
+    out
+}
+
 /// Q4_K super-block (256 values, 144 bytes): [f16 d, f16 dmin, u8 scales[12], u8 qs[128]].
 /// 8 sub-blocks of 32; each has a 6-bit scale & 6-bit min packed in `scales`. y = d·sc·q − dmin·m.
 /// **Q5_K** — 176-byte super-block, 256 values: `f16 d`, `f16 dmin`, 12 packed scale bytes (same 8
@@ -347,6 +418,51 @@ fn deq_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
                 out[y + l + 96] = d * sch[is + 6] as i8 as f32 * q4 as f32;
             }
             y += 128;
+        }
+    }
+    out
+}
+
+/// The IQ4 non-linear 4-bit codebook (llama.cpp `kvalues_iq4nl`): a 4-bit index maps to one of
+/// these 16 signed levels (denser near zero), instead of a uniform grid — this is what lets IQ4
+/// beat Q4 at the same bit-width.
+const KVALUES_IQ4NL: [i32; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// **IQ4_NL** — 18-byte block, 32 values: `f16 d`, `qs[16]` (two 4-bit codebook indices each).
+/// value = `d · kvalues_iq4nl[idx]`.
+fn deq_iq4_nl(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(18).take(n / 32).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let qs = &blk[2..18];
+        let y = bi * 32;
+        for j in 0..16 {
+            out[y + j] = d * KVALUES_IQ4NL[(qs[j] & 0x0F) as usize] as f32;
+            out[y + j + 16] = d * KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
+        }
+    }
+    out
+}
+
+/// **IQ4_XS** — 136-byte super-block, 256 values: `f16 d`, `u16 scales_h`, `scales_l[4]`, `qs[128]`.
+/// 8 sub-blocks of 32; each sub-block `ib` has a 6-bit scale `ls` (low nibble from `scales_l[ib/2]`,
+/// high 2 bits from `scales_h` at bit `2·ib`); `dl = d·(ls − 32)`, value = `dl · kvalues_iq4nl[idx]`.
+fn deq_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(136).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        let base = bi * 256;
+        for ib in 0..8 {
+            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F) as u16 | (((scales_h >> (2 * ib)) & 3) << 4)) as i32;
+            let dl = d * (ls - 32) as f32;
+            let (y, q) = (base + ib * 32, &qs[ib * 16..]);
+            for j in 0..16 {
+                out[y + j] = dl * KVALUES_IQ4NL[(q[j] & 0x0F) as usize] as f32;
+                out[y + j + 16] = dl * KVALUES_IQ4NL[(q[j] >> 4) as usize] as f32;
+            }
         }
     }
     out
@@ -503,6 +619,74 @@ pub fn quant_q4_0(x: &[f32]) -> Vec<u8> {
             let q = |v: f32| -> u8 { if d != 0.0 { ((v / d).round().clamp(-8.0, 7.0) as i32 + 8) as u8 & 0x0F } else { 8 } };
             out.push(q(blk.get(i).copied().unwrap_or(0.0)) | (q(blk.get(i + 16).copied().unwrap_or(0.0)) << 4));
         }
+    }
+    out
+}
+/// Q4_1 encoder (affine, min-offset): `d = (max−min)/15`, `m = min`, `q = round((v−m)/d)∈0..15`.
+pub fn quant_q4_1(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in x.chunks(32) {
+        let mn = blk.iter().copied().fold(f32::INFINITY, f32::min).min(0.0);
+        let mx = blk.iter().copied().fold(f32::NEG_INFINITY, f32::max).max(0.0);
+        let d = (mx - mn) / 15.0;
+        // store f16 d/m, then quantize against the SAME rounded d/m the kernels will read back
+        let (df, mf) = (f16::from_f32(d).to_f32(), f16::from_f32(mn).to_f32());
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(mn).to_le_bytes());
+        for i in 0..16 {
+            let q = |v: f32| -> u8 { if df != 0.0 { ((v - mf) / df).round().clamp(0.0, 15.0) as u8 & 0x0F } else { 0 } };
+            out.push(q(blk.get(i).copied().unwrap_or(0.0)) | (q(blk.get(i + 16).copied().unwrap_or(0.0)) << 4));
+        }
+    }
+    out
+}
+/// Q5_0 encoder (symmetric 5-bit): `d = amax/16`, code = `round(v/d)∈−16..15` offset by +16 → 0..31;
+/// low 4 bits go in `qs`, the 5th bit into `qh` (bit i for value i, bit i+16 for value i+16).
+pub fn quant_q5_0(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in x.chunks(32) {
+        let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let d = amax / 16.0;
+        let df = f16::from_f32(d).to_f32();
+        let enc = |v: f32| -> u32 { if df != 0.0 { (((v / df).round().clamp(-16.0, 15.0) as i32) + 16) as u32 } else { 16 } };
+        let mut qh: u32 = 0;
+        let mut nibbles = [0u8; 16];
+        for i in 0..16 {
+            let c0 = enc(blk.get(i).copied().unwrap_or(0.0));       // 0..31
+            let c1 = enc(blk.get(i + 16).copied().unwrap_or(0.0));
+            nibbles[i] = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
+            qh |= ((c0 >> 4) & 1) << i;
+            qh |= ((c1 >> 4) & 1) << (i + 16);
+        }
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        out.extend_from_slice(&qh.to_le_bytes());
+        out.extend_from_slice(&nibbles);
+    }
+    out
+}
+/// Q5_1 encoder (affine 5-bit): `d = (max−min)/31`, `m = min`, code = `round((v−m)/d)∈0..31`; low 4
+/// bits in `qs`, 5th bit in `qh` (bit i for value i, bit i+16 for value i+16).
+pub fn quant_q5_1(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in x.chunks(32) {
+        let mn = blk.iter().copied().fold(f32::INFINITY, f32::min).min(0.0);
+        let mx = blk.iter().copied().fold(f32::NEG_INFINITY, f32::max).max(0.0);
+        let d = (mx - mn) / 31.0;
+        let (df, mf) = (f16::from_f32(d).to_f32(), f16::from_f32(mn).to_f32());
+        let enc = |v: f32| -> u32 { if df != 0.0 { ((v - mf) / df).round().clamp(0.0, 31.0) as u32 } else { 0 } };
+        let mut qh: u32 = 0;
+        let mut nibbles = [0u8; 16];
+        for i in 0..16 {
+            let c0 = enc(blk.get(i).copied().unwrap_or(0.0));
+            let c1 = enc(blk.get(i + 16).copied().unwrap_or(0.0));
+            nibbles[i] = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
+            qh |= ((c0 >> 4) & 1) << i;
+            qh |= ((c1 >> 4) & 1) << (i + 16);
+        }
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(mn).to_le_bytes());
+        out.extend_from_slice(&qh.to_le_bytes());
+        out.extend_from_slice(&nibbles);
     }
     out
 }

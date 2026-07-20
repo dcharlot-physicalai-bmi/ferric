@@ -479,11 +479,34 @@ pub enum QShard {
     Q5_K(Q5_KWeights),
     Q6_K(Q6_KWeights),
     Q8_0(Q8_0Weights),
+    /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_XS/IQ4_NL): the weight
+    /// is dequantized to f32 on load and run through a plain matmul. Correct and format-complete, at
+    /// the cost of f32 weight memory — a native kernel can replace it later purely as a speed/size win.
+    Dense(DenseWeight),
+}
+
+/// A dequantized weight held as `Wᵀ` (`[cols, rows]`, f32) on the GPU, so `x[T,cols]·Wᵀ = y[T,rows]`
+/// is one ordinary matmul. The dequant-on-load fallback that makes IQ-class GGUFs runnable.
+pub struct DenseWeight {
+    wt: Tensor,
+    rows: usize,
+    cols: usize,
+}
+
+impl DenseWeight {
+    fn nbytes(&self) -> usize { self.rows * self.cols * 4 }
+    /// `w` is a row-major `[rows, cols]` (already-dequantized) weight; store it transposed as
+    /// `Wᵀ = [cols, rows]` so `x·Wᵀ` is a plain matmul.
+    fn from_f32(ctx: &Arc<Context>, w: &[f32], rows: usize, cols: usize) -> DenseWeight {
+        let mut wt = vec![0f32; rows * cols];
+        for r in 0..rows { for c in 0..cols { wt[c * rows + r] = w[r * cols + c]; } }
+        DenseWeight { wt: Tensor::from_vec(ctx, &wt, &[cols, rows]), rows, cols }
+    }
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -495,6 +518,8 @@ impl QShard {
             13 => QShard::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
             14 => QShard::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
+            // Types with no native packed kernel take the dense fallback via `QMatrix::from_dense`
+            // (the loader dequantizes them), so they never reach this packed-build path.
             other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
         })
     }
@@ -545,6 +570,24 @@ impl QMatrix {
         }
         if shards.is_empty() { shards.push(QShard::build(ctx, bytes, ggml_type, rows, cols)?); }
         Ok(QMatrix { shards, rows, cols })
+    }
+    /// Build from an already-dequantized, row-major `[rows, cols]` weight — the fallback for GGUF
+    /// quants with no native packed kernel (IQ4_XS/IQ4_NL/…): the loader dequantizes to f32 and hands
+    /// it here. Sharded along rows to respect the device binding limit, exactly like `from_bytes`.
+    pub fn from_dense(ctx: &Arc<Context>, w: &[f32], rows: usize, cols: usize) -> QMatrix {
+        let row_bytes = cols * 4;
+        let limit = std::env::var("FERRIC_MAX_BINDING").ok().and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| (ctx.max_binding as usize).saturating_sub(1 << 20).max(1 << 20));
+        let max_rows = if row_bytes == 0 { rows.max(1) } else { (limit / row_bytes).max(1) };
+        let mut shards = Vec::new();
+        let mut r0 = 0;
+        while r0 < rows {
+            let n = (rows - r0).min(max_rows);
+            shards.push(QShard::Dense(DenseWeight::from_f32(ctx, &w[r0 * cols..(r0 + n) * cols], n, cols)));
+            r0 += n;
+        }
+        if shards.is_empty() { shards.push(QShard::Dense(DenseWeight::from_f32(ctx, w, rows, cols))); }
+        QMatrix { shards, rows, cols }
     }
     pub fn rows(&self) -> usize { self.rows }
     pub fn cols(&self) -> usize { self.cols }
@@ -622,6 +665,7 @@ impl Tensor {
             QShard::Q5_K(w) => self.matmul_q5_k(w),
             QShard::Q6_K(w) => self.matmul_q6_k(w),
             QShard::Q8_0(w) => self.matmul_q8_0(w),
+            QShard::Dense(w) => self.matmul(&w.wt),
         }
     }
 }
