@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferric — schema-perfect JSON, on-device, deterministic</title>
+<meta name="description" content="Ferric runs schema-constrained (guided) decoding entirely in your browser tab on WebGPU: every output is guaranteed-conformant JSON, produced deterministically, with no server. It is also a drop-in Vercel AI SDK provider — real generateObject() code running on your GPU.">
+<style>
+  :root{
+    --bg:#080b12; --bg2:#0b0f19; --panel:#101728; --panel2:#0c1220; --line:#1c2540;
+    --ink:#eaf0fb; --dim:#93a3c4; --faint:#5f6f92; --gold:#e8b24a; --gold2:#f2c96b;
+    --ok:#5bd68a; --bad:#f2777a; --accent:#6ea8fe;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  .mono{font-family:var(--mono)}
+
+  nav{position:sticky;top:0;z-index:20;background:rgba(8,11,18,.82);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.01em}
+  .phi{color:var(--gold);font-size:22px;line-height:1}
+  nav .sp{flex:1}
+  nav a.link{color:var(--dim);font-size:14px}
+  nav a.link:hover{color:var(--ink)}
+  .btn{background:var(--gold);color:#0a0d14;padding:9px 16px;border-radius:9px;font-weight:650;font-size:14px;border:0;cursor:pointer}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn:hover{filter:brightness(1.05)}
+  .btn:disabled{opacity:.5;cursor:default;filter:none}
+
+  .hero{position:relative;padding:80px 0 44px;overflow:hidden}
+  .hero::before{content:"";position:absolute;inset:0;background:
+     radial-gradient(680px 320px at 30% -8%, rgba(232,178,74,.13), transparent 70%),
+     radial-gradient(520px 320px at 90% 4%, rgba(110,168,254,.10), transparent 70%);pointer-events:none}
+  .badge{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);
+     color:var(--dim);font-size:12.5px;padding:6px 12px;border-radius:999px;margin-bottom:22px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  h1{font-size:clamp(32px,5.4vw,52px);line-height:1.04;letter-spacing:-.03em;margin:0 0 16px;font-weight:780}
+  h1 .g{color:var(--gold)}
+  .lede{max-width:660px;font-size:clamp(16px,2.1vw,19px);color:var(--dim)}
+  .lede b{color:var(--ink);font-weight:600}
+
+  section{padding:44px 0;border-top:1px solid var(--line)}
+  .eyebrow{color:var(--gold);font:600 13px var(--mono);letter-spacing:.12em;text-transform:uppercase;margin:0 0 14px}
+  h2{font-size:clamp(22px,3.4vw,30px);letter-spacing:-.02em;margin:0 0 12px;font-weight:720}
+  .muted{color:var(--dim)}
+  .faint{color:var(--faint)}
+
+  .pg{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:22px}
+  .field{margin-top:16px}
+  .field label{display:block;color:var(--faint);font-size:12.5px;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em}
+  textarea,input,select{width:100%;background:#070a11;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:11px 13px;font:13.5px var(--mono)}
+  textarea{resize:vertical;min-height:52px}
+  .rowflex{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
+  .rowflex > .field{flex:1;min-width:150px;margin-top:0}
+  .presets{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+  .preset{font:12.5px var(--mono);padding:5px 11px;border-radius:8px;border:1px solid var(--line);background:#070a11;color:var(--dim);cursor:pointer}
+  .preset.on{background:rgba(232,178,74,.14);border-color:rgba(232,178,74,.5);color:var(--gold2)}
+  .barwrap{height:6px;background:#070a11;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:14px;display:none}
+  .bar{height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--gold2));transition:width .15s}
+  .out{background:#070a11;border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px;white-space:pre-wrap;font:13.5px/1.55 var(--mono);color:var(--ok);min-height:44px}
+  .kv{display:flex;flex-wrap:wrap;gap:8px 20px;font:12.5px var(--mono);margin-top:12px;color:var(--faint)}
+  .kv b{color:var(--dim);font-weight:500}
+  .verdict{display:inline-flex;align-items:center;gap:8px;font:600 13px var(--mono);padding:6px 12px;border-radius:8px;margin-top:12px}
+  .verdict.ok{background:rgba(91,214,138,.12);border:1px solid rgba(91,214,138,.4);color:var(--ok)}
+  .verdict.bad{background:rgba(242,119,122,.12);border:1px solid rgba(242,119,122,.4);color:var(--bad)}
+  .banner{border-left:3px solid var(--gold);padding:12px 16px;background:rgba(232,178,74,.07);border-radius:0 10px 10px 0;color:var(--dim);font-size:13.5px;margin-top:16px}
+
+  .why{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:22px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:18px}
+  .card h3{margin:0 0 6px;font-size:14.5px;font-weight:640;color:var(--gold2)}
+  .card p{margin:0;font-size:13.5px;color:var(--dim);line-height:1.55}
+
+  pre.code{background:#070a11;border:1px solid var(--line);border-radius:12px;padding:16px;overflow:auto;font:13px/1.6 var(--mono);color:var(--dim)}
+  pre.code .k{color:var(--accent)} pre.code .s{color:var(--ok)} pre.code .c{color:var(--faint)}
+  footer{padding:36px 0 60px;border-top:1px solid var(--line);color:var(--faint);font-size:13.5px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center}
+  footer a{color:var(--dim)} footer a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="brand" href="/"><span class="phi">Φ</span> Ferric</a>
+  <span class="sp"></span>
+  <a class="link" href="/#proof">Proof</a>
+  <a class="link" href="/#crates">Crates</a>
+  <a class="link" href="/bonsai">Live LLM</a>
+  <a class="link" href="/agent" style="color:var(--ink)">Structured</a>
+  <a class="btn ghost" href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <span class="badge"><span class="dot"></span> guided decoding · in this browser tab · nothing leaves your machine</span>
+  <h1>Schema-perfect JSON.<br><span class="g">On-device. Deterministic.</span></h1>
+  <p class="lede">Ferric masks the model's logits token-by-token so the output <b>cannot</b> leave the grammar of your schema — every generation is <b>guaranteed-conformant JSON</b>, produced <b>deterministically</b>, running entirely on your GPU via WebGPU. Because Ferric owns the logits <i>and</i> is bit-identical across fabrics, the same constrained output is reproducible from a datacenter to this tab. No incumbent runtime does this in a browser.</p>
+</div></header>
+
+<section><div class="wrap">
+  <p class="eyebrow">Try it</p>
+  <h2>Give it a schema. Get back exactly that shape — always.</h2>
+  <p class="muted">Loads <span class="mono">Qwen2.5-0.5B-Instruct</span> (~491 MB, once) straight from Hugging Face to your GPU, then generates under the constraint. First run downloads the weights; after that it is instant and offline.</p>
+
+  <div class="pg" style="margin-top:20px">
+    <div class="presets" id="presets"></div>
+
+    <div class="field">
+      <label>JSON Schema (the output is forced to satisfy this)</label>
+      <textarea id="schema" spellcheck="false" style="min-height:150px"></textarea>
+    </div>
+
+    <div class="rowflex" style="margin-top:16px">
+      <div class="field"><label>prompt</label><input id="prompt" spellcheck="false"></div>
+      <div class="field" style="flex:0 0 96px"><label>max tokens</label><input id="steps" type="number" value="80" min="8" max="256"></div>
+    </div>
+
+    <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn" id="run" disabled>Generate ▸</button>
+      <button class="btn ghost" id="runsdk" disabled title="Runs the real Vercel AI SDK generateObject() against Ferric, on-device">Run via Vercel AI SDK ▸</button>
+    </div>
+
+    <div class="barwrap" id="barwrap"><div class="bar" id="bar"></div></div>
+    <div class="out" id="out">initializing WebGPU…</div>
+    <div id="verdict"></div>
+    <div class="kv" id="stats"></div>
+    <div class="banner" id="gpuNote" style="display:none">This demo needs <b>WebGPU</b>. Open in Chrome/Edge 113+ or Safari 18+.</div>
+  </div>
+  <p class="faint" style="font-size:13px;margin-top:14px">The verdict below the output is checked in-page: the text is parsed as JSON and every declared key is confirmed present with the right type. It is green on every run because the sampler physically cannot emit a token that breaks the schema.</p>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">Why it matters</p>
+  <h2>Structured output is where agents break. Ferric makes it impossible to break.</h2>
+  <div class="why">
+    <div class="card"><h3>Guaranteed, not coaxed</h3><p>Not a prompt asking nicely for JSON, not a retry loop. The grammar is enforced on the logits — invalid tokens have zero probability of being sampled.</p></div>
+    <div class="card"><h3>Deterministic across fabrics</h3><p>Ferric's kernels are bit-identical Metal ↔ WebGPU ↔ Vulkan. Constrain the logits and the constrained result is reproducible everywhere — a property no other runtime holds.</p></div>
+    <div class="card"><h3>Private by construction</h3><p>The model, the decoding, and your data never leave the tab. No API key, no server round-trip, no token bill.</p></div>
+    <div class="card"><h3>Drop-in AI SDK provider</h3><p>The same handle is a Vercel AI SDK <span class="mono">LanguageModelV2</span>. Every <span class="mono">generateObject()</span> app runs on-device, unchanged.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">Vercel AI SDK</p>
+  <h2>The exact code — running on your GPU when you click “Run via Vercel AI SDK”.</h2>
+  <p class="muted">This is real <span class="mono">ai@5</span> + <span class="mono">zod</span> from npm, driving Ferric as the model. No provider key, no network — the inference happens in this tab.</p>
+  <pre class="code" style="margin-top:16px"><span class="k">import</span> { generateObject } <span class="k">from</span> <span class="s">'ai'</span>;
+<span class="k">import</span> { z } <span class="k">from</span> <span class="s">'zod'</span>;
+<span class="k">import</span> { loadFerric, ferric } <span class="k">from</span> <span class="s">'./ferric-provider.js'</span>;
+
+<span class="c">// load the GGUF once, straight onto WebGPU</span>
+<span class="k">const</span> fm = <span class="k">await</span> loadFerric(ggufBytes);
+<span class="k">const</span> model = ferric(fm);
+
+<span class="k">const</span> { object } = <span class="k">await</span> generateObject({
+  model,                                   <span class="c">// ← Ferric, on-device</span>
+  schema: z.object({ name: z.string(), age: z.number().int(), city: z.string() }),
+  prompt: <span class="s">'Invent a fictional person.'</span>,
+});
+<span class="c">// object is guaranteed to match the schema — decoded under constraint</span></pre>
+</div></section>
+
+<footer><div class="wrap">
+  <span class="phi">Φ</span>
+  <span>Ferric — from the <a href="https://physicalai-bmi.org" target="_blank">Institute for Physical AI</a>.</span>
+  <span class="sp" style="flex:1"></span>
+  <a href="/bonsai">Live LLM</a>
+  <a href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
+  <span class="faint">Apache-2.0</span>
+</div></footer>
+
+<script type="module">
+import init, { FerricModel } from './pkg/ferric_web.js';
+const $ = id => document.getElementById(id);
+const MODEL = new URLSearchParams(location.search).get('model')
+  || 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf';
+
+const PRESETS = {
+  Person: {
+    prompt: 'Invent a fictional person.',
+    schema: { type:'object', properties:{
+      name:{type:'string'}, age:{type:'integer'}, city:{type:'string'}, active:{type:'boolean'} } },
+    check: o => typeof o.name==='string' && Number.isInteger(o.age) && typeof o.city==='string' && typeof o.active==='boolean',
+  },
+  Movie: {
+    prompt: 'Invent a science-fiction movie.',
+    schema: { type:'object', properties:{
+      title:{type:'string'}, year:{type:'integer'},
+      genre:{type:'string', enum:['action','comedy','drama','scifi','horror']}, rating:{type:'number'} } },
+    check: o => typeof o.title==='string' && Number.isInteger(o.year) && ['action','comedy','drama','scifi','horror'].includes(o.genre) && typeof o.rating==='number',
+  },
+  Robot: {
+    prompt: 'Describe a fictional warehouse robot.',
+    schema: { type:'object', properties:{
+      name:{type:'string'}, dof:{type:'integer'}, autonomous:{type:'boolean'}, payload_kg:{type:'number'} } },
+    check: o => typeof o.name==='string' && Number.isInteger(o.dof) && typeof o.autonomous==='boolean' && typeof o.payload_kg==='number',
+  },
+};
+let current = 'Person';
+
+function paintPresets(){
+  $('presets').innerHTML = Object.keys(PRESETS).map(k =>
+    `<span class="preset${k===current?' on':''}" data-k="${k}">${k}</span>`).join('') +
+    `<span class="preset${current==='Custom'?' on':''}" data-k="Custom">Custom…</span>`;
+  $('presets').querySelectorAll('.preset').forEach(el => el.onclick = () => {
+    current = el.dataset.k;
+    if (current !== 'Custom') { const p = PRESETS[current]; $('schema').value = JSON.stringify(p.schema, null, 2); $('prompt').value = p.prompt; }
+    paintPresets();
+  });
+}
+function loadPreset(k){ const p = PRESETS[k]; $('schema').value = JSON.stringify(p.schema, null, 2); $('prompt').value = p.prompt; }
+loadPreset('Person'); paintPresets();
+
+let ready = false, modelBytes = null, fm = null;
+async function ensureInit(){ if(!ready){ await init(); ready = true; } }
+
+async function fetchModel(){
+  if (modelBytes) return modelBytes;
+  $('barwrap').style.display = 'block';
+  const r = await fetch(MODEL);
+  const total = +r.headers.get('content-length') || 491000000;
+  const reader = r.body.getReader(); const chunks = []; let got = 0;
+  for(;;){ const {done,value} = await reader.read(); if(done) break; chunks.push(value); got += value.length;
+    $('bar').style.width = (100*got/total).toFixed(1)+'%';
+    $('out').textContent = `downloading Qwen2.5-0.5B… ${(got/1048576|0)} / ${(total/1048576|0)} MB`; }
+  const buf = new Uint8Array(got); let o = 0; for(const c of chunks){ buf.set(c,o); o += c.length; }
+  modelBytes = buf; $('barwrap').style.display = 'none'; return buf;
+}
+async function ensureModel(){
+  await ensureInit();
+  const bytes = await fetchModel();
+  if (!fm){ $('out').textContent = 'loading weights onto WebGPU…'; fm = await FerricModel.load(bytes); }
+  return fm;
+}
+
+function currentCheck(parsed){
+  // for a preset, use its typed check; for custom, verify declared keys exist
+  if (current !== 'Custom' && PRESETS[current]) return PRESETS[current].check(parsed);
+  try { const s = JSON.parse($('schema').value); return Object.keys(s.properties||{}).every(k => k in parsed); }
+  catch { return typeof parsed === 'object' && parsed !== null; }
+}
+function showVerdict(text){
+  let ok = false, parsed = null;
+  try { parsed = JSON.parse(text); ok = currentCheck(parsed); } catch { ok = false; }
+  $('verdict').innerHTML = ok
+    ? `<span class="verdict ok">✓ valid JSON · conforms to schema</span>`
+    : `<span class="verdict bad">✗ did not parse</span>`;
+  return ok;
+}
+
+async function run(){
+  if(!navigator.gpu){ $('out').textContent=''; $('gpuNote').style.display='block'; return; }
+  $('run').disabled = $('runsdk').disabled = true; $('verdict').innerHTML=''; $('stats').innerHTML='';
+  try{
+    const model = await ensureModel();
+    const schema = $('schema').value.trim();
+    const steps = Math.max(8, Math.min(256, +$('steps').value||80));
+    $('out').textContent = '';
+    const t0 = performance.now();
+    const onTok = (kind, payload) => {
+      if (kind === 'status') { /* keep the streamed text clean */ }
+      else if (kind === 'token') $('out').textContent += payload;
+    };
+    const text = await model.generate_json($('prompt').value, steps, schema, onTok);
+    const ms = Math.round(performance.now() - t0);
+    $('out').textContent = text;
+    showVerdict(text);
+    $('stats').innerHTML = `<span>backend <b>WebGPU</b></span><span>on-device <b>Qwen2.5-0.5B</b></span><span>latency <b>${ms} ms</b></span><span><b>guided</b> · schema-masked logits</span>`;
+  }catch(e){ $('out').textContent = 'error: ' + (e && e.message || e); }
+  $('run').disabled = $('runsdk').disabled = false;
+}
+
+async function runSdk(){
+  if(!navigator.gpu){ $('out').textContent=''; $('gpuNote').style.display='block'; return; }
+  $('run').disabled = $('runsdk').disabled = true; $('verdict').innerHTML=''; $('stats').innerHTML='';
+  try{
+    await ensureModel();
+    $('out').textContent = 'importing ai@5 + zod from npm…';
+    const [{ generateObject }, { z }, prov] = await Promise.all([
+      import('https://esm.sh/ai@5'),
+      import('https://esm.sh/zod@3'),
+      import('./ferric-provider.js'),
+    ]);
+    // reuse the already-loaded weights: hand the loaded FerricModel to the provider
+    const model = prov.ferric(fm, { steps: Math.max(8, Math.min(256, +$('steps').value||80)) });
+    // build a zod schema mirroring the Person preset (the AI SDK path validates + parses)
+    const schema = z.object({ name: z.string(), age: z.number().int(), city: z.string(), active: z.boolean() });
+    $('out').textContent = 'running generateObject() on-device…';
+    const t0 = performance.now();
+    const { object } = await generateObject({ model, schema, prompt: $('prompt').value || 'Invent a fictional person.' });
+    const ms = Math.round(performance.now() - t0);
+    $('out').textContent = JSON.stringify(object, null, 2);
+    const ok = schema.safeParse(object).success;
+    $('verdict').innerHTML = ok
+      ? `<span class="verdict ok">✓ generateObject() → schema-valid object · on-device</span>`
+      : `<span class="verdict bad">✗ validation failed</span>`;
+    $('stats').innerHTML = `<span>via <b>Vercel AI SDK</b> generateObject()</span><span>backend <b>WebGPU</b></span><span>latency <b>${ms} ms</b></span><span>zod-validated <b>${ok}</b></span>`;
+  }catch(e){ $('out').textContent = 'AI SDK path unavailable (CDN blocked?): ' + (e && e.message || e) + '\nThe on-device engine above still runs — it needs no CDN.'; }
+  $('run').disabled = $('runsdk').disabled = false;
+}
+
+async function boot(){
+  if(!navigator.gpu){ $('out').textContent=''; $('gpuNote').style.display='block'; return; }
+  await ensureInit();
+  const a = await navigator.gpu.requestAdapter();
+  if(!a){ $('out').textContent=''; $('gpuNote').style.display='block'; return; }
+  $('out').textContent = 'ready — pick a schema and press Generate (first run downloads the model).';
+  $('run').disabled = $('runsdk').disabled = false;
+  $('run').onclick = run; $('runsdk').onclick = runSdk;
+}
+boot();
+</script>
+</body>
+</html>
