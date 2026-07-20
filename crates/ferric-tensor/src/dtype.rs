@@ -1037,6 +1037,11 @@ pub struct Q4_KWeights {
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 32 u32 per block (128 quant bytes)
     aux: Arc<wgpu::Buffer>,   // 4 u32 per block: [d|dmin<<16, scale bytes 0..4, 4..8, 8..12]
+    // Transposed (output-minor) copies for the coalesced GEMV experiment (FERRIC_Q4K_TRANS): the same
+    // words/aux reordered so consecutive output-threads read consecutive memory. Built only when the
+    // env flag is set (else empty), since it doubles weight memory. Same math → bit-identical.
+    codes_t: Option<Arc<wgpu::Buffer>>, // [block][word][output]
+    aux_t: Option<Arc<wgpu::Buffer>>,   // [block][k][output]
     pub rows: usize,
     pub cols: usize,          // multiple of 256
 }
@@ -1059,7 +1064,21 @@ impl Q4_KWeights {
             label: Some(label), contents: bytemuck::cast_slice(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         }));
-        Q4_KWeights { ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), rows, cols }
+        // Optional transposed (coalesced-GEMV) copies: codes_t[(j*32+w)*rows + o], aux_t[(j*4+k)*rows + o].
+        let (codes_t, aux_t) = if std::env::var("FERRIC_Q4K_TRANS").is_ok() {
+            let nbpr = cols / 256;
+            let mut ct = vec![0u32; nblk * 32];
+            let mut at = vec![0u32; nblk * 4];
+            for o in 0..rows {
+                for j in 0..nbpr {
+                    let bi = o * nbpr + j;
+                    for k in 0..4 { at[(j * 4 + k) * rows + o] = aux[bi * 4 + k]; }
+                    for w in 0..32 { ct[(j * 32 + w) * rows + o] = codes[bi * 32 + w]; }
+                }
+            }
+            (Some(mk("q4k.codes_t", &ct)), Some(mk("q4k.aux_t", &at)))
+        } else { (None, None) };
+        Q4_KWeights { ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), codes_t, aux_t, rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 144 }
 }
@@ -1079,6 +1098,15 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
         };
+        // Coalesced-GEMV experiment: transposed weight layout so output-threads read contiguous memory.
+        if let (Some(ct), Some(at)) = (&w.codes_t, &w.aux_t) {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            let grid = ((gw as u32), wg.div_ceil(gw) as u32, 1u32);
+            run(&self.ctx, MATMUL_Q4_K_TRANS_WGSL, "matmul_q4_k_trans",
+                &[x.buf.as_ref(), ct.as_ref(), at.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])], grid);
+            return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
+        }
         // Prefill tensor-core fast-path (opt-in, Metal), same discipline as Q2_0.
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q4_k_coop(w);
@@ -1932,6 +1960,49 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var k: u32 = tid; k < n_embd; k = k + 256u) {
         out[row * n_embd + k] = dn_dot(k, nblk_f);
     }
+}
+"#;
+
+/// Transposed (output-minor) Q4_K GEMV — same math as the flat kernel, weights reordered so the 64
+/// output-threads of a workgroup read contiguous memory (coalesced). A/B experiment vs the flat kernel.
+const MATMUL_Q4_K_TRANS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:       array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes_t: array<u32>;   // [block][word][output]
+@group(0) @binding(2) var<storage,read>        aux_t:   array<u32>;   // [block][k][output]
+@group(0) @binding(3) var<storage,read_write>  out:     array<f32>;
+@group(0) @binding(4) var<uniform>             info:    vec4<u32>;    // rows, out(=o_dim), in, row_stride
+fn scbyte_t(base: u32, od: u32, i: u32) -> u32 { return (aux_t[base + od * (1u + (i >> 2u))] >> (8u * (i & 3u))) & 0xffu; }
+fn scmin_t(base: u32, od: u32, j: u32) -> vec2<u32> {
+    if (j < 4u) { return vec2<u32>(scbyte_t(base, od, j) & 63u, scbyte_t(base, od, j + 4u) & 63u); }
+    let a = scbyte_t(base, od, j + 4u); let lo = scbyte_t(base, od, j - 4u); let hi = scbyte_t(base, od, j);
+    return vec2<u32>((a & 0x0Fu) | ((lo >> 6u) << 4u), (a >> 4u) | ((hi >> 6u) << 4u));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var j: u32 = 0u; j < nblk; j = j + 1u) {
+        let ab = j * 4u * o_dim + o;
+        let dd = unpack2x16float(aux_t[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + j * 256u;
+        let cbase = j * 32u * o_dim + o;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin_t(ab, o_dim, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cbase + (8u * (s >> 1u)) * o_dim; let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes_t[cw + w * o_dim];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    out[idx] = acc;
 }
 "#;
 
