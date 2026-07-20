@@ -120,6 +120,80 @@ impl Bpe {
     }
 }
 
+/// A **SentencePiece** tokenizer (llama.cpp `tokenizer.ggml.model == "llama"` — SPM/BPE-with-scores).
+/// This is the Llama-2 / Mistral / **Phi-3** / Gemma family: a scored vocab (no merges list), spaces
+/// encoded as `▁` (U+2581), and `<0xXX>` byte-fallback tokens for anything out of vocab. Tokenization
+/// is the SPM greedy merge — repeatedly fuse the adjacent pair whose combined token has the highest
+/// vocab score — matching llama.cpp's `llm_tokenizer_spm`.
+pub struct Spm {
+    tokens: Vec<String>,
+    vocab: HashMap<String, u32>,
+    scores: Vec<f32>,
+    byte_tok: Vec<Option<u32>>, // byte value → `<0xXX>` id
+}
+
+impl Spm {
+    pub fn new(tokens: Vec<String>, scores: Vec<f32>) -> Spm {
+        let vocab: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let byte_tok = (0..256u32).map(|b| vocab.get(&format!("<0x{b:02X}>")).copied()).collect();
+        Spm { tokens, vocab, scores, byte_tok }
+    }
+    pub fn vocab_size(&self) -> usize { self.tokens.len() }
+    pub fn id_of(&self, s: &str) -> Option<u32> { self.vocab.get(s).copied() }
+    fn score_of(&self, s: &str) -> Option<f32> { self.vocab.get(s).map(|&id| self.scores.get(id as usize).copied().unwrap_or(0.0)) }
+
+    /// Encode one raw-text fragment. `prefix` requests SentencePiece's leading-space (▁) — true only for
+    /// text at the very start of the sequence (text following a special token gets none).
+    pub fn encode_piece(&self, text: &str, prefix: bool) -> Vec<u32> {
+        if text.is_empty() { return Vec::new(); }
+        // Escape whitespace to ▁ and optionally prepend the leading ▁.
+        let mut esc = String::new();
+        if prefix { esc.push('\u{2581}'); }
+        for c in text.chars() { esc.push(if c == ' ' { '\u{2581}' } else { c }); }
+        // Initial symbols = individual UTF-8 chars; greedily merge the highest-score adjacent pair.
+        let mut syms: Vec<String> = esc.chars().map(|c| c.to_string()).collect();
+        loop {
+            let mut best: Option<(usize, f32)> = None;
+            for i in 0..syms.len().saturating_sub(1) {
+                let merged = format!("{}{}", syms[i], syms[i + 1]);
+                if let Some(sc) = self.score_of(&merged) {
+                    if best.is_none_or(|(_, bs)| sc > bs) { best = Some((i, sc)); }
+                }
+            }
+            let Some((i, _)) = best else { break };
+            let right = syms.remove(i + 1);
+            syms[i].push_str(&right);
+        }
+        // Resegment to ids; anything still out-of-vocab falls back to its raw `<0xXX>` bytes.
+        let mut ids = Vec::new();
+        for s in &syms {
+            if let Some(&id) = self.vocab.get(s) { ids.push(id); }
+            else { for b in s.bytes() { if let Some(id) = self.byte_tok[b as usize] { ids.push(id); } } }
+        }
+        ids
+    }
+
+    /// Raw bytes a token represents: `<0xXX>` → that byte, `▁` → space, a bracketed control piece
+    /// (`<s>`, `</s>`, `<|user|>`, `<unk>`, …) → None (not literal text — barred under a guided constraint).
+    pub fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        let t = self.tokens.get(id as usize)?;
+        if t.len() == 6 && t.starts_with("<0x") && t.ends_with('>') {
+            return u8::from_str_radix(&t[3..5], 16).ok().map(|b| vec![b]);
+        }
+        if t.starts_with('<') && t.ends_with('>') && (t.contains('|') || t.ends_with("s>") || matches!(t.as_str(), "<unk>" | "<pad>" | "<mask>")) {
+            return None;
+        }
+        Some(t.replace('\u{2581}', " ").into_bytes())
+    }
+
+    /// Decode ids → text (drops control tokens; joins the rest's bytes).
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut bytes = Vec::new();
+        for &id in ids { if let Some(b) = self.token_bytes(id) { bytes.extend(b); } }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 /// The HF SmolLM/GPT-2 pre-tokenizer: a `Digits(individual)` split (each digit isolated) followed by
 /// the ByteLevel GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
 /// Hand-rolled to match `tokenizers` token-for-token — contractions, leading-space attach, multi-space

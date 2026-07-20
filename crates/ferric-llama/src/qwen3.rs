@@ -148,18 +148,35 @@ impl Qwen3 {
                 bias.extend(g.dequant(&b("attn_v.bias"))?);
                 Some(Tensor::from_vec(ctx, &bias, &[1, bias.len()]))
             } else { None };
+            // Q/K/V: Qwen/Llama store three separate weights (we fuse them); Phi-3 stores ONE pre-fused
+            // `attn_qkv` (q|k|v stacked) — load it directly and take the split widths from the config.
+            let (wqkv, q_out, kv_out) = if g.tensor(&b("attn_qkv.weight")).is_some() {
+                (Proj::load(ctx, g, &[&b("attn_qkv.weight")])?, cfg.n_head * cfg.head_dim, cfg.n_head_kv * cfg.head_dim)
+            } else {
+                (Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                 g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
+                 g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize)
+            };
+            // FFN gate|up: Qwen/Llama store separate `ffn_gate`+`ffn_up`; Phi-3 pre-fuses them into
+            // `ffn_up` ([2·n_ff, n_embd], gate first) — same layout our SwiGLU fast-path already expects.
+            let (ffn_gate_up, ffn_gate_out) = if g.tensor(&b("ffn_gate.weight")).is_some() {
+                (Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+                 g.tensor(&b("ffn_gate.weight")).unwrap().dims[1] as usize)
+            } else {
+                (Proj::load(ctx, g, &[&b("ffn_up.weight")])?, cfg.n_ff)
+            };
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 ffn_norm: f32t(ctx, g, &b("ffn_norm.weight"), &[cfg.n_embd])?,
                 q_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?) } else { None },
                 k_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?) } else { None },
-                wqkv: Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                wqkv,
                 qkv_bias,
-                q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
-                kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
+                q_out,
+                kv_out,
                 wo: qm(ctx, g, &b("attn_output.weight"))?,
-                ffn_gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
-                ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
+                ffn_gate_up,
+                ffn_gate_out,
                 ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
             });
         }

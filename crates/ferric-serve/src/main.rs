@@ -10,7 +10,7 @@ mod mcp;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
-use ferric_tokenizer::Bpe;
+use ferric_tokenizer::{Bpe, Spm};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -33,6 +33,9 @@ struct Engine {
     ctx: Arc<Context>,
     model: Qwen3,
     bpe: Bpe,
+    /// Present for SentencePiece models (`tokenizer.ggml.model == "llama"`: Phi-3 / Mistral / Llama-2 /
+    /// Gemma). When set, all text tokenization goes through it instead of the byte-level `bpe`.
+    spm: Option<Spm>,
     tokens: Vec<String>,
     u2b: HashMap<char, u8>,
     im_start: Option<u32>,
@@ -67,6 +70,17 @@ impl Engine {
             _ => Vec::new(),
         };
         let bpe = Bpe::new(vocab.clone(), &merges);
+        // SentencePiece models carry a per-token score array and no merges — detect and build an Spm.
+        let spm = match g.metadata.get("tokenizer.ggml.model") {
+            Some(Meta::Str(s)) if s == "llama" => {
+                let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {
+                    Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
+                    _ => Vec::new(),
+                };
+                Some(Spm::new(tokens.clone(), scores))
+            }
+            _ => None,
+        };
         let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let mut eos: Vec<u32> = Vec::new();
@@ -79,11 +93,15 @@ impl Engine {
         let u2b = byte_decoder();
         // Precompute each token's raw bytes (chars → bytes via u2b). A token containing any char not in
         // the byte map is a special token (e.g. <|im_end|>) → None → disallowed under a constraint.
-        let token_bytes: Vec<Option<Vec<u8>>> = tokens.iter().map(|t| {
-            let mut b = Vec::with_capacity(t.len());
-            for c in t.chars() { match u2b.get(&c) { Some(&x) => b.push(x), None => return None } }
-            Some(b)
-        }).collect();
+        let token_bytes: Vec<Option<Vec<u8>>> = if let Some(sp) = &spm {
+            (0..tokens.len() as u32).map(|i| sp.token_bytes(i)).collect()
+        } else {
+            tokens.iter().map(|t| {
+                let mut b = Vec::with_capacity(t.len());
+                for c in t.chars() { match u2b.get(&c) { Some(&x) => b.push(x), None => return None } }
+                Some(b)
+            }).collect()
+        };
         // Special (control) tokens for template-aware tokenization: prefer the GGUF token_type array
         // (3 = CONTROL); else fall back to the reliable `<|…|>` pattern (ChatML/Llama-3 style).
         let ttypes: Vec<i64> = match g.metadata.get("tokenizer.ggml.token_type") {
@@ -100,7 +118,13 @@ impl Engine {
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
         let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        Engine { ctx, model, bpe, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
+        Engine { ctx, model, bpe, spm, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
+    }
+
+    /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `prefix` requests the
+    /// SentencePiece leading-space (ignored by byte-level BPE, which encodes spaces directly).
+    fn enc(&self, text: &str, prefix: bool) -> Vec<u32> {
+        match &self.spm { Some(sp) => sp.encode_piece(text, prefix), None => self.bpe.encode(text) }
     }
 
     /// Split `text` on control tokens (longest match) and encode: control tokens → their id, the text
@@ -118,11 +142,11 @@ impl Engine {
             }
             match best {
                 Some((pos, s, id)) => {
-                    if pos > 0 { ids.extend(self.bpe.encode(&rest[..pos])); }
+                    if pos > 0 { let p = ids.is_empty(); ids.extend(self.enc(&rest[..pos], p)); }
                     ids.push(id);
                     rest = &rest[pos + s.len()..];
                 }
-                None => { ids.extend(self.bpe.encode(rest)); break 'outer; }
+                None => { let p = ids.is_empty(); ids.extend(self.enc(rest, p)); break 'outer; }
             }
         }
         ids
@@ -171,6 +195,7 @@ impl Engine {
     }
 
     fn detok(&self, ids: &[u32]) -> String {
+        if let Some(sp) = &self.spm { return sp.decode(ids); }
         let s: String = ids.iter().map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default()).collect();
         String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
     }
@@ -185,10 +210,16 @@ impl Engine {
             let text: String = messages.iter().map(|m| format!("{}: {}\n", m["role"].as_str().unwrap_or("user"), m["content"].as_str().unwrap_or(""))).collect();
             let mut ids = Vec::new();
             if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
-            ids.extend(self.bpe.encode(&text));
+            ids.extend(self.enc(&text, true));
             return ids;
         }
-        self.encode_special(&self.render_chat(messages))
+        let mut ids = self.encode_special(&self.render_chat(messages));
+        // SentencePiece templates (Phi-3/Mistral) don't embed BOS; add_bos prepends it. (BPE templates
+        // like Llama-3 carry their own <|begin_of_text|>, so guard on it not already leading.)
+        if self.spm.is_some() && self.add_bos {
+            if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
+        }
+        ids
     }
 
     /// Decode. `temperature` 0 → greedy argmax (deterministic — the default). >0 → top-p sampling
@@ -447,7 +478,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
-    ids.extend(eng.bpe.encode(prompt_text));
+    ids.extend(eng.enc(prompt_text, true));
     let (text, ptok, gtok) = eng.generate(&ids, max_tokens, temperature, None, |_| {});
     write_json(stream, 200, &json!({
         "id": format!("cmpl-ferric-{}", ids.len()), "object": "text_completion", "created": now_unix(), "model": eng.name,
