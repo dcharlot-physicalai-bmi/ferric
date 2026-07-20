@@ -89,6 +89,8 @@ impl Engine {
         let im_start = vocab.get("<|im_start|>").copied();
         if let Some(e) = im_end { if !eos.contains(&e) { eos.push(e); } }
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
+        // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
+        for t in ["<end_of_turn>", "<|end|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
         let model = Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}"));
         let u2b = byte_decoder();
         // Precompute each token's raw bytes (chars → bytes via u2b). A token containing any char not in

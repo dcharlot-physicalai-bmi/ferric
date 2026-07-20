@@ -28,6 +28,8 @@ pub struct Cfg {
     pub rope_base: f32,
     pub has_qk_norm: bool, // Qwen3 has it, Qwen2/Llama don't
     pub qkv_bias: bool,    // Qwen2 has q/k/v biases; Qwen3/Llama don't
+    pub is_gemma: bool,    // Gemma: (1+w) norms, √d embed scale, post-attn/post-ffn norms, gelu, per-layer rope
+    pub embd_scale: f32,   // Gemma scales token embeddings by √n_embd; 1.0 otherwise
 }
 
 impl Cfg {
@@ -41,8 +43,10 @@ impl Cfg {
         let n_head = u("attention.head_count")?;
         // Some arches (qwen2) omit key_length; then head_dim = embedding_length / head_count.
         let head_dim = u("attention.key_length").unwrap_or_else(|_| u("embedding_length").unwrap_or(0) / n_head.max(1));
+        let is_gemma = arch.starts_with("gemma");
+        let n_embd = u("embedding_length")?;
         Ok(Cfg {
-            n_embd: u("embedding_length")?,
+            n_embd,
             n_layer: u("block_count")?,
             n_head,
             n_head_kv: u("attention.head_count_kv")?,
@@ -53,6 +57,8 @@ impl Cfg {
             rope_base: f("rope.freq_base")?,
             has_qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
             qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
+            is_gemma,
+            embd_scale: if is_gemma { (n_embd as f32).sqrt() } else { 1.0 },
         })
     }
 }
@@ -112,6 +118,9 @@ pub struct Layer {
     ffn_gate_up: Proj,
     ffn_gate_out: usize,
     ffn_down: QMatrix,
+    post_attn_norm: Option<Tensor>, // Gemma: normalizes the attn output before the residual add
+    post_ffn_norm: Option<Tensor>,  // Gemma: normalizes the ffn output before the residual add
+    rope_base: f32,                 // per-layer RoPE θ (Gemma alternates local 1e4 / global 1e6)
 }
 
 /// Per-layer attention K/V history. One step per token: append the new K/V into a grow-in-place
@@ -140,6 +149,12 @@ impl Qwen3 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen3, String> {
         let cfg = Cfg::from_gguf(g)?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
+        // Gemma's `(1+w)` RMSNorm is folded into the weight at GGUF-conversion time (llama.cpp adds 1 to
+        // every `*_norm` weight), so at runtime it's a plain rmsnorm·weight — no offset here. `nrm` just
+        // loads a norm tensor (kept as one helper so the Gemma post-norms load the same way).
+        let nrm = |name: &str, n: usize| -> Result<Tensor, String> {
+            Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[n]))
+        };
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
             let qkv_bias = if cfg.qkv_bias {
@@ -165,11 +180,13 @@ impl Qwen3 {
             } else {
                 (Proj::load(ctx, g, &[&b("ffn_up.weight")])?, cfg.n_ff)
             };
+            // Gemma alternates attention: 1 global layer every 6 (θ=rope_base=1e6), the rest local (θ=1e4).
+            let rope_base = if cfg.is_gemma && il % 6 != 5 { 10000.0 } else { cfg.rope_base };
             layers.push(Layer {
-                attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
-                ffn_norm: f32t(ctx, g, &b("ffn_norm.weight"), &[cfg.n_embd])?,
-                q_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?) } else { None },
-                k_norm: if cfg.has_qk_norm { Some(f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?) } else { None },
+                attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
+                ffn_norm: nrm(&b("ffn_norm.weight"), cfg.n_embd)?,
+                q_norm: if cfg.has_qk_norm { Some(nrm(&b("attn_q_norm.weight"), cfg.head_dim)?) } else { None },
+                k_norm: if cfg.has_qk_norm { Some(nrm(&b("attn_k_norm.weight"), cfg.head_dim)?) } else { None },
                 wqkv,
                 qkv_bias,
                 q_out,
@@ -178,12 +195,15 @@ impl Qwen3 {
                 ffn_gate_up,
                 ffn_gate_out,
                 ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
+                post_attn_norm: if cfg.is_gemma { Some(nrm(&b("post_attention_norm.weight"), cfg.n_embd)?) } else { None },
+                post_ffn_norm: if cfg.is_gemma { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
+                rope_base,
             });
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         Ok(Qwen3 {
             tok_embd: g.raw("token_embd.weight")?,
-            out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
+            out_norm: nrm("output_norm.weight", cfg.n_embd)?,
             lm_head: qm(ctx, g, head)?,
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
             rope_freqs: g.tensor("rope_freqs.weight").map(|t| {
@@ -204,15 +224,17 @@ impl Qwen3 {
             let off = t as usize * row_bytes;
             v.extend(deq_raw(&self.tok_embd[off..off + row_bytes], d, self.embd_type).expect("embed row"));
         }
+        // Gemma scales the token embeddings by √n_embd (identity elsewhere, embd_scale == 1.0).
+        if self.cfg.embd_scale != 1.0 { for x in &mut v { *x *= self.cfg.embd_scale; } }
         Tensor::from_vec(&self.ctx, &v, &[tokens.len(), d])
     }
 
     /// Full RoPE over head_dim (Qwen rotates the whole head). Llama-3 applies its per-frequency
     /// `rope_freqs` scaling; Qwen has none, so it's plain RoPE.
-    fn rope(&self, x: &Tensor, n_heads: usize, offset: usize) -> Tensor {
+    fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
         match &self.rope_freqs {
-            Some(fs) => x.rope_scaled(fs, n_heads, self.cfg.head_dim, self.cfg.rope_base, offset),
-            None => x.rope(n_heads, self.cfg.head_dim, self.cfg.rope_base, offset),
+            Some(fs) => x.rope_scaled(fs, n_heads, self.cfg.head_dim, base, offset),
+            None => x.rope(n_heads, self.cfg.head_dim, base, offset),
         }
     }
 
@@ -230,8 +252,8 @@ impl Qwen3 {
         let k = qn(qkv.narrow(1, l.q_out, l.kv_out).contiguous(), nkv, &l.k_norm);
         let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out).contiguous();
 
-        let q = self.rope(&q, nh, offset);
-        let k = self.rope(&k, nkv, offset);
+        let q = self.rope(&q, nh, offset, l.rope_base);
+        let k = self.rope(&k, nkv, offset, l.rope_base);
 
         // Append the new K/V rows into the grow-in-place cache and read a view over all rows so far.
         // Byte-identical to the old `pk.cat(&k, 0)`, but without re-copying the history each step.
@@ -251,6 +273,15 @@ impl Qwen3 {
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
+        // Gemma uses GEGLU (gelu gate) not SwiGLU (silu), so it can't use the silu-fused fast paths:
+        // project gate|up, gelu the gate half, multiply by the up half, then the down projection.
+        if self.cfg.is_gemma {
+            let gu = l.ffn_gate_up.matmul(h);
+            let n = l.ffn_gate_out;
+            let gate = gu.narrow(1, 0, n).contiguous().gelu();
+            let up = gu.narrow(1, n, n).contiguous();
+            return gate.mul(&up).matmul_q(&l.ffn_down);
+        }
         // Whole-FFN megakernel (gate_up Q4_K + SwiGLU + down Q6_K in one dispatch), OPT-IN via
         // FERRIC_MEGA — correct but ~2× slower at decode (occupancy-bound); off by default.
         if let Proj::Fused(gu) = &l.ffn_gate_up {
@@ -282,6 +313,16 @@ impl Qwen3 {
                 prof(&self.ctx, "attn");
                 x = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l).add(&xy) });
                 prof(&self.ctx, "ffn");
+            } else if self.cfg.is_gemma {
+                // Gemma normalizes the attn AND ffn *outputs* (post-norms) before each residual add:
+                //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
+                let eps = self.cfg.eps;
+                x = batch(&self.ctx, || {
+                    let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos);
+                    let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
+                    let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l);
+                    x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
+                });
             } else {
                 x = batch(&self.ctx, || {
                     let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos);
