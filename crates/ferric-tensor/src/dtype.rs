@@ -1107,6 +1107,17 @@ impl Tensor {
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])], grid);
             return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
         }
+        // K-split subgroup GEMV (opt-in, needs subgroups): one subgroup per output, lanes split the
+        // blocks then subgroupAdd. Non-bit-identical → opt-in fast path.
+        if std::env::var("FERRIC_SGGEMV").is_ok() && self.ctx.subgroups {
+            let gw = n.min(65535);
+            let grid = ((gw as u32), n.div_ceil(gw) as u32, 1u32);
+            let src = MATMUL_Q4_K_SGGEMV_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+            run(&self.ctx, &src, "matmul_q4_k_sggemv",
+                &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, gw as u32])], grid);
+            return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
+        }
         // Prefill tensor-core fast-path (opt-in, Metal), same discipline as Q2_0.
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q4_k_coop(w);
@@ -1960,6 +1971,46 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var k: u32 = tid; k < n_embd; k = k + 256u) {
         out[row * n_embd + k] = dn_dot(k, nblk_f);
     }
+}
+"#;
+
+/// **K-split subgroup GEMV** (opt-in `FERRIC_SGGEMV`): one subgroup per output, its lanes split the
+/// blocks (lane L does blocks L, L+sgsz, …) into partial dots, then `subgroupAdd` reduces. The classic
+/// warp-cooperative GEMV — more memory parallelism per output than one-thread-per-output. Reuses the
+/// FLAT weight buffers. NOT bit-identical (reduction order differs) → opt-in fast path, not the default.
+const MATMUL_Q4_K_SGGEMV_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, out, in, grid_width
+__HELPERS__
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_size) sgsz: u32) {
+    let idx = wg.x + wg.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = lane; blk < nblk; blk = blk + sgsz) {
+        let bi = o * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    let total = subgroupAdd(acc);
+    if (lane == 0u) { out[idx] = total; }
 }
 "#;
 
