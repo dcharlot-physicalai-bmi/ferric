@@ -205,6 +205,12 @@ const PRESETS = {
       name:{type:'string'}, dof:{type:'integer'}, autonomous:{type:'boolean'}, payload_kg:{type:'number'} } },
     check: o => typeof o.name==='string' && Number.isInteger(o.dof) && typeof o.autonomous==='boolean' && typeof o.payload_kg==='number',
   },
+  Character: {
+    prompt: 'Invent a video-game character with a few abilities.',
+    schema: { type:'object', properties:{
+      name:{type:'string'}, level:{type:'integer'}, abilities:{type:'array', items:{type:'string'}, minItems:2, maxItems:4} } },
+    check: o => typeof o.name==='string' && Number.isInteger(o.level) && Array.isArray(o.abilities) && o.abilities.every(a=>typeof a==='string'),
+  },
 };
 let current = 'Person';
 
