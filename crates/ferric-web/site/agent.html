@@ -103,10 +103,17 @@
 <section><div class="wrap">
   <p class="eyebrow">Try it</p>
   <h2>Give it a schema. Get back exactly that shape — always.</h2>
-  <p class="muted">Loads <span class="mono">Qwen2.5-0.5B-Instruct</span> (~491 MB, once) straight from Hugging Face to your GPU, then generates under the constraint. First run downloads the weights; after that it is instant and offline.</p>
+  <p class="muted">Pick a model — a <span class="mono">byte-level BPE</span> one (Qwen) or a <span class="mono">SentencePiece</span> one (Gemma) — it streams once from Hugging Face onto your GPU, then generates under the constraint. Same pure-Rust code runs both, and produces bit-identical output to the native build. First run downloads the weights; after that it is instant and offline.</p>
 
   <div class="pg" style="margin-top:20px">
-    <div class="presets" id="presets"></div>
+    <div class="field" style="margin-top:0">
+      <label>model — runs entirely on your GPU, weights streamed from Hugging Face</label>
+      <select id="model">
+        <option value="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf">Qwen2.5-0.5B-Instruct · byte-level BPE · 491 MB</option>
+        <option value="https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf">Gemma-3-1B-it · SentencePiece · 769 MB</option>
+      </select>
+    </div>
+    <div class="presets" id="presets" style="margin-top:14px"></div>
 
     <div class="field">
       <label>JSON Schema (the output is forced to satisfy this)</label>
@@ -175,8 +182,8 @@
 <script type="module">
 import init, { FerricModel } from './pkg/ferric_web.js';
 const $ = id => document.getElementById(id);
-const MODEL = new URLSearchParams(location.search).get('model')
-  || 'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf';
+// The model URL is whichever the picker has selected (a ?model= override still wins, for testing).
+const modelUrl = () => new URLSearchParams(location.search).get('model') || $('model').value;
 
 const PRESETS = {
   Person: {
@@ -214,20 +221,25 @@ function paintPresets(){
 function loadPreset(k){ const p = PRESETS[k]; $('schema').value = JSON.stringify(p.schema, null, 2); $('prompt').value = p.prompt; }
 loadPreset('Person'); paintPresets();
 
-let ready = false, modelBytes = null, fm = null;
+let ready = false, modelBytes = null, fm = null, loadedUrl = null;
 async function ensureInit(){ if(!ready){ await init(); ready = true; } }
 
+// Switching models drops the cached bytes + GPU handle so the next run loads the new one.
+$('model').onchange = () => { modelBytes = null; fm = null;
+  $('out').textContent = 'model changed — press Generate to download & load it.'; };
+
 async function fetchModel(){
-  if (modelBytes) return modelBytes;
+  if (modelBytes && loadedUrl === modelUrl()) return modelBytes;
+  const url = modelUrl(); const name = url.split('/').pop();
   $('barwrap').style.display = 'block';
-  const r = await fetch(MODEL);
+  const r = await fetch(url);
   const total = +r.headers.get('content-length') || 491000000;
   const reader = r.body.getReader(); const chunks = []; let got = 0;
   for(;;){ const {done,value} = await reader.read(); if(done) break; chunks.push(value); got += value.length;
     $('bar').style.width = (100*got/total).toFixed(1)+'%';
-    $('out').textContent = `downloading Qwen2.5-0.5B… ${(got/1048576|0)} / ${(total/1048576|0)} MB`; }
+    $('out').textContent = `downloading ${name}… ${(got/1048576|0)} / ${(total/1048576|0)} MB`; }
   const buf = new Uint8Array(got); let o = 0; for(const c of chunks){ buf.set(c,o); o += c.length; }
-  modelBytes = buf; $('barwrap').style.display = 'none'; return buf;
+  modelBytes = buf; loadedUrl = url; $('barwrap').style.display = 'none'; return buf;
 }
 async function ensureModel(){
   await ensureInit();
