@@ -223,6 +223,9 @@ impl Tensor {
     pub fn sigmoid(&self) -> Tensor { self.unary(6) }
     pub fn silu(&self) -> Tensor { self.unary(7) }
     pub fn gelu(&self) -> Tensor { self.unary(8) }
+    /// GELU via the tanh approximation (`gelu_pytorch_tanh`) — what Gemma and GPT-2 actually use, vs
+    /// the exact erf `gelu()`. Matters for matching those models' reference numerics.
+    pub fn gelu_tanh(&self) -> Tensor { self.unary(12) }
     pub fn log(&self) -> Tensor { self.unary(9) }
     pub fn relu2(&self) -> Tensor { self.unary(10) } // ReLU² (BitNet FFN)
     pub fn softplus(&self) -> Tensor { self.unary(11) } // log(1+eˣ) — Qwen3.5 gate
@@ -875,6 +878,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 9u: { r = log(v); }
         case 10u: { let z = max(v, 0.0); r = z * z; } // ReLU² (BitNet FFN)
         case 11u: { r = max(v, 0.0) + log(1.0 + exp(-abs(v))); } // softplus (stable)
+        case 12u: { let a = 0.7978845608028654 * (v + 0.044715 * v * v * v); r = 0.5 * v * (1.0 + tanh(clamp(a, -15.0, 15.0))); } // gelu (tanh approx — Gemma/GPT-2); clamp: tanh saturates by ±15 and its exp form overflows f32 past ~44
         default: { r = v; }
     }
     out[i] = r;

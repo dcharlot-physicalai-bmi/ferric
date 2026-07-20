@@ -291,7 +291,7 @@ impl Qwen3 {
         if self.cfg.is_gemma {
             let gu = l.ffn_gate_up.matmul(h);
             let n = l.ffn_gate_out;
-            let gate = gu.narrow(1, 0, n).contiguous().gelu();
+            let gate = gu.narrow(1, 0, n).contiguous().gelu_tanh();
             let up = gu.narrow(1, n, n).contiguous();
             return gate.mul(&up).matmul_q(&l.ffn_down);
         }
