@@ -4,7 +4,7 @@ use ferric_core::{demo, matmul_cpu, max_abs_diff, Context};
 use ferric_gguf::{parse, GgufSource, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_tensor::Tensor;
-use ferric_tokenizer::Bpe;
+use ferric_tokenizer::{Bpe, Spm};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -326,6 +326,10 @@ pub struct FerricModel {
     ctx: Arc<Context>,
     model: Qwen3,
     bpe: Bpe,
+    /// SentencePiece tokenizer (Gemma / Phi-3 / Mistral / Llama-2 — `tokenizer.ggml.model == "llama"`);
+    /// when set, text goes through it instead of the byte-level `bpe`. Lets the browser run those families.
+    spm: Option<Spm>,
+    add_space_prefix: bool,
     toks: Vec<String>,
     u2b: HashMap<char, u8>,
     token_bytes: Vec<Option<Vec<u8>>>,
@@ -340,29 +344,57 @@ impl FerricModel {
         console_error_panic_hook::set_once();
         let err = |e: String| JsValue::from_str(&e);
         let g = parse(model).map_err(err)?;
-        let (bpe, toks) = build_bpe(&g)?;
+        let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
+            Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
+            _ => return Err(err("no tokens".into())),
+        };
+        let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        // SentencePiece (Gemma/Phi/Mistral/Llama-2) vs byte-level BPE (Qwen/Llama-3), from the GGUF.
+        let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "llama");
+        let (bpe, spm) = if is_spm {
+            let scores: Vec<f32> = match g.metadata().get("tokenizer.ggml.scores") {
+                Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
+                _ => Vec::new(),
+            };
+            (Bpe::new(vocab, &[]), Some(Spm::new(toks.clone(), scores)))
+        } else {
+            let merges: Vec<(String, String)> = match g.metadata().get("tokenizer.ggml.merges") {
+                Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),
+                _ => return Err(err("no merges".into())),
+            };
+            (Bpe::new(vocab, &merges), None)
+        };
+        let add_space_prefix = !matches!(g.metadata().get("tokenizer.ggml.add_space_prefix"), Some(Meta::Bool(false)));
         let u2b = gpt2_byte_decoder();
-        let token_bytes: Vec<Option<Vec<u8>>> = toks.iter().map(|t| {
-            let mut b = Vec::with_capacity(t.len());
-            for ch in t.chars() { match u2b.get(&ch) { Some(&x) => b.push(x), None => return None } }
-            Some(b)
-        }).collect();
+        let token_bytes: Vec<Option<Vec<u8>>> = if let Some(sp) = &spm {
+            (0..toks.len() as u32).map(|i| sp.token_bytes(i)).collect()
+        } else {
+            toks.iter().map(|t| {
+                let mut b = Vec::with_capacity(t.len());
+                for ch in t.chars() { match u2b.get(&ch) { Some(&x) => b.push(x), None => return None } }
+                Some(b)
+            }).collect()
+        };
         let bos_id = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let ctx = Arc::new(Context::new().await.map_err(err)?);
         let model = Qwen3::load(&ctx, &g).map_err(err)?;
-        Ok(FerricModel { ctx, model, bpe, toks, u2b, token_bytes, add_bos, bos_id })
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id })
     }
 
     /// `#layers · backend` — a small readiness string for the UI.
     pub fn info(&self) -> String { format!("{} layers · {:?}", self.model.cfg.n_layer, self.ctx.backend) }
 
     fn detok(&self, ids: &[u32]) -> String {
+        if let Some(sp) = &self.spm { return sp.decode(ids); }
         let s: String = ids.iter().map(|&i| self.toks.get(i as usize).cloned().unwrap_or_default()).collect();
         String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
     }
     fn encode(&self, prompt: &str) -> Vec<u32> {
-        let mut ids = self.bpe.encode(prompt);
+        let mut ids = match &self.spm {
+            Some(sp) => sp.encode_piece(prompt, self.add_space_prefix),
+            None => self.bpe.encode(prompt),
+        };
         if self.add_bos { if let Some(b) = self.bos_id { ids.insert(0, b); } }
         ids
     }
