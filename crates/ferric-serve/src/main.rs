@@ -36,6 +36,9 @@ struct Engine {
     /// Present for SentencePiece models (`tokenizer.ggml.model == "llama"`: Phi-3 / Mistral / Llama-2 /
     /// Gemma). When set, all text tokenization goes through it instead of the byte-level `bpe`.
     spm: Option<Spm>,
+    /// SentencePiece `add_space_prefix` (default true; Gemma sets false): prepend a leading ▁ to the
+    /// first text fragment. Wrong value → the first token differs from llama.cpp.
+    add_space_prefix: bool,
     tokens: Vec<String>,
     u2b: HashMap<char, u8>,
     im_start: Option<u32>,
@@ -81,6 +84,7 @@ impl Engine {
             }
             _ => None,
         };
+        let add_space_prefix = match g.metadata.get("tokenizer.ggml.add_space_prefix") { Some(Meta::Bool(b)) => *b, _ => true };
         let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let mut eos: Vec<u32> = Vec::new();
@@ -120,13 +124,14 @@ impl Engine {
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
         let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        Engine { ctx, model, bpe, spm, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
     }
 
-    /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `prefix` requests the
-    /// SentencePiece leading-space (ignored by byte-level BPE, which encodes spaces directly).
-    fn enc(&self, text: &str, prefix: bool) -> Vec<u32> {
-        match &self.spm { Some(sp) => sp.encode_piece(text, prefix), None => self.bpe.encode(text) }
+    /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
+    /// the first fragment of the sequence → apply SentencePiece's leading-space (gated by the model's
+    /// `add_space_prefix`; ignored by byte-level BPE, which encodes spaces directly).
+    fn enc(&self, text: &str, at_start: bool) -> Vec<u32> {
+        match &self.spm { Some(sp) => sp.encode_piece(text, at_start && self.add_space_prefix), None => self.bpe.encode(text) }
     }
 
     /// Split `text` on control tokens (longest match) and encode: control tokens → their id, the text
@@ -353,6 +358,15 @@ fn main() {
     let resolved = resolve_model(path);
     eprintln!("ferric-serve: loading {resolved} …");
     let eng = Engine::load(&resolved, name.clone());
+    if let Some(i) = args.iter().position(|a| a == "--tokenize") {
+        // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
+        let text = args.get(i + 1).cloned().unwrap_or_default();
+        let mut ids = Vec::new();
+        if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
+        ids.extend(eng.enc(&text, true));
+        eprintln!("TOKENS {}: {:?}", ids.len(), ids);
+        return;
+    }
     if args.iter().any(|a| a == "--once") {
         // Smoke test: one chat turn straight through the pipeline, no HTTP.
         let msgs = vec![json!({"role": "user", "content": "Hi"})];
