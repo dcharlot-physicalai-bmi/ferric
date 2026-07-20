@@ -133,7 +133,7 @@ impl Json {
 
 /// One template element: a fixed literal to emit, or a typed value slot.
 #[derive(Clone)]
-pub enum Item { Lit(Vec<u8>), Str, Int, Num, Bool, Enum(Vec<Vec<u8>>), Any, Arr(Box<Item>) }
+pub enum Item { Lit(Vec<u8>), Str, Int, Num, Bool, Enum(Vec<Vec<u8>>), Any, Arr(Box<Item>, u32, u32) } // Arr(element, minItems, maxItems)
 
 /// Compile a JSON-Schema object to a template. Returns None if it isn't a supported object schema.
 pub fn compile(schema: &serde_json::Value) -> Option<Vec<Item>> {
@@ -166,7 +166,11 @@ fn value_items(sub: &serde_json::Value, prog: &mut Vec<Item>) {
         // Typed array of a scalar/enum element → enforce `[`, elements, commas, `]`. Arrays of objects
         // or nested arrays (no single-Item element) fall back to a free JSON value.
         "array" => match scalar_item(&sub["items"]) {
-            Some(el) => prog.push(Item::Arr(Box::new(el))),
+            Some(el) => {
+                let min = sub["minItems"].as_u64().unwrap_or(0) as u32;
+                let max = sub["maxItems"].as_u64().map(|v| v as u32).unwrap_or(u32::MAX);
+                prog.push(Item::Arr(Box::new(el), min, max));
+            }
             None => prog.push(Item::Any),
         },
         _ => prog.push(Item::Any), // null / unknown → free JSON value
@@ -200,7 +204,7 @@ fn compile_object(schema: &serde_json::Value, prog: &mut Vec<Item>) {
 }
 
 #[derive(Clone, Copy)]
-enum Val { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize), Any(Json), Arr(u8, ArrElem) } // Str(u8): 0 body,1 esc,2..=5 in \u; Arr(phase, element-substate)
+enum Val { Fresh, Str(u8), Num(NumSt), Bool(u8, u8), Enum(u64, usize), Any(Json), Arr(u8, u32, ArrElem) } // Str(u8): 0 body,1 esc,2..=5 in \u; Arr(phase, elements-so-far, element-substate)
 
 /// In-progress state of the current element inside a typed array (mirrors the scalar `Val` variants,
 /// but non-recursive so `Val::Arr` stays `Copy`). Enum's option list lives in the array's `Item`.
@@ -231,33 +235,35 @@ impl<'a> Schema<'a> {
             Item::Bool => self.step_bool(b),
             Item::Enum(opts) => self.step_enum(b, opts),
             Item::Any => self.step_any(b),
-            Item::Arr(elem) => self.step_arr(elem, b),
+            Item::Arr(elem, min, max) => self.step_arr(elem, *min, *max, b),
         }
     }
 
-    /// Typed array: `[` (elem (`,` elem)*)? `]`, each elem constrained to `elem`'s scalar/enum type.
-    /// Phases: 0 need `[`, 1 after `[` (elem or `]`), 2 in elem, 3 after elem (`,` or `]`), 4 after `,`.
-    fn step_arr(&mut self, elem: &Item, b: u8) -> bool {
-        let (phase, mut ev) = match self.val { Val::Arr(p, e) => (p, e), Val::Fresh => (0u8, ArrElem::Fresh), _ => return false };
+    /// Typed array: `[` (elem (`,` elem)*)? `]`, each elem constrained to `elem`'s scalar/enum type,
+    /// element count in `[min, max]`. Phases: 0 need `[`, 1 after `[` (elem or `]`), 2 in elem, 3 after
+    /// elem (`,` or `]`), 4 after `,`. `count` = completed elements so far.
+    fn step_arr(&mut self, elem: &Item, min: u32, max: u32, b: u8) -> bool {
+        let (phase, count, mut ev) = match self.val { Val::Arr(p, c, e) => (p, c, e), Val::Fresh => (0u8, 0u32, ArrElem::Fresh), _ => return false };
         match phase {
-            0 => if b == b'[' { self.val = Val::Arr(1, ArrElem::Fresh); true } else { false },
+            0 => if b == b'[' { self.val = Val::Arr(1, 0, ArrElem::Fresh); true } else { false },
             1 | 4 => {
-                if phase == 1 && b == b']' { self.advance(); return true; } // empty array (only right after `[`)
+                if phase == 1 && b == b']' { if count >= min { self.advance(); return true; } return false; } // empty/short array
+                if count >= max { return false; } // maxItems reached — no more elements
                 match step_elem(elem, &mut ev, b) {
-                    EO::Consumed => { self.val = Val::Arr(2, ev); true }
-                    EO::Completed => { self.val = Val::Arr(3, ArrElem::Fresh); true }
+                    EO::Consumed => { self.val = Val::Arr(2, count, ev); true }
+                    EO::Completed => { self.val = Val::Arr(3, count + 1, ArrElem::Fresh); true }
                     EO::Reject | EO::EndedBefore => false,
                 }
             }
             2 => match step_elem(elem, &mut ev, b) {
-                EO::Consumed => { self.val = Val::Arr(2, ev); true }
-                EO::Completed => { self.val = Val::Arr(3, ArrElem::Fresh); true }
-                EO::EndedBefore => { self.val = Val::Arr(3, ArrElem::Fresh); self.step_arr(elem, b) } // number closed — reprocess byte as `,`/`]`
+                EO::Consumed => { self.val = Val::Arr(2, count, ev); true }
+                EO::Completed => { self.val = Val::Arr(3, count + 1, ArrElem::Fresh); true }
+                EO::EndedBefore => { self.val = Val::Arr(3, count + 1, ArrElem::Fresh); self.step_arr(elem, min, max, b) } // number closed — reprocess byte as `,`/`]`
                 EO::Reject => false,
             },
             3 => {
-                if b == b',' { self.val = Val::Arr(4, ArrElem::Fresh); true }
-                else if b == b']' { self.advance(); true }
+                if b == b',' && count < max { self.val = Val::Arr(4, count, ArrElem::Fresh); true }
+                else if b == b']' && count >= min { self.advance(); true }
                 else { false }
             }
             _ => false,
@@ -443,6 +449,15 @@ mod tests {
         assert!(!sch_accepts(sc, r#"{"tags":["a",],"nums":[]}"#));       // trailing comma rejected
         assert!(!sch_accepts(sc, r#"{"tags":"a","nums":[]}"#));          // array slot rejects a bare string
         assert!(!sch_accepts(sc, r#"{"tags":[,"nums":[]}"#));            // leading comma / no element
+    }
+    #[test]
+    fn schema_array_bounds() {
+        let sc = r#"{"type":"object","properties":{"xs":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":3}}}"#;
+        assert!(sch_accepts(sc, r#"{"xs":[1,2]}"#));       // min
+        assert!(sch_accepts(sc, r#"{"xs":[1,2,3]}"#));     // max
+        assert!(!sch_accepts(sc, r#"{"xs":[1]}"#));        // below minItems
+        assert!(!sch_accepts(sc, r#"{"xs":[1,2,3,4]}"#));  // above maxItems (4th element / comma rejected)
+        assert!(!sch_accepts(sc, r#"{"xs":[]}"#));         // empty below min
     }
     #[test]
     fn schema_array_of_enum_and_bool() {
