@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferric — private semantic search, on-device</title>
+<meta name="description" content="Ferric embeds text in your browser tab on WebGPU with a real embedding model (Qwen3-Embedding), so you can run semantic search / RAG entirely on-device — your documents and queries never leave your machine.">
+<style>
+  :root{--bg:#080b12;--bg2:#0b0f19;--panel:#101728;--panel2:#0c1220;--line:#1c2540;--ink:#eaf0fb;--dim:#93a3c4;--faint:#5f6f92;--gold:#e8b24a;--gold2:#f2c96b;--ok:#5bd68a;--accent:#6ea8fe;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;--sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  *{box-sizing:border-box}html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}.wrap{max-width:960px;margin:0 auto;padding:0 24px}.mono{font-family:var(--mono)}
+  nav{position:sticky;top:0;z-index:20;background:rgba(8,11,18,.82);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700}.phi{color:var(--gold);font-size:22px}
+  nav .sp{flex:1}nav a.link{color:var(--dim);font-size:14px}nav a.link:hover{color:var(--ink)}
+  .btn{background:var(--gold);color:#0a0d14;padding:9px 16px;border-radius:9px;font-weight:650;font-size:14px;border:0;cursor:pointer}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}.btn:hover{filter:brightness(1.05)}.btn:disabled{opacity:.5;cursor:default}
+  .hero{position:relative;padding:80px 0 40px;overflow:hidden}
+  .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(680px 320px at 30% -8%, rgba(232,178,74,.13), transparent 70%),radial-gradient(520px 320px at 90% 4%, rgba(110,168,254,.10), transparent 70%);pointer-events:none}
+  .badge{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);font-size:12.5px;padding:6px 12px;border-radius:999px;margin-bottom:22px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  h1{font-size:clamp(32px,5.4vw,52px);line-height:1.04;letter-spacing:-.03em;margin:0 0 16px;font-weight:780}h1 .g{color:var(--gold)}
+  .lede{max-width:660px;font-size:clamp(16px,2.1vw,19px);color:var(--dim)}.lede b{color:var(--ink);font-weight:600}
+  section{padding:40px 0;border-top:1px solid var(--line)}
+  .eyebrow{color:var(--gold);font:600 13px var(--mono);letter-spacing:.12em;text-transform:uppercase;margin:0 0 14px}
+  h2{font-size:clamp(22px,3.4vw,30px);letter-spacing:-.02em;margin:0 0 12px;font-weight:720}.muted{color:var(--dim)}
+  .pg{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:22px}
+  .field{margin-top:16px}.field label{display:block;color:var(--faint);font-size:12.5px;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em}
+  textarea,input,select{width:100%;background:#070a11;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:11px 13px;font:13.5px var(--mono)}
+  textarea{resize:vertical;min-height:120px}
+  .barwrap{height:6px;background:#070a11;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:14px;display:none}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--gold2));transition:width .15s}
+  .out{margin-top:16px}
+  .hit{display:flex;gap:12px;align-items:center;background:#070a11;border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-top:8px}
+  .score{font:600 13px var(--mono);color:var(--gold2);min-width:52px}
+  .meter{flex:0 0 90px;height:6px;background:#131a2b;border-radius:4px;overflow:hidden}.meter>i{display:block;height:100%;background:linear-gradient(90deg,var(--gold),var(--gold2))}
+  .txt{flex:1;font-size:14px}
+  .why{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:22px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:18px}
+  .card h3{margin:0 0 6px;font-size:14.5px;font-weight:640;color:var(--gold2)}.card p{margin:0;font-size:13.5px;color:var(--dim)}
+  footer{padding:36px 0 60px;border-top:1px solid var(--line);color:var(--faint);font-size:13.5px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center}footer a{color:var(--dim)}
+</style>
+</head>
+<body>
+<nav><div class="wrap">
+  <a class="brand" href="/"><span class="phi">Φ</span> Ferric</a><span class="sp"></span>
+  <a class="link" href="/#proof">Proof</a><a class="link" href="/bonsai">Live LLM</a>
+  <a class="link" href="/agent">Structured</a><a class="link" href="/tools">Tools</a><a class="link" href="/rag" style="color:var(--ink)">Search</a>
+  <a class="btn ghost" href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <span class="badge"><span class="dot"></span> embeddings · in this browser tab · nothing leaves your machine</span>
+  <h1>Private semantic search.<br><span class="g">On-device.</span></h1>
+  <p class="lede">Ferric embeds text with a <b>real embedding model</b> (Qwen3-Embedding) on your GPU, so you can search by <b>meaning</b> — not keywords — entirely in the tab. This is the retrieval half of <b>RAG</b>: your documents and queries never touch a server. The same pure-Rust code as the cloud, and the embeddings are bit-identical to the native build.</p>
+</div></header>
+
+<section><div class="wrap">
+  <p class="eyebrow">Try it</p>
+  <h2>Search these facts by meaning.</h2>
+  <p class="muted">Edit the corpus if you like — each line is embedded once on your GPU. Then ask in your own words; the closest lines by <span class="mono">cosine similarity</span> rank to the top. Note it matches meaning, not words (e.g. “how plants make food” finds photosynthesis).</p>
+  <div class="pg" style="margin-top:20px">
+    <div class="field"><label>corpus — one document per line</label><textarea id="corpus" spellcheck="false"></textarea></div>
+    <div class="field"><label>query — ask in your own words</label><input id="query" spellcheck="false" value="How do plants make food from sunlight?"></div>
+    <div style="margin-top:16px"><button class="btn" id="run" disabled>Search ▸</button></div>
+    <div class="barwrap" id="barwrap"><div class="bar" id="bar"></div></div>
+    <div class="out" id="out">initializing WebGPU…</div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">Why it matters</p>
+  <h2>RAG, without the cloud.</h2>
+  <div class="why">
+    <div class="card"><h3>Private by construction</h3><p>Your corpus and query are embedded and compared in the tab. No embeddings API, no vector DB in the cloud, no data leaving.</p></div>
+    <div class="card"><h3>Meaning, not keywords</h3><p>A real 0.6B embedding model on WebGPU — it matches paraphrases and concepts, the foundation of retrieval-augmented generation.</p></div>
+    <div class="card"><h3>Same server API</h3><p>Ferric's native server exposes the OpenAI <span class="mono">/v1/embeddings</span> endpoint too — point any RAG stack at it.</p></div>
+    <div class="card"><h3>Bit-identical everywhere</h3><p>The exact pure-Rust model, on the browser's GPU — embeddings match the native build to the bit.</p></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap"><span class="phi">Φ</span><span>Ferric — from the <a href="https://physicalai-bmi.org" target="_blank">Institute for Physical AI</a>.</span><span class="sp" style="flex:1"></span><a href="/tools">Tools</a><a href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a></div></footer>
+
+<script type="module">
+import init, { FerricModel } from './pkg/ferric_web.js';
+const $ = id => document.getElementById(id);
+const MODEL = new URLSearchParams(location.search).get('model')
+  || 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf';
+const DEFAULT_CORPUS = [
+  "Photosynthesis lets plants convert sunlight, water, and carbon dioxide into sugars for energy.",
+  "The Eiffel Tower is a wrought-iron landmark on the Champ de Mars in Paris, France.",
+  "Mitochondria generate most of a cell's supply of ATP, its chemical energy.",
+  "Mount Everest, on the China–Nepal border, is Earth's highest mountain above sea level.",
+  "The speed of light in a vacuum is about 299,792 kilometres per second.",
+  "The Great Wall of China stretches thousands of kilometres across northern China.",
+  "Honeybees communicate the location of flowers to the hive by performing a waggle dance.",
+  "Shakespeare wrote the tragedy Romeo and Juliet in the late 16th century.",
+  "The Amazon rainforest is a vast tropical forest that produces a large share of Earth's oxygen.",
+  "Water freezes into ice at zero degrees Celsius at standard atmospheric pressure.",
+];
+$('corpus').value = DEFAULT_CORPUS.join('\n');
+
+let ready=false, fm=null, bytes=null, docEmb=null, docText=null;
+async function ensureInit(){ if(!ready){ await init(); ready=true; } }
+async function fetchModel(){
+  if(bytes) return bytes;
+  $('barwrap').style.display='block';
+  const r=await fetch(MODEL); const total=+r.headers.get('content-length')||639000000;
+  const reader=r.body.getReader(); const chunks=[]; let got=0;
+  for(;;){ const {done,value}=await reader.read(); if(done) break; chunks.push(value); got+=value.length;
+    $('bar').style.width=(100*got/total).toFixed(1)+'%'; $('out').textContent=`downloading Qwen3-Embedding-0.6B… ${(got/1048576|0)} / ${(total/1048576|0)} MB`; }
+  const buf=new Uint8Array(got); let o=0; for(const c of chunks){ buf.set(c,o); o+=c.length; }
+  bytes=buf; $('barwrap').style.display='none'; return buf;
+}
+const cos=(a,b)=>{ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s; };
+
+async function run(){
+  if(!navigator.gpu){ $('out').textContent='This demo needs WebGPU (Chrome/Edge 113+ or Safari 18+).'; return; }
+  $('run').disabled=true;
+  try{
+    await ensureInit();
+    const b=await fetchModel();
+    if(!fm){ $('out').textContent='loading the embedder onto WebGPU…'; fm=await FerricModel.load(b); }
+    const docs=$('corpus').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    // (Re)embed the corpus only when it changed — embedding is the cost; a query is then instant.
+    if(docText !== docs.join('\n')){
+      docEmb=[];
+      for(let i=0;i<docs.length;i++){ $('out').textContent=`embedding corpus… ${i+1} / ${docs.length}`; docEmb.push(await fm.embed(docs[i])); }
+      docText=docs.join('\n');
+    }
+    $('out').textContent='embedding query…';
+    const q=await fm.embed($('query').value);
+    const ranked=docs.map((t,i)=>({t,s:cos(q,docEmb[i])})).sort((a,b)=>b.s-a.s);
+    const top=Math.min(5,ranked.length);
+    $('out').innerHTML=`<div class="mono" style="color:var(--faint);font-size:12px;margin-bottom:6px">ranked by cosine similarity to the query</div>`+
+      ranked.slice(0,top).map((r,i)=>`<div class="hit"><span class="score">${r.s.toFixed(3)}</span><span class="meter"><i style="width:${Math.max(0,Math.min(100,r.s*100)).toFixed(0)}%"></i></span><span class="txt">${i===0?'<b>':''}${r.t}${i===0?'</b>':''}</span></div>`).join('');
+  }catch(e){ $('out').textContent='error: '+(e&&e.message||e); }
+  $('run').disabled=false;
+}
+async function boot(){
+  if(!navigator.gpu){ $('out').textContent='This demo needs WebGPU (Chrome/Edge 113+ or Safari 18+).'; return; }
+  await ensureInit(); const a=await navigator.gpu.requestAdapter();
+  if(!a){ $('out').textContent='no WebGPU adapter'; return; }
+  $('out').textContent='ready — press Search (first run downloads the ~640 MB embedder).';
+  $('run').disabled=false; $('run').onclick=run;
+}
+boot();
+</script>
+</body>
+</html>

@@ -448,6 +448,19 @@ impl FerricModel {
         let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(k), &JsValue::from_str(p)); };
         self.run(&prompt, steps, None, &emit).await
     }
+
+    /// Embed `text` → an L2-normalized vector (last-token pooling), for on-device semantic search / RAG.
+    /// Only meaningful on an embedding model (e.g. Qwen3-Embedding); returns a Float32Array to JS.
+    pub async fn embed(&self, text: String) -> std::result::Result<Vec<f32>, JsValue> {
+        let ids = self.encode(&text);
+        if ids.is_empty() { return Ok(Vec::new()); }
+        let n = self.model.cfg.n_embd;
+        let v = self.model.forward_hidden(&ids).to_vec().await; // [T·n_embd]
+        let t = (v.len() / n).max(1);
+        let last = &v[(t - 1) * n..t * n]; // last-token pool
+        let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        Ok(last.iter().map(|x| x / norm).collect())
+    }
 }
 
 impl FerricModel {
