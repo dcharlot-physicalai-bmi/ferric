@@ -24,6 +24,7 @@ use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 #[allow(unused_imports)] use ferric_gguf::GgufFile;
 use ferric_tensor::dtype::Q2_0Weights;
+use ferric_tensor::QMatrix;
 use ferric_tensor::{nn, Tensor};
 use std::sync::Arc;
 
@@ -83,10 +84,10 @@ impl Cfg {
 }
 
 pub struct AttnW {
-    pub wqkv: Q2_0Weights, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
+    pub wqkv: QMatrix, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
     pub q_out: usize,      // n_head·head_dim·2 (query and gate, interleaved per head)
     pub kv_out: usize,     // n_head_kv·head_dim (each of k and v)
-    pub wo: Q2_0Weights,
+    pub wo: QMatrix,
     pub q_norm: Tensor,
     pub k_norm: Tensor,
 }
@@ -94,7 +95,7 @@ pub struct AttnW {
 pub struct GdnW {
     // in_proj = qkv | z | alpha | beta stacked: the four projections all read the same h, so one
     // fused matmul replaces four (48 GDN layers × 4 → 1).
-    pub in_proj: Q2_0Weights,
+    pub in_proj: QMatrix,
     pub qkv_out: usize, // 2·key_dim + d_inner
     pub z_out: usize,   // d_inner
     pub ba_out: usize,  // n_v_heads (each of alpha, beta)
@@ -102,7 +103,7 @@ pub struct GdnW {
     pub dt_bias: Tensor, // [n_v_heads]
     pub a: Tensor,       // [n_v_heads] — already -exp(A_log)
     pub norm: Tensor,    // [head_v_dim]
-    pub out: Q2_0Weights,
+    pub out: QMatrix,
 }
 
 pub enum Mixer { Attn(AttnW), Gdn(GdnW) }
@@ -128,9 +129,9 @@ impl Cache {
 pub struct Layer {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
-    pub ffn_gate_up: Q2_0Weights, // gate stacked over up: one matmul, then split
+    pub ffn_gate_up: QMatrix, // gate stacked over up: one matmul, then split
     pub ffn_gate_out: usize,      // where gate ends / up begins in the fused output
-    pub ffn_down: Q2_0Weights,
+    pub ffn_down: QMatrix,
     pub mixer: Mixer,
 }
 
@@ -140,9 +141,11 @@ pub struct Qwen35 {
     /// Token embeddings stay packed in *host* RAM: only the prompt's rows are ever needed, so
     /// dequantizing those few rows on the CPU beats parking 338 MB on the GPU for a gather.
     tok_embd: Vec<u8>,
+    emb_type: u32,       // ggml type id of token_embd (for per-row dequant — any quant, not just Q2_0)
+    emb_row_bytes: usize, // packed bytes per embedding row
     pub layers: Vec<Layer>,
     pub out_norm: Tensor,
-    pub lm_head: Q2_0Weights,
+    pub lm_head: QMatrix,
 }
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
@@ -227,7 +230,7 @@ impl Qwen35 {
             let b = |s: &str| format!("blk.{il}.{s}");
             let mixer = if cfg.is_recurrent(il) {
                 Mixer::Gdn(GdnW {
-                    in_proj: q2_cat(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
+                    in_proj: qm_cat(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
                     qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
                     z_out: g.tensor(&b("attn_gate.weight")).ok_or("no attn_gate")?.dims[1] as usize,
                     ba_out: g.tensor(&b("ssm_alpha.weight")).ok_or("no ssm_alpha")?.dims[1] as usize,
@@ -235,14 +238,14 @@ impl Qwen35 {
                     dt_bias: f32t(ctx, g, &b("ssm_dt.bias"), &[cfg.n_v_heads])?,
                     a: f32t(ctx, g, &b("ssm_a"), &[cfg.n_v_heads])?,
                     norm: f32t(ctx, g, &b("ssm_norm.weight"), &[cfg.head_v_dim()])?,
-                    out: q2(ctx, g, &b("ssm_out.weight"))?,
+                    out: qm(ctx, g, &b("ssm_out.weight"))?,
                 })
             } else {
                 Mixer::Attn(AttnW {
-                    wqkv: q2_cat(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                    wqkv: qm_cat(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
                     q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
                     kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
-                    wo: q2(ctx, g, &b("attn_output.weight"))?,
+                    wo: qm(ctx, g, &b("attn_output.weight"))?,
                     q_norm: f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?,
                 })
@@ -250,31 +253,36 @@ impl Qwen35 {
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 post_norm: f32t(ctx, g, &b("post_attention_norm.weight"), &[cfg.n_embd])?,
-                ffn_gate_up: q2_cat(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+                ffn_gate_up: qm_cat(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
                 ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
-                ffn_down: q2(ctx, g, &b("ffn_down.weight"))?,
+                ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
                 mixer,
             });
         }
 
         // Tied head: if `output.weight` is absent the embeddings double as the LM head.
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+        let emb = g.tensor("token_embd.weight").ok_or("no token_embd")?;
+        let emb_type = emb.ggml_type;
+        let tok_embd = g.raw("token_embd.weight")?;
+        let emb_row_bytes = tok_embd.len() / cfg.n_vocab;
         Ok(Qwen35 {
-            tok_embd: g.raw("token_embd.weight")?,
+            tok_embd, emb_type, emb_row_bytes,
             out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
-            lm_head: q2(ctx, g, head)?,
+            lm_head: qm(ctx, g, head)?,
             cfg, ctx: ctx.clone(), layers,
         })
     }
 
-    /// Dequantize just the rows the prompt touches, straight out of the packed Q2_0 blocks.
+    /// Dequantize just the rows the prompt touches, straight out of the packed blocks — for whatever
+    /// quant the token-embedding tensor is stored in (Q2_0 for Bonsai, Q4_K for Qwen3.6-27B, …).
     pub fn embed(&self, tokens: &[u32]) -> Tensor {
         let d = self.cfg.n_embd;
-        let row_bytes = d / 128 * 34;
+        let rb = self.emb_row_bytes;
         let mut v = Vec::with_capacity(tokens.len() * d);
         for &t in tokens {
-            let off = t as usize * row_bytes;
-            v.extend(ferric_gguf::deq_raw(&self.tok_embd[off..off + row_bytes], d, 42).expect("embed row"));
+            let off = t as usize * rb;
+            v.extend(ferric_gguf::deq_raw(&self.tok_embd[off..off + rb], d, self.emb_type).expect("embed row"));
         }
         Tensor::from_vec(&self.ctx, &v, &[tokens.len(), d])
     }
@@ -293,7 +301,7 @@ impl Qwen35 {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
         let nkv = self.cfg.n_head_kv;
         // One fused matmul emits [q_and_gate | k | v]; split it back out.
-        let qkv = h.matmul_q2_0(&w.wqkv);
+        let qkv = h.matmul_q(&w.wqkv);
         let qf = qkv.narrow(1, 0, w.q_out).reshape(&[t, nh, hd * 2]);
         let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
         let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[t, nh * hd]);
@@ -320,7 +328,7 @@ impl Qwen35 {
             nn::causal_attention(&q, &kc, &vc, nh, nkv, 0.0)
         };
         *cache = Some(LayerCache::Attn { k: kc, v: vc });
-        o.mul(&gate.sigmoid()).matmul_q2_0(&w.wo)
+        o.mul(&gate.sigmoid()).matmul_q(&w.wo)
     }
 
     fn gdn(&self, h: &Tensor, w: &GdnW, cache: &mut Option<LayerCache>) -> Tensor {
@@ -330,7 +338,7 @@ impl Qwen35 {
 
         // One fused matmul emits [qkv | z | alpha | beta]; split it back out. qkv feeds the conv,
         // the rest are used as-is.
-        let proj = h.matmul_q2_0(&w.in_proj);
+        let proj = h.matmul_q(&w.in_proj);
         let (qo, zo, bo) = (w.qkv_out, w.z_out, w.ba_out);
         let qkv = proj.narrow(1, 0, qo).contiguous();
         let z = proj.narrow(1, qo, zo);
@@ -372,12 +380,12 @@ impl Qwen35 {
 
         // gated RMSNorm over head_v_dim, gated by silu(z)
         let z = z.reshape(&[t, nv, dv]);
-        o.rmsnorm(&w.norm, c.eps).mul(&z.silu()).reshape(&[t, c.d_inner]).matmul_q2_0(&w.out)
+        o.rmsnorm(&w.norm, c.eps).mul(&z.silu()).reshape(&[t, c.d_inner]).matmul_q(&w.out)
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
         // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-        h.matmul_q2_0(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q2_0(&l.ffn_down)
+        h.matmul_q(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q(&l.ffn_down)
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).
@@ -438,7 +446,7 @@ impl Qwen35 {
             }
         }
         cache.pos += tokens.len();
-        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q2_0(&self.lm_head));
+        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head));
         prof(&self.ctx, "lm_head");
         out
     }
