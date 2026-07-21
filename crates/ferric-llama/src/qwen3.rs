@@ -31,6 +31,10 @@ pub struct Cfg {
     pub is_gemma: bool,    // Gemma: (1+w) norms, √d embed scale, post-attn/post-ffn norms, gelu, per-layer rope
     pub embd_scale: f32,   // Gemma scales token embeddings by √n_embd; 1.0 otherwise
     pub sliding_window: usize, // Gemma local layers attend to the last `sliding_window` tokens (0 = full)
+    pub sliding_pattern: usize, // 1 global layer every `pattern` (Gemma-3=6, Gemma-2=2); 0 = non-Gemma
+    pub gemma2: bool,      // Gemma-2 only: logit softcapping + uniform rope (Gemma-3 dropped both)
+    pub attn_softcap: f32, // Gemma-2 attention-score softcap (50); 0 = none
+    pub final_softcap: f32, // Gemma-2 final-logit softcap (30); 0 = none
 }
 
 impl Cfg {
@@ -45,6 +49,7 @@ impl Cfg {
         // Some arches (qwen2) omit key_length; then head_dim = embedding_length / head_count.
         let head_dim = u("attention.key_length").unwrap_or_else(|_| u("embedding_length").unwrap_or(0) / n_head.max(1));
         let is_gemma = arch.starts_with("gemma");
+        let gemma2 = arch == "gemma2";
         let n_embd = u("embedding_length")?;
         Ok(Cfg {
             n_embd,
@@ -55,12 +60,18 @@ impl Cfg {
             n_ff: u("feed_forward_length")?,
             n_vocab,
             eps: f("attention.layer_norm_rms_epsilon")?,
-            rope_base: f("rope.freq_base")?,
+            // Gemma-2 omits rope.freq_base (uniform 10000 default); other arches require it.
+            rope_base: f("rope.freq_base").unwrap_or(10000.0),
             has_qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
             qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
             is_gemma,
             embd_scale: if is_gemma { (n_embd as f32).sqrt() } else { 1.0 },
             sliding_window: u("attention.sliding_window").unwrap_or(0),
+            // Global-attention layer every `pattern` layers: Gemma-2 alternates (2), Gemma-3 is 1-in-6.
+            sliding_pattern: u("attention.sliding_window_pattern").unwrap_or(if gemma2 { 2 } else if is_gemma { 6 } else { 0 }),
+            gemma2,
+            attn_softcap: f("attn_logit_softcapping").unwrap_or(0.0),
+            final_softcap: f("final_logit_softcapping").unwrap_or(0.0),
         })
     }
 }
@@ -185,8 +196,10 @@ impl Qwen3 {
             };
             // Gemma alternates attention: 1 global layer every 6 (full attn, θ=rope_base=1e6), the rest
             // local (sliding-window, θ=1e4). Non-Gemma layers are always full causal (window 0).
-            let is_local = cfg.is_gemma && il % 6 != 5;
-            let rope_base = if is_local { 10000.0 } else { cfg.rope_base };
+            // Local (sliding-window) layer unless it's the global one every `sliding_pattern` layers.
+            let is_local = cfg.is_gemma && cfg.sliding_pattern > 0 && il % cfg.sliding_pattern != cfg.sliding_pattern - 1;
+            // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
+            let rope_base = if !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
             let window = if is_local { cfg.sliding_window } else { 0 };
             layers.push(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
@@ -346,7 +359,11 @@ impl Qwen3 {
             }
         }
         cache.pos += tokens.len();
-        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head));
+        let sc = self.cfg.final_softcap;
+        let out = batch(&self.ctx, || {
+            let l = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
+            if sc > 0.0 { l.softcap(sc) } else { l } // Gemma-2 final-logit softcap
+        });
         prof(&self.ctx, "lm_head");
         out
     }

@@ -226,6 +226,10 @@ impl Tensor {
     /// GELU via the tanh approximation (`gelu_pytorch_tanh`) — what Gemma and GPT-2 actually use, vs
     /// the exact erf `gelu()`. Matters for matching those models' reference numerics.
     pub fn gelu_tanh(&self) -> Tensor { self.unary(12) }
+    /// `tanh` (clamped to ±15 for f32 stability). Building block for Gemma-2 logit softcapping.
+    pub fn tanh(&self) -> Tensor { self.unary(13) }
+    /// Gemma-2 logit softcap: `cap · tanh(x / cap)` — squashes logits into (−cap, cap).
+    pub fn softcap(&self, cap: f32) -> Tensor { self.mul(&self.scalar(1.0 / cap)).tanh().mul(&self.scalar(cap)) }
     pub fn log(&self) -> Tensor { self.unary(9) }
     pub fn relu2(&self) -> Tensor { self.unary(10) } // ReLU² (BitNet FFN)
     pub fn softplus(&self) -> Tensor { self.unary(11) } // log(1+eˣ) — Qwen3.5 gate
@@ -879,6 +883,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 10u: { let z = max(v, 0.0); r = z * z; } // ReLU² (BitNet FFN)
         case 11u: { r = max(v, 0.0) + log(1.0 + exp(-abs(v))); } // softplus (stable)
         case 12u: { let a = 0.7978845608028654 * (v + 0.044715 * v * v * v); r = 0.5 * v * (1.0 + tanh(clamp(a, -15.0, 15.0))); } // gelu (tanh approx — Gemma/GPT-2); clamp: tanh saturates by ±15 and its exp form overflows f32 past ~44
+        case 13u: { r = tanh(clamp(v, -15.0, 15.0)); } // tanh (clamped — WGSL tanh's exp form overflows f32 past ~44); used for Gemma-2 logit softcapping c·tanh(x/c)
         default: { r = v; }
     }
     out[i] = r;
