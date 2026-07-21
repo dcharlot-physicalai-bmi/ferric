@@ -211,6 +211,20 @@ impl Engine {
     /// (family-detected from the GGUF) to a string, then tokenize special-token-aware. The template
     /// is self-contained (it carries its own BOS, e.g. Llama-3's `<|begin_of_text|>`), so BOS is not
     /// prepended separately. Byte-identical to the old hardcoded path for ChatML models.
+    /// Embed one text → an L2-normalized vector. Runs the transformer, takes the last token's hidden
+    /// state (Qwen3-Embedding's last-token pooling, pooling_type=3), and normalizes. Same model code as
+    /// generation — this is just the pre-lm_head hidden state, pooled.
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let ids = self.enc(text, true);
+        if ids.is_empty() { return Vec::new(); }
+        let n = self.model.cfg.n_embd;
+        let v = pollster::block_on(self.model.forward_hidden(&ids).to_vec()); // [T·n_embd]
+        let t = (v.len() / n).max(1);
+        let last = &v[(t - 1) * n..t * n]; // last-token pool
+        let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        last.iter().map(|x| x / norm).collect()
+    }
+
     fn chat_ids(&self, messages: &[Value]) -> Vec<u32> {
         if !self.has_chat_family() {
             // No recognized chat family in the vocab → a base model — plain concatenation.
@@ -397,8 +411,29 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, mut stream: TcpS
         })),
         ("POST", "/v1/chat/completions") => chat(eng, mcps, &mut stream, &body),
         ("POST", "/v1/completions") => completions(eng, &mut stream, &body),
+        ("POST", "/v1/embeddings") => embeddings(eng, &mut stream, &body),
         _ => write_json(&mut stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}})),
     }
+}
+
+/// OpenAI-compatible `/v1/embeddings`: `input` is a string or array of strings → L2-normalized vectors.
+/// Runs on an embedding model (e.g. Qwen3-Embedding, a Qwen3-arch model with no lm_head).
+fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
+    let inputs: Vec<String> = match &req["input"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+        _ => return write_json(stream, 400, &json!({"error": {"message": "`input` must be a string or array of strings"}})),
+    };
+    let mut total = 0usize;
+    let data: Vec<Value> = inputs.iter().enumerate().map(|(i, text)| {
+        total += eng.enc(text, true).len();
+        json!({"object": "embedding", "index": i, "embedding": eng.embed(text)})
+    }).collect();
+    write_json(stream, 200, &json!({
+        "object": "list", "data": data, "model": eng.name,
+        "usage": {"prompt_tokens": total, "total_tokens": total}
+    }));
 }
 
 fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {

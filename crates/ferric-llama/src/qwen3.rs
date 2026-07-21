@@ -324,8 +324,9 @@ impl Qwen3 {
         self.forward_cached(tokens, &mut cache)
     }
 
-    /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step.
-    pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+    /// Run embed + all transformer layers, carrying K/V in `cache`. Returns the last layer's hidden
+    /// state `x` (BEFORE the final norm / lm_head) — shared by decode (→ logits) and embedding (→ pooled).
+    fn run_layers(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         let mut x = self.embed(tokens);
@@ -360,6 +361,13 @@ impl Qwen3 {
             }
         }
         cache.pos += tokens.len();
+        x
+    }
+
+    /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step. Returns logits.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+        use ferric_tensor::{batch, prof};
+        let x = self.run_layers(tokens, cache);
         let sc = self.cfg.final_softcap;
         let out = batch(&self.ctx, || {
             let l = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
@@ -367,5 +375,14 @@ impl Qwen3 {
         });
         prof(&self.ctx, "lm_head");
         out
+    }
+
+    /// The final hidden state `out_norm(x)` — shape [T, n_embd] — for embedding models. No lm_head; the
+    /// caller pools (last-token / mean) and L2-normalizes. A full stateless forward over `tokens`.
+    pub fn forward_hidden(&self, tokens: &[u32]) -> Tensor {
+        use ferric_tensor::batch;
+        let mut cache = Cache::new(&self.cfg);
+        let x = self.run_layers(tokens, &mut cache);
+        batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 }
