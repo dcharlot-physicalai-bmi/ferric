@@ -55,24 +55,27 @@ export function parseToolCalls(text) {
  *   user     — the user request
  * Returns { text, trace } where trace lists each tool call + its result.
  */
-export async function runToolLoop(fm, { user, tools, execute, system = '', steps = 160, maxRounds = 4, onToken = () => {} }) {
-  // Plain user:/assistant: transcript. (ChatML's <|im_start|> are special tokens the browser
-  // `generate` doesn't encode as such, so a literal-text ChatML prompt tokenizes wrong — this format
-  // is what works with raw generate.) The model's tool_call emission is fed back verbatim + the
-  // tool_response, and it synthesizes the answer from the results.
-  let convo = hermesSystem(tools) + (system ? `\n${system}` : '') + `\nuser: ${user}\nassistant:`;
+export async function runToolLoop(fm, { user, tools, execute, system = '', steps = 200, maxRounds = 4, onToken = () => {} }) {
+  // ChatML — Qwen/Hermes are trained on it, and FerricModel now encodes <|im_start|>/<|im_end|> as
+  // their special tokens, so the model behaves as trained and stops cleanly at <|im_end|> after each
+  // turn (no garbage tail). Tool results come back as a `user` turn, the way Qwen's tool format expects.
+  const IM = '<|im_start|>', E = '<|im_end|>';
+  const strip = t => t.replace(/<\|im_(start|end)\|>[\s\S]*$/, '').trim();
+  const sys = hermesSystem(tools) + (system ? `\n${system}` : '');
+  let convo = `${IM}system\n${sys}${E}\n${IM}user\n${user}${E}\n${IM}assistant\n`;
   const trace = [];
   for (let round = 0; round < maxRounds; round++) {
     const out = await fm.generate(convo, steps, onToken);
     const calls = parseToolCalls(out);
-    if (!calls.length) return { text: out.trim(), trace };
-    convo += out;
+    if (!calls.length) return { text: strip(out), trace };
+    const tcs = calls.map(c => `<tool_call>${JSON.stringify({ name: c.name, arguments: c.arguments })}</tool_call>`).join('');
+    convo += `${tcs}${E}\n${IM}user\n`;
     for (const c of calls) {
       const result = await execute(c.name, c.arguments);
       trace.push({ name: c.name, args: c.arguments, result });
-      convo += `\n<tool_response>${JSON.stringify(result)}</tool_response>`;
+      convo += `<tool_response>${JSON.stringify(result)}</tool_response>`;
     }
-    convo += '\nassistant:';
+    convo += `${E}\n${IM}assistant\n`;
   }
-  return { text: (await fm.generate(convo, steps, onToken)).trim(), trace };
+  return { text: strip(await fm.generate(convo, steps, onToken)), trace };
 }

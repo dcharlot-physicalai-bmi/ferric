@@ -335,6 +335,10 @@ pub struct FerricModel {
     token_bytes: Vec<Option<Vec<u8>>>,
     add_bos: bool,
     bos_id: Option<u32>,
+    /// Control tokens (`<|im_start|>`, `<end_of_turn>`, …) → id, longest-first — so a chat-templated
+    /// prompt tokenizes them to their special ids instead of BPE-ing the literal text (essential for
+    /// ChatML/Gemma chat + tool-calling to behave as the model was trained).
+    specials: Vec<(String, u32)>,
 }
 
 #[wasm_bindgen]
@@ -377,9 +381,15 @@ impl FerricModel {
         };
         let bos_id = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
+        let mut specials: Vec<(String, u32)> = toks.iter().enumerate().filter_map(|(i, t)| {
+            let ctrl = (t.starts_with("<|") && t.ends_with("|>"))
+                || matches!(t.as_str(), "<s>" | "</s>" | "<bos>" | "<eos>" | "<pad>" | "<unk>" | "<mask>" | "<start_of_turn>" | "<end_of_turn>");
+            if ctrl && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
+        }).collect();
+        specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest match first
         let ctx = Arc::new(Context::new().await.map_err(err)?);
         let model = Qwen3::load(&ctx, &g).map_err(err)?;
-        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id })
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, specials })
     }
 
     /// `#layers · backend` — a small readiness string for the UI.
@@ -390,12 +400,35 @@ impl FerricModel {
         let s: String = ids.iter().map(|&i| self.toks.get(i as usize).cloned().unwrap_or_default()).collect();
         String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
     }
+    fn enc_piece(&self, text: &str, at_start: bool) -> Vec<u32> {
+        match &self.spm {
+            Some(sp) => sp.encode_piece(text, at_start && self.add_space_prefix),
+            None => self.bpe.encode(text),
+        }
+    }
+    /// Encode a (possibly chat-templated) prompt: split on control tokens → their special ids, the
+    /// text between → BPE/SPM. Lets callers pass ChatML/Gemma templates and have `<|im_start|>` etc.
+    /// become the right token instead of BPE'd characters.
     fn encode(&self, prompt: &str) -> Vec<u32> {
-        let mut ids = match &self.spm {
-            Some(sp) => sp.encode_piece(prompt, self.add_space_prefix),
-            None => self.bpe.encode(prompt),
-        };
-        if self.add_bos { if let Some(b) = self.bos_id { ids.insert(0, b); } }
+        let mut ids = Vec::new();
+        let mut rest = prompt;
+        'outer: while !rest.is_empty() {
+            let mut best: Option<(usize, &str, u32)> = None;
+            for (s, id) in &self.specials {
+                if let Some(pos) = rest.find(s.as_str()) {
+                    if best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
+                }
+            }
+            match best {
+                Some((pos, s, id)) => {
+                    if pos > 0 { let start = ids.is_empty(); ids.extend(self.enc_piece(&rest[..pos], start)); }
+                    ids.push(id);
+                    rest = &rest[pos + s.len()..];
+                }
+                None => { let start = ids.is_empty(); ids.extend(self.enc_piece(rest, start)); break 'outer; }
+            }
+        }
+        if self.add_bos { if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } } }
         ids
     }
 
