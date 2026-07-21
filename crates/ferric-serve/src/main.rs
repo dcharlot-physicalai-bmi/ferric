@@ -45,6 +45,10 @@ struct Engine {
     im_end: Option<u32>,
     bos_id: Option<u32>,
     add_bos: bool,
+    /// `tokenizer.ggml.eos_token_id` + `add_eos_token` — embedding models (Qwen3-Embedding) append EOS
+    /// and pool ITS hidden state (pooling_type=LAST), so `embed` must append it to match the reference.
+    eos_id: Option<u32>,
+    add_eos: bool,
     eos: Vec<u32>,
     name: String,
     /// Raw bytes each token decodes to (for guided decoding); `None` for special/non-text tokens,
@@ -87,8 +91,10 @@ impl Engine {
         let add_space_prefix = match g.metadata.get("tokenizer.ggml.add_space_prefix") { Some(Meta::Bool(b)) => *b, _ => true };
         let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
+        let eos_id = match g.metadata.get("tokenizer.ggml.eos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
+        let add_eos = matches!(g.metadata.get("tokenizer.ggml.add_eos_token"), Some(Meta::Bool(true)));
         let mut eos: Vec<u32> = Vec::new();
-        if let Some(Meta::U(v)) = g.metadata.get("tokenizer.ggml.eos_token_id") { eos.push(*v as u32); }
+        if let Some(e) = eos_id { eos.push(e); }
         let im_end = vocab.get("<|im_end|>").copied();
         let im_start = vocab.get("<|im_start|>").copied();
         if let Some(e) = im_end { if !eos.contains(&e) { eos.push(e); } }
@@ -124,7 +130,7 @@ impl Engine {
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
         let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos, name, token_bytes, specials, template }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -215,12 +221,16 @@ impl Engine {
     /// state (Qwen3-Embedding's last-token pooling, pooling_type=3), and normalizes. Same model code as
     /// generation — this is just the pre-lm_head hidden state, pooled.
     fn embed(&self, text: &str) -> Vec<f32> {
-        let ids = self.enc(text, true);
-        if ids.is_empty() { return Vec::new(); }
         let n = self.model.cfg.n_embd;
+        let mut ids = self.enc(text, true);
+        // Qwen3-Embedding (add_eos_token) appends EOS and pools ITS hidden state; append it to match.
+        if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } }
+        // Empty input: keep the response's vectors equal-length (a zero vector), not a []; some clients
+        // build a matrix over a batch and a ragged row breaks them.
+        if ids.is_empty() { return vec![0.0; n]; }
         let v = pollster::block_on(self.model.forward_hidden(&ids).to_vec()); // [T·n_embd]
         let t = (v.len() / n).max(1);
-        let last = &v[(t - 1) * n..t * n]; // last-token pool
+        let last = &v[(t - 1) * n..t * n]; // last-token pool (the appended EOS when present)
         let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
         last.iter().map(|x| x / norm).collect()
     }
@@ -419,11 +429,17 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, mut stream: TcpS
 /// OpenAI-compatible `/v1/embeddings`: `input` is a string or array of strings → L2-normalized vectors.
 /// Runs on an embedding model (e.g. Qwen3-Embedding, a Qwen3-arch model with no lm_head).
 fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
-    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
+    let bad = |stream: &mut TcpStream, m: &str| write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad(stream, &format!("bad json: {e}")) };
     let inputs: Vec<String> = match &req["input"] {
         Value::String(s) => vec![s.clone()],
-        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
-        _ => return write_json(stream, 400, &json!({"error": {"message": "`input` must be a string or array of strings"}})),
+        // Error (don't silently drop) on a non-string element — dropping would misalign every `index`.
+        Value::Array(a) => {
+            let mut v = Vec::with_capacity(a.len());
+            for x in a { match x.as_str() { Some(s) => v.push(s.to_string()), None => return bad(stream, "`input` array must contain only strings") } }
+            v
+        }
+        _ => return bad(stream, "`input` must be a string or array of strings"),
     };
     let mut total = 0usize;
     let data: Vec<Value> = inputs.iter().enumerate().map(|(i, text)| {

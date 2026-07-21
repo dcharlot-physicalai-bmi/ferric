@@ -335,6 +335,10 @@ pub struct FerricModel {
     token_bytes: Vec<Option<Vec<u8>>>,
     add_bos: bool,
     bos_id: Option<u32>,
+    /// Embedding models (Qwen3-Embedding, add_eos_token) append EOS and pool ITS hidden state — embed()
+    /// must append it to match the reference / native build.
+    add_eos: bool,
+    eos_id: Option<u32>,
     /// Control tokens (`<|im_start|>`, `<end_of_turn>`, …) → id, longest-first — so a chat-templated
     /// prompt tokenizes them to their special ids instead of BPE-ing the literal text (essential for
     /// ChatML/Gemma chat + tool-calling to behave as the model was trained).
@@ -381,6 +385,8 @@ impl FerricModel {
         };
         let bos_id = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
+        let eos_id = match g.metadata().get("tokenizer.ggml.eos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
+        let add_eos = matches!(g.metadata().get("tokenizer.ggml.add_eos_token"), Some(Meta::Bool(true)));
         let mut specials: Vec<(String, u32)> = toks.iter().enumerate().filter_map(|(i, t)| {
             let ctrl = (t.starts_with("<|") && t.ends_with("|>"))
                 || matches!(t.as_str(), "<s>" | "</s>" | "<bos>" | "<eos>" | "<pad>" | "<unk>" | "<mask>" | "<start_of_turn>" | "<end_of_turn>");
@@ -389,7 +395,7 @@ impl FerricModel {
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest match first
         let ctx = Arc::new(Context::new().await.map_err(err)?);
         let model = Qwen3::load(&ctx, &g).map_err(err)?;
-        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, specials })
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, specials })
     }
 
     /// `#layers · backend` — a small readiness string for the UI.
@@ -452,12 +458,13 @@ impl FerricModel {
     /// Embed `text` → an L2-normalized vector (last-token pooling), for on-device semantic search / RAG.
     /// Only meaningful on an embedding model (e.g. Qwen3-Embedding); returns a Float32Array to JS.
     pub async fn embed(&self, text: String) -> std::result::Result<Vec<f32>, JsValue> {
-        let ids = self.encode(&text);
-        if ids.is_empty() { return Ok(Vec::new()); }
         let n = self.model.cfg.n_embd;
+        let mut ids = self.encode(&text);
+        if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } } // Qwen3-Embedding pools the EOS position
+        if ids.is_empty() { return Ok(vec![0.0; n]); }
         let v = self.model.forward_hidden(&ids).to_vec().await; // [T·n_embd]
         let t = (v.len() / n).max(1);
-        let last = &v[(t - 1) * n..t * n]; // last-token pool
+        let last = &v[(t - 1) * n..t * n]; // last-token pool (the appended EOS when present)
         let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
         Ok(last.iter().map(|x| x / norm).collect())
     }

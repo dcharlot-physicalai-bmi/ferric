@@ -114,6 +114,9 @@ async function fetchModel(){
   bytes=buf; $('barwrap').style.display='none'; return buf;
 }
 const cos=(a,b)=>{ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s; };
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// Qwen3-Embedding is instruction-aware: queries get an Instruct prefix, documents stay raw (improves ranking).
+const QPREFIX='Instruct: Given a search query, retrieve documents that answer it\nQuery: ';
 
 async function run(){
   if(!navigator.gpu){ $('out').textContent='This demo needs WebGPU (Chrome/Edge 113+ or Safari 18+).'; return; }
@@ -130,11 +133,11 @@ async function run(){
       docText=docs.join('\n');
     }
     $('out').textContent='embedding query…';
-    const q=await fm.embed($('query').value);
+    const q=await fm.embed(QPREFIX+$('query').value);
     const ranked=docs.map((t,i)=>({t,s:cos(q,docEmb[i])})).sort((a,b)=>b.s-a.s);
     const top=Math.min(5,ranked.length);
     $('out').innerHTML=`<div class="mono" style="color:var(--faint);font-size:12px;margin-bottom:6px">ranked by cosine similarity to the query</div>`+
-      ranked.slice(0,top).map((r,i)=>`<div class="hit"><span class="score">${r.s.toFixed(3)}</span><span class="meter"><i style="width:${Math.max(0,Math.min(100,r.s*100)).toFixed(0)}%"></i></span><span class="txt">${i===0?'<b>':''}${r.t}${i===0?'</b>':''}</span></div>`).join('');
+      ranked.slice(0,top).map((r,i)=>`<div class="hit"><span class="score">${r.s.toFixed(3)}</span><span class="meter"><i style="width:${Math.max(0,Math.min(100,r.s*100)).toFixed(0)}%"></i></span><span class="txt">${i===0?'<b>':''}${esc(r.t)}${i===0?'</b>':''}</span></div>`).join('');
   }catch(e){ $('out').textContent='error: '+(e&&e.message||e); }
   $('run').disabled=false;
 }
