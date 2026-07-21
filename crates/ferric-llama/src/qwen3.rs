@@ -284,16 +284,17 @@ impl Qwen3 {
         let s = kc.shape[0];
         // FERRIC_NOWINDOW disables the sliding window (attends to all keys) — for A/B-ing its effect.
         let win = if std::env::var("FERRIC_NOWINDOW").is_ok() { 0 } else { l.window };
+        let sc = self.cfg.attn_softcap; // Gemma-2 attention-score softcap (0 elsewhere)
         let o = if win > 0 {
             // Sliding-window (Gemma local layer): the query attends only to the last `window` keys.
-            if t == 1 { nn::decode_attention_win(&q, &kc, &vc, nh, nkv, win) }
-            else { nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win) }
+            if t == 1 { nn::decode_attention_win(&q, &kc, &vc, nh, nkv, win, sc) }
+            else { nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win, sc) }
         } else if t == 1 {
-            nn::decode_attention(&q, &kc, &vc, nh, nkv)
-        } else if t == s && s <= 65535 && hd <= 128 {
+            nn::decode_attention(&q, &kc, &vc, nh, nkv, sc)
+        } else if t == s && s <= 65535 && hd <= 128 && sc == 0.0 {
             q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
-            nn::causal_attention(&q, &kc, &vc, nh, nkv)
+            nn::causal_attention(&q, &kc, &vc, nh, nkv, sc)
         };
         o.matmul_q(&l.wo)
     }

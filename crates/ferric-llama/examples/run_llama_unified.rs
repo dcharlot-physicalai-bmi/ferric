@@ -31,7 +31,7 @@ async fn run() {
         let q = nn::linear_hf(&h, get(&format!("{p}.self_attn.q_proj.weight"))).rope(nh, dh, base, 0);
         let k = nn::linear_hf(&h, get(&format!("{p}.self_attn.k_proj.weight"))).rope(nkv, dh, base, 0);
         let v = nn::linear_hf(&h, get(&format!("{p}.self_attn.v_proj.weight")));
-        let attn = nn::causal_attention(&q, &k, &v, nh, nkv);
+        let attn = nn::causal_attention(&q, &k, &v, nh, nkv, 0.0);
         x = x.add(&nn::linear_hf(&attn, get(&format!("{p}.self_attn.o_proj.weight"))));
         let h2 = x.rmsnorm(get(&format!("{p}.post_attention_layernorm.weight")), eps);
         let gate = nn::linear_hf(&h2, get(&format!("{p}.mlp.gate_proj.weight")));

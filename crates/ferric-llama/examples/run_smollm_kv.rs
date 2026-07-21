@@ -46,7 +46,7 @@ async fn run() {
             let s = kcache[l].len() / KVD;
             let kc = Tensor::from_vec(&ctx, &kcache[l], &[s, KVD]);
             let vc = Tensor::from_vec(&ctx, &vcache[l], &[s, KVD]);
-            let attn = nn::decode_attention(&q1, &kc, &vc, NH, NKV);
+            let attn = nn::decode_attention(&q1, &kc, &vc, NH, NKV, 0.0);
             x = x.add(&nn::linear_hf(&attn, get(&format!("{p}.self_attn.o_proj.weight"))));
             let h2 = x.rmsnorm(get(&format!("{p}.post_attention_layernorm.weight")), EPS);
             let gate = h2.matmul_bt_act(get(&format!("{p}.mlp.gate_proj.weight")), 2);

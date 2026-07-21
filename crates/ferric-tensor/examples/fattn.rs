@@ -16,7 +16,7 @@ async fn run() {
         let fused = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
         // composed reference (bypass the fused fast-path by calling the pieces directly is hard; instead
         // temporarily compare against the math via the OLD composed path — replicate it here):
-        let reference = nn::decode_attention_composed(&q, &k, &v, nh, nkv).to_vec().await;
+        let reference = nn::decode_attention_composed(&q, &k, &v, nh, nkv, 0.0).to_vec().await;
         let e = maxdiff(&fused, &reference);
         let p = e < 2e-4; ok &= p;
         println!("{} nh={nh} nkv={nkv} dh={dh} S={s:<4} max|Δ|={e:.1e}", if p { "✅" } else { "❌" });

@@ -16,7 +16,7 @@ pub fn linear_hf_q(x: &Tensor, w: &crate::QRow) -> Tensor { x.matmul_qweight(w) 
 
 /// Causal multi-head attention with grouped-query attention, composed from general ops (+ fused
 /// softmax). q is [T, n_heads·dh]; k/v are [T, n_kv_heads·dh]. Returns [T, n_heads·dh].
-pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, softcap: f32) -> Tensor {
     let t = q.shape[0];
     let d = q.shape[1];
     let dh = d / n_heads;
@@ -29,16 +29,20 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv
         hx.reshape(&[n_kv_heads, 1, t, dh]).broadcast_to(&[n_kv_heads, g, t, dh]).reshape(&[n_heads, t, dh])
     };
     let (kh, vh) = (kv_heads(k), kv_heads(v));
-    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)); // [nh, T, T]
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap); // [nh, T, T]
     let probs = scores.add(&causal_mask(q, t)).softmax(2);             // masked softmax over keys
     let ctx = probs.matmul(&vh);                                       // [nh, T, dh]
     ctx.permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
+/// Gemma-2 attention-logit softcapping (`cap·tanh(x/cap)` over the scores before softmax); identity
+/// when `cap == 0`.
+fn softcapped(scores: Tensor, cap: f32) -> Tensor { if cap > 0.0 { scores.softcap(cap) } else { scores } }
+
 /// Sliding-window causal attention (Gemma's local layers): query `i` attends to keys `(i-window, i]`.
 /// `window == 0` is full causal. Masking older keys in the full cache is identical to a rolling window
 /// cache (they contribute 0), so this is exact — just not memory-optimized.
-pub fn causal_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, window: usize) -> Tensor {
+pub fn causal_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, window: usize, softcap: f32) -> Tensor {
     let t = q.shape[0];
     let d = q.shape[1];
     let dh = d / n_heads;
@@ -50,16 +54,16 @@ pub fn causal_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, 
         hx.reshape(&[n_kv_heads, 1, t, dh]).broadcast_to(&[n_kv_heads, g, t, dh]).reshape(&[n_heads, t, dh])
     };
     let (kh, vh) = (kv_heads(k), kv_heads(v));
-    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale));
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap);
     let probs = scores.add(&sliding_causal_mask(q, t, window)).softmax(2);
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
 /// Sliding-window single-query decode: the new query (at position S−1) attends to the last `window`
 /// cached keys only. `window == 0` or `window >= S` → no masking (identical to `decode_attention`).
-pub fn decode_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, window: usize) -> Tensor {
+pub fn decode_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, window: usize, softcap: f32) -> Tensor {
     let s = k.shape[0];
-    if window == 0 || window >= s { return decode_attention(q, k, v, n_heads, n_kv_heads); }
+    if window == 0 || window >= s { return decode_attention(q, k, v, n_heads, n_kv_heads, softcap); }
     let d = q.shape[1];
     let dh = d / n_heads;
     let g = n_heads / n_kv_heads;
@@ -70,7 +74,7 @@ pub fn decode_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, 
         hx.reshape(&[n_kv_heads, 1, s, dh]).broadcast_to(&[n_kv_heads, g, s, dh]).reshape(&[n_heads, s, dh])
     };
     let (kh, vh) = (kv_heads(k), kv_heads(v));
-    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)); // [nh, 1, S]
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap); // [nh, 1, S]
     // Mask every key older than the window from the query at S−1.
     let mut m = vec![0.0f32; s];
     for j in 0..(s - window) { m[j] = -1e30; }
@@ -97,19 +101,20 @@ fn sliding_causal_mask(like: &Tensor, t: usize, window: usize) -> Tensor {
 /// Incremental-decode attention against a KV cache (one new query token vs all cached keys/values).
 /// q is [1, n_heads·dh]; k/v are the cache [S, n_kv_heads·dh]. No mask (cache precedes the query).
 /// Composed from general ops — the KV-cache decode path, no bespoke kernel.
-pub fn decode_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+pub fn decode_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, softcap: f32) -> Tensor {
     let dh = q.shape[1] / n_heads;
     // Fused single-pass kernel collapses the ~12-dispatch composed path into one
     // workgroup-per-head kernel; keys stream in chunks with online softmax, so any cache length works.
-    if dh <= 128 {
+    // The fused kernel has no softcap, so a softcapped model (Gemma-2, always dh>128) takes the composed path.
+    if dh <= 128 && softcap == 0.0 {
         return q.fused_decode_attention(k, v, n_heads, n_kv_heads, dh);
     }
-    decode_attention_composed(q, k, v, n_heads, n_kv_heads)
+    decode_attention_composed(q, k, v, n_heads, n_kv_heads, softcap)
 }
 
 /// The composed (multi-dispatch) single-query attention — reference for the fused kernel and the
 /// fallback for long contexts. reshape/permute/matmul/softmax/matmul with GQA broadcast.
-pub fn decode_attention_composed(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+pub fn decode_attention_composed(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, softcap: f32) -> Tensor {
     let d = q.shape[1];
     let dh = d / n_heads;
     let s = k.shape[0];
@@ -121,7 +126,7 @@ pub fn decode_attention_composed(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: us
         hx.reshape(&[n_kv_heads, 1, s, dh]).broadcast_to(&[n_kv_heads, g, s, dh]).reshape(&[n_heads, s, dh])
     };
     let (kh, vh) = (kv_heads(k), kv_heads(v)); // [nh, S, dh]
-    let probs = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)).softmax(2); // [nh, 1, S]
+    let probs = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap).softmax(2); // [nh, 1, S]
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[1, d]) // [nh,1,dh] → [1,d]
 }
 

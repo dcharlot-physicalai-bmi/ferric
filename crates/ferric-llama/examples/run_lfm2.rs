@@ -41,7 +41,7 @@ async fn run() {
             let kl = get(&format!("{p}.self_attn.k_layernorm.weight"));
             let q = q.reshape(&[t * NH, DH]).rmsnorm(ql, EPS).reshape(&[t, NH * DH]).rope(NH, DH, BASE, 0);
             let k = k.reshape(&[t * NKV, DH]).rmsnorm(kl, EPS).reshape(&[t, NKV * DH]).rope(NKV, DH, BASE, 0);
-            let attn = nn::causal_attention(&q, &k, &v, NH, NKV);
+            let attn = nn::causal_attention(&q, &k, &v, NH, NKV, 0.0);
             nn::linear_hf(&attn, get(&format!("{p}.self_attn.out_proj.weight")))
         } else {
             // gated short conv: in_proj → B,C,x ; B⊙x → conv1d(L=3) → C⊙ → out_proj

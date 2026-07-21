@@ -311,13 +311,13 @@ impl Qwen35 {
         };
         let s = kc.shape[0];
         let o = if t == 1 {
-            nn::decode_attention(&q, &kc, &vc, nh, nkv)
+            nn::decode_attention(&q, &kc, &vc, nh, nkv, 0.0)
         } else if t == s && s <= 65535 && hd <= 128 {
             // Prefill: q and the history are the same span. Flash streams keys in chunks with
             // online softmax — O(hd) memory, any T, same math as the composed causal path.
             q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
-            nn::causal_attention(&q, &kc, &vc, nh, nkv)
+            nn::causal_attention(&q, &kc, &vc, nh, nkv, 0.0)
         };
         *cache = Some(LayerCache::Attn { k: kc, v: vc });
         o.mul(&gate.sigmoid()).matmul_q2_0(&w.wo)

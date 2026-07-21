@@ -14,12 +14,12 @@ async fn run() {
         let k = Tensor::from_vec(&ctx, &seq(t*kd, 2.0), &[t, kd]);
         let v = Tensor::from_vec(&ctx, &seq(t*kd, 3.0), &[t, kd]);
         let flash = q.flash_attention_prefill(&k, &v, nh, nkv, dh).to_vec().await;
-        let comp = nn::causal_attention(&q, &k, &v, nh, nkv).to_vec().await;
+        let comp = nn::causal_attention(&q, &k, &v, nh, nkv, 0.0).to_vec().await;
         let e = flash.iter().zip(&comp).map(|(a,b)|(a-b).abs()).fold(0f32,f32::max);
         let p = e < 1e-4; ok &= p;
         let bench = |f: &dyn Fn()->Tensor| { let mut l=None; let t0=Instant::now(); for _ in 0..20 { l=Some(f()); } let _=pollster::block_on(l.unwrap().to_vec()); t0.elapsed().as_secs_f64()/20.0 };
         let ft = bench(&|| q.flash_attention_prefill(&k,&v,nh,nkv,dh));
-        let ct = bench(&|| { let x = nn::causal_attention(&q,&k,&v,nh,nkv); x });
+        let ct = bench(&|| { let x = nn::causal_attention(&q,&k,&v,nh,nkv, 0.0); x });
         let scores_mb = (nh*t*t*4) as f64/1e6;
         println!("{} T={t:<4} nh={nh}: flash {:.2}ms  composed {:.2}ms ({:.1}×, saves {:.0}MB scores)  max|Δ|={e:.1e}",
             if p {"✅"} else {"❌"}, ft*1e3, ct*1e3, ct/ft, scores_mb);
