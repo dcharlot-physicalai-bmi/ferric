@@ -64,14 +64,15 @@ export async function runToolLoop(fm, { user, tools, execute, system = '', steps
     const out = await fm.generate(convo, steps, onToken);
     const calls = parseToolCalls(out);
     if (!calls.length) return { text: out.trim(), trace };
-    convo += out;
+    // Append a NORMALIZED tool_call + tool_response — not the raw generation, which (greedy, no EOS
+    // after the call) often has a garbage tail that would poison the next round's context.
     for (const c of calls) {
       const result = await execute(c.name, c.arguments);
       trace.push({ name: c.name, args: c.arguments, result });
-      convo += `\n<tool_response>${JSON.stringify(result)}</tool_response>`;
+      convo += `\n<tool_call>${JSON.stringify({ name: c.name, arguments: c.arguments })}</tool_call>` +
+               `\n<tool_response>${JSON.stringify(result)}</tool_response>`;
     }
     convo += '\nassistant:';
   }
-  const out = await fm.generate(convo, steps, onToken);
-  return { text: out.trim(), trace };
+  return { text: (await fm.generate(convo, steps, onToken)).trim(), trace };
 }
