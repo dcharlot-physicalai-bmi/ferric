@@ -15,22 +15,36 @@ try {
   $('status').textContent = 'fetching model…';
   const model = new Uint8Array(await (await fetch('./model.gguf')).arrayBuffer());
   log('model bytes', model.length);
+  // Exercises the 2026-07 guided-decoding features cross-fabric: required/optional properties,
+  // integer minimum/maximum, string maxLength, and an array of bounded integers with maxItems.
+  const props = ['id', 'name', 'score', 'tags'];
   const schema = JSON.stringify({ type: 'object', properties: {
-    name: { type: 'string' }, age: { type: 'integer' }, city: { type: 'string' }, active: { type: 'boolean' }
-  }});
+    id:    { type: 'integer', minimum: 1, maximum: 100 },
+    name:  { type: 'string', maxLength: 12 },
+    score: { type: 'integer', minimum: 0, maximum: 10 },
+    tags:  { type: 'array', items: { type: 'integer', minimum: 0, maximum: 9 }, maxItems: 3 },
+  }, required: ['id'] });
   const onTok = (kind, payload) => {
     if (kind === 'status') $('status').textContent = payload;
     if (kind === 'token') $('gen').textContent += payload;
   };
-  const out = await bonsai_generate_json(model, 'Give a fictional person as JSON.', 80, schema, onTok);
+  const out = await bonsai_generate_json(model, 'Give a fictional game character record as JSON.', 96, schema, onTok);
   $('status').textContent = 'done';
-  // validate: parses + exactly the schema keys/types
-  let ok = false;
+  // Validate conformance to every constraint in the browser (cross-fabric proof).
+  let ok = false, why = '';
   try {
     const o = JSON.parse(out);
-    ok = typeof o.name === 'string' && Number.isInteger(o.age) && typeof o.city === 'string' && typeof o.active === 'boolean';
-  } catch (e) { ok = false; }
-  log(ok ? 'RESULT_OK' : 'RESULT_BAD', JSON.stringify(out));
+    const keys = Object.keys(o);
+    const inOrder = keys.every((k, i) => props.includes(k) && (i === 0 || props.indexOf(keys[i - 1]) < props.indexOf(k)));
+    const idOk = Number.isInteger(o.id) && o.id >= 1 && o.id <= 100;                        // required + bounds
+    const nameOk = !('name' in o) || (typeof o.name === 'string' && [...o.name].length <= 12); // maxLength (code points)
+    const scoreOk = !('score' in o) || (Number.isInteger(o.score) && o.score >= 0 && o.score <= 10);
+    const tagsOk = !('tags' in o) || (Array.isArray(o.tags) && o.tags.length <= 3 &&
+                    o.tags.every(t => Number.isInteger(t) && t >= 0 && t <= 9));             // array of bounded ints
+    ok = keys.includes('id') && inOrder && idOk && nameOk && scoreOk && tagsOk;
+    why = JSON.stringify({ inOrder, idOk, nameOk, scoreOk, tagsOk });
+  } catch (e) { ok = false; why = 'parse:' + e; }
+  log(ok ? 'RESULT_OK' : 'RESULT_BAD', JSON.stringify(out), why);
 } catch (e) {
   log('ERROR', String(e && e.message || e));
   $('status').textContent = 'error: ' + e;

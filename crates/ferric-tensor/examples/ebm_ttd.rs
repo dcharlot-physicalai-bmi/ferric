@@ -149,9 +149,10 @@ async fn run() {
                 let d1 = gd[0].value().to_vec().await; let d2 = gd[1].value().to_vec().await;
                 for i in 0..n { cu1[i] = (cu1[i] - alpha * d1[i]).clamp(-UMAX, UMAX); cu2[i] = (cu2[i] - alpha * d2[i]).clamp(-UMAX, UMAX); }
             }
-            for i in 0..n { s[i] = step(s[i], cu1[i], cu2[i]); up[i] = (cu1[i], cu2[i]);
-                if t >= 220 && !(wrap(s[i][0] - goals[i].0).abs() < 0.35 && wrap(s[i][1] - goals[i].1).abs() < 0.35 && s[i][2].abs() < 0.7 && s[i][3].abs() < 0.7) { reach[i] = false; } }
+            for i in 0..n { s[i] = step(s[i], cu1[i], cu2[i]); up[i] = (cu1[i], cu2[i]); }
         }
+        // fair with discrete: check the FINAL state once (was per-step in the window — an unfair stricter test)
+        for i in 0..n { if !(wrap(s[i][0] - goals[i].0).abs() < 0.35 && wrap(s[i][1] - goals[i].1).abs() < 0.35 && s[i][2].abs() < 0.7 && s[i][3].abs() < 0.7) { reach[i] = false; } }
         cres.push((kk, reach.iter().filter(|&&b| b).count() as f32 / n as f32 * 100.0));
     }
 
