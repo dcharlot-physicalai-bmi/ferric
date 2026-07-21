@@ -12,12 +12,13 @@
 //!   - `{"type":"json_schema","json_schema":{"schema": <JSON-Schema>}}` → schema-conformant JSON.
 //! Supported schema: objects with `properties` in *declaration* order, `required` (absent ⇒ all
 //! required; a subset makes the rest optional & skippable), nesting ≤ 8 and ≤ 32 props per object;
-//! `string` (with `minLength`/`maxLength` in Unicode code points), `integer`, `number`, `boolean`,
-//! `enum`; and typed arrays of those (`minItems`/`maxItems`). Deeper/wider/unsupported shapes fall
-//! back to free-but-valid JSON — never a hard error. `temperature` is honored over the legal-token
-//! set (0 = greedy/deterministic). Caveat: unbounded `integer`/`number` fields have no magnitude
-//! bound yet, so a small model can loop digits until `max_tokens` — set `maxLength`/`maxItems`, use
-//! adequate `max_tokens`, or await `maximum`/`minimum` support.
+//! `string` (with `minLength`/`maxLength` in Unicode code points), `integer` (with inclusive
+//! `minimum`/`maximum` — bounds the value so it can't run away), `number`, `boolean`, `enum`; and
+//! typed arrays of those (`minItems`/`maxItems`). Deeper/wider/unsupported shapes fall back to
+//! free-but-valid JSON — never a hard error. `temperature` is honored over the legal-token set
+//! (0 = greedy/deterministic). Caveat: float `number` fields (and `integer` bounds *inside arrays*)
+//! aren't magnitude-bounded yet, so a small model can loop digits until `max_tokens` — bound the
+//! integer, set `maxLength`/`maxItems`, or use adequate `max_tokens`.
 //!
 //! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
 mod mcp;
