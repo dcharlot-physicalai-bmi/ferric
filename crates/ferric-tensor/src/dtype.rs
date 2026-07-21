@@ -1099,13 +1099,17 @@ impl Tensor {
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
         };
         // Coalesced-GEMV experiment: transposed weight layout so output-threads read contiguous memory.
+        // Gated on a SEPARATE flag (measured to HURT the small qkv/o matmuls) so FERRIC_Q4K_TRANS alone
+        // isolates the fused-swiglu transpose on the big gate_up.
         if let (Some(ct), Some(at)) = (&w.codes_t, &w.aux_t) {
+          if std::env::var("FERRIC_Q4K_TRANS_M").is_ok() {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             let grid = ((gw as u32), wg.div_ceil(gw) as u32, 1u32);
             run(&self.ctx, MATMUL_Q4_K_TRANS_WGSL, "matmul_q4_k_trans",
                 &[x.buf.as_ref(), ct.as_ref(), at.as_ref(), &out,
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])], grid);
             return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
+          }
         }
         // K-split subgroup GEMV (opt-in, needs subgroups): one subgroup per output, lanes split the
         // blocks then subgroupAdd. Non-bit-identical → opt-in fast path.
