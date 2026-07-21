@@ -46,7 +46,7 @@ pub fn binary(a: &[f32], ash: &[usize], b: &[f32], bsh: &[usize], op: &str) -> (
 }
 
 pub fn unary(x: &[f32], op: &str) -> Vec<f32> {
-    x.iter().map(|&v| match op { "exp" => v.exp(), "neg" => -v, "relu" => v.max(0.0), "sqrt" => v.sqrt(), _ => v }).collect()
+    x.iter().map(|&v| match op { "exp" => v.exp(), "neg" => -v, "relu" => v.max(0.0), "sqrt" => v.sqrt(), "sin" => v.sin(), "cos" => v.cos(), _ => v }).collect()
 }
 
 pub fn reduce(x: &[f32], shape: &[usize], axes: &[usize], op: &str, keepdim: bool) -> (Vec<f32>, Vec<usize>) {

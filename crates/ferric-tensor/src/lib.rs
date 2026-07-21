@@ -28,7 +28,7 @@ pub mod optim; // optimizers (Adam)
 pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
-pub use autograd::Var;
+pub use autograd::{grad, Var};
 pub use dtype::{DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
@@ -231,6 +231,8 @@ impl Tensor {
     /// Gemma-2 logit softcap: `cap · tanh(x / cap)` — squashes logits into (−cap, cap).
     pub fn softcap(&self, cap: f32) -> Tensor { self.mul(&self.scalar(1.0 / cap)).tanh().mul(&self.scalar(cap)) }
     pub fn log(&self) -> Tensor { self.unary(9) }
+    pub fn sin(&self) -> Tensor { self.unary(14) }
+    pub fn cos(&self) -> Tensor { self.unary(15) }
     pub fn relu2(&self) -> Tensor { self.unary(10) } // ReLU² (BitNet FFN)
     pub fn softplus(&self) -> Tensor { self.unary(11) } // log(1+eˣ) — Qwen3.5 gate
     pub fn scalar(&self, s: f32) -> Tensor { Tensor::from_vec(&self.ctx, &[s], &[1]) }
@@ -884,6 +886,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 11u: { r = max(v, 0.0) + log(1.0 + exp(-abs(v))); } // softplus (stable)
         case 12u: { let a = 0.7978845608028654 * (v + 0.044715 * v * v * v); r = 0.5 * v * (1.0 + tanh(clamp(a, -15.0, 15.0))); } // gelu (tanh approx — Gemma/GPT-2); clamp: tanh saturates by ±15 and its exp form overflows f32 past ~44
         case 13u: { r = tanh(clamp(v, -15.0, 15.0)); } // tanh (clamped — WGSL tanh's exp form overflows f32 past ~44); used for Gemma-2 logit softcapping c·tanh(x/c)
+        case 14u: { r = sin(v); }
+        case 15u: { r = cos(v); }
         default: { r = v; }
     }
     out[i] = r;
