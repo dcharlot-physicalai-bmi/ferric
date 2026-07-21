@@ -56,11 +56,11 @@
 
 <section><div class="wrap">
   <p class="eyebrow">Try it</p>
-  <h2>Ask something that needs a calculator.</h2>
-  <p class="muted">Loads <span class="mono">Qwen2.5-1.5B</span> (~1.1 GB, once) to your GPU. The agent has three tools — <span class="mono">add</span>, <span class="mono">subtract</span>, <span class="mono">multiply</span> — each a real JS function running in this page. Watch it call them and chain the results.</p>
+  <h2>Ask it to add two numbers.</h2>
+  <p class="muted">Loads <span class="mono">Qwen2.5-1.5B</span> (~1.1 GB, once) to your GPU. The agent has one tool — <span class="mono">add</span>, a real JS function running in this page. Watch the model decide to call it, Ferric run it, and the model use the result.</p>
   <div class="pg" style="margin-top:20px">
-    <div class="chips"><span class="chip">add(a, b)</span><span class="chip">subtract(a, b)</span><span class="chip">multiply(a, b)</span></div>
-    <div class="field"><label>your request</label><input id="prompt" spellcheck="false" value="What is 17 plus 25? Use the add tool and tell me the result."></div>
+    <div class="chips"><span class="chip">add(a, b)</span></div>
+    <div class="field"><label>your request</label><input id="prompt" spellcheck="false" value="What is 17 plus 25? Use the add tool, then tell me the result."></div>
     <div style="margin-top:16px"><button class="btn" id="run" disabled>Run the agent ▸</button></div>
     <div class="barwrap" id="barwrap"><div class="bar" id="bar"></div></div>
     <div class="out" id="out">initializing WebGPU…</div>
@@ -90,11 +90,9 @@ const MODEL = new URLSearchParams(location.search).get('model')
 
 // Three real JS tools the on-device model can call.
 const TOOLS = [
-  { name:'add', description:'Add two numbers a and b', parameters:{type:'object',properties:{a:{type:'number'},b:{type:'number'}},required:['a','b']} },
-  { name:'subtract', description:'Subtract b from a', parameters:{type:'object',properties:{a:{type:'number'},b:{type:'number'}},required:['a','b']} },
-  { name:'multiply', description:'Multiply a by b', parameters:{type:'object',properties:{a:{type:'number'},b:{type:'number'}},required:['a','b']} },
+  { name:'add', description:'Add two numbers a and b and return their sum', parameters:{type:'object',properties:{a:{type:'number'},b:{type:'number'}},required:['a','b']} },
 ];
-const IMPL = { add:(a)=>({result:(+a.a)+(+a.b)}), subtract:(a)=>({result:(+a.a)-(+a.b)}), multiply:(a)=>({result:(+a.a)*(+a.b)}) };
+const IMPL = { add:(a)=>({result:(+a.a)+(+a.b)}) };
 
 let ready=false, fm=null, bytes=null;
 async function ensureInit(){ if(!ready){ await init(); ready=true; } }
