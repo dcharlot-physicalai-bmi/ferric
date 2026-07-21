@@ -1195,6 +1195,14 @@ impl Tensor {
         let n = rows * n_ff;
         let wg = n.div_ceil(64); let gw = wg.min(32768);
         let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        // Fused ∧ coalesced (FERRIC_Q4K_TRANS): the transposed weight layout inside the fused swiglu —
+        // the only path to a Vulkan win (fusion already beats a plain transposed matmul). Bit-identical.
+        if let (Some(ct), Some(at)) = (&w.codes_t, &w.aux_t) {
+            run(&self.ctx, MATMUL_Q4_K_SWIGLU_TRANS_WGSL, "matmul_q4_k_swiglu_trans",
+                &[x.buf.as_ref(), ct.as_ref(), at.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
+            return Tensor::from_parts(&self.ctx, out, vec![rows, n_ff]);
+        }
         let src = MATMUL_Q4_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
         run(&self.ctx, &src, "matmul_q4_k_swiglu",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
@@ -1971,6 +1979,54 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var k: u32 = tid; k < n_embd; k = k + 256u) {
         out[row * n_embd + k] = dn_dot(k, nblk_f);
     }
+}
+"#;
+
+/// Fused SwiGLU with the transposed (coalesced) gate_up layout — combines fusion (no [t,2·n_ff]
+/// intermediate) with coalesced weight reads. Same math as MATMUL_Q4_K_SWIGLU_WGSL, bit-identical.
+const MATMUL_Q4_K_SWIGLU_TRANS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:       array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes_t: array<u32>;   // [block][word][row] over the full 2·n_ff rows
+@group(0) @binding(2) var<storage,read>        aux_t:   array<u32>;   // [block][k][row]
+@group(0) @binding(3) var<storage,read_write>  out:     array<f32>;
+@group(0) @binding(4) var<uniform>             info:    vec4<u32>;    // rows, n_ff, in, grid_width
+fn scbyte_t(base: u32, od: u32, i: u32) -> u32 { return (aux_t[base + od * (1u + (i >> 2u))] >> (8u * (i & 3u))) & 0xffu; }
+fn scmin_t(base: u32, od: u32, j: u32) -> vec2<u32> {
+    if (j < 4u) { return vec2<u32>(scbyte_t(base, od, j) & 63u, scbyte_t(base, od, j + 4u) & 63u); }
+    let a = scbyte_t(base, od, j + 4u); let lo = scbyte_t(base, od, j - 4u); let hi = scbyte_t(base, od, j);
+    return vec2<u32>((a & 0x0Fu) | ((lo >> 6u) << 4u), (a >> 4u) | ((hi >> 6u) << 4u));
+}
+fn qk_dot_t(o_row: u32, r: u32, nblk: u32, in_dim: u32, nrow: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let ab = blk * 4u * nrow + o_row;
+        let dd = unpack2x16float(aux_t[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        let cbase = blk * 32u * nrow + o_row;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin_t(ab, nrow, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cbase + (8u * (s >> 1u)) * nrow; let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes_t[cw + w * nrow];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    if (idx >= rows * n_ff) { return; }
+    let o = idx % n_ff; let r = idx / n_ff;
+    let nblk = in_dim / 256u; let nrow = 2u * n_ff;
+    let g = qk_dot_t(o, r, nblk, in_dim, nrow);
+    let u = qk_dot_t(o + n_ff, r, nblk, in_dim, nrow);
+    out[idx] = (g / (1.0 + exp(-g))) * u;
 }
 "#;
 
