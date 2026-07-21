@@ -99,6 +99,7 @@
   <a class="link" href="#crates">Crates</a>
   <a class="link" href="/bonsai">Live LLM</a>
   <a class="link" href="/agent">Structured</a>
+  <a class="link" href="/tools">Tools</a>
   <a class="btn ghost" href="https://github.com/dcharlot-physicalai-bmi/ferric" target="_blank">GitHub</a>
 </div></nav>
 
@@ -125,6 +126,7 @@
   <div class="grid">
     <a class="card" href="/bonsai" style="grid-column:1/-1;display:block;border-color:var(--gold)"><h3 style="color:var(--gold)">A ternary LLM, live in your browser ▸</h3><div class="num">27B → 1.7B</div><p style="color:var(--dim)"><b>PrismML Ternary Bonsai</b> (every weight −1/0/+1) runs on your GPU via WebGPU — the 27B validated against PrismML's own llama.cpp fork to <span class="mono">7.8e-4</span>, the 1.7B streaming in a tab at <b>~50 tok/s</b>. Same pure-Rust code, native and browser. Click to run it — nothing leaves your machine.</p></a>
     <a class="card" href="/agent" style="grid-column:1/-1;display:block;border-color:var(--gold)"><h3 style="color:var(--gold)">Schema-perfect JSON, on-device + deterministic ▸</h3><div class="num">guided</div><p style="color:var(--dim)"><b>Structured output that can't break.</b> Ferric masks the logits to your JSON Schema in a browser tab on WebGPU — every result is guaranteed-conformant and reproducible across fabrics, with no server. Also a drop-in <b>Vercel AI SDK</b> provider: real <span class="mono">generateObject()</span> running on your GPU. Click to try it.</p></a>
+    <a class="card" href="/tools" style="grid-column:1/-1;display:block;border-color:var(--gold)"><h3 style="color:var(--gold)">An AI agent that calls tools — on-device ▸</h3><div class="num">agentic</div><p style="color:var(--dim)"><b>The full tool-calling loop, in a browser tab.</b> The model calls your JavaScript functions, Ferric runs them locally, feeds results back, and it answers — Hermes/OpenAI-style tool-calls on WebGPU, no server. Click to run a calculator agent.</p></a>
     <div class="card"><h3>Runs real models</h3><div class="num">2</div><p><b>SmolLM2-135M</b> matches <span class="mono">numpy</span> 1.4e-6; <b>Liquid AI LFM2-350M</b> (novel conv-hybrid) matches <span class="mono">transformers</span> 4.7e-6.</p></div>
     <div class="card"><h3>Generates real text</h3><div class="num">✓</div><p>Exact GPT-2 tokenizer (HF token-for-token) + O(S) KV-cache decode — end to end.</p></div>
     <div class="card"><h3>Runs on the NPU</h3><div class="num">ANE</div><p>WebNN(npu) → CoreML → <b>Apple Neural Engine</b>, matching CPU to fp16. Plus every GPU + all CPU cores.</p></div>
