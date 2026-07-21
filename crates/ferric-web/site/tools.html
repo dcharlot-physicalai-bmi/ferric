@@ -120,8 +120,12 @@ async function run(){
     const execute=async(name,args)=>{ const r=(IMPL[name]||(()=>({error:'unknown tool'})))(args);
       calls.push(`<div class="call">tool call → <b>${name}</b>(${JSON.stringify(args)}) = ${JSON.stringify(r)}</div>`);
       $('out').innerHTML=calls.join(''); return r; };
-    const { text }=await runToolLoop(fm, { user:$('prompt').value, tools:TOOLS, execute, steps:200, maxRounds:5 });
-    $('out').innerHTML=calls.join('')+`<div class="ans">🤖 ${text||'(no answer)'}</div>`;
+    const { text, trace }=await runToolLoop(fm, { user:$('prompt').value, tools:TOOLS, execute, steps:200, maxRounds:5 });
+    // The tool calls above are the proof. Show the model's narration only when it's clean; small models
+    // are unreliable at the final synthesis, so otherwise summarize the tool results directly.
+    const clean = text && text.length>2 && !/(.)\1{7,}|from a from a|"a": ?"a"/i.test(text);
+    const summary = trace.length ? `✓ the agent called ${trace.map(t=>`<b>${t.name}</b>→${JSON.stringify(t.result.result ?? t.result)}`).join(', ')}` : 'no tool was needed';
+    $('out').innerHTML=calls.join('')+`<div class="ans">${clean ? '🤖 '+text : summary}</div>`;
   }catch(e){ $('out').textContent='error: '+(e&&e.message||e); }
   $('run').disabled=false;
 }
