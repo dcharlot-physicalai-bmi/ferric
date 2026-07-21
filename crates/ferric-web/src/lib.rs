@@ -56,6 +56,58 @@ pub async fn ferric_matmul_demo(m: u32, k: u32, n: u32) -> std::result::Result<S
     Ok(format!("{:?}|{:.3e}|{:?}", ctx.backend, diff, &gpu[..6.min(gpu.len())]))
 }
 
+/// A persistent WebGPU fabric handle for the browser: keeps one `Context` alive so a page can time
+/// matmuls on the tab's GPU vs the in-wasm CPU reference across sizes, and route adaptively — the
+/// heterogeneous fabric, in the browser. Each method returns a checksum (sum of the output) so the caller
+/// can both verify correctness and be sure the work actually ran (nothing optimized away).
+#[wasm_bindgen]
+pub struct FerricFabric {
+    ctx: Arc<Context>,
+}
+
+#[wasm_bindgen]
+impl FerricFabric {
+    /// Create the fabric on the browser's best WebGPU adapter (kept resident).
+    pub async fn new() -> std::result::Result<FerricFabric, JsValue> {
+        console_error_panic_hook::set_once();
+        let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+        Ok(FerricFabric { ctx: Arc::new(ctx) })
+    }
+
+    /// The active GPU backend + adapter (e.g. `BrowserWebGpu · Apple M5 Max`) — proves it's really WebGPU.
+    pub fn backend(&self) -> String {
+        format!("{:?} · {}", self.ctx.backend, self.ctx.adapter_name)
+    }
+
+    /// Run an `n×n·n×n` matmul on the tab's WebGPU; returns the output checksum.
+    pub async fn gpu_matmul(&self, n: u32) -> std::result::Result<f32, JsValue> {
+        let (a, b) = gen(n, n, n);
+        let out = Tensor::from_vec(&self.ctx, &a, &[n as usize, n as usize])
+            .matmul(&Tensor::from_vec(&self.ctx, &b, &[n as usize, n as usize]))
+            .to_vec()
+            .await;
+        Ok(out.iter().sum())
+    }
+
+    /// The same matmul on the in-wasm CPU reference; returns the output checksum (should match the GPU).
+    pub fn cpu_matmul(&self, n: u32) -> f32 {
+        let (a, b) = gen(n, n, n);
+        matmul_cpu(&a, &b, n as usize, n as usize, n as usize).iter().sum()
+    }
+
+    /// Correctness: the **max per-element** absolute difference between the WebGPU and CPU results
+    /// (bounded by fp rounding, ~1e-6 — unlike a summed checksum, this does not accumulate with size).
+    pub async fn verify(&self, n: u32) -> std::result::Result<f32, JsValue> {
+        let (a, b) = gen(n, n, n);
+        let gpu = Tensor::from_vec(&self.ctx, &a, &[n as usize, n as usize])
+            .matmul(&Tensor::from_vec(&self.ctx, &b, &[n as usize, n as usize]))
+            .to_vec()
+            .await;
+        let cpu = matmul_cpu(&a, &b, n as usize, n as usize, n as usize);
+        Ok(max_abs_diff(&gpu, &cpu))
+    }
+}
+
 /// Runs the full Ferric transformer LM in the browser on WebGPU: greedy-generates `steps` tokens from
 /// a comma-separated prompt of token ids, and validates the prefill logits against the in-wasm CPU
 /// reference. Returns a JSON string {backend, prompt, generated, layers, logit_diff, ms}.

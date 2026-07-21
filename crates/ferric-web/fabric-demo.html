@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Ferric heterogeneous fabric — in the browser</title>
+  <style>body{background:#0B1524;color:#EAF1F8;font-family:ui-monospace,Menlo,monospace;padding:24px;line-height:1.6}</style>
+</head>
+<body>
+  <h3>Heterogeneous fabric in the browser: WebGPU vs CPU-wasm, adaptively</h3>
+  <pre id="out">booting…</pre>
+  <script type="module">
+    import init, { FerricFabric } from './pkg/ferric_web.js';
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += '\n' + s; };
+    try {
+      await init();
+      const fab = await FerricFabric.new();
+      const backend = fab.backend();
+      window.__backend = backend;
+      out.textContent = 'backend: ' + backend;
+      const webgpu = /WebGpu|Metal|Vulkan|Dx12/i.test(backend);
+
+      const sizes = [32, 64, 128, 256, 384, 512];
+      const results = [];
+      const timeGpu = async (n) => { let b = Infinity; for (let i = 0; i < 3; i++) { const t = performance.now(); const s = await fab.gpu_matmul(n); b = Math.min(b, performance.now() - t); window.__lastGpu = s; } return b; };
+      const timeCpu = (n) => { let b = Infinity; let s = 0; for (let i = 0; i < 2; i++) { const t = performance.now(); s = fab.cpu_matmul(n); b = Math.min(b, performance.now() - t); } return [b, s]; };
+
+      await fab.gpu_matmul(64); // warm up (compile pipeline once)
+      log('\n   N     gpu(ms)   cpu(ms)   faster   max elem Δ');
+      for (const n of sizes) {
+        const gpu_ms = await timeGpu(n);
+        const [cpu_ms] = timeCpu(n);
+        const faster = gpu_ms < cpu_ms ? 'GPU' : 'CPU';
+        const maxdiff = await fab.verify(n); // true per-element GPU-vs-CPU diff (fp-bounded, size-independent)
+        results.push({ n, gpu_ms, cpu_ms, faster, maxdiff });
+        log(`  ${String(n).padStart(4)}  ${gpu_ms.toFixed(3).padStart(9)}  ${cpu_ms.toFixed(2).padStart(8)}  ${faster.padStart(6)}   ${maxdiff.toExponential(1)}`);
+      }
+      // crossover: first N where GPU beats CPU
+      const cross = results.find((r) => r.faster === 'GPU');
+      log('\n  crossover: GPU (WebGPU) overtakes CPU-wasm at N=' + (cross ? cross.n : 'never'));
+      log('  the adaptive router picks the faster backend per size — small→CPU, large→WebGPU.');
+      window.__results = results;
+      window.__webgpu = webgpu;
+      window.__done = true;
+    } catch (e) {
+      out.textContent += '\nERROR: ' + (e && e.stack || e);
+      window.__error = String(e);
+    }
+  </script>
+</body>
+</html>

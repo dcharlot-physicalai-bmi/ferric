@@ -224,7 +224,7 @@ fn scalar_item(sub: &serde_json::Value) -> Option<Item> {
     }
     match sub["type"].as_str().unwrap_or("") {
         "string" => Some(str_item(sub)),
-        "integer" => Some(Item::Int),
+        "integer" => Some(int_item(sub)),
         "number" => Some(Item::Num),
         "boolean" => Some(Item::Bool),
         _ => None,
@@ -289,7 +289,7 @@ const MAX_OBJ_DEPTH: usize = 8;
 /// In-progress state of the current element inside a typed array (mirrors the scalar `Val` variants,
 /// but non-recursive so `Val::Arr` stays `Copy`). Enum's option list lives in the array's `Item`.
 #[derive(Clone, Copy)]
-enum ArrElem { Fresh, Str(u8, u16), Num(NumSt), Bool(u8, u8), Enum(u64, usize) }
+enum ArrElem { Fresh, Str(u8, u16), Num(NumSt), Bool(u8, u8), Enum(u64, usize), IntR { neg: bool, digits: u8, lead0: bool, mag: i128 } }
 
 /// Outcome of feeding a byte to a typed-array element acceptor.
 enum EO { Reject, Consumed, Completed, EndedBefore } // EndedBefore: byte isn't the element's (number closed by lookahead) — reprocess as structural
@@ -623,6 +623,34 @@ fn step_elem(item: &Item, ev: &mut ArrElem, b: u8) -> EO {
                 _ => EO::Reject,
             }
         }
+        // Bounded integer element — mirrors Schema::step_intrange but reports EO (EndedBefore = the number
+        // closed and the byte is structural, reprocessed by the array loop). Reuses the same feasibility.
+        Item::IntRange(lo, hi) => {
+            let (lo, hi) = (*lo, *hi);
+            let first = |ev: &mut ArrElem, b: u8, neg: bool| -> EO {
+                let d = (b - b'0') as i128;
+                if d == 0 {
+                    if in_range(0, lo, hi) { *ev = ArrElem::IntR { neg, digits: 1, lead0: true, mag: 0 }; EO::Consumed } else { EO::Reject }
+                } else if int_feasible(neg, d, lo, hi) { *ev = ArrElem::IntR { neg, digits: 1, lead0: false, mag: d }; EO::Consumed } else { EO::Reject }
+            };
+            match *ev {
+                ArrElem::Fresh => {
+                    if b == b'-' { if lo < 0 { *ev = ArrElem::IntR { neg: true, digits: 0, lead0: false, mag: 0 }; EO::Consumed } else { EO::Reject } }
+                    else if b.is_ascii_digit() { first(ev, b, false) } else { EO::Reject }
+                }
+                ArrElem::IntR { neg, digits, lead0, mag } => {
+                    if b.is_ascii_digit() {
+                        if lead0 { return EO::Reject; }
+                        if digits == 0 { first(ev, b, neg) }
+                        else {
+                            let mag2 = mag * 10 + (b - b'0') as i128;
+                            if int_feasible(neg, mag2, lo, hi) { *ev = ArrElem::IntR { neg, digits: digits + 1, lead0: false, mag: mag2 }; EO::Consumed } else { EO::Reject }
+                        }
+                    } else if digits >= 1 && in_range(int_value(neg, mag), lo, hi) { EO::EndedBefore } else { EO::Reject }
+                }
+                _ => EO::Reject,
+            }
+        }
         Item::Bool => match *ev {
             ArrElem::Fresh => match b { b't' => { *ev = ArrElem::Bool(0, 1); EO::Consumed } b'f' => { *ev = ArrElem::Bool(1, 1); EO::Consumed } _ => EO::Reject },
             ArrElem::Bool(k, m) => { let word: &[u8] = if k == 0 { b"true" } else { b"false" }; if (m as usize) < word.len() && word[m as usize] == b { let nm = m + 1; if nm as usize == word.len() { EO::Completed } else { *ev = ArrElem::Bool(k, nm); EO::Consumed } } else { EO::Reject } }
@@ -932,6 +960,28 @@ mod tests {
         assert!(sch_accepts(mn, r#"{"x":100000000}"#));
         assert!(!sch_accepts(mn, r#"{"x":99}"#));
         assert!(!sch_accepts(mn, r#"{"x":-1}"#));
+    }
+    #[test]
+    fn schema_array_of_bounded_ints() {
+        let sc = r#"{"type":"object","properties":{"scores":{"type":"array","items":{"type":"integer","minimum":0,"maximum":100}}}}"#;
+        assert!(sch_accepts(sc, r#"{"scores":[0,50,100]}"#));
+        assert!(sch_accepts(sc, r#"{"scores":[]}"#));
+        assert!(sch_accepts(sc, r#"{"scores":[7]}"#));
+        assert!(!sch_accepts(sc, r#"{"scores":[101]}"#));   // element over max
+        assert!(!sch_accepts(sc, r#"{"scores":[-1]}"#));    // element under min
+        assert!(!sch_accepts(sc, r#"{"scores":[50,200]}"#));// second element out of range
+        assert!(!sch_accepts(sc, r#"{"scores":[01]}"#));    // leading zero
+    }
+    #[test]
+    fn schema_array_of_bounded_ints_exhaustive() {
+        // Same brute-force guarantee, but for the array-element path.
+        for &(lo, hi) in &[(0i64, 20), (-10, 10), (5, 5), (-30, -5)] {
+            let sc = format!(r#"{{"type":"object","properties":{{"a":{{"type":"array","items":{{"type":"integer","minimum":{lo},"maximum":{hi}}}}}}}}}"#);
+            for v in -100i64..=100 {
+                let inst = format!(r#"{{"a":[{v}]}}"#);
+                assert_eq!(sch_accepts(&sc, &inst), v >= lo && v <= hi, "arr lo={lo} hi={hi} v={v}");
+            }
+        }
     }
     #[test]
     fn schema_array_of_bounded_strings() {
