@@ -1,0 +1,17 @@
+import puppeteer from 'puppeteer-core';
+import http from 'node:http'; import fs from 'node:fs'; import path from 'node:path';
+const DIR=path.resolve('./site'); const MODEL=process.env.MODEL;
+const MIME={'.js':'text/javascript','.wasm':'application/wasm','.html':'text/html','.gguf':'application/octet-stream'};
+const server=http.createServer((q,r)=>{let p=decodeURIComponent(q.url.split('?')[0]);const f=p==='/model.gguf'?MODEL:path.join(DIR,p);fs.readFile(f,(e,b)=>{if(e){r.writeHead(404);return r.end('nf');}r.writeHead(200,{'content-type':MIME[path.extname(f)]||'application/octet-stream'});r.end(b);});});
+await new Promise(r=>server.listen(8962,r));
+const b=await puppeteer.launch({executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:'new',userDataDir:'/tmp/ferric-tt',args:['--no-sandbox','--enable-unsafe-webgpu','--enable-features=Vulkan,WebGPU','--use-angle=metal']});
+const page=await b.newPage(); page.on('pageerror',e=>console.log('PAGEERR',e.message.slice(0,150)));
+await page.goto('http://localhost:8962/tools.html?model=./model.gguf',{waitUntil:'domcontentloaded',timeout:30000});
+await page.waitForFunction(()=>!document.getElementById('run').disabled,{timeout:30000});
+await page.click('#run');
+await page.waitForFunction(()=>document.querySelector('#out .ans'),{timeout:240000});
+const r=await page.evaluate(()=>({calls:[...document.querySelectorAll('#out .call')].map(e=>e.textContent),ans:document.querySelector('#out .ans')?.textContent}));
+console.log('CALLS:',JSON.stringify(r.calls)); console.log('ANSWER:',r.ans);
+const ok=r.calls.length>=2 && /126|138/.test(r.ans||''); // (17+25)*3=126
+console.log(ok?'✅ chained tool-calling on-device':'⚠️ ran but check numbers');
+await b.close(); server.close();

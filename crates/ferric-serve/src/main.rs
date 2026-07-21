@@ -5,6 +5,20 @@
 //!
 //!   cargo run -p ferric-serve --release -- <model.gguf> [--port 8080] [--name my-model]
 //!
+//! **Structured output** (`/v1/chat/completions` only). `response_format` constrains generation
+//! *in-runtime* by masking the sampler to the bytes that keep the output a valid JSON prefix — so the
+//! model can only emit conformant JSON, deterministically across fabrics (see `ferric_agent::guide`):
+//!   - `{"type":"json_object"}` → any single valid JSON object.
+//!   - `{"type":"json_schema","json_schema":{"schema": <JSON-Schema>}}` → schema-conformant JSON.
+//! Supported schema: objects with `properties` in *declaration* order, `required` (absent ⇒ all
+//! required; a subset makes the rest optional & skippable), nesting ≤ 8 and ≤ 32 props per object;
+//! `string` (with `minLength`/`maxLength` in Unicode code points), `integer`, `number`, `boolean`,
+//! `enum`; and typed arrays of those (`minItems`/`maxItems`). Deeper/wider/unsupported shapes fall
+//! back to free-but-valid JSON — never a hard error. `temperature` is honored over the legal-token
+//! set (0 = greedy/deterministic). Caveat: unbounded `integer`/`number` fields have no magnitude
+//! bound yet, so a small model can loop digits until `max_tokens` — set `maxLength`/`maxItems`, use
+//! adequate `max_tokens`, or await `maximum`/`minimum` support.
+//!
 //! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
 mod mcp;
 use ferric_core::Context;
@@ -269,17 +283,21 @@ impl Engine {
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
             let row = &v[v.len() - n_vocab..];
-            // Guided decoding: pick the highest-logit token whose bytes keep the JSON valid (EOS only
-            // once the value is complete). Most tokens reject on their first byte, so the scan is cheap.
+            // Guided decoding: restrict sampling to tokens whose bytes keep the JSON valid (EOS only once
+            // the value is complete). We mask illegal tokens to -inf, then honor `temperature` over the
+            // legal set — so a guided request still gets varied output instead of a greedy loop; temp 0
+            // stays argmax (deterministic). Most tokens reject on their first byte, so the scan is cheap.
             let next = if let Some(g) = guide.as_ref() {
                 let can_stop = g.can_stop();
-                let (mut best, mut best_l) = (None, f32::NEG_INFINITY);
+                let mut masked = vec![f32::NEG_INFINITY; n_vocab];
+                let mut any = false;
                 for i in 0..n_vocab {
                     let ok = if self.eos.contains(&(i as u32)) { can_stop }
                         else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&c| a.step(c)) } _ => false } };
-                    if ok && row[i] > best_l { best_l = row[i]; best = Some(i as u32); }
+                    if ok { masked[i] = row[i]; any = true; }
                 }
-                match best { Some(t) => t, None => break }
+                if !any { break; } // no legal continuation (shouldn't happen for a valid schema) — stop cleanly
+                if temperature > 0.0 { sample_top_p(&masked, temperature, 0.95, &mut rng) } else { argmax(&masked) }
             } else if temperature > 0.0 { sample_top_p(row, temperature, 0.95, &mut rng) } else { argmax(row) };
             if self.eos.contains(&next) { break; }
             if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }

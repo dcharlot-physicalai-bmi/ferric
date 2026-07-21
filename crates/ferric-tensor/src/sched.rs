@@ -11,6 +11,8 @@
 
 use crate::Tensor;
 use ferric_core::Context;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -211,6 +213,110 @@ impl Fabric {
             trace.push(dev.name());
         }
         (act, trace)
+    }
+}
+
+// ---------- The adaptive cost-model router ("smart software") ----------
+
+/// A calibrated cost model over the fabric: it measures each device's **dispatch overhead** and
+/// **throughput**, then routes each op to the device that will be *fastest for that op's size* — small,
+/// sequential ops to the low-overhead device (usually the CPU), large batched ops to the high-throughput
+/// device (usually the GPU). This is the "know the hardware, adapt to the workload" brain: where
+/// [`Fabric::probe`] gives one global weight, the `Planner` predicts a per-op winner and even the exact
+/// **crossover** size where the GPU overtakes the CPU. Decisions are cached per op shape.
+///
+/// The model is a two-parameter latency fit per device, `t(flops) ≈ overhead + flops / throughput`,
+/// calibrated from a tiny and a large probe matmul (after a warm-up dispatch so one-time pipeline
+/// compilation never pollutes the timing). It is deliberately simple and measured-on-this-box — the point
+/// is that the *same code* adapts to whatever silicon it lands on.
+pub struct Planner {
+    names: Vec<String>,
+    overhead: Vec<f64>,   // per-dispatch fixed cost (seconds), per device
+    throughput: Vec<f64>, // flops per second, per device
+    cache: RefCell<HashMap<u64, usize>>,
+}
+
+fn bmm_flops(batch: usize, m: usize, k: usize, n: usize) -> f64 {
+    2.0 * batch as f64 * m as f64 * k as f64 * n as f64 // one multiply + one add per MAC
+}
+
+impl Planner {
+    /// Calibrate the cost model by timing each device on a small and a large probe matmul.
+    pub fn calibrate(fabric: &Fabric) -> Planner {
+        // two probe points (batch, m, k, n): one tiny (overhead-dominated), one large (throughput-dominated)
+        let small = (1usize, 8usize, 8usize, 8usize);
+        let large = (1usize, 384usize, 384usize, 384usize);
+        let mk = |s: (usize, usize, usize, usize)| {
+            let (b, m, k, n) = s;
+            (vec![0.01f32; b * m * k], vec![0.02f32; k * n], b, m, k, n)
+        };
+        let time_dev = |d: &Device, prep: &(Vec<f32>, Vec<f32>, usize, usize, usize, usize)| -> f64 {
+            let (a, bb, b, m, k, n) = prep;
+            let _ = d.bmm(a, bb, *b, *m, *k, *n); // warm up (compiles the pipeline once)
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let _ = d.bmm(a, bb, *b, *m, *k, *n);
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            best.max(1e-9)
+        };
+        let (ps, pl) = (mk(small), mk(large));
+        let (fs, fl) = (bmm_flops(small.0, small.1, small.2, small.3), bmm_flops(large.0, large.1, large.2, large.3));
+        let (mut names, mut overhead, mut throughput) = (vec![], vec![], vec![]);
+        for d in &fabric.devices {
+            let ts = time_dev(d, &ps);
+            let tl = time_dev(d, &pl);
+            // solve t = overhead + flops/throughput from the two points
+            let rate = ((fl - fs) / (tl - ts).max(1e-9)).max(1.0);
+            let over = (ts - fs / rate).max(0.0);
+            names.push(d.name());
+            overhead.push(over);
+            throughput.push(rate);
+        }
+        Planner { names, overhead, throughput, cache: RefCell::new(HashMap::new()) }
+    }
+
+    /// Predicted latency (seconds) for an op of `flops` on device `dev`.
+    pub fn cost(&self, dev: usize, flops: f64) -> f64 {
+        self.overhead[dev] + flops / self.throughput[dev]
+    }
+
+    /// Device index predicted fastest for a matmul of this shape (cached by shape).
+    pub fn route(&self, batch: usize, m: usize, k: usize, n: usize) -> usize {
+        let key = (batch as u64) << 48 ^ (m as u64) << 32 ^ (k as u64) << 16 ^ n as u64;
+        if let Some(&d) = self.cache.borrow().get(&key) {
+            return d;
+        }
+        let flops = bmm_flops(batch, m, k, n);
+        let best = (0..self.names.len()).min_by(|&i, &j| self.cost(i, flops).total_cmp(&self.cost(j, flops))).unwrap_or(0);
+        self.cache.borrow_mut().insert(key, best);
+        best
+    }
+
+    /// The flops at which device `b` overtakes device `a` (the crossover), or `None` if they never cross
+    /// (one dominates at all sizes). Reads as "above this much work, prefer `b`".
+    pub fn crossover(&self, a: usize, b: usize) -> Option<f64> {
+        // overhead_a + f/tput_a = overhead_b + f/tput_b  →  f = (overhead_b − overhead_a)/(1/tput_a − 1/tput_b)
+        let denom = 1.0 / self.throughput[a] - 1.0 / self.throughput[b];
+        if denom.abs() < 1e-30 {
+            return None;
+        }
+        let f = (self.overhead[b] - self.overhead[a]) / denom;
+        (f.is_finite() && f > 0.0).then_some(f)
+    }
+
+    /// Human-readable calibration (for the demo / logs).
+    pub fn report(&self) -> Vec<(String, f64, f64)> {
+        (0..self.names.len()).map(|i| (self.names[i].clone(), self.overhead[i], self.throughput[i])).collect()
+    }
+
+    /// Route a matmul to the predicted-best device and run it. `dims` is `[batch, m, k, n]`. Returns
+    /// `(result, device_index)`.
+    pub fn adaptive_bmm(&self, fabric: &Fabric, a: &[f32], b: &[f32], dims: [usize; 4]) -> (Vec<f32>, usize) {
+        let [batch, m, k, n] = dims;
+        let d = self.route(batch, m, k, n);
+        (fabric.devices[d].bmm(a, b, batch, m, k, n), d)
     }
 }
 

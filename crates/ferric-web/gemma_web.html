@@ -1,0 +1,19 @@
+<!doctype html><meta charset=utf-8><body style="font:14px system-ui">
+<div id=s>loading…</div><pre id=o style="background:#111;color:#0f0;padding:1rem;white-space:pre-wrap"></pre>
+<script type=module>
+import init, { FerricModel } from './pkg/ferric_web.js';
+const log=(...a)=>console.log('FERRIC>',...a); const $=id=>document.getElementById(id);
+try{
+  await init(); log('webgpu', !!navigator.gpu);
+  $('s').textContent='fetching model…';
+  const bytes=new Uint8Array(await (await fetch('./model.gguf')).arrayBuffer());
+  log('model bytes', bytes.length);
+  $('s').textContent='loading…';
+  const fm=await FerricModel.load(bytes);
+  log('loaded', fm.info());
+  const out=await fm.generate('The capital of France is', 12, (k,p)=>{ if(k==='token') $('o').textContent+=p; });
+  log('GEN', JSON.stringify(out));
+  log(/Paris/i.test(out) ? 'RESULT_OK' : 'RESULT_BAD');
+  $('s').textContent='done';
+}catch(e){ log('ERROR', String(e&&e.message||e)); $('s').textContent='error'; }
+</script></body>
