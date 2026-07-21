@@ -459,7 +459,9 @@ impl FerricModel {
     /// Only meaningful on an embedding model (e.g. Qwen3-Embedding); returns a Float32Array to JS.
     pub async fn embed(&self, text: String) -> std::result::Result<Vec<f32>, JsValue> {
         let n = self.model.cfg.n_embd;
-        let mut ids = self.encode(&text);
+        // Raw piece tokenization (like native Engine::embed) — embeddings embed literal text, so DON'T
+        // split on control tokens or prepend BOS; only the trained EOS is appended below.
+        let mut ids = self.enc_piece(&text, true);
         if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } } // Qwen3-Embedding pools the EOS position
         if ids.is_empty() { return Ok(vec![0.0; n]); }
         let v = self.model.forward_hidden(&ids).to_vec().await; // [T·n_embd]
