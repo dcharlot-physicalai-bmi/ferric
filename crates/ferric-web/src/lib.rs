@@ -679,3 +679,64 @@ pub async fn ferric_sqrt_forensic() -> std::result::Result<String, JsValue> {
     }
     Ok(format!("sqrt gpu-vs-cpu deviations: {bad}/{}\n{first}", gpu.len()))
 }
+
+/// Stage-by-stage browser forensic for det_rsqrt: for each of the 14 chain
+/// stages, run the register-only kernel exporting only that stage and diff
+/// bitwise against the CPU IEEE replica. Reports each stage's deviation count
+/// — the first nonzero stage names the op Tint/ANGLE transforms.
+#[wasm_bindgen]
+pub async fn ferric_rsqrt_stages() -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f32::from_bits(0x3F80_0000 | (s >> 41) as u32) - 1.5
+            })
+            .collect()
+    }
+    fn cpu_stages(y: f32) -> [f32; 14] {
+        let hy = 0.5 * y;
+        let mut x = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        let mut out = [0f32; 14];
+        out[0] = x;
+        let mut idx = 1;
+        for _ in 0..3 {
+            let t = x * x;
+            out[idx] = t;
+            let u = hy * t;
+            out[idx + 1] = u;
+            let w = 1.5 - u;
+            out[idx + 2] = w;
+            x = x * w;
+            out[idx + 3] = x;
+            idx += 4;
+        }
+        out[13] = y * x;
+        out
+    }
+    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let x = det(12 * 64, 1);
+    let y: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
+    let cpu: Vec<[f32; 14]> = y.iter().map(|&v| cpu_stages(v)).collect();
+    let mut rows = Vec::new();
+    for stage in 0..14u32 {
+        let gpu = ctx.det_rsqrt_stage(&y, stage).await.map_err(|e| JsValue::from_str(&e))?;
+        let mut bad = 0usize;
+        let mut first = String::new();
+        for (i, &g) in gpu.iter().enumerate() {
+            let c = cpu[i][stage as usize];
+            if c.to_bits() != g.to_bits() {
+                if bad == 0 {
+                    first = format!("  first i={i} cpu={:08x} gpu={:08x}", c.to_bits(), g.to_bits());
+                }
+                bad += 1;
+            }
+        }
+        rows.push(format!("stage {stage:>2}: {bad}/768{first}"));
+    }
+    Ok(rows.join("\n"))
+}

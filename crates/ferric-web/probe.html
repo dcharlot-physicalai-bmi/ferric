@@ -1,11 +1,11 @@
 <!doctype html><meta charset="utf-8"><title>Ferric fabric probe — browser</title>
 <pre id="out">running…</pre>
 <script type="module">
-import init, { ferric_fabric_probe, ferric_sqrt_forensic } from './pkg/ferric_web.js';
+import init, { ferric_fabric_probe, ferric_sqrt_forensic, ferric_rsqrt_stages } from './pkg/ferric_web.js';
 (async () => {
   try {
     await init();
-    document.getElementById('out').textContent = (await ferric_fabric_probe()) + '\n' + (await ferric_sqrt_forensic());
+    document.getElementById('out').textContent = (await ferric_fabric_probe()) + '\n' + (await ferric_sqrt_forensic()) + '\n' + (await ferric_rsqrt_stages());
   } catch (e) {
     document.getElementById('out').textContent = 'ERROR: ' + e;
   }

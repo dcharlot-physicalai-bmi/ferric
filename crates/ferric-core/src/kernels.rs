@@ -394,27 +394,29 @@ fn det_recip(y: f32, z: u32) -> f32 {
     return x;
 }
 fn det_rsqrt(y: f32, z: u32) -> f32 {
-    // Newton steps decomposed to ONE product per statement, each pinned with
-    // det_bar(·, z): expressions with products feeding adds contract to fma
-    // differently on Metal vs Vulkan. `z` must be a runtime zero (spare
-    // uniform slot). 0.5·y is exact (exponent decrement).
+    // The Newton chain is pinned through a private array indexed at
+    // runtime-opaque offsets (z is 0 at runtime, unprovable at compile time,
+    // and every index expression differs) — stores can't be forwarded or
+    // elided, so every intermediate is a real rounded value. The stage-by-
+    // stage browser forensic proved this exact structure computes plain-IEEE
+    // on all inputs under Tint/ANGLE, where XOR-only barriers on a register
+    // chain do not survive fast-math. `z` = a spare uniform slot.
+    var m: array<f32, 16>;
     let hy = 0.5 * y;
-    var x = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(y) >> 1u));
-    // every intermediate pinned: fast-math may otherwise DISTRIBUTE
-    // x*(1.5-u) into x*1.5 - x*u (different rounding)
-    var t = det_bar(x * x, z);
-    var u = det_bar(hy * t, z);
-    var w = det_bar(1.5 - u, z);
-    x = det_bar(x * w, z);
-    t = det_bar(x * x, z);
-    u = det_bar(hy * t, z);
-    w = det_bar(1.5 - u, z);
-    x = det_bar(x * w, z);
-    t = det_bar(x * x, z);
-    u = det_bar(hy * t, z);
-    w = det_bar(1.5 - u, z);
-    x = det_bar(x * w, z);
-    return x;
+    m[z] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(y) >> 1u));
+    m[z + 1u] = m[z] * m[z];
+    m[z + 2u] = hy * m[z + 1u];
+    m[z + 3u] = 1.5 - m[z + 2u];
+    m[z + 4u] = m[z] * m[z + 3u];
+    m[z + 5u] = m[z + 4u] * m[z + 4u];
+    m[z + 6u] = hy * m[z + 5u];
+    m[z + 7u] = 1.5 - m[z + 6u];
+    m[z + 8u] = m[z + 4u] * m[z + 7u];
+    m[z + 9u] = m[z + 8u] * m[z + 8u];
+    m[z + 10u] = hy * m[z + 9u];
+    m[z + 11u] = 1.5 - m[z + 10u];
+    m[z + 12u] = m[z + 8u] * m[z + 11u];
+    return m[z + 12u];
 }
 fn det_sqrt(y: f32, z: u32) -> f32 {
     if (y <= 0.0) { return 0.0; }
@@ -633,28 +635,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let qo = (i * hq + head) * dh;
     var acc: array<f32, 128>;
     for (var c: u32 = 0u; c < dh; c = c + 1u) { acc[c] = 0.0; }
+    // memory-pinned scratch (see det_rsqrt note): every product is stored and
+    // re-loaded at a runtime-opaque index before its add — adds see two
+    // LOADS, so no compiler can contract them into fma.
+    var sc_: array<f32, 8>;
+    let zz = gqa.y;
     var m: f32 = -3.0e38; var l: f32 = 0.0;
     for (var j: u32 = 0u; j <= i; j = j + 1u) {           // causal: attend to keys 0..=i
         let ko = (j * hkv + kvhead) * dh;
-        // barriered reduction: pins summation ORDER (fast-math may otherwise
-        // tree-reduce/vectorize the dot differently per fabric)
-        var s: f32 = 0.0;
-        for (var c: u32 = 0u; c < dh; c = c + 1u) { s = det_bar(s + det_bar(q[qo + c] * k[ko + c], gqa.y), gqa.y); }
-        s = s * scale;
-        let mnew = max(m, s);
-        let corr = det_exp(m - mnew, gqa.y);
-        let p = det_exp(s - mnew, gqa.y);
-        // barrier every product before its add — Metal and Vulkan fuse
-        // different subsets of mul+add otherwise (probe-verified); gqa.y is
-        // the runtime zero
-        l = det_bar(det_bar(l * corr, gqa.y) + p, gqa.y);
+        sc_[zz] = 0.0;
         for (var c: u32 = 0u; c < dh; c = c + 1u) {
-            let pv = det_bar(p * v[ko + c], gqa.y);
-            acc[c] = det_bar(det_bar(acc[c] * corr, gqa.y) + pv, gqa.y);
+            sc_[zz + 1u] = q[qo + c] * k[ko + c];
+            sc_[zz] = sc_[zz] + sc_[zz + 1u];
+        }
+        let s = sc_[zz] * scale;
+        let mnew = max(m, s);
+        let corr = det_exp(m - mnew, zz);
+        let p = det_exp(s - mnew, zz);
+        sc_[zz + 2u] = l * corr;
+        l = sc_[zz + 2u] + p;
+        for (var c: u32 = 0u; c < dh; c = c + 1u) {
+            sc_[zz + 3u] = p * v[ko + c];
+            sc_[zz + 4u] = acc[c] * corr;
+            acc[c] = sc_[zz + 4u] + sc_[zz + 3u];
         }
         m = mnew;
     }
-    let invl = det_recip(l, gqa.y);
+    let invl = det_recip(l, zz);
     for (var c: u32 = 0u; c < dh; c = c + 1u) { out[qo + c] = acc[c] * invl; }
 }
 "#;
@@ -675,25 +682,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let qo = head * dh;
     var acc: array<f32, 128>;
     for (var c: u32 = 0u; c < dh; c = c + 1u) { acc[c] = 0.0; }
+    // memory-pinned scratch (see MHA_CAUSAL note)
+    var scm: array<f32, 8>;
+    let zz = gqa.y;
     var m: f32 = -3.0e38; var l: f32 = 0.0;
     for (var j: u32 = 0u; j < s; j = j + 1u) {
         let ko = (j * hkv + kvhead) * dh;
-        // barriered reduction (see MHA_CAUSAL note)
-        var sc: f32 = 0.0;
-        for (var c: u32 = 0u; c < dh; c = c + 1u) { sc = det_bar(sc + det_bar(q[qo + c] * k[ko + c], gqa.y), gqa.y); }
-        sc = sc * scale;
-        let mnew = max(m, sc);
-        let corr = det_exp(m - mnew, gqa.y);
-        let p = det_exp(sc - mnew, gqa.y);
-        // barrier every product before its add (see MHA_CAUSAL note)
-        l = det_bar(det_bar(l * corr, gqa.y) + p, gqa.y);
+        scm[zz] = 0.0;
         for (var c: u32 = 0u; c < dh; c = c + 1u) {
-            let pv = det_bar(p * v[ko + c], gqa.y);
-            acc[c] = det_bar(det_bar(acc[c] * corr, gqa.y) + pv, gqa.y);
+            scm[zz + 1u] = q[qo + c] * k[ko + c];
+            scm[zz] = scm[zz] + scm[zz + 1u];
+        }
+        let sc = scm[zz] * scale;
+        let mnew = max(m, sc);
+        let corr = det_exp(m - mnew, zz);
+        let p = det_exp(sc - mnew, zz);
+        scm[zz + 2u] = l * corr;
+        l = scm[zz + 2u] + p;
+        for (var c: u32 = 0u; c < dh; c = c + 1u) {
+            scm[zz + 3u] = p * v[ko + c];
+            scm[zz + 4u] = acc[c] * corr;
+            acc[c] = scm[zz + 4u] + scm[zz + 3u];
         }
         m = mnew;
     }
-    let invl = det_recip(l, gqa.y);
+    let invl = det_recip(l, zz);
     for (var c: u32 = 0u; c < dh; c = c + 1u) { out[qo + c] = acc[c] * invl; }
 }
 "#;
@@ -709,13 +722,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rows = dims.x; let d = dims.y; let eps = bitcast<f32>(dims.z);
     if (row >= rows) { return; }
     let base = row * d;
-    var ms: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = det_bar(ms + det_bar(v * v, dims.w), dims.w); }
-    ms = ms * det_recip(f32(d), dims.w);
-    let inv = det_rsqrt(ms + eps, dims.w);
+    // memory-pinned accumulation (see det_rsqrt note): product and running sum
+    // live in a runtime-opaque-indexed array, so adds see two LOADS — nothing
+    // to contract, on any compiler.
+    var s: array<f32, 4>;
+    let zz = dims.w;
+    s[zz] = 0.0;
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let t = det_bar(x[base + j] * inv, dims.w);
-        out[base + j] = t * weight[j];
+        let v = x[base + j];
+        s[zz + 1u] = v * v;
+        s[zz] = s[zz] + s[zz + 1u];
+    }
+    let ms = s[zz] * det_recip(f32(d), zz);
+    let inv = det_rsqrt(ms + eps, zz);
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        s[zz + 2u] = x[base + j] * inv;
+        out[base + j] = s[zz + 2u] * weight[j];
     }
 }
 "#;
@@ -875,5 +897,55 @@ pub mod cpu {
         let scores = matmul_bt(q, k, rows_q, rows_k, d, scale);
         let probs = softmax(&scores, rows_q, rows_k);
         crate::matmul_cpu(&probs, v, rows_q, rows_k, dv)
+    }
+}
+
+impl Context {
+    /// Forensic: run the REAL det_rsqrt/det_sqrt register-only chain but
+    /// export only stage `k` (0 = initial guess; then per Newton iteration
+    /// t,u,w,x; 13 = y·rsqrt). One dispatch per stage keeps the chain
+    /// register-resident up to the exported value — dumping every stage in
+    /// one kernel would itself act as a barrier and could hide the very
+    /// compiler transform being hunted.
+    pub async fn det_rsqrt_stage(&self, y: &[f32], stage: u32) -> crate::Result<Vec<f32>> {
+        // NOTE: pipeline() auto-prepends DET_MATH_WGSL when it sees det_ —
+        // do not embed it here or det_bar gets redeclared.
+        let src = format!(
+            r#"@group(0) @binding(0) var<storage, read>       y: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform>             dims: vec4<u32>; // n, z, stage, _
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x; if (i >= dims.x) {{ return; }}
+    let z = dims.y;
+    let yy = y[i];
+    let hy = 0.5 * yy;
+    var x = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+    var stages: array<f32, 14>;
+    stages[0] = x;
+    var t = det_bar(x * x, z);      stages[1] = t;
+    var u = det_bar(hy * t, z);     stages[2] = u;
+    var w = det_bar(1.5 - u, z);    stages[3] = w;
+    x = det_bar(x * w, z);          stages[4] = x;
+    t = det_bar(x * x, z);          stages[5] = t;
+    u = det_bar(hy * t, z);         stages[6] = u;
+    w = det_bar(1.5 - u, z);        stages[7] = w;
+    x = det_bar(x * w, z);          stages[8] = x;
+    t = det_bar(x * x, z);          stages[9] = t;
+    u = det_bar(hy * t, z);         stages[10] = u;
+    w = det_bar(1.5 - u, z);        stages[11] = w;
+    x = det_bar(x * w, z);          stages[12] = x;
+    stages[13] = yy * det_bar(x, z);
+    out[i] = stages[dims.z];
+}}
+"#
+        );
+        let n = y.len();
+        let yb = self.storage("fy", y);
+        let ob = self.out_buffer(n);
+        let dims = self.uniform_u32("fd", &[n as u32, 0, stage, 0]);
+        let pipe = self.pipeline("rsqrt_stage", &src);
+        self.dispatch(&pipe, &[&yb, &ob, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.readback(&ob, n).await
     }
 }

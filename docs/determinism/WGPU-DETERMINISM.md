@@ -121,3 +121,35 @@ rsqrt-dependent kernels remain tolerance-validated in the browser.
 Scoreboard: CPU cross-arch ✅ digest · GPU cross-vendor ✅ digest (Vulkan
 re-verify of portable-det pending Tailscale re-auth of the test box) ·
 browser mm/rope/sigmoid ✅ digest · browser rsqrt-class ⏳ forensic.
+
+## Browser campaign round 2 — the memory-pin discovery (2026-07-22)
+
+Stage-by-stage forensics (Context::det_rsqrt_stage — one dispatch per stage,
+so the chain stays register-resident up to the exported value) delivered the
+mechanism: **ANGLE/Tint transforms register-only float chains straight
+through integer-XOR barriers, but cannot optimize across stores to a private
+array at runtime-opaque, mutually-distinct indices.** The identical Newton
+chain scored 183/768 (1 ULP low) as registers and 0/768 through the array.
+
+Applied: det_rsqrt rewritten as a z-offset array chain → **browser sqrt now
+bit-matches native strict (c7d7cc05…, 0/768 vs plain-IEEE CPU)**. Browser
+scoreboard: **mm, sqrt, rope, sigmoid = 4/7 rows digest-identical with
+native Metal AND native Vulkan.** Native regression clean throughout; all
+validations green.
+
+Two instructive failures, preserved for the follow-up:
+- det_bar itself as a store/load at the SAME index expression gets
+  store-forwarded by Tint (barrier elided; browser reverted to fast-math).
+  Index expressions must differ or chain across slots.
+- Array-pinning det_exp/det_recip the same way made rope/sigmoid REGRESS in
+  the browser (native unmoved) — ANGLE appears to register-promote small
+  dynamic arrays differently per inlining context, re-exposing fast-math.
+  Reverted; XOR versions retained (they converge in the probed contexts).
+
+Still open (scoped): rmsnorm + mha (and demo-lm, their composite) in the
+browser — the residue lives in the interaction between det functions and
+their inlining context under ANGLE, not in the accumulation loops (memory-
+pinned accumulators changed nothing). Next tool: per-stage forensic kernels
+for the rmsnorm row (recip → rsqrt-arg → inv → output chain) to name the op.
+Native (Metal+Vulkan) remains 7/7 digest-identical and is the shipping
+guarantee; browser is 4/7 digest + tolerance elsewhere.
