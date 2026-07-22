@@ -566,6 +566,15 @@ pub fn resident_for(ctx: &ferric_core::Context) -> Option<&'static Metal4Gemm> {
     (Retained::as_ptr(&g.device) as usize == raw).then_some(g)
 }
 
+/// Whether the resident fast path would fire for a workload of `flops` on this context — the
+/// opt-in env (`FERRIC_METAL4=1`), the ~1e8-flop floor (below it the ~0.2 ms tensor-unit dispatch
+/// loses to the portable WGSL kernels), and device availability, in one place. Callers that stage
+/// extra work for the tensor units (e.g. a dequant pass) should gate on this so a declined route
+/// never pays the staging cost.
+pub fn resident_ready(ctx: &std::sync::Arc<ferric_core::Context>, flops: usize) -> bool {
+    flops >= 100_000_000 && std::env::var("FERRIC_METAL4").is_ok() && resident_for(ctx).is_some()
+}
+
 /// Ring pool of matmul output buffers for the resident path. A pooled buffer has already been
 /// clear_buffer'd once — wgpu's init tracker marks it initialized forever — so reuse skips the
 /// ~170 µs clear-submit round trip that a fresh buffer needs (returns `fresh = true` when the

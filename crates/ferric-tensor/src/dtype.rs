@@ -1161,6 +1161,27 @@ impl Tensor {
         if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
     }
 
+    /// **Metal-4 tensor-unit Q2_0 prefill** (via `FERRIC_METAL4`): dequantize the packed weight to
+    /// f32 `[K,N]` with the existing transposed-dequant kernel, then plain `matmul` — which routes
+    /// through the resident tensor units. The dequant target comes from the resident out-pool, so
+    /// ONE transient buffer is recycled across a forward's layers instead of accumulating — the OOM
+    /// that stopped the coop16 model-facing hook (~140 live buffers) cannot happen here, and the
+    /// resident path's per-call poll lets wgpu actually reclaim what drops.
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    pub fn matmul_q2_0_metal4(&self, w: &Q2_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        let (n, k) = (w.rows, inn);
+        let (wf, _fresh) = crate::metal4::pooled_out(&self.ctx, k * n);
+        let (grid, rs) = groups2d(n * k);
+        run(&self.ctx, DEQ_Q2_0_NT_WGSL, "deq_q2_0_nt", &[w.codes.as_ref(), w.scales.as_ref(), wf.as_ref(),
+            &u32buf(&self.ctx, &[(n * k) as u32, k as u32, (k / 128) as u32, n as u32, rs])], grid);
+        let wf_nk = Tensor::from_arc(&self.ctx, wf, &[n, k]);
+        let _ = rows;
+        x.matmul_bt(&wf_nk)
+    }
+
     /// **NVIDIA tensor-core Q2_0 prefill**: dequant the packed weight to f32 `[K,N]` (transposed, so
     /// the row-major coop load computes x·Wᵀ), then `matmul_coop16` (f16 inputs, f32 accumulate) on the
     /// tensor cores. The dequant is O(weight) and the matmul O(M·weight), so it amortizes with M — the
@@ -1361,6 +1382,14 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        // Metal-4 tensor-unit prefill (opt-in FERRIC_METAL4): dequant once, then a real GEMM on the
+        // tensor units (~10 TFLOP/s resident) — dequant is O(weight), the GEMM O(M·weight), so it
+        // amortizes with M. Decode (small rows) stays on the fused scalar kernel, which reads only
+        // the packed bytes. Checked before coop so the faster unit wins when both are opted in.
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if rows >= 32 && crate::metal4::resident_ready(&self.ctx, 2 * rows * inn * w.rows) {
+            return self.matmul_q2_0_metal4(w);
+        }
         // Prefill tensor-core fast-path (opt-in, Metal): many tokens make this a real GEMM where the
         // matrix unit's 3-4× beats the scalar dequant kernel. Decode (rows < 8) stays on the scalar
         // path. fp-order/precision dependent, so gated behind FERRIC_COOP, never the default.
@@ -1542,6 +1571,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ci = gblk * 8u + (j >> 4u); let word = codes[ci];
     let code = (word >> ((j & 15u) * 2u)) & 3u;
     let oi = k * nn + n; out[oi] = f32(i32(code) - 1) * d;   // transposed write [K,N]
+}
+"#;
+
+// Non-transposed variant for the Metal-4 NT route: the resident matmul_bt consumes W as [N,K]
+// directly (the packed layout's own row order), so the dequant is a straight linear write —
+// coalesced on both sides, where the transposed variant's 68 KB-strided writes ran ~7x below
+// bandwidth and dominated small prefills.
+const DEQ_Q2_0_NT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(1) var<storage,read>       scales: array<u32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;   // [N,K] — same order as packed
+@group(0) @binding(3) var<storage,read>       info:   array<u32>;   // n_elem, K, nblk, N, row_stride
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let rs = info[4]; let ne = info[0]; let kk = info[1]; let nblk = info[2];
+    let e = gid.x + gid.y * rs;
+    if (e >= ne) { return; }
+    let n = e / kk; let k = e % kk;
+    let blk = k / 128u; let j = k % 128u; let gblk = n * nblk + blk;
+    let si = gblk >> 1u; let sw = unpack2x16float(scales[si]);
+    let d = select(sw.y, sw.x, (gblk & 1u) == 0u);
+    let ci = gblk * 8u + (j >> 4u); let word = codes[ci];
+    let code = (word >> ((j & 15u) * 2u)) & 3u;
+    out[e] = f32(i32(code) - 1) * d;
 }
 "#;
 

@@ -526,7 +526,7 @@ impl Tensor {
         // Below ~1e8 flops the ~0.2 ms tensor-unit dispatch loses to the WGSL kernels, so small ops
         // stay on the portable path.
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
-        if 2 * bn * m * ka * n >= 100_000_000 && std::env::var("FERRIC_METAL4").is_ok() {
+        if crate::metal4::resident_ready(&self.ctx, 2 * bn * m * ka * n) {
             if let Some(g) = crate::metal4::resident_for(&self.ctx) {
                 // Fresh out buffers need one clear_buffer pass: it marks the buffer INITIALIZED in
                 // wgpu's init tracker — without it, wgpu lazily zero-fills the buffer on first wgpu
@@ -693,7 +693,7 @@ impl KvBuf {
 /// activation fused into the unpad epilogue).
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 fn metal4_linear(ctx: &Arc<Context>, x: &Tensor, w: &Tensor, rows: usize, inn: usize, out_f: usize, act: u32) -> Option<Tensor> {
-    if 2 * rows * inn * out_f < 100_000_000 || std::env::var("FERRIC_METAL4").is_err() {
+    if !crate::metal4::resident_ready(ctx, 2 * rows * inn * out_f) {
         return None;
     }
     let g = crate::metal4::resident_for(ctx)?;

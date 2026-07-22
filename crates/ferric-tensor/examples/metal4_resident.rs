@@ -135,5 +135,51 @@ fn main() {
         );
     }
 
+    // quantized prefill — Bonsai-27B's real FFN shape, packed Q2_0 ternary. Decode (1 token) stays
+    // on the fused scalar kernel (bandwidth-optimal on packed bytes); prefill routes dequant-once →
+    // tensor-unit GEMM. The 32-row threshold in matmul_q2_0 is what this section justifies (1.3x there, 9x at 512).
+    println!("\n=== Q2_0 ternary prefill (Bonsai ffn_gate/up shape: 5120→17408) ===");
+    println!("  {:>5}  {:>11}  {:>10}  {:>10}  {:>10}  {:>9}", "toks", "fused (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+    {
+        let (inn, out_f) = (5120usize, 17408usize);
+        let wsrc: Vec<f32> = (0..out_f * inn).map(|i| ((i % 3) as f32 - 1.0) * 0.02).collect();
+        let mut packed = Vec::with_capacity(out_f * (inn / 128) * 34);
+        for r in 0..out_f {
+            packed.extend(ferric_gguf::quant_q2_0(&wsrc[r * inn..(r + 1) * inn]));
+        }
+        let qw = ferric_tensor::Q2_0Weights::from_bytes(&ctx, &packed, out_f, inn);
+        for toks in [32usize, 128, 512] {
+            let x = Tensor::from_vec(&ctx, &gen(toks * inn, 5), &[toks, inn]);
+            let flops = 2.0 * (toks * inn * out_f) as f64;
+            std::env::remove_var("FERRIC_METAL4");
+            let time_q = |reps: usize| {
+                let _ = pollster::block_on(x.matmul_q2_0(&qw).to_vec());
+                let t0 = Instant::now();
+                let mut last = None;
+                for _ in 0..reps {
+                    last = Some(x.matmul_q2_0(&qw));
+                }
+                let res = pollster::block_on(last.unwrap().to_vec());
+                (t0.elapsed().as_secs_f64() / reps as f64, res)
+            };
+            let (t_fused, r_fused) = time_q(3);
+            std::env::set_var("FERRIC_METAL4", "1");
+            let (t_m4, r_m4) = time_q(3);
+            // fp16-contract tolerance, relative to the result scale
+            let scale = r_fused.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let err = max_abs_diff(&r_m4, &r_fused);
+            assert!(err < (1e-2 * scale).max(1e-3), "Q2_0 metal4 off at {toks} toks: err {err} (scale {scale})");
+            println!(
+                "  {:>5}  {:>11.3}  {:>10.1}  {:>10.3}  {:>10.1}  {:>8.1}x",
+                toks,
+                t_fused * 1e3,
+                flops / t_fused / 1e9,
+                t_m4 * 1e3,
+                flops / t_m4 / 1e9,
+                t_fused / t_m4
+            );
+        }
+    }
+
     println!("\n✅ resident tensor-unit path: correct vs the fp16 oracle, faster than WGSL, zero host copies");
 }
