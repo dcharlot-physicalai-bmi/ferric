@@ -870,3 +870,297 @@ pub fn bench_prset(g: &Metal4Gemm, bufs: &[&Obj<dyn MTLBuffer>]) {
     prset.commit();
     prset.requestResidency();
 }
+
+// The MPP `convolution2d` contract, established empirically (the header ships no worked example):
+//  - runtime MSL compilation with MTLLanguageVersion::Version4_0 works (per-config constexpr
+//    descriptors → per-config PSOs);
+//  - the op computes CROSS-CORRELATION with the source window implicitly shifted by -k/2 per axis
+//    (SAME-centering, zero-padded edges) — `set_offsets(k/2 + tile_origin)` recovers corner-anchored
+//    VALID windows exactly;
+//  - multi-threadgroup tiling = per-tile `C.slice(...)` + per-tile offsets; grid (wo/T, ho/T).
+// The tests below pin each of those facts.
+#[cfg(test)]
+mod conv_probe {
+    use super::*;
+
+    /// Decisive semantics experiment: c=1, o=1, asymmetric 3x3 kernel — compare the op's output
+    /// against every plausible index-mapping variant to identify the actual contract.
+    #[test]
+    fn conv2d_semantics_experiment() {
+        let Some(g) = Metal4Gemm::new() else { return };
+        let (h, w, k) = (6usize, 6usize, 3usize);
+        let (ho, wo) = (h - k + 1, w - k + 1);
+        // delta input: single 1.0 at (2,3) → output IS the (possibly transformed) kernel imprint
+        let mut a = vec![0.0f32; h * w];
+        a[2 * w + 3] = 1.0;
+        let wt: Vec<f32> = (0..k * k).map(|i| (i + 1) as f32).collect(); // 1..9, fully asymmetric
+        let got = probe_raw(&g, &a, &wt, h, w, 1, k, 1);
+        eprintln!("kernel (hw): {:?}", wt);
+        for yo in 0..ho {
+            let row: Vec<f32> = (0..wo).map(|xo| got[yo * wo + xo]).collect();
+            eprintln!("  out y{yo}: {row:?}");
+        }
+        // Measured contract: got[y][x] = w[3-y][4-x] — cross-correlation with the source window
+        // shifted by -k/2 on both axes (implicit SAME-centering; zero-padded edges). Assert it so a
+        // toolchain change that alters the semantics fails loudly here.
+        for y in 0..ho as i32 {
+            for x in 0..wo as i32 {
+                let want = if (1..=3).contains(&y) && (2..=3).contains(&x) { wt[((3 - y) * k as i32 + (4 - x)) as usize] } else { 0.0 };
+                let g_ = got[(y * wo as i32 + x) as usize];
+                assert!((g_ - want).abs() < 1e-2, "delta imprint mismatch at ({y},{x}): {g_} vs {want}");
+            }
+        }
+    }
+
+    /// Confirmations: (a) set_offsets(1,1) recovers VALID cross-correlation; (b) dest = src dims
+    /// gives exact SAME cross-correlation with zero-pad.
+    #[test]
+    fn conv2d_offsets_recover_valid_and_same() {
+        let Some(g) = Metal4Gemm::new() else { return };
+        let (h, w, k) = (6usize, 6usize, 3usize);
+        let a: Vec<f32> = (0..h * w).map(|i| 0.1 * (((i + 3) % 11) as f32 - 5.0)).collect();
+        let wt: Vec<f32> = (0..k * k).map(|i| (i + 1) as f32 * 0.1).collect();
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16::from_f32(x).to_f32()).collect() };
+        let (af, wf) = (q(&a), q(&wt));
+        let corr = |yo: i32, xo: i32| -> f32 {
+            let mut acc = 0.0f32;
+            for ky in 0..k as i32 {
+                for kx in 0..k as i32 {
+                    let (yi, xi) = (yo + ky, xo + kx);
+                    if yi >= 0 && yi < h as i32 && xi >= 0 && xi < w as i32 {
+                        acc += af[(yi * w as i32 + xi) as usize] * wf[(ky * k as i32 + kx) as usize];
+                    }
+                }
+            }
+            acc
+        };
+        // (a) valid via offsets (1,1): out[y][x] should be corr(y, x) with corner-anchored windows
+        let (ho, wo) = (h - k + 1, w - k + 1);
+        let got = probe_raw_ex(&g, &a, &wt, h, w, 1, k, 1, ho, wo, 1, 1);
+        let mut err = 0.0f32;
+        for y in 0..ho {
+            for x in 0..wo {
+                err = err.max((got[y * wo + x] - corr(y as i32, x as i32)).abs());
+            }
+        }
+        eprintln!("valid-via-offsets err: {err:.3e}");
+        assert!(err < 1e-2, "offsets(1,1) must recover valid correlation: err {err}");
+        // (b) SAME: dest = src dims, offsets 0 → centered windows, zero-padded
+        let got = probe_raw_ex(&g, &a, &wt, h, w, 1, k, 1, h, w, 0, 0);
+        let mut err = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                err = err.max((got[y * w + x] - corr(y as i32 - 1, x as i32 - 1)).abs());
+            }
+        }
+        eprintln!("same-centered err: {err:.3e} (informational — integration uses explicit-pad + valid + offsets)");
+    }
+
+    /// Tiling experiment: compute an 8x8 valid dest as a 2x2 grid of 4x4 tiles — dest tensor sliced
+    /// per threadgroup, source offsets = cancel + tile origin. This is the multi-threadgroup recipe.
+    #[test]
+    fn conv2d_tiles_assemble_the_full_output() {
+        let Some(g) = Metal4Gemm::new() else { return };
+        let (h, w, k, tile) = (10usize, 10usize, 3usize, 4usize);
+        let (ho, wo) = (h - k + 1, w - k + 1); // 8x8
+        let a: Vec<f32> = (0..h * w).map(|i| 0.1 * (((i + 3) % 11) as f32 - 5.0)).collect();
+        let wt: Vec<f32> = (0..k * k).map(|i| (i + 1) as f32 * 0.1).collect();
+        let src = format!(
+            r#"
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
+                 tensor<device half,  dextents<int32_t, 4>> W,
+                 tensor<device float, dextents<int32_t, 4>> C,
+                 uint2 tgid [[threadgroup_position_in_grid]])
+{{
+    constexpr auto desc = convolution2d_descriptor(
+        int4(1, {tile}, {tile}, 1), int4(1, {w}, {h}, 1), int2({k}, {k}),
+        convolution2d_activation_layout::nhwc, convolution2d_weights_layout::hwio,
+        int2(1, 1), int2(1, 1), 1, false, convolution2d_descriptor::mode::multiply);
+    convolution2d<desc, execution_simdgroups<4>> op;
+    op.set_offsets(int2(1 + int(tgid.x) * {tile}, 1 + int(tgid.y) * {tile}));
+    auto tC = C.slice(0, int(tgid.x) * {tile}, int(tgid.y) * {tile}, 0);
+    op.run(A, W, tC);
+}}
+"#
+        );
+        let opts = MTLCompileOptions::new();
+        unsafe { opts.setLanguageVersion(MTLLanguageVersion::Version4_0) };
+        let lib = g.device.newLibraryWithSource_options_error(&NSString::from_str(&src), Some(&opts)).unwrap();
+        let func = lib.newFunctionWithName(&NSString::from_str("conv")).unwrap();
+        let pso = g.device.newComputePipelineStateWithFunction_error(&func).unwrap();
+        let dev = &g.device;
+        let mk = |bytes: usize| dev.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared).unwrap();
+        let (ba, bw, bc) = (mk(a.len() * 2), mk(wt.len() * 2), mk(ho * wo * 4));
+        unsafe {
+            let pa = std::slice::from_raw_parts_mut(ba.contents().as_ptr() as *mut f16, a.len());
+            pa.convert_from_f32_slice(&a);
+            let pw = std::slice::from_raw_parts_mut(bw.contents().as_ptr() as *mut f16, wt.len());
+            pw.convert_from_f32_slice(&wt);
+            std::ptr::write_bytes(bc.contents().as_ptr() as *mut u8, 0, ho * wo * 4);
+        }
+        let ta = unsafe {
+            ba.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[1, w as isize, h as isize, 1],
+                    &[1, 1, w as isize, (w * h) as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let tw = unsafe {
+            bw.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[1, 1, k as isize, k as isize],
+                    &[1, 1, 1, k as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let tc = unsafe {
+            bc.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float32, &[1, wo as isize, ho as isize, 1],
+                    &[1, 1, wo as isize, (wo * ho) as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(3);
+        let at = g.device.newArgumentTableWithDescriptor_error(&atd).unwrap();
+        unsafe {
+            at.setResource_atBufferIndex(ta.gpuResourceID(), 0);
+            at.setResource_atBufferIndex(tw.gpuResourceID(), 1);
+            at.setResource_atBufferIndex(tc.gpuResourceID(), 2);
+        }
+        let rset = g.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap();
+        for b in [&ba, &bw, &bc] { rset.addAllocation(ProtocolObject::from_ref(&**b)); }
+        for t in [&ta, &tw, &tc] { rset.addAllocation(ProtocolObject::from_ref(&**t)); }
+        rset.commit();
+        rset.requestResidency();
+        let alloc = g.device.newCommandAllocator().unwrap();
+        let cb = g.device.newCommandBuffer().unwrap();
+        cb.beginCommandBufferWithAllocator(&alloc);
+        cb.useResidencySet(&rset);
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pso);
+        enc.setArgumentTable(Some(&at));
+        let tew = pso.threadExecutionWidth();
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: 2, height: 2, depth: 1 },
+            MTLSize { width: tew * 4, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let bufs = [NonNull::from(&*cb)];
+        unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), ticket);
+        assert!(g.event.waitUntilSignaledValue_timeoutMS(ticket, 30_000));
+
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16::from_f32(x).to_f32()).collect() };
+        let (af, wf) = (q(&a), q(&wt));
+        let got = unsafe { std::slice::from_raw_parts(bc.contents().as_ptr() as *const f32, ho * wo) };
+        let mut err = 0.0f32;
+        for yo in 0..ho {
+            for xo in 0..wo {
+                let mut acc = 0.0f32;
+                for ky in 0..k {
+                    for kx in 0..k {
+                        acc += af[(yo + ky) * w + xo + kx] * wf[ky * k + kx];
+                    }
+                }
+                err = err.max((got[yo * wo + xo] - acc).abs());
+            }
+        }
+        eprintln!("tiled valid-conv err: {err:.3e}");
+        assert!(err < 1e-2, "tiled conv must assemble exactly: err {err}");
+    }
+
+    fn probe_raw(g: &Metal4Gemm, a: &[f32], wt: &[f32], h: usize, w: usize, c: usize, k: usize, o: usize) -> Vec<f32> {
+        let (ho, wo) = (h - k + 1, w - k + 1);
+        probe_raw_ex(g, a, wt, h, w, c, k, o, ho, wo, 0, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_raw_ex(g: &Metal4Gemm, a: &[f32], wt: &[f32], h: usize, w: usize, c: usize, k: usize, o: usize,
+                    ho: usize, wo: usize, ox: i32, oy: i32) -> Vec<f32> {
+        let src = format!(
+            r#"
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
+                 tensor<device half,  dextents<int32_t, 4>> W,
+                 tensor<device float, dextents<int32_t, 4>> C)
+{{
+    constexpr auto desc = convolution2d_descriptor(
+        int4({o}, {wo}, {ho}, 1), int4({c}, {w}, {h}, 1), int2({k}, {k}),
+        convolution2d_activation_layout::nhwc, convolution2d_weights_layout::hwio,
+        int2(1, 1), int2(1, 1), 1, false, convolution2d_descriptor::mode::multiply);
+    convolution2d<desc, execution_simdgroups<4>> op;
+    op.set_offsets(int2({ox}, {oy}));
+    op.run(A, W, C);
+}}
+"#
+        );
+        let opts = MTLCompileOptions::new();
+        unsafe { opts.setLanguageVersion(MTLLanguageVersion::Version4_0) };
+        let lib = g.device.newLibraryWithSource_options_error(&NSString::from_str(&src), Some(&opts)).unwrap();
+        let func = lib.newFunctionWithName(&NSString::from_str("conv")).unwrap();
+        let pso = g.device.newComputePipelineStateWithFunction_error(&func).unwrap();
+        let dev = &g.device;
+        let mk = |bytes: usize| dev.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared).unwrap();
+        let (ba, bw, bc) = (mk(a.len() * 2), mk(wt.len() * 2), mk(ho * wo * o * 4));
+        unsafe {
+            let pa = std::slice::from_raw_parts_mut(ba.contents().as_ptr() as *mut f16, a.len());
+            pa.convert_from_f32_slice(a);
+            let pw = std::slice::from_raw_parts_mut(bw.contents().as_ptr() as *mut f16, wt.len());
+            pw.convert_from_f32_slice(wt);
+            std::ptr::write_bytes(bc.contents().as_ptr() as *mut u8, 0, ho * wo * o * 4);
+        }
+        let (ci, oi) = (c as isize, o as isize);
+        let ta = unsafe {
+            ba.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[ci, w as isize, h as isize, 1],
+                    &[1, ci, ci * w as isize, ci * (w * h) as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let tw = unsafe {
+            bw.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[oi, ci, k as isize, k as isize],
+                    &[1, oi, oi * ci, oi * ci * k as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let tc = unsafe {
+            bc.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float32, &[oi, wo as isize, ho as isize, 1],
+                    &[1, oi, oi * wo as isize, oi * (wo * ho) as isize], MTLStorageMode::Shared), 0)
+        }.unwrap();
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(3);
+        let at = g.device.newArgumentTableWithDescriptor_error(&atd).unwrap();
+        unsafe {
+            at.setResource_atBufferIndex(ta.gpuResourceID(), 0);
+            at.setResource_atBufferIndex(tw.gpuResourceID(), 1);
+            at.setResource_atBufferIndex(tc.gpuResourceID(), 2);
+        }
+        let rset = g.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap();
+        for b in [&ba, &bw, &bc] { rset.addAllocation(ProtocolObject::from_ref(&**b)); }
+        for t in [&ta, &tw, &tc] { rset.addAllocation(ProtocolObject::from_ref(&**t)); }
+        rset.commit();
+        rset.requestResidency();
+        let alloc = g.device.newCommandAllocator().unwrap();
+        let cb = g.device.newCommandBuffer().unwrap();
+        cb.beginCommandBufferWithAllocator(&alloc);
+        cb.useResidencySet(&rset);
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pso);
+        enc.setArgumentTable(Some(&at));
+        let tew = pso.threadExecutionWidth();
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: 1, height: 1, depth: 1 },
+            MTLSize { width: tew * 4, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let bufs = [NonNull::from(&*cb)];
+        unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), ticket);
+        assert!(g.event.waitUntilSignaledValue_timeoutMS(ticket, 30_000));
+        let got = unsafe { std::slice::from_raw_parts(bc.contents().as_ptr() as *const f32, ho * wo * o) };
+        got.to_vec()
+    }
+}

@@ -455,6 +455,32 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
     }
 
+    /// 2D convolution: `self` is NHWC activations `[n, h, w, c]`, `w` is HWIO weights
+    /// `[kh, kw, c, o]` (the MPP/TF layout family), output NHWO `[n, ho, wo, o]` with
+    /// `ho = (h + 2·pad.0 − kh)/stride.0 + 1` (and likewise for width). Direct portable kernel —
+    /// the fabric's conv baseline on every backend.
+    pub fn conv2d(&self, w: &Tensor, stride: (usize, usize), pad: (usize, usize)) -> Tensor {
+        let x = self.contiguous();
+        let wc = w.contiguous();
+        assert_eq!(x.rank(), 4, "conv2d activations must be [n,h,w,c]");
+        assert_eq!(wc.rank(), 4, "conv2d weights must be [kh,kw,c,o]");
+        let (n, h, wd, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (kh, kw, wc_c, o) = (wc.shape[0], wc.shape[1], wc.shape[2], wc.shape[3]);
+        assert_eq!(c, wc_c, "conv2d channel mismatch: activations {c} vs weights {wc_c}");
+        assert!(h + 2 * pad.0 >= kh && wd + 2 * pad.1 >= kw, "kernel larger than padded input");
+        let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
+        let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
+        let out = empty(&self.ctx, n * ho * wo * o);
+        let (grid, rs) = groups2d(n * ho * wo * o);
+        run(&self.ctx, CONV2D_WGSL, "conv2d",
+            &[&x.buf, &wc.buf, &out,
+              &u32buf(&self.ctx, &[n as u32, h as u32, wd as u32, c as u32, kh as u32, kw as u32,
+                  o as u32, ho as u32, wo as u32, stride.0 as u32, stride.1 as u32,
+                  pad.0 as u32, pad.1 as u32, rs])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![n, ho, wo, o])
+    }
+
     /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
     pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
         let d = *self.shape.last().unwrap();
@@ -1288,6 +1314,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Direct 2D convolution, NHWC activations x HWIO weights -> NHWO (the MPP/TF layout family).
+// One thread per output element; the portable baseline every backend must match.
+const CONV2D_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;   // [n, h, w, c]
+@group(0) @binding(1) var<storage,read>        wt: array<f32>;  // [kh, kw, c, o]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [n, ho, wo, o]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // n,h,w,c,kh,kw,o,ho,wo,sh,sw,ph,pw,rs
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let rs = info[13];
+    let i = gid.x + gid.y * rs;
+    let n = info[0]; let h = info[1]; let w = info[2]; let c = info[3];
+    let kh = info[4]; let kw = info[5]; let o = info[6]; let ho = info[7]; let wo = info[8];
+    if (i >= n * ho * wo * o) { return; }
+    let oc = i % o; let r1 = i / o;
+    let xo = r1 % wo; let r2 = r1 / wo;
+    let yo = r2 % ho; let b = r2 / ho;
+    var acc = 0.0;
+    for (var ky: u32 = 0u; ky < kh; ky = ky + 1u) {
+        let yi = i32(yo * info[9]) + i32(ky) - i32(info[11]);
+        if (yi < 0 || yi >= i32(h)) { continue; }
+        for (var kx: u32 = 0u; kx < kw; kx = kx + 1u) {
+            let xi = i32(xo * info[10]) + i32(kx) - i32(info[12]);
+            if (xi < 0 || xi >= i32(w)) { continue; }
+            let xb = ((b * h + u32(yi)) * w + u32(xi)) * c;
+            let wb = (ky * kw + kx) * c * o + oc;
+            for (var ci: u32 = 0u; ci < c; ci = ci + 1u) {
+                acc = acc + x[xb + ci] * wt[wb + ci * o];
+            }
+        }
+    }
+    out[i] = acc;
+}
+"#;
+
 const GATHER_ROWS_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        table: array<f32>;
 @group(0) @binding(1) var<storage,read>        idx: array<u32>;
@@ -1923,5 +1984,79 @@ mod reduce_tests {
         let t = Tensor::from_vec(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
         assert_eq!(pollster::block_on(t.sum(&[1], false).to_vec()), vec![6.0, 15.0]);
         assert_eq!(pollster::block_on(t.max(&[0], false).to_vec()), vec![4.0, 5.0, 6.0]);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod conv_tests {
+    use super::*;
+
+    fn cpu_conv2d(
+        x: &[f32], w: &[f32], n: usize, h: usize, wd: usize, c: usize,
+        kh: usize, kw: usize, o: usize, stride: (usize, usize), pad: (usize, usize),
+    ) -> Vec<f32> {
+        let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
+        let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
+        let mut out = vec![0.0f32; n * ho * wo * o];
+        for b in 0..n {
+            for yo in 0..ho {
+                for xo in 0..wo {
+                    for oc in 0..o {
+                        let mut acc = 0.0f32;
+                        for ky in 0..kh {
+                            let yi = (yo * stride.0 + ky) as isize - pad.0 as isize;
+                            if yi < 0 || yi >= h as isize { continue; }
+                            for kx in 0..kw {
+                                let xi = (xo * stride.1 + kx) as isize - pad.1 as isize;
+                                if xi < 0 || xi >= wd as isize { continue; }
+                                for ci in 0..c {
+                                    acc += x[((b * h + yi as usize) * wd + xi as usize) * c + ci]
+                                        * w[((ky * kw + kx) * c + ci) * o + oc];
+                                }
+                            }
+                        }
+                        out[((b * ho + yo) * wo + xo) * o + oc] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The portable conv2d against a CPU oracle: 1x1 identity, 3x3 same-pad, strided, batched,
+    /// asymmetric kernel + rectangular input.
+    #[test]
+    fn conv2d_matches_the_cpu_oracle() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let ctx = std::sync::Arc::new(ctx);
+        let check = |n: usize, h: usize, wd: usize, c: usize, kh: usize, kw: usize, o: usize,
+                     stride: (usize, usize), pad: (usize, usize)| {
+            let x: Vec<f32> = (0..n * h * wd * c).map(|i| 0.1 * (((i + 3) % 11) as f32 - 5.0)).collect();
+            let w: Vec<f32> = (0..kh * kw * c * o).map(|i| 0.1 * (((i + 5) % 7) as f32 - 3.0)).collect();
+            let xt = Tensor::from_vec(&ctx, &x, &[n, h, wd, c]);
+            let wt = Tensor::from_vec(&ctx, &w, &[kh, kw, c, o]);
+            let got = pollster::block_on(xt.conv2d(&wt, stride, pad).to_vec());
+            let want = cpu_conv2d(&x, &w, n, h, wd, c, kh, kw, o, stride, pad);
+            let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(err < 1e-4, "n={n} h={h} w={wd} c={c} k={kh}x{kw} o={o} s={stride:?} p={pad:?}: err {err}");
+        };
+        // 1x1 identity kernel passes channels through
+        {
+            let (h, wd, c) = (5usize, 4usize, 3usize);
+            let x: Vec<f32> = (0..h * wd * c).map(|i| i as f32 * 0.1).collect();
+            let mut eye = vec![0.0f32; c * c];
+            for i in 0..c { eye[i * c + i] = 1.0; }
+            let xt = Tensor::from_vec(&ctx, &x, &[1, h, wd, c]);
+            let wt = Tensor::from_vec(&ctx, &eye, &[1, 1, c, c]);
+            let got = pollster::block_on(xt.conv2d(&wt, (1, 1), (0, 0)).to_vec());
+            assert_eq!(got, x, "1x1 identity conv must pass through");
+        }
+        check(1, 8, 8, 4, 3, 3, 8, (1, 1), (1, 1)); // 3x3 same-pad
+        check(2, 9, 7, 3, 3, 3, 5, (2, 2), (1, 1)); // strided + batch + rectangular
+        check(1, 6, 6, 2, 5, 3, 4, (1, 1), (2, 1)); // asymmetric kernel + pads
+        check(2, 16, 16, 8, 3, 3, 16, (1, 1), (1, 1)); // a real CNN-ish layer
     }
 }
