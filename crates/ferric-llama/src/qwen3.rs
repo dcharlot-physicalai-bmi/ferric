@@ -80,12 +80,12 @@ impl Cfg {
 /// If every part shares a quant format it's byte-fused into one QMatrix (the fast path); real Q4_K_M
 /// models mix formats even within qkv (V is often Q6_K while Q/K are Q4_K), so it falls back to one
 /// matmul per part, concatenated — same result, one extra dispatch.
-enum Proj {
+pub(crate) enum Proj {
     Fused(QMatrix),
     Split(Vec<QMatrix>),
 }
 impl Proj {
-    fn load(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Proj, String> {
+    pub(crate) fn load(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Proj, String> {
         let types: Vec<u32> = names.iter().map(|n| g.tensor(n).map(|t| t.ggml_type).unwrap_or(0)).collect();
         if names.len() > 1 && types.windows(2).all(|w| w[0] == w[1]) {
             Ok(Proj::Fused(qm_cat(ctx, g, names)?))
@@ -95,7 +95,7 @@ impl Proj {
             Ok(Proj::Split(names.iter().map(|n| qm(ctx, g, n)).collect::<Result<_, _>>()?))
         }
     }
-    fn matmul(&self, x: &Tensor) -> Tensor {
+    pub(crate) fn matmul(&self, x: &Tensor) -> Tensor {
         match self {
             Proj::Fused(w) => x.matmul_q(w),
             Proj::Split(ws) => {
@@ -107,7 +107,7 @@ impl Proj {
     }
     /// gate_up projection + SwiGLU. When gate|up is one fused Q4_K/Q5_K/Q6_K weight, one fused kernel
     /// does both (no [t, 2·n_ff] intermediate); otherwise the plain matmul + SwiGLU. Same result either way.
-    fn gate_up_swiglu(&self, x: &Tensor, n_ff: usize) -> Tensor {
+    pub(crate) fn gate_up_swiglu(&self, x: &Tensor, n_ff: usize) -> Tensor {
         // FERRIC_NOFUSE forces the un-fused path — for controlled A/B of the fusion, same binary.
         if std::env::var("FERRIC_NOFUSE").is_err() {
             if let Proj::Fused(w) = self {

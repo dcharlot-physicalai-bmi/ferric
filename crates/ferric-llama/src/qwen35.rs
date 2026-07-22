@@ -25,6 +25,7 @@ use ferric_gguf::{GgufSource, Meta};
 #[allow(unused_imports)] use ferric_gguf::GgufFile;
 use ferric_tensor::dtype::Q2_0Weights;
 use ferric_tensor::QMatrix;
+use crate::qwen3::Proj; // Fused-or-Split projection: real Q4_K_M models mix quants within a fused qkv/gate
 use ferric_tensor::{nn, Tensor};
 use std::sync::Arc;
 
@@ -84,7 +85,7 @@ impl Cfg {
 }
 
 pub struct AttnW {
-    pub wqkv: QMatrix, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
+    pub wqkv: Proj, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
     pub q_out: usize,      // n_head·head_dim·2 (query and gate, interleaved per head)
     pub kv_out: usize,     // n_head_kv·head_dim (each of k and v)
     pub wo: QMatrix,
@@ -95,7 +96,7 @@ pub struct AttnW {
 pub struct GdnW {
     // in_proj = qkv | z | alpha | beta stacked: the four projections all read the same h, so one
     // fused matmul replaces four (48 GDN layers × 4 → 1).
-    pub in_proj: QMatrix,
+    pub in_proj: Proj,
     pub qkv_out: usize, // 2·key_dim + d_inner
     pub z_out: usize,   // d_inner
     pub ba_out: usize,  // n_v_heads (each of alpha, beta)
@@ -129,7 +130,7 @@ impl Cache {
 pub struct Layer {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
-    pub ffn_gate_up: QMatrix, // gate stacked over up: one matmul, then split
+    pub ffn_gate_up: Proj, // gate stacked over up: one matmul, then split
     pub ffn_gate_out: usize,      // where gate ends / up begins in the fused output
     pub ffn_down: QMatrix,
     pub mixer: Mixer,
@@ -230,7 +231,7 @@ impl Qwen35 {
             let b = |s: &str| format!("blk.{il}.{s}");
             let mixer = if cfg.is_recurrent(il) {
                 Mixer::Gdn(GdnW {
-                    in_proj: qm_cat(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
+                    in_proj: Proj::load(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
                     qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
                     z_out: g.tensor(&b("attn_gate.weight")).ok_or("no attn_gate")?.dims[1] as usize,
                     ba_out: g.tensor(&b("ssm_alpha.weight")).ok_or("no ssm_alpha")?.dims[1] as usize,
@@ -242,7 +243,7 @@ impl Qwen35 {
                 })
             } else {
                 Mixer::Attn(AttnW {
-                    wqkv: qm_cat(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                    wqkv: Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
                     q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
                     kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
                     wo: qm(ctx, g, &b("attn_output.weight"))?,
@@ -253,7 +254,7 @@ impl Qwen35 {
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 post_norm: f32t(ctx, g, &b("post_attention_norm.weight"), &[cfg.n_embd])?,
-                ffn_gate_up: qm_cat(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+                ffn_gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
                 ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
                 ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
                 mixer,
@@ -301,7 +302,7 @@ impl Qwen35 {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
         let nkv = self.cfg.n_head_kv;
         // One fused matmul emits [q_and_gate | k | v]; split it back out.
-        let qkv = h.matmul_q(&w.wqkv);
+        let qkv = w.wqkv.matmul(h);
         let qf = qkv.narrow(1, 0, w.q_out).reshape(&[t, nh, hd * 2]);
         let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
         let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[t, nh * hd]);
@@ -338,7 +339,7 @@ impl Qwen35 {
 
         // One fused matmul emits [qkv | z | alpha | beta]; split it back out. qkv feeds the conv,
         // the rest are used as-is.
-        let proj = h.matmul_q(&w.in_proj);
+        let proj = w.in_proj.matmul(h);
         let (qo, zo, bo) = (w.qkv_out, w.z_out, w.ba_out);
         let qkv = proj.narrow(1, 0, qo).contiguous();
         let z = proj.narrow(1, qo, zo);
@@ -385,7 +386,7 @@ impl Qwen35 {
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
         // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-        h.matmul_q(&l.ffn_gate_up).swiglu(l.ffn_gate_out).matmul_q(&l.ffn_down)
+        l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out).matmul_q(&l.ffn_down)
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).

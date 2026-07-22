@@ -24,7 +24,34 @@
 mod mcp;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
-use ferric_llama::qwen3::{Cache, Qwen3};
+use ferric_llama::{qwen3, qwen35};
+use ferric_llama::qwen3::Qwen3;
+use ferric_llama::qwen35::Qwen35;
+use ferric_tensor::Tensor;
+
+/// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
+/// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
+/// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
+enum Model { Dense(Qwen3), Hybrid(Qwen35) }
+enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache) }
+impl Model {
+    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab } }
+    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer } }
+    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd } }
+    fn new_cache(&self) -> ModelCache {
+        match self { Model::Dense(m) => ModelCache::Dense(qwen3::Cache::new(&m.cfg)), Model::Hybrid(m) => ModelCache::Hybrid(qwen35::Cache::new(&m.cfg)) }
+    }
+    fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
+        match (self, cache) {
+            (Model::Dense(m), ModelCache::Dense(c)) => m.forward_cached(tokens, c),
+            (Model::Hybrid(m), ModelCache::Hybrid(c)) => m.forward_cached(tokens, c, m.cfg.n_layer),
+            _ => unreachable!("model/cache kind mismatch"),
+        }
+    }
+    fn forward_hidden(&self, ids: &[u32]) -> Tensor {
+        match self { Model::Dense(m) => m.forward_hidden(ids), Model::Hybrid(_) => panic!("/v1/embeddings is not supported for hybrid (qwen35) models") }
+    }
+}
 use ferric_tokenizer::{Bpe, Spm};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -46,7 +73,7 @@ fn byte_decoder() -> HashMap<char, u8> {
 
 struct Engine {
     ctx: Arc<Context>,
-    model: Qwen3,
+    model: Model,
     bpe: Bpe,
     /// Present for SentencePiece models (`tokenizer.ggml.model == "llama"`: Phi-3 / Mistral / Llama-2 /
     /// Gemma). When set, all text tokenization goes through it instead of the byte-level `bpe`.
@@ -116,7 +143,14 @@ impl Engine {
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
         // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
         for t in ["<end_of_turn>", "<|end|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
-        let model = Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}"));
+        // Dispatch on architecture: the Qwen3.5/3.6 hybrid GGUF declares `general.architecture = qwen35`
+        // (gated delta net + SSM); everything else (qwen2/qwen3/llama/gemma/phi) is the dense path.
+        let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        let model = if arch == "qwen35" {
+            Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}")))
+        } else {
+            Model::Dense(Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}")))
+        };
         let u2b = byte_decoder();
         // Precompute each token's raw bytes (chars → bytes via u2b). A token containing any char not in
         // the byte map is a special token (e.g. <|im_end|>) → None → disallowed under a constraint.
@@ -236,7 +270,7 @@ impl Engine {
     /// state (Qwen3-Embedding's last-token pooling, pooling_type=3), and normalizes. Same model code as
     /// generation — this is just the pre-lm_head hidden state, pooled.
     fn embed(&self, text: &str) -> Vec<f32> {
-        let n = self.model.cfg.n_embd;
+        let n = self.model.n_embd();
         let mut ids = self.enc(text, true);
         // Qwen3-Embedding (add_eos_token) appends EOS and pools ITS hidden state; append it to match.
         if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } }
@@ -273,8 +307,8 @@ impl Engine {
     /// Guided decoding always stays argmax (deterministic structured output). Calls `on_delta` per
     /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
     fn generate(&self, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
-        let mut cache = Cache::new(&self.model.cfg);
-        let n_vocab = self.model.cfg.n_vocab;
+        let mut cache = self.model.new_cache();
+        let n_vocab = self.model.n_vocab();
         let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
         let mut rng: u64 = 0x2545_F491_4F6C_DD1D; // deterministic seed → reproducible sampling
         let mut gen: Vec<u32> = Vec::new();
@@ -419,7 +453,7 @@ fn main() {
     }
     let mcps = std::cell::RefCell::new(mcps);
     eprintln!("ferric-serve: {} ({} layers, vocab {}) on {:?}{} — http://127.0.0.1:{port}/v1",
-        name, eng.model.cfg.n_layer, eng.model.cfg.n_vocab, eng.ctx.backend,
+        name, eng.model.n_layer(), eng.model.n_vocab(), eng.ctx.backend,
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("bind :{port}: {e}"));
     for stream in listener.incoming() {
