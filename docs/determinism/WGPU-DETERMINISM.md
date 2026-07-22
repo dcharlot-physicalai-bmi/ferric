@@ -67,3 +67,31 @@ kernels) are already feature-gated off the bit-identical default path.
   GPUs regardless of compiler flags.
 - Browser fabrics (Dawn/Tint in Chrome) compile WGSL with their own stack;
   parity there must be measured separately, not assumed.
+
+## Browser fabric (Dawn/Tint) — measured 2026-07-22
+
+`ferric-web::ferric_fabric_probe` runs the identical probe in Chrome
+(headless, WebGPU via ANGLE-Metal on the M5 Max). Result: **not
+bit-identical with the strict-IEEE native path** — Tint compiles WGSL with
+fma contraction, and the browser's compiler is not ours to configure.
+
+The diagnostic detail: every browser row reproduces, bit-exactly, a value
+from a specific earlier round of the native experiments — mm/rmsnorm/rope/
+sigmoid equal the pre-NoContraction native values; sqrt and mha equal the
+runtime-zero-barriered rounds under contraction-allowed compilation. Two
+implications, both measured rather than assumed:
+
+1. The browser is *deterministic*, with contraction-allowed semantics.
+2. The runtime-zero `det_bar` barriers pin op-level behavior even under
+   contracting compilers — the barriered kernels landed on identical bits
+   across Tint, fast-math Metal, and fusing NVIDIA.
+
+Path to browser↔native bit-identity, if wanted: a "portable-det" kernel
+profile with runtime-zero barriers on every float op (including inside
+det_exp/det_recip/det_sincos Horner chains) — WGSL-only, so it works on any
+conforming WebGPU implementation, at a to-be-measured throughput cost.
+Until that ships: browser parity is validated by tolerance (CPU reference
+deltas ~1e-7), not by digest. Also note "the browser" is not one fabric:
+Dawn picks ANGLE-Metal / Vulkan / D3D per platform, and contraction choices
+can differ across them (the mha row already shows two contracted compilers
+disagreeing) — cross-browser digests must be measured per platform.

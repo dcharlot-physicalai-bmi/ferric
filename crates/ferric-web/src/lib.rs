@@ -557,3 +557,70 @@ impl FerricModel {
         Ok(emitted)
     }
 }
+
+/// The cross-fabric determinism probe, in the browser. Runs the SAME
+/// deterministic per-kernel measurement as `ferric-core/examples/fabric_probe`
+/// (same integer-PRNG inputs, same FNV-1a over output bit patterns) — but here
+/// the WGSL is compiled by the BROWSER's stack (Dawn/Tint in Chrome), not our
+/// patched naga/wgpu-hal. Whether these hashes match the native
+/// Metal/Vulkan values is a measurement, never an assumption.
+#[wasm_bindgen]
+pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f32::from_bits(0x3F80_0000 | (s >> 41) as u32) - 1.5
+            })
+            .collect()
+    }
+    fn fnv(bits: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in bits {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h
+    }
+    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    const T: usize = 12;
+    const D: usize = 64;
+    const H: u32 = 4;
+    const DH: u32 = 16;
+    let (t, d) = (T as u32, D as u32);
+    let x = det(T * D, 1);
+    let w = det(D * D, 2);
+    let wn: Vec<f32> = det(D, 3).iter().map(|v| v + 1.0).collect();
+    let xt = ctx.tensor(&x, &[T, D]);
+    let wt = ctx.tensor(&w, &[D, D]);
+    let wnt = ctx.tensor(&wn, &[D]);
+    let mut rows = vec![format!("fabric: {:?} ({})", ctx.backend, ctx.adapter_name)];
+    let mm = ctx.mm(&xt, &wt, t, d, d);
+    rows.push(format!("mm        {:016x}", fnv(&ctx.to_vec(&mm).await.map_err(|e| JsValue::from_str(&e))?)));
+    let rms = ctx.rmsnorm_t(&xt, &wnt, t, d, 1e-5);
+    rows.push(format!("rmsnorm   {:016x}", fnv(&ctx.to_vec(&rms).await.map_err(|e| JsValue::from_str(&e))?)));
+    let x_pos: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
+    let xpt = ctx.tensor(&x_pos, &[T, D]);
+    let sq = ctx.sqrt_t(&xpt);
+    rows.push(format!("sqrt      {:016x}", fnv(&ctx.to_vec(&sq).await.map_err(|e| JsValue::from_str(&e))?)));
+    let rope = ctx.rope_t(&mm, t, H, DH, 10000.0);
+    rows.push(format!("rope      {:016x}", fnv(&ctx.to_vec(&rope).await.map_err(|e| JsValue::from_str(&e))?)));
+    let q = ctx.mm(&xt, &wt, t, d, d);
+    let k = ctx.mm(&rms, &wt, t, d, d);
+    let v = ctx.mm(&xt, &wt, t, d, d);
+    let mha = ctx.mha_causal_t(&q, &k, &v, t, H, H, DH);
+    rows.push(format!("mha       {:016x}", fnv(&ctx.to_vec(&mha).await.map_err(|e| JsValue::from_str(&e))?)));
+    let sg = ctx.sigmoid_t(&xt);
+    rows.push(format!("sigmoid   {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| JsValue::from_str(&e))?)));
+    let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
+    let lg = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
+    rows.push(format!("demo-lm   {:016x}", fnv(&lg)));
+    Ok(rows.join("\n"))
+}
+mod efa;

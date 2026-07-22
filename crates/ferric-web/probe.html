@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Ferric fabric probe — browser</title>
+<pre id="out">running…</pre>
+<script type="module">
+import init, { ferric_fabric_probe } from './pkg/ferric_web.js';
+(async () => {
+  try {
+    await init();
+    document.getElementById('out').textContent = await ferric_fabric_probe();
+  } catch (e) {
+    document.getElementById('out').textContent = 'ERROR: ' + e;
+  }
+})();
+</script>
