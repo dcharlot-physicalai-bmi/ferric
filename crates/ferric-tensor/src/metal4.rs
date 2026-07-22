@@ -109,9 +109,9 @@ pub struct Metal4Gemm {
     pso_unpad: Obj<dyn MTLComputePipelineState>,
     event: Obj<dyn MTLSharedEvent>,
     ticket: AtomicU64,
-    cache: Mutex<Option<ShapeCache>>,
-    rcache: Mutex<Option<ResidentCache>>,
-    ccache: Mutex<Option<ConvCache>>,
+    cache: Mutex<Vec<ShapeCache>>,      // MRU-front, capped — alternating shapes must not thrash
+    rcache: Mutex<Vec<ResidentCache>>,  // (a real model's q/k/v projections are 3 different shapes)
+    ccache: Mutex<Vec<ConvCache>>,
     conv_psos: Mutex<std::collections::HashMap<(usize, usize, usize, usize, usize, usize, usize, usize, usize), Obj<dyn MTLComputePipelineState>>>,
     pub adapter_name: String,
 }
@@ -122,6 +122,27 @@ pub struct Metal4Gemm {
 // before releasing the lock — so no cross-thread concurrent use is possible.
 unsafe impl Send for Metal4Gemm {}
 unsafe impl Sync for Metal4Gemm {}
+
+// MRU-front bounded cache lookup: find-or-build, move to front, evict past `cap`. Returns a
+// reference into the vec's front slot (stable for the borrow's lifetime — the caller holds the lock).
+fn lru_entry<'a, T, K: PartialEq + Copy>(
+    v: &'a mut Vec<T>,
+    key: K,
+    cap: usize,
+    build: impl FnOnce(K) -> T,
+    key_of: impl Fn(&T) -> K,
+) -> &'a T {
+    if let Some(pos) = v.iter().position(|e| key_of(e) == key) {
+        if pos != 0 {
+            let e = v.remove(pos);
+            v.insert(0, e);
+        }
+    } else {
+        v.insert(0, build(key));
+        v.truncate(cap);
+    }
+    &v[0]
+}
 
 fn make_extents(vals: &[isize]) -> Retained<MTLTensorExtents> {
     unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), vals.len(), vals.as_ptr()) }
@@ -186,9 +207,9 @@ impl Metal4Gemm {
             pso_unpad,
             event,
             ticket: AtomicU64::new(0),
-            cache: Mutex::new(None),
-            rcache: Mutex::new(None),
-            ccache: Mutex::new(None),
+            cache: Mutex::new(Vec::new()),
+            rcache: Mutex::new(Vec::new()),
+            ccache: Mutex::new(Vec::new()),
             conv_psos: Mutex::new(std::collections::HashMap::new()),
             adapter_name,
         })
@@ -281,10 +302,7 @@ impl Metal4Gemm {
     /// Batched matmul `[batch,m,k] · [k,n] → [batch,m,n]` on the tensor units (fp16 inputs, fp32 out).
     pub fn bmm(&self, a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut guard = self.cache.lock().unwrap();
-        if guard.as_ref().map(|c| c.key) != Some((batch, m, k, n)) {
-            *guard = Some(self.build_cache(batch, m, k, n));
-        }
-        let c = guard.as_ref().unwrap();
+        let c = lru_entry(&mut guard, (batch, m, k, n), 8, |key| self.build_cache(key.0, key.1, key.2, key.3), |e| e.key);
         let mp = m.div_ceil(TILE_M) * TILE_M;
         let np = n.div_ceil(TILE_N) * TILE_N;
 
@@ -521,10 +539,7 @@ impl Metal4Gemm {
         let rb = wgpu_buffer_raw(b)?;
         let rc = wgpu_buffer_raw(out)?;
         let mut guard = self.rcache.lock().unwrap();
-        if guard.as_ref().map(|c| c.key) != Some((batch, m, k, n, bt, act)) {
-            *guard = Some(self.build_rcache(batch, m, k, n, bt, act));
-        }
-        let c = guard.as_ref().unwrap();
+        let c = lru_entry(&mut guard, (batch, m, k, n, bt, act), 16, |key| self.build_rcache(key.0, key.1, key.2, key.3, key.4, key.5), |e| e.key);
         let mp = m.div_ceil(TILE_M) * TILE_M;
         let np = n.div_ceil(TILE_N) * TILE_N;
 
@@ -814,10 +829,17 @@ kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
         let rc = wgpu_buffer_raw(out)?;
         let mut guard = self.ccache.lock().unwrap();
         let key = (n, h, wd, c, kh, kw, o, stride.0, stride.1, pad.0, pad.1);
-        if guard.as_ref().map(|cc| cc.key) != Some(key) {
-            *guard = Some(self.build_conv_cache(n, h, wd, c, kh, kw, o, stride, pad)?);
+        if !guard.iter().any(|e| e.key == key) {
+            let built = self.build_conv_cache(n, h, wd, c, kh, kw, o, stride, pad)?;
+            guard.insert(0, built);
+            guard.truncate(8);
         }
-        let cc = guard.as_ref().unwrap();
+        let pos = guard.iter().position(|e| e.key == key).unwrap();
+        if pos != 0 {
+            let e = guard.remove(pos);
+            guard.insert(0, e);
+        }
+        let cc = &guard[0];
         let d = cc.dims;
 
         unsafe {
