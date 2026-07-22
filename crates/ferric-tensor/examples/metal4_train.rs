@@ -32,7 +32,10 @@ async fn run_size(ctx: &Arc<ferric_core::Context>, b: usize, d: usize) {
     let yt = Tensor::from_vec(ctx, &seq(b * d, 9.0), &[b, d]);
 
     let mut results = Vec::new();
-    for m4 in [false, true] {
+    for mode in [0usize, 1, 2] {
+        // 0 = portable WGSL, 1 = Metal4 immediate, 2 = Metal4 + op-DAG (step deferred in batch())
+        let m4 = mode > 0;
+        let dag = mode == 2;
         if m4 {
             std::env::set_var("FERRIC_METAL4", "1");
         } else {
@@ -61,27 +64,38 @@ async fn run_size(ctx: &Arc<ferric_core::Context>, b: usize, d: usize) {
             loss
         };
         // warm (shader/pipeline/shape caches), then measure
-        let first = pollster::block_on(step(&mut params, &mut adam).value().to_vec())[0];
+        let run_step = |params: &mut Vec<Tensor>, adam: &mut Adam| -> f32 {
+            if dag {
+                let loss = ferric_tensor::batch(&ctx, || step(params, adam));
+                pollster::block_on(loss.value().to_vec())[0]
+            } else {
+                pollster::block_on(step(params, adam).value().to_vec())[0]
+            }
+        };
+        let first = run_step(&mut params, &mut adam);
         let t0 = Instant::now();
         let steps = 15;
         let mut last = first;
         for _ in 0..steps {
-            last = pollster::block_on(step(&mut params, &mut adam).value().to_vec())[0];
+            last = run_step(&mut params, &mut adam);
         }
         let per = t0.elapsed().as_secs_f64() / steps as f64;
-        let label = if m4 { "Metal4 resident" } else { "portable WGSL " };
+        let label = match mode { 0 => "portable WGSL ", 1 => "Metal4 resident", _ => "Metal4 + DAG  " };
         println!("  {label}: {:.2} ms/step   loss {first:.5} → {last:.5}", per * 1e3);
         assert!(last < first * 0.9, "loss must fall ({label}): {first} → {last}");
         results.push((per, last));
     }
     let speedup = results[0].0 / results[1].0;
-    println!("\n  training-step speedup on the tensor units: {speedup:.1}x");
-    assert!(
-        (results[0].1 - results[1].1).abs() < 0.2 * results[0].1.abs().max(1e-3),
-        "both paths must converge to the same neighbourhood: {} vs {}",
-        results[0].1,
-        results[1].1
-    );
+    let speedup_dag = results[0].0 / results[2].0;
+    println!("\n  speedups vs WGSL: tensor units {speedup:.1}x, + op-DAG {speedup_dag:.1}x");
+    for r in &results[1..] {
+        assert!(
+            (results[0].1 - r.1).abs() < 0.2 * results[0].1.abs().max(1e-3),
+            "all paths must converge to the same neighbourhood: {} vs {}",
+            results[0].1,
+            r.1
+        );
+    }
     if 6 * 2 * b * d * d > 20_000_000_000 {
         assert!(speedup > 1.5, "tensor units should clearly win once the GEMMs dominate");
     }

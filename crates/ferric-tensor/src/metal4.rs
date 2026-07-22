@@ -62,8 +62,28 @@ struct ResidentCache {
     _params: Vec<Obj<dyn MTLBuffer>>,  // kernel param blocks (shape-static, written at build)
     _tensors: Vec<Obj<dyn MTLTensor>>, // kept alive for the argtables' resource IDs
     rset: Obj<dyn MTLResidencySet>,
-    alloc: Obj<dyn MTL4CommandAllocator>,
-    cb: Obj<dyn MTL4CommandBuffer>,
+}
+
+/// A deferred resident GEMM — the op-DAG's unit of work. Owns `Arc`s to its wgpu buffers so a
+/// pooled output can't be recycled (and an input can't be dropped) before the op executes.
+pub struct ResOp {
+    pub a: std::sync::Arc<wgpu::Buffer>,
+    pub a_off: usize,
+    pub b: std::sync::Arc<wgpu::Buffer>,
+    pub b_off: usize,
+    pub out: std::sync::Arc<wgpu::Buffer>,
+    pub batch: usize,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub bt: bool,
+    pub act: u32,
+}
+
+impl ResOp {
+    fn key(&self) -> (usize, usize, usize, usize, bool, u32) {
+        (self.batch, self.m, self.k, self.n, self.bt, self.act)
+    }
 }
 
 // Resident conv2d objects — same shape-static doctrine as ResidentCache. The conv PSO itself is
@@ -112,6 +132,9 @@ pub struct Metal4Gemm {
     cache: Mutex<Vec<ShapeCache>>,      // MRU-front, capped — alternating shapes must not thrash
     rcache: Mutex<Vec<ResidentCache>>,  // (a real model's q/k/v projections are 3 different shapes)
     ccache: Mutex<Vec<ConvCache>>,
+    // The ONE allocator/command-buffer pair for resident GEMM runs (single or multi-op). Guarded
+    // by the mutex; every run waits for completion before releasing it, so reuse is race-free.
+    mcb: Mutex<Option<(Obj<dyn MTL4CommandAllocator>, Obj<dyn MTL4CommandBuffer>)>>,
     conv_psos: Mutex<std::collections::HashMap<(usize, usize, usize, usize, usize, usize, usize, usize, usize), Obj<dyn MTLComputePipelineState>>>,
     pub adapter_name: String,
 }
@@ -210,6 +233,7 @@ impl Metal4Gemm {
             cache: Mutex::new(Vec::new()),
             rcache: Mutex::new(Vec::new()),
             ccache: Mutex::new(Vec::new()),
+            mcb: Mutex::new(None),
             conv_psos: Mutex::new(std::collections::HashMap::new()),
             adapter_name,
         })
@@ -458,8 +482,6 @@ impl Metal4Gemm {
         rset.commit();
         rset.requestResidency();
 
-        let alloc = dev.newCommandAllocator().expect("allocator");
-        let cb = dev.newCommandBuffer().expect("command buffer");
         ResidentCache {
             key: (batch, m, k, n, bt, act),
             _scr: [scr_a, scr_b, scr_c],
@@ -470,8 +492,6 @@ impl Metal4Gemm {
             _params: vec![par_a, par_b, par_c],
             _tensors: tensors,
             rset,
-            alloc,
-            cb,
         }
     }
 
@@ -487,17 +507,18 @@ impl Metal4Gemm {
     #[allow(clippy::too_many_arguments)] // a GEMM signature: three operands + offsets + four dims
     pub fn bmm_resident(
         &self,
-        a: &wgpu::Buffer,
+        a: &std::sync::Arc<wgpu::Buffer>,
         a_off: usize,
-        b: &wgpu::Buffer,
+        b: &std::sync::Arc<wgpu::Buffer>,
         b_off: usize,
-        out: &wgpu::Buffer,
+        out: &std::sync::Arc<wgpu::Buffer>,
         batch: usize,
         m: usize,
         k: usize,
         n: usize,
     ) -> Option<()> {
-        self.run_resident(a, a_off, b, b_off, out, batch, m, k, n, false, 0)
+        let op = ResOp { a: a.clone(), a_off, b: b.clone(), b_off, out: out.clone(), batch, m, k, n, bt: false, act: 0 };
+        self.run_resident_many(std::slice::from_ref(&op))
     }
 
     /// **Resident** linear layer `y = act(x·Wᵀ)` with W in the HF `[out_f, in]` layout, consumed
@@ -507,63 +528,114 @@ impl Metal4Gemm {
     #[allow(clippy::too_many_arguments)]
     pub fn linear_resident(
         &self,
-        x: &wgpu::Buffer,
+        x: &std::sync::Arc<wgpu::Buffer>,
         x_off: usize,
-        w: &wgpu::Buffer,
+        w: &std::sync::Arc<wgpu::Buffer>,
         w_off: usize,
-        out: &wgpu::Buffer,
+        out: &std::sync::Arc<wgpu::Buffer>,
         rows: usize,
         inn: usize,
         out_f: usize,
         act: u32,
     ) -> Option<()> {
-        self.run_resident(x, x_off, w, w_off, out, 1, rows, inn, out_f, true, act)
+        let op = ResOp { a: x.clone(), a_off: x_off, b: w.clone(), b_off: w_off, out: out.clone(), batch: 1, m: rows, k: inn, n: out_f, bt: true, act };
+        self.run_resident_many(std::slice::from_ref(&op))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_resident(
-        &self,
-        a: &wgpu::Buffer,
-        a_off: usize,
-        b: &wgpu::Buffer,
-        b_off: usize,
-        out: &wgpu::Buffer,
-        batch: usize,
-        m: usize,
-        k: usize,
-        n: usize,
-        bt: bool,
-        act: u32,
-    ) -> Option<()> {
-        let ra = wgpu_buffer_raw(a)?;
-        let rb = wgpu_buffer_raw(b)?;
-        let rc = wgpu_buffer_raw(out)?;
-        let mut guard = self.rcache.lock().unwrap();
-        let c = lru_entry(&mut guard, (batch, m, k, n, bt, act), 16, |key| self.build_rcache(key.0, key.1, key.2, key.3, key.4, key.5), |e| e.key);
-        let mp = m.div_ceil(TILE_M) * TILE_M;
-        let np = n.div_ceil(TILE_N) * TILE_N;
-
-        unsafe {
-            c.at_cv_a.setAddress_atIndex(ra.gpuAddress() + a_off as u64, 0);
-            c.at_cv_b.setAddress_atIndex(rb.gpuAddress() + b_off as u64, 0);
-            c.at_up.setAddress_atIndex(rc.gpuAddress(), 1);
+    /// Execute a sequence of deferred resident GEMMs — the op-DAG executor. Ops are split into
+    /// runs at shape repeats (same-shape ops share scratch and argument tables, so they cannot
+    /// coexist in one command buffer) and at the cache capacity; each run encodes every op's
+    /// stages into ONE MTL4 command buffer with barriers between ops, then pays a single
+    /// commit + completion wait — instead of a full round-trip per op.
+    pub fn run_resident_many(&self, ops: &[ResOp]) -> Option<()> {
+        let mut i = 0;
+        while i < ops.len() {
+            let mut keys: Vec<(usize, usize, usize, usize, bool, u32)> = Vec::new();
+            let mut j = i;
+            while j < ops.len() && keys.len() < 12 && !keys.contains(&ops[j].key()) {
+                keys.push(ops[j].key());
+                j += 1;
+            }
+            self.run_ops_one_cb(&ops[i..j])?;
+            i = j;
         }
-        // the wgpu buffers change every call → a small per-call residency set alongside the cached one
+        Some(())
+    }
+
+    fn run_ops_one_cb(&self, ops: &[ResOp]) -> Option<()> {
+        // raw handles first (fallible) — also what the per-run residency set needs
+        let raws: Vec<[Obj<dyn MTLBuffer>; 3]> = ops
+            .iter()
+            .map(|op| -> Option<[Obj<dyn MTLBuffer>; 3]> {
+                Some([wgpu_buffer_raw(&op.a)?, wgpu_buffer_raw(&op.b)?, wgpu_buffer_raw(&op.out)?])
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        let mut guard = self.rcache.lock().unwrap();
+        // phase 1: ensure every shape's cache entry exists (mutating; distinct keys ≤ run cap < LRU cap)
+        for op in ops {
+            let k = op.key();
+            let _ = lru_entry(&mut guard, k, 16, |key| self.build_rcache(key.0, key.1, key.2, key.3, key.4, key.5), |e| e.key);
+        }
+        // phase 2: immutable per-op views + per-op address binding
+        let entries: Vec<&ResidentCache> = ops.iter().map(|op| guard.iter().find(|e| e.key == op.key()).unwrap()).collect();
         let prset = self.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).ok()?;
-        for buf in [&ra, &rb, &rc] {
-            prset.addAllocation(ProtocolObject::from_ref(&**buf));
+        for (op, raw) in ops.iter().zip(&raws) {
+            let c = guard.iter().find(|e| e.key == op.key()).unwrap();
+            unsafe {
+                c.at_cv_a.setAddress_atIndex(raw[0].gpuAddress() + op.a_off as u64, 0);
+                c.at_cv_b.setAddress_atIndex(raw[1].gpuAddress() + op.b_off as u64, 0);
+                c.at_up.setAddress_atIndex(raw[2].gpuAddress(), 1);
+            }
+            for b in raw {
+                prset.addAllocation(ProtocolObject::from_ref(&**b));
+            }
         }
         prset.commit();
         prset.requestResidency();
 
-        c.alloc.reset();
-        c.cb.beginCommandBufferWithAllocator(&c.alloc);
-        c.cb.useResidencySet(&c.rset);
-        c.cb.useResidencySet(&prset);
-        let enc = c.cb.computeCommandEncoder()?;
+        let mut mcb = self.mcb.lock().unwrap();
+        if mcb.is_none() {
+            *mcb = Some((self.device.newCommandAllocator()?, self.device.newCommandBuffer()?));
+        }
+        let (alloc, cb) = mcb.as_ref().unwrap();
+        alloc.reset();
+        cb.beginCommandBufferWithAllocator(alloc);
+        for c in &entries {
+            cb.useResidencySet(&c.rset);
+        }
+        cb.useResidencySet(&prset);
+        let enc = cb.computeCommandEncoder()?;
+        for (idx, (op, c)) in ops.iter().zip(&entries).enumerate() {
+            if idx > 0 {
+                // conservative inter-op dependency barrier (op N may read op N-1's output)
+                enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                    MTLStages::Dispatch,
+                    MTLStages::Dispatch,
+                    MTL4VisibilityOptions::Device,
+                );
+            }
+            self.encode_stages(&enc, c, op);
+        }
+        enc.endEncoding();
+        cb.endCommandBuffer();
+
+        let bufs = [NonNull::from(&**cb)];
+        unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
+        self.wait_ticket(ticket);
+        Some(())
+    }
+
+    // One op's three stages (pad-convert both operands, tensor-unit GEMM, unpad-gather), with the
+    // stage barriers, into an open encoder.
+    fn encode_stages(&self, enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>, c: &ResidentCache, op: &ResOp) {
+        let (batch, m, k, n) = (op.batch, op.m, op.k, op.n);
+        let mp = m.div_ceil(TILE_M) * TILE_M;
+        let np = n.div_ceil(TILE_N) * TILE_N;
         let tg256 = MTLSize { width: 256, height: 1, depth: 1 };
         let lin = |count: usize| MTLSize { width: count.div_ceil(256), height: 1, depth: 1 };
-        // stage 1: pad-convert both operands (independent dispatches)
         enc.setComputePipelineState(&self.pso_pad);
         enc.setArgumentTable(Some(&c.at_cv_a));
         enc.dispatchThreadgroups_threadsPerThreadgroup(lin(batch * m * k), tg256);
@@ -574,8 +646,7 @@ impl Metal4Gemm {
             MTLStages::Dispatch,
             MTL4VisibilityOptions::Device,
         );
-        // stage 2: the tensor-unit GEMM (one dispatch per batch element, disjoint C)
-        let mm = if bt { &self.pso_bt } else { &self.pso };
+        let mm = if op.bt { &self.pso_bt } else { &self.pso };
         enc.setComputePipelineState(mm);
         let tew = mm.threadExecutionWidth();
         let grid = MTLSize { width: np / TILE_N, height: mp / TILE_M, depth: 1 };
@@ -589,19 +660,9 @@ impl Metal4Gemm {
             MTLStages::Dispatch,
             MTL4VisibilityOptions::Device,
         );
-        // stage 3: gather the [m,n] regions into the wgpu output
         enc.setComputePipelineState(&self.pso_unpad);
         enc.setArgumentTable(Some(&c.at_up));
         enc.dispatchThreadgroups_threadsPerThreadgroup(lin(batch * m * n), tg256);
-        enc.endEncoding();
-        c.cb.endCommandBuffer();
-
-        let bufs = [NonNull::from(&*c.cb)];
-        unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
-        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
-        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
-        self.wait_ticket(ticket);
-        Some(())
     }
 
     // Runtime-compile (and cache) the per-config conv PSO. The MPP descriptor is fully constexpr,
@@ -1324,6 +1385,78 @@ mod tests {
             }
         }
         assert!(err < 1e-3, "batched-input resident bmm: err {err}");
+    }
+
+    /// The op-DAG end to end: inside ONE `batch()`, a dependency chain (h = x·W1ᵀ then y = h·W2ᵀ —
+    /// a deferred output consumed as a deferred input) and the q/k/v pattern (three different
+    /// shapes) all defer into segments, execute as multi-op command buffers at flush, and match the
+    /// fp16 oracle. Env-gated route, exercised exactly as a model would.
+    #[test]
+    fn deferred_dag_chains_match_the_oracle() {
+        use std::sync::Arc;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            return;
+        }
+        let ctx = Arc::new(ctx);
+        if resident_for(&ctx).is_none() {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        }
+        std::env::set_var("FERRIC_METAL4", "1");
+        let (rows, d, dk) = (128usize, 512usize, 256usize);
+        let xv: Vec<f32> = (0..rows * d).map(|i| 0.02 * (((i + 1) % 13) as f32 - 6.0)).collect();
+        let w1v: Vec<f32> = (0..d * d).map(|i| 0.02 * (((i + 7) % 11) as f32 - 5.0)).collect();
+        let w2v: Vec<f32> = (0..d * d).map(|i| 0.02 * (((i + 3) % 7) as f32 - 3.0)).collect();
+        let wkv: Vec<f32> = (0..dk * d).map(|i| 0.02 * (((i + 5) % 9) as f32 - 4.0)).collect();
+        let x = crate::Tensor::from_vec(&ctx, &xv, &[rows, d]);
+        let w1 = crate::Tensor::from_vec(&ctx, &w1v, &[d, d]);
+        let w2 = crate::Tensor::from_vec(&ctx, &w2v, &[d, d]);
+        let wk = crate::Tensor::from_vec(&ctx, &wkv, &[dk, d]);
+
+        let (y, q, kk, v) = crate::batch(&ctx, || {
+            let h = x.matmul_bt(&w1); // deferred
+            let y = h.matmul_bt(&w2); // deferred, READS a deferred output
+            let q = x.matmul_bt(&w1); // qkv-style same-shape (forces a run split)
+            let kkk = x.matmul_bt(&wk); // different shape in the same segment
+            let v = x.matmul_bt(&wk);
+            (y, q, kkk, v)
+        });
+        std::env::remove_var("FERRIC_METAL4");
+        let (gy, gq, gk, gv) = (
+            pollster::block_on(y.to_vec()),
+            pollster::block_on(q.to_vec()),
+            pollster::block_on(kk.to_vec()),
+            pollster::block_on(v.to_vec()),
+        );
+
+        // fp16 oracle (two-level for y: h is itself fp16-rounded through the device)
+        let qz = |vv: &[f32]| -> Vec<f32> { vv.iter().map(|&t| f16::from_f32(t).to_f32()).collect() };
+        let bt_ref = |xin: &[f32], w: &[f32], r: usize, inn: usize, of: usize| -> Vec<f32> {
+            let (xf, wf) = (qz(xin), qz(w));
+            let mut out = vec![0.0f32; r * of];
+            for i in 0..r {
+                for j in 0..of {
+                    out[i * of + j] = (0..inn).map(|l| xf[i * inn + l] * wf[j * inn + l]).sum();
+                }
+            }
+            out
+        };
+        let href = bt_ref(&xv, &w1v, rows, d, d);
+        let yref = bt_ref(&href, &w2v, rows, d, d);
+        let qref = href.clone();
+        let kref = bt_ref(&xv, &wkv, rows, d, dk);
+        let ck = |got: &[f32], want: &[f32], tol: f32, label: &str| {
+            let e = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(e < tol, "{label}: err {e}");
+        };
+        ck(&gy, &yref, 5e-2, "chained y"); // two fp16 hops accumulate error
+        ck(&gq, &qref, 1e-2, "q");
+        ck(&gk, &kref, 1e-2, "k");
+        ck(&gv, &kref, 1e-2, "v");
     }
 }
 

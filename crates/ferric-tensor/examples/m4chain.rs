@@ -38,5 +38,30 @@ fn main() {
         let _ = x.matmul_bt(&wv);
     }
     device_sync(&ctx);
-    println!("qkv 3-chain:        {:.3} ms/iter", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
+    println!("qkv 3-chain (immediate): {:.3} ms/iter  (3 waits)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
+
+    // the op-DAG: same 3 ops deferred inside batch() → ONE command buffer, ONE wait
+    let _ = ferric_tensor::batch(&ctx, || {
+        let _ = x.matmul_bt(&wq);
+        let _ = x.matmul_bt(&wk);
+        let _ = x.matmul_bt(&wv);
+    });
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        ferric_tensor::batch(&ctx, || {
+            let _ = x.matmul_bt(&wq);
+            let _ = x.matmul_bt(&wk);
+            let _ = x.matmul_bt(&wv);
+        });
+    }
+    device_sync(&ctx);
+    println!("qkv 3-chain (deferred):  {:.3} ms/iter  (1 wait)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
+
+    // correctness of the deferred path vs the immediate path
+    let imm = pollster::block_on(x.matmul_bt(&wq).to_vec());
+    let def = ferric_tensor::batch(&ctx, || x.matmul_bt(&wq));
+    let defv = pollster::block_on(def.to_vec());
+    let err = imm.iter().zip(&defv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(err < 1e-4, "deferred != immediate: {err}");
+    println!("deferred == immediate ✓ (err {err:.1e})");
 }

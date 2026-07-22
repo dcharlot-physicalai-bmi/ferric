@@ -583,35 +583,12 @@ impl Tensor {
         let b = other.broadcast_to(&b_full).contiguous();
         // Metal-4 tensor-unit resident path — opt-in (`FERRIC_METAL4=1`): like FERRIC_COOP, a
         // precision-changing fast path (fp16 inputs by contract) must never silently alter default
-        // results. Everything stays on-GPU — pad+convert, `matmul2d` on the tensor units, and unpad
-        // run as one MTL4 command buffer on wgpu's own MTLDevice; only control crosses the host.
-        // Below ~1e8 flops the ~0.2 ms tensor-unit dispatch loses to the WGSL kernels, so small ops
-        // stay on the portable path.
+        // results. Inside a batch() the op DEFERS into the segment list (multi-op command buffers,
+        // one wait per run); otherwise it executes immediately. See metal4_gemm_route.
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
-        if crate::metal4::resident_ready(&self.ctx, 2 * bn * m * ka * n) {
-            if let Some(g) = crate::metal4::resident_for(&self.ctx) {
-                // Fresh out buffers need one clear_buffer pass: it marks the buffer INITIALIZED in
-                // wgpu's init tracker — without it, wgpu lazily zero-fills the buffer on first wgpu
-                // use, clobbering the external queue's writes. Pooled buffers already had it, so
-                // reuse (the training pattern) skips the ~170 µs clear-submit round trip. Either
-                // submit also flushes staged uploads (poll alone never runs them); the poll then
-                // drains the queue so a/b are fully produced — and any in-flight readers of a
-                // recycled out buffer are finished — before the tensor units touch them.
-                flush_batch(&self.ctx); // an open batch's dispatches must land before the external queue reads
-                let (out, fresh) = crate::metal4::pooled_out(&self.ctx, bn * m * n);
-                if fresh {
-                    let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    enc.clear_buffer(&out, 0, None);
-                    self.ctx.queue.submit([enc.finish()]);
-                } else {
-                    self.ctx.queue.submit([]);
-                }
-                device_sync(&self.ctx);
-                if g.bmm_resident(&a.buf, a.offset * 4, &b.buf, b.offset * 4, &out, bn, m, ka, n).is_some() {
-                    let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
-                    return Tensor::from_arc(&self.ctx, out, &oshape);
-                }
-            }
+        if let Some(out) = metal4_gemm_route(&self.ctx, &a, &b, bn, m, ka, n, false, 0) {
+            let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
+            return Tensor::from_arc(&self.ctx, out, &oshape);
         }
         let out = empty(&self.ctx, bn * m * n);
         // Pick the GEMM kernel by what the autotuner measured fastest for this shape+device (naive vs
@@ -756,22 +733,78 @@ impl KvBuf {
 /// activation fused into the unpad epilogue).
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 fn metal4_linear(ctx: &Arc<Context>, x: &Tensor, w: &Tensor, rows: usize, inn: usize, out_f: usize, act: u32) -> Option<Tensor> {
-    if !crate::metal4::resident_ready(ctx, 2 * rows * inn * out_f) {
+    let out = metal4_gemm_route(ctx, x, w, 1, rows, inn, out_f, true, act)?;
+    Some(Tensor::from_arc(ctx, out, &[rows, out_f]))
+}
+
+/// The shared Metal-4 GEMM router (NN and NT+act families). Applies the opt-in gate; then either
+/// **defers** the op into the open batch's segment list — the fresh-buffer init clear records into
+/// the preceding Wgsl segment, the op joins (or opens) an External segment, and the whole segment
+/// later runs as one MTL4 command buffer with a single wait — or, outside a batch, executes
+/// immediately under the established contract (clear-or-flush submit, poll, dispatch, wait).
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+fn metal4_gemm_route(
+    ctx: &Arc<Context>,
+    a: &Tensor,
+    b: &Tensor,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    bt: bool,
+    act: u32,
+) -> Option<Arc<wgpu::Buffer>> {
+    if !crate::metal4::resident_ready(ctx, 2 * batch * m * k * n) {
         return None;
     }
     let g = crate::metal4::resident_for(ctx)?;
-    flush_batch(ctx); // an open batch's dispatches must land before the external queue reads
-    let (out, fresh) = crate::metal4::pooled_out(ctx, rows * out_f);
-    if fresh {
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        enc.clear_buffer(&out, 0, None);
-        ctx.queue.submit([enc.finish()]);
-    } else {
-        ctx.queue.submit([]);
+    let (out, fresh) = crate::metal4::pooled_out(ctx, batch * m * n);
+    let op = crate::metal4::ResOp {
+        a: a.buf.clone(),
+        a_off: a.offset * 4,
+        b: b.buf.clone(),
+        b_off: b.offset * 4,
+        out: out.clone(),
+        batch,
+        m,
+        k,
+        n,
+        bt,
+        act,
+    };
+    let mut op_slot = Some(op);
+    let deferred = BATCH.with(|bl| {
+        let mut bo = bl.borrow_mut();
+        let Some(segs) = bo.as_mut() else { return false };
+        if fresh {
+            // the init-marking clear must be SUBMITTED before the external queue writes the buffer
+            if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
+                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+            }
+            let Some(Seg::Wgsl(enc, _)) = segs.last_mut() else { unreachable!() };
+            enc.clear_buffer(&out, 0, None);
+        }
+        if !matches!(segs.last_mut(), Some(Seg::External(_))) {
+            segs.push(Seg::External(Vec::new()));
+        }
+        let Some(Seg::External(ops)) = segs.last_mut() else { unreachable!() };
+        ops.push(op_slot.take().unwrap());
+        true
+    });
+    if !deferred {
+        let op = op_slot.take().unwrap();
+        if fresh {
+            let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            enc.clear_buffer(&out, 0, None);
+            ctx.queue.submit([enc.finish()]);
+        } else {
+            ctx.queue.submit([]);
+        }
+        device_sync(ctx);
+        g.run_resident_many(std::slice::from_ref(&op))?;
     }
-    device_sync(ctx);
-    g.linear_resident(&x.buf, x.offset * 4, &w.buf, w.offset * 4, &out, rows, inn, out_f, act)?;
-    Some(Tensor::from_arc(ctx, out, &[rows, out_f]))
+    Some(out)
 }
 
 fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
@@ -847,11 +880,19 @@ thread_local! {
     // With batching those diverge — one submit can carry hundreds of dispatches.
     static DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    // When Some, run() records dispatches into this encoder instead of submitting each one. The
-    // Vec retains every bind group (and through it, the buffers) referenced by a recorded-but-
-    // unsubmitted pass — otherwise an intermediate tensor dropped mid-batch would free a buffer the
-    // encoder still points at, which wgpu rejects at submit as an invalid resource.
-    static BATCH: std::cell::RefCell<Option<(wgpu::CommandEncoder, Vec<wgpu::BindGroup>)>> = const { std::cell::RefCell::new(None) };
+    // When Some, ops record into an ordered SEGMENT LIST instead of executing immediately — the
+    // op-DAG's linearized form. Wgsl segments hold a command encoder plus every bind group a
+    // recorded pass references (dropping one mid-batch would free a buffer the encoder still
+    // points at). External segments hold deferred tensor-unit ops; at flush they run as ONE MTL4
+    // command buffer per run with a single completion wait, instead of a full
+    // submit/poll/dispatch/wait round-trip per op.
+    static BATCH: std::cell::RefCell<Option<Vec<Seg>>> = const { std::cell::RefCell::new(None) };
+}
+
+enum Seg {
+    Wgsl(wgpu::CommandEncoder, Vec<wgpu::BindGroup>),
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    External(Vec<crate::metal4::ResOp>),
 }
 
 /// (dispatches, submits) issued so far on this thread.
@@ -872,10 +913,21 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
     };
-    // If a batch is open, append to it (retaining the bind group) and defer the submit; otherwise
-    // submit this op alone. `bg` comes back out when unbatched so it can be recorded standalone.
+    // If a batch is open, append to its current (or a fresh) Wgsl segment and defer the submit;
+    // otherwise submit this op alone. `bg` comes back out when unbatched.
     let bg = BATCH.with(|b| {
-        if let Some((enc, keep)) = b.borrow_mut().as_mut() { record(enc, &bg); keep.push(bg); None } else { Some(bg) }
+        let mut b = b.borrow_mut();
+        if let Some(segs) = b.as_mut() {
+            if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
+                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+            }
+            let Some(Seg::Wgsl(enc, keep)) = segs.last_mut() else { unreachable!() };
+            record(enc, &bg);
+            keep.push(bg);
+            None
+        } else {
+            Some(bg)
+        }
     });
     if let Some(bg) = bg {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
@@ -894,9 +946,24 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
 /// `queue.submit([])` does NOT include an open batch's recorded-but-unsubmitted dispatches. Ops
 /// recorded after this fall back to per-op submits: correctness over batching.
 pub(crate) fn flush_batch(ctx: &Context) {
-    if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
-        ctx.queue.submit([enc.finish()]);
-        SUBMITS.with(|c| c.set(c.get() + 1));
+    let Some(segs) = BATCH.with(|b| b.borrow_mut().take()) else { return };
+    for seg in segs {
+        match seg {
+            Seg::Wgsl(enc, _keep) => {
+                ctx.queue.submit([enc.finish()]);
+                SUBMITS.with(|c| c.set(c.get() + 1));
+            }
+            #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+            Seg::External(ops) => {
+                // prior wgpu segments — AND pending staged uploads, which only flush on a submit
+                // (the submit-then-poll contract) — must LAND before the external queue reads
+                ctx.queue.submit([]);
+                device_sync(ctx);
+                if let Some(g) = crate::metal4::resident_for(ctx) {
+                    g.run_resident_many(&ops);
+                }
+            }
+        }
     }
 }
 
@@ -904,15 +971,13 @@ pub fn batch<R>(ctx: &Arc<Context>, f: impl FnOnce() -> R) -> R {
     // Re-entrant safe: an inner batch() just joins the outer one.
     let outermost = BATCH.with(|b| {
         if b.borrow().is_some() { false } else {
-            *b.borrow_mut() = Some((ctx.device.create_command_encoder(&Default::default()), Vec::new())); true
+            *b.borrow_mut() = Some(Vec::new());
+            true
         }
     });
     let r = f();
     if outermost {
-        if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
-            ctx.queue.submit([enc.finish()]);
-            SUBMITS.with(|c| c.set(c.get() + 1));
-        }
+        flush_batch(ctx);
     }
     r
 }
