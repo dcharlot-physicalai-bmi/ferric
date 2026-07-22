@@ -12,6 +12,7 @@ use std::collections::HashMap;
 // ---- ggml tensor type codes we handle ----
 const F32: u32 = 0;
 const F16T: u32 = 1;
+const BF16T: u32 = 30; // brain-float16: f32's top 16 bits (seen on qwen35moe's final-layer routers)
 const Q4_0: u32 = 2;
 const Q4_1: u32 = 3; // 4-bit affine: value = nibble·d + m (f16 d, f16 min per 32-block)
 const Q5_0: u32 = 6; // 5-bit symmetric: value = ((nibble | 5th-bit) − 16)·d (f16 d, u32 qh per 32-block)
@@ -164,6 +165,7 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
     Ok(match ty {
         F32 => n * 4,
         F16T => n * 2,
+        BF16T => n * 2,
         Q8_0 => n / 32 * 34,
         Q4_0 => n / 32 * 18,
         Q4_1 => n / 32 * 20,
@@ -186,6 +188,7 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
     Ok(match ty {
         F32 => raw[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
         F16T => raw[..n * 2].chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
+        BF16T => raw[..n * 2].chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
         Q8_0 => deq_q8_0(raw, n),
         Q4_0 => deq_q4_0(raw, n),
         Q4_1 => deq_q4_1(raw, n),

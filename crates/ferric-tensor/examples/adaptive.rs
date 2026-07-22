@@ -44,8 +44,8 @@ async fn run() {
     }
 
     println!("\n=== routing sweep (verify each result vs the CPU oracle) ===");
-    println!("  {:>5}  {:>14}  {:>10}  {:>10}  {:>9}", "N", "routed to", "cpu (ms)", "gpu (ms)", "max err");
-    let sizes = [8usize, 32, 64, 128, 256, 384, 512, 768];
+    println!("  {:>5}  {:>28}  {:>10}  {:>10}  {:>9}", "N", "routed to", "cpu (ms)", "gpu (ms)", "max err");
+    let sizes = [8usize, 32, 64, 128, 256, 384, 512, 768, 1024, 1408];
     let mut worst_err = 0.0f32;
     for &nn in &sizes {
         let (a, b) = (gen(nn * nn, 1), gen(nn * nn, 7));
@@ -66,15 +66,23 @@ async fn run() {
         };
         let cpu_ms = t(cpu);
         let gpu_ms = gpu.map(t).unwrap_or(f64::NAN);
-        println!("  {:>5}  {:>14}  {:>10.3}  {:>10.3}  {:>9.1e}", nn, fabric.devices[dev].name(), cpu_ms, gpu_ms, err);
-        assert!(err < 1e-2, "adaptive result must match the CPU oracle at N={nn}: err {err}");
+        println!("  {:>5}  {:>28}  {:>10.3}  {:>10.3}  {:>9.1e}", nn, fabric.devices[dev].name(), cpu_ms, gpu_ms, err);
+        // fp16-input backends (Metal4 tensor units) are reduced-precision by contract
+        let tol = if fabric.devices[dev].name().contains("Metal4") { 5e-2 } else { 1e-2 };
+        assert!(err < tol, "adaptive result must match the CPU oracle at N={nn}: err {err}");
     }
 
     // the headline invariants: tiny → CPU, huge → GPU (when a GPU is present)
     assert!(matches!(fabric.devices[planner.route(1, 8, 8, 8)], Device::Cpu), "a tiny matmul should route to the CPU");
     if gpu.is_some() {
         let big = planner.route(1, 768, 768, 768);
-        assert!(matches!(fabric.devices[big], Device::Gpu(_)), "a large matmul should route to the GPU");
+        let is_gpu_class = match &fabric.devices[big] {
+            Device::Gpu(_) => true,
+            #[cfg(target_os = "macos")]
+            Device::Metal4(_) => true, // the tensor units ARE the GPU's fastest path
+            _ => false,
+        };
+        assert!(is_gpu_class, "a large matmul should route to GPU-class silicon, got {}", fabric.devices[big].name());
     }
     println!("\n✅ adaptive router: every result matched the CPU oracle (worst {:.1e}); tiny→CPU, large→GPU, chosen by a measured cost model", worst_err);
 }

@@ -32,6 +32,11 @@ pub enum Device {
     /// WebNN). WebGPU cannot target an NPU, so this only exists when a real backend is plugged in —
     /// it never falls back to the GPU/CPU silently.
     Npu(Arc<dyn NpuBackend>),
+    /// Apple's Metal-4 tensor units (MetalPerformancePrimitives matmul2d, fp16→fp32) — the ~TFLOP-class
+    /// GEMM path wgpu cannot reach. Reduced precision (fp16 inputs) by contract; the Planner measures and
+    /// routes to it like any device. macOS only, added when the kernel probe succeeds.
+    #[cfg(target_os = "macos")]
+    Metal4(Arc<crate::metal4::Metal4Gemm>),
 }
 
 /// An NPU execution-provider backend. Implement over CoreML (Apple ANE), DirectML/QNN, OpenVINO, or
@@ -53,6 +58,8 @@ impl Device {
             Device::Remote(addr) => format!("Remote:{addr}"),
             Device::BrowserWorker(_) => "BrowserWorker".into(),
             Device::Npu(b) => format!("NPU:{}", b.name()),
+            #[cfg(target_os = "macos")]
+            Device::Metal4(g) => format!("Metal4-TensorUnits:{} (fp16)", g.adapter_name),
         }
     }
 
@@ -67,6 +74,8 @@ impl Device {
             Device::Remote(addr) => remote_call(addr, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
             Device::BrowserWorker(conn) => browser_call(conn, 0, &[batch as u32, m as u32, k as u32, n as u32], a, b),
             Device::Npu(back) => back.bmm(a, b, batch, m, k, n),
+            #[cfg(target_os = "macos")]
+            Device::Metal4(g) => g.bmm(a, b, batch, m, k, n),
             Device::Cpu => cpu_bmm(a, b, batch, m, k, n), // parallel across all cores
         }
     }
@@ -82,6 +91,8 @@ impl Device {
             Device::Remote(addr) => remote_call(addr, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
             Device::BrowserWorker(conn) => browser_call(conn, 1, &[rows as u32, in_ as u32, out as u32, 0], x, w),
             Device::Npu(back) => back.linear_relu(x, rows, w, in_, out),
+            #[cfg(target_os = "macos")]
+            Device::Metal4(g) => g.bmm(x, w, 1, rows, in_, out).iter().map(|v| v.max(0.0)).collect(),
             Device::Cpu => cpu_bmm(x, w, 1, rows, in_, out).iter().map(|v| v.max(0.0)).collect(),
         }
     }
@@ -143,6 +154,10 @@ pub async fn detect_devices() -> (Vec<Device>, NpuInfo) {
         }
     }
     devices.push(Device::Cpu);
+    #[cfg(target_os = "macos")]
+    if let Some(g) = crate::metal4::Metal4Gemm::new() {
+        devices.push(Device::Metal4(Arc::new(g)));
+    }
     (devices, probe_npu())
 }
 
@@ -252,9 +267,13 @@ impl Planner {
         };
         let time_dev = |d: &Device, prep: &(Vec<f32>, Vec<f32>, usize, usize, usize, usize)| -> f64 {
             let (a, bb, b, m, k, n) = prep;
-            let _ = d.bmm(a, bb, *b, *m, *k, *n); // warm up (compiles the pipeline once)
+            // warm up twice (pipeline compile + allocator/thread-pool spin-up), then min of 5 —
+            // a single noisy sample would mis-calibrate the router's overhead estimate
+            for _ in 0..2 {
+                let _ = d.bmm(a, bb, *b, *m, *k, *n);
+            }
             let mut best = f64::INFINITY;
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let t0 = Instant::now();
                 let _ = d.bmm(a, bb, *b, *m, *k, *n);
                 best = best.min(t0.elapsed().as_secs_f64());

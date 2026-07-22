@@ -21,3 +21,10 @@ pollster = "1.0.1"
 ferric-gguf = { path = "../ferric-gguf" }
 pollster = "1.0.1"
 half = "2"
+
+# Metal 4 tensor-unit GEMM backend (src/metal4.rs) — macOS only, all vendored.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+half = "2"
