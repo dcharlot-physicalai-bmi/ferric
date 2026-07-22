@@ -477,8 +477,22 @@ impl Tensor {
         let moved = self.permute(&perm).contiguous();
         let red: usize = ax.iter().map(|&d| self.shape[d]).product();
         let outer: usize = moved.numel() / red.max(1);
+        // Large reduced axes go through staged grid-stride passes so the work parallelizes —
+        // the plain kernel gives each output ONE thread, catastrophic when outer is small
+        // (a scalar sum over 8M elements = one thread, ~100 ms).
+        let mut src = moved.buf.clone();
+        let mut red = red;
+        while red > 4096 {
+            let nchunk = red.div_ceil(4096);
+            let stage = Arc::new(empty(&self.ctx, outer * nchunk));
+            run(&self.ctx, REDUCE_STAGE_WGSL, "reduce_stage",
+                &[&src, &stage, &u32buf(&self.ctx, &[outer as u32, red as u32, nchunk as u32, op])],
+                groups(outer * nchunk));
+            src = stage;
+            red = nchunk;
+        }
         let out = empty(&self.ctx, outer);
-        run(&self.ctx, REDUCE_WGSL, "reduce", &[&moved.buf, &out, &u32buf(&self.ctx, &[outer as u32, red as u32, op])], groups(outer));
+        run(&self.ctx, REDUCE_WGSL, "reduce", &[&src, &out, &u32buf(&self.ctx, &[outer as u32, red as u32, op])], groups(outer));
         let mut oshape: Vec<usize> = keep.iter().map(|&d| self.shape[d]).collect();
         if keepdim {
             oshape = (0..self.rank()).map(|d| if ax.contains(&d) { 1 } else { self.shape[d] }).collect();
@@ -979,6 +993,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         src = src + idx * info[4u + rank + d];
     }
     out[i] = x[src];
+}
+"#;
+
+// One stage of a large-axis reduction: [outer, red] → [outer, nchunk], thread c of each outer row
+// accumulating the grid-stride slice {c, c+nchunk, c+2·nchunk, …} (coalesced across threads). The
+// driver loops stages until red is small, then the plain kernel finishes. Without this, a scalar
+// sum over N elements ran on ONE thread — 40–170 ms per training step at MLP sizes.
+const REDUCE_STAGE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;   // [outer, red] contiguous
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>; // [outer, nchunk]
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // outer, red, nchunk, op
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; let outer = info[0]; let red = info[1]; let nchunk = info[2]; let op = info[3];
+    if (i >= outer * nchunk) { return; }
+    let o = i / nchunk; let c = i % nchunk;
+    let base = o * red;
+    var acc = x[base + c]; // c < red always (nchunk <= red)
+    if (op == 1u) {
+        for (var j = c + nchunk; j < red; j = j + nchunk) { acc = max(acc, x[base + j]); }
+    } else {
+        for (var j = c + nchunk; j < red; j = j + nchunk) { acc = acc + x[base + j]; }
+    }
+    out[i] = acc;
 }
 "#;
 
@@ -1848,3 +1886,42 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>) {
     coopStoreT(acc, &c[ci], nn);
 }
 "#;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod reduce_tests {
+    use super::*;
+
+    /// Staged large-axis reduction vs exact expectations — the sizes that used to run on one thread.
+    #[test]
+    fn large_axis_reductions_are_exact_and_parallel() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let ctx = std::sync::Arc::new(ctx);
+        // scalar sum over 8M elements (multi-stage: 8M → 2048 → final)
+        let n = 8 * 1024 * 1024;
+        let t = Tensor::from_vec(&ctx, &vec![0.25f32; n], &[n]);
+        let s = pollster::block_on(t.sum(&[0], false).to_vec())[0];
+        assert_eq!(s, 0.25 * n as f32, "8M scalar sum");
+        // max with a planted needle (staged max path)
+        let mut v = vec![-1.0f32; n];
+        v[5_000_017] = 42.5;
+        let t = Tensor::from_vec(&ctx, &v, &[n]);
+        let m = pollster::block_on(t.max(&[0], false).to_vec())[0];
+        assert_eq!(m, 42.5, "8M scalar max");
+        // 2D: reduce a large axis with outer kept — [8, 1<<20] sum over axis 1
+        let (o, r) = (8usize, 1 << 20);
+        let v: Vec<f32> = (0..o * r).map(|i| ((i / r) + 1) as f32 * 1e-3).collect();
+        let t = Tensor::from_vec(&ctx, &v, &[o, r]);
+        let s = pollster::block_on(t.sum(&[1], false).to_vec());
+        for (i, &x) in s.iter().enumerate() {
+            let want = (i + 1) as f32 * 1e-3 * r as f32;
+            assert!((x - want).abs() < want * 1e-4, "row {i}: {x} vs {want}");
+        }
+        // small axes must still hit the single-pass path and stay exact
+        let t = Tensor::from_vec(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        assert_eq!(pollster::block_on(t.sum(&[1], false).to_vec()), vec![6.0, 15.0]);
+        assert_eq!(pollster::block_on(t.max(&[0], false).to_vec()), vec![4.0, 5.0, 6.0]);
+    }
+}
