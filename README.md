@@ -8,11 +8,13 @@
 optimized, heterogeneous, no Python/C++ in the hot path. A model defined once runs the *same code* on
 a datacenter GPU, a laptop, an edge robot, and a browser tab.
 
-> **Status: a complete transformer runs.** The cross-fabric thesis is proven — one Rust kernel runs
-> *bit-identical* on a native GPU and in the browser — and Ferric now assembles that into a full
-> Llama/SmolVLA-style language model: embedding → RoPE grouped-query attention → RMSNorm → SwiGLU,
-> stacked, with a KV cache and autoregressive generation, plus a pure-Rust ONNX importer and a
-> safetensors checkpoint loader. Every step is validated against a reference. See
+> **Status: runs a current-generation flagship, end to end.** The cross-fabric thesis is proven — one
+> Rust kernel runs *bit-identical* on a native GPU and in the browser — and Ferric assembles that into a
+> full language-model runtime: embedding → RoPE grouped-query attention → RMSNorm → SwiGLU, a KV cache
+> and autoregressive generation, the standard quantized-GGUF ecosystem, and the **Qwen3.5/3.6 GDN-hybrid**
+> (gated delta net + periodic full attention). The OpenAI-compatible server runs **Qwen3.6-27B** (a 2026
+> flagship) with **in-runtime constrained decoding** (schema-conformant JSON), plus a pure-Rust ONNX
+> importer and safetensors loader. Every step is validated against a reference. See
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Why
@@ -42,6 +44,8 @@ builds fully offline from vendored source.
 | **Runs a REAL model** — SmolLM2-135M (30-layer Llama, GQA, tied, bf16) end-to-end | logits match numpy `1.4e-6` |
 | **Generates REAL text** — HF tokenizer + greedy decode | *"The capital of France is the capital of the country."* |
 | **Model families** — BitNet/PrismML (ternary), Liquid LFM2 (conv1d), EBM (Langevin), JEPA/V-JEPA2 | all validated |
+| **Runs a CURRENT flagship** — Qwen3.6-27B (2026 GDN-hybrid: 48 gated-delta-net + 16 full-attn, Q4_K_M) on the OpenAI server | coherent (*"…Tokyo … Senso-ji Temple"*) |
+| **Structured output** — in-runtime constrained JSON (schema: required/optional, int `min`/`max`, `maxLength`, typed/bounded arrays, enum), native + browser/WebGPU | schema-conformant on Qwen3.6-27B |
 
 ## Crates
 - [`ferric-core`](crates/ferric-core) — L0/L1: the `wgpu` `Context` + the cross-fabric kernel set + CPU references.

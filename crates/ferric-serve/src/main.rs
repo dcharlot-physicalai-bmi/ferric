@@ -143,10 +143,11 @@ impl Engine {
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
         // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
         for t in ["<end_of_turn>", "<|end|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
-        // Dispatch on architecture: the Qwen3.5/3.6 hybrid GGUF declares `general.architecture = qwen35`
-        // (gated delta net + SSM); everything else (qwen2/qwen3/llama/gemma/phi) is the dense path.
+        // Dispatch on architecture: the Qwen3.5/3.6 hybrid GGUFs declare `general.architecture = qwen35`
+        // (dense FFN) or `qwen35moe` (mixture-of-experts FFN) — both run on the Qwen35 hybrid runtime;
+        // everything else (qwen2/qwen3/llama/gemma/phi) is the dense path.
         let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        let model = if arch == "qwen35" {
+        let model = if arch.starts_with("qwen35") {
             Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}")))
         } else {
             Model::Dense(Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}")))

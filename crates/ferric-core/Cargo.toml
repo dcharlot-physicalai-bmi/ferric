@@ -17,3 +17,10 @@ wgpu = "30.0.0"
 
 [dev-dependencies]
 pollster = "1.0.1"
+
+# Metal 4 tensor-unit GEMM example (examples/metal4_tensor_gemm.rs) — macOS only, all vendored.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+half = "2"

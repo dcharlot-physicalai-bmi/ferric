@@ -48,36 +48,51 @@ pub struct Cfg {
     pub n_v_heads: usize,  // ssm.time_step_rank
     pub head_k_dim: usize, // ssm.state_size
     pub d_inner: usize,    // ssm.inner_size
+    // mixture-of-experts (qwen35moe) — all 0 for the dense `qwen35`
+    pub n_expert: usize,      // routed expert count (0 = dense FFN)
+    pub n_expert_used: usize, // top-k experts per token
+    pub expert_ff: usize,     // each routed expert's intermediate width
+    pub shared_ff: usize,     // always-on shared expert's intermediate width
 }
 
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
+        // Both `qwen35` (dense) and `qwen35moe` (mixture-of-experts) share the hybrid attention/GDN; the
+        // only difference is the FFN. Key prefix follows general.architecture.
+        let p = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => "qwen35".into() };
+        let key = |k: &str| format!("{p}.{k}");
         let u = |k: &str| -> Result<usize, String> {
-            match g.metadata().get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing metadata {k}")) }
+            match g.metadata().get(&key(k)) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing metadata {}", key(k))) }
         };
+        let uo = |k: &str| -> usize { match g.metadata().get(&key(k)) { Some(Meta::U(v)) => *v as usize, _ => 0 } };
         let f = |k: &str| -> Result<f32, String> {
-            match g.metadata().get(k) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing metadata {k}")) }
+            match g.metadata().get(&key(k)) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing metadata {}", key(k))) }
         };
         let n_vocab = match g.metadata().get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("missing tokenizer.ggml.tokens".into()) };
         Ok(Cfg {
-            n_embd: u("qwen35.embedding_length")?,
-            n_layer: u("qwen35.block_count")?,
-            n_head: u("qwen35.attention.head_count")?,
-            n_head_kv: u("qwen35.attention.head_count_kv")?,
-            head_dim: u("qwen35.attention.key_length")?,
-            n_ff: u("qwen35.feed_forward_length")?,
+            n_embd: u("embedding_length")?,
+            n_layer: u("block_count")?,
+            n_head: u("attention.head_count")?,
+            n_head_kv: u("attention.head_count_kv")?,
+            head_dim: u("attention.key_length")?,
+            n_ff: uo("feed_forward_length"), // MoE models have no single dense FFN width
             n_vocab,
-            eps: f("qwen35.attention.layer_norm_rms_epsilon")?,
-            rope_base: f("qwen35.rope.freq_base")?,
-            n_rot: u("qwen35.rope.dimension_count")?,
-            full_attention_interval: u("qwen35.full_attention_interval").unwrap_or(4),
-            conv_kernel: u("qwen35.ssm.conv_kernel")?,
-            n_k_heads: u("qwen35.ssm.group_count")?,
-            n_v_heads: u("qwen35.ssm.time_step_rank")?,
-            head_k_dim: u("qwen35.ssm.state_size")?,
-            d_inner: u("qwen35.ssm.inner_size")?,
+            eps: f("attention.layer_norm_rms_epsilon")?,
+            rope_base: f("rope.freq_base")?,
+            n_rot: u("rope.dimension_count")?,
+            full_attention_interval: g.metadata().get(&key("full_attention_interval")).and_then(|m| if let Meta::U(v) = m { Some(*v as usize) } else { None }).unwrap_or(4),
+            conv_kernel: u("ssm.conv_kernel")?,
+            n_k_heads: u("ssm.group_count")?,
+            n_v_heads: u("ssm.time_step_rank")?,
+            head_k_dim: u("ssm.state_size")?,
+            d_inner: u("ssm.inner_size")?,
+            n_expert: uo("expert_count"),
+            n_expert_used: uo("expert_used_count"),
+            expert_ff: uo("expert_feed_forward_length"),
+            shared_ff: uo("expert_shared_feed_forward_length"),
         })
     }
+    pub fn is_moe(&self) -> bool { self.n_expert > 0 }
     pub fn head_v_dim(&self) -> usize { self.d_inner / self.n_v_heads }
     pub fn key_dim(&self) -> usize { self.head_k_dim * self.n_k_heads }
     /// llama.cpp: layer is recurrent (linear attention) unless it's every `interval`-th one.
@@ -127,12 +142,28 @@ impl Cache {
     pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, layers: (0..cfg.n_layer).map(|_| None).collect() } }
 }
 
+/// One routed/shared expert (a SwiGLU FFN): `down(silu(gate(x)) * up(x))`.
+pub struct Expert { pub gate: QMatrix, pub up: QMatrix, pub down: QMatrix }
+
+/// Mixture-of-experts FFN (qwen35moe): a softmax router picks the top-k of `experts`, each a SwiGLU FFN,
+/// summed by router weight; plus an always-on `shared` expert scaled by a sigmoid gate (`sh_gate`).
+pub struct MoeFfn {
+    pub router: Tensor,        // [n_expert, n_embd] f32 — routed-expert gate
+    pub experts: Vec<Expert>,  // n_expert routed experts (each [n_embd→expert_ff→n_embd])
+    pub shared: Expert,        // always-on shared expert
+    pub sh_gate: Tensor,       // [n_embd] f32 — sigmoid(x·sh_gate) scales the shared expert
+    pub n_used: usize,         // top-k
+}
+
+pub enum Ffn {
+    Dense { gate_up: Proj, gate_out: usize, down: QMatrix }, // gate|up fused, then down
+    Moe(MoeFfn),
+}
+
 pub struct Layer {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
-    pub ffn_gate_up: Proj, // gate stacked over up: one matmul, then split
-    pub ffn_gate_out: usize,      // where gate ends / up begins in the fused output
-    pub ffn_down: QMatrix,
+    pub ffn: Ffn,
     pub mixer: Mixer,
 }
 
@@ -221,6 +252,48 @@ pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) ->
     }
 }
 
+/// Load a layer's FFN — a dense SwiGLU (qwen35), or a mixture-of-experts (qwen35moe): softmax router +
+/// `n_expert` routed SwiGLU experts + an always-on sigmoid-gated shared expert. The stacked 3D `*_exps`
+/// tensors slice cleanly per expert (each expert is whole rows, so quant-block boundaries are respected).
+fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Result<Ffn, String> {
+    let b = |s: &str| format!("blk.{il}.{s}");
+    if !cfg.is_moe() {
+        return Ok(Ffn::Dense {
+            gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+            gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
+            down: qm(ctx, g, &b("ffn_down.weight"))?,
+        });
+    }
+    let (ne, eff, d) = (cfg.n_expert, cfg.expert_ff, cfg.n_embd);
+    // Slice a stacked [inn, out, n_expert] tensor into one QMatrix per expert (expert = slowest dim →
+    // each expert's [out, inn] plane is a contiguous byte range of len total/n_expert).
+    let experts_of = |name: &str, out: usize, inn: usize| -> Result<Vec<QMatrix>, String> {
+        let ty = g.tensor(name).ok_or_else(|| format!("no {name}"))?.ggml_type;
+        let full = g.raw(name)?;
+        let per = full.len() / ne;
+        (0..ne).map(|e| {
+            let s = &full[e * per..(e + 1) * per];
+            if QMatrix::block_bytes(ty).is_some() { QMatrix::from_bytes(ctx, s, ty, out, inn) }
+            else { Ok(QMatrix::from_dense(ctx, &ferric_gguf::deq_raw(s, out * inn, ty)?, out, inn)) }
+        }).collect()
+    };
+    let gate = experts_of(&b("ffn_gate_exps.weight"), eff, d)?;
+    let up = experts_of(&b("ffn_up_exps.weight"), eff, d)?;
+    let down = experts_of(&b("ffn_down_exps.weight"), d, eff)?;
+    let experts = gate.into_iter().zip(up).zip(down).map(|((gate, up), down)| Expert { gate, up, down }).collect();
+    Ok(Ffn::Moe(MoeFfn {
+        router: f32t(ctx, g, &b("ffn_gate_inp.weight"), &[ne, d])?,
+        experts,
+        shared: Expert {
+            gate: qm(ctx, g, &b("ffn_gate_shexp.weight"))?,
+            up: qm(ctx, g, &b("ffn_up_shexp.weight"))?,
+            down: qm(ctx, g, &b("ffn_down_shexp.weight"))?,
+        },
+        sh_gate: f32t(ctx, g, &b("ffn_gate_inp_shexp.weight"), &[d])?,
+        n_used: cfg.n_expert_used,
+    }))
+}
+
 impl Qwen35 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
         let cfg = Cfg::from_gguf(g)?;
@@ -229,7 +302,10 @@ impl Qwen35 {
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
-            let mixer = if cfg.is_recurrent(il) {
+            // Feature-detect the mixer from tensor presence, not the interval formula: qwen35moe makes
+            // the FINAL layer full-attention regardless of `full_attention_interval` (41 layers ⇒ blk.40
+            // is ATTN even though (40+1)%4≠0), and presence is always ground truth.
+            let mixer = if g.tensor(&b("ssm_out.weight")).is_some() {
                 Mixer::Gdn(GdnW {
                     in_proj: Proj::load(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
                     qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
@@ -254,9 +330,7 @@ impl Qwen35 {
             layers.push(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 post_norm: f32t(ctx, g, &b("post_attention_norm.weight"), &[cfg.n_embd])?,
-                ffn_gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
-                ffn_gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
-                ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
+                ffn: load_ffn(ctx, g, il, &cfg)?,
                 mixer,
             });
         }
@@ -385,8 +459,53 @@ impl Qwen35 {
     }
 
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
-        // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-        l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out).matmul_q(&l.ffn_down)
+        match &l.ffn {
+            // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
+            Ffn::Dense { gate_up, gate_out, down } => gate_up.gate_up_swiglu(h, *gate_out).matmul_q(down),
+            Ffn::Moe(m) => self.moe_ffn(h, m),
+        }
+    }
+
+    /// One SwiGLU expert: `down(silu(gate(x)) · up(x))`.
+    fn expert(&self, h: &Tensor, e: &Expert) -> Tensor {
+        h.matmul_q(&e.gate).silu().mul(&h.matmul_q(&e.up)).matmul_q(&e.down)
+    }
+
+    /// Mixture-of-experts FFN, token by token (each token routes independently): softmax the router
+    /// logits over all experts, take the top-k, renormalize their weights (Qwen's norm_topk_prob),
+    /// run only those k experts, and add the always-on shared expert scaled by `sigmoid(x·sh_gate)`.
+    /// Tensors are eager, so reading the tiny router row back mid-forward is just a buffer readback.
+    fn moe_ffn(&self, h: &Tensor, m: &MoeFfn) -> Tensor {
+        let (t, d) = (h.shape[0], self.cfg.n_embd);
+        let mut rows: Vec<Tensor> = Vec::with_capacity(t);
+        for ti in 0..t {
+            let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]
+            let lg = pollster::block_on(m.router.matmul(&h_t.reshape(&[d, 1])).to_vec()); // [n_expert]
+            // softmax over ALL experts → top-k → renormalize the selected weights to sum 1
+            let maxl = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs: Vec<f32> = lg.iter().map(|x| (x - maxl).exp()).collect();
+            let s: f32 = probs.iter().sum();
+            for p in &mut probs { *p /= s; }
+            let mut idx: Vec<usize> = (0..probs.len()).collect();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            let sel = &idx[..m.n_used.min(idx.len())];
+            let wsum: f32 = sel.iter().map(|&e| probs[e]).sum();
+            let mut acc: Option<Tensor> = None;
+            for &e in sel {
+                let w = probs[e] / wsum;
+                let y = self.expert(&h_t, &m.experts[e]).mul(&Tensor::from_vec(&self.ctx, &vec![w; d], &[1, d]));
+                acc = Some(match acc { Some(a) => a.add(&y), None => y });
+            }
+            // shared expert, scaled by a scalar sigmoid gate on the hidden state
+            let sgl = pollster::block_on(m.sh_gate.reshape(&[1, d]).matmul(&h_t.reshape(&[d, 1])).to_vec())[0];
+            let gate = 1.0 / (1.0 + (-sgl).exp());
+            let sh = self.expert(&h_t, &m.shared).mul(&Tensor::from_vec(&self.ctx, &vec![gate; d], &[1, d]));
+            rows.push(match acc { Some(a) => a.add(&sh), None => sh });
+        }
+        let mut it = rows.into_iter();
+        let mut o = it.next().expect("moe_ffn: empty input");
+        for r in it { o = o.cat(&r, 0); }
+        o
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).
