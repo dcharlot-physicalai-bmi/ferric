@@ -181,5 +181,40 @@ fn main() {
         }
     }
 
+    // conv layers — CNN-class shapes on the conv tensor units (dequantless: f32 in, fp16 contract)
+    println!("\n=== conv2d (NHWC, 3x3, same-pad — CNN backbone shapes) ===");
+    println!("  {:>26}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+    for &(n, hw, c, o) in &[(1usize, 64usize, 64usize, 128usize), (8, 32, 128, 128)] {
+        let x = Tensor::from_vec(&ctx, &gen(n * hw * hw * c, 1), &[n, hw, hw, c]);
+        let w = Tensor::from_vec(&ctx, &gen(3 * 3 * c * o, 7), &[3, 3, c, o]);
+        let flops = 2.0 * (n * hw * hw * o * 3 * 3 * c) as f64;
+        std::env::remove_var("FERRIC_METAL4");
+        let time_conv = |reps: usize| {
+            let _ = pollster::block_on(x.conv2d(&w, (1, 1), (1, 1)).to_vec());
+            let t0 = Instant::now();
+            let mut last = None;
+            for _ in 0..reps {
+                last = Some(x.conv2d(&w, (1, 1), (1, 1)));
+            }
+            let res = pollster::block_on(last.unwrap().to_vec());
+            (t0.elapsed().as_secs_f64() / reps as f64, res)
+        };
+        let (t_wgsl, r_wgsl) = time_conv(3);
+        std::env::set_var("FERRIC_METAL4", "1");
+        let (t_m4, r_m4) = time_conv(3);
+        let scale = r_wgsl.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let err = max_abs_diff(&r_m4, &r_wgsl);
+        assert!(err < (1e-2 * scale).max(1e-3), "resident conv off at {n}x{hw}x{c}->{o}: err {err} (scale {scale})");
+        println!(
+            "  {:>26}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
+            format!("[{n},{hw},{hw},{c}]→{o}"),
+            t_wgsl * 1e3,
+            flops / t_wgsl / 1e9,
+            t_m4 * 1e3,
+            flops / t_m4 / 1e9,
+            t_wgsl / t_m4
+        );
+    }
+
     println!("\n✅ resident tensor-unit path: correct vs the fp16 oracle, faster than WGSL, zero host copies");
 }

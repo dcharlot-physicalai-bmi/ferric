@@ -470,6 +470,25 @@ impl Tensor {
         assert!(h + 2 * pad.0 >= kh && wd + 2 * pad.1 >= kw, "kernel larger than padded input");
         let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
         let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
+        // Metal-4 conv tensor-unit resident path — same opt-in + precision doctrine as matmul
+        // (FERRIC_METAL4, fp16 inputs by contract, ~1e8-flop floor).
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if crate::metal4::resident_ready(&self.ctx, 2 * n * ho * wo * o * kh * kw * c) {
+            if let Some(g) = crate::metal4::resident_for(&self.ctx) {
+                let (out, fresh) = crate::metal4::pooled_out(&self.ctx, n * ho * wo * o);
+                if fresh {
+                    let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    enc.clear_buffer(&out, 0, None);
+                    self.ctx.queue.submit([enc.finish()]);
+                } else {
+                    self.ctx.queue.submit([]);
+                }
+                device_sync(&self.ctx);
+                if g.conv2d_resident(&x.buf, x.offset * 4, &wc.buf, wc.offset * 4, &out, n, h, wd, c, kh, kw, o, stride, pad).is_some() {
+                    return Tensor::from_arc(&self.ctx, out, &[n, ho, wo, o]);
+                }
+            }
+        }
         let out = empty(&self.ctx, n * ho * wo * o);
         let (grid, rs) = groups2d(n * ho * wo * o);
         run(&self.ctx, CONV2D_WGSL, "conv2d",

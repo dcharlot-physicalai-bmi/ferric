@@ -66,6 +66,37 @@ struct ResidentCache {
     cb: Obj<dyn MTL4CommandBuffer>,
 }
 
+// Resident conv2d objects — same shape-static doctrine as ResidentCache. The conv PSO itself is
+// per-config (the MPP descriptor is fully constexpr), runtime-compiled and cached in `conv_psos`.
+struct ConvCache {
+    key: (usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize), // n,h,w,c,kh,kw,o,sh,sw,ph,pw
+    at_cv_a: Obj<dyn MTL4ArgumentTable>, // padConvertNHWC: wgpu x → scr_a
+    at_cv_w: Obj<dyn MTL4ArgumentTable>, // padConvert (identity): wgpu w → scr_w
+    at_up: Obj<dyn MTL4ArgumentTable>,   // unpad: scr_c → wgpu out
+    at_conv: Obj<dyn MTL4ArgumentTable>, // the three tensor views
+    pso_conv: Obj<dyn MTLComputePipelineState>,
+    dims: ConvDims,
+    _scr: [Obj<dyn MTLBuffer>; 3],
+    _params: Vec<Obj<dyn MTLBuffer>>,
+    _tensors: Vec<Obj<dyn MTLTensor>>,
+    rset: Obj<dyn MTLResidencySet>,
+    alloc: Obj<dyn MTL4CommandAllocator>,
+    cb: Obj<dyn MTL4CommandBuffer>,
+}
+
+#[derive(Clone, Copy)]
+struct ConvDims {
+    ho: usize,
+    wo: usize,
+    tiles_x: usize,
+    tiles_y: usize,
+    n_a: usize, // activation element count (pad-convert dispatch)
+    n_w: usize, // weight element count
+    n_o: usize, // output element count (unpad dispatch)
+}
+
+const CONV_TILE: usize = 16;
+
 /// The Metal-4 tensor-unit GEMM device. Create with [`Metal4Gemm::new`]; `None` when the platform has no
 /// Metal-4 tensor support (kernel load or pipeline creation fails), so detection stays honest.
 pub struct Metal4Gemm {
@@ -74,11 +105,14 @@ pub struct Metal4Gemm {
     pso: Obj<dyn MTLComputePipelineState>,
     pso_bt: Obj<dyn MTLComputePipelineState>,
     pso_pad: Obj<dyn MTLComputePipelineState>,
+    pso_padnhwc: Obj<dyn MTLComputePipelineState>,
     pso_unpad: Obj<dyn MTLComputePipelineState>,
     event: Obj<dyn MTLSharedEvent>,
     ticket: AtomicU64,
     cache: Mutex<Option<ShapeCache>>,
     rcache: Mutex<Option<ResidentCache>>,
+    ccache: Mutex<Option<ConvCache>>,
+    conv_psos: Mutex<std::collections::HashMap<(usize, usize, usize, usize, usize, usize, usize, usize, usize), Obj<dyn MTLComputePipelineState>>>,
     pub adapter_name: String,
 }
 
@@ -133,11 +167,12 @@ impl Metal4Gemm {
         std::fs::write(&path, METALLIB).ok()?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
         let lib = device.newLibraryWithURL_error(&url).ok()?;
-        let mut psos = ["matMul", "matMulBT", "padConvert", "unpad"].into_iter().map(|name| {
+        let mut psos = ["matMul", "matMulBT", "padConvert", "padConvertNHWC", "unpad"].into_iter().map(|name| {
             let func = lib.newFunctionWithName(&NSString::from_str(name))?;
             device.newComputePipelineStateWithFunction_error(&func).ok()
         });
-        let (pso, pso_bt, pso_pad, pso_unpad) = (psos.next()??, psos.next()??, psos.next()??, psos.next()??);
+        let (pso, pso_bt, pso_pad, pso_padnhwc, pso_unpad) =
+            (psos.next()??, psos.next()??, psos.next()??, psos.next()??, psos.next()??);
         let queue = device.newMTL4CommandQueue()?;
         let event = device.newSharedEvent()?;
         let adapter_name = device.name().to_string();
@@ -147,11 +182,14 @@ impl Metal4Gemm {
             pso,
             pso_bt,
             pso_pad,
+            pso_padnhwc,
             pso_unpad,
             event,
             ticket: AtomicU64::new(0),
             cache: Mutex::new(None),
             rcache: Mutex::new(None),
+            ccache: Mutex::new(None),
+            conv_psos: Mutex::new(std::collections::HashMap::new()),
             adapter_name,
         })
     }
@@ -550,6 +588,293 @@ impl Metal4Gemm {
         self.wait_ticket(ticket);
         Some(())
     }
+
+    // Runtime-compile (and cache) the per-config conv PSO. The MPP descriptor is fully constexpr,
+    // so every (dims, kernel, stride) combination is its own pipeline; the contract baked here is
+    // the one the conv_probe tests pin: VALID windows via set_offsets(k/2 + tile·stride), per-tile
+    // dest slices, grid over ceil(dest/16) tiles.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_pso(
+        &self,
+        n: usize,
+        hp: usize,
+        wp: usize,
+        c: usize,
+        kh: usize,
+        kw: usize,
+        o: usize,
+        sh: usize,
+        sw: usize,
+    ) -> Option<Obj<dyn MTLComputePipelineState>> {
+        let key = (n, hp, wp, c, kh, kw, o, sh, sw);
+        if let Some(p) = self.conv_psos.lock().unwrap().get(&key) {
+            return Some(p.clone());
+        }
+        let t = CONV_TILE;
+        let (cx, cy) = (kw / 2, kh / 2);
+        let (a_bind, a_use, c_z) = if n == 1 {
+            ("", "A", "0")
+        } else {
+            ("auto tA = A.slice(0, 0, 0, int(tgid.z));", "tA", "int(tgid.z)")
+        };
+        let src = format!(
+            r#"
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
+                 tensor<device half,  dextents<int32_t, 4>> W,
+                 tensor<device float, dextents<int32_t, 4>> C,
+                 uint3 tgid [[threadgroup_position_in_grid]])
+{{
+    // batch rides the grid's z (descriptor N = 1, per-batch slices) so batches parallelize
+    // across threadgroups instead of serializing inside each tile; the n = 1 build keeps the
+    // unsliced activation (slicing A measurably defeats an internal fast path)
+    constexpr auto desc = convolution2d_descriptor(
+        int4({o}, {t}, {t}, 1), int4({c}, {wp}, {hp}, 1), int2({kw}, {kh}),
+        convolution2d_activation_layout::nhwc, convolution2d_weights_layout::hwio,
+        int2({sw}, {sh}), int2(1, 1), 1, false, convolution2d_descriptor::mode::multiply);
+    convolution2d<desc, execution_simdgroups<4>> op;
+    op.set_offsets(int2({cx} + int(tgid.x) * {t} * {sw}, {cy} + int(tgid.y) * {t} * {sh}));
+    {a_bind}
+    auto tC = C.slice(0, int(tgid.x) * {t}, int(tgid.y) * {t}, {c_z});
+    op.run({a_use}, W, tC);
+}}
+"#
+        );
+        let opts = MTLCompileOptions::new();
+        unsafe { opts.setLanguageVersion(MTLLanguageVersion::Version4_0) };
+        let lib = self.device.newLibraryWithSource_options_error(&NSString::from_str(&src), Some(&opts)).ok()?;
+        let func = lib.newFunctionWithName(&NSString::from_str("conv"))?;
+        let pso = self.device.newComputePipelineStateWithFunction_error(&func).ok()?;
+        self.conv_psos.lock().unwrap().insert(key, pso.clone());
+        Some(pso)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_conv_cache(
+        &self,
+        n: usize,
+        h: usize,
+        w: usize,
+        c: usize,
+        kh: usize,
+        kw: usize,
+        o: usize,
+        stride: (usize, usize),
+        pad: (usize, usize),
+    ) -> Option<ConvCache> {
+        let (sh, sw) = stride;
+        let (ph, pw) = pad;
+        let (hp, wp) = (h + 2 * ph, w + 2 * pw);
+        let ho = (hp - kh) / sh + 1;
+        let wo = (wp - kw) / sw + 1;
+        let (ho_p, wo_p) = (ho.div_ceil(CONV_TILE) * CONV_TILE, wo.div_ceil(CONV_TILE) * CONV_TILE);
+        let pso_conv = self.conv_pso(n, hp, wp, c, kh, kw, o, sh, sw)?;
+        let dev = &self.device;
+
+        let scr_a = dev.newBufferWithLength_options(n * hp * wp * c * 2, MTLResourceOptions::StorageModeShared).expect("A scratch");
+        let scr_w = dev.newBufferWithLength_options(kh * kw * c * o * 2, MTLResourceOptions::StorageModeShared).expect("W scratch");
+        let scr_c = dev.newBufferWithLength_options(n * ho_p * wo_p * o * 4, MTLResourceOptions::StorageModeShared).expect("C scratch");
+        unsafe {
+            std::ptr::write_bytes(scr_a.contents().as_ptr() as *mut u8, 0, n * hp * wp * c * 2);
+            std::ptr::write_bytes(scr_c.contents().as_ptr() as *mut u8, 0, n * ho_p * wo_p * o * 4);
+        }
+
+        let mk_params = |vals: &[u32]| {
+            let b = dev.newBufferWithLength_options(vals.len() * 4, MTLResourceOptions::StorageModeShared).expect("param buf");
+            unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), b.contents().as_ptr() as *mut u32, vals.len()) };
+            b
+        };
+        let par_a = mk_params(&[(n * h * w * c) as u32, h as u32, w as u32, c as u32, hp as u32, wp as u32, ph as u32, pw as u32]);
+        let par_w = mk_params(&[(kh * kw * c * o) as u32, (kh * kw * c * o) as u32, (kh * kw * c * o) as u32]);
+        let par_c = mk_params(&[(n * ho * wo * o) as u32, (wo * o) as u32, (wo_p * o) as u32, ho as u32, ho_p as u32, 0]);
+
+        let mk_at = || {
+            let atd = MTL4ArgumentTableDescriptor::new();
+            atd.setMaxBufferBindCount(3);
+            self.device.newArgumentTableWithDescriptor_error(&atd).expect("arg table")
+        };
+        let (at_cv_a, at_cv_w, at_up, at_conv) = (mk_at(), mk_at(), mk_at(), mk_at());
+        unsafe {
+            at_cv_a.setAddress_atIndex(scr_a.gpuAddress(), 1);
+            at_cv_a.setAddress_atIndex(par_a.gpuAddress(), 2);
+            at_cv_w.setAddress_atIndex(scr_w.gpuAddress(), 1);
+            at_cv_w.setAddress_atIndex(par_w.gpuAddress(), 2);
+            at_up.setAddress_atIndex(scr_c.gpuAddress(), 0);
+            at_up.setAddress_atIndex(par_c.gpuAddress(), 2);
+        }
+
+        // tensor views over the scratch (extents innermost-first)
+        let (ci, oi) = (c as isize, o as isize);
+        let t_a = unsafe {
+            scr_a.newTensorWithDescriptor_offset_error(
+                &tensor_desc(
+                    MTLTensorDataType::Float16,
+                    &[ci, wp as isize, hp as isize, n as isize],
+                    &[1, ci, ci * wp as isize, ci * (wp * hp) as isize],
+                    MTLStorageMode::Shared,
+                ),
+                0,
+            )
+        }
+        .expect("A tensor");
+        let t_w = unsafe {
+            scr_w.newTensorWithDescriptor_offset_error(
+                &tensor_desc(
+                    MTLTensorDataType::Float16,
+                    &[oi, ci, kw as isize, kh as isize],
+                    &[1, oi, oi * ci, oi * ci * kw as isize],
+                    MTLStorageMode::Shared,
+                ),
+                0,
+            )
+        }
+        .expect("W tensor");
+        let t_c = unsafe {
+            scr_c.newTensorWithDescriptor_offset_error(
+                &tensor_desc(
+                    MTLTensorDataType::Float32,
+                    &[oi, wo_p as isize, ho_p as isize, n as isize],
+                    &[1, oi, oi * wo_p as isize, oi * (wo_p * ho_p) as isize],
+                    MTLStorageMode::Shared,
+                ),
+                0,
+            )
+        }
+        .expect("C tensor");
+        unsafe {
+            at_conv.setResource_atBufferIndex(t_a.gpuResourceID(), 0);
+            at_conv.setResource_atBufferIndex(t_w.gpuResourceID(), 1);
+            at_conv.setResource_atBufferIndex(t_c.gpuResourceID(), 2);
+        }
+
+        let rset = dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).expect("residency set");
+        for b in [&scr_a, &scr_w, &scr_c, &par_a, &par_w, &par_c] {
+            rset.addAllocation(ProtocolObject::from_ref(&**b));
+        }
+        for t in [&t_a, &t_w, &t_c] {
+            rset.addAllocation(ProtocolObject::from_ref(&**t));
+        }
+        rset.commit();
+        rset.requestResidency();
+
+        let alloc = dev.newCommandAllocator().expect("allocator");
+        let cb = dev.newCommandBuffer().expect("command buffer");
+        Some(ConvCache {
+            key: (n, h, w, c, kh, kw, o, sh, sw, ph, pw),
+            at_cv_a,
+            at_cv_w,
+            at_up,
+            at_conv,
+            pso_conv,
+            dims: ConvDims {
+                ho,
+                wo,
+                tiles_x: wo_p / CONV_TILE,
+                tiles_y: ho_p / CONV_TILE,
+                n_a: n * h * w * c,
+                n_w: kh * kw * c * o,
+                n_o: n * ho * wo * o,
+            },
+            _scr: [scr_a, scr_w, scr_c],
+            _params: vec![par_a, par_w, par_c],
+            _tensors: vec![t_a, t_w, t_c],
+            rset,
+            alloc,
+            cb,
+        })
+    }
+
+    /// **Resident conv2d**: NHWC f32 wgpu activations × HWIO f32 wgpu weights → NHWO f32 wgpu
+    /// output, on the conv tensor units — pad+f16-convert, tiled `convolution2d`, unpad, all one
+    /// MTL4 command buffer, zero host copies. Same sync contract as [`Self::bmm_resident`];
+    /// fp16-input by contract like the whole device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_resident(
+        &self,
+        x: &wgpu::Buffer,
+        x_off: usize,
+        w: &wgpu::Buffer,
+        w_off: usize,
+        out: &wgpu::Buffer,
+        n: usize,
+        h: usize,
+        wd: usize,
+        c: usize,
+        kh: usize,
+        kw: usize,
+        o: usize,
+        stride: (usize, usize),
+        pad: (usize, usize),
+    ) -> Option<()> {
+        let rx = wgpu_buffer_raw(x)?;
+        let rw = wgpu_buffer_raw(w)?;
+        let rc = wgpu_buffer_raw(out)?;
+        let mut guard = self.ccache.lock().unwrap();
+        let key = (n, h, wd, c, kh, kw, o, stride.0, stride.1, pad.0, pad.1);
+        if guard.as_ref().map(|cc| cc.key) != Some(key) {
+            *guard = Some(self.build_conv_cache(n, h, wd, c, kh, kw, o, stride, pad)?);
+        }
+        let cc = guard.as_ref().unwrap();
+        let d = cc.dims;
+
+        unsafe {
+            cc.at_cv_a.setAddress_atIndex(rx.gpuAddress() + x_off as u64, 0);
+            cc.at_cv_w.setAddress_atIndex(rw.gpuAddress() + w_off as u64, 0);
+            cc.at_up.setAddress_atIndex(rc.gpuAddress(), 1);
+        }
+        let prset = self.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).ok()?;
+        for b in [&rx, &rw, &rc] {
+            prset.addAllocation(ProtocolObject::from_ref(&**b));
+        }
+        prset.commit();
+        prset.requestResidency();
+
+        cc.alloc.reset();
+        cc.cb.beginCommandBufferWithAllocator(&cc.alloc);
+        cc.cb.useResidencySet(&cc.rset);
+        cc.cb.useResidencySet(&prset);
+        let enc = cc.cb.computeCommandEncoder()?;
+        let tg256 = MTLSize { width: 256, height: 1, depth: 1 };
+        let lin = |count: usize| MTLSize { width: count.div_ceil(256), height: 1, depth: 1 };
+        enc.setComputePipelineState(&self.pso_padnhwc);
+        enc.setArgumentTable(Some(&cc.at_cv_a));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(d.n_a), tg256);
+        enc.setComputePipelineState(&self.pso_pad);
+        enc.setArgumentTable(Some(&cc.at_cv_w));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(d.n_w), tg256);
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::Device,
+        );
+        enc.setComputePipelineState(&cc.pso_conv);
+        enc.setArgumentTable(Some(&cc.at_conv));
+        let tew = cc.pso_conv.threadExecutionWidth();
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: d.tiles_x, height: d.tiles_y, depth: n },
+            MTLSize { width: tew * 4, height: 1, depth: 1 },
+        );
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::Device,
+        );
+        enc.setComputePipelineState(&self.pso_unpad);
+        enc.setArgumentTable(Some(&cc.at_up));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(d.n_o), tg256);
+        enc.endEncoding();
+        cc.cb.endCommandBuffer();
+
+        let bufs = [NonNull::from(&*cc.cb)];
+        unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
+        self.wait_ticket(ticket);
+        Some(())
+    }
 }
 
 /// The process-wide resident tensor-unit device bound to a wgpu `Context`'s `MTLDevice`. Built on
@@ -856,6 +1181,78 @@ mod tests {
         lcheck(100, 37, 50, 2, 0); // ragged + fused silu
         lcheck(128, 64, 64, 1, 0); // relu → act is part of the cache key (rebuild)
         lcheck(128, 64, 64, 4, 1); // sigmoid
+    }
+
+    /// The resident conv2d pipeline (NHWC pad+convert → tiled convolution2d → unpad) against the
+    /// fp16 CPU oracle — exact tiles, ragged edge tiles, stride, larger kernels, batch, reuse.
+    #[test]
+    fn resident_conv2d_matches_the_fp16_oracle() {
+        use std::sync::Arc;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            return;
+        }
+        let ctx = Arc::new(ctx);
+        let Some(g) = resident_for(&ctx) else {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        };
+
+        let ccheck = |n: usize, h: usize, w: usize, c: usize, kh: usize, kw: usize, o: usize,
+                      stride: (usize, usize), pad: (usize, usize), salt: usize| {
+            let x: Vec<f32> = (0..n * h * w * c).map(|i| 0.1 * (((i + 3 + salt) % 11) as f32 - 5.0)).collect();
+            let wt: Vec<f32> = (0..kh * kw * c * o).map(|i| 0.1 * (((i + 5 + salt) % 7) as f32 - 3.0)).collect();
+            let tx = crate::Tensor::from_vec(&ctx, &x, &[n, h, w, c]);
+            let tw = crate::Tensor::from_vec(&ctx, &wt, &[kh, kw, c, o]);
+            let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
+            let wo = (w + 2 * pad.1 - kw) / stride.1 + 1;
+            let out = crate::Tensor::zeros(&ctx, &[n, ho, wo, o]);
+            ctx.queue.submit([]);
+            crate::device_sync(&ctx);
+            g.conv2d_resident(&tx.buf, 0, &tw.buf, 0, &out.buf, n, h, w, c, kh, kw, o, stride, pad)
+                .expect("resident conv dispatch");
+            let got = pollster::block_on(out.to_vec());
+            // fp16-input oracle
+            let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&t| f16::from_f32(t).to_f32()).collect() };
+            let (xf, wf) = (q(&x), q(&wt));
+            let mut err = 0.0f32;
+            for b in 0..n {
+                for yo in 0..ho {
+                    for xo in 0..wo {
+                        for oc in 0..o {
+                            let mut acc = 0.0f32;
+                            for ky in 0..kh {
+                                let yi = (yo * stride.0 + ky) as isize - pad.0 as isize;
+                                if yi < 0 || yi >= h as isize {
+                                    continue;
+                                }
+                                for kx in 0..kw {
+                                    let xi = (xo * stride.1 + kx) as isize - pad.1 as isize;
+                                    if xi < 0 || xi >= w as isize {
+                                        continue;
+                                    }
+                                    for cc in 0..c {
+                                        acc += xf[((b * h + yi as usize) * w + xi as usize) * c + cc]
+                                            * wf[((ky * kw + kx) * c + cc) * o + oc];
+                                    }
+                                }
+                            }
+                            err = err.max((got[((b * ho + yo) * wo + xo) * o + oc] - acc).abs());
+                        }
+                    }
+                }
+            }
+            assert!(err < 1e-2, "resident conv n={n} {h}x{w}x{c} k={kh}x{kw} o={o} s={stride:?} p={pad:?} salt={salt}: err {err}");
+        };
+        ccheck(1, 18, 18, 16, 3, 3, 32, (1, 1), (0, 0), 0); // exact 16x16 dest tile
+        ccheck(1, 18, 18, 16, 3, 3, 32, (1, 1), (0, 0), 3); // cache reuse, fresh data
+        ccheck(1, 13, 11, 8, 3, 3, 8, (1, 1), (1, 1), 0); // ragged → edge tiles + spatial pad
+        ccheck(1, 17, 17, 8, 3, 3, 8, (2, 2), (1, 1), 0); // stride 2
+        ccheck(1, 20, 20, 4, 5, 5, 8, (1, 1), (2, 2), 0); // k=5 (offset cancel = 2)
+        ccheck(2, 12, 12, 4, 3, 3, 8, (1, 1), (1, 1), 0); // batch
     }
 }
 

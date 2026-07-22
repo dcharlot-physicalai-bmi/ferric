@@ -65,6 +65,20 @@ static float applyAct(float v, uint a)
     }
 }
 
+// NHWC spatial pad-convert for the resident conv path: f32 [n,h,w,c] → f16 [n,hp,wp,c] with the
+// data region placed at (ph,pw). Pad elements are zeroed once at cache build.
+kernel void padConvertNHWC(device const float* src [[buffer(0)]],
+                           device half*        dst [[buffer(1)]],
+                           constant uint*      p   [[buffer(2)]], // count,h,w,c,hp,wp,ph,pw
+                           uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p[0]) return;
+    uint ci = gid % p[3]; uint r = gid / p[3];
+    uint x = r % p[2]; r = r / p[2];
+    uint y = r % p[1]; uint b = r / p[1];
+    dst[((b * p[4] + y + p[6]) * p[5] + x + p[7]) * p[3] + ci] = half(src[gid]);
+}
+
 // Inverse for C: gather the [m,n] data region out of the padded [mp,np] result, per batch, applying
 // the fused activation epilogue on the way out.
 kernel void unpad(device const float* src [[buffer(0)]],
