@@ -23,7 +23,8 @@ re-derives them wherever it lands.
 per device (2 probe sizes, 2 warm-ups, min-of-5; the rate is clamped — shape-cached devices can
 return both probes latency-dominated and degenerate the fit to infinity).
 
-Calibrated on the M5 Max:
+Calibrated on the M5 Max (per-op dispatch; a chained op-DAG flush amortizes the external floor
+across its runs — see The op-DAG below):
 
 ```
 GPU:Apple M5 Max          overhead ~290 µs   throughput ~100 GFLOP/s   (portable WGSL matmul)
@@ -49,8 +50,35 @@ precedent), with a ~1e8-flop floor.
 | `matmul` (NN) resident | 11.9 TFLOP/s @2048³, 13.9× over WGSL |
 | `matmul_bt`/`matmul_bt_act` (NT + fused relu/silu/gelu/sigmoid) | 5.0–8.3× on llama-class linears |
 | Q2_0 ternary prefill (`matmul_q2_0`, rows ≥ 32: dequant-once → NT GEMM) | 9.3× @512 tokens (13.6 TFLOP/s) |
-| Var/Adam training step (all six GEMMs resident) | 3.3× @batch 1024 × width 2048 |
+| Var/Adam training step (all six GEMMs resident) | 3.3–4.3× @batch 1024 × width 2048 |
 | `conv2d` (NHWC, runtime-compiled per-config PSOs) | ~2.2× single, ~3–7× batched |
+| `Var::conv2d` autograd (dX = strided transposed conv, dW = input×grad correlation, portable WGSL) | FD-verified ~3e-4; conv layers train |
+
+## The op-DAG
+
+`batch()` builds an ordered **segment list** — Wgsl segments (one encoder each) interleaved with
+External segments (deferred tensor-unit ops, GEMM and conv alike, as `ExtOp`s owning `Arc`s to
+their buffers). At flush, segments execute in order; each External segment splits into runs at
+config repeats (same-config ops share scratch and argument tables) and encodes every op of a run
+into ONE MTL4 command buffer with inter-op barriers.
+
+Runs **chain GPU-side**: `MTL4CommandQueue::waitForEvent/signalEvent` orders dependent command
+buffers on the queue (proven exact by the `floor_probe` copy-chain test), so a whole flush pays
+**one** host wait. The floor decomposition that motivated it:
+
+```
+empty MTL4 cb, host wait:        ~172 µs   (the platform's commit→completion round trip)
+8 cbs, host wait each:          ~1089 µs
+8 cbs, queue-chained, 1 wait:    ~279 µs   (~35 µs marginal per chained cb)
+```
+
+Measured effect: a same-shape 3-chain (which must split into 3 runs) drops 1.7 → 0.68 ms deferred
+(2.4×); the q/k/v pattern runs 1.5–1.7× faster deferred than immediate, bit-identical results.
+Beneath it all, the three device caches are bounded MRU lists (16 GEMM / 8 conv / 8 host-boundary
+shapes), so alternating shapes — every real model — never rebuild.
+
+Honest boundary: a training step's GEMMs alternate with elementwise WGSL, leaving External
+segments mostly single-op — the DAG is roughly neutral there. It pays where resident ops cluster.
 
 ## The ANE (the `Npu` device)
 
@@ -94,6 +122,15 @@ Facts established by experiment in this repo, each pinned by a test:
 - **fp16 gradient underflow is real**: a full-mean loss puts gradients (~1e-7) below fp16's
   normal range and the tensor units crush them — observed as slower convergence, restored by
   per-sample loss scale. This is *why* the fp16 paths are opt-in.
+- **The dispatch floor is the platform's**: an EMPTY MTL4 command buffer round-trips in ~172 µs.
+  You cannot shrink it; you can only pay it less often — queue-side event chaining orders
+  dependent cbs on the GPU (~35 µs marginal each) with one host wait per flush.
+- **Same-config ops cannot share a command buffer** — they share scratch and argument tables, and
+  argument tables are read at execution, so the last `setAddress` would win for both dispatches.
+  Runs split on config repeats; queue chaining makes the split nearly free.
+- **In-flight cbs pin their cache entries**: an LRU eviction while a committed command buffer
+  still references an entry's scratch frees memory the GPU is reading. Locks are held across a
+  chained flush and eviction happens only after its final wait.
 
 ## Doctrine
 
@@ -109,10 +146,11 @@ Facts established by experiment in this repo, each pinned by a test:
 
 ## Known limits / open items
 
-- ~134 µs commit→GPU-start latency floor per external dispatch (breaking it needs deferred/batched
-  submission, i.e. async tensor semantics).
-- No scheduler op-DAG yet — ops route independently, each paying its own sync.
-- Resident conv has no autograd; quantized resident recipes beyond Q2_0 (Q4_K/Q5_K/Q6_K) pending.
+- The ~172 µs platform floor is paid once per op outside `batch()`, once per flush inside it;
+  fully hiding it would need async tensor semantics (results promised, waited at readback).
+- Quantized resident recipes beyond Q2_0 (Q4_K/Q5_K/Q6_K) pending.
+- Conv autograd is first-order only (no double-backward); its backward runs on the portable floor.
+- An ANE conv1x1 EP variant is receipt-confirmed but awaits a consumer.
 - `vendor/` is machine-local (gitignored): rebuilding elsewhere needs `cargo vendor`. The CoreML
   models regenerate from `scripts/npu-models/` (coremltools MIL + `coremlcompiler`); the EP's
   `.mlmodelc` is embedded in-tree either way.
