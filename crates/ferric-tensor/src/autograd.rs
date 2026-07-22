@@ -111,6 +111,20 @@ impl Var {
                 vec![g.matmul(&p[1].transpose(r - 1, r - 2)), p[0].transpose(r - 1, r - 2).matmul(g)]
             }))
     }
+    /// 2D convolution (NHWC × HWIO → NHWO, like [`Tensor::conv2d`]). First-order gradients only
+    /// (no double-backward): dX is the stride-aware transposed convolution, dW the input×grad
+    /// correlation — both portable WGSL. The forward routes through the tensor units under
+    /// `FERRIC_METAL4` like every conv; the backward stays on the portable floor.
+    pub fn conv2d(&self, w: &Var, stride: (usize, usize), pad: (usize, usize)) -> Var {
+        let out = self.0.value.conv2d(&w.0.value, stride, pad);
+        let (x, wt) = (self.0.value.clone(), w.0.value.clone());
+        Var::node(out, vec![self.clone(), w.clone()],
+            Box::new(move |g, p| {
+                p[0].accumulate(&g.conv2d_dx(&wt, stride, pad, (x.shape[1], x.shape[2])));
+                p[1].accumulate(&x.conv2d_dw(g, stride, pad, (wt.shape[0], wt.shape[1])));
+            }))
+    }
+
     pub fn relu(&self) -> Var {
         let out = self.0.value.relu();
         let x = self.0.value.clone();

@@ -543,6 +543,47 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![n, ho, wo, o])
     }
 
+    /// Input gradient of [`Self::conv2d`]: `self` is the output gradient `[n, ho, wo, o]`, `w` the
+    /// forward weights `[kh, kw, c, o]`, `in_hw` the forward input's spatial dims. Returns
+    /// `[n, h, w, c]` — the stride-aware transposed convolution, portable WGSL.
+    pub fn conv2d_dx(&self, w: &Tensor, stride: (usize, usize), pad: (usize, usize), in_hw: (usize, usize)) -> Tensor {
+        let g = self.contiguous();
+        let wc = w.contiguous();
+        let (n, ho, wo, o) = (g.shape[0], g.shape[1], g.shape[2], g.shape[3]);
+        let (kh, kw, c, wo_) = (wc.shape[0], wc.shape[1], wc.shape[2], wc.shape[3]);
+        assert_eq!(o, wo_, "conv2d_dx channel mismatch");
+        let (h, wd) = in_hw;
+        let out = empty(&self.ctx, n * h * wd * c);
+        let (grid, rs) = groups2d(n * h * wd * c);
+        run(&self.ctx, CONV2D_DX_WGSL, "conv2d_dx",
+            &[&g.buf, &wc.buf, &out,
+              &u32buf(&self.ctx, &[n as u32, h as u32, wd as u32, c as u32, kh as u32, kw as u32,
+                  o as u32, ho as u32, wo as u32, stride.0 as u32, stride.1 as u32,
+                  pad.0 as u32, pad.1 as u32, rs])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![n, h, wd, c])
+    }
+
+    /// Weight gradient of [`Self::conv2d`]: `self` is the forward input `[n, h, w, c]`, `g` the
+    /// output gradient `[n, ho, wo, o]`, `k_hw` the kernel's spatial dims. Returns `[kh, kw, c, o]`.
+    pub fn conv2d_dw(&self, g: &Tensor, stride: (usize, usize), pad: (usize, usize), k_hw: (usize, usize)) -> Tensor {
+        let x = self.contiguous();
+        let gc = g.contiguous();
+        let (n, h, wd, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (gn, ho, wo, o) = (gc.shape[0], gc.shape[1], gc.shape[2], gc.shape[3]);
+        assert_eq!(n, gn, "conv2d_dw batch mismatch");
+        let (kh, kw) = k_hw;
+        let out = empty(&self.ctx, kh * kw * c * o);
+        let (grid, rs) = groups2d(kh * kw * c * o);
+        run(&self.ctx, CONV2D_DW_WGSL, "conv2d_dw",
+            &[&x.buf, &gc.buf, &out,
+              &u32buf(&self.ctx, &[n as u32, h as u32, wd as u32, c as u32, kh as u32, kw as u32,
+                  o as u32, ho as u32, wo as u32, stride.0 as u32, stride.1 as u32,
+                  pad.0 as u32, pad.1 as u32, rs])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![kh, kw, c, o])
+    }
+
     /// Row gather (embedding lookup): self is a [vocab, d] table; returns [idx.len(), d].
     pub fn gather_rows(&self, idx: &[u32]) -> Tensor {
         let d = *self.shape.last().unwrap();
@@ -1486,6 +1527,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+// Input gradient of conv2d (the stride-aware transposed convolution): for each input element,
+// gather every output position whose window covered it. Same info table as the forward.
+const CONV2D_DX_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        g: array<f32>;   // [n, ho, wo, o]
+@group(0) @binding(1) var<storage,read>        wt: array<f32>;  // [kh, kw, c, o]
+@group(0) @binding(2) var<storage,read_write>  dx: array<f32>;  // [n, h, w, c]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // n,h,w,c,kh,kw,o,ho,wo,sh,sw,ph,pw,rs
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let rs = info[13];
+    let i = gid.x + gid.y * rs;
+    let n = info[0]; let h = info[1]; let w = info[2]; let c = info[3];
+    let kh = info[4]; let kw = info[5]; let o = info[6]; let ho = info[7]; let wo = info[8];
+    let sh = info[9]; let sw = info[10];
+    if (i >= n * h * w * c) { return; }
+    let ci = i % c; let r1 = i / c;
+    let xi = r1 % w; let r2 = r1 / w;
+    let yi = r2 % h; let b = r2 / h;
+    var acc = 0.0;
+    for (var ky: u32 = 0u; ky < kh; ky = ky + 1u) {
+        let yt = i32(yi) + i32(info[11]) - i32(ky);
+        if (yt < 0 || yt % i32(sh) != 0) { continue; }
+        let yo = u32(yt) / sh;
+        if (yo >= ho) { continue; }
+        for (var kx: u32 = 0u; kx < kw; kx = kx + 1u) {
+            let xt = i32(xi) + i32(info[12]) - i32(kx);
+            if (xt < 0 || xt % i32(sw) != 0) { continue; }
+            let xo = u32(xt) / sw;
+            if (xo >= wo) { continue; }
+            let gb = ((b * ho + yo) * wo + xo) * o;
+            let wb = (ky * kw + kx) * c * o + ci * o;
+            for (var oc: u32 = 0u; oc < o; oc = oc + 1u) {
+                acc = acc + g[gb + oc] * wt[wb + oc];
+            }
+        }
+    }
+    dx[i] = acc;
+}
+"#;
+
+// Weight gradient of conv2d: each weight tap correlates the input window with the output grad.
+const CONV2D_DW_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;   // [n, h, w, c]
+@group(0) @binding(1) var<storage,read>        g: array<f32>;   // [n, ho, wo, o]
+@group(0) @binding(2) var<storage,read_write>  dw: array<f32>;  // [kh, kw, c, o]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // n,h,w,c,kh,kw,o,ho,wo,sh,sw,ph,pw,rs
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let rs = info[13];
+    let i = gid.x + gid.y * rs;
+    let n = info[0]; let h = info[1]; let w = info[2]; let c = info[3];
+    let kh = info[4]; let kw = info[5]; let o = info[6]; let ho = info[7]; let wo = info[8];
+    if (i >= kh * kw * c * o) { return; }
+    let oc = i % o; let r1 = i / o;
+    let ci = r1 % c; let r2 = r1 / c;
+    let kx = r2 % kw; let ky = r2 / kw;
+    var acc = 0.0;
+    for (var b: u32 = 0u; b < n; b = b + 1u) {
+        for (var yo: u32 = 0u; yo < ho; yo = yo + 1u) {
+            let yi = i32(yo * info[9] + ky) - i32(info[11]);
+            if (yi < 0 || yi >= i32(h)) { continue; }
+            for (var xo: u32 = 0u; xo < wo; xo = xo + 1u) {
+                let xi = i32(xo * info[10] + kx) - i32(info[12]);
+                if (xi < 0 || xi >= i32(w)) { continue; }
+                acc = acc + x[((b * h + u32(yi)) * w + u32(xi)) * c + ci] * g[((b * ho + yo) * wo + xo) * o + oc];
+            }
+        }
+    }
+    dw[i] = acc;
+}
+"#;
+
 const GATHER_ROWS_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        table: array<f32>;
 @group(0) @binding(1) var<storage,read>        idx: array<u32>;
@@ -2195,5 +2308,101 @@ mod conv_tests {
         check(2, 9, 7, 3, 3, 3, 5, (2, 2), (1, 1)); // strided + batch + rectangular
         check(1, 6, 6, 2, 5, 3, 4, (1, 1), (2, 1)); // asymmetric kernel + pads
         check(2, 16, 16, 8, 3, 3, 16, (1, 1), (1, 1)); // a real CNN-ish layer
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod conv_grad_tests {
+    use super::*;
+
+    /// Finite-difference check of BOTH conv gradients on an asymmetric strided padded case —
+    /// loss = Σ conv(x, w)², perturb every element of w and of x.
+    #[test]
+    fn conv2d_gradients_match_finite_differences() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let ctx = std::sync::Arc::new(ctx);
+        let (n, h, w, c, kh, kw, o) = (2usize, 5usize, 4usize, 2usize, 3usize, 2usize, 3usize);
+        let (stride, pad) = ((2usize, 1usize), (1usize, 1usize));
+        let x0: Vec<f32> = (0..n * h * w * c).map(|i| ((i as f32 * 0.7 + 1.0).sin()) * 0.5).collect();
+        let w0: Vec<f32> = (0..kh * kw * c * o).map(|i| ((i as f32 * 0.9 + 2.0).sin()) * 0.5).collect();
+
+        let loss_of = |xv: &[f32], wv: &[f32]| -> f32 {
+            let xt = Tensor::from_vec(&ctx, xv, &[n, h, w, c]);
+            let wt = Tensor::from_vec(&ctx, wv, &[kh, kw, c, o]);
+            let y = xt.conv2d(&wt, stride, pad);
+            let ns = y.rank();
+            pollster::block_on(y.mul(&y).sum(&(0..ns).collect::<Vec<_>>(), false).to_vec())[0]
+        };
+
+        // autograd gradients
+        let xv = crate::Var::leaf(Tensor::from_vec(&ctx, &x0, &[n, h, w, c]));
+        let wv = crate::Var::leaf(Tensor::from_vec(&ctx, &w0, &[kh, kw, c, o]));
+        let y = xv.conv2d(&wv, stride, pad);
+        let loss = y.mul(&y).sum_all();
+        loss.backward();
+        let gx = pollster::block_on(xv.grad().unwrap().to_vec());
+        let gw = pollster::block_on(wv.grad().unwrap().to_vec());
+
+        let eps = 1e-3;
+        let fd_check = |base_x: &[f32], base_w: &[f32], grads: &[f32], which_w: bool, label: &str| {
+            let mut max_rel = 0.0f32;
+            let count = if which_w { base_w.len() } else { base_x.len() };
+            for i in 0..count {
+                let (mut xp, mut wp) = (base_x.to_vec(), base_w.to_vec());
+                let (mut xm, mut wm) = (base_x.to_vec(), base_w.to_vec());
+                if which_w {
+                    wp[i] += eps;
+                    wm[i] -= eps;
+                } else {
+                    xp[i] += eps;
+                    xm[i] -= eps;
+                }
+                let num = (loss_of(&xp, &wp) - loss_of(&xm, &wm)) / (2.0 * eps);
+                let rel = (num - grads[i]).abs() / num.abs().max(1.0);
+                max_rel = max_rel.max(rel);
+            }
+            assert!(max_rel < 1e-2, "{label}: max rel err {max_rel}");
+            eprintln!("{label}: max rel err {max_rel:.2e}");
+        };
+        fd_check(&x0, &w0, &gw, true, "dW vs finite differences");
+        fd_check(&x0, &w0, &gx, false, "dX vs finite differences");
+    }
+
+    /// End to end: a conv layer actually TRAINS — fit a fixed target with Adam, loss must fall.
+    #[test]
+    fn conv2d_layer_trains() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else {
+            return;
+        };
+        let ctx = std::sync::Arc::new(ctx);
+        let (n, hw, c, o) = (2usize, 8usize, 3usize, 4usize);
+        let x0: Vec<f32> = (0..n * hw * hw * c).map(|i| ((i as f32 * 0.31).sin()) * 0.5).collect();
+        let tgt: Vec<f32> = (0..n * hw * hw * o).map(|i| ((i as f32 * 0.17).cos()) * 0.1).collect();
+        let xt = Tensor::from_vec(&ctx, &x0, &[n, hw, hw, c]);
+        let yt = Tensor::from_vec(&ctx, &tgt, &[n, hw, hw, o]);
+        let mut params = vec![Tensor::from_vec(&ctx, &vec![0.05f32; 3 * 3 * c * o], &[3, 3, c, o])];
+        let mut adam = crate::Adam::new(&params, 5e-3);
+        let mut first = 0.0;
+        let mut last = 0.0;
+        for step in 0..30 {
+            let xv = crate::Var::leaf(xt.clone());
+            let yv = crate::Var::leaf(yt.clone());
+            let wv = crate::Var::leaf(params[0].clone());
+            let e = xv.conv2d(&wv, (1, 1), (1, 1)).sub(&yv);
+            let loss = e.mul(&e).mean(&[0]).sum_all();
+            loss.backward();
+            let l = pollster::block_on(loss.value().to_vec())[0];
+            if step == 0 {
+                first = l;
+            }
+            last = l;
+            let grads = vec![wv.grad().unwrap()];
+            adam.step(&mut params, &grads);
+        }
+        assert!(last < first * 0.5, "conv training must reduce loss: {first} → {last}");
+        eprintln!("conv fit: loss {first:.5} → {last:.5}");
     }
 }
