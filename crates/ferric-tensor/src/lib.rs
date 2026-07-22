@@ -520,19 +520,25 @@ impl Tensor {
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
         if 2 * bn * m * ka * n >= 100_000_000 && std::env::var("FERRIC_METAL4").is_ok() {
             if let Some(g) = crate::metal4::resident_for(&self.ctx) {
-                let out = empty(&self.ctx, bn * m * n);
-                // clear_buffer marks `out` INITIALIZED in wgpu's init tracker — without it, wgpu
-                // lazily zero-fills the "uninitialized" buffer on first wgpu use, clobbering the
-                // external queue's writes. The submit also flushes staged uploads (poll alone never
-                // runs them); the poll then drains the queue so a/b are fully produced before the
-                // tensor units read them.
-                let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                enc.clear_buffer(&out, 0, None);
-                self.ctx.queue.submit([enc.finish()]);
+                // Fresh out buffers need one clear_buffer pass: it marks the buffer INITIALIZED in
+                // wgpu's init tracker — without it, wgpu lazily zero-fills the buffer on first wgpu
+                // use, clobbering the external queue's writes. Pooled buffers already had it, so
+                // reuse (the training pattern) skips the ~170 µs clear-submit round trip. Either
+                // submit also flushes staged uploads (poll alone never runs them); the poll then
+                // drains the queue so a/b are fully produced — and any in-flight readers of a
+                // recycled out buffer are finished — before the tensor units touch them.
+                let (out, fresh) = crate::metal4::pooled_out(&self.ctx, bn * m * n);
+                if fresh {
+                    let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    enc.clear_buffer(&out, 0, None);
+                    self.ctx.queue.submit([enc.finish()]);
+                } else {
+                    self.ctx.queue.submit([]);
+                }
                 device_sync(&self.ctx);
                 if g.bmm_resident(&a.buf, a.offset * 4, &b.buf, b.offset * 4, &out, bn, m, ka, n).is_some() {
                     let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
-                    return Tensor::from_parts(&self.ctx, out, oshape);
+                    return Tensor::from_arc(&self.ctx, out, &oshape);
                 }
             }
         }

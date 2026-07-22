@@ -154,6 +154,20 @@ impl Metal4Gemm {
         })
     }
 
+    // Completion wait: bounded spin on the shared event's counter first — completion latency is
+    // ~100 µs-scale and the kernel wakeup inside waitUntilSignaledValue costs tens of µs, which a
+    // short GEMM feels. Falls back to the blocking wait for anything longer than 2 ms.
+    fn wait_ticket(&self, ticket: u64) {
+        let t0 = std::time::Instant::now();
+        while self.event.signaledValue() < ticket {
+            if t0.elapsed().as_millis() >= 2 {
+                assert!(self.event.waitUntilSignaledValue_timeoutMS(ticket, 60_000), "Metal4 GEMM timed out");
+                return;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     // Build (or rebuild) all shape-dependent objects.
     fn build_cache(&self, batch: usize, m: usize, k: usize, n: usize) -> ShapeCache {
         let mp = m.div_ceil(TILE_M) * TILE_M;
@@ -270,7 +284,7 @@ impl Metal4Gemm {
         let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
         let ev: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         self.queue.signalEvent_value(ev, ticket);
-        assert!(self.event.waitUntilSignaledValue_timeoutMS(ticket, 60_000), "Metal4 GEMM timed out");
+        self.wait_ticket(ticket);
 
         // readback: slice [m, n] out of the padded [mp, np] per batch
         let mut out = vec![0.0f32; batch * m * n];
@@ -482,7 +496,7 @@ impl Metal4Gemm {
         unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
         let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
         self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
-        assert!(self.event.waitUntilSignaledValue_timeoutMS(ticket, 60_000), "Metal4 resident GEMM timed out");
+        self.wait_ticket(ticket);
         Some(())
     }
 }
@@ -499,6 +513,34 @@ pub fn resident_for(ctx: &ferric_core::Context) -> Option<&'static Metal4Gemm> {
     };
     let g = DEV.get_or_init(|| Metal4Gemm::for_wgpu(&ctx.device)).as_ref()?;
     (Retained::as_ptr(&g.device) as usize == raw).then_some(g)
+}
+
+/// Ring pool of matmul output buffers for the resident path. A pooled buffer has already been
+/// clear_buffer'd once — wgpu's init tracker marks it initialized forever — so reuse skips the
+/// ~170 µs clear-submit round trip that a fresh buffer needs (returns `fresh = true` when the
+/// caller must still clear). Reuse requires `strong_count == 1` (the tensor that borrowed it was
+/// dropped); content races with in-flight wgpu readers are excluded by the fast path's
+/// submit-then-poll drain, which runs before the external queue touches the buffer. Keyed per
+/// `Context` identity (Weak-checked, so a recycled address can't resurrect a dead pool) and element
+/// count; at most 4 buffers pooled per key, extra demand allocates transient un-pooled buffers.
+pub fn pooled_out(ctx: &std::sync::Arc<ferric_core::Context>, n: usize) -> (std::sync::Arc<wgpu::Buffer>, bool) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock, Weak};
+    type Pool = Mutex<HashMap<(usize, usize), (Weak<ferric_core::Context>, Vec<Arc<wgpu::Buffer>>)>>;
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    let mut map = POOL.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let entry = map.entry((Arc::as_ptr(ctx) as usize, n)).or_insert_with(|| (Arc::downgrade(ctx), Vec::new()));
+    if entry.0.upgrade().is_none() {
+        *entry = (Arc::downgrade(ctx), Vec::new()); // dead Context recycled this address
+    }
+    if let Some(buf) = entry.1.iter().find(|b| Arc::strong_count(b) == 1) {
+        return (buf.clone(), false);
+    }
+    let buf = Arc::new(crate::empty(ctx, n));
+    if entry.1.len() < 4 {
+        entry.1.push(buf.clone());
+    }
+    (buf, true)
 }
 
 #[cfg(test)]
@@ -699,3 +741,14 @@ mod tests {
     }
 }
 
+
+/// Bench-only: measure per-call residency-set construction (used by examples/m4prof.rs).
+#[doc(hidden)]
+pub fn bench_prset(g: &Metal4Gemm, bufs: &[&Obj<dyn MTLBuffer>]) {
+    let prset = g.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap();
+    for b in bufs {
+        prset.addAllocation(ProtocolObject::from_ref(&***b));
+    }
+    prset.commit();
+    prset.requestResidency();
+}
