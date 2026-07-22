@@ -312,7 +312,12 @@ impl Context {
 
         let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("matmul"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MATMUL_WGSL)),
+            // Same det-math preamble rule as Context::pipeline — this raw path
+            // must never drift from the portable-det kernels.
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                "{}\n{MATMUL_WGSL}",
+                kernels::DET_MATH_WGSL
+            ))),
         });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("matmul"),
@@ -380,8 +385,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x; let col = gid.y;
     if (row >= m || col >= n) { return; }
     var acc: f32 = 0.0;
+    // portable-det: barriered MAC — forces the plain rounded sequence even on
+    // compilers we can't configure (the browser's). Value-identical under
+    // strict compilers; see kernels::DET_MATH_WGSL.
     for (var i: u32 = 0u; i < k; i = i + 1u) {
-        acc = acc + a[row * k + i] * b[i * n + col];
+        acc = det_bar(acc + det_bar(a[row * k + i] * b[i * n + col], dims.w), dims.w);
     }
     out[row * n + col] = acc;
 }

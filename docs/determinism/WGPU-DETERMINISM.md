@@ -95,3 +95,29 @@ deltas ~1e-7), not by digest. Also note "the browser" is not one fabric:
 Dawn picks ANGLE-Metal / Vulkan / D3D per platform, and contraction choices
 can differ across them (the mha row already shows two contracted compilers
 disagreeing) — cross-browser digests must be measured per platform.
+
+## Portable-det profile — 2026-07-22, second measurement round
+
+All det functions and every kernel accumulation/product chain are now
+barriered (runtime-zero `det_bar` at each step; op order preserved exactly).
+Native regression: **all 7 probe rows unchanged** on Metal — the barriers are
+value no-ops under strict compilation, as designed. `matmul_native` timing on
+the 64×48×32 validation case: 5.95 ms before → 4.85 ms after (noise-level;
+the case is overhead-dominated — a real perf ceiling needs larger shapes).
+
+Browser (Dawn/Tint, ANGLE-Metal) after portable-det: **mm, rope, and sigmoid
+now match the strict-native digests bit-exactly** — barrier-forced plain
+sequences hold in a compiler we cannot configure. Still divergent: sqrt and
+rmsnorm (both via det_rsqrt) and mha (+ demo-lm, which composes them). The
+sqrt forensic in-browser reproduces native fast-math Metal's fingerprint
+EXACTLY (183/768 deviations, first at i=0, cpu 3f1db1f4 vs gpu 3f1db1f3, 1
+ULP low) — some Metal fast-math transform inside the Newton chain survives
+per-step XOR barriers. Open question, scoped for a micro-kernel forensic
+session: emit per-iteration intermediates from the GPU and diff against the
+CPU replica stage by stage to identify the exact op. Until resolved,
+browser↔native digest parity covers the mm/rope/sigmoid kernel class;
+rsqrt-dependent kernels remain tolerance-validated in the browser.
+
+Scoreboard: CPU cross-arch ✅ digest · GPU cross-vendor ✅ digest (Vulkan
+re-verify of portable-det pending Tailscale re-auth of the test box) ·
+browser mm/rope/sigmoid ✅ digest · browser rsqrt-class ⏳ forensic.

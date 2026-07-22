@@ -375,11 +375,22 @@ pub(crate) const DET_MATH_WGSL: &str = r#"
 // runtime value it cannot fold, so both fabrics are forced to the plain
 // rounded mul/add sequence. Free at runtime; priceless for bit-identity.
 fn det_bar(v: f32, z: u32) -> f32 { return bitcast<f32>(bitcast<u32>(v) ^ z); }
-fn det_recip(y: f32) -> f32 {
+// PORTABLE-DET: every det function is barriered at each step, so even
+// compilers we cannot configure (the browser's Dawn/Tint) are forced to the
+// plain rounded sequence. Under strict compilers the barriers are value
+// no-ops — native digests do not move; contracted compilers converge onto
+// them. Operation ORDER matches the original expressions exactly.
+fn det_recip(y: f32, z: u32) -> f32 {
     var x = bitcast<f32>(0x7EF311C3u - bitcast<u32>(y));
-    x = x * (2.0 - y * x);
-    x = x * (2.0 - y * x);
-    x = x * (2.0 - y * x);
+    var t = det_bar(y * x, z);
+    var w = det_bar(2.0 - t, z);
+    x = det_bar(x * w, z);
+    t = det_bar(y * x, z);
+    w = det_bar(2.0 - t, z);
+    x = det_bar(x * w, z);
+    t = det_bar(y * x, z);
+    w = det_bar(2.0 - t, z);
+    x = det_bar(x * w, z);
     return x;
 }
 fn det_rsqrt(y: f32, z: u32) -> f32 {
@@ -411,43 +422,68 @@ fn det_sqrt(y: f32, z: u32) -> f32 {
     return y * rb;
 }
 // e^v via Cody-Waite ln2 split (exact for |k|<256) + Taylor-6 on [-0.347,0.347].
-fn det_exp(v: f32) -> f32 {
+fn det_exp(v: f32, z: u32) -> f32 {
     let x = clamp(v, -87.0, 88.0);
-    let kf = floor(x * 1.4426950216293335 + 0.5);
-    let r = (x - kf * 0.693115234375) - kf * 3.194618329871446e-05;
-    let p = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666667 + r * (0.041666668 + r * (0.008333334 + r * 0.0013888889)))));
+    let kf = floor(det_bar(x * 1.4426950216293335, z) + 0.5);
+    let a = det_bar(x - det_bar(kf * 0.693115234375, z), z);
+    let r = det_bar(a - det_bar(kf * 3.194618329871446e-05, z), z);
+    var p = 0.0013888889;
+    p = det_bar(det_bar(p * r, z) + 0.008333334, z);
+    p = det_bar(det_bar(p * r, z) + 0.041666668, z);
+    p = det_bar(det_bar(p * r, z) + 0.16666667, z);
+    p = det_bar(det_bar(p * r, z) + 0.5, z);
+    p = det_bar(det_bar(p * r, z) + 1.0, z);
+    p = det_bar(det_bar(p * r, z) + 1.0, z);
     let scale = bitcast<f32>(u32(clamp(i32(kf), -126, 127) + 127) << 23u);
     return p * scale;
 }
-fn det_sin_poly(r: f32) -> f32 {
-    let r2 = r * r;
-    return r * (1.0 + r2 * (-0.16666667 + r2 * (0.008333334 + r2 * (-1.9841270e-4 + r2 * 2.7557319e-6))));
+fn det_sin_poly(r: f32, z: u32) -> f32 {
+    let r2 = det_bar(r * r, z);
+    var p = 2.7557319e-6;
+    p = det_bar(det_bar(p * r2, z) + -1.9841270e-4, z);
+    p = det_bar(det_bar(p * r2, z) + 0.008333334, z);
+    p = det_bar(det_bar(p * r2, z) + -0.16666667, z);
+    p = det_bar(det_bar(p * r2, z) + 1.0, z);
+    return r * p;
 }
-fn det_cos_poly(r: f32) -> f32 {
-    let r2 = r * r;
-    return 1.0 + r2 * (-0.5 + r2 * (0.041666668 + r2 * (-0.0013888889 + r2 * 2.4801587e-5)));
+fn det_cos_poly(r: f32, z: u32) -> f32 {
+    let r2 = det_bar(r * r, z);
+    var p = 2.4801587e-5;
+    p = det_bar(det_bar(p * r2, z) + -0.0013888889, z);
+    p = det_bar(det_bar(p * r2, z) + 0.041666668, z);
+    p = det_bar(det_bar(p * r2, z) + -0.5, z);
+    p = det_bar(det_bar(p * r2, z) + 1.0, z);
+    return p;
 }
 // (sin, cos) via 3-term π/2 Cody-Waite reduction — exact for |q| < 4096.
-fn det_sincos(ang: f32) -> vec2<f32> {
-    let qf = floor(ang * 0.6366197466850281 + 0.5);
-    let r = ((ang - qf * 1.5703125) - qf * 4.8382679e-4) - qf * 2.5632829e-12;
+fn det_sincos(ang: f32, z: u32) -> vec2<f32> {
+    let qf = floor(det_bar(ang * 0.6366197466850281, z) + 0.5);
+    var r = det_bar(ang - det_bar(qf * 1.5703125, z), z);
+    r = det_bar(r - det_bar(qf * 4.8382679e-4, z), z);
+    r = det_bar(r - det_bar(qf * 2.5632829e-12, z), z);
     let q = i32(qf) & 3;
-    let s = det_sin_poly(r);
-    let c = det_cos_poly(r);
+    let s = det_sin_poly(r, z);
+    let c = det_cos_poly(r, z);
     if (q == 0) { return vec2<f32>(s, c); }
     if (q == 1) { return vec2<f32>(c, -s); }
     if (q == 2) { return vec2<f32>(-s, -c); }
     return vec2<f32>(-c, s);
 }
 // ln(y), y > 0: exponent split + atanh series on the mantissa (s ≤ 1/3).
-fn det_ln(y: f32) -> f32 {
+fn det_ln(y: f32, z: u32) -> f32 {
     let bits = bitcast<u32>(y);
     let e = i32(bits >> 23u) - 127;
     let m = bitcast<f32>((bits & 0x007FFFFFu) | 0x3F800000u);
-    let s = (m - 1.0) * det_recip(m + 1.0);
-    let s2 = s * s;
-    let lnm = 2.0 * s * (1.0 + s2 * (0.33333334 + s2 * (0.2 + s2 * (0.14285715 + s2 * 0.11111111))));
-    return f32(e) * 0.6931471824645996 + lnm;
+    let s = det_bar((m - 1.0) * det_recip(m + 1.0, z), z);
+    let s2 = det_bar(s * s, z);
+    var p = 0.11111111;
+    p = det_bar(det_bar(p * s2, z) + 0.14285715, z);
+    p = det_bar(det_bar(p * s2, z) + 0.2, z);
+    p = det_bar(det_bar(p * s2, z) + 0.33333334, z);
+    p = det_bar(det_bar(p * s2, z) + 1.0, z);
+    let ts = det_bar(2.0 * s, z);
+    let lnm = det_bar(ts * p, z);
+    return det_bar(det_bar(f32(e) * 0.6931471824645996, z) + lnm, z);
 }
 "#;
 
@@ -460,7 +496,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= dims.x) { return; }
     let v = x[i];
-    out[i] = v * det_recip(1.0 + det_exp(-v));
+    out[i] = v * det_recip(1.0 + det_exp(-v, dims.y), dims.y);
 }
 "#;
 
@@ -485,7 +521,7 @@ const SIGMOID_WGSL: &str = r#"
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= dims.x) { return; }
-    out[i] = det_recip(1.0 + det_exp(-x[i]));
+    out[i] = det_recip(1.0 + det_exp(-x[i], dims.y), dims.y);
 }
 "#;
 
@@ -506,17 +542,24 @@ const GELU_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform>             dims: vec4<u32>; // n
-fn erf(z: f32) -> f32 {
-    let s = sign(z); let a = abs(z);
-    let t = det_recip(1.0 + 0.3275911 * a);
-    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * det_exp(-a * a);
+fn erf(zz: f32, z: u32) -> f32 {
+    let s = sign(zz); let a = abs(zz);
+    let t = det_recip(1.0 + det_bar(0.3275911 * a, z), z);
+    var p = det_bar(det_bar(1.061405429 * t, z) - 1.453152027, z);
+    p = det_bar(det_bar(p * t, z) + 1.421413741, z);
+    p = det_bar(det_bar(p * t, z) - 0.284496736, z);
+    p = det_bar(det_bar(p * t, z) + 0.254829592, z);
+    var q = det_bar(p * t, z);
+    q = det_bar(q * det_exp(-det_bar(a * a, z), z), z);
+    let y = 1.0 - q;
     return s * y;
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= dims.x) { return; }
     let v = x[i];
-    out[i] = 0.5 * v * (1.0 + erf(v * 0.7071067811865476));
+    let h = det_bar(0.5 * v, dims.y);
+    out[i] = h * (1.0 + erf(v * 0.7071067811865476, dims.y));
 }
 "#;
 
@@ -556,16 +599,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = id / h; let head = id % h;
     let half = dh / 2u;
     let o = (i * h + head) * dh;
-    let lb = det_ln(base);
-    let inv_dh = det_recip(f32(dh));
+    let lb = det_ln(base, rmeta.y);
+    let inv_dh = det_recip(f32(dh), rmeta.y);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
-        let inv = det_exp(-2.0 * f32(c) * inv_dh * lb);
+        var e1 = det_bar(-2.0 * f32(c), rmeta.y);
+        e1 = det_bar(e1 * inv_dh, rmeta.y);
+        e1 = det_bar(e1 * lb, rmeta.y);
+        let inv = det_exp(e1, rmeta.y);
         let ang = f32(i + rmeta.x) * inv;
-        let sc = det_sincos(ang);
+        let sc = det_sincos(ang, rmeta.y);
         let cs = sc.y; let sn = sc.x;
         let x1 = x[o + c]; let x2 = x[o + c + half];
-        out[o + c] = x1 * cs - x2 * sn;
-        out[o + c + half] = x2 * cs + x1 * sn;
+        out[o + c] = det_bar(x1 * cs, rmeta.y) - det_bar(x2 * sn, rmeta.y);
+        out[o + c + half] = det_bar(x2 * cs, rmeta.y) + det_bar(x1 * sn, rmeta.y);
     }
 }
 "#;
@@ -596,8 +642,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var c: u32 = 0u; c < dh; c = c + 1u) { s = det_bar(s + det_bar(q[qo + c] * k[ko + c], gqa.y), gqa.y); }
         s = s * scale;
         let mnew = max(m, s);
-        let corr = det_exp(m - mnew);
-        let p = det_exp(s - mnew);
+        let corr = det_exp(m - mnew, gqa.y);
+        let p = det_exp(s - mnew, gqa.y);
         // barrier every product before its add — Metal and Vulkan fuse
         // different subsets of mul+add otherwise (probe-verified); gqa.y is
         // the runtime zero
@@ -608,7 +654,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         m = mnew;
     }
-    let invl = det_recip(l);
+    let invl = det_recip(l, gqa.y);
     for (var c: u32 = 0u; c < dh; c = c + 1u) { out[qo + c] = acc[c] * invl; }
 }
 "#;
@@ -637,8 +683,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var c: u32 = 0u; c < dh; c = c + 1u) { sc = det_bar(sc + det_bar(q[qo + c] * k[ko + c], gqa.y), gqa.y); }
         sc = sc * scale;
         let mnew = max(m, sc);
-        let corr = det_exp(m - mnew);
-        let p = det_exp(sc - mnew);
+        let corr = det_exp(m - mnew, gqa.y);
+        let p = det_exp(sc - mnew, gqa.y);
         // barrier every product before its add (see MHA_CAUSAL note)
         l = det_bar(det_bar(l * corr, gqa.y) + p, gqa.y);
         for (var c: u32 = 0u; c < dh; c = c + 1u) {
@@ -647,7 +693,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         m = mnew;
     }
-    let invl = det_recip(l);
+    let invl = det_recip(l, gqa.y);
     for (var c: u32 = 0u; c < dh; c = c + 1u) { out[qo + c] = acc[c] * invl; }
 }
 "#;
@@ -664,10 +710,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (row >= rows) { return; }
     let base = row * d;
     var ms: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = ms + v * v; }
-    ms = ms * det_recip(f32(d));
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = det_bar(ms + det_bar(v * v, dims.w), dims.w); }
+    ms = ms * det_recip(f32(d), dims.w);
     let inv = det_rsqrt(ms + eps, dims.w);
-    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv * weight[j]; }
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        let t = det_bar(x[base + j] * inv, dims.w);
+        out[base + j] = t * weight[j];
+    }
 }
 "#;
 
@@ -683,16 +732,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rows = dims.x; let d = dims.y; let eps = bitcast<f32>(dims.z);
     if (row >= rows) { return; }
     let base = row * d;
-    let invd = det_recip(f32(d));
+    let invd = det_recip(f32(d), dims.w);
     var mean: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { mean = mean + x[base + j]; }
+    for (var j: u32 = 0u; j < d; j = j + 1u) { mean = det_bar(mean + x[base + j], dims.w); }
     mean = mean * invd;
     var vari: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let c = x[base + j] - mean; vari = vari + c * c; }
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let c = x[base + j] - mean; vari = det_bar(vari + det_bar(c * c, dims.w), dims.w); }
     vari = vari * invd;
     let inv = det_rsqrt(vari + eps, dims.w);
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        out[base + j] = (x[base + j] - mean) * inv * weight[j] + bias[j];
+        let t1 = det_bar((x[base + j] - mean) * inv, dims.w);
+        let t2 = det_bar(t1 * weight[j], dims.w);
+        out[base + j] = t2 + bias[j];
     }
 }
 "#;
@@ -710,8 +761,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mx: f32 = x[base];
     for (var j: u32 = 1u; j < d; j = j + 1u) { mx = max(mx, x[base + j]); }
     var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let e = det_exp(x[base + j] - mx); out[base + j] = e; sum = sum + e; }
-    let inv = det_recip(sum);
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let e = det_exp(x[base + j] - mx, dims.z); out[base + j] = e; sum = det_bar(sum + e, dims.z); }
+    let inv = det_recip(sum, dims.z);
     for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = out[base + j] * inv; }
 }
 "#;
