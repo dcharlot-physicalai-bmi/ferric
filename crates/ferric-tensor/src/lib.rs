@@ -472,22 +472,62 @@ impl Tensor {
         assert!(h + 2 * pad.0 >= kh && wd + 2 * pad.1 >= kw, "kernel larger than padded input");
         let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
         let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
-        // Metal-4 conv tensor-unit resident path — same opt-in + precision doctrine as matmul
-        // (FERRIC_METAL4, fp16 inputs by contract, ~1e8-flop floor).
+        // Metal-4 conv tensor-unit resident path — same opt-in + precision doctrine and the same
+        // batch()-deferral behaviour as the GEMM routes (convs join External segments and share
+        // multi-op command buffers; consecutive same-config convs split into their own runs).
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
         if crate::metal4::resident_ready(&self.ctx, 2 * n * ho * wo * o * kh * kw * c) {
             if let Some(g) = crate::metal4::resident_for(&self.ctx) {
-                flush_batch(&self.ctx); // an open batch's dispatches must land before the external queue reads
                 let (out, fresh) = crate::metal4::pooled_out(&self.ctx, n * ho * wo * o);
-                if fresh {
-                    let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    enc.clear_buffer(&out, 0, None);
-                    self.ctx.queue.submit([enc.finish()]);
+                let op = crate::metal4::ConvOp {
+                    x: x.buf.clone(),
+                    x_off: x.offset * 4,
+                    w: wc.buf.clone(),
+                    w_off: wc.offset * 4,
+                    out: out.clone(),
+                    n,
+                    h,
+                    wd,
+                    c,
+                    kh,
+                    kw,
+                    o,
+                    stride,
+                    pad,
+                };
+                let mut op_slot = Some(op);
+                let deferred = BATCH.with(|bl| {
+                    let mut bo = bl.borrow_mut();
+                    let Some(segs) = bo.as_mut() else { return false };
+                    if fresh {
+                        if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
+                            segs.push(Seg::Wgsl(self.ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+                        }
+                        let Some(Seg::Wgsl(enc, _)) = segs.last_mut() else { unreachable!() };
+                        enc.clear_buffer(&out, 0, None);
+                    }
+                    if !matches!(segs.last_mut(), Some(Seg::External(_))) {
+                        segs.push(Seg::External(Vec::new()));
+                    }
+                    let Some(Seg::External(ops)) = segs.last_mut() else { unreachable!() };
+                    ops.push(crate::metal4::ExtOp::Conv(op_slot.take().unwrap()));
+                    true
+                });
+                let ok = if deferred {
+                    true
                 } else {
-                    self.ctx.queue.submit([]);
-                }
-                device_sync(&self.ctx);
-                if g.conv2d_resident(&x.buf, x.offset * 4, &wc.buf, wc.offset * 4, &out, n, h, wd, c, kh, kw, o, stride, pad).is_some() {
+                    let op = crate::metal4::ExtOp::Conv(op_slot.take().unwrap());
+                    if fresh {
+                        let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                        enc.clear_buffer(&out, 0, None);
+                        self.ctx.queue.submit([enc.finish()]);
+                    } else {
+                        self.ctx.queue.submit([]);
+                    }
+                    device_sync(&self.ctx);
+                    g.run_resident_many(std::slice::from_ref(&op)).is_some()
+                };
+                if ok {
                     return Tensor::from_arc(&self.ctx, out, &[n, ho, wo, o]);
                 }
             }
@@ -789,11 +829,11 @@ fn metal4_gemm_route(
             segs.push(Seg::External(Vec::new()));
         }
         let Some(Seg::External(ops)) = segs.last_mut() else { unreachable!() };
-        ops.push(op_slot.take().unwrap());
+        ops.push(crate::metal4::ExtOp::Gemm(op_slot.take().unwrap()));
         true
     });
     if !deferred {
-        let op = op_slot.take().unwrap();
+        let op = crate::metal4::ExtOp::Gemm(op_slot.take().unwrap());
         if fresh {
             let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             enc.clear_buffer(&out, 0, None);
@@ -892,7 +932,7 @@ thread_local! {
 enum Seg {
     Wgsl(wgpu::CommandEncoder, Vec<wgpu::BindGroup>),
     #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
-    External(Vec<crate::metal4::ResOp>),
+    External(Vec<crate::metal4::ExtOp>),
 }
 
 /// (dispatches, submits) issued so far on this thread.
