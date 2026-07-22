@@ -57,6 +57,23 @@ fn main() {
     device_sync(&ctx);
     println!("qkv 3-chain (deferred):  {:.3} ms/iter  (1 wait)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
 
+    // same-shape deferred: 3 single-op runs, queue-chained → still ONE host wait
+    let _ = ferric_tensor::batch(&ctx, || {
+        let _ = x.matmul_bt(&wq);
+        let _ = x.matmul_bt(&wq);
+        let _ = x.matmul_bt(&wq);
+    });
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        ferric_tensor::batch(&ctx, || {
+            let _ = x.matmul_bt(&wq);
+            let _ = x.matmul_bt(&wq);
+            let _ = x.matmul_bt(&wq);
+        });
+    }
+    device_sync(&ctx);
+    println!("same-shape 3-chain (deferred): {:.3} ms/iter  (3 chained runs, 1 wait)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
+
     // correctness of the deferred path vs the immediate path
     let imm = pollster::block_on(x.matmul_bt(&wq).to_vec());
     let def = ferric_tensor::batch(&ctx, || x.matmul_bt(&wq));

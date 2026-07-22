@@ -161,9 +161,12 @@ pub struct Metal4Gemm {
     cache: Mutex<Vec<ShapeCache>>,      // MRU-front, capped — alternating shapes must not thrash
     rcache: Mutex<Vec<ResidentCache>>,  // (a real model's q/k/v projections are 3 different shapes)
     ccache: Mutex<Vec<ConvCache>>,
-    // The ONE allocator/command-buffer pair for resident GEMM runs (single or multi-op). Guarded
-    // by the mutex; every run waits for completion before releasing it, so reuse is race-free.
-    mcb: Mutex<Option<(Obj<dyn MTL4CommandAllocator>, Obj<dyn MTL4CommandBuffer>)>>,
+    // Allocator/command-buffer pairs for resident runs. A multi-run flush encodes each run into
+    // its own pair and chains them with QUEUE-side event waits (ordering proven by the
+    // floor_probe test), paying the ~170 µs commit→completion floor ONCE per flush instead of
+    // once per run (~35 µs marginal per chained cb, measured). Guarded by the mutex; the flush's
+    // final host wait completes every pair before release, so reuse is race-free.
+    mcb: Mutex<Vec<(Obj<dyn MTL4CommandAllocator>, Obj<dyn MTL4CommandBuffer>)>>,
     conv_psos: Mutex<std::collections::HashMap<(usize, usize, usize, usize, usize, usize, usize, usize, usize), Obj<dyn MTLComputePipelineState>>>,
     pub adapter_name: String,
 }
@@ -262,7 +265,7 @@ impl Metal4Gemm {
             cache: Mutex::new(Vec::new()),
             rcache: Mutex::new(Vec::new()),
             ccache: Mutex::new(Vec::new()),
-            mcb: Mutex::new(None),
+            mcb: Mutex::new(Vec::new()),
             conv_psos: Mutex::new(std::collections::HashMap::new()),
             adapter_name,
         })
@@ -586,6 +589,8 @@ impl Metal4Gemm {
             ExtOp::Gemm(g) => K::G(g.key()),
             ExtOp::Conv(c) => K::C(c.key()),
         };
+        // split into runs at key repeats / cap
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < ops.len() {
             let mut keys: Vec<K> = Vec::new();
@@ -594,13 +599,53 @@ impl Metal4Gemm {
                 keys.push(key_of(&ops[j]));
                 j += 1;
             }
-            self.run_ops_one_cb(&ops[i..j])?;
+            runs.push((i, j));
             i = j;
         }
+        // encode each run into its own cb; chain with queue-side event waits (GPU-ordered, proven
+        // by floor_probe); ONE host wait at the end — the dispatch floor is paid once per flush.
+        const POOL: usize = 8;
+        let mut pairs = self.mcb.lock().unwrap();
+        // hold BOTH cache locks across the whole chained flush: committed-but-unfinished cbs
+        // reference cache-owned scratch/argtables, and an LRU eviction mid-flight would free them
+        let mut rguard = self.rcache.lock().unwrap();
+        let mut cguard = self.ccache.lock().unwrap();
+        let mut last_ticket = 0u64;
+        for (ri, &(a, b)) in runs.iter().enumerate() {
+            if ri > 0 && ri % POOL == 0 {
+                self.wait_ticket(last_ticket); // recycle the pair pool
+            }
+            let idx = ri % POOL;
+            if pairs.len() <= idx {
+                pairs.push((self.device.newCommandAllocator()?, self.device.newCommandBuffer()?));
+            }
+            let (alloc, cb) = &pairs[idx];
+            self.encode_run(alloc, cb, &ops[a..b], &mut rguard, &mut cguard)?;
+            if ri > 0 {
+                self.queue.waitForEvent_value(ProtocolObject::from_ref(&*self.event), last_ticket);
+            }
+            let bufs = [NonNull::from(&**cb)];
+            unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+            last_ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+            self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), last_ticket);
+        }
+        if last_ticket > 0 {
+            self.wait_ticket(last_ticket);
+        }
+        // safe to evict now — nothing is in flight
+        rguard.truncate(16);
+        cguard.truncate(8);
         Some(())
     }
 
-    fn run_ops_one_cb(&self, ops: &[ExtOp]) -> Option<()> {
+    fn encode_run(
+        &self,
+        alloc: &ProtocolObject<dyn MTL4CommandAllocator>,
+        cb: &ProtocolObject<dyn MTL4CommandBuffer>,
+        ops: &[ExtOp],
+        rguard: &mut Vec<ResidentCache>,
+        cguard: &mut Vec<ConvCache>,
+    ) -> Option<()> {
         // raw handles first (fallible) — also what the per-run residency set needs
         let raws: Vec<[Obj<dyn MTLBuffer>; 3]> = ops
             .iter()
@@ -612,21 +657,20 @@ impl Metal4Gemm {
             })
             .collect::<Option<Vec<_>>>()?;
 
-        let mut rguard = self.rcache.lock().unwrap();
-        let mut cguard = self.ccache.lock().unwrap();
         // phase 1: ensure every op's cache entry exists (mutating; distinct keys ≤ run cap < caps)
         for op in ops {
             match op {
                 ExtOp::Gemm(g) => {
+                    // no eviction here — earlier runs of this flush may still be in flight on the
+                    // GPU referencing their entries; the flush truncates after its final wait
                     let k = g.key();
-                    let _ = lru_entry(&mut rguard, k, 16, |key| self.build_rcache(key.0, key.1, key.2, key.3, key.4, key.5), |e| e.key);
+                    let _ = lru_entry(rguard, k, usize::MAX, |key| self.build_rcache(key.0, key.1, key.2, key.3, key.4, key.5), |e| e.key);
                 }
                 ExtOp::Conv(cv) => {
                     let key = cv.key();
                     if !cguard.iter().any(|e| e.key == key) {
                         let built = self.build_conv_cache(cv.n, cv.h, cv.wd, cv.c, cv.kh, cv.kw, cv.o, cv.stride, cv.pad)?;
                         cguard.insert(0, built);
-                        cguard.truncate(8);
                     }
                 }
             }
@@ -659,11 +703,6 @@ impl Metal4Gemm {
         prset.commit();
         prset.requestResidency();
 
-        let mut mcb = self.mcb.lock().unwrap();
-        if mcb.is_none() {
-            *mcb = Some((self.device.newCommandAllocator()?, self.device.newCommandBuffer()?));
-        }
-        let (alloc, cb) = mcb.as_ref().unwrap();
         alloc.reset();
         cb.beginCommandBufferWithAllocator(alloc);
         for op in ops {
@@ -690,12 +729,6 @@ impl Metal4Gemm {
         }
         enc.endEncoding();
         cb.endCommandBuffer();
-
-        let bufs = [NonNull::from(&**cb)];
-        unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
-        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
-        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
-        self.wait_ticket(ticket);
         Some(())
     }
 
@@ -1862,5 +1895,143 @@ kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
         assert!(g.event.waitUntilSignaledValue_timeoutMS(ticket, 30_000));
         let got = unsafe { std::slice::from_raw_parts(bc.contents().as_ptr() as *const f32, ho * wo * o) };
         got.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod floor_probe {
+    use super::*;
+    use std::time::Instant;
+
+    /// Decompose the per-run dispatch floor: what does an EMPTY command buffer round trip cost,
+    /// what does host-waiting per cb cost vs chaining cbs with QUEUE-side event waits and paying
+    /// one host wait at the end — and is cross-cb ordering via queue wait/signal actually correct?
+    #[test]
+    fn dispatch_floor_decomposition_and_queue_ordering() {
+        let Some(g) = Metal4Gemm::new() else { return };
+        let dev = &g.device;
+        let mk_pair = || (dev.newCommandAllocator().unwrap(), dev.newCommandBuffer().unwrap());
+        let pairs: Vec<_> = (0..8).map(|_| mk_pair()).collect();
+
+        // (a) single empty cb, host wait — the irreducible platform floor
+        let round = |reps: usize| -> f64 {
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                let (alloc, cb) = &pairs[0];
+                alloc.reset();
+                cb.beginCommandBufferWithAllocator(alloc);
+                cb.endCommandBuffer();
+                let bufs = [NonNull::from(&**cb)];
+                unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+                let t = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+                g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), t);
+                g.wait_ticket(t);
+            }
+            t0.elapsed().as_secs_f64() / reps as f64 * 1e6
+        };
+        round(20); // warm
+        eprintln!("empty cb, host wait each:      {:>7.1} µs/cb", round(100));
+
+        // (b) 8 empty cbs, host wait per cb
+        let t0 = Instant::now();
+        let reps = 25;
+        for _ in 0..reps {
+            for (alloc, cb) in &pairs {
+                alloc.reset();
+                cb.beginCommandBufferWithAllocator(alloc);
+                cb.endCommandBuffer();
+                let bufs = [NonNull::from(&**cb)];
+                unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+                let t = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+                g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), t);
+                g.wait_ticket(t);
+            }
+        }
+        eprintln!("8 cbs, host wait each:         {:>7.1} µs total", t0.elapsed().as_secs_f64() / reps as f64 * 1e6);
+
+        // (c) 8 empty cbs, queue-side signal/wait chain, ONE host wait
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let mut last = 0u64;
+            for (i, (alloc, cb)) in pairs.iter().enumerate() {
+                alloc.reset();
+                cb.beginCommandBufferWithAllocator(alloc);
+                cb.endCommandBuffer();
+                if i > 0 {
+                    g.queue.waitForEvent_value(ProtocolObject::from_ref(&*g.event), last);
+                }
+                let bufs = [NonNull::from(&**cb)];
+                unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+                last = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+                g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), last);
+            }
+            g.wait_ticket(last);
+        }
+        eprintln!("8 cbs, queue-chained, 1 wait:  {:>7.1} µs total", t0.elapsed().as_secs_f64() / reps as f64 * 1e6);
+
+        // (d) ORDERING PROOF: cb1 doubles a buffer (padConvert identity f32→f16 won't do —
+        // use the unpad kernel as a copy: src f32 → dst f32 with act=0, 1 "row"), cb2 doubles
+        // again reading cb1's output. Chain via queue wait; ONE host wait; check = 4×input.
+        let n = 4096usize;
+        let mkbuf = |bytes: usize| dev.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared).unwrap();
+        let (b0, b1, b2) = (mkbuf(n * 4), mkbuf(n * 4), mkbuf(n * 4));
+        let par = mkbuf(6 * 4);
+        unsafe {
+            let p0 = std::slice::from_raw_parts_mut(b0.contents().as_ptr() as *mut f32, n);
+            for (i, v) in p0.iter_mut().enumerate() { *v = i as f32 * 0.25; }
+            let pp = std::slice::from_raw_parts_mut(par.contents().as_ptr() as *mut u32, 6);
+            pp.copy_from_slice(&[n as u32, n as u32, n as u32, 1, 1, 0]); // count,n,np,m,mp,act — identity copy
+        }
+        // "double" kernel: reuse padConvert? it converts to f16. Simplest true f32 op we have with
+        // raw pointers is unpad (identity copy). Copy proves ORDERING (cb2 output == input) if we
+        // chain b0→b1→b2 and check b2 == b0 with only one host wait.
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(3);
+        let (at1, at2) = (
+            dev.newArgumentTableWithDescriptor_error(&atd).unwrap(),
+            dev.newArgumentTableWithDescriptor_error(&atd).unwrap(),
+        );
+        unsafe {
+            at1.setAddress_atIndex(b0.gpuAddress(), 0);
+            at1.setAddress_atIndex(b1.gpuAddress(), 1);
+            at1.setAddress_atIndex(par.gpuAddress(), 2);
+            at2.setAddress_atIndex(b1.gpuAddress(), 0);
+            at2.setAddress_atIndex(b2.gpuAddress(), 1);
+            at2.setAddress_atIndex(par.gpuAddress(), 2);
+        }
+        let rset = dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap();
+        for b in [&b0, &b1, &b2, &par] { rset.addAllocation(ProtocolObject::from_ref(&**b)); }
+        rset.commit();
+        rset.requestResidency();
+        let mut last = 0u64;
+        for (i, at) in [&at1, &at2].iter().enumerate() {
+            let (alloc, cb) = &pairs[i];
+            alloc.reset();
+            cb.beginCommandBufferWithAllocator(alloc);
+            cb.useResidencySet(&rset);
+            let enc = cb.computeCommandEncoder().unwrap();
+            enc.setComputePipelineState(&g.pso_unpad);
+            enc.setArgumentTable(Some(at));
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize { width: n.div_ceil(256), height: 1, depth: 1 },
+                MTLSize { width: 256, height: 1, depth: 1 },
+            );
+            enc.endEncoding();
+            cb.endCommandBuffer();
+            if i > 0 {
+                g.queue.waitForEvent_value(ProtocolObject::from_ref(&*g.event), last);
+            }
+            let bufs = [NonNull::from(&**cb)];
+            unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+            last = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+            g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), last);
+        }
+        g.wait_ticket(last);
+        let err = unsafe {
+            let p2 = std::slice::from_raw_parts(b2.contents().as_ptr() as *const f32, n);
+            (0..n).map(|i| (p2[i] - i as f32 * 0.25).abs()).fold(0.0f32, f32::max)
+        };
+        eprintln!("cross-cb chained copy err: {err:.1e}");
+        assert!(err == 0.0, "queue-chained cbs must execute in order: err {err}");
     }
 }
