@@ -18,7 +18,19 @@ pub const BASE: f32 = 10000.0;
 pub const EPS: f32 = 1e-5;
 
 fn fill(n: usize, s: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract()) * 0.2 - 0.1).collect()
+    // Integer xorshift + mantissa bitcast — NO libm. The previous sin()-based
+    // hash silently gave "the same model" different weights on macOS vs glibc
+    // (host sinf differs by ULPs), which broke cross-machine bit-identity even
+    // after the GPU kernels were made deterministic. Values in [-0.1, 0.1).
+    let mut state = (s.to_bits() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (f32::from_bits(0x3F80_0000 | (state >> 41) as u32) - 1.5) * 0.2
+        })
+        .collect()
 }
 fn emul(a: &[f32], b: &[f32]) -> Vec<f32> { a.iter().zip(b).map(|(x, y)| x * y).collect() }
 

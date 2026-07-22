@@ -4570,6 +4570,13 @@ impl<W: Write> Writer<W> {
         )?;
         writeln!(self.out, "#include <metal_stdlib>")?;
         writeln!(self.out, "#include <simd/simd.h>")?;
+        // FERRIC PATCH — strict float math. MSL contracts mul+add into fma even
+        // under MTLMathModeSafe (fp-contract is a separate, default-on pragma).
+        // Turning it off makes Metal evaluate float ops exactly as written —
+        // matching the NoContraction-decorated SPIR-V (see the spv backend
+        // patch) and plain IEEE. The Metal half of Ferric's cross-fabric
+        // bit-identity guarantee.
+        writeln!(self.out, "#pragma STDC FP_CONTRACT OFF")?;
         writeln!(self.out)?;
         // Work around Metal bug where `uint` is not available by default
         writeln!(self.out, "using {NAMESPACE}::uint;")?;

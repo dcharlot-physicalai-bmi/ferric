@@ -53,6 +53,15 @@ impl Tensor {
 }
 
 impl Context {
+    /// Submit an empty batch and wait for the device to go idle — commits any pending buffer
+    /// initializations. Call periodically during huge allocation bursts (tens of GB across tens of
+    /// thousands of `create_buffer_init` calls, e.g. loading a mixture-of-experts model), where Metal
+    /// otherwise silently drops later buffers' contents (they read back as zeros, with no error).
+    pub fn flush(&self) {
+        self.queue.submit(std::iter::empty());
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
     /// Whether the cooperative-matrix GEMM path produces **correct** results here. Metal only.
     /// Metal (MSL → simdgroup_matrix) is exact f32 — verified with constant operands (a=0.01, b=0.02,
     /// every output = K·2e-4, relΔ ~1e-5 across M=8…2048, square and non-square). On Vulkan the kernel
@@ -220,10 +229,18 @@ impl Context {
         })
     }
     /// Compile a WGSL compute pipeline (entry `main`, auto bind-group layout).
+    /// Kernels that reference `det_` get the deterministic-math preamble
+    /// prepended — the exact-ops transcendentals that keep every kernel on the
+    /// cross-fabric bit-identical path (see kernels::DET_MATH_WGSL).
     pub(crate) fn pipeline(&self, label: &str, wgsl: &str) -> wgpu::ComputePipeline {
+        let src = if wgsl.contains("det_") {
+            format!("{}\n{wgsl}", kernels::DET_MATH_WGSL)
+        } else {
+            wgsl.to_string()
+        };
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(wgsl.to_string())),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
         });
         self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(label),

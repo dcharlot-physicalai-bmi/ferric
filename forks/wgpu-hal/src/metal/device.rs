@@ -277,6 +277,21 @@ impl super::Device {
                     options.setPreserveInvariance(true);
                 }
 
+                // FERRIC PATCH — deterministic math. Metal's default math mode is
+                // fast (fma contraction + reassociation), which silently breaks
+                // cross-fabric bit-identity: Vulkan/NVIDIA evaluates WGSL as
+                // written (IEEE round-to-nearest per op, forensically verified
+                // 0/768 deviations), while Metal fast-math deviates by ±1 ULP on
+                // ~24% of values. Safe math makes Metal evaluate exactly as
+                // written too — the foundation of Ferric's bit-identical
+                // cross-fabric guarantee. (Upstream-worthy: wgpu#determinism.)
+                if available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
+                    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+                } else {
+                    #[allow(deprecated)]
+                    options.setFastMathEnabled(false);
+                }
+
                 let library = self
                     .shared
                     .device
@@ -1301,6 +1316,13 @@ impl crate::Device for super::Device {
                 num_workgroups,
             } => {
                 let options = MTLCompileOptions::new();
+                // FERRIC PATCH — deterministic math (see the WGSL path above).
+                if available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
+                    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+                } else {
+                    #[allow(deprecated)]
+                    options.setFastMathEnabled(false);
+                }
                 // Obtain the device from shared
                 let device = &self.shared.device;
                 let library = device
