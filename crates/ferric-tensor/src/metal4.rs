@@ -1254,6 +1254,55 @@ mod tests {
         ccheck(1, 20, 20, 4, 5, 5, 8, (1, 1), (2, 2), 0); // k=5 (offset cancel = 2)
         ccheck(2, 12, 12, 4, 3, 3, 8, (1, 1), (1, 1), 0); // batch
     }
+
+    /// An open `batch()` records dispatches WITHOUT submitting them — an external-queue path that
+    /// only does `queue.submit([])` would read inputs that haven't been computed yet. The fast
+    /// paths flush the batch first; this pins the contract at the `bmm_resident` level: inputs
+    /// produced inside an open batch are visible after `flush_batch` + poll.
+    #[test]
+    fn resident_path_sees_ops_recorded_in_an_open_batch() {
+        use std::sync::Arc;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            return;
+        }
+        let ctx = Arc::new(ctx);
+        let Some(g) = resident_for(&ctx) else {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        };
+        let (m, k, n) = (64usize, 64, 64);
+        let base: Vec<f32> = (0..m * k).map(|i| 0.02 * (((i + 1) % 13) as f32 - 6.0)).collect();
+        let bv: Vec<f32> = (0..k * n).map(|i| 0.02 * (((i + 7) % 11) as f32 - 5.0)).collect();
+        let tb = crate::Tensor::from_vec(&ctx, &bv, &[k, n]);
+        let out = crate::Tensor::zeros(&ctx, &[m, n]);
+        let got = crate::batch(&ctx, || {
+            // `a` is PRODUCED INSIDE the open batch — recorded, not yet submitted
+            let t_base = crate::Tensor::from_vec(&ctx, &base, &[m, k]);
+            let two = crate::Tensor::from_vec(&ctx, &[2.0], &[1]);
+            let a = t_base.mul(&two);
+            // what the fast paths do before handing to the external queue:
+            crate::flush_batch(&ctx);
+            ctx.queue.submit([]);
+            crate::device_sync(&ctx);
+            g.bmm_resident(&a.buf, 0, &tb.buf, 0, &out.buf, 1, m, k, n).expect("dispatch");
+            pollster::block_on(out.to_vec())
+        });
+        // oracle over the DOUBLED input (fp16 contract)
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16::from_f32(x).to_f32()).collect() };
+        let (af, bf) = (q(&base.iter().map(|v| v * 2.0).collect::<Vec<_>>()), q(&bv));
+        let mut err = 0.0f32;
+        for i in 0..m {
+            for j in 0..n {
+                let acc: f32 = (0..k).map(|l| af[i * k + l] * bf[l * n + j]).sum();
+                err = err.max((got[i * n + j] - acc).abs());
+            }
+        }
+        assert!(err < 1e-3, "batched-input resident bmm: err {err}");
+    }
 }
 
 

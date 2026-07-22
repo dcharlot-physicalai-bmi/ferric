@@ -477,6 +477,7 @@ impl Tensor {
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
         if crate::metal4::resident_ready(&self.ctx, 2 * n * ho * wo * o * kh * kw * c) {
             if let Some(g) = crate::metal4::resident_for(&self.ctx) {
+                flush_batch(&self.ctx); // an open batch's dispatches must land before the external queue reads
                 let (out, fresh) = crate::metal4::pooled_out(&self.ctx, n * ho * wo * o);
                 if fresh {
                     let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -596,6 +597,7 @@ impl Tensor {
                 // submit also flushes staged uploads (poll alone never runs them); the poll then
                 // drains the queue so a/b are fully produced — and any in-flight readers of a
                 // recycled out buffer are finished — before the tensor units touch them.
+                flush_batch(&self.ctx); // an open batch's dispatches must land before the external queue reads
                 let (out, fresh) = crate::metal4::pooled_out(&self.ctx, bn * m * n);
                 if fresh {
                     let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -758,6 +760,7 @@ fn metal4_linear(ctx: &Arc<Context>, x: &Tensor, w: &Tensor, rows: usize, inn: u
         return None;
     }
     let g = crate::metal4::resident_for(ctx)?;
+    flush_batch(ctx); // an open batch's dispatches must land before the external queue reads
     let (out, fresh) = crate::metal4::pooled_out(ctx, rows * out_f);
     if fresh {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -886,6 +889,17 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
 /// order (compute passes on one queue execute serially), so results are identical — this only
 /// removes the per-op encoder+submit overhead, which dominates when a forward pass issues hundreds
 /// of small kernels. Buffers read inside `f` (`to_vec`) flush the batch first, so reads stay correct.
+/// Flush (and end) any open thread-local [`batch`] — paths that hand work to an EXTERNAL queue
+/// (the Metal-4 tensor units, the ANE) or read results back must see all prior compute, and a
+/// `queue.submit([])` does NOT include an open batch's recorded-but-unsubmitted dispatches. Ops
+/// recorded after this fall back to per-op submits: correctness over batching.
+pub(crate) fn flush_batch(ctx: &Context) {
+    if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
+        ctx.queue.submit([enc.finish()]);
+        SUBMITS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 pub fn batch<R>(ctx: &Arc<Context>, f: impl FnOnce() -> R) -> R {
     // Re-entrant safe: an inner batch() just joins the outer one.
     let outermost = BATCH.with(|b| {
@@ -905,10 +919,7 @@ pub fn batch<R>(ctx: &Arc<Context>, f: impl FnOnce() -> R) -> R {
 async fn readback(ctx: &Context, buf: &wgpu::Buffer, n: usize) -> Vec<f32> {
     // A read must see all prior compute, so flush any open batch first — otherwise the copy below
     // would be submitted ahead of the deferred dispatches and read stale data.
-    if let Some((enc, _keep)) = BATCH.with(|b| b.borrow_mut().take()) {
-        ctx.queue.submit([enc.finish()]);
-        SUBMITS.with(|c| c.set(c.get() + 1));
-    }
+    flush_batch(ctx);
     let bytes = (n * 4) as u64;
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("staging"), size: bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
