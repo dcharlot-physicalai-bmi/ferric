@@ -1,0 +1,31 @@
+diff --git a/forks/naga/src/back/spv/block.rs b/forks/naga/src/back/spv/block.rs
+index bb977e8..4e6c63f 100644
+--- a/forks/naga/src/back/spv/block.rs
++++ b/forks/naga/src/back/spv/block.rs
+@@ -1260,6 +1260,26 @@ impl BlockContext<'_> {
+                         if reverse_operands { right_id } else { left_id },
+                         if reverse_operands { left_id } else { right_id },
+                     ));
++
++                    // FERRIC PATCH — strict float math. SPIR-V permits drivers to
++                    // contract mul+add into fma unless NoContraction is decorated;
++                    // NVIDIA's compiler does so, which breaks bit-identity with
++                    // Metal compiled under MTLMathModeSafe (see the wgpu-hal fork
++                    // patch). Decorating every float arithmetic result forces
++                    // as-written IEEE evaluation on every Vulkan driver — the
++                    // Vulkan half of Ferric's cross-fabric determinism guarantee.
++                    if matches!(
++                        spirv_op,
++                        spirv::Op::FMul
++                            | spirv::Op::FAdd
++                            | spirv::Op::FSub
++                            | spirv::Op::FDiv
++                            | spirv::Op::FRem
++                            | spirv::Op::VectorTimesScalar
++                    ) {
++                        self.writer
++                            .decorate(id, spirv::Decoration::NoContraction, &[]);
++                    }
+                 }
+                 id
+             }
