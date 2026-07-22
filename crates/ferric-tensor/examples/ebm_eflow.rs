@@ -48,8 +48,17 @@ impl Ef {
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.b3; for j in 0..H { o += h2[j] * self.w3[j]; } o }
-    fn grad_a(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) { let h = 1e-2;
-        ((self.e(s, g, a1 + h, a2, t) - self.e(s, g, a1 - h, a2, t)) / (2.0 * h), (self.e(s, g, a1, a2 + h, t) - self.e(s, g, a1, a2 - h, t)) / (2.0 * h)) }
+    // EXACT action-gradient: analytic backprop through the relu net (replaces finite differences)
+    fn grad_a(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) {
+        let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+        let mut h1 = [0.0f32; H]; let mut m1 = [false; H];
+        for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } m1[j] = z > 0.0; h1[j] = z.max(0.0); }
+        let mut m2 = [false; H];
+        for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } m2[j] = z > 0.0; }
+        let mut d2 = [0.0f32; H]; for j in 0..H { if m2[j] { d2[j] = self.w3[j]; } }
+        let mut d1 = [0.0f32; H]; for k in 0..H { if m1[k] { let mut z = 0.0; for j in 0..H { z += self.w2[k * H + j] * d2[j]; } d1[k] = z; } }
+        let (mut g1, mut g2) = (0.0f32, 0.0f32); for j in 0..H { g1 += self.w[8][j] * d1[j]; g2 += self.w[9][j] * d1[j]; }
+        (g1, g2) }
     // actuation: integrate a ← a − (κ/K)·∇ₐE  (energy descent along the flow; κ un-scales the trained gradient) from a=0
     fn act(&self, s: [f32; 4], g: (f32, f32), k: usize) -> (f32, f32) { let (mut a1, mut a2) = (0.0f32, 0.0f32);
         for i in 0..k { let t = i as f32 / k as f32; let (g1, g2) = self.grad_a(s, g, a1, a2, t); a1 -= KAPPA * g1 / k as f32; a2 -= KAPPA * g2 / k as f32; }
@@ -102,7 +111,7 @@ async fn run() {
         for i in 0..bs { let sd = it as u32 * 13 + i as u32;
             let s = [(u(sd, 1) * 2.0 - 1.0) * PI, (u(sd, 2) * 2.0 - 1.0) * PI, (u(sd, 3) * 2.0 - 1.0) * 3.0, (u(sd, 4) * 2.0 - 1.0) * 3.0];
             let g = ((u(sd, 5) * 2.0 - 1.0) * 1.2, (u(sd, 6) * 2.0 - 1.0) * 1.2); let us = vn.ustar(s, g, &G9);
-            let a01 = (u(sd, 7) * 2.0 - 1.0) * 3.0; let a02 = (u(sd, 8) * 2.0 - 1.0) * 3.0; let t = u(sd, 9);
+            let a01 = (u(sd, 7) * 2.0 - 1.0) * 3.0; let a02 = (u(sd, 8) * 2.0 - 1.0) * 3.0; let t = u(sd, 9) * 0.9;   // cap t: the target field steepens ∝1/(1−t); the K-grid never reaches t=1
             let ff = feat8(s, g); for c in 0..8 { fc[c][i] = ff[c]; }
             at1[i] = (1.0 - t) * a01 + t * us.0; at2[i] = (1.0 - t) * a02 + t * us.1; tt[i] = t;
             g1t[i] = -(us.0 - a01) / KAPPA; g2t[i] = -(us.1 - a02) / KAPPA;   // want −κ∇ₐE = (u*−a0) ⇒ ∇ₐE target = −(u*−a0)/κ
@@ -137,7 +146,7 @@ async fn run() {
     println!("  ONE scalar potential Eθ(s,a,t); v=−∇ₐEθ. DIAG: K=2 descend-action mean|u|={:.2}, mean|u−u*|={:.2}\n", dm / n as f32, de / n as f32);
     println!("     reading                                        result");
     println!("     discrete argmin (demonstrator), fine 9×9       {:>4.0}% reach   (81 evals/decision)", rf);
-    for k in [1usize, 2, 4] { println!("     ACTUATE — descend v=−∇ₐE, K={:<2}                  {:>4.0}% reach   ({} grad evals)", k, run_act(k), k); }
+    for k in [1usize, 2, 4, 8] { println!("     ACTUATE — descend v=−∇ₐE, K={:<2}                  {:>4.0}% reach   ({} grad evals)", k, run_act(k), k); }
     println!("     VERIFY  — same Eθ(·,1) ranks good action < bad  {:>4.1}%", vg as f32 / vt as f32 * 100.0);
     println!("\n  If ACTUATE reaches AND VERIFY is high from the SAME potential, EFA has a literally energy-first unified object:");
     println!("  the action is energy descent (v=−∇ₐE) and validity is the same energy's value — flow-matching, done energy-first.");
