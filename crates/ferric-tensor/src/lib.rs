@@ -428,6 +428,10 @@ impl Tensor {
         let wc = w.contiguous();
         let out_f = wc.shape[0];
         assert_eq!(inn, wc.shape[1], "inner dims mismatch");
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if let Some(t) = metal4_linear(&self.ctx, &x, &wc, rows, inn, out_f, 0) {
+            return t;
+        }
         let out = empty(&self.ctx, rows * out_f);
         run(&self.ctx, MATMUL_BT_WGSL, "matmul_bt", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32])], groups(rows * out_f));
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
@@ -442,6 +446,10 @@ impl Tensor {
         let (rows, inn) = (x.shape[0], x.shape[1]);
         let wc = w.contiguous();
         let out_f = wc.shape[0];
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if let Some(t) = metal4_linear(&self.ctx, &x, &wc, rows, inn, out_f, act) {
+            return t;
+        }
         let out = empty(&self.ctx, rows * out_f);
         run(&self.ctx, MATMUL_BT_ACT_WGSL, "matmul_bt_act", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32, act])], groups(rows * out_f));
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
@@ -677,6 +685,31 @@ impl KvBuf {
 }
 
 // ---------- device plumbing (uses ferric-core Context's public device/queue) ----------
+/// The Metal-4 resident linear fast path (`y = act(x·Wᵀ)`, W in HF [out,in] layout) — opt-in via
+/// `FERRIC_METAL4=1` under the same precision doctrine as the matmul fast path (fp16 inputs by
+/// contract, never silently on), with the same ~1e8-flop floor and the same sync contract: the
+/// clear-or-empty submit flushes staged uploads and marks a fresh out buffer initialized, the poll
+/// drains wgpu, then the tensor units consume the wgpu buffers directly (NT — no Wᵀ materialized,
+/// activation fused into the unpad epilogue).
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn metal4_linear(ctx: &Arc<Context>, x: &Tensor, w: &Tensor, rows: usize, inn: usize, out_f: usize, act: u32) -> Option<Tensor> {
+    if 2 * rows * inn * out_f < 100_000_000 || std::env::var("FERRIC_METAL4").is_err() {
+        return None;
+    }
+    let g = crate::metal4::resident_for(ctx)?;
+    let (out, fresh) = crate::metal4::pooled_out(ctx, rows * out_f);
+    if fresh {
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.clear_buffer(&out, 0, None);
+        ctx.queue.submit([enc.finish()]);
+    } else {
+        ctx.queue.submit([]);
+    }
+    device_sync(ctx);
+    g.linear_resident(&x.buf, x.offset * 4, &w.buf, w.offset * 4, &out, rows, inn, out_f, act)?;
+    Some(Tensor::from_arc(ctx, out, &[rows, out_f]))
+}
+
 fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
     ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("t"), size: (n.max(1) * 4) as u64,

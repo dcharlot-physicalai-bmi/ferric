@@ -98,5 +98,42 @@ fn main() {
     let per = t0.elapsed().as_secs_f64() / 20.0;
     println!("  {:.3} ms/call  ({:.1} GFLOP/s sustained)", per * 1e3, 2.0 * (nn as f64).powi(3) / per / 1e9);
 
+    // the inference hot path: y = silu(x·Wᵀ), W in the HF [out,in] layout (a llama-class FFN
+    // projection) — NT on the tensor units, activation fused into the unpad epilogue
+    println!("\n=== linear layers (x·Wᵀ, HF layout — the ferric-llama hot path) ===");
+    println!("  {:>22}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+    for &(rows, inn, out_f) in &[(32usize, 2048usize, 8192usize), (64, 4096, 4096)] {
+        let x = Tensor::from_vec(&ctx, &gen(rows * inn, 1), &[rows, inn]);
+        let w = Tensor::from_vec(&ctx, &gen(out_f * inn, 7), &[out_f, inn]);
+        let flops = 2.0 * (rows * inn * out_f) as f64;
+
+        std::env::remove_var("FERRIC_METAL4");
+        let time_bt = |reps: usize| {
+            let _ = pollster::block_on(x.matmul_bt_act(&w, 2).to_vec());
+            let t0 = Instant::now();
+            let mut last = None;
+            for _ in 0..reps {
+                last = Some(x.matmul_bt_act(&w, 2));
+            }
+            let res = pollster::block_on(last.unwrap().to_vec());
+            (t0.elapsed().as_secs_f64() / reps as f64, res)
+        };
+        let (t_wgsl, r_wgsl) = time_bt(3);
+        std::env::set_var("FERRIC_METAL4", "1");
+        let (t_m4, r_m4) = time_bt(3);
+        let err = max_abs_diff(&r_m4, &r_wgsl);
+        assert!(err < 5e-2, "resident linear off at {rows}x{inn}x{out_f}: err {err}");
+        assert!(t_m4 < t_wgsl, "tensor units should beat WGSL at {rows}x{inn}x{out_f}");
+        println!(
+            "  {:>22}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
+            format!("[{rows},{inn}]·[{out_f},{inn}]ᵀ"),
+            t_wgsl * 1e3,
+            flops / t_wgsl / 1e9,
+            t_m4 * 1e3,
+            flops / t_m4 / 1e9,
+            t_wgsl / t_m4
+        );
+    }
+
     println!("\n✅ resident tensor-unit path: correct vs the fp16 oracle, faster than WGSL, zero host copies");
 }

@@ -52,7 +52,7 @@ struct ShapeCache {
 // buffers themselves are per-call: their GPU addresses go into the convert/unpad argument tables and
 // a small per-call residency set; everything else here is shape-static.
 struct ResidentCache {
-    key: (usize, usize, usize, usize), // batch, m, k, n
+    key: (usize, usize, usize, usize, bool, u32), // batch, m, k, n, b-transposed, act
     // scratch kept alive for the argtables' baked GPU addresses (f16 A/B pads, f32 C pad)
     _scr: [Obj<dyn MTLBuffer>; 3],
     at_cv_a: Obj<dyn MTL4ArgumentTable>, // padConvert A: wgpu src → scr_a
@@ -72,6 +72,7 @@ pub struct Metal4Gemm {
     device: Obj<dyn MTLDevice>,
     queue: Obj<dyn MTL4CommandQueue>,
     pso: Obj<dyn MTLComputePipelineState>,
+    pso_bt: Obj<dyn MTLComputePipelineState>,
     pso_pad: Obj<dyn MTLComputePipelineState>,
     pso_unpad: Obj<dyn MTLComputePipelineState>,
     event: Obj<dyn MTLSharedEvent>,
@@ -132,11 +133,11 @@ impl Metal4Gemm {
         std::fs::write(&path, METALLIB).ok()?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
         let lib = device.newLibraryWithURL_error(&url).ok()?;
-        let mut psos = ["matMul", "padConvert", "unpad"].into_iter().map(|name| {
+        let mut psos = ["matMul", "matMulBT", "padConvert", "unpad"].into_iter().map(|name| {
             let func = lib.newFunctionWithName(&NSString::from_str(name))?;
             device.newComputePipelineStateWithFunction_error(&func).ok()
         });
-        let (pso, pso_pad, pso_unpad) = (psos.next()??, psos.next()??, psos.next()??);
+        let (pso, pso_bt, pso_pad, pso_unpad) = (psos.next()??, psos.next()??, psos.next()??, psos.next()??);
         let queue = device.newMTL4CommandQueue()?;
         let event = device.newSharedEvent()?;
         let adapter_name = device.name().to_string();
@@ -144,6 +145,7 @@ impl Metal4Gemm {
             device,
             queue,
             pso,
+            pso_bt,
             pso_pad,
             pso_unpad,
             event,
@@ -299,14 +301,15 @@ impl Metal4Gemm {
         out
     }
 
-    // Build (or rebuild) the resident-path shape-static objects.
-    fn build_rcache(&self, batch: usize, m: usize, k: usize, n: usize) -> ResidentCache {
+    // Build (or rebuild) the resident-path shape-static objects. `bt` = B is a [n, k] weight
+    // consumed transposed (NT); `act` = fused activation code applied by the unpad epilogue.
+    fn build_rcache(&self, batch: usize, m: usize, k: usize, n: usize, bt: bool, act: u32) -> ResidentCache {
         let mp = m.div_ceil(TILE_M) * TILE_M;
         let np = n.div_ceil(TILE_N) * TILE_N;
         let dev = &self.device;
 
         let scr_a = dev.newBufferWithLength_options(batch * mp * k * 2, MTLResourceOptions::StorageModeShared).expect("A scratch");
-        let scr_b = dev.newBufferWithLength_options(k * np * 2, MTLResourceOptions::StorageModeShared).expect("B scratch");
+        let scr_b = dev.newBufferWithLength_options(k * np * 2, MTLResourceOptions::StorageModeShared).expect("B scratch"); // same byte size either orientation
         let scr_c = dev.newBufferWithLength_options(batch * mp * np * 4, MTLResourceOptions::StorageModeShared).expect("C scratch");
         // zero once: pads stay zero (padConvert only writes data regions; matmul rewrites all of C)
         unsafe {
@@ -324,8 +327,13 @@ impl Metal4Gemm {
             b
         };
         let par_a = mk_params(&[(batch * m * k) as u32, (m * k) as u32, (mp * k) as u32]);
-        let par_b = mk_params(&[(k * n) as u32, n as u32, np as u32]);
-        let par_c = mk_params(&[(batch * m * n) as u32, n as u32, np as u32, m as u32, mp as u32]);
+        // NT: W's [n, k] rows are contiguous — the padded copy is the identity map, pads = tail rows
+        let par_b = if bt {
+            mk_params(&[(n * k) as u32, (n * k) as u32, (n * k) as u32])
+        } else {
+            mk_params(&[(k * n) as u32, n as u32, np as u32])
+        };
+        let par_c = mk_params(&[(batch * m * n) as u32, n as u32, np as u32, m as u32, mp as u32, act]);
 
         // convert/unpad argument tables: scratch + param addresses are static; the wgpu-side
         // addresses (index 0 of cv_a/cv_b, index 1 of up) are set per call.
@@ -344,12 +352,15 @@ impl Metal4Gemm {
             at_up.setAddress_atIndex(par_c.gpuAddress(), 2);
         }
 
-        // matmul tensor views over the scratch buffers — identical layout to the host-boundary path
+        // matmul tensor views over the scratch buffers — NN keeps the host-boundary layout; NT views
+        // the weight rows as extents [k, np] (k innermost), which matmul2d consumes transposed
         let t_b = unsafe {
-            scr_b.newTensorWithDescriptor_offset_error(
-                &tensor_desc(MTLTensorDataType::Float16, &[np as isize, k as isize], &[1, np as isize], MTLStorageMode::Shared),
-                0,
-            )
+            let desc = if bt {
+                tensor_desc(MTLTensorDataType::Float16, &[k as isize, np as isize], &[1, k as isize], MTLStorageMode::Shared)
+            } else {
+                tensor_desc(MTLTensorDataType::Float16, &[np as isize, k as isize], &[1, np as isize], MTLStorageMode::Shared)
+            };
+            scr_b.newTensorWithDescriptor_offset_error(&desc, 0)
         }
         .expect("B tensor");
         let mut mm_argtabs = Vec::with_capacity(batch);
@@ -394,7 +405,7 @@ impl Metal4Gemm {
         let alloc = dev.newCommandAllocator().expect("allocator");
         let cb = dev.newCommandBuffer().expect("command buffer");
         ResidentCache {
-            key: (batch, m, k, n),
+            key: (batch, m, k, n, bt, act),
             _scr: [scr_a, scr_b, scr_c],
             at_cv_a,
             at_cv_b,
@@ -408,12 +419,13 @@ impl Metal4Gemm {
         }
     }
 
-    /// **Resident** batched matmul: operands and result are **wgpu buffers** (f32, contiguous), and the
-    /// whole pipeline — pad+f16-convert, `matmul2d` on the tensor units, unpad — runs as one MTL4
-    /// command buffer on wgpu's own `MTLDevice`. No byte crosses the host. Offsets are in bytes.
+    /// **Resident** batched matmul `[batch,m,k]·[k,n]`: operands and result are **wgpu buffers**
+    /// (f32, contiguous), and the whole pipeline — pad+f16-convert, `matmul2d` on the tensor units,
+    /// unpad — runs as one MTL4 command buffer on wgpu's own `MTLDevice`. No byte crosses the host.
+    /// Offsets are in bytes.
     ///
-    /// The caller must ensure prior wgpu work producing `a`/`b` has completed (e.g.
-    /// [`ferric_core`-level] device poll) — this call blocks until the GPU finishes, so wgpu
+    /// The caller must ensure prior wgpu work producing `a`/`b` has completed (submit **then** poll —
+    /// staged uploads only flush on submit) — this call blocks until the GPU finishes, so wgpu
     /// submissions issued after it return safely observe `out`. Returns `None` (touching nothing) if
     /// the buffers aren't Metal-backed.
     #[allow(clippy::too_many_arguments)] // a GEMM signature: three operands + offsets + four dims
@@ -429,12 +441,50 @@ impl Metal4Gemm {
         k: usize,
         n: usize,
     ) -> Option<()> {
+        self.run_resident(a, a_off, b, b_off, out, batch, m, k, n, false, 0)
+    }
+
+    /// **Resident** linear layer `y = act(x·Wᵀ)` with W in the HF `[out_f, in]` layout, consumed
+    /// transposed by the tensor units (NT — no transpose materialization) and the activation fused
+    /// into the unpad epilogue (codes match `matmul_bt_act`: 0 id, 1 relu, 2 silu, 3 gelu,
+    /// 4 sigmoid). Same residency/sync contract as [`Self::bmm_resident`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_resident(
+        &self,
+        x: &wgpu::Buffer,
+        x_off: usize,
+        w: &wgpu::Buffer,
+        w_off: usize,
+        out: &wgpu::Buffer,
+        rows: usize,
+        inn: usize,
+        out_f: usize,
+        act: u32,
+    ) -> Option<()> {
+        self.run_resident(x, x_off, w, w_off, out, 1, rows, inn, out_f, true, act)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_resident(
+        &self,
+        a: &wgpu::Buffer,
+        a_off: usize,
+        b: &wgpu::Buffer,
+        b_off: usize,
+        out: &wgpu::Buffer,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        bt: bool,
+        act: u32,
+    ) -> Option<()> {
         let ra = wgpu_buffer_raw(a)?;
         let rb = wgpu_buffer_raw(b)?;
         let rc = wgpu_buffer_raw(out)?;
         let mut guard = self.rcache.lock().unwrap();
-        if guard.as_ref().map(|c| c.key) != Some((batch, m, k, n)) {
-            *guard = Some(self.build_rcache(batch, m, k, n));
+        if guard.as_ref().map(|c| c.key) != Some((batch, m, k, n, bt, act)) {
+            *guard = Some(self.build_rcache(batch, m, k, n, bt, act));
         }
         let c = guard.as_ref().unwrap();
         let mp = m.div_ceil(TILE_M) * TILE_M;
@@ -472,8 +522,9 @@ impl Metal4Gemm {
             MTL4VisibilityOptions::Device,
         );
         // stage 2: the tensor-unit GEMM (one dispatch per batch element, disjoint C)
-        enc.setComputePipelineState(&self.pso);
-        let tew = self.pso.threadExecutionWidth();
+        let mm = if bt { &self.pso_bt } else { &self.pso };
+        enc.setComputePipelineState(mm);
+        let tew = mm.threadExecutionWidth();
         let grid = MTLSize { width: np / TILE_N, height: mp / TILE_M, depth: 1 };
         let tgm = MTLSize { width: tew * 4, height: 1, depth: 1 };
         for at in &c.mm_argtabs {
@@ -738,6 +789,64 @@ mod tests {
         rcheck(1, 100, 37, 50, 0); // ragged → rebuild + padding
         rcheck(4, 32, 64, 32, 0); // batch → offset views
         rcheck(1, 128, 64, 64, 9); // shape switch back
+    }
+
+    /// The NT (transpose-right) linear path with the fused activation epilogue: y = act(x·Wᵀ),
+    /// W in the HF [out,in] layout, against an fp16-input oracle mirroring the WGSL act formulas.
+    #[test]
+    fn resident_linear_bt_and_act_match_the_fp16_oracle() {
+        use std::sync::Arc;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            eprintln!("backend is {:?}, not Metal — skipping", ctx.backend);
+            return;
+        }
+        let ctx = Arc::new(ctx);
+        let Some(g) = resident_for(&ctx) else {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        };
+
+        let act_f = |v: f32, a: u32| -> f32 {
+            match a {
+                1 => v.max(0.0),
+                2 => v / (1.0 + (-v).exp()),
+                4 => 1.0 / (1.0 + (-v).exp()),
+                _ => v,
+            }
+        };
+        let lcheck = |rows: usize, inn: usize, out_f: usize, act: u32, salt: usize| {
+            let x: Vec<f32> = (0..rows * inn).map(|i| 0.05 * (((i + 1 + salt) % 13) as f32 - 6.0)).collect();
+            let w: Vec<f32> = (0..out_f * inn).map(|i| 0.05 * (((i + 7 + salt) % 11) as f32 - 5.0)).collect();
+            let tx = crate::Tensor::from_vec(&ctx, &x, &[rows, inn]);
+            let tw = crate::Tensor::from_vec(&ctx, &w, &[out_f, inn]);
+            let out = crate::Tensor::zeros(&ctx, &[rows, out_f]);
+            ctx.queue.submit([]);
+            crate::device_sync(&ctx);
+            g.linear_resident(&tx.buf, 0, &tw.buf, 0, &out.buf, rows, inn, out_f, act)
+                .expect("resident linear dispatch");
+            let got = pollster::block_on(out.to_vec());
+            // fp16-input oracle: y[i,j] = act(Σ_l x16[i,l]·w16[j,l])
+            let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&t| f16::from_f32(t).to_f32()).collect() };
+            let (xf, wf) = (q(&x), q(&w));
+            let err = (0..rows * out_f)
+                .map(|i| {
+                    let (r, j) = (i / out_f, i % out_f);
+                    let acc: f32 = (0..inn).map(|l| xf[r * inn + l] * wf[j * inn + l]).sum();
+                    (got[i] - act_f(acc, act)).abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(err < 1e-3, "linear rows={rows} in={inn} out={out_f} act={act} salt={salt}: err {err}");
+        };
+        lcheck(128, 64, 64, 0, 0); // exact tiles, identity
+        lcheck(128, 64, 64, 0, 3); // cache reuse, fresh data
+        lcheck(100, 37, 50, 0, 0); // ragged → padding (weight tail rows)
+        lcheck(100, 37, 50, 2, 0); // ragged + fused silu
+        lcheck(128, 64, 64, 1, 0); // relu → act is part of the cache key (rebuild)
+        lcheck(128, 64, 64, 4, 1); // sigmoid
     }
 }
 
