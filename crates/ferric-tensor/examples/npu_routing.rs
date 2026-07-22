@@ -1,13 +1,12 @@
 //! **NPU routing readiness** — proves the fabric's `Device::Npu` dispatch path and the adaptive `Planner`
 //! route correctly across a CPU + GPU + NPU device set, so a real NPU execution-provider drops straight in.
 //!
-//! HONESTY (the same contract as `probe_npu`): there is **no faked ANE dispatch** here. A real Apple ANE is
-//! reachable only through CoreML (which also decides the compute unit), and WebNN's `'npu'` device is the
-//! browser route — neither is wired in this build (no `objc2-core-ml` vendored; WebNN absent). So the NPU
-//! device below is a **reference execution-provider that computes on the CPU**, present only to exercise the
-//! fabric's `NpuBackend` trait, `Device::Npu` dispatch, and the `Planner`'s N-way routing end to end. When a
-//! genuine CoreML / WebNN / DirectML EP is available, it implements the *same* `NpuBackend` and is routed by
-//! the *same* Planner — nothing else changes. The reference EP is never reported as the ANE.
+//! HONESTY (the same contract as `probe_npu`): no faked ANE dispatch, ever. On Apple Silicon the
+//! **real CoreML ANE execution-provider** (`ferric_tensor::npu_coreml`) is auto-added by
+//! `detect_devices` — but only after `MLComputePlan` confirms the Neural Engine runs the model's
+//! matmul (Apple's own scheduler receipt). Where no real EP is available, this example falls back to
+//! a **reference EP that computes on the CPU**, present only to exercise `Device::Npu` dispatch and
+//! N-way routing — and never reported as the ANE.
 
 use ferric_tensor::sched::{detect_devices, Device, Fabric, NpuBackend, Planner};
 use std::sync::Arc;
@@ -50,16 +49,24 @@ fn gen(n: usize, salt: usize) -> Vec<f32> {
 
 async fn run() {
     let (mut devices, npu_info) = detect_devices().await;
-    // register the reference NPU as a real device in the fabric (via the NpuBackend trait)
-    devices.push(Device::Npu(Arc::new(ReferenceNpu)));
+    // real ANE present? detect_devices added it (plan-receipt-gated). Otherwise fall back to the
+    // reference EP so the dispatch path is still exercised.
+    let real_ane = devices.iter().any(|d| matches!(d, Device::Npu(_)));
+    if !real_ane {
+        devices.push(Device::Npu(Arc::new(ReferenceNpu)));
+    }
     let fabric = Fabric::new(devices);
 
-    println!("=== fabric (with a reference NPU execution-provider) ===");
+    println!("=== fabric ===");
     for d in &fabric.devices {
         println!("  {}", d.name());
     }
-    println!("  probe_npu: {} — reachable via {}, dispatchable now: {}", npu_info.name, npu_info.reachable_via, npu_info.dispatchable);
-    println!("  (the ANE stays 'not dispatchable' — the reference EP below is CPU-backed, only to test routing)");
+    println!("  probe: {} — {}, dispatchable now: {}", npu_info.name, npu_info.reachable_via, npu_info.dispatchable);
+    if real_ane {
+        println!("  → the NPU device above is the REAL Neural Engine (compute-plan receipt in `reachable via`)");
+    } else {
+        println!("  → no real EP here; the CPU-backed reference EP exercises the dispatch path only");
+    }
 
     // find the NPU device index; confirm the Planner calibrates + can route to it
     let npu = fabric.devices.iter().position(|d| matches!(d, Device::Npu(_))).unwrap();
@@ -84,7 +91,9 @@ async fn run() {
         worst = worst.max(e);
         npu_ran = true;
         println!("  N={nn:>3}  direct NPU-EP dispatch → max err vs oracle {e:.1e}");
-        assert!(e < 1e-4, "NPU dispatch must be correct");
+        // the real ANE is an fp16-input device (like Metal4); the reference EP is exact f32
+        let tol = if real_ane { 1e-2 } else { 1e-4 };
+        assert!(e < tol, "NPU dispatch must be correct (tol {tol})");
     }
     // (b) adaptive routing: the Planner picks a device per size across the whole fabric
     for &nn in &[8usize, 64, 256, 512] {
@@ -98,7 +107,10 @@ async fn run() {
     }
 
     println!("\n✅ the fabric dispatches through Device::Npu and the Planner routes across CPU+GPU+NPU (worst err {worst:.1e}).");
-    println!("   A real ANE (CoreML EP) or WebNN 'npu' backend implements the same NpuBackend and is routed identically —");
+    if real_ane {
+        println!("   That NPU is the REAL Apple Neural Engine — CoreML EP, ANE dispatch confirmed by MLComputePlan.");
+    }
+    println!("   Any other NPU (WebNN 'npu', DirectML/QNN) implements the same NpuBackend and is routed identically —");
     println!("   that platform binding is the remaining work; the routing/dispatch path is proven ready.");
     assert!(npu_ran && worst < 1e-2);
 }

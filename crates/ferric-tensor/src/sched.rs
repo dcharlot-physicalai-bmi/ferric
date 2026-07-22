@@ -158,6 +158,26 @@ pub async fn detect_devices() -> (Vec<Device>, NpuInfo) {
     if let Some(g) = crate::metal4::Metal4Gemm::new() {
         devices.push(Device::Metal4(Arc::new(g)));
     }
+    // The real ANE execution provider — added ONLY when MLComputePlan confirms the Neural Engine
+    // runs the model's matmul (the honesty gate: Apple's own scheduler receipt, never our claim).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if let Some(npu) = crate::npu_coreml::CoreMlNpu::new() {
+            if npu.ane_confirmed {
+                let plan = npu.plan_report.clone();
+                devices.push(Device::Npu(Arc::new(npu)));
+                return (
+                    devices,
+                    NpuInfo {
+                        present: true,
+                        name: "Apple Neural Engine (ANE)".into(),
+                        reachable_via: format!("CoreML — compute plan: {plan}"),
+                        dispatchable: true,
+                    },
+                );
+            }
+        }
+    }
     (devices, probe_npu())
 }
 
@@ -286,8 +306,11 @@ impl Planner {
         for d in &fabric.devices {
             let ts = time_dev(d, &ps);
             let tl = time_dev(d, &pl);
-            // solve t = overhead + flops/throughput from the two points
-            let rate = ((fl - fs) / (tl - ts).max(1e-9)).max(1.0);
+            // solve t = overhead + flops/throughput from the two points. Devices with shape
+            // caches can return BOTH probes latency-dominated (tl ≈ ts), degenerating the slope
+            // to ~0 and the fitted rate to infinity — clamp to a physical ceiling so the cost
+            // model stays sane (100 TFLOP/s is above any single-die GEMM rate we can reach).
+            let rate = ((fl - fs) / (tl - ts).max(1e-9)).clamp(1.0, 1e14);
             let over = (ts - fs / rate).max(0.0);
             names.push(d.name());
             overhead.push(over);

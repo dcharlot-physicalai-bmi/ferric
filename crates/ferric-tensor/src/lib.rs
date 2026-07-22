@@ -25,7 +25,9 @@ pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler
 pub mod nn; // transformer blocks expressed on the general runtime
 pub mod optim; // optimizers (Adam)
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
-pub mod metal4; // Metal 4 tensor-unit GEMM backend (~280× the WGSL path on Apple silicon)
+pub mod metal4;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_arch = "wasm32")))]
+pub mod npu_coreml; // Metal 4 tensor-unit GEMM backend (~280× the WGSL path on Apple silicon)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]

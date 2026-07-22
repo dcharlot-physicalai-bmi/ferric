@@ -1,4 +1,30 @@
-# Wiring a real NPU execution-provider
+# The real NPU execution-provider
+
+**DONE (2026-07): the fabric dispatches on the real Apple Neural Engine.**
+`ferric_tensor::npu_coreml::CoreMlNpu` is a CoreML execution-provider whose ANE use is
+**confirmed by `MLComputePlan`** (Apple's own scheduler receipt — the honesty gate below);
+`detect_devices()` adds it as `Device::Npu` only when the receipt shows the Neural Engine.
+
+What the receipts taught us (all measured from Rust, see `npu_coreml::plan_experiments`):
+
+| model pattern                                   | preferred device |
+|-------------------------------------------------|------------------|
+| rank-2 matmul (512×512, dynamic operands)       | CPU              |
+| rank-2 linear+relu (fixed weights)              | CPU              |
+| 3×3 conv, 64 ch, 56×56                          | CPU              |
+| **rank-4 matmul (1,8,512,64)·(1,8,64,512)**     | **ANE** (all ops)|
+| **1×1 conv, 512 ch, 32×32**                     | **ANE**          |
+
+The embedded EP uses the rank-4 matmul (≈16 KB `.mlmodelc`, authored with coremltools MIL +
+`coremlcompiler`); arbitrary `bmm` shapes tile onto it (512×512 output tiles, K covered 8
+lanes × 64 per prediction, lanes host-summed). Measured on M5 Max: ~500 µs dispatch overhead,
+~700 GFLOP/s through the host-boundary tiling — real numbers from real silicon, calibrated by
+the same `Planner` as every other device. On this box the M5's GPU tensor units still win
+every size class; the point is the fabric *knows* that by measurement, not assumption.
+
+---
+
+## The original plan (kept for the record)
 
 The fabric's NPU **routing + dispatch path is done and verified**
 (`crates/ferric-tensor/examples/npu_routing.rs`): `Device::Npu(Arc<dyn NpuBackend>)`
