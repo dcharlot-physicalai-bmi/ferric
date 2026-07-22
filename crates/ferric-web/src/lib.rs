@@ -624,3 +624,58 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
     Ok(rows.join("\n"))
 }
 mod efa;
+
+/// Browser forensic: GPU det_sqrt vs the bit-exact CPU (wasm, IEEE) replica of
+/// the same barriered sequence — pinpoints WHICH inputs deviate under Tint.
+#[wasm_bindgen]
+pub async fn ferric_sqrt_forensic() -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f32::from_bits(0x3F80_0000 | (s >> 41) as u32) - 1.5
+            })
+            .collect()
+    }
+    fn det_sqrt_cpu(y: f32) -> f32 {
+        if y <= 0.0 {
+            return 0.0;
+        }
+        let hy = 0.5 * y;
+        let mut x = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = x * x;
+            let u = hy * t;
+            let w = 1.5 - u;
+            x = x * w;
+        }
+        y * x
+    }
+    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let x = det(12 * 64, 1);
+    let x_pos: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
+    let xpt = ctx.tensor(&x_pos, &[12, 64]);
+    let sq = ctx.sqrt_t(&xpt);
+    let gpu = ctx.to_vec(&sq).await.map_err(|e| JsValue::from_str(&e))?;
+    let mut bad = 0usize;
+    let mut first = String::new();
+    for (i, (&y, &g)) in x_pos.iter().zip(&gpu).enumerate() {
+        let c = det_sqrt_cpu(y);
+        if c.to_bits() != g.to_bits() {
+            if bad == 0 {
+                first = format!(
+                    "first dev: i={i} y={:08x} cpu={:08x} gpu={:08x}",
+                    y.to_bits(),
+                    c.to_bits(),
+                    g.to_bits()
+                );
+            }
+            bad += 1;
+        }
+    }
+    Ok(format!("sqrt gpu-vs-cpu deviations: {bad}/{}\n{first}", gpu.len()))
+}

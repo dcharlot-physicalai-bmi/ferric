@@ -1,0 +1,167 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EFA on Ferric — open weights on browser WebGPU</title>
+<style>
+:root{ --bg:#0b1024; --panel:#0e1630; --edge:rgba(207,170,91,.22); --line:#243157; --ink:#eef1f8; --dim:#8aa0bd; --gold:#cfaa5b; --teal:#46c6b0; --blue:#6ea8ff; --red:#ff6a6a;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace; --sans:"Inter",system-ui,-apple-system,sans-serif; }
+*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--gold);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:980px;margin:0 auto;padding:0 22px 80px}
+header{padding:54px 0 30px;border-bottom:1px solid var(--line)}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--gold);font-weight:600;margin:0 0 14px}
+h1{margin:0;font-size:32px;line-height:1.12;font-weight:650;letter-spacing:-.01em;text-wrap:balance}
+h1 .thin{color:var(--dim);font-weight:400}
+.thesis{margin:16px 0 0;font-size:15.5px;line-height:1.6;color:var(--dim);max-width:70ch}
+.thesis b{color:var(--ink);font-weight:600}
+.tabs{display:flex;gap:8px;margin:26px 0 14px;font-family:var(--mono);font-size:12px;flex-wrap:wrap}
+.tab{border:1px solid var(--line);border-radius:8px;padding:8px 14px;cursor:pointer;color:var(--dim)}
+.tab.on{border-color:var(--edge);color:var(--gold)}
+.stage{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:16px}
+canvas{width:100%;height:auto;display:block;border-radius:8px}
+.hud{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+.hud b{color:var(--ink)} .hud .g{color:var(--gold)} .hud .t{color:var(--teal)}
+.ctrl{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center;font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+.btn{border:1px solid var(--line);border-radius:8px;background:none;color:var(--ink);font-family:var(--mono);font-size:11.5px;padding:7px 12px;cursor:pointer}
+.btn:hover{border-color:var(--edge);color:var(--gold)} .btn.on{border-color:var(--edge);color:var(--gold)}
+input[type=range]{accent-color:var(--gold);width:110px}
+.meter{height:8px;border-radius:4px;background:#182348;overflow:hidden;width:140px;display:inline-block;vertical-align:middle}
+.meter i{display:block;height:100%;background:var(--teal)}
+.note{margin-top:22px;font-size:13px;line-height:1.6;color:var(--dim);max-width:74ch}
+.note b{color:var(--ink)}
+.links{margin-top:10px;font-family:var(--mono);font-size:12px}
+#load{font-family:var(--mono);font-size:12px;color:var(--dim);padding:40px 0;text-align:center}
+</style></head><body><div class="wrap">
+<header>
+  <p class="eyebrow">Charlot Lab · EFA · Ferric Runtime</p>
+  <h1>Open weights on WebGPU. <span class="thin">Same kernels as native.</span></h1>
+  <p class="thesis">The released EFA checkpoints, fetched from Hugging Face and executed by <b>Ferric compiled to WASM on your browser's WebGPU</b> — the same pure-Rust tensor ops (including the second-order autograd that computes the hybrid's ∇ₐE) that run natively on Metal. Toggle to the <b>JS CPU</b> path and watch the per-decision latency: at 21k parameters the CPU wins — dispatch overhead dominates — and the page says so, because that is the honest crossover. <b>The WebGPU path is the runtime that scales when the models outgrow JS.</b></p>
+  <div class="links">
+    <a href="https://huggingface.co/physicalai-bmi/efa-hybrid-arm2">efa-hybrid-arm2</a> ·
+    <a href="https://huggingface.co/physicalai-bmi/efa-flow-arm3">efa-flow-arm3</a> ·
+    <a href="https://physicalai-bmi.org/assets/sims/efa-weights.html">pure-JS demo</a> ·
+    <a href="https://efa.physicalai-bmi.org">EFA</a> ·
+    <a href="/">Ferric</a>
+  </div>
+</header>
+<div class="tabs">
+  <div class="tab on" id="tab2">efa-hybrid-arm2 — act + verify</div>
+  <div class="tab" id="tab3">efa-flow-arm3 — 3 joints</div>
+  <div style="flex:1"></div>
+  <div class="tab on" id="rtgpu">runtime: Ferric WebGPU</div>
+  <div class="tab" id="rtcpu">runtime: JS CPU</div>
+</div>
+<div class="stage">
+  <div id="load">initializing Ferric on WebGPU… fetching released weights from Hugging Face…</div>
+  <canvas id="cv" width="1880" height="720" style="display:none"></canvas>
+  <div class="hud" id="hud" style="display:none">
+    <span id="hmodel"></span><span id="hreach"></span><span id="hver"></span><span id="hlat"></span>
+  </div>
+  <div class="ctrl" id="ctrl" style="display:none">
+    <button class="btn" id="rand">randomize goal</button>
+    <button class="btn" id="kick">perturb</button>
+    <span id="sliders"></span>
+  </div>
+</div>
+<p class="note"><b>What is different from the pure-JS page.</b> Nothing about the models — that is the point. The same safetensors bytes are handed to <span style="font-family:var(--mono)">ferric_web.wasm</span>, uploaded once as Ferric tensors on the tab's WebGPU device, and each decision runs as real tensor-graph ops: forward the potential, backprop ∇ₐE through the second-order autograd, forward the correction, integrate — then the same potential scores the chosen action against a random one (the teal meter). Latency is displayed per decision for whichever runtime is active; switch runtimes live and compare. Cross-fabric is the claim: Metal natively, WebGPU here, one codebase.</p>
+</div>
+<script type="module">
+import init, { efa_load, efa_hybrid_act, efa_flow_act } from './pkg/ferric_web.js';
+const DT=.05, CPL=.5, UMAX=4, KAPPA=2, H=96;
+const wrap=x=>{while(x>Math.PI)x-=2*Math.PI;while(x<-Math.PI)x+=2*Math.PI;return x};
+// ---- JS CPU path (identical math, for the honest latency comparison) ----
+let T2=null,T3=null; // Float32Array maps for CPU path
+function parseST(buf){const dv=new DataView(buf);const n=Number(dv.getBigUint64(0,true));const hdr=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,8,n)));const base=8+n;const t={};
+  for(const k in hdr){if(k==="__metadata__")continue;const o=hdr[k].data_offsets;t[k]=new Float32Array(buf.slice(base+o[0],base+o[1]));}return t;}
+function mlp(t,pre,f,nout){const b1=t[pre+".b1"],W2=t[pre+".w2"],b2=t[pre+".b2"],W3=t[pre+".w3"],b3=t[pre+".b3"];
+  const h1=new Float32Array(H);for(let j=0;j<H;j++){let z=b1[j];for(let c=0;c<f.length;c++)z+=f[c]*t[pre+".in"+c][j];h1[j]=z>0?z:0;}
+  const h2=new Float32Array(H);for(let j=0;j<H;j++){let z=b2[j];for(let k=0;k<H;k++)z+=h1[k]*W2[k*H+j];h2[j]=z>0?z:0;}
+  const o=new Float32Array(nout);for(let c=0;c<nout;c++){let v=b3[c];for(let j=0;j<H;j++)v+=h2[j]*W3[j*nout+c];o[c]=v;}return o;}
+function gradA2(t,f){const b1=t["potential.b1"],W2=t["potential.w2"],b2=t["potential.b2"],W3=t["potential.w3"];
+  const h1=new Float32Array(H),m1=new Uint8Array(H);for(let j=0;j<H;j++){let z=b1[j];for(let c=0;c<f.length;c++)z+=f[c]*t["potential.in"+c][j];m1[j]=z>0;h1[j]=z>0?z:0;}
+  const m2=new Uint8Array(H);for(let j=0;j<H;j++){let z=b2[j];for(let k=0;k<H;k++)z+=h1[k]*W2[k*H+j];m2[j]=z>0;}
+  const d2=new Float32Array(H);for(let j=0;j<H;j++)if(m2[j])d2[j]=W3[j];
+  const d1=new Float32Array(H);for(let k=0;k<H;k++)if(m1[k]){let z=0;for(let j=0;j<H;j++)z+=W2[k*H+j]*d2[j];d1[k]=z;}
+  let g1=0,g2=0;for(let j=0;j<H;j++){g1+=t["potential.in8"][j]*d1[j];g2+=t["potential.in9"][j]*d1[j];}return[g1,g2];}
+// ---- env + state ----
+const S2={th:[2.2,-1.5],om:[0,0],g:[.8,-.8]};
+const S3={th:[2.2,-1.5,1.0],om:[0,0,0],g:[.8,-.6,.5]};
+let mode=2, useGPU=true, lat=0, verSmooth=.5;
+function feat2(s,a1,a2,tt){const d1=s.th[0]-s.g[0],d2=s.th[1]-s.g[1];
+  return[Math.cos(d1),Math.sin(d1),s.om[0],Math.cos(d2),Math.sin(d2),s.om[1],Math.sin(s.th[0]),Math.sin(s.th[1]),a1,a2,tt];}
+function step2(s,u1,u2){const[t1,t2]=s.th,[o1,o2]=s.om;
+  const n1=o1+DT*(-Math.sin(t1)-.05*o1+CPL*Math.sin(t2-t1)+u1), n2=o2+DT*(-Math.sin(t2)-.05*o2+CPL*Math.sin(t1-t2)+u2);
+  s.th=[wrap(t1+DT*n1),wrap(t2+DT*n2)];s.om=[n1,n2];}
+function step3(s,u){const t=s.th,o=s.om;
+  const n1=o[0]+DT*(-Math.sin(t[0])-.05*o[0]+CPL*Math.sin(t[1]-t[0])+u[0]);
+  const n2=o[1]+DT*(-Math.sin(t[1])-.05*o[1]+CPL*Math.sin(t[0]-t[1])+CPL*Math.sin(t[2]-t[1])+u[1]);
+  const n3=o[2]+DT*(-Math.sin(t[2])-.05*o[2]+CPL*Math.sin(t[1]-t[2])+u[2]);
+  s.th=[wrap(t[0]+DT*n1),wrap(t[1]+DT*n2),wrap(t[2]+DT*n3)];s.om=[n1,n2,n3];}
+let fc2=0;
+function probeState(){return {th:[(Math.random()*2-1)*Math.PI,(Math.random()*2-1)*Math.PI],om:[(Math.random()*2-1)*3,(Math.random()*2-1)*3],g:S2.g};}
+function cpuAct2(s){let a1=0,a2=0;for(let k=0;k<2;k++){const tt=k/2;const g=gradA2(T2,feat2(s,a1,a2,tt));const w=mlp(T2,"correction",feat2(s,a1,a2,tt),2);
+    a1+=(-KAPPA*g[0]+w[0])/2;a2+=(-KAPPA*g[1]+w[1])/2;}
+  return[Math.max(-UMAX,Math.min(UMAX,a1)),Math.max(-UMAX,Math.min(UMAX,a2))];}
+async function decide2(){const r1=(Math.random()*2-1)*UMAX,r2=(Math.random()*2-1)*UMAX;fc2++;
+  if(useGPU){const o=await efa_hybrid_act(S2.th[0],S2.th[1],S2.om[0],S2.om[1],S2.g[0],S2.g[1],r1,r2);
+    lat=o[4];
+    // verify meter = the ledger metric: every few frames, probe a RANDOM state (policy action there vs random)
+    if(fc2%3===0){const P=probeState();const po=await efa_hybrid_act(P.th[0],P.th[1],P.om[0],P.om[1],P.g[0],P.g[1],r1,r2);
+      verSmooth=.94*verSmooth+.06*(po[2]<po[3]?1:0);}
+    return[o[0],o[1]];}
+  const t0=performance.now();const[a1,a2]=cpuAct2(S2);lat=performance.now()-t0;
+  if(fc2%3===0){const P=probeState();const[p1,p2]=cpuAct2(P);
+    const ep=mlp(T2,"potential",feat2(P,p1,p2,1),1)[0], er=mlp(T2,"potential",feat2(P,r1,r2,1),1)[0];
+    verSmooth=.94*verSmooth+.06*(ep<er?1:0);}
+  return[a1,a2];}
+async function decide3(){if(useGPU){const o=await efa_flow_act(S3.th[0],S3.th[1],S3.th[2],S3.om[0],S3.om[1],S3.om[2],S3.g[0],S3.g[1],S3.g[2]);
+    lat=o[3];return[o[0],o[1],o[2]];}
+  const t0=performance.now();const d=[0,1,2].map(i=>S3.th[i]-S3.g[i]);
+  const f=[Math.cos(d[0]),Math.sin(d[0]),S3.om[0],Math.cos(d[1]),Math.sin(d[1]),S3.om[1],Math.cos(d[2]),Math.sin(d[2]),S3.om[2],Math.sin(S3.th[0]),Math.sin(S3.th[1]),Math.sin(S3.th[2]),0,0,0,0];
+  const v=mlp(T3,"flow",f,3).map(x=>Math.max(-UMAX,Math.min(UMAX,x)));lat=performance.now()-t0;return v;}
+// ---- draw ----
+const cv=document.getElementById("cv"),cx=cv.getContext("2d");const $=id=>document.getElementById(id);
+function draw(){const s=mode===2?S2:S3,n=s.th.length;cx.clearRect(0,0,cv.width,cv.height);cx.font="22px ui-monospace,Menlo";const cw=cv.width/n;
+  for(let i=0;i<n;i++){const px=cw*(i+.5),py=200,L=340;
+    if(i>0){cx.strokeStyle="rgba(110,168,255,.35)";cx.beginPath();cx.moveTo(cw*(i-.5)+40,py);
+      for(let q=0;q<=20;q++){const x=cw*(i-.5)+40+(cw-80)*q/20;cx.lineTo(x,py+Math.sin(q*2.2)*8);}cx.stroke();}
+    cx.strokeStyle="rgba(207,170,91,.5)";cx.lineWidth=3;cx.setLineDash([8,8]);
+    cx.beginPath();cx.moveTo(px,py);cx.lineTo(px+L*Math.sin(s.g[i]),py+L*Math.cos(s.g[i]));cx.stroke();cx.setLineDash([]);
+    const ok=Math.abs(wrap(s.th[i]-s.g[i]))<.35&&Math.abs(s.om[i])<.7;
+    cx.strokeStyle=ok?"#46c6b0":"#eef1f8";cx.lineWidth=5;
+    const bx=px+L*Math.sin(s.th[i]),by=py+L*Math.cos(s.th[i]);
+    cx.beginPath();cx.moveTo(px,py);cx.lineTo(bx,by);cx.stroke();
+    cx.fillStyle=ok?"#46c6b0":"#cfaa5b";cx.beginPath();cx.arc(bx,by,16,0,7);cx.fill();
+    cx.fillStyle="#8aa0bd";cx.fillText("joint "+(i+1),px-38,py-30);}}
+function hud(){$("hlat").innerHTML=`runtime: <b class="g">${useGPU?"Ferric WebGPU":"JS CPU"}</b> · <b>${lat.toFixed(2)} ms</b>/decision`;
+  if(mode===2){const ok=[0,1].every(i=>Math.abs(wrap(S2.th[i]-S2.g[i]))<.35&&Math.abs(S2.om[i])<.7);
+    $("hreach").innerHTML=ok?'<b class="t">AT GOAL ✓</b>':"<b>driving…</b>";
+    $("hver").innerHTML=`verify · random-state probes: <span class="meter"><i style="width:${(verSmooth*100)|0}%"></i></span> <b class="t">${(verSmooth*100)|0}%</b>`;}
+  else{const ok=[0,1,2].every(i=>Math.abs(wrap(S3.th[i]-S3.g[i]))<.35&&Math.abs(S3.om[i])<.7);
+    $("hreach").innerHTML=ok?'<b class="t">AT GOAL ✓</b>':"<b>driving…</b>";$("hver").innerHTML="K=1 forward pass";}}
+let running=false;
+async function loop(){if(running)return;running=true;
+  while(true){try{ if(mode===2){const[u1,u2]=await decide2();step2(S2,u1,u2);}else{const u=await decide3();step3(S3,u);}
+    draw();hud();}catch(e){console.error(e);} await new Promise(r=>requestAnimationFrame(r)); }}
+function sliders(){const n=mode===2?2:3,s=mode===2?S2:S3;let h="";
+  for(let i=0;i<n;i++)h+=`g${i+1} <input type="range" id="sl${i}" min="-1.2" max="1.2" step="0.05" value="${s.g[i]}"> `;
+  $("sliders").innerHTML=h;for(let i=0;i<n;i++)$("sl"+i).oninput=e=>{(mode===2?S2:S3).g[i]=parseFloat(e.target.value)};}
+function setMode(m){mode=m;$("tab2").classList.toggle("on",m===2);$("tab3").classList.toggle("on",m===3);
+  $("hmodel").innerHTML=m===2?'<b class="g">efa-hybrid-arm2</b> · 21,219 params':'<b class="g">efa-flow-arm3</b> · 11,235 params';sliders();}
+function setRT(g){useGPU=g;$("rtgpu").classList.toggle("on",g);$("rtcpu").classList.toggle("on",!g);}
+$("tab2").onclick=()=>setMode(2);$("tab3").onclick=()=>setMode(3);
+$("rtgpu").onclick=()=>setRT(true);$("rtcpu").onclick=()=>setRT(false);
+$("rand").onclick=()=>{const s=mode===2?S2:S3;for(let i=0;i<s.g.length;i++){s.g[i]=(Math.random()*2-1)*(mode===2?1.2:1.0);const el=$("sl"+i);if(el)el.value=s.g[i];}};
+$("kick").onclick=()=>{const s=mode===2?S2:S3;for(let i=0;i<s.om.length;i++)s.om[i]+=(Math.random()*2-1)*2.5;};
+(async()=>{try{
+  await init();
+  const b="https://huggingface.co/physicalai-bmi/";
+  const [buf2,buf3]=await Promise.all([
+    fetch(b+"efa-hybrid-arm2/resolve/main/model.safetensors").then(r=>r.arrayBuffer()),
+    fetch(b+"efa-flow-arm3/resolve/main/model.safetensors").then(r=>r.arrayBuffer())]);
+  T2=parseST(buf2);T3=parseST(buf3);
+  const m1=await efa_load(0,new Uint8Array(buf2));
+  const m2=await efa_load(1,new Uint8Array(buf3));
+  console.log(m1,m2);
+  $("load").style.display="none";cv.style.display="block";$("hud").style.display="flex";$("ctrl").style.display="flex";
+  setMode(2);setRT(true);loop();
+}catch(e){$("load").textContent="init failed — needs a WebGPU browser ("+(e.message||e)+")";console.error(e);}})();
+</script></body></html>
