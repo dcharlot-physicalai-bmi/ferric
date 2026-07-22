@@ -48,15 +48,36 @@ struct ShapeCache {
     cb: Obj<dyn MTL4CommandBuffer>,
 }
 
+// Resident-path objects (wgpu-buffer operands), rebuilt on shape change like ShapeCache. The wgpu
+// buffers themselves are per-call: their GPU addresses go into the convert/unpad argument tables and
+// a small per-call residency set; everything else here is shape-static.
+struct ResidentCache {
+    key: (usize, usize, usize, usize), // batch, m, k, n
+    // scratch kept alive for the argtables' baked GPU addresses (f16 A/B pads, f32 C pad)
+    _scr: [Obj<dyn MTLBuffer>; 3],
+    at_cv_a: Obj<dyn MTL4ArgumentTable>, // padConvert A: wgpu src → scr_a
+    at_cv_b: Obj<dyn MTL4ArgumentTable>, // padConvert B: wgpu src → scr_b
+    at_up: Obj<dyn MTL4ArgumentTable>,   // unpad: scr_c → wgpu out
+    mm_argtabs: Vec<Obj<dyn MTL4ArgumentTable>>,
+    _params: Vec<Obj<dyn MTLBuffer>>,  // kernel param blocks (shape-static, written at build)
+    _tensors: Vec<Obj<dyn MTLTensor>>, // kept alive for the argtables' resource IDs
+    rset: Obj<dyn MTLResidencySet>,
+    alloc: Obj<dyn MTL4CommandAllocator>,
+    cb: Obj<dyn MTL4CommandBuffer>,
+}
+
 /// The Metal-4 tensor-unit GEMM device. Create with [`Metal4Gemm::new`]; `None` when the platform has no
 /// Metal-4 tensor support (kernel load or pipeline creation fails), so detection stays honest.
 pub struct Metal4Gemm {
     device: Obj<dyn MTLDevice>,
     queue: Obj<dyn MTL4CommandQueue>,
     pso: Obj<dyn MTLComputePipelineState>,
+    pso_pad: Obj<dyn MTLComputePipelineState>,
+    pso_unpad: Obj<dyn MTLComputePipelineState>,
     event: Obj<dyn MTLSharedEvent>,
     ticket: AtomicU64,
     cache: Mutex<Option<ShapeCache>>,
+    rcache: Mutex<Option<ResidentCache>>,
     pub adapter_name: String,
 }
 
@@ -72,29 +93,65 @@ fn make_extents(vals: &[isize]) -> Retained<MTLTensorExtents> {
         .expect("tensor extents")
 }
 
-fn tensor_desc(dt: MTLTensorDataType, dims: &[isize], strides: &[isize]) -> Retained<MTLTensorDescriptor> {
+// The descriptor's storage mode must MATCH the backing buffer's (Metal validates it) — wgpu storage
+// buffers are Private, our own staging buffers Shared, so the mode is the caller's to state.
+fn tensor_desc(dt: MTLTensorDataType, dims: &[isize], strides: &[isize], mode: MTLStorageMode) -> Retained<MTLTensorDescriptor> {
     let d = MTLTensorDescriptor::new();
     d.setDataType(dt);
     d.setUsage(MTLTensorUsage::Compute);
     d.setDimensions(&make_extents(dims));
     d.setStrides(Some(&make_extents(strides)));
+    d.setStorageMode(mode);
     d
 }
 
+/// The raw `MTLBuffer` behind a wgpu buffer (Metal backend only) — the interop handle that lets the
+/// tensor units read/write wgpu-resident data with no host copy. Caller owns queue synchronization.
+pub fn wgpu_buffer_raw(buf: &wgpu::Buffer) -> Option<Obj<dyn MTLBuffer>> {
+    let hal = unsafe { buf.as_hal::<wgpu::hal::api::Metal>() }?;
+    Some(hal.raw_handle().clone())
+}
+
 impl Metal4Gemm {
-    /// Probe + build the tensor-unit device. Returns `None` if unavailable (no faked capability).
+    /// Probe + build the tensor-unit device on the system default `MTLDevice` (standalone use —
+    /// host-boundary `bmm`). Returns `None` if unavailable (no faked capability).
     pub fn new() -> Option<Metal4Gemm> {
-        let device = MTLCreateSystemDefaultDevice()?;
+        Self::from_raw_device(MTLCreateSystemDefaultDevice()?)
+    }
+
+    /// Build on **wgpu's own** `MTLDevice`, so wgpu-resident buffers are directly usable as tensor
+    /// operands (Metal resources are per-`MTLDevice`; sharing requires the same device object).
+    pub fn for_wgpu(device: &wgpu::Device) -> Option<Metal4Gemm> {
+        let hal = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }?;
+        Self::from_raw_device(hal.raw_device().clone())
+    }
+
+    /// Build the queue/pipeline/event on an existing `MTLDevice`.
+    pub fn from_raw_device(device: Obj<dyn MTLDevice>) -> Option<Metal4Gemm> {
         let path = std::env::temp_dir().join("ferric_metal4_gemm.metallib");
         std::fs::write(&path, METALLIB).ok()?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
         let lib = device.newLibraryWithURL_error(&url).ok()?;
-        let func = lib.newFunctionWithName(&NSString::from_str("matMul"))?;
-        let pso = device.newComputePipelineStateWithFunction_error(&func).ok()?;
+        let mut psos = ["matMul", "padConvert", "unpad"].into_iter().map(|name| {
+            let func = lib.newFunctionWithName(&NSString::from_str(name))?;
+            device.newComputePipelineStateWithFunction_error(&func).ok()
+        });
+        let (pso, pso_pad, pso_unpad) = (psos.next()??, psos.next()??, psos.next()??);
         let queue = device.newMTL4CommandQueue()?;
         let event = device.newSharedEvent()?;
         let adapter_name = device.name().to_string();
-        Some(Metal4Gemm { device, queue, pso, event, ticket: AtomicU64::new(0), cache: Mutex::new(None), adapter_name })
+        Some(Metal4Gemm {
+            device,
+            queue,
+            pso,
+            pso_pad,
+            pso_unpad,
+            event,
+            ticket: AtomicU64::new(0),
+            cache: Mutex::new(None),
+            rcache: Mutex::new(None),
+            adapter_name,
+        })
     }
 
     // Build (or rebuild) all shape-dependent objects.
@@ -115,7 +172,7 @@ impl Metal4Gemm {
 
         let t_b = unsafe {
             buf_b.newTensorWithDescriptor_offset_error(
-                &tensor_desc(MTLTensorDataType::Float16, &[np as isize, k as isize], &[1, np as isize]),
+                &tensor_desc(MTLTensorDataType::Float16, &[np as isize, k as isize], &[1, np as isize], MTLStorageMode::Shared),
                 0,
             )
         }
@@ -125,14 +182,14 @@ impl Metal4Gemm {
         for bt in 0..batch {
             let t_a = unsafe {
                 buf_a.newTensorWithDescriptor_offset_error(
-                    &tensor_desc(MTLTensorDataType::Float16, &[k as isize, mp as isize], &[1, k as isize]),
+                    &tensor_desc(MTLTensorDataType::Float16, &[k as isize, mp as isize], &[1, k as isize], MTLStorageMode::Shared),
                     bt * mp * k * 2,
                 )
             }
             .expect("A tensor");
             let t_c = unsafe {
                 buf_c.newTensorWithDescriptor_offset_error(
-                    &tensor_desc(MTLTensorDataType::Float32, &[np as isize, mp as isize], &[1, np as isize]),
+                    &tensor_desc(MTLTensorDataType::Float32, &[np as isize, mp as isize], &[1, np as isize], MTLStorageMode::Shared),
                     bt * mp * np * 4,
                 )
             }
@@ -227,6 +284,221 @@ impl Metal4Gemm {
         }
         out
     }
+
+    // Build (or rebuild) the resident-path shape-static objects.
+    fn build_rcache(&self, batch: usize, m: usize, k: usize, n: usize) -> ResidentCache {
+        let mp = m.div_ceil(TILE_M) * TILE_M;
+        let np = n.div_ceil(TILE_N) * TILE_N;
+        let dev = &self.device;
+
+        let scr_a = dev.newBufferWithLength_options(batch * mp * k * 2, MTLResourceOptions::StorageModeShared).expect("A scratch");
+        let scr_b = dev.newBufferWithLength_options(k * np * 2, MTLResourceOptions::StorageModeShared).expect("B scratch");
+        let scr_c = dev.newBufferWithLength_options(batch * mp * np * 4, MTLResourceOptions::StorageModeShared).expect("C scratch");
+        // zero once: pads stay zero (padConvert only writes data regions; matmul rewrites all of C)
+        unsafe {
+            std::ptr::write_bytes(scr_a.contents().as_ptr() as *mut u8, 0, batch * mp * k * 2);
+            std::ptr::write_bytes(scr_b.contents().as_ptr() as *mut u8, 0, k * np * 2);
+            std::ptr::write_bytes(scr_c.contents().as_ptr() as *mut u8, 0, batch * mp * np * 4);
+        }
+
+        // kernel param blocks — shape-only, written once here
+        let mk_params = |vals: &[u32]| {
+            let b = dev
+                .newBufferWithLength_options(vals.len() * 4, MTLResourceOptions::StorageModeShared)
+                .expect("param buf");
+            unsafe { std::ptr::copy_nonoverlapping(vals.as_ptr(), b.contents().as_ptr() as *mut u32, vals.len()) };
+            b
+        };
+        let par_a = mk_params(&[(batch * m * k) as u32, (m * k) as u32, (mp * k) as u32]);
+        let par_b = mk_params(&[(k * n) as u32, n as u32, np as u32]);
+        let par_c = mk_params(&[(batch * m * n) as u32, n as u32, np as u32, m as u32, mp as u32]);
+
+        // convert/unpad argument tables: scratch + param addresses are static; the wgpu-side
+        // addresses (index 0 of cv_a/cv_b, index 1 of up) are set per call.
+        let mk_at = |count: usize| {
+            let atd = MTL4ArgumentTableDescriptor::new();
+            atd.setMaxBufferBindCount(count);
+            self.device.newArgumentTableWithDescriptor_error(&atd).expect("arg table")
+        };
+        let (at_cv_a, at_cv_b, at_up) = (mk_at(3), mk_at(3), mk_at(3));
+        unsafe {
+            at_cv_a.setAddress_atIndex(scr_a.gpuAddress(), 1);
+            at_cv_a.setAddress_atIndex(par_a.gpuAddress(), 2);
+            at_cv_b.setAddress_atIndex(scr_b.gpuAddress(), 1);
+            at_cv_b.setAddress_atIndex(par_b.gpuAddress(), 2);
+            at_up.setAddress_atIndex(scr_c.gpuAddress(), 0);
+            at_up.setAddress_atIndex(par_c.gpuAddress(), 2);
+        }
+
+        // matmul tensor views over the scratch buffers — identical layout to the host-boundary path
+        let t_b = unsafe {
+            scr_b.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[np as isize, k as isize], &[1, np as isize], MTLStorageMode::Shared),
+                0,
+            )
+        }
+        .expect("B tensor");
+        let mut mm_argtabs = Vec::with_capacity(batch);
+        let mut tensors: Vec<Obj<dyn MTLTensor>> = Vec::with_capacity(batch * 2 + 1);
+        for bt in 0..batch {
+            let t_a = unsafe {
+                scr_a.newTensorWithDescriptor_offset_error(
+                    &tensor_desc(MTLTensorDataType::Float16, &[k as isize, mp as isize], &[1, k as isize], MTLStorageMode::Shared),
+                    bt * mp * k * 2,
+                )
+            }
+            .expect("A tensor");
+            let t_c = unsafe {
+                scr_c.newTensorWithDescriptor_offset_error(
+                    &tensor_desc(MTLTensorDataType::Float32, &[np as isize, mp as isize], &[1, np as isize], MTLStorageMode::Shared),
+                    bt * mp * np * 4,
+                )
+            }
+            .expect("C tensor");
+            let at = mk_at(3);
+            unsafe {
+                at.setResource_atBufferIndex(t_a.gpuResourceID(), 0);
+                at.setResource_atBufferIndex(t_b.gpuResourceID(), 1);
+                at.setResource_atBufferIndex(t_c.gpuResourceID(), 2);
+            }
+            mm_argtabs.push(at);
+            tensors.push(t_a);
+            tensors.push(t_c);
+        }
+        tensors.push(t_b);
+
+        let rset = dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).expect("residency set");
+        for b in [&scr_a, &scr_b, &scr_c, &par_a, &par_b, &par_c] {
+            rset.addAllocation(ProtocolObject::from_ref(&**b));
+        }
+        for t in &tensors {
+            rset.addAllocation(ProtocolObject::from_ref(&**t));
+        }
+        rset.commit();
+        rset.requestResidency();
+
+        let alloc = dev.newCommandAllocator().expect("allocator");
+        let cb = dev.newCommandBuffer().expect("command buffer");
+        ResidentCache {
+            key: (batch, m, k, n),
+            _scr: [scr_a, scr_b, scr_c],
+            at_cv_a,
+            at_cv_b,
+            at_up,
+            mm_argtabs,
+            _params: vec![par_a, par_b, par_c],
+            _tensors: tensors,
+            rset,
+            alloc,
+            cb,
+        }
+    }
+
+    /// **Resident** batched matmul: operands and result are **wgpu buffers** (f32, contiguous), and the
+    /// whole pipeline — pad+f16-convert, `matmul2d` on the tensor units, unpad — runs as one MTL4
+    /// command buffer on wgpu's own `MTLDevice`. No byte crosses the host. Offsets are in bytes.
+    ///
+    /// The caller must ensure prior wgpu work producing `a`/`b` has completed (e.g.
+    /// [`ferric_core`-level] device poll) — this call blocks until the GPU finishes, so wgpu
+    /// submissions issued after it return safely observe `out`. Returns `None` (touching nothing) if
+    /// the buffers aren't Metal-backed.
+    #[allow(clippy::too_many_arguments)] // a GEMM signature: three operands + offsets + four dims
+    pub fn bmm_resident(
+        &self,
+        a: &wgpu::Buffer,
+        a_off: usize,
+        b: &wgpu::Buffer,
+        b_off: usize,
+        out: &wgpu::Buffer,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<()> {
+        let ra = wgpu_buffer_raw(a)?;
+        let rb = wgpu_buffer_raw(b)?;
+        let rc = wgpu_buffer_raw(out)?;
+        let mut guard = self.rcache.lock().unwrap();
+        if guard.as_ref().map(|c| c.key) != Some((batch, m, k, n)) {
+            *guard = Some(self.build_rcache(batch, m, k, n));
+        }
+        let c = guard.as_ref().unwrap();
+        let mp = m.div_ceil(TILE_M) * TILE_M;
+        let np = n.div_ceil(TILE_N) * TILE_N;
+
+        unsafe {
+            c.at_cv_a.setAddress_atIndex(ra.gpuAddress() + a_off as u64, 0);
+            c.at_cv_b.setAddress_atIndex(rb.gpuAddress() + b_off as u64, 0);
+            c.at_up.setAddress_atIndex(rc.gpuAddress(), 1);
+        }
+        // the wgpu buffers change every call → a small per-call residency set alongside the cached one
+        let prset = self.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).ok()?;
+        for buf in [&ra, &rb, &rc] {
+            prset.addAllocation(ProtocolObject::from_ref(&**buf));
+        }
+        prset.commit();
+        prset.requestResidency();
+
+        c.alloc.reset();
+        c.cb.beginCommandBufferWithAllocator(&c.alloc);
+        c.cb.useResidencySet(&c.rset);
+        c.cb.useResidencySet(&prset);
+        let enc = c.cb.computeCommandEncoder()?;
+        let tg256 = MTLSize { width: 256, height: 1, depth: 1 };
+        let lin = |count: usize| MTLSize { width: count.div_ceil(256), height: 1, depth: 1 };
+        // stage 1: pad-convert both operands (independent dispatches)
+        enc.setComputePipelineState(&self.pso_pad);
+        enc.setArgumentTable(Some(&c.at_cv_a));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(batch * m * k), tg256);
+        enc.setArgumentTable(Some(&c.at_cv_b));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(k * n), tg256);
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::Device,
+        );
+        // stage 2: the tensor-unit GEMM (one dispatch per batch element, disjoint C)
+        enc.setComputePipelineState(&self.pso);
+        let tew = self.pso.threadExecutionWidth();
+        let grid = MTLSize { width: np / TILE_N, height: mp / TILE_M, depth: 1 };
+        let tgm = MTLSize { width: tew * 4, height: 1, depth: 1 };
+        for at in &c.mm_argtabs {
+            enc.setArgumentTable(Some(at));
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tgm);
+        }
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::Device,
+        );
+        // stage 3: gather the [m,n] regions into the wgpu output
+        enc.setComputePipelineState(&self.pso_unpad);
+        enc.setArgumentTable(Some(&c.at_up));
+        enc.dispatchThreadgroups_threadsPerThreadgroup(lin(batch * m * n), tg256);
+        enc.endEncoding();
+        c.cb.endCommandBuffer();
+
+        let bufs = [NonNull::from(&*c.cb)];
+        unsafe { self.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = self.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue.signalEvent_value(ProtocolObject::from_ref(&*self.event), ticket);
+        assert!(self.event.waitUntilSignaledValue_timeoutMS(ticket, 60_000), "Metal4 resident GEMM timed out");
+        Some(())
+    }
+}
+
+/// The process-wide resident tensor-unit device bound to a wgpu `Context`'s `MTLDevice`. Built on
+/// first use (one per process); guarded by raw-device identity so a second `Context` on a different
+/// device falls back to the portable path instead of crossing Metal devices.
+pub fn resident_for(ctx: &ferric_core::Context) -> Option<&'static Metal4Gemm> {
+    use std::sync::OnceLock;
+    static DEV: OnceLock<Option<Metal4Gemm>> = OnceLock::new();
+    let raw = {
+        let hal = unsafe { ctx.device.as_hal::<wgpu::hal::api::Metal>() }?;
+        Retained::as_ptr(hal.raw_device()) as usize
+    };
+    let g = DEV.get_or_init(|| Metal4Gemm::for_wgpu(&ctx.device)).as_ref()?;
+    (Retained::as_ptr(&g.device) as usize == raw).then_some(g)
 }
 
 #[cfg(test)]
@@ -274,4 +546,156 @@ mod tests {
         check(&g, 4, 32, 64, 32, 5); // batch reuse
         check(&g, 1, 128, 64, 64, 9); // shape switch back → rebuild again
     }
+
+    /// The interop proof for the resident path: MTLTensor views created directly on **wgpu-created**
+    /// buffers (via `as_hal`), dispatched on a Metal-4 queue built from **wgpu's own MTLDevice**, with
+    /// the result read back through wgpu — no host copy of the operands anywhere.
+    #[test]
+    fn tensor_views_on_wgpu_buffers_feed_the_tensor_units_directly() {
+        use std::sync::Arc;
+        use wgpu::util::DeviceExt;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            eprintln!("backend is {:?}, not Metal — skipping", ctx.backend);
+            return;
+        }
+        let Some(g) = Metal4Gemm::for_wgpu(&ctx.device) else {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        };
+
+        let (m, k, n) = (64usize, 16, 32); // one exact tile — isolates interop, not padding
+        let a: Vec<f32> = (0..m * k).map(|i| 0.05 * ((i % 13) as f32 - 6.0)).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| 0.05 * (((i + 7) % 11) as f32 - 5.0)).collect();
+        let ah: Vec<u16> = a.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let bh: Vec<u16> = b.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+        let mk_buf = |bytes: &[u8]| {
+            ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let buf_a = mk_buf(bytemuck::cast_slice(&ah));
+        let buf_b = mk_buf(bytemuck::cast_slice(&bh));
+        let buf_c = mk_buf(&vec![0u8; m * n * 4]);
+        ctx.queue.submit([]);
+        crate::device_sync(&ctx); // wgpu writes must land before the external queue reads
+
+        let ra = wgpu_buffer_raw(&buf_a).expect("raw A");
+        let rb = wgpu_buffer_raw(&buf_b).expect("raw B");
+        let rc = wgpu_buffer_raw(&buf_c).expect("raw C");
+        let t_a = unsafe {
+            ra.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[k as isize, m as isize], &[1, k as isize], ra.storageMode()),
+                0,
+            )
+        }
+        .expect("A tensor on wgpu buffer");
+        let t_b = unsafe {
+            rb.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float16, &[n as isize, k as isize], &[1, n as isize], rb.storageMode()),
+                0,
+            )
+        }
+        .expect("B tensor on wgpu buffer");
+        let t_c = unsafe {
+            rc.newTensorWithDescriptor_offset_error(
+                &tensor_desc(MTLTensorDataType::Float32, &[n as isize, m as isize], &[1, n as isize], rc.storageMode()),
+                0,
+            )
+        }
+        .expect("C tensor on wgpu buffer");
+
+        let atd = MTL4ArgumentTableDescriptor::new();
+        atd.setMaxBufferBindCount(3);
+        let at = g.device.newArgumentTableWithDescriptor_error(&atd).expect("arg table");
+        unsafe {
+            at.setResource_atBufferIndex(t_a.gpuResourceID(), 0);
+            at.setResource_atBufferIndex(t_b.gpuResourceID(), 1);
+            at.setResource_atBufferIndex(t_c.gpuResourceID(), 2);
+        }
+        let rset = g.device.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).expect("rset");
+        for buf in [&ra, &rb, &rc] {
+            rset.addAllocation(ProtocolObject::from_ref(&**buf));
+        }
+        for t in [&t_a, &t_b, &t_c] {
+            rset.addAllocation(ProtocolObject::from_ref(&**t));
+        }
+        rset.commit();
+        rset.requestResidency();
+
+        let alloc = g.device.newCommandAllocator().expect("allocator");
+        let cb = g.device.newCommandBuffer().expect("command buffer");
+        cb.beginCommandBufferWithAllocator(&alloc);
+        cb.useResidencySet(&rset);
+        let enc = cb.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(&g.pso);
+        enc.setArgumentTable(Some(&at));
+        let tew = g.pso.threadExecutionWidth();
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: n / TILE_N, height: m / TILE_M, depth: 1 },
+            MTLSize { width: tew * 4, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let bufs = [NonNull::from(&*cb)];
+        unsafe { g.queue.commit_count(NonNull::new(bufs.as_ptr() as *mut _).unwrap(), 1) };
+        let ticket = g.ticket.fetch_add(1, Ordering::SeqCst) + 1;
+        g.queue.signalEvent_value(ProtocolObject::from_ref(&*g.event), ticket);
+        assert!(g.event.waitUntilSignaledValue_timeoutMS(ticket, 60_000), "interop GEMM timed out");
+
+        // readback THROUGH wgpu — proves wgpu sees the external queue's writes
+        let arc_ctx = Arc::new(ctx);
+        let t = crate::Tensor::from_arc(&arc_ctx, Arc::new(buf_c), &[m, n]);
+        let got = pollster::block_on(t.to_vec());
+        let want = cpu_ref_f16(&a, &b, 1, m, k, n);
+        let err = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "wgpu-resident interop GEMM mismatch: err {err}");
+    }
+
+    /// The full resident pipeline (pad+convert → matmul2d → unpad, one command buffer, zero host
+    /// copies) against the fp16 oracle — exact tiles, cache reuse, ragged shapes, batches.
+    #[test]
+    fn resident_bmm_on_wgpu_tensors_matches_the_fp16_oracle() {
+        use std::sync::Arc;
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("no GPU context — skipping");
+            return;
+        };
+        if ctx.backend != wgpu::Backend::Metal {
+            eprintln!("backend is {:?}, not Metal — skipping", ctx.backend);
+            return;
+        }
+        let ctx = Arc::new(ctx);
+        let Some(g) = resident_for(&ctx) else {
+            eprintln!("no Metal 4 tensor support — skipping");
+            return;
+        };
+
+        let rcheck = |batch: usize, m: usize, k: usize, n: usize, salt: usize| {
+            let a: Vec<f32> = (0..batch * m * k).map(|i| 0.05 * (((i + 1 + salt) % 13) as f32 - 6.0)).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| 0.05 * (((i + 7 + salt) % 11) as f32 - 5.0)).collect();
+            let ta = crate::Tensor::from_vec(&ctx, &a, &[batch, m, k]);
+            let tb = crate::Tensor::from_vec(&ctx, &b, &[k, n]);
+            let out = crate::Tensor::zeros(&ctx, &[batch, m, n]);
+            ctx.queue.submit([]); // flush pending staged uploads (poll alone never runs them)
+            crate::device_sync(&ctx);
+            g.bmm_resident(&ta.buf, 0, &tb.buf, 0, &out.buf, batch, m, k, n)
+                .expect("resident dispatch");
+            let got = pollster::block_on(out.to_vec());
+            let want = cpu_ref_f16(&a, &b, batch, m, k, n);
+            let err = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert!(err < 1e-3, "resident batch={batch} m={m} k={k} n={n} salt={salt}: err {err}");
+        };
+        rcheck(1, 128, 64, 64, 0); // exact tiles
+        rcheck(1, 128, 64, 64, 3); // cache reuse, fresh data
+        rcheck(1, 100, 37, 50, 0); // ragged → rebuild + padding
+        rcheck(4, 32, 64, 32, 0); // batch → offset views
+        rcheck(1, 128, 64, 64, 9); // shape switch back
+    }
 }
+

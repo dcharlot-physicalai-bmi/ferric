@@ -855,6 +855,12 @@ impl Buffer {
     fn as_raw(&self) -> NonNull<ProtocolObject<dyn MTLBuffer>> {
         unsafe { NonNull::new_unchecked(Retained::as_ptr(&self.raw) as *mut _) }
     }
+
+    /// The underlying `MTLBuffer`, for external interop (e.g. binding wgpu-resident data into
+    /// raw-Metal tensor ops). The caller owns synchronization with wgpu's queue.
+    pub fn raw_handle(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
+        &self.raw
+    }
 }
 
 impl crate::BufferBinding<'_, Buffer> {

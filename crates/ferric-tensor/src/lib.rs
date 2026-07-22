@@ -68,6 +68,9 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> Vec<usize> {
 
 impl Tensor {
     pub fn numel(&self) -> usize { numel(&self.shape) }
+    /// The underlying wgpu buffer (external interop — e.g. handing tensors to the Metal-4 resident
+    /// path or other raw-backend consumers). Offsets/strides still apply; see `offset`/`strides`.
+    pub fn buffer(&self) -> &wgpu::Buffer { &self.buf }
     pub fn rank(&self) -> usize { self.shape.len() }
     pub fn is_contiguous(&self) -> bool { self.strides == contig_strides(&self.shape) && self.offset == 0 }
 
@@ -508,6 +511,31 @@ impl Tensor {
         }
         let a = self.broadcast_to(&a_full).contiguous();
         let b = other.broadcast_to(&b_full).contiguous();
+        // Metal-4 tensor-unit resident path — opt-in (`FERRIC_METAL4=1`): like FERRIC_COOP, a
+        // precision-changing fast path (fp16 inputs by contract) must never silently alter default
+        // results. Everything stays on-GPU — pad+convert, `matmul2d` on the tensor units, and unpad
+        // run as one MTL4 command buffer on wgpu's own MTLDevice; only control crosses the host.
+        // Below ~1e8 flops the ~0.2 ms tensor-unit dispatch loses to the WGSL kernels, so small ops
+        // stay on the portable path.
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if 2 * bn * m * ka * n >= 100_000_000 && std::env::var("FERRIC_METAL4").is_ok() {
+            if let Some(g) = crate::metal4::resident_for(&self.ctx) {
+                let out = empty(&self.ctx, bn * m * n);
+                // clear_buffer marks `out` INITIALIZED in wgpu's init tracker — without it, wgpu
+                // lazily zero-fills the "uninitialized" buffer on first wgpu use, clobbering the
+                // external queue's writes. The submit also flushes staged uploads (poll alone never
+                // runs them); the poll then drains the queue so a/b are fully produced before the
+                // tensor units read them.
+                let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                enc.clear_buffer(&out, 0, None);
+                self.ctx.queue.submit([enc.finish()]);
+                device_sync(&self.ctx);
+                if g.bmm_resident(&a.buf, a.offset * 4, &b.buf, b.offset * 4, &out, bn, m, ka, n).is_some() {
+                    let oshape: Vec<usize> = batch.iter().chain([m, n].iter()).copied().collect();
+                    return Tensor::from_parts(&self.ctx, out, oshape);
+                }
+            }
+        }
         let out = empty(&self.ctx, bn * m * n);
         // Pick the GEMM kernel by what the autotuner measured fastest for this shape+device (naive vs
         // register-blocked tiled). No single kernel wins on every GPU, so we select by measurement:
