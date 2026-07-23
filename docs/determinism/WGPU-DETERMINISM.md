@@ -362,3 +362,18 @@ digest as Apple simdgroups, NVIDIA warps, and the ARM/x86/wasm lane
 simulations. The gate reports 17/17 on every fabric with zero
 capability-gated skips. Warp-level parallelism is fully under the digest
 contract on all six substrates.
+
+## 2026-07-23 — NPU families: the oracle-digest contract, first measurements
+
+Opaque accelerator stacks (CoreML → Apple Neural Engine) cannot join the
+one-digest contract — their compilers are not ours to pin. The honest
+contract is per-family oracles: measure what a family produces for fixed
+(model, precision, compute-units, inputs) and pin THAT. First measurements
+(experiments/npu-oracle/, M5 Max): the ANE engaged (2.3× CPU, distinct
+digest — twice-witnessed), every execution family (CPU/GPU/ANE) is
+deterministic within-process AND across fresh compiles, fp32 silently never
+reaches the ANE, and `ALL` follows the scheduler — so contracts pin
+explicit units. Three stable families on one chip, each oracle-able.
+Open until more hardware: cross-device-within-family and cross-OS/compiler
+stability — the oracle store versions by (family, OS, compiler) until
+measured otherwise.
