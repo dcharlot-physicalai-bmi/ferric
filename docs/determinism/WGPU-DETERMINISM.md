@@ -231,3 +231,43 @@ instead of per element) should beat BOTH variants while keeping the digest
 guarantee — better than maintaining a fast/det kernel pair. Until then:
 these numbers are the honest price list, and at education/demo scale
 (the probe, the portal benches, Ferrite eval vectors) it is negligible.
+
+## 2026-07-23 — heterogeneous fabric: one algorithm, one digest, six substrates
+
+Direction: deterministic compute across the FULL heterogeneous substrate —
+CPU, GPU, and beyond — with all the parallelism each allows. The key
+insight, now demonstrated: **cross-substrate bit-identity is what makes
+dynamic heterogeneous scheduling safe.** When every substrate produces the
+same bits, a scheduler is free to place work anywhere — parallelism and
+determinism are allies, not a trade.
+
+Proof: `rmsnorm_tree` — a fixed-shape parallel reduction (64 strided
+partials → 6-level add tree → storage-pinned scalar tail) — produces the
+identical digest on:
+
+    Apple Metal GPU · NVIDIA Vulkan GPU · Chrome Dawn/Tint GPU
+    ARM multicore CPU · x86 multicore CPU · wasm CPU
+
+`ddeeb58c50f5ae9f` on all six. The CPU replica is plain IEEE Rust with
+row-level threading (scheduling cannot touch the digest — rows are
+independent and per-row shape is fixed); the GPU kernel is 64-way parallel
+per row with workgroupBarrier-separated phases.
+
+New lessons captured on the way:
+- Tint privatizes same-thread stride arrays (writer == reader) back into
+  registers and re-fuses; ENTANGLE phases so the reader of each slot is a
+  different thread than its writer (value-preserving by rotation — the tree
+  pairing commutes with class rotation).
+- The thread-0 scalar tail must be full-storage INCLUDING recip and the
+  ms·recip product; XOR chains fused in this kernel's context.
+
+Timing note (honesty): det_perf currently times dispatch+readback per op
+(8 MB readback dominates at these shapes), so tree-vs-sequential kernel
+differences are masked (2.44 vs 2.48 ms). Batched-dispatch timing is the
+follow-up; the tree's structural win is 64-way row parallelism plus the
+heterogeneous identity above. Substrate roadmap from here: subgroup
+(warp-op) reduction variants behind the same digest contract where
+subgroupAdd order can be fixed; tensor-unit (coop-matrix) paths remain
+off the digest contract until their accumulation order can be pinned —
+verified-behavior envelopes per accelerator family (record oracle digests
+per NPU) are the honest bridge for opaque compilers.

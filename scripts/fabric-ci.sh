@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|demo-lm) +[0-9a-f]{16}$' | sort; }
+norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|rms-tree|rms-tcpu|demo-lm) +[0-9a-f]{16}$' | sort; }
 
 echo "── local native ──"
 cargo run --release -p ferric-core --example fabric_probe 2>/dev/null | tee /tmp/fabric-local.txt | grep -E "^fabric"

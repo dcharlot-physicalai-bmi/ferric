@@ -12,6 +12,7 @@ pub type Result<T> = std::result::Result<T, String>;
 
 mod kernels;
 pub use kernels::cpu; // CPU references for validation
+pub use kernels::rmsnorm_tree_cpu;
 pub mod demo; // a small deterministic Llama-style LM, same code native + browser
 
 /// A compute context bound to one GPU adapter on whatever fabric is available.

@@ -70,6 +70,20 @@ async fn run() {
     let gbs = (rows * d * 4 * 2) as f64 / (ms / 1000.0) / 1e9;
     println!("rmsnorm 512×4096      {ms:8.2} ms/op  {gbs:7.1} GB/s eff");
 
+    // ── rmsnorm-TREE 512 × 4096 (the roadmap kernel) ──
+    for _ in 0..3 {
+        let y = ctx.rmsnorm_tree_t(&xt, &wt, rows as u32, d as u32, 1e-5);
+        ctx.to_vec(&y).await.unwrap();
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let y = ctx.rmsnorm_tree_t(&xt, &wt, rows as u32, d as u32, 1e-5);
+        ctx.to_vec(&y).await.unwrap();
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let gbs = (rows * d * 4 * 2) as f64 / (ms / 1000.0) / 1e9;
+    println!("rms-TREE 512×4096     {ms:8.2} ms/op  {gbs:7.1} GB/s eff");
+
     // ── layernorm 512 × 4096 ──
     let bsv = det(d, 5);
     let bt2 = ctx.tensor(&bsv, &[d]);

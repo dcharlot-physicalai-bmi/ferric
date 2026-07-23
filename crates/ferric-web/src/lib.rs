@@ -624,6 +624,10 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
     rows.push(format!("layernorm {:016x}", fnv(&ctx.to_vec(&ln).await.map_err(|e| JsValue::from_str(&e))?)));
     let sm = ctx.softmax_t(&xt, t, d);
     rows.push(format!("softmax   {:016x}", fnv(&ctx.to_vec(&sm).await.map_err(|e| JsValue::from_str(&e))?)));
+    let rt = ctx.rmsnorm_tree_t(&xt, &wnt, t, d, 1e-5);
+    rows.push(format!("rms-tree  {:016x}", fnv(&ctx.to_vec(&rt).await.map_err(|e| JsValue::from_str(&e))?)));
+    let rc = ferric_core::rmsnorm_tree_cpu(&x, &wn, T, D, 1e-5);
+    rows.push(format!("rms-tcpu  {:016x}", fnv(&rc)));
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
     let lg = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
     rows.push(format!("demo-lm   {:016x}", fnv(&lg)));

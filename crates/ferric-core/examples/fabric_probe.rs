@@ -132,6 +132,12 @@ async fn run() {
     println!("layernorm {:016x}", fnv(ctx.to_vec(&ln).await.unwrap()));
     let sm = ctx.softmax_t(&xt, t, d);
     println!("softmax   {:016x}", fnv(ctx.to_vec(&sm).await.unwrap()));
+    let rt = ctx.rmsnorm_tree_t(&xt, &wnt, t, d, 1e-5);
+    println!("rms-tree  {:016x}", fnv(ctx.to_vec(&rt).await.unwrap()));
+    // the heterogeneous row: SAME algorithm on the parallel CPU — the digest
+    // must equal the GPU row's on every substrate.
+    let rc = ferric_core::rmsnorm_tree_cpu(&x, &wn, T, D, 1e-5);
+    println!("rms-tcpu  {:016x}", fnv(rc));
 
     // 7. the full demo LM forward — the composite target.
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();

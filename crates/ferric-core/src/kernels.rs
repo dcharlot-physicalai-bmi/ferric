@@ -1086,3 +1086,187 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         self.readback(&ob, rows as usize).await
     }
 }
+
+/// Deterministic PARALLEL rmsnorm: one workgroup (64 threads) per row.
+/// Squares are pinned by workgroup stores; the reduction is a fixed-shape
+/// tree of pure adds (strided per-thread partials, then a 6-level tree over
+/// 64 partials) separated by workgroupBarrier() — barriers make the shared
+/// memory real, and an adds-only tree has no mul to contract, so the
+/// summation order is the algorithm's on every compiler. The per-row rsqrt
+/// runs once (thread 0) through the storage scratch and is shared back.
+/// Digest differs from the sequential kernel (different summation order) —
+/// this is a NEW op; migration of default rmsnorm is a deliberate,
+/// versioned change. Supports d ≤ 4096.
+const RMSNORM_TREE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // rows, d, bitcast(eps), _
+@group(0) @binding(4) var<storage, read_write> scr: array<f32>; // rows*16 det-scratch
+var<workgroup> ws: array<f32, 4096>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let row = wid.x;
+    let d = dims.y;
+    let eps = bitcast<f32>(dims.z);
+    let base = row * d;
+    // squares, strided; each product pinned by its workgroup store
+    for (var j = li; j < d; j = j + 64u) { ws[j] = x[base + j] * x[base + j]; }
+    workgroupBarrier();
+    // per-thread partial over a DIFFERENT thread's stride class: reader ≠
+    // writer across the barrier, so no compiler can privatize ws into
+    // registers (Tint proved same-thread stride arrays private and re-fused
+    // the squares — probe-caught). Values are identical; only the label of
+    // which partial holds which class shifts, fixed on every substrate.
+    let cls = (li + 1u) & 63u;
+    red[li] = 0.0;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = red[li] + ws[j]; }
+    workgroupBarrier();
+    // fixed 6-level tree over the 64 partials — pure adds
+    for (var s = 32u; s >= 1u; s = s >> 1u) {
+        if (li < s) { red[li] = red[li] + red[li + s]; }
+        workgroupBarrier();
+    }
+    // per-row scalars once, on thread 0 — the ENTIRE tail through storage
+    // (recip included): the XOR-chain recip and the ms·recip product were
+    // the last register ops, and Tint fused them in this kernel's context.
+    if (li == 0u) {
+        let sb = row * 32u;
+        let df = f32(d);
+        scr[sb + 16u] = bitcast<f32>(0x7EF311C3u - bitcast<u32>(df));
+        scr[sb + 17u] = df * scr[sb + 16u];
+        scr[sb + 18u] = 2.0 - scr[sb + 17u];
+        scr[sb + 19u] = scr[sb + 16u] * scr[sb + 18u];
+        scr[sb + 20u] = df * scr[sb + 19u];
+        scr[sb + 21u] = 2.0 - scr[sb + 20u];
+        scr[sb + 22u] = scr[sb + 19u] * scr[sb + 21u];
+        scr[sb + 23u] = df * scr[sb + 22u];
+        scr[sb + 24u] = 2.0 - scr[sb + 23u];
+        scr[sb + 25u] = scr[sb + 22u] * scr[sb + 24u];
+        scr[sb + 26u] = red[0] * scr[sb + 25u];
+        let yy = scr[sb + 26u] + eps;
+        let hy = 0.5 * yy;
+        scr[sb] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+        scr[sb + 1u] = scr[sb] * scr[sb];
+        scr[sb + 2u] = hy * scr[sb + 1u];
+        scr[sb + 3u] = 1.5 - scr[sb + 2u];
+        scr[sb + 4u] = scr[sb] * scr[sb + 3u];
+        scr[sb + 5u] = scr[sb + 4u] * scr[sb + 4u];
+        scr[sb + 6u] = hy * scr[sb + 5u];
+        scr[sb + 7u] = 1.5 - scr[sb + 6u];
+        scr[sb + 8u] = scr[sb + 4u] * scr[sb + 7u];
+        scr[sb + 9u] = scr[sb + 8u] * scr[sb + 8u];
+        scr[sb + 10u] = hy * scr[sb + 9u];
+        scr[sb + 11u] = 1.5 - scr[sb + 10u];
+        scr[sb + 12u] = scr[sb + 8u] * scr[sb + 11u];
+        red[1] = scr[sb + 12u];
+    }
+    workgroupBarrier();
+    let inv = red[1];
+    // output in two phases with a barrier: writes on the own stride, reads on
+    // the offset stride — reader ≠ writer keeps ws un-privatizable here too.
+    for (var j = li; j < d; j = j + 64u) { ws[j] = x[base + j] * inv; }
+    workgroupBarrier();
+    for (var j = cls; j < d; j = j + 64u) { out[base + j] = ws[j] * weight[j]; }
+}
+"#;
+
+impl Context {
+    /// Deterministic tree-reduction RMSNorm (see RMSNORM_TREE_WGSL). One
+    /// workgroup per row; d ≤ 4096. Digest differs from `rmsnorm_t` by
+    /// summation order — cross-fabric identity is what the probe certifies.
+    pub fn rmsnorm_tree_t(&self, x: &Tensor, w: &Tensor, rows: u32, d: u32, eps: f32) -> Tensor {
+        assert!(d <= 4096, "rmsnorm_tree_t supports d ≤ 4096");
+        let out = self.empty(&x.shape);
+        let dims = self.uniform_u32("d", &[rows, d, eps.to_bits(), 0]);
+        let scr = self.out_buffer(rows as usize * 32);
+        let pipe = self.pipeline("rmsnorm_tree", RMSNORM_TREE_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &out.buf, &dims, &scr], (rows, 1, 1));
+        out
+    }
+}
+
+/// CPU replica of the tree rmsnorm — the SAME fixed-shape algorithm (64
+/// strided partials → 6-level add tree → Newton scalars) in plain IEEE Rust.
+/// Rows are independent, so row-level threading never affects the digest:
+/// this is the heterogeneous-fabric claim made concrete — one algorithm,
+/// one digest, any substrate (GPU shader or CPU cores, native or wasm).
+pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> Vec<f32> {
+    fn recip(y: f32) -> f32 {
+        let mut r = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * r;
+            let ww = 2.0 - t;
+            r = r * ww;
+        }
+        r
+    }
+    fn rsqrt(y: f32) -> f32 {
+        let hy = 0.5 * y;
+        let mut r = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = r * r;
+            let u = hy * t;
+            let ww = 1.5 - u;
+            r = r * ww;
+        }
+        r
+    }
+    let mut out = vec![0f32; rows * d];
+    // row-parallel across available cores (sequential on wasm — no threads);
+    // per-row math is fixed-shape, so scheduling never touches the digest
+    #[cfg(target_arch = "wasm32")]
+    let n_threads = 1usize;
+    #[cfg(not(target_arch = "wasm32"))]
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    std::thread::scope(|scope| {
+        let chunk = rows.div_ceil(n_threads);
+        for (ci, out_chunk) in out.chunks_mut(chunk * d).enumerate() {
+            let x = &x;
+            let w = &w;
+            #[allow(unused_mut)]
+            let mut work = move || {
+                for (ri, orow) in out_chunk.chunks_mut(d).enumerate() {
+                    let row = ci * chunk + ri;
+                    let base = row * d;
+                    // squares (rounded muls), then 64 strided partials
+                    let mut red = [0f32; 64];
+                    for li in 0..64usize {
+                        let cls = (li + 1) & 63;
+                        let mut p = 0f32;
+                        let mut j = cls;
+                        while j < d {
+                            let sq = x[base + j] * x[base + j];
+                            p += sq;
+                            j += 64;
+                        }
+                        red[li] = p;
+                    }
+                    // fixed 6-level tree
+                    let mut s = 32usize;
+                    while s >= 1 {
+                        for li in 0..s {
+                            red[li] += red[li + s];
+                        }
+                        if s == 1 { break; }
+                        s >>= 1;
+                    }
+                    let ms = red[0] * recip(d as f32);
+                    let inv = rsqrt(ms + eps);
+                    for j in 0..d {
+                        let t = x[base + j] * inv;
+                        orow[j] = t * w[j];
+                    }
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            work();
+            #[cfg(not(target_arch = "wasm32"))]
+            scope.spawn(work);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = scope;
+    });
+    out
+}
