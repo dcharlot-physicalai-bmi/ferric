@@ -377,3 +377,26 @@ explicit units. Three stable families on one chip, each oracle-able.
 Open until more hardware: cross-device-within-family and cross-OS/compiler
 stability — the oracle store versions by (family, OS, compiler) until
 measured otherwise.
+
+## 2026-07-23 — the definitive price table (quiet machine, min of 5)
+
+Idle GPU (only a dormant ferric-serve resident), min of 5 full det_perf
+runs per generation, batched dispatches:
+
+| kernel               | old fast | best det        | tax  |
+|----------------------|----------|-----------------|------|
+| matmul 512³          | 0.41 ms  | 0.47 ms         | +15% |
+| softmax 512×4096     | 0.62 ms  | 0.72 ms (seq)   | +16% |
+| layernorm 512×4096   | 0.62 ms  | 0.77 ms (tree)  | +24% |
+| mha T=256 H=8 dh=64  | 1.39 ms  | 1.78 ms         | +28% |
+| rmsnorm 512×4096     | 0.47 ms  | 0.72 ms (seq)   | +53% |
+
+Surprises, kept: on an idle GPU the SEQUENTIAL det kernels edge out the
+trees for rmsnorm (0.72 vs 0.75) and softmax (0.72 vs 0.80) — at 512 rows,
+one-thread-per-row already fills the machine and the tree's barriers cost
+more than its parallelism earns. Only layernorm's tree wins decisively
+(1.02 → 0.77). Tree-vs-sequential is shape-dependent; both stay in the
+codebase, both under the digest contract. Bottom line, replacing all
+earlier estimates: full cross-substrate determinism costs +15–53%
+depending on kernel — a price an education/verification platform pays
+gladly, and one that narrows further with ordinary kernel engineering.
