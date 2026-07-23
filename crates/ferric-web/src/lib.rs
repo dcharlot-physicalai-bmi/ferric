@@ -618,6 +618,12 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
     rows.push(format!("mha       {:016x}", fnv(&ctx.to_vec(&mha).await.map_err(|e| JsValue::from_str(&e))?)));
     let sg = ctx.sigmoid_t(&xt);
     rows.push(format!("sigmoid   {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| JsValue::from_str(&e))?)));
+    let bias = det(D, 4);
+    let bt = ctx.tensor(&bias, &[D]);
+    let ln = ctx.layernorm_t(&xt, &wnt, &bt, t, d, 1e-5);
+    rows.push(format!("layernorm {:016x}", fnv(&ctx.to_vec(&ln).await.map_err(|e| JsValue::from_str(&e))?)));
+    let sm = ctx.softmax_t(&xt, t, d);
+    rows.push(format!("softmax   {:016x}", fnv(&ctx.to_vec(&sm).await.map_err(|e| JsValue::from_str(&e))?)));
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
     let lg = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
     rows.push(format!("demo-lm   {:016x}", fnv(&lg)));

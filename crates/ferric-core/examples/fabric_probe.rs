@@ -124,6 +124,15 @@ async fn run() {
     let sg = ctx.sigmoid_t(&xt);
     println!("sigmoid   {:016x}", fnv(ctx.to_vec(&sg).await.unwrap()));
 
+    // 6b/6c. layernorm + softmax — the storage-chain kernels outside the
+    // demo path, probed so their parity is measured, not assumed.
+    let bias = det(D, 4);
+    let bt = ctx.tensor(&bias, &[D]);
+    let ln = ctx.layernorm_t(&xt, &wnt, &bt, t, d, 1e-5);
+    println!("layernorm {:016x}", fnv(ctx.to_vec(&ln).await.unwrap()));
+    let sm = ctx.softmax_t(&xt, t, d);
+    println!("softmax   {:016x}", fnv(ctx.to_vec(&sm).await.unwrap()));
+
     // 7. the full demo LM forward — the composite target.
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
     let lg = ferric_core::demo::logits(&ctx, &ids).await.unwrap();

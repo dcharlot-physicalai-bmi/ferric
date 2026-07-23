@@ -189,3 +189,21 @@ Follow-ups (scoped): apply the storage-scratch pattern to LAYERNORM and
 SOFTMAX (same class, not in the demo path); perf-profile the storage
 traffic at real model shapes and consider a fast-path/det-path kernel pair
 if it costs; extend the probe with a per-fabric CI row.
+
+## 2026-07-23 — kernel set complete: 9/9 rows, three fabrics
+
+layernorm and softmax received the storage-chain treatment (same per-row
+scalar pattern as rmsnorm; softmax's exp-sum accumulates through a scratch
+slot with each exp pinned by its store to out[]). Probe extended to 9 rows
+so their parity is measured, not assumed:
+
+    mm · rmsnorm · sqrt · rope · mha · sigmoid · layernorm · softmax ·
+    demo-lm (full transformer) — identical digests on Chrome (Dawn/Tint),
+    Apple Metal, and NVIDIA Vulkan; sqrt 0/768 vs plain-IEEE CPU on all
+    three. All CPU-reference validations green (layernorm 4.8e-7,
+    softmax 3.7e-9); KV-cache decode exact.
+
+These kernels are free for anyone to use, study, and build on (MIT OR
+Apache-2.0) — the probe, the CPU replicas, and this document are the
+reproduction kit. Remaining scoped work: perf profile of the storage
+scratch at real model shapes; a per-fabric CI row.

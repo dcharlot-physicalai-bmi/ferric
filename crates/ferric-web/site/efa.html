@@ -33,8 +33,9 @@ input[type=range]{accent-color:var(--gold);width:110px}
 <header>
   <p class="eyebrow">Charlot Lab · EFA · Ferric Runtime</p>
   <h1>Open weights on WebGPU. <span class="thin">Same kernels as native.</span></h1>
-  <p class="thesis">The released EFA checkpoints, fetched from Hugging Face and executed by <b>Ferric compiled to WASM on your browser's WebGPU</b> — the same pure-Rust tensor ops (including the second-order autograd that computes the hybrid's ∇ₐE) that run natively on Metal. Toggle to the <b>JS CPU</b> path and watch the per-decision latency: at 21k parameters the CPU wins — dispatch overhead dominates — and the page says so, because that is the honest crossover. <b>The WebGPU path is the runtime that scales when the models outgrow JS.</b></p>
+  <p class="thesis">The released EFA checkpoints, fetched from Hugging Face and executed by <b>Ferric compiled to WASM on your browser's WebGPU</b> — the same pure-Rust tensor ops that run natively on Metal. The flagship <b>EFA-1</b> runs here with its shipped <b>agency gate on-fabric</b>: one trunk drives 1-, 2-, or 3-joint bodies, its own energy checked against the artifact's τ each decision. Toggle to the <b>JS CPU</b> path and watch the per-decision latency: at these sizes the CPU wins — dispatch overhead dominates — and the page says so, because that is the honest crossover. <b>The WebGPU path is the runtime that scales when the models outgrow JS.</b></p>
   <div class="links">
+    <a href="https://huggingface.co/physicalai-bmi/efa-1">efa-1</a> ·
     <a href="https://huggingface.co/physicalai-bmi/efa-hybrid-arm2">efa-hybrid-arm2</a> ·
     <a href="https://huggingface.co/physicalai-bmi/efa-flow-arm3">efa-flow-arm3</a> ·
     <a href="https://physicalai-bmi.org/assets/sims/efa-weights.html">pure-JS demo</a> ·
@@ -43,8 +44,9 @@ input[type=range]{accent-color:var(--gold);width:110px}
   </div>
 </header>
 <div class="tabs">
-  <div class="tab on" id="tab2">efa-hybrid-arm2 — act + verify</div>
-  <div class="tab" id="tab3">efa-flow-arm3 — 3 joints</div>
+  <div class="tab on" id="tab1">efa-1 — one trunk, 3 bodies</div>
+  <div class="tab" id="tab2">efa-hybrid-arm2</div>
+  <div class="tab" id="tab3">efa-flow-arm3</div>
   <div style="flex:1"></div>
   <div class="tab on" id="rtgpu">runtime: Ferric WebGPU</div>
   <div class="tab" id="rtcpu">runtime: JS CPU</div>
@@ -53,9 +55,10 @@ input[type=range]{accent-color:var(--gold);width:110px}
   <div id="load">initializing Ferric on WebGPU… fetching released weights from Hugging Face…</div>
   <canvas id="cv" width="1880" height="720" style="display:none"></canvas>
   <div class="hud" id="hud" style="display:none">
-    <span id="hmodel"></span><span id="hreach"></span><span id="hver"></span><span id="hlat"></span>
+    <span id="hmodel"></span><span id="hreach"></span><span id="hgate"></span><span id="hver"></span><span id="hlat"></span>
   </div>
   <div class="ctrl" id="ctrl" style="display:none">
+    <span id="bodysel"></span>
     <button class="btn" id="rand">randomize goal</button>
     <button class="btn" id="kick">perturb</button>
     <span id="sliders"></span>

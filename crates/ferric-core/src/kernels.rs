@@ -133,8 +133,10 @@ impl Context {
     pub fn softmax_t(&self, x: &Tensor, rows: u32, d: u32) -> Tensor {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("d", &[rows, d, 0, 0]);
+        // det-scratch: storage slot for the exp-sum
+        let scr = self.out_buffer(rows as usize * 2);
         let pipe = self.pipeline("softmax", SOFTMAX_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims, &scr], ((rows + 63) / 64, 1, 1));
         out
     }
     /// Rotary position embedding (rotate-half, NeoX/Llama style). x is [T, H·dh]; rotates each head's
@@ -188,8 +190,10 @@ impl Context {
     pub fn layernorm_t(&self, x: &Tensor, w: &Tensor, b: &Tensor, rows: u32, d: u32, eps: f32) -> Tensor {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("d", &[rows, d, eps.to_bits(), 0]);
+        // det-scratch: storage-space slots for the per-row scalar chain
+        let scr = self.out_buffer(rows as usize * 16);
         let pipe = self.pipeline("layernorm", LAYERNORM_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &w.buf, &b.buf, &out.buf, &dims], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &b.buf, &out.buf, &dims, &scr], ((rows + 63) / 64, 1, 1));
         out
     }
     /// Single-head attention on-GPU: softmax(scale·Q·Kᵀ)·V, all buffers stay on device.
@@ -232,8 +236,9 @@ impl Context {
         let (xb, wb, bb) = (self.storage("x", x), self.storage("w", weight), self.storage("b", bias));
         let out = self.out_buffer((rows * d) as usize);
         let dims = self.uniform_u32("dims", &[rows, d, eps.to_bits(), 0]);
+        let scr = self.out_buffer(rows as usize * 16);
         let pipe = self.pipeline("layernorm", LAYERNORM_WGSL);
-        self.dispatch(&pipe, &[&xb, &wb, &bb, &out, &dims], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &wb, &bb, &out, &dims, &scr], ((rows + 63) / 64, 1, 1));
         self.readback(&out, (rows * d) as usize).await
     }
 
@@ -243,8 +248,9 @@ impl Context {
         let xb = self.storage("x", x);
         let out = self.out_buffer((rows * d) as usize);
         let dims = self.uniform_u32("dims", &[rows, d, 0, 0]);
+        let scr = self.out_buffer(rows as usize * 2);
         let pipe = self.pipeline("softmax", SOFTMAX_WGSL);
-        self.dispatch(&pipe, &[&xb, &out, &dims], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &out, &dims, &scr], ((rows + 63) / 64, 1, 1));
         self.readback(&out, (rows * d) as usize).await
     }
 
@@ -774,24 +780,49 @@ const LAYERNORM_WGSL: &str = r#"
 @group(0) @binding(2) var<storage, read>       bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform>             dims: vec4<u32>; // rows, d, bitcast(eps), _
+@group(0) @binding(5) var<storage, read_write> scr: array<f32>; // rows*16 det-scratch
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
     let rows = dims.x; let d = dims.y; let eps = bitcast<f32>(dims.z);
     if (row >= rows) { return; }
     let base = row * d;
-    let invd = det_recip(f32(d), dims.w);
-    var mean: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { mean = det_bar(mean + x[base + j], dims.w); }
-    mean = mean * invd;
-    var vari: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let c = x[base + j] - mean; vari = det_bar(vari + det_bar(c * c, dims.w), dims.w); }
-    vari = vari * invd;
-    let inv = det_rsqrt(vari + eps, dims.w);
+    let zz = dims.w;
+    let sb = row * 16u;
+    // full-STORAGE per-row chain (see RMSNORM): device memory is the only
+    // address space no conforming compiler may promote or fuse across.
+    let invd = det_recip(f32(d), zz);
+    scr[sb + 13u] = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { scr[sb + 13u] = scr[sb + 13u] + x[base + j]; }
+    scr[sb + 15u] = scr[sb + 13u] * invd;
+    let mean = scr[sb + 15u];
+    scr[sb + 13u] = 0.0;
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let t1 = det_bar((x[base + j] - mean) * inv, dims.w);
-        let t2 = det_bar(t1 * weight[j], dims.w);
-        out[base + j] = t2 + bias[j];
+        let c = x[base + j] - mean;
+        scr[sb + 14u] = c * c;
+        scr[sb + 13u] = scr[sb + 13u] + scr[sb + 14u];
+    }
+    scr[sb + 15u] = scr[sb + 13u] * invd;
+    let yy = scr[sb + 15u] + eps;
+    let hy = 0.5 * yy;
+    scr[sb] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+    scr[sb + 1u] = scr[sb] * scr[sb];
+    scr[sb + 2u] = hy * scr[sb + 1u];
+    scr[sb + 3u] = 1.5 - scr[sb + 2u];
+    scr[sb + 4u] = scr[sb] * scr[sb + 3u];
+    scr[sb + 5u] = scr[sb + 4u] * scr[sb + 4u];
+    scr[sb + 6u] = hy * scr[sb + 5u];
+    scr[sb + 7u] = 1.5 - scr[sb + 6u];
+    scr[sb + 8u] = scr[sb + 4u] * scr[sb + 7u];
+    scr[sb + 9u] = scr[sb + 8u] * scr[sb + 8u];
+    scr[sb + 10u] = hy * scr[sb + 9u];
+    scr[sb + 11u] = 1.5 - scr[sb + 10u];
+    scr[sb + 12u] = scr[sb + 8u] * scr[sb + 11u];
+    let inv = scr[sb + 12u];
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        scr[sb + 14u] = (x[base + j] - mean) * inv;
+        scr[sb + 15u] = scr[sb + 14u] * weight[j];
+        out[base + j] = scr[sb + 15u] + bias[j];
     }
 }
 "#;
@@ -800,6 +831,7 @@ const SOFTMAX_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform>             dims: vec4<u32>; // rows, d
+@group(0) @binding(3) var<storage, read_write> scr: array<f32>; // rows*2 det-scratch
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let row = gid.x;
@@ -808,9 +840,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = row * d;
     var mx: f32 = x[base];
     for (var j: u32 = 1u; j < d; j = j + 1u) { mx = max(mx, x[base + j]); }
-    var sum: f32 = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let e = det_exp(x[base + j] - mx, dims.z); out[base + j] = e; sum = det_bar(sum + e, dims.z); }
-    let inv = det_recip(sum, dims.z);
+    // sum through STORAGE: e is pinned by its store to out[]; the running sum
+    // lives in the det-scratch slot — the add sees two device-memory loads.
+    let sb = row * 2u;
+    scr[sb] = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        out[base + j] = det_exp(x[base + j] - mx, dims.z);
+        scr[sb] = scr[sb] + out[base + j];
+    }
+    let inv = det_recip(scr[sb], dims.z);
     for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = out[base + j] * inv; }
 }
 "#;
