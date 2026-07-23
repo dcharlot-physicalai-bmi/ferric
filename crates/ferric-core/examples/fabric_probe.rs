@@ -138,6 +138,10 @@ async fn run() {
     // must equal the GPU row's on every substrate.
     let rc = ferric_core::rmsnorm_tree_cpu(&x, &wn, T, D, 1e-5);
     println!("rms-tcpu  {:016x}", fnv(rc));
+    let lt = ctx.layernorm_tree_t(&xt, &wnt, &bt, t, d, 1e-5);
+    println!("ln-tree   {:016x}", fnv(ctx.to_vec(&lt).await.unwrap()));
+    let lc = ferric_core::layernorm_tree_cpu(&x, &wn, &bias, T, D, 1e-5);
+    println!("ln-tcpu   {:016x}", fnv(lc));
 
     // 7. the full demo LM forward — the composite target.
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();

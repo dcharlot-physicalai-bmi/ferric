@@ -1270,3 +1270,177 @@ pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -
     });
     out
 }
+
+/// Deterministic PARALLEL layernorm: rmsnorm_tree's structure with two
+/// chained reductions (mean, then variance) and a three-phase output whose
+/// writer/reader stride classes differ at every barrier (no compiler can
+/// privatize ws between phases). d ≤ 4096.
+const LAYERNORM_TREE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       weight: array<f32>;
+@group(0) @binding(2) var<storage, read>       bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform>             dims: vec4<u32>; // rows, d, bitcast(eps), _
+@group(0) @binding(5) var<storage, read_write> scr: array<f32>; // rows*32 det-scratch
+var<workgroup> ws: array<f32, 4096>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let row = wid.x;
+    let d = dims.y;
+    let eps = bitcast<f32>(dims.z);
+    let base = row * d;
+    let cls = (li + 1u) & 63u;
+    let cls2 = (li + 2u) & 63u;
+    let sb = row * 32u;
+    // ── mean: partials of storage loads (unprivatizable), fixed tree ──
+    red[li] = 0.0;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = red[li] + x[base + j]; }
+    workgroupBarrier();
+    for (var s = 32u; s >= 1u; s = s >> 1u) {
+        if (li < s) { red[li] = red[li] + red[li + s]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        let df = f32(d);
+        scr[sb + 16u] = bitcast<f32>(0x7EF311C3u - bitcast<u32>(df));
+        scr[sb + 17u] = df * scr[sb + 16u];
+        scr[sb + 18u] = 2.0 - scr[sb + 17u];
+        scr[sb + 19u] = scr[sb + 16u] * scr[sb + 18u];
+        scr[sb + 20u] = df * scr[sb + 19u];
+        scr[sb + 21u] = 2.0 - scr[sb + 20u];
+        scr[sb + 22u] = scr[sb + 19u] * scr[sb + 21u];
+        scr[sb + 23u] = df * scr[sb + 22u];
+        scr[sb + 24u] = 2.0 - scr[sb + 23u];
+        scr[sb + 25u] = scr[sb + 22u] * scr[sb + 24u];   // recip(d)
+        scr[sb + 26u] = red[0] * scr[sb + 25u];          // mean
+    }
+    workgroupBarrier();
+    let mean = scr[sb + 26u];
+    // ── variance: centered squares pinned by ws stores, entangled partials ──
+    for (var j = li; j < d; j = j + 64u) {
+        let c = x[base + j] - mean;
+        ws[j] = c * c;
+    }
+    workgroupBarrier();
+    red[li] = 0.0;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = red[li] + ws[j]; }
+    workgroupBarrier();
+    for (var s = 32u; s >= 1u; s = s >> 1u) {
+        if (li < s) { red[li] = red[li] + red[li + s]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        scr[sb + 27u] = red[0] * scr[sb + 25u];          // var
+        let yy = scr[sb + 27u] + eps;
+        let hy = 0.5 * yy;
+        scr[sb] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+        scr[sb + 1u] = scr[sb] * scr[sb];
+        scr[sb + 2u] = hy * scr[sb + 1u];
+        scr[sb + 3u] = 1.5 - scr[sb + 2u];
+        scr[sb + 4u] = scr[sb] * scr[sb + 3u];
+        scr[sb + 5u] = scr[sb + 4u] * scr[sb + 4u];
+        scr[sb + 6u] = hy * scr[sb + 5u];
+        scr[sb + 7u] = 1.5 - scr[sb + 6u];
+        scr[sb + 8u] = scr[sb + 4u] * scr[sb + 7u];
+        scr[sb + 9u] = scr[sb + 8u] * scr[sb + 8u];
+        scr[sb + 10u] = hy * scr[sb + 9u];
+        scr[sb + 11u] = 1.5 - scr[sb + 10u];
+        scr[sb + 12u] = scr[sb + 8u] * scr[sb + 11u];    // inv
+    }
+    workgroupBarrier();
+    let inv = scr[sb + 12u];
+    // ── output: three phases, writer ≠ reader at every barrier ──
+    for (var j = li; j < d; j = j + 64u) { ws[j] = (x[base + j] - mean) * inv; }
+    workgroupBarrier();
+    for (var j = cls; j < d; j = j + 64u) { ws[j] = ws[j] * weight[j]; }
+    workgroupBarrier();
+    for (var j = cls2; j < d; j = j + 64u) { out[base + j] = ws[j] + bias[j]; }
+}
+"#;
+
+impl Context {
+    /// Deterministic tree-reduction LayerNorm (see LAYERNORM_TREE_WGSL). d ≤ 4096.
+    pub fn layernorm_tree_t(&self, x: &Tensor, w: &Tensor, b: &Tensor, rows: u32, d: u32, eps: f32) -> Tensor {
+        assert!(d <= 4096, "layernorm_tree_t supports d ≤ 4096");
+        let out = self.empty(&x.shape);
+        let dims = self.uniform_u32("d", &[rows, d, eps.to_bits(), 0]);
+        let scr = self.out_buffer(rows as usize * 32);
+        let pipe = self.pipeline("layernorm_tree", LAYERNORM_TREE_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &b.buf, &out.buf, &dims, &scr], (rows, 1, 1));
+        out
+    }
+}
+
+/// CPU twin of the tree layernorm — identical fixed shape, plain IEEE Rust.
+pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize, eps: f32) -> Vec<f32> {
+    fn recip(y: f32) -> f32 {
+        let mut r = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * r;
+            let ww = 2.0 - t;
+            r = r * ww;
+        }
+        r
+    }
+    fn rsqrt(y: f32) -> f32 {
+        let hy = 0.5 * y;
+        let mut r = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = r * r;
+            let u = hy * t;
+            let ww = 1.5 - u;
+            r = r * ww;
+        }
+        r
+    }
+    fn tree64(red: &mut [f32; 64]) -> f32 {
+        let mut s = 32usize;
+        loop {
+            for li in 0..s {
+                red[li] += red[li + s];
+            }
+            if s == 1 { break; }
+            s >>= 1;
+        }
+        red[0]
+    }
+    let mut out = vec![0f32; rows * d];
+    for row in 0..rows {
+        let base = row * d;
+        let mut red = [0f32; 64];
+        for li in 0..64usize {
+            let cls = (li + 1) & 63;
+            let mut p = 0f32;
+            let mut j = cls;
+            while j < d {
+                p += x[base + j];
+                j += 64;
+            }
+            red[li] = p;
+        }
+        let rc = recip(d as f32);
+        let mean = tree64(&mut red) * rc;
+        let mut red = [0f32; 64];
+        for li in 0..64usize {
+            let cls = (li + 1) & 63;
+            let mut p = 0f32;
+            let mut j = cls;
+            while j < d {
+                let c = x[base + j] - mean;
+                let sq = c * c;
+                p += sq;
+                j += 64;
+            }
+            red[li] = p;
+        }
+        let var = tree64(&mut red) * rc;
+        let inv = rsqrt(var + eps);
+        for j in 0..d {
+            let t = (x[base + j] - mean) * inv;
+            let t2 = t * w[j];
+            out[base + j] = t2 + b[j];
+        }
+    }
+    out
+}

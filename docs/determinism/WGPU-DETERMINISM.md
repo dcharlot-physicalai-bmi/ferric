@@ -294,3 +294,19 @@ kernel-bound. Current honest statement: determinism costs +19–65% on the
 tree/XOR kernels and ~2× on the not-yet-treed sequential norms; the tree
 pattern (applied to layernorm next) is the path to narrowing further. All
 six-substrate digests unaffected by the harness change.
+
+## 2026-07-23 — layernorm tree: six substrates green; perf deferred honestly
+
+`layernorm_tree` (two chained reductions — mean, then variance — with
+writer≠reader stride classes at every barrier phase, full-storage scalar
+tails) + its CPU twin: digest `11430c38…` identical on all six substrates
+first try; the CI gate is now 13 rows.
+
+Perf comparison DEFERRED: the benchmark machine is under concurrent GPU
+load (parallel model-decode work), and det_perf swings 6–10× run-to-run —
+numbers taken now would be noise. The earlier batched table stands as the
+last quiet-machine measurement. Worth recording what the contention proved
+instead: the six-way digest gate passed DURING heavy load — bit-identity is
+indifferent to scheduling pressure, contention, and thermal state, which is
+precisely the property that makes dynamically-scheduled heterogeneous
+compute trustworthy.

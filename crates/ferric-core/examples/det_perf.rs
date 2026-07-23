@@ -107,6 +107,20 @@ async fn run() {
     let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     println!("layernorm 512×4096    {ms:8.2} ms/op");
 
+    // ── layernorm-TREE 512 × 4096 ──
+    for _ in 0..3 {
+        let y = ctx.layernorm_tree_t(&xt, &wt, &bt2, rows as u32, d as u32, 1e-5);
+        ctx.to_vec(&y).await.unwrap();
+    }
+    let t0 = Instant::now();
+    let mut last = ctx.layernorm_tree_t(&xt, &wt, &bt2, rows as u32, d as u32, 1e-5);
+    for _ in 1..iters {
+        last = ctx.layernorm_tree_t(&xt, &wt, &bt2, rows as u32, d as u32, 1e-5);
+    }
+    ctx.to_vec(&last).await.unwrap();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!("ln-TREE 512×4096      {ms:8.2} ms/op");
+
     // ── softmax 512 × 4096 ──
     for _ in 0..3 {
         let y = ctx.softmax_t(&xt, rows as u32, d as u32);
