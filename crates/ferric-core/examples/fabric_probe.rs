@@ -146,6 +146,13 @@ async fn run() {
     println!("sm-tree   {:016x}", fnv(ctx.to_vec(&st).await.unwrap()));
     let sc = ferric_core::softmax_tree_cpu(&x, T, D);
     println!("sm-tcpu   {:016x}", fnv(sc));
+    if let Some(sg) = ctx.rmsnorm_sg_t(&xt, &wnt, t, d, 1e-5) {
+        println!("rms-sg    {:016x}", fnv(ctx.to_vec(&sg).await.unwrap()));
+        let sgc = ferric_core::rmsnorm_sg_cpu(&x, &wn, T, D, 1e-5);
+        println!("rms-sgc   {:016x}", fnv(sgc));
+    } else {
+        println!("rms-sg    (no subgroup support)");
+    }
 
     // 7. the full demo LM forward — the composite target.
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();

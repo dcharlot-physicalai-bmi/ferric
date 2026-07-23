@@ -327,3 +327,24 @@ substrate roadmap unchanged: subgroup butterfly (explicit shuffleXor
 pairwise order; subgroup width becomes part of the declared shape),
 tensor units / NPUs via per-family oracle digests, and a quiet-machine
 det_perf table.
+
+## 2026-07-23 — warp ops under the digest contract: the subgroup butterfly
+
+`rmsnorm_sg`: the reduction's cross-lane half runs on subgroup hardware —
+five explicit `subgroupShuffleXor` pairwise adds (OUR order, not the
+driver's implementation-defined `subgroupAdd`), lane 0 canonical and
+broadcast, declared shape = width-32 subgroups with linear lane mapping.
+The CPU twin simulates all 32 lanes through the butterfly exactly.
+
+Measured: digest `38e0cb5c…` identical on Apple simdgroups, NVIDIA warps,
+and the ARM/x86/wasm CPU lane simulations. Chrome is skipped-and-named by
+the gate (wgpu's wasm backend does not yet surface the WebGPU `subgroups`
+feature — a fork enhancement candidate), and the gate now compares the
+row intersection per fabric so capability-gated rows are reported as
+skipped rather than failed. naga note: WGSL `enable subgroups;` is not
+accepted — subgroup builtins are available directly under naga's
+capability model.
+
+Probe stands at 17 rows. The substrate ledger for reductions:
+shared-memory trees (6 substrates) · subgroup butterflies (5, browser
+pending upstream) · CPU threads (digest-invariant by row independence).

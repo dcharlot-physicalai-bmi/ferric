@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|rms-tree|rms-tcpu|ln-tree|ln-tcpu|sm-tree|sm-tcpu|demo-lm) +[0-9a-f]{16}$' | sort; }
+norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|rms-tree|rms-tcpu|ln-tree|ln-tcpu|sm-tree|sm-tcpu|rms-sg|rms-sgc|demo-lm) +[0-9a-f]{16}$' | sort; }
 
 echo "── local native ──"
 cargo run --release -p ferric-core --example fabric_probe 2>/dev/null | tee /tmp/fabric-local.txt | grep -E "^fabric"
@@ -36,11 +36,17 @@ if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && [ -d
     node probe_test.mjs > /tmp/fabric-browser.txt 2>&1 || true
     kill $SRV 2>/dev/null || true )
   BROWSER=$(norm < /tmp/fabric-browser.txt)
-  if [ "$BROWSER" = "$LOCAL" ]; then
-    echo "browser: MATCH ($NROWS/$NROWS)"
+  # capability-gated rows (e.g. subgroups) may be absent on a fabric: compare
+  # the intersection, and NAME what was skipped — absence is honest, silence isn't.
+  echo "$BROWSER" | awk '{print $1}' > /tmp/fabric-bnames.txt
+  LSHARED=$(awk 'NR==FNR{keep[$1]=1;next} keep[$1]' /tmp/fabric-bnames.txt <(echo "$LOCAL"))
+  SKIPPED=$(comm -23 <(echo "$LOCAL" | awk '{print $1}' | sort) <(sort /tmp/fabric-bnames.txt) | tr '\n' ' ')
+  if [ "$BROWSER" = "$LSHARED" ]; then
+    N=$(echo "$LSHARED" | wc -l | tr -d ' ')
+    echo "browser: MATCH ($N/$N)${SKIPPED:+  [skipped, capability-gated: $SKIPPED]}"
   else
     echo "browser: MISMATCH"
-    diff <(echo "$LOCAL") <(echo "$BROWSER") || true
+    diff <(echo "$LSHARED") <(echo "$BROWSER") || true
     FAIL=1
   fi
 else

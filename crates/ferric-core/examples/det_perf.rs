@@ -135,6 +135,20 @@ async fn run() {
     let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     println!("softmax 512×4096      {ms:8.2} ms/op");
 
+    // ── softmax-TREE 512 × 4096 ──
+    for _ in 0..3 {
+        let y = ctx.softmax_tree_t(&xt, rows as u32, d as u32);
+        ctx.to_vec(&y).await.unwrap();
+    }
+    let t0 = Instant::now();
+    let mut last = ctx.softmax_tree_t(&xt, rows as u32, d as u32);
+    for _ in 1..iters {
+        last = ctx.softmax_tree_t(&xt, rows as u32, d as u32);
+    }
+    ctx.to_vec(&last).await.unwrap();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    println!("sm-TREE 512×4096      {ms:8.2} ms/op");
+
     // ── causal MHA T=256, H=8, dh=64 ──
     let (tt, h, dh) = (256usize, 8usize, 64usize);
     let q = det(tt * h * dh, 6);

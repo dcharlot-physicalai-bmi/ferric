@@ -1590,3 +1590,161 @@ pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
     }
     out
 }
+
+/// Deterministic SUBGROUP-butterfly rmsnorm — the warp-op variant. Declared
+/// shape: subgroup width 32, linear invocation→lane mapping, and an explicit
+/// shuffleXor butterfly (masks 16,8,4,2,1) whose adds are OURS, not the
+/// driver's `subgroupAdd` (whose order is implementation-defined). Every
+/// lane's accumulation order differs, so lane 0's value is canonical and
+/// broadcast. Two subgroups' canonical sums combine with one add; scalar
+/// tail and output phases are the tree kernel's. The six-substrate probe is
+/// the arbiter of the mapping assumption on every fabric. d ≤ 4096.
+const RMSNORM_SG_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // rows, d, bitcast(eps), _
+@group(0) @binding(4) var<storage, read_write> scr: array<f32>; // rows*32 det-scratch
+var<workgroup> ws: array<f32, 4096>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) li: u32,
+        @builtin(subgroup_invocation_id) lane: u32) {
+    let row = wid.x;
+    let d = dims.y;
+    let eps = bitcast<f32>(dims.z);
+    let base = row * d;
+    let cls = (li + 1u) & 63u;
+    let sb = row * 32u;
+    for (var j = li; j < d; j = j + 64u) { ws[j] = x[base + j] * x[base + j]; }
+    workgroupBarrier();
+    red[li] = 0.0;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = red[li] + ws[j]; }
+    workgroupBarrier();
+    // butterfly: five explicit pairwise adds, canonical lane 0 broadcast
+    var v = red[li];
+    v = v + subgroupShuffleXor(v, 16u);
+    v = v + subgroupShuffleXor(v, 8u);
+    v = v + subgroupShuffleXor(v, 4u);
+    v = v + subgroupShuffleXor(v, 2u);
+    v = v + subgroupShuffleXor(v, 1u);
+    let v0 = subgroupBroadcast(v, 0u);
+    if (lane == 0u) { red[li] = v0; }
+    workgroupBarrier();
+    if (li == 0u) {
+        let total = red[0] + red[32];
+        let df = f32(d);
+        scr[sb + 16u] = bitcast<f32>(0x7EF311C3u - bitcast<u32>(df));
+        scr[sb + 17u] = df * scr[sb + 16u];
+        scr[sb + 18u] = 2.0 - scr[sb + 17u];
+        scr[sb + 19u] = scr[sb + 16u] * scr[sb + 18u];
+        scr[sb + 20u] = df * scr[sb + 19u];
+        scr[sb + 21u] = 2.0 - scr[sb + 20u];
+        scr[sb + 22u] = scr[sb + 19u] * scr[sb + 21u];
+        scr[sb + 23u] = df * scr[sb + 22u];
+        scr[sb + 24u] = 2.0 - scr[sb + 23u];
+        scr[sb + 25u] = scr[sb + 22u] * scr[sb + 24u];
+        scr[sb + 26u] = total * scr[sb + 25u];
+        let yy = scr[sb + 26u] + eps;
+        let hy = 0.5 * yy;
+        scr[sb] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+        scr[sb + 1u] = scr[sb] * scr[sb];
+        scr[sb + 2u] = hy * scr[sb + 1u];
+        scr[sb + 3u] = 1.5 - scr[sb + 2u];
+        scr[sb + 4u] = scr[sb] * scr[sb + 3u];
+        scr[sb + 5u] = scr[sb + 4u] * scr[sb + 4u];
+        scr[sb + 6u] = hy * scr[sb + 5u];
+        scr[sb + 7u] = 1.5 - scr[sb + 6u];
+        scr[sb + 8u] = scr[sb + 4u] * scr[sb + 7u];
+        scr[sb + 9u] = scr[sb + 8u] * scr[sb + 8u];
+        scr[sb + 10u] = hy * scr[sb + 9u];
+        scr[sb + 11u] = 1.5 - scr[sb + 10u];
+        scr[sb + 12u] = scr[sb + 8u] * scr[sb + 11u];
+    }
+    workgroupBarrier();
+    let inv = scr[sb + 12u];
+    for (var j = li; j < d; j = j + 64u) { ws[j] = x[base + j] * inv; }
+    workgroupBarrier();
+    for (var j = cls; j < d; j = j + 64u) { out[base + j] = ws[j] * weight[j]; }
+}
+"#;
+
+impl Context {
+    /// Subgroup-butterfly rmsnorm. Requires subgroup support; declared shape
+    /// assumes width-32 subgroups with linear lane mapping (probe-verified
+    /// per fabric). Falls back to None where subgroups are unavailable.
+    pub fn rmsnorm_sg_t(&self, x: &Tensor, w: &Tensor, rows: u32, d: u32, eps: f32) -> Option<Tensor> {
+        if !self.subgroups {
+            return None;
+        }
+        assert!(d <= 4096, "rmsnorm_sg_t supports d ≤ 4096");
+        let out = self.empty(&x.shape);
+        let dims = self.uniform_u32("d", &[rows, d, eps.to_bits(), 0]);
+        let scr = self.out_buffer(rows as usize * 32);
+        let pipe = self.pipeline("rmsnorm_sg", RMSNORM_SG_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &out.buf, &dims, &scr], (rows, 1, 1));
+        Some(out)
+    }
+}
+
+/// CPU twin of the subgroup-butterfly rmsnorm: simulates the width-32
+/// butterfly lane-exactly (all 32 lane values through the five shuffleXor
+/// steps, canonical lane 0), matching the declared GPU shape.
+pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> Vec<f32> {
+    fn recip(y: f32) -> f32 {
+        let mut r = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * r;
+            let ww = 2.0 - t;
+            r = r * ww;
+        }
+        r
+    }
+    fn rsqrt(y: f32) -> f32 {
+        let hy = 0.5 * y;
+        let mut r = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = r * r;
+            let u = hy * t;
+            let ww = 1.5 - u;
+            r = r * ww;
+        }
+        r
+    }
+    fn butterfly32(v: &mut [f32; 32]) -> f32 {
+        for mask in [16usize, 8, 4, 2, 1] {
+            let prev = *v;
+            for l in 0..32 {
+                v[l] = prev[l] + prev[l ^ mask];
+            }
+        }
+        v[0]
+    }
+    let mut out = vec![0f32; rows * d];
+    for row in 0..rows {
+        let base = row * d;
+        let mut red = [0f32; 64];
+        for li in 0..64usize {
+            let cls = (li + 1) & 63;
+            let mut p = 0f32;
+            let mut j = cls;
+            while j < d {
+                let sq = x[base + j] * x[base + j];
+                p += sq;
+                j += 64;
+            }
+            red[li] = p;
+        }
+        let mut sg0: [f32; 32] = red[0..32].try_into().unwrap();
+        let mut sg1: [f32; 32] = red[32..64].try_into().unwrap();
+        let total = butterfly32(&mut sg0) + butterfly32(&mut sg1);
+        let ms = total * recip(d as f32);
+        let inv = rsqrt(ms + eps);
+        for j in 0..d {
+            let t = x[base + j] * inv;
+            out[base + j] = t * w[j];
+        }
+    }
+    out
+}

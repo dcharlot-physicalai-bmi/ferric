@@ -636,6 +636,12 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
     rows.push(format!("sm-tree   {:016x}", fnv(&ctx.to_vec(&st).await.map_err(|e| JsValue::from_str(&e))?)));
     let sc = ferric_core::softmax_tree_cpu(&x, T, D);
     rows.push(format!("sm-tcpu   {:016x}", fnv(&sc)));
+    if let Some(sg) = ctx.rmsnorm_sg_t(&xt, &wnt, t, d, 1e-5) {
+        rows.push(format!("rms-sg    {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| JsValue::from_str(&e))?)));
+    }
+    // the lane-simulation twin is substrate-independent — always present
+    let sgc = ferric_core::rmsnorm_sg_cpu(&x, &wn, T, D, 1e-5);
+    rows.push(format!("rms-sgc   {:016x}", fnv(&sgc)));
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
     let lg = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
     rows.push(format!("demo-lm   {:016x}", fnv(&lg)));
