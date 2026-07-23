@@ -187,8 +187,15 @@ byte-identically on NVIDIA Vulkan. The same digests hold in Chrome's WebGPU,
 so browser-trained → device-deployed is a checkable signature end to end.
 Also shipped since: `ferrite run` (verified inner loop: 256 ms warm / 762 ms
 code-change, Mac→device over Tailscale with full verification per deploy).
-Still open for v0.2: landlock/seccomp native payloads, Rugix OS A/B, USB-C
-CDC-NCM dev link.
+**Native-payload sandbox SHIPPED (2026-07-23):** native ELF packs run
+confined — landlock (payload dir rx · per-run scratch rw · loader dirs +
+specific resolver files r · TCP denied unless `net` granted) + no-new-privs
++ CPU/AS/FSIZE/NOFILE rlimits + cleared env. E2E-proven on the RTX Linux box:
+the same binary reads `/etc/hostname` freely unconfined but is denied inside
+the pack, with the deploy behavior verified bit-exact. Engine `native`,
+target-gated so macOS/wasm still build.
+Still open for v0.2: seccomp syscall filter (needs per-payload profiling),
+Rugix OS A/B, USB-C CDC-NCM dev link.
 
 **v0.2 EXTENSION — WHOLE-MODEL DETERMINISM (2026-07-22, same day): the
 verifiable envelope now covers FULL TRANSFORMERS.** The demo-lm rejection was
