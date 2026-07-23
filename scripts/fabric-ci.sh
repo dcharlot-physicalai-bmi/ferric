@@ -15,12 +15,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|rms-tree|rms-tcpu|ln-tree|ln-tcpu|demo-lm) +[0-9a-f]{16}$' | sort; }
+norm() { grep -E '^(mm|rmsnorm|sqrt|rope|mha|sigmoid|layernorm|softmax|rms-tree|rms-tcpu|ln-tree|ln-tcpu|sm-tree|sm-tcpu|demo-lm) +[0-9a-f]{16}$' | sort; }
 
 echo "── local native ──"
 cargo run --release -p ferric-core --example fabric_probe 2>/dev/null | tee /tmp/fabric-local.txt | grep -E "^fabric"
 LOCAL=$(norm < /tmp/fabric-local.txt)
 [ -n "$LOCAL" ] || { echo "FAIL: local probe produced no rows"; exit 1; }
+NROWS=$(echo "$LOCAL" | wc -l | tr -d ' ')
 
 FAIL=0
 
@@ -36,7 +37,7 @@ if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && [ -d
     kill $SRV 2>/dev/null || true )
   BROWSER=$(norm < /tmp/fabric-browser.txt)
   if [ "$BROWSER" = "$LOCAL" ]; then
-    echo "browser: MATCH (9/9)"
+    echo "browser: MATCH ($NROWS/$NROWS)"
   else
     echo "browser: MISMATCH"
     diff <(echo "$LOCAL") <(echo "$BROWSER") || true
@@ -56,7 +57,7 @@ if [ -n "${FABRIC_CI_REMOTE:-}" ]; then
   grep -E "^fabric" /tmp/fabric-remote.txt || true
   REMOTE=$(norm < /tmp/fabric-remote.txt)
   if [ "$REMOTE" = "$LOCAL" ]; then
-    echo "remote: MATCH (9/9)"
+    echo "remote: MATCH ($NROWS/$NROWS)"
   else
     echo "remote: MISMATCH"
     diff <(echo "$LOCAL") <(echo "$REMOTE") || true

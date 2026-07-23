@@ -310,3 +310,20 @@ instead: the six-way digest gate passed DURING heavy load — bit-identity is
 indifferent to scheduling pressure, contention, and thermal state, which is
 precisely the property that makes dynamically-scheduled heterogeneous
 compute trustworthy.
+
+## 2026-07-23 — softmax tree: the parallel deterministic kernel set is complete
+
+`softmax_tree` (max-tree → ws-pinned exp wave → entangled sum-tree →
+storage-tail reciprocal) + a CPU twin that replicates det_exp's operation
+sequence bit-exactly in plain Rust: digest `f72aee8e…` identical on all six
+substrates, first try. The gate now certifies **15 rows**. Notable: the
+XOR-chain det_exp internals HELD under Tint in this kernel's context — one
+ws store per result was sufficient pinning here; the fragility is
+context-dependent, and the probe remains the arbiter every time.
+
+The parallel deterministic set — rmsnorm, layernorm, softmax as
+64-thread-per-row tree kernels with CPU twins — is complete. Remaining
+substrate roadmap unchanged: subgroup butterfly (explicit shuffleXor
+pairwise order; subgroup width becomes part of the declared shape),
+tensor units / NPUs via per-family oracle digests, and a quiet-machine
+det_perf table.

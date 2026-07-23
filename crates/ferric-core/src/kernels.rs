@@ -1444,3 +1444,149 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
     }
     out
 }
+
+/// Deterministic PARALLEL softmax: max-tree (exact, order-free — fixed shape
+/// kept anyway), exp wave with each result pinned by its ws store, sum-tree
+/// over entangled classes, storage-tail reciprocal. The exp INTERNALS are
+/// XOR-chain det_exp — the known fragile spot under Tint inlining; the
+/// six-substrate probe is the arbiter, and the sequential softmax remains
+/// the fallback if this context fuses. d ≤ 4096.
+const SOFTMAX_TREE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform>             dims: vec4<u32>; // rows, d, _, z
+@group(0) @binding(3) var<storage, read_write> scr: array<f32>; // rows*32 det-scratch
+var<workgroup> ws: array<f32, 4096>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let row = wid.x;
+    let d = dims.y;
+    let base = row * d;
+    let cls = (li + 1u) & 63u;
+    let cls2 = (li + 2u) & 63u;
+    let sb = row * 32u;
+    // ── max (exact any order; fixed shape for uniformity) ──
+    red[li] = -3.0e38;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = max(red[li], x[base + j]); }
+    workgroupBarrier();
+    for (var s = 32u; s >= 1u; s = s >> 1u) {
+        if (li < s) { red[li] = max(red[li], red[li + s]); }
+        workgroupBarrier();
+    }
+    let mx = red[0];
+    workgroupBarrier();
+    // ── exps, each pinned by its ws store ──
+    for (var j = li; j < d; j = j + 64u) { ws[j] = det_exp(x[base + j] - mx, dims.w); }
+    workgroupBarrier();
+    // ── sum over entangled classes, fixed tree ──
+    red[li] = 0.0;
+    for (var j = cls; j < d; j = j + 64u) { red[li] = red[li] + ws[j]; }
+    workgroupBarrier();
+    for (var s = 32u; s >= 1u; s = s >> 1u) {
+        if (li < s) { red[li] = red[li] + red[li + s]; }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        let y = red[0];
+        scr[sb + 16u] = bitcast<f32>(0x7EF311C3u - bitcast<u32>(y));
+        scr[sb + 17u] = y * scr[sb + 16u];
+        scr[sb + 18u] = 2.0 - scr[sb + 17u];
+        scr[sb + 19u] = scr[sb + 16u] * scr[sb + 18u];
+        scr[sb + 20u] = y * scr[sb + 19u];
+        scr[sb + 21u] = 2.0 - scr[sb + 20u];
+        scr[sb + 22u] = scr[sb + 19u] * scr[sb + 21u];
+        scr[sb + 23u] = y * scr[sb + 22u];
+        scr[sb + 24u] = 2.0 - scr[sb + 23u];
+        scr[sb + 25u] = scr[sb + 22u] * scr[sb + 24u];   // 1/sum
+    }
+    workgroupBarrier();
+    let inv = scr[sb + 25u];
+    for (var j = cls2; j < d; j = j + 64u) { out[base + j] = ws[j] * inv; }
+}
+"#;
+
+impl Context {
+    /// Deterministic tree-reduction softmax (see SOFTMAX_TREE_WGSL). d ≤ 4096.
+    pub fn softmax_tree_t(&self, x: &Tensor, rows: u32, d: u32) -> Tensor {
+        assert!(d <= 4096, "softmax_tree_t supports d ≤ 4096");
+        let out = self.empty(&x.shape);
+        let dims = self.uniform_u32("d", &[rows, d, 0, 0]);
+        let scr = self.out_buffer(rows as usize * 32);
+        let pipe = self.pipeline("softmax_tree", SOFTMAX_TREE_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims, &scr], (rows, 1, 1));
+        out
+    }
+}
+
+/// CPU twin of the tree softmax — including a bit-exact replica of det_exp's
+/// operation sequence (same f32 constants, same order, plain IEEE).
+pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
+    fn exp_det(v: f32) -> f32 {
+        let xx = v.clamp(-87.0, 88.0);
+        let log2e = f32::from_bits(0x3FB8_AA3B);
+        let ln2hi = 0.693115234375f32;
+        let ln2lo = f32::from_bits(0x3805_FDF4);
+        let kf = (xx * log2e + 0.5).floor();
+        let a = xx - kf * ln2hi;
+        let r = a - kf * ln2lo;
+        let mut p = 0.0013888889f32;
+        p = p * r + 0.008333334;
+        p = p * r + 0.041666668;
+        p = p * r + 0.16666667;
+        p = p * r + 0.5;
+        p = p * r + 1.0;
+        p = p * r + 1.0;
+        let k = (kf as i32).clamp(-126, 127);
+        let scale = f32::from_bits(((k + 127) as u32) << 23);
+        p * scale
+    }
+    fn recip(y: f32) -> f32 {
+        let mut r = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * r;
+            let ww = 2.0 - t;
+            r = r * ww;
+        }
+        r
+    }
+    fn tree64(red: &mut [f32; 64]) -> f32 {
+        let mut s = 32usize;
+        loop {
+            for li in 0..s {
+                red[li] += red[li + s];
+            }
+            if s == 1 { break; }
+            s >>= 1;
+        }
+        red[0]
+    }
+    let mut out = vec![0f32; rows * d];
+    let mut ws = vec![0f32; d];
+    for row in 0..rows {
+        let base = row * d;
+        let mut mx = -3.0e38f32;
+        for j in 0..d {
+            mx = mx.max(x[base + j]);
+        }
+        for j in 0..d {
+            ws[j] = exp_det(x[base + j] - mx);
+        }
+        let mut red = [0f32; 64];
+        for li in 0..64usize {
+            let cls = (li + 1) & 63;
+            let mut p = 0f32;
+            let mut j = cls;
+            while j < d {
+                p += ws[j];
+                j += 64;
+            }
+            red[li] = p;
+        }
+        let inv = recip(tree64(&mut red));
+        for j in 0..d {
+            out[base + j] = ws[j] * inv;
+        }
+    }
+    out
+}

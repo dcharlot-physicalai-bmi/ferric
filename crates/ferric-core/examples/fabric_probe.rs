@@ -142,6 +142,10 @@ async fn run() {
     println!("ln-tree   {:016x}", fnv(ctx.to_vec(&lt).await.unwrap()));
     let lc = ferric_core::layernorm_tree_cpu(&x, &wn, &bias, T, D, 1e-5);
     println!("ln-tcpu   {:016x}", fnv(lc));
+    let st = ctx.softmax_tree_t(&xt, t, d);
+    println!("sm-tree   {:016x}", fnv(ctx.to_vec(&st).await.unwrap()));
+    let sc = ferric_core::softmax_tree_cpu(&x, T, D);
+    println!("sm-tcpu   {:016x}", fnv(sc));
 
     // 7. the full demo LM forward — the composite target.
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
