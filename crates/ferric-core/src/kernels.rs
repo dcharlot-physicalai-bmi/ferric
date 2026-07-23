@@ -179,8 +179,10 @@ impl Context {
     pub fn rmsnorm_t(&self, x: &Tensor, w: &Tensor, rows: u32, d: u32, eps: f32) -> Tensor {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("d", &[rows, d, eps.to_bits(), 0]);
+        // det-scratch: storage-space slots for the rsqrt Newton chain
+        let scr = self.out_buffer(rows as usize * 16);
         let pipe = self.pipeline("rmsnorm", RMSNORM_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &w.buf, &out.buf, &dims], (rows, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &out.buf, &dims, &scr], (rows, 1, 1));
         out
     }
     pub fn layernorm_t(&self, x: &Tensor, w: &Tensor, b: &Tensor, rows: u32, d: u32, eps: f32) -> Tensor {
@@ -638,7 +640,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // memory-pinned scratch (see det_rsqrt note): every product is stored and
     // re-loaded at a runtime-opaque index before its add — adds see two
     // LOADS, so no compiler can contract them into fma.
-    var sc_: array<f32, 8>;
+    var sc_: array<f32, 16>;
     let zz = gqa.y;
     var m: f32 = -3.0e38; var l: f32 = 0.0;
     for (var j: u32 = 0u; j <= i; j = j + 1u) {           // causal: attend to keys 0..=i
@@ -683,7 +685,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc: array<f32, 128>;
     for (var c: u32 = 0u; c < dh; c = c + 1u) { acc[c] = 0.0; }
     // memory-pinned scratch (see MHA_CAUSAL note)
-    var scm: array<f32, 8>;
+    var scm: array<f32, 16>;
     let zz = gqa.y;
     var m: f32 = -3.0e38; var l: f32 = 0.0;
     for (var j: u32 = 0u; j < s; j = j + 1u) {
@@ -716,28 +718,52 @@ const RMSNORM_WGSL: &str = r#"
 @group(0) @binding(1) var<storage, read>       weight: array<f32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform>             dims: vec4<u32>; // rows, d, bitcast(eps), _
+@group(0) @binding(4) var<storage, read_write> scr: array<f32>; // rows*16 det-scratch
+var<workgroup> wacc: array<f32, 64>;
+var<workgroup> wprod: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let row = gid.x;
     let rows = dims.x; let d = dims.y; let eps = bitcast<f32>(dims.z);
     if (row >= rows) { return; }
     let base = row * d;
-    // memory-pinned accumulation (see det_rsqrt note): product and running sum
-    // live in a runtime-opaque-indexed array, so adds see two LOADS — nothing
-    // to contract, on any compiler.
-    var s: array<f32, 4>;
+    // Sum and product go through WORKGROUP memory — the dynamic-trip loop
+    // blocks register promotion there (probe-verified clean). The straight-
+    // line rsqrt chain below goes through STORAGE scratch instead: barrier-
+    // free workgroup slots in straight-line code DO get promoted (row-10
+    // forensic, 2 ULP), but device memory is host-visible — no conforming
+    // compiler may promote or fuse across it.
     let zz = dims.w;
-    s[zz] = 0.0;
+    let sb = row * 16u;
+    // full-STORAGE per-row chain: workgroup slots proved promotable in this
+    // kernel's context too (7/12 rows fused, direct-diff) — device memory is
+    // the only space every compiler must treat as opaque.
+    scr[sb + 13u] = 0.0;
     for (var j: u32 = 0u; j < d; j = j + 1u) {
         let v = x[base + j];
-        s[zz + 1u] = v * v;
-        s[zz] = s[zz] + s[zz + 1u];
+        scr[sb + 14u] = v * v;
+        scr[sb + 13u] = scr[sb + 13u] + scr[sb + 14u];
     }
-    let ms = s[zz] * det_recip(f32(d), zz);
-    let inv = det_rsqrt(ms + eps, zz);
+    scr[sb + 15u] = scr[sb + 13u] * det_recip(f32(d), zz);
+    let yy = scr[sb + 15u] + eps;
+    let hy = 0.5 * yy;
+    scr[sb] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+    scr[sb + 1u] = scr[sb] * scr[sb];
+    scr[sb + 2u] = hy * scr[sb + 1u];
+    scr[sb + 3u] = 1.5 - scr[sb + 2u];
+    scr[sb + 4u] = scr[sb] * scr[sb + 3u];
+    scr[sb + 5u] = scr[sb + 4u] * scr[sb + 4u];
+    scr[sb + 6u] = hy * scr[sb + 5u];
+    scr[sb + 7u] = 1.5 - scr[sb + 6u];
+    scr[sb + 8u] = scr[sb + 4u] * scr[sb + 7u];
+    scr[sb + 9u] = scr[sb + 8u] * scr[sb + 8u];
+    scr[sb + 10u] = hy * scr[sb + 9u];
+    scr[sb + 11u] = 1.5 - scr[sb + 10u];
+    scr[sb + 12u] = scr[sb + 8u] * scr[sb + 11u];
+    let inv = scr[sb + 12u];
     for (var j: u32 = 0u; j < d; j = j + 1u) {
-        s[zz + 2u] = x[base + j] * inv;
-        out[base + j] = s[zz + 2u] * weight[j];
+        scr[sb + 14u] = x[base + j] * inv;
+        out[base + j] = scr[sb + 14u] * weight[j];
     }
 }
 "#;
@@ -947,5 +973,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let pipe = self.pipeline("rsqrt_stage", &src);
         self.dispatch(&pipe, &[&yb, &ob, &dims], ((n as u32 + 63) / 64, 1, 1));
         self.readback(&ob, n).await
+    }
+}
+
+impl Context {
+    /// Forensic twin of the shipped RMSNORM kernel: identical code, but
+    /// exports per-row stage `k` (0=ms accum, 1=recip(d), 2=ms·recip,
+    /// 3=+eps, 4=rsqrt, 5=x[0]·inv, 6=out[0]). One dispatch per stage.
+    pub async fn det_rmsnorm_stage(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        rows: u32,
+        d: u32,
+        eps: f32,
+        stage: u32,
+    ) -> crate::Result<Vec<f32>> {
+        let src = r#"@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // rows, d, eps, stage
+var<workgroup> wacc: array<f32, 64>;
+var<workgroup> wprod: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let row = gid.x;
+    let rows = dims.x; let d = dims.y; let eps = bitcast<f32>(dims.z);
+    if (row >= rows) { return; }
+    let base = row * d;
+    let zz = dims.x - rows; // runtime zero the compiler cannot fold
+    var stg: array<f32, 8>;
+    var s: array<f32, 16>;
+    wacc[li] = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) {
+        let v = x[base + j];
+        wprod[li] = v * v;
+        wacc[li] = wacc[li] + wprod[li];
+    }
+    stg[0] = wacc[li];
+    let rc = det_recip(f32(d), zz);
+    stg[1] = rc;
+    let ms = wacc[li] * rc;
+    stg[2] = ms;
+    stg[3] = ms + eps;
+    let yy = ms + eps;
+    let hy = 0.5 * yy;
+    wacc[li] = bitcast<f32>(0x5F3759DFu - (bitcast<u32>(yy) >> 1u));
+    wprod[li] = wacc[li] * wacc[li];
+    wprod[li] = hy * wprod[li];
+    wprod[li] = 1.5 - wprod[li];
+    wacc[li] = wacc[li] * wprod[li];
+    wprod[li] = wacc[li] * wacc[li];
+    wprod[li] = hy * wprod[li];
+    wprod[li] = 1.5 - wprod[li];
+    wacc[li] = wacc[li] * wprod[li];
+    wprod[li] = wacc[li] * wacc[li];
+    wprod[li] = hy * wprod[li];
+    wprod[li] = 1.5 - wprod[li];
+    wacc[li] = wacc[li] * wprod[li];
+    let inv = wacc[li];
+    stg[4] = inv;
+    wprod[li] = x[base] * inv;
+    stg[5] = wprod[li];
+    stg[6] = wprod[li] * weight[0];
+    out[row] = stg[dims.w];
+}
+"#;
+        let xb = self.storage("fx", x);
+        let wb = self.storage("fw", w);
+        let ob = self.out_buffer(rows as usize);
+        let dims = self.uniform_u32("fd", &[rows, d, eps.to_bits(), stage]);
+        let pipe = self.pipeline("rmsnorm_stage", src);
+        self.dispatch(&pipe, &[&xb, &wb, &ob, &dims], ((rows + 63) / 64, 1, 1));
+        self.readback(&ob, rows as usize).await
     }
 }

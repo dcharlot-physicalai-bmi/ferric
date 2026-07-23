@@ -740,3 +740,159 @@ pub async fn ferric_rsqrt_stages() -> std::result::Result<String, JsValue> {
     }
     Ok(rows.join("\n"))
 }
+
+/// Browser stage forensic for the rmsnorm chain — names the first op where
+/// Tint/ANGLE deviates from the plain-IEEE CPU replica.
+#[wasm_bindgen]
+pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f32::from_bits(0x3F80_0000 | (s >> 41) as u32) - 1.5
+            })
+            .collect()
+    }
+    fn cpu_recip(y: f32) -> f32 {
+        let mut x = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * x;
+            let w = 2.0 - t;
+            x = x * w;
+        }
+        x
+    }
+    fn cpu_rsqrt(y: f32) -> f32 {
+        let hy = 0.5 * y;
+        let mut x = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = x * x;
+            let u = hy * t;
+            let w = 1.5 - u;
+            x = x * w;
+        }
+        x
+    }
+    const T: usize = 12;
+    const D: usize = 64;
+    let x = det(T * D, 1);
+    let wn: Vec<f32> = det(D, 3).iter().map(|v| v + 1.0).collect();
+    // CPU replica per row
+    let mut cpu = vec![[0f32; 7]; T];
+    for row in 0..T {
+        let base = row * D;
+        let mut ms_acc = 0f32;
+        for j in 0..D {
+            let v = x[base + j];
+            let p = v * v;
+            ms_acc += p;
+        }
+        let rc = cpu_recip(D as f32);
+        let ms = ms_acc * rc;
+        let arg = ms + 1e-5;
+        let inv = cpu_rsqrt(arg);
+        let t = x[base] * inv;
+        cpu[row] = [ms_acc, rc, ms, arg, inv, t, t * wn[0]];
+    }
+    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let mut rows = Vec::new();
+    for stage in 0..7u32 {
+        let gpu = ctx
+            .det_rmsnorm_stage(&x, &wn, T as u32, D as u32, 1e-5, stage)
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
+        let mut bad = 0;
+        let mut first = String::new();
+        for (i, &g) in gpu.iter().enumerate() {
+            let c = cpu[i][stage as usize];
+            if c.to_bits() != g.to_bits() {
+                if bad == 0 {
+                    first = format!("  first row={i} cpu={:08x} gpu={:08x}", c.to_bits(), g.to_bits());
+                }
+                bad += 1;
+            }
+        }
+        rows.push(format!("rms stage {stage}: {bad}/12{first}"));
+    }
+    Ok(rows.join("\n"))
+}
+
+/// Direct diff of the SHIPPED rmsnorm kernel vs its CPU replica — per-row
+/// deviation pattern (whole rows ⇒ the per-row scalar chain; scattered
+/// elements ⇒ the output loop).
+#[wasm_bindgen]
+pub async fn ferric_rmsnorm_diff() -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    fn det(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                f32::from_bits(0x3F80_0000 | (s >> 41) as u32) - 1.5
+            })
+            .collect()
+    }
+    fn cpu_recip(y: f32) -> f32 {
+        let mut x = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        for _ in 0..3 {
+            let t = y * x;
+            let w = 2.0 - t;
+            x = x * w;
+        }
+        x
+    }
+    fn cpu_rsqrt(y: f32) -> f32 {
+        let hy = 0.5 * y;
+        let mut x = f32::from_bits(0x5F37_59DFu32.wrapping_sub(y.to_bits() >> 1));
+        for _ in 0..3 {
+            let t = x * x;
+            let u = hy * t;
+            let w = 1.5 - u;
+            x = x * w;
+        }
+        x
+    }
+    const T: usize = 12;
+    const D: usize = 64;
+    let x = det(T * D, 1);
+    let wn: Vec<f32> = det(D, 3).iter().map(|v| v + 1.0).collect();
+    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let xt = ctx.tensor(&x, &[T, D]);
+    let wt = ctx.tensor(&wn, &[D]);
+    let g = ctx
+        .to_vec(&ctx.rmsnorm_t(&xt, &wt, T as u32, D as u32, 1e-5))
+        .await
+        .map_err(|e| JsValue::from_str(&e))?;
+    let mut rows = Vec::new();
+    for row in 0..T {
+        let base = row * D;
+        let mut ms = 0f32;
+        for j in 0..D {
+            let v = x[base + j];
+            let p = v * v;
+            ms += p;
+        }
+        let msn = ms * cpu_recip(D as f32);
+        let inv = cpu_rsqrt(msn + 1e-5);
+        let mut bad = 0;
+        let mut first = String::new();
+        for j in 0..D {
+            let t = x[base + j] * inv;
+            let c = t * wn[j];
+            if c.to_bits() != g[base + j].to_bits() {
+                if bad == 0 {
+                    first = format!(" first j={j} cpu={:08x} gpu={:08x}", c.to_bits(), g[base + j].to_bits());
+                }
+                bad += 1;
+            }
+        }
+        rows.push(format!("row {row:>2}: {bad}/64{first}"));
+    }
+    Ok(rows.join("\n"))
+}

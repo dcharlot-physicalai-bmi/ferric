@@ -153,3 +153,39 @@ pinned accumulators changed nothing). Next tool: per-stage forensic kernels
 for the rmsnorm row (recip → rsqrt-arg → inv → output chain) to name the op.
 Native (Metal+Vulkan) remains 7/7 digest-identical and is the shipping
 guarantee; browser is 4/7 digest + tolerance elsewhere.
+
+## 2026-07-23 — BROWSER PARITY COMPLETE: 7/7 rows, three fabrics, one digest
+
+The rmsnorm forensic escalation resolved the last divergences and completed
+the triangle: **all seven probe rows — including the full 3-layer
+transformer forward — are bit-identical across Chrome (Dawn/Tint via
+ANGLE-Metal), native Apple Metal, and native NVIDIA Vulkan**, with sqrt
+verified 0/768 against the plain-IEEE CPU replica on all three.
+
+The address-space hierarchy that emerged (the campaign's core lesson):
+1. **Private arrays** (even at runtime-opaque indices) — register-promoted
+   in some inlining contexts; unreliable under Tint/ANGLE.
+2. **Workgroup memory without barriers** — legally promotable too (no
+   cross-thread visibility guarantees); held in dynamic-trip loops in one
+   kernel context and fused in another. Context-dependent; unreliable.
+3. **Storage (device) memory** — host-visible; NO conforming compiler may
+   promote or fuse across it. **The only universally reliable pin.**
+
+Final rmsnorm structure: per-row scalar chain (accumulation, ms·recip,
+rsqrt Newton, output products) entirely through a 16-slot-per-row storage
+scratch buffer, SSA-style unique slots for straight-line steps, two
+loop-carried slots for accumulations. mha and demo-lm converged with NO
+further changes — their divergence had been inherited from rmsnorm inputs
+end-to-end. Native digests never moved throughout; all validations green;
+matmul timing unchanged.
+
+What this buys the ecosystem: a policy/model in the demo-LM kernel class
+now has ONE behavioral signature valid in the training browser, on any
+Metal device, and on any Vulkan device — Ferrite eval vectors recorded in
+any of the three verify bit-exactly on the other two. Browser-trained →
+deployed continuity is a checkable digest, not a claim.
+
+Follow-ups (scoped): apply the storage-scratch pattern to LAYERNORM and
+SOFTMAX (same class, not in the demo path); perf-profile the storage
+traffic at real model shapes and consider a fast-path/det-path kernel pair
+if it costs; extend the probe with a per-fabric CI row.
