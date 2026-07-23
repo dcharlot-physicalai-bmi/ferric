@@ -179,8 +179,16 @@ enforces Ferric's documented determinism boundary at update time.
 35 golden byte-vector tests) + `BridgeSpec` manifest stage — payload stdout
 (JSON actuator targets) → wire bytes via the named codec, and those wire bytes
 are what vectors digest and authors sign: *signed wire-level behavior*.
+**2026-07-23 — envelope extension: FULL TRANSFORMERS.** After the ferric
+det-math campaign (see ferric/docs/determinism/), the demo-lm pack that the
+Vulkan device correctly REJECTED on day one now deploys **accepted,
+bit-exact** — a full 3-layer transformer whose Metal-recorded vectors verify
+byte-identically on NVIDIA Vulkan. The same digests hold in Chrome's WebGPU,
+so browser-trained → device-deployed is a checkable signature end to end.
+Also shipped since: `ferrite run` (verified inner loop: 256 ms warm / 762 ms
+code-change, Mac→device over Tailscale with full verification per deploy).
 Still open for v0.2: landlock/seccomp native payloads, Rugix OS A/B, USB-C
-CDC-NCM dev link, sub-5s `ferrite run`.
+CDC-NCM dev link.
 
 **v0.2 EXTENSION — WHOLE-MODEL DETERMINISM (2026-07-22, same day): the
 verifiable envelope now covers FULL TRANSFORMERS.** The demo-lm rejection was
