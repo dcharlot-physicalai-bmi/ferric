@@ -207,3 +207,27 @@ These kernels are free for anyone to use, study, and build on (MIT OR
 Apache-2.0) — the probe, the CPU replicas, and this document are the
 reproduction kit. Remaining scoped work: perf profile of the storage
 scratch at real model shapes; a per-fabric CI row.
+
+## 2026-07-23 — the measured price of determinism (Metal, M5 Max)
+
+`examples/det_perf.rs` at transformer shapes, A/B against the pre-campaign
+kernels (worktree at 102d625, same harness):
+
+| kernel                | fast    | deterministic | cost  |
+|-----------------------|---------|---------------|-------|
+| matmul 512³           | 2.80 ms · 95.9 GF/s | 3.26 ms · 82.4 GF/s | +16% |
+| rmsnorm 512×4096      | 2.22 ms | 6.43 ms       | +190% |
+| layernorm 512×4096    | 2.03 ms | 3.69 ms       | +82%  |
+| softmax 512×4096      | 2.10 ms | 2.48 ms       | +18%  |
+| mha T=256 H=8 dh=64   | 3.25 ms | 4.25 ms       | +31%  |
+
+Reading: XOR-barrier kernels (matmul, softmax, mha) pay 16–31%; the
+storage-chain norms pay for per-element device-memory round-trips, rmsnorm
+worst at 2.9×. Both variants are the same naive one-thread-per-row designs,
+so absolute throughput is modest either way (GEMM tiling remains the known
+roadmap item). Conclusion for the roadmap: a deterministic parallel-tree
+reduction for the norms (storage-pinned partials, one pin per tree level
+instead of per element) should beat BOTH variants while keeping the digest
+guarantee — better than maintaining a fast/det kernel pair. Until then:
+these numbers are the honest price list, and at education/demo scale
+(the probe, the portal benches, Ferrite eval vectors) it is negligible.
