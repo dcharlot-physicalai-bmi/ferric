@@ -271,3 +271,26 @@ subgroupAdd order can be fixed; tensor-unit (coop-matrix) paths remain
 off the digest contract until their accumulation order can be pinned —
 verified-behavior envelopes per accelerator family (record oracle digests
 per NPU) are the honest bridge for opaque compilers.
+
+## 2026-07-23 — corrected perf: batched-dispatch harness (readback removed)
+
+The earlier price table was readback-dominated (8 MB per-op transfers
+masked kernel differences) — those numbers measured the bus, not the
+kernels. Corrected method: N dispatches queued, one readback. Metal, M5 Max:
+
+| kernel              | old fast | det sequential | det tree | det tax |
+|---------------------|----------|----------------|----------|---------|
+| matmul 512³         | 0.79 ms · 338 GF/s | 0.94 ms · 285 GF/s | — | +19% |
+| rmsnorm 512×4096    | 0.46 ms  | 1.10 ms        | 0.76 ms  | +65%   |
+| layernorm 512×4096  | 0.62 ms  | 1.25 ms        | —        | +102%  |
+| softmax 512×4096    | 0.60 ms  | 0.85 ms        | —        | +42%   |
+| mha T=256 H=8 dh=64 | 1.40 ms  | 1.81 ms        | —        | +29%   |
+
+Corrections to prior conclusions, stated plainly: the tree kernel beats the
+sequential deterministic kernel by 31% but does NOT beat the old fast
+kernel (+65% remains) — the earlier "should beat both" prediction was
+wrong, and the earlier "2.9× rmsnorm" figure was transfer-bound, not
+kernel-bound. Current honest statement: determinism costs +19–65% on the
+tree/XOR kernels and ~2× on the not-yet-treed sequential norms; the tree
+pattern (applied to layernorm next) is the path to narrowing further. All
+six-substrate digests unaffected by the harness change.
