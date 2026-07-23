@@ -765,7 +765,10 @@ fn map_map_mode(mode: crate::MapMode) -> u32 {
     }
 }
 
-const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 16] = [
+const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 17] = [
+    // FERRIC PATCH — surface WebGPU `subgroups` (Chrome 134+) as
+    // Features::SUBGROUP so warp-op kernels run in the browser too.
+    (wgt::Features::SUBGROUP, webgpu_sys::GpuFeatureName::Subgroups),
     (
         wgt::Features::DEPTH_CLIP_CONTROL,
         webgpu_sys::GpuFeatureName::DepthClipControl,

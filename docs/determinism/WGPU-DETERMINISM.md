@@ -348,3 +348,17 @@ capability model.
 Probe stands at 17 rows. The substrate ledger for reductions:
 shared-memory trees (6 substrates) · subgroup butterflies (5, browser
 pending upstream) · CPU threads (digest-invariant by row independence).
+
+## 2026-07-23 — browser warp ops: 17/17, no skips
+
+Two fork patches closed the last capability gap: naga now accepts
+`enable subgroups;` as an implemented extension (builtins were already
+ungated; browsers REQUIRE the directive, so one WGSL source must carry it
+everywhere — mapped to Capabilities::SUBGROUP), and wgpu's web backend maps
+WebGPU's `subgroups` feature to Features::SUBGROUP (FEATURES_MAPPING 16→17,
+web-sys already had the variant). Result: the shuffleXor butterfly runs on
+Chrome's subgroup hardware and produces `38e0cb5c…` bit-exactly — the same
+digest as Apple simdgroups, NVIDIA warps, and the ARM/x86/wasm lane
+simulations. The gate reports 17/17 on every fabric with zero
+capability-gated skips. Warp-level parallelism is fully under the digest
+contract on all six substrates.

@@ -25,6 +25,8 @@ pub(crate) struct EnableExtensions {
     primitive_index: bool,
     per_vertex: bool,
     wgpu_binding_array: bool,
+    /// FERRIC PATCH — whether `enable subgroups;` was written in the module.
+    subgroups: bool,
 }
 
 impl EnableExtensions {
@@ -43,6 +45,7 @@ impl EnableExtensions {
             primitive_index: false,
             per_vertex: false,
             wgpu_binding_array: false,
+            subgroups: false,
         }
     }
 
@@ -66,6 +69,7 @@ impl EnableExtensions {
             ImplementedEnableExtension::PrimitiveIndex => &mut self.primitive_index,
             ImplementedEnableExtension::WgpuPerVertex => &mut self.per_vertex,
             ImplementedEnableExtension::WgpuBindingArray => &mut self.wgpu_binding_array,
+            ImplementedEnableExtension::Subgroups => &mut self.subgroups,
         };
         *field = true;
     }
@@ -88,6 +92,7 @@ impl EnableExtensions {
             ImplementedEnableExtension::PrimitiveIndex => self.primitive_index,
             ImplementedEnableExtension::WgpuPerVertex => self.per_vertex,
             ImplementedEnableExtension::WgpuBindingArray => self.wgpu_binding_array,
+            ImplementedEnableExtension::Subgroups => self.subgroups,
         }
     }
 
@@ -163,7 +168,10 @@ impl EnableExtension {
             Self::COOPERATIVE_MATRIX => {
                 Self::Implemented(ImplementedEnableExtension::WgpuCooperativeMatrix)
             }
-            Self::SUBGROUPS => Self::Unimplemented(UnimplementedEnableExtension::Subgroups),
+            // FERRIC PATCH — accept `enable subgroups;` as implemented: naga's
+            // subgroup builtins already work ungated, and browsers (Tint)
+            // REQUIRE the directive, so the same WGSL must carry it everywhere.
+            Self::SUBGROUPS => Self::Implemented(ImplementedEnableExtension::Subgroups),
             Self::DRAW_INDEX => Self::Implemented(ImplementedEnableExtension::DrawIndex),
             Self::PRIMITIVE_INDEX => Self::Implemented(ImplementedEnableExtension::PrimitiveIndex),
             Self::PER_VERTEX => Self::Implemented(ImplementedEnableExtension::WgpuPerVertex),
@@ -192,6 +200,7 @@ impl EnableExtension {
                 ImplementedEnableExtension::WgpuPerVertex => Self::PER_VERTEX,
                 ImplementedEnableExtension::WgpuBindingArray => Self::BINDING_ARRAY,
                 ImplementedEnableExtension::WgpuInt16 => Self::INT16,
+                ImplementedEnableExtension::Subgroups => Self::SUBGROUPS,
             },
             Self::Unimplemented(kind) => match kind {
                 UnimplementedEnableExtension::Subgroups => Self::SUBGROUPS,
@@ -246,6 +255,10 @@ pub enum ImplementedEnableExtension {
     WgpuBindingArray,
     /// Enables `i16`/`u16` 16-bit integer support in WGSL, native only.
     WgpuInt16,
+    /// FERRIC PATCH — `enable subgroups;` accepted as implemented (see
+    /// from_ident): builtins are ungated in naga, browsers require the
+    /// directive, one WGSL source must serve both.
+    Subgroups,
 }
 
 impl ImplementedEnableExtension {
@@ -264,6 +277,7 @@ impl ImplementedEnableExtension {
         Self::WgpuPerVertex,
         Self::WgpuBindingArray,
         Self::WgpuInt16,
+        Self::Subgroups,
     ];
 
     /// Returns slice of all variants of [`ImplementedEnableExtension`].
@@ -276,6 +290,7 @@ impl ImplementedEnableExtension {
         use crate::valid::Capabilities as C;
         match self {
             Self::F16 => C::SHADER_FLOAT16,
+            Self::Subgroups => C::SUBGROUP,
             Self::DualSourceBlending => C::DUAL_SOURCE_BLENDING,
             Self::ClipDistances => C::CLIP_DISTANCES,
             Self::WgpuMeshShader => C::MESH_SHADER,
