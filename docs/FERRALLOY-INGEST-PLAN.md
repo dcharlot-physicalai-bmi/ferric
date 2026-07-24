@@ -228,15 +228,37 @@ denied inside the pack, with the deploy behavior verified bit-exact. Engine
 self-hostable, ungated fleet server the whole field gates behind a paid
 cloud. Channels hold one signed release each (statically verified on upload —
 a corrupt PUT is 400'd, channel never created); `ferralloyd` opt-in-subscribes
-(FERRITE_FLEET_URL/_CHANNEL/_DEVICE_ID), PULLS its target, runs the SAME
+(FERRALLOY_FLEET_URL/_CHANNEL/_DEVICE_ID), PULLS its target, runs the SAME
 on-device accept gate (behavioral verification), applies atomically, reports.
 Server never pushes → NAT'd devices update; "rolled out" = behavior verified
 on-device, not bytes sent. CLI `ferralloy release … --channel … --fleet …` +
 `ferralloy fleet`; live dashboard at /. Agent accept gate refactored to a
 shared `accept_pack()`. E2E-proven: release → poll → verify → apply → report;
 version bump auto-picked-up; corrupt release rejected CLI- AND server-side.
-Still open for v0.2: cohorts/canary staging, TUF-rooted keys, Rugix OS A/B,
-USB-C CDC-NCM dev link.
+**CANARY ROLLOUTS SHIPPED (2026-07-24), gated on VERIFIED BEHAVIOR.** A
+channel now holds a `current` release plus an optional `rollout` at N% of its
+devices, assigned by a stable FNV percentile of the device id. `ferralloy
+release … --canary 20` stages a canary; the device poll carries `?device=<id>`
+so the server resolves each device to its release; the dashboard shows the
+canary's verified-pass rate ("2/2 verified") as the promotion signal;
+`ferralloy promote` makes it fleet-wide, `ferralloy abort` reverts. E2E: 4
+devices, 50% canary → the right 2 pulled v2 and verified bit-exact while the
+other 2 held v1, then promote converged the fleet. "Rolled out" = behavior
+verified on a slice of the REAL fleet, not bytes delivered — no incumbent does
+this. `ferralloy-fleet` + `ferralloy-agent` published at 0.2.0.
+
+**PUBLISHED to crates.io + fork-free determinism (2026-07-24).** `cargo
+install ferralloy` works. The wgpu/naga determinism forks were proven
+REDUNDANT — pure-WGSL storage-pinning is bit-identical on STOCK wgpu 30
+(Metal + Vulkan, 9/9 golden), so `ferric-core` republished at 0.2 against
+stock wgpu, Ferralloy dropped its fork mirror, and every crate builds on the
+public registry unmodified. TR-2026-23 revised to Preprint v2 with the
+finding.
+
+Still open for v0.2: TUF-rooted keys, Rugix OS A/B, USB-C CDC-NCM dev link.
+(A formal-certificate facet — device-side Lyapunov re-verification, verified
+CORRECTNESS beyond verified behavior — is in active development in
+`ferralloy-pack`.)
 
 **v0.2 EXTENSION — WHOLE-MODEL DETERMINISM (2026-07-22, same day): the
 verifiable envelope now covers FULL TRANSFORMERS.** The demo-lm rejection was
@@ -263,14 +285,21 @@ determinism patches are a legitimate wgpu contribution.
 **v0.3 — the gates.** `ferralloy-gate`: sim-gated promotion (pack must pass the
 MuJoCo twin regression before hardware), joules-per-task telemetry
 (RAPL/tegrastats), browser ops page on the site (WebSerial console, WebUSB flash),
-and the **certificate gate** (§5b.7) — a `certificate` pack facet + re-verify the
-deployed weights carry a valid formal behavioral certificate (SOS/dReal/Taylor+CROWN)
-before the hardware cohort. The certificate *science* is proven and the reference
-certified-ternary pack already runs native + wasm on Ferric; the gate *integration*
-(pack facet + `ferralloy verify-cert` + the promotion hook) is the v0.3 build — a
-sound-verifier-in-Rust port (the Taylor+CROWN pass is dependency-free f64) is the
-device-side path; SOS/dReal stay a build-time/fleet-server gate (they need SDP/SMT
-solvers, not on-device).
+and the **certificate gate** (§5b.7). **✅ SHIPPED (2026-07-24):** the certificate
+gate is built and workspace-tested end to end —
+- `ferralloy-pack::certificate` — a `CertificateSpec` manifest facet (`Manifest.certificate`,
+  optional ⇒ pre-certificate packs' canonical bytes unchanged) + the **device-side re-verifier**
+  in dependency-free f64 (2nd-order Taylor + per-box CROWN |tanh″|, adaptive box refinement,
+  all 6 free/contact×saturation hybrid cases). No SDP/SMT, only `tanh` — a faithful port of
+  `ebm_cert_verify.rs` (proven wasm-clean @75KB). Re-proves the R=1.2 certificate: 1486 boxes,
+  depth 8, worst bound −0.00000.
+- `ferralloy verify-cert <fpack>` — the explicit on-device re-proof CLI.
+- **The gate, wired at every hop:** `build --certificate` re-proves at build time (rejects a bad
+  cert, naming the offending box); `deploy`/`release` re-prove before shipping/publishing (the
+  operator promotion hook); and the **device agent** (`accept_pack`) re-proves before a pack goes
+  live — verified *correctness* alongside verified *behavior*. 5 certificate unit tests +
+  workspace green; reference fixture in `ferralloy/payloads/certificate-example/`.
+SOS/dReal stay a build-time/fleet-server gate (they need SDP/SMT solvers, not on-device).
 
 **v1.0 — trust + fleet.** TUF root via `tough`, channels/cohorts
 (Peridio-style release algebra), delta streaming, `ferralloy-lite` MCU preview.
