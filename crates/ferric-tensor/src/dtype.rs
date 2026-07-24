@@ -1234,6 +1234,147 @@ impl Tensor {
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, n_ff])
     }
+    /// MoE router top-k, entirely on the GPU — kills the per-layer CPU readback sync. `self` is the
+    /// router logits [T, n_expert] (one row per token — `h.matmul_bt(router)` order); per token:
+    /// computes scores (softmax or sigmoid), selects the top-k by score(+bias) with the bias never
+    /// entering the weights, renormalizes the selected scores to sum 1 (× `scale`), and writes a
+    /// `[w_0..w_{k-1} | idx_0..idx_{k-1}]` row (indices stored as f32 — exact for n_expert ≤ 2^24)
+    /// → [T, 2k] for the `*_id` expert kernels to consume without any CPU round-trip. One thread
+    /// per token, scanning its own contiguous logits row.
+    pub fn moe_topk(&self, bias: Option<&Tensor>, k: usize, sigmoid: bool, scale: f32) -> Tensor {
+        let x = self.contiguous();
+        let (t, ne) = if x.shape.len() == 2 { (x.shape[0], x.shape[1]) } else { (1, x.numel()) };
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert!(ne <= 1024, "moe_topk: n_expert ≤ 1024 (single-thread scan)");
+        let out = empty(&self.ctx, t * 2 * k);
+        // bias is optional: bind a 1-element dummy when absent (has_bias=0 ignores it)
+        let dummy;
+        let bias_buf = match bias {
+            Some(b) => b.contiguous().buf.clone(),
+            None => { dummy = Tensor::from_vec(&self.ctx, &[0.0], &[1]); dummy.buf.clone() }
+        };
+        run(&self.ctx, MOE_TOPK_WGSL, "moe_topk",
+            &[x.buf.as_ref(), bias_buf.as_ref(), &out,
+              &unibuf(&self.ctx, &[ne as u32, k as u32, sigmoid as u32, bias.is_some() as u32, scale.to_bits(), t as u32, 0, 0])],
+            (t as u32, 1, 1));
+        Tensor::from_parts(&self.ctx, out, vec![t, 2 * k])
+    }
+
+    /// Batched selected-expert gate|up + SwiGLU (mixture-of-experts decode). `self` is [T, in] hidden
+    /// rows (each token routes independently); `w` packs ALL experts' fused gate|up weights,
+    /// expert-major: rows = n_expert · 2·eff; `selw` is the [T, 2k] `moe_topk` output. One dispatch
+    /// computes silu(gate)·up for every (token, selected expert) → [T, k, eff]. Replaces T·k separate
+    /// matmul+swiglu dispatches — the MoE dispatch-count fix.
+    pub fn matmul_q4_k_swiglu_id(&self, w: &Q4_KWeights, selw: &Tensor, k: usize, eff: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, t * k * eff);
+        let n = t * k * eff;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q4_K_SWIGLU_ID_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q4_k_swiglu_id",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, eff as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, k, eff])
+    }
+
+    /// Batched selected-expert down projection (mixture-of-experts decode). `self` is [k, in] — row s
+    /// is expert slot s's SwiGLU output; `w` packs ALL experts' down weights, expert-major
+    /// (rows = n_expert · out_pe). One dispatch → [k, out_pe]; caller weight-sums the k rows.
+    pub fn matmul_q6_k_id(&self, w: &Q6_KWeights, selw: &Tensor, out_pe: usize) -> Tensor {
+        let x = self.contiguous();
+        let (k, inn) = (x.shape[0], x.shape[1]);
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, k * out_pe);
+        let n = k * out_pe;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q6_K_ID_WGSL.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY);
+        run(&self.ctx, &src, "matmul_q6_k_id",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![k, out_pe])
+    }
+
+
+    /// Batched selected-expert down projection WITH the weighted sum fused: `self` is [T, k, in]
+    /// (row (t,s) = token t's expert-slot-s SwiGLU output; a 2D [k, in] means T=1); returns
+    /// [T, out_pe] with row t = Σ_s w_{t,s} · down_{e_{t,s}}(x_{t,s}), w/idx read from the [T, 2k]
+    /// `moe_topk` buffer. One dispatch for the whole routed-expert combine, all tokens.
+    pub fn matmul_q6_k_id_wsum(&self, w: &Q6_KWeights, selw: &Tensor, out_pe: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, k, inn) = if x.shape.len() == 3 { (x.shape[0], x.shape[1], x.shape[2]) } else { (1, x.shape[0], x.shape[1]) };
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, t * out_pe);
+        let n = t * out_pe;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q6_K_ID_WSUM_WGSL.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY);
+        run(&self.ctx, &src, "matmul_q6_k_id_wsum",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
+    }
+    /// `matmul_q4_k_swiglu_id` for a Q8_0 gate|up slab (the MTP draft block's expert format).
+    pub fn matmul_q8_0_swiglu_id(&self, w: &Q8_0Weights, selw: &Tensor, k: usize, eff: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, t * k * eff);
+        let n = t * k * eff;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        run(&self.ctx, MATMUL_Q8_0_SWIGLU_ID_WGSL, "matmul_q8_0_swiglu_id",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, eff as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, k, eff])
+    }
+
+    /// `matmul_q6_k_id_wsum` for a Q8_0 down slab — companion to `matmul_q8_0_swiglu_id`.
+    pub fn matmul_q8_0_id_wsum(&self, w: &Q8_0Weights, selw: &Tensor, out_pe: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, k, inn) = if x.shape.len() == 3 { (x.shape[0], x.shape[1], x.shape[2]) } else { (1, x.shape[0], x.shape[1]) };
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, t * out_pe);
+        let n = t * out_pe;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        run(&self.ctx, MATMUL_Q8_0_ID_WSUM_WGSL, "matmul_q8_0_id_wsum",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
+    }
+
+    /// `matmul_q6_k_id_wsum` for a Q4_K down slab — same [T,k,in]→[T,out] weighted combine, Q4_K math.
+    pub fn matmul_q4_k_id_wsum(&self, w: &Q4_KWeights, selw: &Tensor, out_pe: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, k, inn) = if x.shape.len() == 3 { (x.shape[0], x.shape[1], x.shape[2]) } else { (1, x.shape[0], x.shape[1]) };
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let sw = selw.contiguous();
+        let out = empty(&self.ctx, t * out_pe);
+        let n = t * out_pe;
+        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        let src = MATMUL_Q4_K_ID_WSUM_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        run(&self.ctx, &src, "matmul_q4_k_id_wsum",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out, sw.buf.as_ref(),
+              &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
+    }
+
     /// Fused gate/up + SwiGLU for a Q5_K gate_up weight (Q5_K_M FFNs). Same whole-block fusion as
     /// `matmul_q4_k_swiglu`, plus the 5th (qh) bit per quant.
     pub fn matmul_q5_k_swiglu(&self, w: &Q5_KWeights) -> Tensor {
@@ -1861,6 +2002,280 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = qk_dot(o, r, nblk, in_dim);         // gate row
     let u = qk_dot(o + n_ff, r, nblk, in_dim);  // up row
     out[idx] = (g / (1.0 + exp(-g))) * u;       // silu(g)·u
+}
+"#;
+
+// MoE router top-k on the GPU: scores (softmax/sigmoid), biased SELECTION (bias never in weights),
+// renormalized scaled weights → out = [w_0..w_{k-1} | idx_0..idx_{k-1}]. One thread scans ≤1024
+// experts serially — nanoseconds of ALU against a saved CPU round-trip per layer per token.
+const MOE_TOPK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       logits: array<f32>;
+@group(0) @binding(1) var<storage,read>       bias:   array<f32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;
+@group(0) @binding(3) var<uniform>            info:   array<vec4<u32>, 2>; // ne,k,sigmoid,has_bias | scale_bits
+fn score(lb: u32, i: u32, sig: u32, maxl: f32, ssum: f32) -> f32 {
+    if (sig == 1u) { return 1.0 / (1.0 + exp(-logits[lb + i])); }
+    return exp(logits[lb + i] - maxl) / ssum;
+}
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ne = info[0].x; let k = info[0].y; let sig = info[0].z; let hb = info[0].w;
+    let scale = bitcast<f32>(info[1].x); let t = info[1].y;
+    let ti = gid.x;
+    if (ti >= t) { return; }
+    let lb = ti * ne;   // this token's contiguous logits row
+    var maxl = -3.4e38; var ssum = 0.0;
+    if (sig == 0u) {
+        for (var i = 0u; i < ne; i = i + 1u) { maxl = max(maxl, logits[lb + i]); }
+        for (var i = 0u; i < ne; i = i + 1u) { ssum = ssum + exp(logits[lb + i] - maxl); }
+    }
+    var picked: array<u32, 32>;
+    for (var w = 0u; w < 32u; w = w + 1u) { picked[w] = 0u; }
+    let ob = ti * 2u * k;
+    var wsum = 0.0;
+    for (var s = 0u; s < k; s = s + 1u) {
+        var bi = 0u; var bv = -3.4e38;
+        for (var i = 0u; i < ne; i = i + 1u) {
+            if ((picked[i >> 5u] & (1u << (i & 31u))) != 0u) { continue; }
+            var m = score(lb, i, sig, maxl, ssum);
+            if (hb == 1u) { m = m + bias[i]; }
+            if (m > bv) { bv = m; bi = i; }
+        }
+        picked[bi >> 5u] = picked[bi >> 5u] | (1u << (bi & 31u));
+        let sc = score(lb, bi, sig, maxl, ssum);
+        out[ob + s] = sc; out[ob + k + s] = f32(bi);
+        wsum = wsum + sc;
+    }
+    for (var s = 0u; s < k; s = s + 1u) { out[ob + s] = out[ob + s] / wsum * scale; }
+}
+"#;
+
+// Batched selected-expert gate|up + SwiGLU (MoE): weight rows are expert-major in one slab; the k
+// selected expert ids ride in the uniform (info[1..3]); x is a single hidden row. Same qk_dot math as
+// MATMUL_Q4_K_SWIGLU_WGSL — identical bytes per expert row, just indirect row addressing.
+const MATMUL_Q4_K_SWIGLU_ID_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [T, w_0..w_{k-1} | idx_0..idx_{k-1}] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   array<vec4<u32>, 2>;  // k, eff, in, gw | tot
+__HELPERS__
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info[0].w; let k = info[0].x; let eff = info[0].y; let in_dim = info[0].z;
+    if (idx >= info[1].x) { return; }
+    let ti = idx / (k * eff); let rem = idx % (k * eff);
+    let s = rem / eff; let o = rem % eff;
+    let e = u32(selw[ti * 2u * k + k + s]);
+    let base = e * (2u * eff);
+    let nblk = in_dim / 256u;
+    let g = qk_dot(base + o, ti, nblk, in_dim);         // this expert's gate row · token ti's hidden
+    let u = qk_dot(base + eff + o, ti, nblk, in_dim);   // this expert's up row
+    out[idx] = (g / (1.0 + exp(-g))) * u;               // silu(g)·u
+}
+"#;
+
+// Batched selected-expert down projection (MoE): x row s is expert slot s's swiglu output; weight rows
+// are expert-major in one slab. Same per-block math as MATMUL_Q6_K_FLAT_WGSL (__BODY__ reads `bi`,`r`).
+const MATMUL_Q6_K_ID_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [w | idx] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   vec4<u32>;  // k, out_pe, in, gw
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let k = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= k * o_dim) { return; }
+    let s = idx / o_dim; let o = idx % o_dim;
+    let e = u32(selw[k + s]);
+    let row = e * o_dim + o;      // absolute weight row in the expert slab
+    let r = s;                    // x row for this slot (each expert has its own hidden)
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = row * nblk + blk;
+__BODY__
+    }
+    out[idx] = acc;
+}
+"#;
+
+
+// Batched selected-expert down + WEIGHTED SUM fused (MoE): out[o] = Σ_s w_s · dot(x_s, W[e_s][o]) —
+// one dispatch replaces the down matmul plus the narrow/reshape/broadcast/mul/sum combine chain.
+const MATMUL_Q6_K_ID_WSUM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [T, w | idx] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   array<vec4<u32>, 2>;  // k, out_pe, in, gw | tot
+__HELPERS__
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info[0].w; let k = info[0].x; let o_dim = info[0].y; let in_dim = info[0].z;
+    if (idx >= info[1].x) { return; }
+    let ti = idx / o_dim; let o = idx % o_dim;
+    let nblk = in_dim / 256u;
+    var total = 0.0;
+    for (var s = 0u; s < k; s = s + 1u) {
+        let e = u32(selw[ti * 2u * k + k + s]);
+        let row = e * o_dim + o;
+        let r = ti * k + s;
+        var acc = 0.0;
+        for (var blk = 0u; blk < nblk; blk = blk + 1u) {
+            let bi = row * nblk + blk;
+__BODY__
+        }
+        total = total + selw[ti * 2u * k + s] * acc;
+    }
+    out[idx] = total;
+}
+"#;
+
+// Batched selected-expert down + WEIGHTED SUM for a Q4_K down slab (Q4_K_M quantizes half the
+// layers' down_exps as Q4_K, the other half Q6_K) — same structure as MATMUL_Q6_K_ID_WSUM_WGSL,
+// Q4_K block math (identical to the swiglu_id kernel's qk_dot).
+const MATMUL_Q4_K_ID_WSUM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;  // [T·k, in] swiglu outputs
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        aux:    array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [T, w | idx] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   array<vec4<u32>, 2>;  // k, out_pe, in, gw | tot
+__HELPERS__
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let bi = o_row * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
+        let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
+        let xbb = r * in_dim + blk * 256u;
+        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
+            let cw = cb8 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let word = codes[cw + w];
+                var nib: vec4<f32>;
+                if (hi == 0u) { nib = vec4<f32>(f32(word & 0xfu), f32((word >> 8u) & 0xfu), f32((word >> 16u) & 0xfu), f32((word >> 24u) & 0xfu)); }
+                else          { nib = vec4<f32>(f32((word >> 4u) & 0xfu), f32((word >> 12u) & 0xfu), f32((word >> 20u) & 0xfu), f32((word >> 28u) & 0xfu)); }
+                let xw = x[xv + w];
+                acc = acc + ds * dot(xw, nib) - mm * (xw.x + xw.y + xw.z + xw.w);
+            }
+        }
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info[0].w; let k = info[0].x; let o_dim = info[0].y; let in_dim = info[0].z;
+    if (idx >= info[1].x) { return; }
+    let ti = idx / o_dim; let o = idx % o_dim;
+    let nblk = in_dim / 256u;
+    var total = 0.0;
+    for (var s = 0u; s < k; s = s + 1u) {
+        let e = u32(selw[ti * 2u * k + k + s]);
+        total = total + selw[ti * 2u * k + s] * qk_dot(e * o_dim + o, ti * k + s, nblk, in_dim);
+    }
+    out[idx] = total;
+}
+"#;
+
+// Q8_0 selected-expert gate|up + SwiGLU — the MTP draft block's experts are Q8_0; without a slab
+// path they fall back to per-token CPU routing whose mid-batch readbacks are both slow and racy.
+// Same block/word order as MATMUL_Q8_0_FLAT_WGSL.
+const MATMUL_Q8_0_SWIGLU_ID_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [T, w | idx] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   array<vec4<u32>, 2>;  // k, eff, in, gw | tot
+fn q8_dot(o_row: u32, r: u32, in_dim: u32) -> f32 {
+    let nblk = in_dim / 32u; let nwords = nblk * 8u;
+    var acc = 0.0;
+    for (var w: u32 = 0u; w < nwords; w = w + 1u) {
+        let blk = w >> 3u; let bi = o_row * nblk + blk;
+        let sw = unpack2x16float(scales[bi >> 1u]);
+        let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+        let word = codes[o_row * nwords + w];
+        let xi = (r * in_dim + blk * 32u + (w & 7u) * 4u) >> 2u;
+        let v = vec4<f32>(f32(i32(word << 24u) >> 24u), f32(i32(word << 16u) >> 24u), f32(i32(word << 8u) >> 24u), f32(i32(word) >> 24u));
+        acc = acc + d * dot(x[xi], v);
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info[0].w; let k = info[0].x; let eff = info[0].y; let in_dim = info[0].z;
+    if (idx >= info[1].x) { return; }
+    let ti = idx / (k * eff); let rem = idx % (k * eff);
+    let s = rem / eff; let o = rem % eff;
+    let e = u32(selw[ti * 2u * k + k + s]);
+    let base = e * (2u * eff);
+    let g = q8_dot(base + o, ti, in_dim);
+    let u = q8_dot(base + eff + o, ti, in_dim);
+    out[idx] = (g / (1.0 + exp(-g))) * u;
+}
+"#;
+
+// Q8_0 selected-expert down + weighted sum — companion to MATMUL_Q8_0_SWIGLU_ID_WGSL.
+const MATMUL_Q8_0_ID_WSUM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;  // [T·k, in] swiglu outputs
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>; // [T, w | idx] from moe_topk
+@group(0) @binding(5) var<uniform>             info:   array<vec4<u32>, 2>;  // k, out_pe, in, gw | tot
+fn q8_dot(o_row: u32, r: u32, in_dim: u32) -> f32 {
+    let nblk = in_dim / 32u; let nwords = nblk * 8u;
+    var acc = 0.0;
+    for (var w: u32 = 0u; w < nwords; w = w + 1u) {
+        let blk = w >> 3u; let bi = o_row * nblk + blk;
+        let sw = unpack2x16float(scales[bi >> 1u]);
+        let d = select(sw.y, sw.x, (bi & 1u) == 0u);
+        let word = codes[o_row * nwords + w];
+        let xi = (r * in_dim + blk * 32u + (w & 7u) * 4u) >> 2u;
+        let v = vec4<f32>(f32(i32(word << 24u) >> 24u), f32(i32(word << 16u) >> 24u), f32(i32(word << 8u) >> 24u), f32(i32(word) >> 24u));
+        acc = acc + d * dot(x[xi], v);
+    }
+    return acc;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info[0].w; let k = info[0].x; let o_dim = info[0].y; let in_dim = info[0].z;
+    if (idx >= info[1].x) { return; }
+    let ti = idx / o_dim; let o = idx % o_dim;
+    var total = 0.0;
+    for (var s = 0u; s < k; s = s + 1u) {
+        let e = u32(selw[ti * 2u * k + k + s]);
+        total = total + selw[ti * 2u * k + s] * q8_dot(e * o_dim + o, ti * k + s, in_dim);
+    }
+    out[idx] = total;
 }
 "#;
 

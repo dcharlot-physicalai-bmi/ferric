@@ -167,11 +167,15 @@ impl Tensor {
         let n = numel(&shape);
         let out = empty(&self.ctx, n);
         // info: [rank, dim, n, offA, offB, aDim, shape[r], aStr[r], bStr[r]]
+        // 2D grid: n can exceed the 65535-workgroup (4.19M-element) 1D cap — a long-prompt hybrid
+        // prefill's rope/proj concats do.
+        let (grid, rs) = groups2d(n);
         let mut info = vec![self.rank() as u32, dim as u32, n as u32, self.offset as u32, other.offset as u32, self.shape[dim] as u32];
         info.extend(shape.iter().map(|&x| x as u32));
         info.extend(self.strides.iter().map(|&x| x as u32));
         info.extend(other.strides.iter().map(|&x| x as u32));
-        run(&self.ctx, CAT_WGSL, "cat", &[&self.buf, &other.buf, &out, &u32buf(&self.ctx, &info)], groups(n));
+        info.push(rs);
+        run(&self.ctx, CAT_WGSL, "cat", &[&self.buf, &other.buf, &out, &u32buf(&self.ctx, &info)], grid);
         Tensor::from_parts(&self.ctx, out, shape)
     }
 
@@ -1090,10 +1094,11 @@ const CAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;
 @group(0) @binding(1) var<storage,read>        b: array<f32>;
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>;
-@group(0) @binding(3) var<storage,read>        info: array<u32>; // rank,dim,n,offA,offB,aDim,shape[r],aStr[r],bStr[r]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rank,dim,n,offA,offB,aDim,shape[r],aStr[r],bStr[r],row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; let rank = info[0]; let dim = info[1]; let n = info[2]; let aDim = info[5];
+    let rank = info[0]; let dim = info[1]; let n = info[2]; let aDim = info[5];
+    let i = gid.x + gid.y * info[6u + 3u * rank];   // 2D grid: n can exceed 4.19M
     if (i >= n) { return; }
     // decompose i over the OUTPUT shape, then route each thread to whichever side owns its slot
     var rem = i; var from_a = true; var idx_at_dim: u32 = 0u;

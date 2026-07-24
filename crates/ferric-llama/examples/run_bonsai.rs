@@ -55,6 +55,40 @@ async fn run() {
         c.n_k_heads, c.n_v_heads, c.head_k_dim, c.head_v_dim(), c.conv_kernel, c.n_head, c.n_head_kv, c.head_dim
     );
 
+    if args.iter().any(|a| a == "--ffnbench") {
+        for t in [1usize, 2, 3, 5, 8] {
+            println!("  ffn[1] t={t}: {:.2} ms (median of 20)", m.bench_ffn(1, t, 20));
+        }
+        return;
+    }
+    // `--fwdbench` — median cost of the speculative-verify shape (snapshot → t-token forward →
+    // rollback) at t=1..3 against a warm cache. Isolates the verify's t-scaling.
+    if args.iter().any(|a| a == "--fwdbench") {
+        let mut cache = ferric_llama::qwen35::Cache::new(c);
+        let (lg, _hid) = m.forward_spec(&ids, &mut cache, c.n_layer);
+        lg.to_vec().await;
+        for t in [1usize, 2, 3, 1, 2, 3] {
+            let toks: Vec<u32> = ids.iter().copied().cycle().take(t).collect();
+            let mut times = Vec::new();
+            for i in 0..14 {
+                let snap = cache.snapshot();
+                let t0 = std::time::Instant::now();
+                let (lg, _h) = m.forward_spec(&toks, &mut cache, c.n_layer);
+                lg.to_vec().await;
+                if i >= 2 { times.push(t0.elapsed().as_secs_f64() * 1e3); } // 2 warmups
+                cache = snap;
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ferric_tensor::reset_op_counters();
+            let snap = cache.snapshot();
+            let (lg, _h) = m.forward_spec(&toks, &mut cache, c.n_layer);
+            lg.to_vec().await;
+            cache = snap;
+            let (disp, subs) = ferric_tensor::op_counters();
+            println!("  verify t={t}: min {:.1} · median {:.1} ms (12 runs) · {disp} dispatches, {subs} submits", times[0], times[6]);
+        }
+        return;
+    }
     if ids.is_empty() { println!("(no token ids given — load-only)"); return; }
     println!("\ntokens: {ids:?}");
     for &i in &ids { print!("{}", detok(vocab.get(i as usize).map(|s| s.as_str()).unwrap_or("?"))); }
@@ -133,6 +167,8 @@ async fn run() {
             seq.push(next);
         }
         ferric_tensor::prof_report(); // accumulated over the decode steps
+        let (disp, subs) = ferric_tensor::op_counters();
+        println!("\n  [{disp} dispatches, {subs} submits total]");
         let total = t0.elapsed().as_secs_f64();
         let decode_ms = (total * 1e3 - prompt_ms) / (n - 1).max(1) as f64;
         println!("\n  {n} tokens in {:.2}s · prompt {:.0}ms · {:.0} ms/token after", total, prompt_ms, decode_ms);
@@ -140,6 +176,7 @@ async fn run() {
 
         // `--verify-cache` — the cache is only correct if carrying state is indistinguishable from
         // re-running the prefix. Generate both ways and require identical tokens.
+        // (see also `--spec` below: speculative output must equal `--gen` output token-for-token)
         if args.iter().any(|a| a == "--verify-cache") && !reprefill {
             let mut naive = ids.clone();
             let t1 = std::time::Instant::now();
@@ -154,5 +191,183 @@ async fn run() {
                 if same { "✅" } else { "❌" }, slow / total);
             assert!(same, "cached decode diverged from re-prefill");
         }
+    }
+
+    // `--spec N` — greedy speculative decoding with the model's own MTP ("nextn") draft block.
+    // The draft block proposes tokenᵢ₊₂ from (tokenᵢ₊₁, hiddenᵢ); the main model verifies every
+    // proposal, so the output is LOSSLESS — it must match `--gen` token-for-token. The win: a
+    // (k+1)-token verify forward costs barely more than a 1-token forward in the fixed-overhead-
+    // bound decode regime, so each accepted draft is a nearly-free extra token.
+    if let Some(p) = args.iter().position(|a| a == "--spec") {
+        let n: usize = args[p + 1].parse().unwrap();
+        use std::io::Write;
+        let argmax = |row: &[f32]| (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+        assert!(m.mtp.is_some(), "model has no MTP draft block (nextn_predict_layers == 0)");
+        let pr = |t: u32| { print!("{}", detok(vocab.get(t as usize).map(|s| s.as_str()).unwrap_or("?"))); std::io::stdout().flush().ok(); };
+
+        print!("\ngenerating (speculative, MTP self-draft): ");
+        for &i in &ids { print!("{}", detok(vocab.get(i as usize).map(|s| s.as_str()).unwrap_or("?"))); }
+        std::io::stdout().flush().ok();
+
+        let t0 = std::time::Instant::now();
+        let mut cache = ferric_llama::qwen35::Cache::new(c);
+        let mut mc = ferric_llama::qwen35::MtpCache::default();
+        mc.pos = 1; // the first pair (prompt token 1, hidden 0) sits at position 1
+
+        // Prompt: one prefill for the main model; its hidden rows also seed the draft block's cache
+        // (pairs for every prompt position — without them the drafter is blind to the prompt).
+        let (lg, hid) = m.forward_spec(&ids, &mut cache, c.n_layer);
+        let v = lg.to_vec().await;
+        let pend0 = argmax(&v[v.len() - c.n_vocab..]);
+        let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
+        ferric_tensor::prof_report(); // prompt-phase categories
+        pr(pend0);
+        let mut out: Vec<u32> = vec![pend0];
+        let mut unfed: Vec<u32> = vec![pend0];      // committed tokens the main cache hasn't seen yet
+        let mut ptoks: Vec<u32> = ids[1..].iter().copied().chain([pend0]).collect();
+        let mut phid = hid;                          // pair i = (ptoks[i], row i of phid)
+        let (mut steps, mut acc) = (0usize, 0usize);
+        let (mut draft_s, mut verify_s) = (0.0f64, 0.0f64);
+
+        while out.len() < n {
+            // 1. Draft: feed the pending pairs (keeps the draft cache aligned), propose one token.
+            let td = std::time::Instant::now();
+            let dlog = m.mtp_forward(&ptoks, &phid, &mut mc);
+            let dv = dlog.to_vec().await;
+            draft_s += td.elapsed().as_secs_f64();
+            let d = argmax(&dv[dv.len() - c.n_vocab..]);
+            // 2. Verify: one forward over [unfed…, draft]. Snapshot first — tensors are immutable
+            //    Arc-shared buffers, so the snapshot is O(1) handle copies, and rollback is free.
+            let tv = std::time::Instant::now();
+            let snap = cache.snapshot();
+            let k = unfed.len();
+            let toks: Vec<u32> = unfed.iter().copied().chain([d]).collect();
+            let (lg, hid) = m.forward_spec(&toks, &mut cache, c.n_layer);
+            let v = lg.to_vec().await;
+            verify_s += tv.elapsed().as_secs_f64();
+            let truth = argmax(&v[0..c.n_vocab]); // row 0 = last unfed position (forward_spec heads only the last two)
+            steps += 1;
+            if truth == d {
+                // Accept: everything in the cache is valid; the draft's own logits row is valid too,
+                // so it immediately yields the next committed token — 2 tokens from this forward.
+                acc += 1;
+                let pend = argmax(&v[c.n_vocab..2 * c.n_vocab]);
+                pr(d); pr(pend);
+                out.push(d); out.push(pend);
+                ptoks = vec![d, pend];
+                phid = hid.narrow(0, k - 1, 2).contiguous(); // hiddens at d's and pend's predecessors
+                unfed = vec![pend];
+            } else {
+                // Reject: the cache holds a wrong entry at the draft's position — roll back to the
+                // snapshot. Nothing is wasted: the true token was still learned from this forward,
+                // and next iteration's verify forward re-feeds the unfed tokens together.
+                pr(truth);
+                out.push(truth);
+                cache = snap;
+                unfed.push(truth);
+                ptoks = vec![truth];
+                phid = hid.narrow(0, k - 1, 1).contiguous(); // hidden at truth's predecessor
+            }
+        }
+        out.truncate(n);
+        ferric_tensor::prof_report(); // verify-forward categories accumulated over the loop
+        let total = t0.elapsed().as_secs_f64();
+        let decode_ms = (total * 1e3 - prompt_ms) / (out.len() - 1).max(1) as f64;
+        println!("\n  {} tokens in {:.2}s · prompt {:.0}ms · {:.1} ms/token after", out.len(), total, prompt_ms, decode_ms);
+        println!("  drafts: {acc}/{steps} accepted ({:.0}%) · draft {:.0}ms/iter · verify {:.0}ms/iter",
+            100.0 * acc as f64 / steps.max(1) as f64, draft_s * 1e3 / steps.max(1) as f64, verify_s * 1e3 / steps.max(1) as f64);
+        println!("  ids: {:?}", out);
+    }
+
+    // `--spec2 N` — REAL 2-token speculative decoding (measured d2 conditional acceptance ≈65% ⇒
+    // +29% tokens/verify; verify is fixed-overhead-bound so ~14% wall-clock). The MTP block drafts
+    // d1, then recursively drafts d2 from (d1, d1's own draft-hidden). ONE verify forward over
+    // [unfed…, d1, d2] commits 1, 2, or 3 tokens. Two caches advance on separate ledgers: MAIN (fed
+    // by verify forwards) and MTP `mc` (fed the committed pairs by draft forwards, each exactly once).
+    // On partial accept (d1 ok, d2 wrong) we roll MAIN back to the snapshot and re-feed [d1, t2] next
+    // iter — one wasted d1 recompute, but the rollback point stays trivially correct. Output == --gen.
+    if let Some(p) = args.iter().position(|a| a == "--spec2") {
+        let n: usize = args[p + 1].parse().unwrap();
+        use std::io::Write;
+        let argmax = |row: &[f32]| (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
+        assert!(m.mtp.is_some(), "model has no MTP draft block");
+        let pr = |t: u32| { print!("{}", detok(vocab.get(t as usize).map(|s| s.as_str()).unwrap_or("?"))); std::io::stdout().flush().ok(); };
+        print!("\ngenerating (2-token speculative): ");
+        for &i in &ids { pr(i); }
+
+        let t0 = std::time::Instant::now();
+        let mut cache = ferric_llama::qwen35::Cache::new(c);
+        let mut mc = ferric_llama::qwen35::MtpCache::default();
+        mc.pos = 1;
+        let (lg, hid) = m.forward_spec(&ids, &mut cache, c.n_layer);
+        let v = lg.to_vec().await;
+        let pend0 = argmax(&v[v.len() - c.n_vocab..]);
+        pr(pend0);
+        let mut out: Vec<u32> = vec![pend0];
+        let mut unfed: Vec<u32> = vec![pend0];        // committed, not yet in MAIN cache
+        let mut ptoks: Vec<u32> = ids[1..].iter().copied().chain([pend0]).collect(); // committed, not yet in mc
+        let mut phid = hid;
+        let (mut steps, mut a1, mut a2) = (0usize, 0usize, 0usize);
+        while out.len() < n {
+            // Draft d1 (advances real mc past ptoks), then d2 recursively on a throwaway clone.
+            let (l1, h1) = m.mtp_forward_h(&ptoks, &phid, &mut mc);
+            let d1 = argmax(&l1.to_vec().await[..c.n_vocab]);
+            let mut probe = mc.clone();
+            let l2 = m.mtp_forward_h(&[d1], &h1, &mut probe).0;
+            let d2 = argmax(&l2.to_vec().await[..c.n_vocab]);
+            // Verify [unfed…, d1, d2] — head the last 3 rows (d1-check, d2-check, pend).
+            let snap = cache.snapshot();
+            let k = unfed.len();
+            let toks: Vec<u32> = unfed.iter().copied().chain([d1, d2]).collect();
+            let (lg, hid) = m.forward_spec_k(&toks, &mut cache, c.n_layer, 3);
+            let v = lg.to_vec().await; // row 0 → after unfed (=d1?), 1 → after d1 (=d2?), 2 → after d2 (pend)
+            steps += 1;
+            let t1 = argmax(&v[0..c.n_vocab]);
+            let dbg = std::env::var("FERRIC_SPEC_DBG").is_ok();
+            if dbg {
+                let r1 = &v[c.n_vocab..2 * c.n_vocab];
+                let t2p = argmax(r1);
+                // gap between the row-1 argmax and the runner-up — a near-tie means the multi-token
+                // verify's fp-order can legally flip vs single-token decode.
+                let mut sorted: Vec<f32> = r1.to_vec(); sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                eprintln!("iter {steps}: k={k} unfed={unfed:?} d1={d1} d2={d2} t1={t1} t2={t2p} · row1 top2 gap={:.4}", sorted[0] - sorted[1]);
+            }
+            if t1 != d1 {
+                // Reject both. Roll MAIN back; re-feed [t1] next iter. mc next gets [t1].
+                pr(t1); out.push(t1);
+                cache = snap;
+                unfed.push(t1);
+                ptoks = vec![t1];
+                phid = hid.narrow(0, k - 1, 1).contiguous(); // t1's predecessor (last unfed)
+                continue;
+            }
+            a1 += 1;
+            let t2 = argmax(&v[c.n_vocab..2 * c.n_vocab]);
+            if t2 != d2 {
+                // Accept d1 only. d2's cache entry is wrong → roll MAIN back to snap (loses d1's valid
+                // entry too) and re-feed [d1, t2] next iter. hid rows k-1,k (d1/t2 predecessors) valid.
+                pr(d1); pr(t2); out.push(d1); out.push(t2);
+                cache = snap;
+                unfed.push(d1); unfed.push(t2);
+                ptoks = vec![d1, t2];
+                phid = hid.narrow(0, k - 1, 2).contiguous();
+            } else {
+                // Accept both. MAIN holds [unfed…, d1, d2] valid; emit pend (not fed). mc gets d1,d2,pend.
+                a2 += 1;
+                let pend = argmax(&v[2 * c.n_vocab..3 * c.n_vocab]);
+                pr(d1); pr(d2); pr(pend);
+                out.push(d1); out.push(d2); out.push(pend);
+                unfed = vec![pend];
+                ptoks = vec![d1, d2, pend];
+                phid = hid.narrow(0, k - 1, 3).contiguous();
+            }
+        }
+        out.truncate(n);
+        let total = t0.elapsed().as_secs_f64();
+        println!("\n  {} tokens in {:.2}s · {:.1} ms/token", out.len(), total, total * 1e3 / out.len() as f64);
+        println!("  d1 accept {a1}/{steps} ({:.0}%) · d2 accept {a2}/{} ({:.0}%) · {:.2} tok/verify",
+            100.0 * a1 as f64 / steps.max(1) as f64, a1, 100.0 * a2 as f64 / a1.max(1) as f64,
+            out.len() as f64 / steps.max(1) as f64);
+        println!("  ids: {:?}", out);
     }
 }

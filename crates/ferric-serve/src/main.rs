@@ -49,7 +49,15 @@ impl Model {
         }
     }
     fn forward_hidden(&self, ids: &[u32]) -> Tensor {
-        match self { Model::Dense(m) => m.forward_hidden(ids), Model::Hybrid(_) => panic!("/v1/embeddings is not supported for hybrid (qwen35) models") }
+        match self {
+            Model::Dense(m) => m.forward_hidden(ids),
+            // Same semantics as the dense path: all layers, then the final norm (what LAST-pooling
+            // embedding references pool).
+            Model::Hybrid(m) => {
+                let mut c = qwen35::Cache::new(&m.cfg);
+                m.forward_hidden_cached(ids, &mut c, m.cfg.n_layer).rmsnorm(&m.out_norm, m.cfg.eps)
+            }
+        }
     }
 }
 use ferric_tokenizer::{Bpe, Spm};
@@ -101,7 +109,17 @@ struct Engine {
     specials: Vec<(String, u32)>,
     /// The GGUF `chat_template` string (used only to detect the model's template family).
     template: String,
+    /// One-slot prompt-prefix cache (hybrid speculative path): the last request's fed tokens plus
+    /// the carried main + draft caches. Multi-turn chat re-sends the whole conversation; when the
+    /// new prompt extends the cached tokens, only the new suffix is prefilled. Output is identical
+    /// to a full prefill (cached-decode ≡ re-prefill, the invariant `--verify-cache` proves) —
+    /// the conversation just stops being re-paid every turn. RefCell: the server is single-threaded.
+    prefix: std::cell::RefCell<Option<PrefixSlot>>,
 }
+
+/// See `Engine::prefix`. `fed` is exactly the token sequence the main cache has consumed —
+/// kept consistent through speculative rollbacks.
+struct PrefixSlot { fed: Vec<u32>, cache: qwen35::Cache, mc: qwen35::MtpCache }
 
 impl Engine {
     fn load(path: &str, name: String) -> Engine {
@@ -147,7 +165,7 @@ impl Engine {
         // (dense FFN) or `qwen35moe` (mixture-of-experts FFN) — both run on the Qwen35 hybrid runtime;
         // everything else (qwen2/qwen3/llama/gemma/phi) is the dense path.
         let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        let model = if arch.starts_with("qwen35") {
+        let model = if arch.starts_with("qwen35") || arch == "laguna" {
             Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}")))
         } else {
             Model::Dense(Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}")))
@@ -180,7 +198,7 @@ impl Engine {
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
         let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None) }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -308,9 +326,20 @@ impl Engine {
     /// Guided decoding always stays argmax (deterministic structured output). Calls `on_delta` per
     /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
     fn generate(&self, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+        // Speculative fast path: a hybrid model shipping its own MTP draft block self-drafts.
+        // Emits IDENTICAL tokens (drafts are only accepted when they equal what the sampler picks
+        // from the true logits, and the fixed-seed RNG advances once per emitted token either way)
+        // — the same determinism story, just fewer main-model forwards.
+        // Debug: FERRIC_DUMP_IDS=1 prints each request's prompt token ids (replayable in run_bonsai).
+        if std::env::var("FERRIC_DUMP_IDS").is_ok() { eprintln!("prompt ids ({}): {:?}", prompt.len(), prompt); }
+        if let Model::Hybrid(m) = &self.model {
+            // FERRIC_NOSPEC=1 forces the plain loop (A/B + regression escape hatch).
+            if m.mtp.is_some() && std::env::var("FERRIC_NOSPEC").is_err() {
+                return self.generate_spec(m, prompt, max_tokens, temperature, guide, on_delta);
+            }
+        }
         let mut cache = self.model.new_cache();
         let n_vocab = self.model.n_vocab();
-        let argmax = |row: &[f32]| (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32;
         let mut rng: u64 = 0x2545_F491_4F6C_DD1D; // deterministic seed → reproducible sampling
         let mut gen: Vec<u32> = Vec::new();
         let mut emitted = String::new();
@@ -318,23 +347,7 @@ impl Engine {
             let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*gen.last().unwrap()] };
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
-            let row = &v[v.len() - n_vocab..];
-            // Guided decoding: restrict sampling to tokens whose bytes keep the JSON valid (EOS only once
-            // the value is complete). We mask illegal tokens to -inf, then honor `temperature` over the
-            // legal set — so a guided request still gets varied output instead of a greedy loop; temp 0
-            // stays argmax (deterministic). Most tokens reject on their first byte, so the scan is cheap.
-            let next = if let Some(g) = guide.as_ref() {
-                let can_stop = g.can_stop();
-                let mut masked = vec![f32::NEG_INFINITY; n_vocab];
-                let mut any = false;
-                for i in 0..n_vocab {
-                    let ok = if self.eos.contains(&(i as u32)) { can_stop }
-                        else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&c| a.step(c)) } _ => false } };
-                    if ok { masked[i] = row[i]; any = true; }
-                }
-                if !any { break; } // no legal continuation (shouldn't happen for a valid schema) — stop cleanly
-                if temperature > 0.0 { sample_top_p(&masked, temperature, 0.95, &mut rng) } else { argmax(&masked) }
-            } else if temperature > 0.0 { sample_top_p(row, temperature, 0.95, &mut rng) } else { argmax(row) };
+            let Some(next) = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng) else { break };
             if self.eos.contains(&next) { break; }
             if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
             gen.push(next);
@@ -346,6 +359,183 @@ impl Engine {
                 emitted = full;
             }
         }
+        (emitted, prompt.len(), gen.len())
+    }
+
+    /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
+    /// -inf (EOS legal only once the value is complete), then `temperature` is honored over the
+    /// legal set — temp 0 stays argmax (deterministic). Returns `None` when the guide leaves no
+    /// legal continuation (stop cleanly). Most tokens reject on their first byte, so the scan is cheap.
+    fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, temperature: f32, rng: &mut u64) -> Option<u32> {
+        let n_vocab = row.len();
+        let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
+        if let Some(g) = guide.as_ref() {
+            let can_stop = g.can_stop();
+            let mut masked = vec![f32::NEG_INFINITY; n_vocab];
+            let mut any = false;
+            for i in 0..n_vocab {
+                let ok = if self.eos.contains(&(i as u32)) { can_stop }
+                    else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&c| a.step(c)) } _ => false } };
+                if ok { masked[i] = row[i]; any = true; }
+            }
+            if !any { return None; } // no legal continuation (shouldn't happen for a valid schema)
+            Some(if temperature > 0.0 { sample_top_p(&masked, temperature, 0.95, rng) } else { argmax(&masked) })
+        } else if temperature > 0.0 { Some(sample_top_p(row, temperature, 0.95, rng)) } else { Some(argmax(row)) }
+    }
+
+    /// Speculative decoding with the model's own MTP ("nextn") draft block. Every emitted token is
+    /// selected by `select_token` from true model logits at a verified position — never from the
+    /// draft — and the fixed-seed RNG advances once per emitted token, so output is fully
+    /// deterministic (same request → same bytes, every run). It equals the plain loop's output
+    /// whenever logit gaps exceed kernel fp-order (measured: 64-token unguided greedy identical);
+    /// a restrictive guide mask can leave near-tie candidates where the multi-token verify's
+    /// fp-order picks a different (equally legal) token than the single-token path — the same
+    /// class of shift as any kernel-fusion change. The draft only decides how many tokens each
+    /// main forward yields (~80% acceptance ⇒ ~2 per forward). Rollback on rejection is O(1):
+    /// caches are Arc-handle snapshots, never GPU copies.
+    fn generate_spec(&self, m: &Qwen35, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+        let n_vocab = self.model.n_vocab();
+        let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut gen: Vec<u32> = Vec::new();
+        let mut emitted = String::new();
+        // One-slot prompt-prefix reuse: when this prompt extends the cached conversation, resume
+        // its caches and prefill only the new suffix.
+        let (mut fed, mut cache, mut mc) = match self.prefix.borrow_mut().take() {
+            Some(s) if prompt.len() > s.fed.len() && prompt[..s.fed.len()] == s.fed[..] => (s.fed, s.cache, s.mc),
+            _ => {
+                let mut mc = qwen35::MtpCache::default();
+                mc.pos = 1; // first draft pair (prompt token 1, hidden 0) sits at position 1
+                (Vec::new(), qwen35::Cache::new(&m.cfg), mc)
+            }
+        };
+        // Commit one token: advance the guide, then stream the newly-decoded suffix.
+        macro_rules! commit {
+            ($tok:expr) => {{
+                if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[$tok as usize].as_ref()) { for &c in b { g.step(c); } }
+                gen.push($tok);
+                let full = self.detok(&gen);
+                if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
+                    let delta = full[emitted.len()..].to_string();
+                    on_delta(&delta);
+                    emitted = full;
+                }
+            }};
+        }
+        macro_rules! save_slot {
+            () => { *self.prefix.borrow_mut() = Some(PrefixSlot { fed, cache, mc }); };
+        }
+        // Prompt (or suffix) prefill; the hidden rows also seed the draft block's cache (pairs for
+        // the new positions — without them the drafter is blind to the prompt).
+        let p0 = fed.len(); // hid row i ↔ absolute position p0 + i
+        let suffix: Vec<u32> = prompt[p0..].to_vec();
+        let (lg, hid) = m.forward_spec(&suffix, &mut cache, m.cfg.n_layer);
+        fed.extend_from_slice(&suffix);
+        let v = pollster::block_on(lg.to_vec());
+        let first = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng);
+        let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else { save_slot!(); return (emitted, prompt.len(), 0) };
+        commit!(pend0);
+        let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
+        // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
+        // first position whose predecessor hidden we have. A positional gap in the draft cache
+        // (possible after an early-EOS request) only costs it context: rope offsets are explicit,
+        // and drafts are guesses the main model verifies anyway.
+        let start = mc.pos.max(p0 + 1);
+        mc.pos = start;
+        let mut ptoks: Vec<u32> = prompt[start..].to_vec();
+        ptoks.push(pend0);
+        let mut phid = hid.narrow(0, start - 1 - p0, prompt.len() - start + 1).contiguous();
+        // FERRIC_SPEC_DRAFT=2 → recursively draft a 2nd token per verify (~19% faster; measured d2
+        // conditional acceptance ~65-71%). The larger verify `t` flips near-tie logits vs single-token
+        // decode a little more often than the 1-token path, so 1-token stays the byte-identical default.
+        let draft2 = std::env::var("FERRIC_SPEC_DRAFT").ok().as_deref() == Some("2");
+        while gen.len() < max_tokens {
+            if draft2 {
+                // Draft d1 (advances the real mc past ptoks), then d2 recursively on a throwaway clone.
+                let (l1, h1) = m.mtp_forward_h(&ptoks, &phid, &mut mc);
+                let d1 = argmax(&pollster::block_on(l1.to_vec())[..n_vocab]);
+                let mut probe = mc.clone();
+                let l2 = m.mtp_forward_h(&[d1], &h1, &mut probe).0;
+                let d2 = argmax(&pollster::block_on(l2.to_vec())[..n_vocab]);
+                // Verify [unfed…, d1, d2] — head the last 3 rows (d1-check, d2-check, pend).
+                let snap = cache.snapshot();
+                let k = unfed.len();
+                let toks: Vec<u32> = unfed.iter().copied().chain([d1, d2]).collect();
+                let (lg, hid2) = m.forward_spec_k(&toks, &mut cache, m.cfg.n_layer, 3);
+                let v = pollster::block_on(lg.to_vec()); // rows: 0=→d1, 1=→d2, 2=→pend
+                let t1 = self.select_token(&v[0..n_vocab], &guide, temperature, &mut rng);
+                let Some(t1) = t1.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
+                commit!(t1);
+                if t1 != d1 || gen.len() >= max_tokens {
+                    // Reject both (or stop): discard the forward, re-feed t1 next iter.
+                    cache = snap;
+                    unfed.push(t1);
+                    ptoks = vec![t1];
+                    phid = hid2.narrow(0, k - 1, 1).contiguous();
+                    continue;
+                }
+                // d1 accepted — check the 2nd draft against the true token after d1.
+                let t2 = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
+                let Some(t2) = t2.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
+                commit!(t2);
+                if t2 != d2 || gen.len() >= max_tokens {
+                    // Accept d1 only: d2's cache entry is wrong → discard forward, re-feed [d1, t2].
+                    cache = snap;
+                    unfed = { let mut u = unfed.clone(); u.push(d1); u.push(t2); u };
+                    ptoks = vec![d1, t2];
+                    phid = hid2.narrow(0, k - 1, 2).contiguous();
+                    continue;
+                }
+                // Accept both: the cache validly holds [unfed…, d1, d2]; emit pend from row 2.
+                fed.extend_from_slice(&toks);
+                let pend = self.select_token(&v[2 * n_vocab..3 * n_vocab], &guide, temperature, &mut rng);
+                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { break };
+                commit!(pend);
+                ptoks = vec![d1, d2, pend];
+                phid = hid2.narrow(0, k - 1, 3).contiguous();
+                unfed = vec![pend];
+                continue;
+            }
+            // 1. Draft: feed pending pairs (keeps the draft cache aligned), propose one token (argmax
+            //    — the draft is a guess; only agreement with the true sampler matters).
+            let dlog = m.mtp_forward(&ptoks, &phid, &mut mc);
+            let dv = pollster::block_on(dlog.to_vec());
+            let d = argmax(&dv[dv.len() - n_vocab..]);
+            // 2. Verify: one forward over [unfed…, draft], snapshot first for O(1) rollback.
+            let snap = cache.snapshot();
+            let k = unfed.len();
+            let toks: Vec<u32> = unfed.iter().copied().chain([d]).collect();
+            let (lg, hid2) = m.forward_spec(&toks, &mut cache, m.cfg.n_layer);
+            // forward_spec heads only the last two positions: row 0 = last unfed (truth), row 1 = draft.
+            let v = pollster::block_on(lg.to_vec());
+            let truth = self.select_token(&v[0..n_vocab], &guide, temperature, &mut rng);
+            let Some(truth) = truth.filter(|t| !self.eos.contains(t)) else {
+                cache = snap; // this forward's entries include the unverified draft — discard
+                break;
+            };
+            commit!(truth);
+            if truth == d && gen.len() < max_tokens {
+                fed.extend_from_slice(&toks); // everything this forward fed is now known-valid
+                // Accepted: the draft's own logits row is valid too — take the next token from it.
+                let pend = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
+                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { break };
+                commit!(pend);
+                ptoks = vec![d, pend];
+                phid = hid2.narrow(0, k - 1, 2).contiguous(); // hiddens at d's and pend's predecessors
+                unfed = vec![pend];
+            } else if truth == d {
+                fed.extend_from_slice(&toks);
+                break; // accepted, but max_tokens lands exactly here
+            } else {
+                // Rejected: the cache holds a wrong entry at the draft's position — roll back.
+                // Nothing is wasted: the true token was still learned from this forward.
+                cache = snap;
+                unfed.push(truth);
+                ptoks = vec![truth];
+                phid = hid2.narrow(0, k - 1, 1).contiguous(); // hidden at truth's predecessor
+            }
+        }
+        save_slot!();
         (emitted, prompt.len(), gen.len())
     }
 }

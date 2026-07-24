@@ -1,9 +1,9 @@
-# Ferrite — the pure-Rust edge-deploy ingest plan
+# Ferralloy — the pure-Rust edge-deploy ingest plan
 
 *Synthesized 2026-07-22 from four parallel research sweeps: (1) robotics-native
 frameworks (Copper/Viam/LeRobot/Zenoh/dora-rs), (2) Rust building blocks + our own
 assets (hwbridge/skillpack/ferric), (3) the 20-platform Wendy-class field survey,
-(4) WASM-edge + MCU deploy. Working name **Ferrite** — final name pending approval.*
+(4) WASM-edge + MCU deploy. Name **Ferralloy** — chosen 2026-07-24 (bare crate name free on crates.io; was working-name Ferrite, which collides with an image viewer).*
 
 ---
 
@@ -12,7 +12,7 @@ assets (hwbridge/skillpack/ferric), (3) the 20-platform Wendy-class field survey
 Every platform in the field ships **bytes**. None ships **verified behavior**.
 And every platform in the field gates its fleet plane behind a paid cloud.
 
-Ferrite is IPAI @ BMI's play to build the **dominant open-source edge ecosystem
+ Ferralloy is IPAI @ BMI's play to build the **dominant open-source edge ecosystem
 for physical AI** — not a niche beside the incumbents, the whole thing:
 
 1. **Full parity, ungated.** Every table stake (§4) and every killer capability
@@ -80,17 +80,17 @@ Wasefire has no capability model yet.
 
 ## 3. Architecture
 
-New sibling workspace `~/vibe-coding/ferrite/` (family: ferric, ferromotion).
+New sibling workspace `~/vibe-coding/ferralloy/` (family: ferric, ferromotion).
 
 | Crate | Contents |
 |---|---|
-| `ferrite-pack` | The artifact format. Skillpack manifest evolved: payload kinds (`wasm-component` \| `native` \| `model` \| `config`), `requires{}` capability grants, safety envelope, sha256 digests, **ed25519 author signatures**, and **signed eval vectors** (input → expected output hashes) for verified-behavior checks. |
-| `ferrite-bridge` | hwbridge ported: 12 codecs × 17 targets as pure `fn(&Cmd) -> Vec<u8>` with the JS test vectors as Rust tests. The typed floor of the capability worlds. |
-| `ferrite-agent` (bin `ferrited`) | Device daemon: `mdns-sd` advertise · rustls mTLS API (info/deploy/start/stop/logs) · wasmtime runtime — WASI grants derived from manifest `requires{}` · landlock+seccomp for native payloads · staged-dir + atomic-rename app updates · **post-apply self-check** (run signed eval vectors, byte-compare) · telemetry incl. joules-per-task where counters exist (RAPL/tegrastats). |
-| `ferrite` (bin) | CLI: `discover` · `ls` · `build` (cargo-zigbuild cross) · `sign` · `deploy` (stream to device, changed-chunks only) · `run` (host-compile → deploy → attach logs, the Wendy inner loop) · `verify` · `promote`. |
-| `ferrite-gate` | Promotion gates: eval harness, sim-gate hooks (run the pack against the MuJoCo twin before hardware cohort). v0.3. |
-| `ferrite-lite` | MCU runtime (wasmi or wasmtime+Pulley) with the same pack format. v2 — after Linux-class is real. |
-| `ferrite-fleet` | Channels/cohorts/TUF fleet plane. v2. |
+| `ferralloy-pack` | The artifact format. Skillpack manifest evolved: payload kinds (`wasm-component` \| `native` \| `model` \| `config`), `requires{}` capability grants, safety envelope, sha256 digests, **ed25519 author signatures**, and **signed eval vectors** (input → expected output hashes) for verified-behavior checks. |
+| `ferralloy-bridge` | hwbridge ported: 12 codecs × 17 targets as pure `fn(&Cmd) -> Vec<u8>` with the JS test vectors as Rust tests. The typed floor of the capability worlds. |
+| `ferralloy-agent` (bin `ferralloyd`) | Device daemon: `mdns-sd` advertise · rustls mTLS API (info/deploy/start/stop/logs) · wasmtime runtime — WASI grants derived from manifest `requires{}` · landlock+seccomp for native payloads · staged-dir + atomic-rename app updates · **post-apply self-check** (run signed eval vectors, byte-compare) · telemetry incl. joules-per-task where counters exist (RAPL/tegrastats). |
+| `ferralloy` (bin) | CLI: `discover` · `ls` · `build` (cargo-zigbuild cross) · `sign` · `deploy` (stream to device, changed-chunks only) · `run` (host-compile → deploy → attach logs, the Wendy inner loop) · `verify` · `promote`. |
+| `ferralloy-gate` | Promotion gates: eval harness, sim-gate hooks (run the pack against the MuJoCo twin before hardware cohort). v0.3. |
+| `ferralloy-lite` | MCU runtime (wasmi or wasmtime+Pulley) with the same pack format. v2 — after Linux-class is real. |
+| `ferralloy-fleet` | Channels/cohorts/TUF fleet plane. v2. |
 
 **Inference boundary:** wasi-nn-shaped WIT world (`ipai:nn`) backed by Ferric as
 the host engine. Policies are components that *orchestrate*; kernels run native.
@@ -106,11 +106,11 @@ mTLS/HTTP2 in v1; Zenoh when fleet-scale demands it.
 | 3 | App layer decoupled from OS | wasmtime components; staged-dir + atomic rename |
 | 4 | Delta transport | Rugix content-defined chunking (OS); changed-chunk streaming (apps) |
 | 5 | Per-device crypto identity | rustls mTLS, per-device keypair at first boot |
-| 6 | Cohorts/staged rollout/pin | `ferrite-fleet` (v2); manual pin in v1 |
-| 7 | Remote access + logs/vitals | `ferrited` API: logs/attach in v1 |
-| 8 | Sub-30s local dev loop | `ferrite run`: host cross-compile → mDNS/USB stream (target: sub-5s redeploy) |
+| 6 | Cohorts/staged rollout/pin | `ferralloy-fleet` (v2); manual pin in v1 |
+| 7 | Remote access + logs/vitals | `ferralloyd` API: logs/attach in v1 |
+| 8 | Sub-30s local dev loop | `ferralloy run`: host cross-compile → mDNS/USB stream (target: sub-5s redeploy) |
 | 9 | Pi + Jetson named targets | cargo-zigbuild aarch64-musl static binaries |
-| 10 | Open device side | MIT/Apache-2.0, no feature gating — **and open fleet side** (`ferrite-fleet` self-hostable, deltas + cohorts + dashboard included; the whole field gates at least one of these) |
+| 10 | Open device side | MIT/Apache-2.0, no feature gating — **and open fleet side** (`ferralloy-fleet` self-hostable, deltas + cohorts + dashboard included; the whole field gates at least one of these) |
 | 11 | SBOM + reproducible builds | hermetic vendored builds (ferric tradition) + cargo-auditable |
 
 ## 5. Beyond parity
@@ -121,11 +121,11 @@ mTLS/HTTP2 in v1; Zenoh when fleet-scale demands it.
 - balena's **engine-level delta transport** (Rugix content-defined chunking both halves)
 - Torizon/Foundries' **TUF/Uptane root-of-trust** (`tough` — the first credible pure-Rust Uptane)
 - Memfault's **observability-gated rollouts** (success = metric non-regression, on ferric-flow)
-- Peridio's **cohort/bundle/channel release algebra** (OS-agnostic, in `ferrite-fleet`)
-- Viam's **typed registry of drivers + models** (ferrite-bridge worlds + signed packs)
+- Peridio's **cohort/bundle/channel release algebra** (OS-agnostic, in `ferralloy-fleet`)
+- Viam's **typed registry of drivers + models** (ferralloy-bridge worlds + signed packs)
 - Wendy/EVE-OS **entitlement-based hardware permissioning** — done *better* as WASI typed
   imports (deny-by-default at the interface, not the daemon)
-- Wendy Lite/Ocre's **one artifact format down to the MCU** (ferrite-lite, v2)
+- Wendy Lite/Ocre's **one artifact format down to the MCU** (ferralloy-lite, v2)
 
 ### 5b. The moat (what none of them can build)
 
@@ -141,17 +141,45 @@ mTLS/HTTP2 in v1; Zenoh when fleet-scale demands it.
    simulate-before-deploy in-page, and **browser-trained → deployed continuity**:
    a policy trained at /research/vla ships as a signed pack to a device, same bits.
 5. **One typed artifact browser → Jetson → MCU** — WASM component + WIT hardware
-   worlds (`ipai:nn`, motor-bus via ferrite-bridge). Wendy needs two substrates;
+   worlds (`ipai:nn`, motor-bus via ferralloy-bridge). Wendy needs two substrates;
    we need one.
 6. **Pure-Rust end-to-end** — a single static musl agent (<10 MB target), no
    runtime deps. Incumbent agents: Go, C++, Java, Elixir. Only Rugix is Rust and
    it is only the update engine.
+7. **Certificate-gated packs — verified *correctness*, not just verified
+   reproduction** (the axis beyond the axis; the science is now proven). §5b.1
+   verifies a pack *reproduces* bit-exactly across fabrics — it does not verify
+   the pack is *correct*. The Charlot Lab certificate program
+   (`bmi-concept/research/certificate-toolchain/`, 24 reproducible artifacts)
+   closes that gap: a control policy can ship with a machine-checkable **formal
+   behavioral certificate** — a Lyapunov energy, a certified region, and the
+   prover + its parameters — proving the *closed-loop behavior* (stability,
+   non-divergence, convergence to goal) holds over a **whole continuous region**,
+   not at sampled eval points. The pack carries the certificate as a first-class
+   facet; `ferralloy-gate` re-checks it for the *deployed* weights (re-run the SOS
+   SDP / dReal SMT query, or the sound Taylor+CROWN pass) before the hardware
+   cohort — a pack that no longer certifies is 400'd exactly as a drifted eval
+   vector is. Grounded receipts, all reproducible: dReal-certified learned
+   **ternary** energy beating any quadratic on a non-convex ROA (reversed Van der
+   Pol, proven in **2D and 4D**), certified *across* actuator saturation **and**
+   contact mode-switches (R=1.2), SOS-certified to **8 states** where SMT chokes
+   at 4. And the EFA twist the pack format was built for: **the payload IS the
+   certificate** — one ternary energy is simultaneously the controller descended
+   and the Lyapunov function proven (8/16 nonzero weights, `Tⱼ·x` = select+negate,
+   no matmul), already running native + wasm32 on Ferric
+   (`ferric-tensor/examples/ebm_ternary_cert.rs`, cross-verified 4.7e-13). And it
+   is nearly free — measured **~1.2 µJ per certified step** on the RAPL telemetry
+   axis Ferralloy already ships (§5b.3), 0.0004–0.003% of a per-joint actuation
+   budget. No incumbent verifies reproduction; none verifies correctness. The
+   §5 law that governs it (a learned energy beats a quadratic *iff* the ROA is
+   non-convex) tells the gate when a cheap quadratic certificate suffices and
+   when the learned ternary one is required — a deploy-time decision, not a guess.
 
 ## 6. Phasing
 
 **v0.1 — the verified loop (MVP). ✅ SHIPPED 2026-07-22** (same day as this
-plan). Workspace `~/vibe-coding/ferrite/`: ferrite-pack + ferrite-runtime +
-ferrite CLI + ferrited. 11 tests green (incl. bit-identical pack rebuilds,
+plan). Workspace `~/vibe-coding/ferralloy/`: ferralloy-pack + ferralloy-runtime +
+ferralloy CLI + ferralloyd. 11 tests green (incl. bit-identical pack rebuilds,
 behavioral-drift rejection, fuel-bounded runaways). **Live cross-arch demo
 completed**: pd-hover (a real PD hover-controller policy, wasm32-wasip1) built
 + signed + vectored on the aarch64 Mac, deployed over Tailscale to the x86_64
@@ -175,7 +203,7 @@ gate's teeth: `demo-lm` (GPU sin/exp = implementation-defined) genuinely
 diverges Metal↔Vulkan and was **rejected 400 with the differing digests** —
 divergence every other platform would silently ship. The deploy gate now
 enforces Ferric's documented determinism boundary at update time.
-(b) **ferrite-bridge**: all 12 hwbridge codecs × 17 targets ported (zero-dep,
+(b) **ferralloy-bridge**: all 12 hwbridge codecs × 17 targets ported (zero-dep,
 35 golden byte-vector tests) + `BridgeSpec` manifest stage — payload stdout
 (JSON actuator targets) → wire bytes via the named codec, and those wire bytes
 are what vectors digest and authors sign: *signed wire-level behavior*.
@@ -185,7 +213,7 @@ Vulkan device correctly REJECTED on day one now deploys **accepted,
 bit-exact** — a full 3-layer transformer whose Metal-recorded vectors verify
 byte-identically on NVIDIA Vulkan. The same digests hold in Chrome's WebGPU,
 so browser-trained → device-deployed is a checkable signature end to end.
-Also shipped since: `ferrite run` (verified inner loop: 256 ms warm / 762 ms
+Also shipped since: `ferralloy run` (verified inner loop: 256 ms warm / 762 ms
 code-change, Mac→device over Tailscale with full verification per deploy).
 **Native-payload sandbox SHIPPED (2026-07-23):** native ELF packs run
 confined — landlock (payload dir rx · per-run scratch rw · loader dirs +
@@ -196,15 +224,15 @@ rlimits + cleared env. E2E-proven on the RTX Linux box: the same binary
 reads `/etc/hostname` and unshares namespaces freely unconfined but both are
 denied inside the pack, with the deploy behavior verified bit-exact. Engine
 `native`, target-gated so macOS/wasm still build.
-**Open fleet plane SHIPPED (2026-07-23):** `ferrite-fleet` — the
+**Open fleet plane SHIPPED (2026-07-23):** `ferralloy-fleet` — the
 self-hostable, ungated fleet server the whole field gates behind a paid
 cloud. Channels hold one signed release each (statically verified on upload —
-a corrupt PUT is 400'd, channel never created); `ferrited` opt-in-subscribes
+a corrupt PUT is 400'd, channel never created); `ferralloyd` opt-in-subscribes
 (FERRITE_FLEET_URL/_CHANNEL/_DEVICE_ID), PULLS its target, runs the SAME
 on-device accept gate (behavioral verification), applies atomically, reports.
 Server never pushes → NAT'd devices update; "rolled out" = behavior verified
-on-device, not bytes sent. CLI `ferrite release … --channel … --fleet …` +
-`ferrite fleet`; live dashboard at /. Agent accept gate refactored to a
+on-device, not bytes sent. CLI `ferralloy release … --channel … --fleet …` +
+`ferralloy fleet`; live dashboard at /. Agent accept gate refactored to a
 shared `accept_pack()`. E2E-proven: release → poll → verify → apply → report;
 version bump auto-picked-up; corrupt release rejected CLI- AND server-side.
 Still open for v0.2: cohorts/canary staging, TUF-rooted keys, Rugix OS A/B,
@@ -226,23 +254,31 @@ sinf differs macOS↔glibc). Result: **all 7 probe rows bit-identical Metal
 WGSL now evaluates as-written IEEE on every fabric (same semantics as CPU and
 wasm)**. ferric-core validations all green (softmax 3.7e-9, attention 2.2e-8,
 matmul exact-0 vs CPU). E2E: demo-lm 0.2.1 (full 3-layer transformer) recorded
-on Metal → **ACCEPTED bit-exact on the Vulkan device** through ferrited.
+on Metal → **ACCEPTED bit-exact on the Vulkan device** through ferralloyd.
 Plumbing lesson: patch tables apply only at the build's workspace root —
-ferrite/Cargo.toml now mirrors ferric's fork patches (without them packs
+ferralloy/Cargo.toml now mirrors ferric's fork patches (without them packs
 verify against STOCK fast-math wgpu). Upstream-worthy: the wgpu-hal/naga
 determinism patches are a legitimate wgpu contribution.
 
-**v0.3 — the gates.** `ferrite-gate`: sim-gated promotion (pack must pass the
+**v0.3 — the gates.** `ferralloy-gate`: sim-gated promotion (pack must pass the
 MuJoCo twin regression before hardware), joules-per-task telemetry
-(RAPL/tegrastats), browser ops page on the site (WebSerial console, WebUSB flash).
+(RAPL/tegrastats), browser ops page on the site (WebSerial console, WebUSB flash),
+and the **certificate gate** (§5b.7) — a `certificate` pack facet + re-verify the
+deployed weights carry a valid formal behavioral certificate (SOS/dReal/Taylor+CROWN)
+before the hardware cohort. The certificate *science* is proven and the reference
+certified-ternary pack already runs native + wasm on Ferric; the gate *integration*
+(pack facet + `ferralloy verify-cert` + the promotion hook) is the v0.3 build — a
+sound-verifier-in-Rust port (the Taylor+CROWN pass is dependency-free f64) is the
+device-side path; SOS/dReal stay a build-time/fleet-server gate (they need SDP/SMT
+solvers, not on-device).
 
 **v1.0 — trust + fleet.** TUF root via `tough`, channels/cohorts
-(Peridio-style release algebra), delta streaming, `ferrite-lite` MCU preview.
+(Peridio-style release algebra), delta streaming, `ferralloy-lite` MCU preview.
 
 ## 7. Honest caveats
 
 - **MCU AOT gap is real**: nothing pure-Rust ships an AOT path for
-  Xtensa/riscv32. ferrite-lite v2 starts interpreter-class (wasmi/Pulley) —
+  Xtensa/riscv32. ferralloy-lite v2 starts interpreter-class (wasmi/Pulley) —
   supervisory logic only, not 1 kHz loops. The pure-Rust MCU AOT compiler is a
   genuine open research slot, not a v1 promise.
 - **GPU access from WASM on Jetson** is host-plugin-mediated (wasi-nn), not
@@ -250,7 +286,7 @@ MuJoCo twin regression before hardware), joules-per-task telemetry
   in-sandbox GPU compute is not a thing we can promise.
 - **Joules-per-task needs counters**: RAPL (x86) and tegrastats (Jetson) exist;
   Pi-class needs an external meter — telemetry is best-effort per platform.
-- **Name collisions on crates.io** (`ferrite` variants exist) — irrelevant until
+- **Name collisions on crates.io** (`ferralloy` variants exist) — irrelevant until
   we publish; pick the public crate prefix then.
 - **Peridio/Avocado and Wendy will keep moving** — parity items must track the
   field continuously (re-survey quarterly). The moat axis (determinism / eval
@@ -260,8 +296,8 @@ MuJoCo twin regression before hardware), joules-per-task telemetry
 ## 8. Naming
 
 Family: Ferric (AI), Ferromotion (kinematics/dynamics), ferric-flow (dataflow).
-Proposed: **Ferrite** — the magnetic-core material; small, embedded, carries the
-field. CLI `ferrite`, daemon `ferrited`. Alternatives considered: Ferrofleet
+Proposed: ** Ferralloy** — the magnetic-core material; small, embedded, carries the
+field. CLI `ferralloy`, daemon `ferralloyd`. Alternatives considered: Ferrofleet
 (explicit but narrow — the fleet plane is v2, the artifact layer is the soul),
 Forgeline (ties to Forge but leaves the Ferric family), ferric-edge (in-workspace
 crates — undersells a product this large). Final call: the Dean's.
