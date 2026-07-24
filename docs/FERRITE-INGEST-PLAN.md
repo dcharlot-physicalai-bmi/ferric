@@ -196,7 +196,19 @@ rlimits + cleared env. E2E-proven on the RTX Linux box: the same binary
 reads `/etc/hostname` and unshares namespaces freely unconfined but both are
 denied inside the pack, with the deploy behavior verified bit-exact. Engine
 `native`, target-gated so macOS/wasm still build.
-Still open for v0.2: Rugix OS A/B, USB-C CDC-NCM dev link.
+**Open fleet plane SHIPPED (2026-07-23):** `ferrite-fleet` — the
+self-hostable, ungated fleet server the whole field gates behind a paid
+cloud. Channels hold one signed release each (statically verified on upload —
+a corrupt PUT is 400'd, channel never created); `ferrited` opt-in-subscribes
+(FERRITE_FLEET_URL/_CHANNEL/_DEVICE_ID), PULLS its target, runs the SAME
+on-device accept gate (behavioral verification), applies atomically, reports.
+Server never pushes → NAT'd devices update; "rolled out" = behavior verified
+on-device, not bytes sent. CLI `ferrite release … --channel … --fleet …` +
+`ferrite fleet`; live dashboard at /. Agent accept gate refactored to a
+shared `accept_pack()`. E2E-proven: release → poll → verify → apply → report;
+version bump auto-picked-up; corrupt release rejected CLI- AND server-side.
+Still open for v0.2: cohorts/canary staging, TUF-rooted keys, Rugix OS A/B,
+USB-C CDC-NCM dev link.
 
 **v0.2 EXTENSION — WHOLE-MODEL DETERMINISM (2026-07-22, same day): the
 verifiable envelope now covers FULL TRANSFORMERS.** The demo-lm rejection was
