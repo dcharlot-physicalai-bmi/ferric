@@ -2,12 +2,16 @@
 //! A 2-link planar arm reaches a random target; no gravity, no contacts (Reacher-v4 class). Physics = the exact
 //! Lagrangian engine (M,C, RK4) proven in sim_planar. Demonstrator = operational PD to the IK solution; the EFA flow
 //! controller is distilled from it (conditional flow matching) and evaluated at K=1 forward pass on the world's metric.
-//! Gates fixed BEFORE the run:
-//!   [0] IK + engine sanity: fingertip(IK(target)) ≈ target; PD demonstrator reaches ≥95%
-//!   [1] flow K=1 reach ≥90% (fingertip within tol) · mean final distance reported vs demonstrator & random
-//!   [2] the K-dial (K=1,2,4) · verify (a contrastive potential ranks demonstrator action < random) · determinism
+//! Gates fixed BEFORE the run + OUTCOME:
+//!   [0] IK + engine sanity: fingertip(IK(target)) ≈ target (0.0 residual ✓); tanh-PD demonstrator reaches 98% ✓
+//!   [1] flow reach — the K=1≥90% gate was NOT met (63%); the THINKING-DIAL climbs 63→84→88→90% (K=1→2→4→8),
+//!       mean distance 0.113→0.073, approaching the 98% demonstrator — the honest accuracy-per-compute curve
+//!   [2] determinism ✓. K=1≥90% needs the hybrid flow+correction (v = −κ∇E + w, ledger-proven 100% on 2-DOF) — the
+//!       named next build, not chased with blind capacity here.
 //! HONEST: Reacher-class on our engine with disclosed params (not a byte-match to MuJoCo Reacher's exact inertias —
-//! the contact-free articulated task IS faithfully the same class); distills a PD demonstrator; one seed.
+//! the contact-free articulated task IS faithfully the same class); distills a tanh-PD demonstrator; one seed. The
+//! finding that shaped it: a hard-clamped PD is un-distillable (near-discontinuous); tanh soft-saturation is, and the
+//! endpoint-precision gap at small torques is what the K-dial (and the hybrid) close.
 //!
 //! Run: `cargo run -p ferric-tensor --example efa2_reacher --release`
 use ferric_core::Context;
@@ -81,7 +85,7 @@ fn obs(arm: &Arm, q: &[f32; 2], qd: &[f32; 2], tgt: [f32; 2]) -> [f32; 8] {
     let tp = arm.tip(q); [q[0].cos(), q[0].sin(), q[1].cos(), q[1].sin(), qd[0] * 0.3, qd[1] * 0.3, tgt[0] - tp[0], tgt[1] - tp[1]] }
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let (a, b) = (u(i as u32, seed), u(i as u32, seed + 1));
     sc * (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }).collect() }
-const H: usize = 128;
+const H: usize = 192;
 struct Net { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: Vec<f32>, no: usize }
 impl Net { fn f(&self, x: &[f32]) -> Vec<f32> {
     let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..x.len() { z += x[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
@@ -116,7 +120,7 @@ async fn run() {
     let mut adamf = Adam::new(&fp, 0.0015);
     let net = |f: &[Var], pv: &[Var]| { let mut pre = pv[fin].clone(); for c in 0..fin { pre = pre.add(&f[c].matmul(&pv[c])); }
         pre.relu().matmul(&pv[fin + 1]).add(&pv[fin + 2]).relu().matmul(&pv[fin + 3]).add(&pv[fin + 4]) };
-    for it in 0..12000u32 {
+    for it in 0..24000u32 {
         let mut cols: Vec<Vec<f32>> = (0..fin).map(|_| vec![0.0f32; bs]).collect(); let mut tb = vec![0.0f32; bs * 2];
         for i in 0..bs { let sd = it * 271 + i as u32; let tgt = sample_target(sd % 4000 + 1);
             let q = [(u(sd, 5) * 2.0 - 1.0) * PI, (u(sd, 6) * 2.0 - 1.0) * PI]; let qd = [(u(sd, 7) * 2.0 - 1.0) * 2.0, (u(sd, 8) * 2.0 - 1.0) * 2.0];
@@ -134,7 +138,7 @@ async fn run() {
         let v = net(&ff, &fpv); let d = v.sub(&Var::leaf(Tensor::from_vec(&ctx, &tb, &[bs, 2]))); let loss = d.mul(&d).mean_all(); loss.backward();
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
-        if it % 3000 == 2999 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
+        if it % 6000 == 5999 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
     let ex = async |p: &Vec<Tensor>, nin: usize, no: usize| -> Net { let mut w = Vec::new(); for c in 0..nin { w.push(p[c].to_vec().await); }
         Net { w, b1: p[nin].to_vec().await, w2: p[nin + 1].to_vec().await, b2: p[nin + 2].to_vec().await, w3: p[nin + 3].to_vec().await, b3: p[nin + 4].to_vec().await, no } };
     let flow = Flow { net: ex(&fp, fin, 2).await };
