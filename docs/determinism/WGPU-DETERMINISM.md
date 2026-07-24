@@ -400,3 +400,34 @@ codebase, both under the digest contract. Bottom line, replacing all
 earlier estimates: full cross-substrate determinism costs +15–53%
 depending on kernel — a price an education/verification platform pays
 gladly, and one that narrows further with ordinary kernel engineering.
+
+## 2026-07-24 — the fork patches are REDUNDANT: pure-WGSL determinism on stock wgpu
+
+Tested by disabling the entire `[patch.crates-io]` fork block (and the
+vendoring redirect) and rebuilding the probe against **stock wgpu 30 + naga
+30 from crates.io** — no MTLMathModeSafe, no SPIR-V NoContraction, no MSL
+FP_CONTRACT OFF. Result on BOTH fabrics:
+
+    Metal (M5 Max, stock wgpu):  mm 2a5bf373… · demo-lm 1935293a… · 9/9 golden
+    Vulkan (RTX 4050, stock):    mm 2a5bf373… · demo-lm 1935293a… · 9/9 golden
+
+Every core row (matmul, RMSNorm, LayerNorm, softmax, sqrt, RoPE, causal
+attention, the tree kernels, and the full 3-layer transformer) is
+bit-identical to the forked build AND across the two fabrics — with the
+storage-pinning WGSL alone. The browser (Tint) never had the forks and
+already matched, so all three fabrics are now shown deterministic on
+unpatched toolchains.
+
+Interpretation and correction to §3: the compiler-level pins were developed
+first and mattered before the storage-pinning was complete; once the address-
+space hierarchy (device-visible storage, per-step unique slots, phase-
+entangled reductions) was applied everywhere, the toolchain patches became
+belt-and-suspenders — measurably redundant for the core kernel set. The
+stronger, simpler claim now holds: **cross-fabric bit-identity needs no wgpu
+or naga fork — it is a property of the shader source.** (The only fork-only
+capability is the subgroup-butterfly probe kernel, which stock naga 30 does
+not yet compile; it is a demonstration, not part of the core determinism or
+the ferric inference engine.)
+
+Consequence: `ferric-core` can publish to crates.io against stock wgpu and
+remain deterministic — which unblocks publishing the full Ferralloy stack.
