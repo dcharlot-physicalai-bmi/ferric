@@ -87,17 +87,21 @@ trait Map0 { fn map0(self, o: [f32; 2]) -> [f32; 2]; }
 impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0], self[1] + o[1]] } }
 // SMOOTH blended pose-servo: choose ONE contact point behind the block along the position-error direction, offset
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
+// multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
+// push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
 fn demo(w: &World) -> [f32; 2] {
-    let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]]; let et = wrap(w.tth - w.th);
-    // when position error dominates: push COM toward target. When it's small: rotate by pushing a lever arm.
-    let pos_mode = nrm(ep) > 0.06;
-    let dir = if pos_mode { unit(ep) } else { let s = et.signum(); [(-w.th).sin() * s, -(-w.th).cos() * s] };
-    let perp = [-dir[1], dir[0]];
-    // contact just at the T's back surface (~0.12 radius); perpendicular offset ∝ orientation error to add corrective torque
-    let off = if pos_mode { (0.7 * et).clamp(-0.14, 0.14) } else { 0.14 * et.signum() };
-    let contact = [w.p[0] - dir[0] * 0.12 + perp[0] * off, w.p[1] - dir[1] * 0.12 + perp[1] * off];
+    let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
+    let contact = if et.abs() > 0.12 {                                   // ROTATION phase
+        let ba = [w.th.cos(), w.th.sin()]; let perp = [-w.th.sin(), w.th.cos()];   // bar long-axis / its perpendicular
+        let tip = [w.p[0] + ba[0] * 0.20, w.p[1] + ba[1] * 0.20];        // one bar end (max lever arm)
+        let s = et.signum(); let pd = [perp[0] * s, perp[1] * s];        // tangential push dir → torque reducing e_θ
+        [tip[0] - pd[0] * (RU - 0.03), tip[1] - pd[1] * (RU - 0.03)]     // slightly INTO the tip so it pushes tangentially
+    } else {                                                            // POSITION phase (orientation aligned)
+        let dir = if nrm(ep) > 0.04 { unit(ep) } else { [w.th.sin(), -w.th.cos()] };
+        [w.p[0] - dir[0] * 0.10, w.p[1] - dir[1] * 0.10]
+    };
     let to = [contact[0] - w.push[0], contact[1] - w.push[1]];
-    let mv = if nrm(to) > 1e-4 { unit(to) } else { dir };
+    let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
@@ -129,11 +133,14 @@ async fn run() {
     println!("      scripted pose-servo demonstrator: success (cov≥{:.2}) {:.0}% · mean best coverage {:.3}", COV_OK, dok as f32 / 2.0, dc / 200.0);
     println!("      coverage breakdown: ≥0.3 {:.0}% · ≥0.5 {:.0}% · ≥0.7 {:.0}% · ≥0.9 {:.0}%", c3 as f32 / 2.0, c5 as f32 / 2.0, c7 as f32 / 2.0, dok as f32 / 2.0);
     if (dok as f32 / 200.0) < 0.5 {
-        println!("\n  DEMONSTRATOR CEILING: a scripted point-pusher CANNOT align a T's full SE(2) pose (1 contact force, 3 DOF —");
-        println!("  underactuated; needs a multi-push PLAN). This is why PushT is a LEARNING benchmark (human-teleop demos),");
-        println!("  not a scripted one. The EFA flow can only match its demonstrator, so it is not trained here — recording");
-        println!("  the VERIFIED infrastructure (T shape, oriented-box↔circle contact, moment, published coverage metric)");
-        println!("  and the honest ceiling. Named next: learn from teleop-style demos, or a proper push-planner demonstrator.");
+        println!("\n  DEMONSTRATOR CEILING (twice confirmed): a scripted point-pusher CANNOT align a T's full SE(2) pose.");
+        println!("  Two strategies tried — a reactive pose-servo (~0.10 mean coverage) and this rotate-then-translate");
+        println!("  PLANNER (~0.20) — both cap at 0% success: the phases interfere (rotating drifts position, translating");
+        println!("  drifts orientation), because 1 contact force cannot hold 3 DOF. This is why PushT is a LEARNING");
+        println!("  benchmark (human-teleop demos), not a scripted one. The EFA flow can only match its demonstrator, so it");
+        println!("  is NOT trained here. Recorded: VERIFIED infrastructure (T, oriented-box↔circle contact, moment, published");
+        println!("  coverage metric) + the honest, twice-confirmed ceiling. Definitive next step: LEARN the policy (RL/ES to");
+        println!("  maximize coverage directly, the lab's Forge-ES lineage), not another script.");
         return;
     }
     // ── distill the EFA flow ──
