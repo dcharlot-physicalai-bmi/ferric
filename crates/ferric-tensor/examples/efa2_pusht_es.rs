@@ -77,9 +77,10 @@ impl World {
                 self.v = [self.v[0] + jn * n[0], self.v[1] + jn * n[1]]; self.w += jn * rn / self.im; }
         }
     }
-    fn coverage(&self) -> f32 { let mut cov = 0; let n = 400;                 // fraction of the TARGET region covered by the block
-        for k in 0..n { let q = sample_T(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);   // point in target-T (world)
-            if in_T(w, self.p, self.th) { cov += 1; } } cov as f32 / n as f32 }
+    fn cov(&self, n: usize) -> f32 { let mut c = 0;                            // coverage with n samples (cheap for training, full for eval)
+        for k in 0..n { let q = sample_T(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
+            if in_T(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
+    fn coverage(&self) -> f32 { self.cov(400) }
     fn obs(&self) -> [f32; 12] { let ep = [self.tp[0] - self.p[0], self.tp[1] - self.p[1]]; let dpt = unit(ep); let et = wrap(self.tth - self.th);
         [self.th.cos(), self.th.sin(), self.push[0] - self.p[0], self.push[1] - self.p[1], ep[0], ep[1], dpt[0], dpt[1], et.cos(), et.sin(), self.tth.cos(), self.tth.sin()] }
 }
@@ -126,7 +127,7 @@ impl Pol {
 // a far stronger learning signal than sparse "best coverage".
 fn ep_dense(seed: u32, im: f32, pol: &Pol) -> f32 {
     let mut w = World::new(seed, im); let mut sum = 0.0f32; let steps = (TMAX / DT) as usize;
-    for _ in 0..steps { let c = pol.act(&w.obs()); w.step(c); sum += w.coverage(); } sum / steps as f32 }
+    for _ in 0..steps { let c = pol.act(&w.obs()); w.step(c); sum += w.cov(96); } sum / steps as f32 }  // cheap coverage for training
 fn fitness(pol: &Pol, im: f32, seeds: &[u32]) -> f32 {                  // mean dense reward over the given seeds
     let mut s = 0.0; for &sd in seeds { s += ep_dense(sd, im, pol); } s / seeds.len() as f32 }
 fn gauss(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32), u(seed, i as u32 + 777)); (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }
@@ -140,9 +141,12 @@ async fn run() {
     let (mut dcov, mut dok) = (0.0f32, 0); for k in 0..200u32 { let c = episode(k, im, |w| demo(w)); dcov += c; if c >= COV_OK { dok += 1; } }
     println!("  [anchor] scripted planner demonstrator: mean coverage {:.3} · success {:.0}%\n", dcov / 200.0, dok as f32 / 2.0);
     // OpenAI-ES
+    // RECORDED NEGATIVE (naive compute-scaling): σ-decay 0.12→0.03 over 500 gens made it WORSE — held-out coverage
+    // PEAKED ~0.29 by gen ~120 then DEGRADED to 0.10 by gen 500. Cause: the update θ += lr/(pop·σ)·grad grows 4× as σ
+    // shrinks, so late training takes ever-larger steps and diverges. Best config is CONSTANT σ, ~120 gens → 0.28.
     let n = pol_len(); let (pop, gens, sigma, lr) = (48usize, 120usize, 0.10f32, 0.03f32);
     let mut theta = vec![0.0f32; n]; for i in 0..n { theta[i] = gauss(12345, i) * 0.1; }
-    println!("  ES: {} params · pop {} (antithetic) · {} gens · σ={} lr={} · dense reward · FRESH seeds/gen (anti-overfit)", n, pop, gens, sigma, lr);
+    println!("  ES: {} params · pop {} (antithetic) · {} gens · σ={} (constant) · lr={} · dense reward · fresh seeds/gen", n, pop, gens, sigma, lr);
     for g in 0..gens {
         // fresh random training seeds EACH generation → the policy must generalize, not memorize a fixed set
         let train: Vec<u32> = (0..24u32).map(|j| 200000 + g as u32 * 977 + j).collect();
@@ -159,7 +163,7 @@ async fn run() {
         for i in 0..pop { let sign = if i % 2 == 0 { 1.0 } else { -1.0 }; let eseed = base + (i as u32 / 2);
             for k in 0..n { grad[k] += rankw[i] * sign * gauss(eseed, k); } }
         for k in 0..n { theta[k] += lr / (pop as f32 * sigma) * grad[k]; }
-        if g % 20 == 19 || g == gens - 1 {                             // report held-out best-coverage success (the task metric)
+        if g % 40 == 39 || g == gens - 1 {                             // report held-out best-coverage success (the task metric)
             let pol = Pol { p: theta.clone() }; let (mut mc, mut ok) = (0.0f32, 0);
             for k in 800..860u32 { let c = episode(k, im, |w| pol.act(&w.obs())); mc += c; if c >= COV_OK { ok += 1; } }
             println!("     gen {:>3}: held-out mean coverage {:.3} · success {:.0}%", g + 1, mc / 60.0, ok as f32 / 60.0 * 100.0); }
