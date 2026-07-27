@@ -117,6 +117,35 @@ fn in_region(c1: f64, c2: f64, r1: f64, r2: f64) -> bool {
     let hi = (c1.abs() + r1).powi(2) + (c2.abs() + r2).powi(2);
     hi >= R0 * R0 && lo <= RR * RR
 }
+/// one full sound re-verification of the certificate; returns final-depth box count (or None if rejected)
+fn certify(verbose: bool) -> Option<u64> {
+    let h0 = 0.04f64;
+    let mut boxes: Vec<[f64; 4]> = Vec::new();
+    let n = (2.0 * RR / h0).ceil() as i64;
+    for i in 0..n { for k in 0..n {
+        let c1 = -RR + (i as f64 + 0.5) * h0; let c2 = -RR + (k as f64 + 0.5) * h0;
+        if in_region(c1, c2, h0 / 2.0, h0 / 2.0) { boxes.push([c1, c2, h0 / 2.0, h0 / 2.0]); }
+    }}
+    let mut depth = 0;
+    loop {
+        let mut fails: Vec<[f64; 4]> = Vec::new(); let mut cert = 0u64;
+        for b in &boxes {
+            if box_certified(b[0], b[1], b[2], b[3]) { cert += 1; } else { fails.push(*b); }
+        }
+        if verbose { println!("   depth {}: {} boxes, {} fail, {} certified", depth, boxes.len(), fails.len(), cert); }
+        if fails.is_empty() { return Some(boxes.len() as u64); }
+        if depth >= 8 { return None; }
+        let mut next: Vec<[f64; 4]> = Vec::with_capacity(fails.len() * 4);
+        for b in &fails {
+            let (nr1, nr2) = (b[2] / 2.0, b[3] / 2.0);
+            for &sx in &[-1.0, 1.0] { for &sy in &[-1.0, 1.0] {
+                let (c1, c2) = (b[0] + sx * nr1, b[1] + sy * nr2);
+                if in_region(c1, c2, nr1, nr2) { next.push([c1, c2, nr1, nr2]); }
+            }}
+        }
+        boxes = next; depth += 1;
+    }
+}
 
 fn main() {
     println!("EFA #54 — nonlinear weak-torque unification proof on the fabric (dependency-free f64; wasm-clean)");
@@ -129,33 +158,19 @@ fn main() {
 
     // 2 · sound greedy-contraction certification over the weak-torque basin annulus (adaptive refinement)
     println!("\n2 · prove the CLF energy is BOTH controller and certificate (greedy = OR over {} torques):", NCAND);
-    let h0 = 0.04f64;
-    let mut boxes: Vec<[f64; 4]> = Vec::new();
-    let n = (2.0 * RR / h0).ceil() as i64;
-    for i in 0..n { for k in 0..n {
-        let c1 = -RR + (i as f64 + 0.5) * h0; let c2 = -RR + (k as f64 + 0.5) * h0;
-        if in_region(c1, c2, h0 / 2.0, h0 / 2.0) { boxes.push([c1, c2, h0 / 2.0, h0 / 2.0]); }
-    }}
-    let mut depth = 0;
-    let final_boxes: u64 = loop {
-        let mut fails: Vec<[f64; 4]> = Vec::new(); let mut cert = 0u64;
-        for b in &boxes {
-            if box_certified(b[0], b[1], b[2], b[3]) { cert += 1; } else { fails.push(*b); }
-        }
-        println!("   depth {}: {} boxes, {} fail, {} certified", depth, boxes.len(), fails.len(), cert);
-        if fails.is_empty() { break boxes.len() as u64; }
-        if depth >= 8 { println!("   REJECTED at [{:.3},{:.3}]", fails[0][0], fails[0][1]); std::process::exit(1); }
-        let mut next: Vec<[f64; 4]> = Vec::with_capacity(fails.len() * 4);
-        for b in &fails {
-            let (nr1, nr2) = (b[2] / 2.0, b[3] / 2.0);
-            for &sx in &[-1.0, 1.0] { for &sy in &[-1.0, 1.0] {
-                let (c1, c2) = (b[0] + sx * nr1, b[1] + sy * nr2);
-                if in_region(c1, c2, nr1, nr2) { next.push([c1, c2, nr1, nr2]); }
-            }}
-        }
-        boxes = next; depth += 1;
+    let final_boxes = match certify(true) {
+        Some(nb) => nb,
+        None => { println!("   REJECTED"); std::process::exit(1); }
     };
     println!("\nCERTIFIED — on the NONLINEAR weak-torque pendulum, the directly-synthesized CLF energy is a PROVEN");
     println!("Lyapunov certificate under its OWN greedy control ({} boxes at the final depth). One energy, both", final_boxes);
     println!("roles, soundly, where value iteration cannot — on the fabric.");
+
+    // 3 · the RUN axis — re-proof cost on the fabric (how cheap is the sound certificate?)
+    let reps = 100u32;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps { std::hint::black_box(certify(false)); }
+    let per_us = t0.elapsed().as_secs_f64() / reps as f64 * 1e6;
+    println!("\n3 · RUN axis — re-proof cost: {:.2} ms per full sound re-verification (mean over {} reps, single-thread f64)", per_us / 1e3, reps);
+    println!("    — a few ms on the fabric, paid once per pack accept: the certificate check is cheap relative to control.");
 }
