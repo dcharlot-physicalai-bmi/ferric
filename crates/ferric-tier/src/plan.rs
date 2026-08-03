@@ -11,9 +11,11 @@
 /// two-slot ring at "binds 558, hits 0 (0.0%)" while holding 2.34 GB, i.e. 20% of a 12 GB budget for
 /// nothing, and cut it to one.
 ///
-/// When Ferric adds an async reader this becomes 2 and the prefetch becomes trivially correct, because the
-/// access order is fixed and known forever (0, 1, ... N-1, repeat). That is the single largest performance
-/// win available here, and it is why the constant is named rather than inlined.
+/// This governs the SYNCHRONOUS [`crate::LayerCache`] only. [`crate::PrefetchCache`] is the overlapped
+/// path: it manages exactly two buffers itself, handing ownership of one to a reader thread while the
+/// caller uses the other, and measures ~1.9x when read time and compute time are comparable. The fixed
+/// access order (0, 1, ... N-1, repeat) is what makes its one-ahead prediction exact rather than
+/// speculative. Both share this plan; only the ring differs.
 pub const RING_SLOTS: u64 = 1;
 
 /// Passes of the sizing fixed-point. See [`plan_layers`] for why this terminates.

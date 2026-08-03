@@ -48,10 +48,16 @@
 mod expert;
 mod layer;
 mod plan;
+/// Threads, so not on wasm — the browser gets the synchronous [`LayerCache`], which is the same policy
+/// without the overlap.
+#[cfg(not(target_arch = "wasm32"))]
+mod prefetch;
 
 pub use expert::{ExpertCache, ExpertStats};
 pub use layer::{LayerCache, LayerStats};
 pub use plan::{align_up, plan_layers, LayerDesc, LayerPlan, RING_SLOTS};
+#[cfg(not(target_arch = "wasm32"))]
+pub use prefetch::{PrefetchCache, PrefetchStats};
 
 /// Where a weight was served from on a given fetch.
 ///
