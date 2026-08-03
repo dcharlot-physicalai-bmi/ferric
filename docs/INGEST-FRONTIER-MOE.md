@@ -365,3 +365,59 @@ Both verified against source, and both were overstated in the summary that opene
 2. **Router scores are `sqrt(softplus(logit))`, not softmax**, normalized only *after* top-k selection,
    then scaled by 1.5. Selection uses *biased* scores; combining weights use the *unbiased* ones — the
    same selection/weighting split kimi-k3 lists among its five silent-wrong-model invariants.
+
+---
+
+# TESTED: does role-based quantization transfer to ternary?
+
+`cargo run -p ferric-llama --example ternary_by_role --release` — Qwen2.5-0.5B, 6 disjoint chunks ×
+384 tokens of real corpus, single-plane group-128 ternary, metric = NLL in **nats/token**.
+
+Qwen's FFN makes this a controlled test: `gate`/`up` are `[4864,896]` and `down` is `[896,4864]` —
+**4,358,144 parameters each**. Ternarizing exactly one holds the bit budget fixed and varies only role.
+
+| variant (one role at a time) | ΔNLL vs baseline |
+|---|---|
+| **gate only** | **+5.849 nats** |
+| up only | +4.561 nats |
+| down only | +4.237 nats |
+
+*(baseline Q8_0 = 3.461 nats. Context: gate+up +7.720, all-FFN +9.740, attn-only +6.620.)*
+
+## Result 1 — a real role effect, perfectly controlled
+
+`gate` and `up` have identical shape, identical fan-in, and read the **identical** RMSNorm'd hidden state.
+The only thing that differs is downstream: `gate`'s output passes through SiLU before multiplying `up`'s.
+
+**`gate` is worse by 1.288 nats, on 6/6 chunks paired.** Nothing else varies, so this is a genuine
+role effect — and the plausible mechanism is that gate error is *multiplicative* in the FFN output
+(`silu'(g)·δg·up(x)`) while up error is merely additive (`silu(g)·δu`).
+
+## Result 2 — ds4's stated premise does NOT transfer to ternary
+
+`down` is the **least** sensitive of the three, not the most. The input-symmetry argument predicts the
+opposite sign.
+
+⚠️ **This corrects the framing written earlier in this document**, which said the mechanism "predicts
+`down_proj` was the weak link" in the uniform 16B QAT. Measured, it is not.
+
+Two caveats that keep this honest in both directions:
+- **`down` vs `up` is only 4/6 paired** — weak. The robust statement is narrower than "down is best": it
+  is *`gate` is uniquely fragile*, with `up` and `down` comparable.
+- **`down` has 5.4× the fan-in** (4864 vs 896) at equal parameter count, and quantization error averages
+  down as ~√N across summed terms. Input symmetry and fan-in are confounded in this architecture and this
+  test cannot separate them. So this does not refute ds4's *choice* — only the *reason given for it*.
+
+The likelier explanation for IQ2_XXS-on-gate/up + Q2_K-on-down is (a) **codebook shape** — IQ2_XXS has no
+zero and literally cannot represent a pruned weight — and (b) the **kernel fusion** that makes the split
+free, since gate/up share one activation read and are therefore forced to share a type anyway.
+
+## Actionable for Ferric
+
+A uniform ternary QAT is **not** obviously mis-spending bits at `down`. If bits are re-allocated by role,
+spend them on **`gate`** — measurably the most fragile role at equal parameter count. That is the opposite
+of the recipe a straight port of ds4 would have produced, and it is the kind of thing that only shows up
+by testing the mechanism rather than copying the configuration.
+
+*Scope: single-plane ternary at 0.5B, where absolute degradation is severe by design (the relative ordering
+is what is under test). Whether the ordering holds at 16B and at gentler quantization is not established.*
