@@ -242,6 +242,12 @@ impl GgufFile {
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
 
+    /// Byte offset where the tensor data section begins. `TensorInfo::offset` is relative to this, so a
+    /// tensor's absolute position is `data_start() + t.offset` — which is what a streaming reader needs
+    /// in order to fetch weights positionally without going through this handle (whose `File` sits behind
+    /// a `RefCell` and is therefore not shareable across threads).
+    pub fn data_start(&self) -> u64 { self.data_start }
+
     /// The tensor's raw on-disk bytes — packed, exactly as stored (feed straight to a native
     /// quantized matmul so the weights never round-trip through f32).
     pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {

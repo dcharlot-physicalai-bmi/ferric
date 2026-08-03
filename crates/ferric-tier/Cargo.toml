@@ -14,3 +14,8 @@ categories = ["caching", "science", "wasm"]
 # trait, which the caller implements. That is what lets this compile to wasm and run in the browser,
 # and what lets the placement-invariance test run in CI with no checkpoint on disk.
 [dependencies]
+
+# Only for the real-checkpoint example. Dev-dependencies do not affect the library, so the crate stays
+# dependency-free and wasm-clean.
+[dev-dependencies]
+ferric-gguf = { path = "../ferric-gguf" }

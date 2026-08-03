@@ -46,6 +46,10 @@
 #![forbid(unsafe_code)]
 
 mod expert;
+/// Real file I/O. Not on wasm, which has no filesystem — the browser supplies its own [`Backing`]
+/// (fetch, OPFS, or an in-memory buffer).
+#[cfg(not(target_arch = "wasm32"))]
+mod file;
 mod layer;
 mod plan;
 /// Threads, so not on wasm — the browser gets the synchronous [`LayerCache`], which is the same policy
@@ -54,6 +58,8 @@ mod plan;
 mod prefetch;
 
 pub use expert::{ExpertCache, ExpertStats};
+#[cfg(not(target_arch = "wasm32"))]
+pub use file::FileBacking;
 pub use layer::{LayerCache, LayerStats};
 pub use plan::{align_up, plan_layers, LayerDesc, LayerPlan, RING_SLOTS};
 #[cfg(not(target_arch = "wasm32"))]
