@@ -297,8 +297,20 @@ gate is built and workspace-tested end to end —
 - **The gate, wired at every hop:** `build --certificate` re-proves at build time (rejects a bad
   cert, naming the offending box); `deploy`/`release` re-prove before shipping/publishing (the
   operator promotion hook); and the **device agent** (`accept_pack`) re-proves before a pack goes
-  live — verified *correctness* alongside verified *behavior*. 5 certificate unit tests +
-  workspace green; reference fixture in `ferralloy/payloads/certificate-example/`.
+  live — verified *correctness* alongside verified *behavior*, with 3 device-side agent tests
+  (valid→live, bad-cert→REJECTED-before-live, no-cert→unaffected).
+- **A system registry spanning the spectrum — four certified systems.** `Sys` is an enum:
+  `linear-double-integrator` (smooth, pure `dlyap` quadratic, R=2.0), `saturated-double-integrator`
+  (a **trained** ternary head certifies R=1.0 where the quadratic is refuted at ~0.8 — the cleanest
+  learned-beats-quadratic case), `saturated-hybrid-wall-contact` (ternary head, R=1.2), and
+  **`reversed-van-der-pol` — a genuinely NONLINEAR `(x²−1)x` field with a non-convex ROA, certified
+  on-device to R=1.3, matching the dReal SMT ground truth with only `tanh` + a box worklist.** The
+  nonlinear path ranges the Jacobian over each box and adds the dynamics' Hessian term; the affine
+  path keeps the exact-cancellation bound (`is_affine()`), so the hybrid stays byte-identical. Together
+  they demonstrate the law in the gate: a head certifies more region ⟺ the quadratic is insufficient
+  (non-convex ROA / mode switch / input saturation). Every certificate was Monte-Carlo soundness-checked
+  before shipping. 64 workspace tests green; fixtures in `ferralloy/payloads/certificate-example/`
+  (`cert-linear-di.json`, `cert-saturated-di.json`, `cert.json`, `cert-van-der-pol.json`).
 SOS/dReal stay a build-time/fleet-server gate (they need SDP/SMT solvers, not on-device).
 
 **v1.0 — trust + fleet.** TUF root via `tough`, channels/cohorts
