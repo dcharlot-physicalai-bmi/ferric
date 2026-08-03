@@ -18,3 +18,4 @@ crates/ferric-onnx/testdata/proj/
 # ad-hoc headless test scripts (hardcoded local Chrome path)
 crates/ferric-web/*_test.mjs
 crates/ferric-web/site/pkg/
+.phase0/
