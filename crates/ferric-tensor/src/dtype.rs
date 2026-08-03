@@ -128,7 +128,8 @@ impl Tensor {
         let per_word = (32 / bits) as usize;
         let words = (rows * cols).div_ceil(per_word);
         let out = empty(&self.ctx, words);
-        run(&self.ctx, QUANT_ROW_WGSL, "quant_row", &[c.buf.as_ref(), scale.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, cols as u32, bits, qmax.to_bits()])], groups(words));
+        let (grid, rs) = crate::groups2d(words);
+        run(&self.ctx, QUANT_ROW_WGSL, "quant_row", &[c.buf.as_ref(), scale.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, cols as u32, bits, qmax.to_bits(), rs])], grid);
         QRow { ctx: self.ctx.clone(), buf: Arc::new(out), scale: scale.buf.clone(), rows, cols, bits }
     }
 }
@@ -191,6 +192,97 @@ impl Tensor {
         run(&self.ctx, MATMUL_TERNARY_WGSL, "matmul_ternary", &[x.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out, &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, 0])], groups(rows * w.rows));
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
+    /// Multiply-free ternary matmul (add/sub/skip via branchless select) — see MATMUL_TERNARY_MF_WGSL.
+    pub fn matmul_ternary_mf(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dims mismatch");
+        let out = empty(&self.ctx, rows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_MF_WGSL, "matmul_ternary_mf", &[x.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out, &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, 0])], groups(rows * w.rows));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+    /// Cooperative-matrix (tensor-core) ternary matmul — same 8x8 tile structure as `matmul_q8_0_coop`.
+    /// Unpacks a ternary weight tile into shared memory, then uses the matrix units. NOT multiply-free by
+    /// design: the test is whether tensor cores beat multiply-free scalar arithmetic on GPU.
+    pub fn matmul_ternary_coop(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0 && inn % 8 == 0, "matmul_ternary_coop needs N,K multiples of 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_COOP_WGSL, "matmul_ternary_coop",
+            &[xp.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, 0])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+    /// Wider N-tile (8x16 per workgroup) — reuses the activation tile across two matmuls.
+    pub fn matmul_ternary_coop_n16(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 16 == 0 && inn % 8 == 0, "matmul_ternary_coop_n16 needs N mult 16, K mult 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_COOP_N16_WGSL, "matmul_ternary_coop_n16",
+            &[xp.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, 0])],
+            ((w.rows / 16) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+    /// N=32 tile — activation reused 4x.
+    pub fn matmul_ternary_coop_n32(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 32 == 0 && inn % 8 == 0, "matmul_ternary_coop_n32 needs N mult 16, K mult 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_COOP_N32_WGSL, "matmul_ternary_coop_n32",
+            &[xp.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, 0])],
+            ((w.rows / 32) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+    /// N=64 tile — activation reused 8x; tests the register-pressure limit.
+    pub fn matmul_ternary_coop_n64(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 64 == 0 && inn % 8 == 0, "matmul_ternary_coop_n64 needs N mult 16, K mult 8");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_COOP_N64_WGSL, "matmul_ternary_coop_n64",
+            &[xp.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, 0])],
+            ((w.rows / 64) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
+    /// Deeper K-blocking (32) — four coopMultiplyAdds per barrier round.
+    pub fn matmul_ternary_coop4(&self, w: &Ternary) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch");
+        assert!(w.rows % 8 == 0 && inn % 32 == 0, "matmul_ternary_coop4 needs N mult of 8, K mult of 32");
+        let mrows = rows.div_ceil(8) * 8;
+        let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
+        let out = empty(&self.ctx, mrows * w.rows);
+        run(&self.ctx, MATMUL_TERNARY_COOP4_WGSL, "matmul_ternary_coop4",
+            &[xp.buf.as_ref(), w.buf.as_ref(), w.scale.as_ref(), &out,
+              &unibuf(&self.ctx, &[mrows as u32, inn as u32, w.rows as u32, 0])],
+            ((w.rows / 8) as u32, (mrows / 8) as u32, 1));
+        let full = Tensor::from_parts(&self.ctx, out, vec![mrows, w.rows]);
+        if mrows == rows { full } else { full.narrow(0, 0, rows).contiguous() }
+    }
 }
 impl Ternary {
     pub fn nbytes(&self) -> usize { (self.rows * self.cols * 2).div_ceil(8) }
@@ -216,6 +308,240 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     out[w] = word;
+}
+"#;
+
+const MATMUL_TERNARY_COOP_N64_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:     array<f32>;
+@group(0) @binding(1) var<storage,read>       tw:    array<u32>;
+@group(0) @binding(2) var<storage,read>       scale: array<f32>;
+@group(0) @binding(3) var<storage,read_write> c:     array<f32>;
+@group(0) @binding(4) var<uniform>            dims:  vec4<u32>;
+var<workgroup> bs: array<f32, 512>;   // EIGHT 8x8 weight tiles (N-tile = 64)
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // Push the intensity lever to its limit: activation tile loaded ONCE, reused EIGHT times. Eight live
+    // accumulators start pressuring registers, so this should find where the direction stops paying.
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 64u; let t = lid.x;
+    var a0 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 0u], nn);
+    var a1 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 8u], nn);
+    var a2 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 16u], nn);
+    var a3 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 24u], nn);
+    var a4 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 32u], nn);
+    var a5 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 40u], nn);
+    var a6 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 48u], nn);
+    var a7 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 56u], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 16u; e = e + 1u) {      // 512 values / 32 threads
+            let i = t + e * 32u;
+            let q = i / 64u; let rem = i % 64u; let kl = rem / 8u; let nl = rem % 8u;
+            let n = n0 + q * 8u + nl; let k = k0 + kl;
+            let widx = n * kk + k;
+            let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;
+            bs[i] = f32(i32(code) - 1) * scale[n];
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        a0 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u), a0);
+        a1 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[64], 8u), a1);
+        a2 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[128], 8u), a2);
+        a3 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[192], 8u), a3);
+        a4 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[256], 8u), a4);
+        a5 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[320], 8u), a5);
+        a6 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[384], 8u), a6);
+        a7 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[448], 8u), a7);
+        workgroupBarrier();
+    }
+    coopStoreT(a0, &c[m0 * nn + n0 + 0u], nn);
+    coopStoreT(a1, &c[m0 * nn + n0 + 8u], nn);
+    coopStoreT(a2, &c[m0 * nn + n0 + 16u], nn);
+    coopStoreT(a3, &c[m0 * nn + n0 + 24u], nn);
+    coopStoreT(a4, &c[m0 * nn + n0 + 32u], nn);
+    coopStoreT(a5, &c[m0 * nn + n0 + 40u], nn);
+    coopStoreT(a6, &c[m0 * nn + n0 + 48u], nn);
+    coopStoreT(a7, &c[m0 * nn + n0 + 56u], nn);
+}
+"#;
+
+const MATMUL_TERNARY_COOP_N32_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:     array<f32>;
+@group(0) @binding(1) var<storage,read>       tw:    array<u32>;
+@group(0) @binding(2) var<storage,read>       scale: array<f32>;
+@group(0) @binding(3) var<storage,read_write> c:     array<f32>;
+@group(0) @binding(4) var<uniform>            dims:  vec4<u32>;
+var<workgroup> bs: array<f32, 256>;   // FOUR 8x8 weight tiles (N-tile = 32)
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // Push the winning lever: 8x32 output tile ⇒ the activation tile is loaded ONCE and reused across FOUR
+    // matmuls (vs 2 at N=16). Note this uses the SAME 256 floats of shared memory as the K=32 experiment that
+    // REGRESSED — the difference is that this spend BUYS arithmetic intensity, which K=32 did not.
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 32u; let t = lid.x;
+    var a0 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0], nn);
+    var a1 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 8u], nn);
+    var a2 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 16u], nn);
+    var a3 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 24u], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 8u; e = e + 1u) {
+            let i = t + e * 32u;
+            let q = i / 64u; let rem = i % 64u; let kl = rem / 8u; let nl = rem % 8u;
+            let n = n0 + q * 8u + nl; let k = k0 + kl;
+            let widx = n * kk + k;
+            let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;
+            bs[i] = f32(i32(code) - 1) * scale[n];
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);   // ONE load, FOUR uses
+        a0 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u), a0);
+        a1 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[64], 8u), a1);
+        a2 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[128], 8u), a2);
+        a3 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[192], 8u), a3);
+        workgroupBarrier();
+    }
+    coopStoreT(a0, &c[m0 * nn + n0], nn);
+    coopStoreT(a1, &c[m0 * nn + n0 + 8u], nn);
+    coopStoreT(a2, &c[m0 * nn + n0 + 16u], nn);
+    coopStoreT(a3, &c[m0 * nn + n0 + 24u], nn);
+}
+"#;
+
+const MATMUL_TERNARY_COOP_N16_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:     array<f32>;
+@group(0) @binding(1) var<storage,read>       tw:    array<u32>;
+@group(0) @binding(2) var<storage,read>       scale: array<f32>;
+@group(0) @binding(3) var<storage,read_write> c:     array<f32>;
+@group(0) @binding(4) var<uniform>            dims:  vec4<u32>;   // M, K, N, _
+var<workgroup> bs: array<f32, 128>;   // TWO 8x8 weight tiles (N-tile = 16)
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // WIDER N-TILE (8x16 output per workgroup, two accumulators). The K=32 experiment showed the bottleneck is
+    // NOT barrier count, so target ARITHMETIC INTENSITY instead: the activation tile `ma` is loaded ONCE and
+    // reused across TWO coopMultiplyAdds, halving global x-traffic per output element.
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 16u; let t = lid.x;
+    var acc0 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0], nn);
+    var acc1 = coopLoadT<coop_mat8x8<f32, C>>(&c[m0 * nn + n0 + 8u], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 4u; e = e + 1u) {          // 128 values / 32 threads = 4 each
+            let i = t + e * 32u;
+            let half = i / 64u; let rem = i % 64u; let kl = rem / 8u; let nl = rem % 8u;
+            let n = n0 + half * 8u + nl; let k = k0 + kl;
+            let widx = n * kk + k;
+            let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;
+            bs[i] = f32(i32(code) - 1) * scale[n];
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);   // loaded ONCE, used twice
+        acc0 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u), acc0);
+        acc1 = coopMultiplyAdd(ma, coopLoadT<coop_mat8x8<f32, B>>(&bs[64], 8u), acc1);
+        workgroupBarrier();
+    }
+    coopStoreT(acc0, &c[m0 * nn + n0], nn);
+    coopStoreT(acc1, &c[m0 * nn + n0 + 8u], nn);
+}
+"#;
+
+const MATMUL_TERNARY_COOP4_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:     array<f32>;
+@group(0) @binding(1) var<storage,read>       tw:    array<u32>;
+@group(0) @binding(2) var<storage,read>       scale: array<f32>;
+@group(0) @binding(3) var<storage,read_write> c:     array<f32>;
+@group(0) @binding(4) var<uniform>            dims:  vec4<u32>;   // M, K, N, _
+var<workgroup> bs: array<f32, 256>;   // FOUR 8x8 weight tiles (K-block = 32)
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // DEEPER K-BLOCKING: the 8-wide version pays a workgroupBarrier PAIR for every single coopMultiplyAdd.
+    // Staging four 8x8 weight tiles per barrier round amortizes that 4x — the same total matmul work with a
+    // quarter of the synchronisation.
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 32u) {
+        for (var e: u32 = 0u; e < 8u; e = e + 1u) {          // 256 values / 32 threads = 8 each
+            let i = t + e * 32u;
+            let j = i / 64u; let rem = i % 64u; let kl = rem / 8u; let nl = rem % 8u;
+            let n = n0 + nl; let k = k0 + j * 8u + kl;
+            let widx = n * kk + k;
+            let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;
+            bs[i] = f32(i32(code) - 1) * scale[n];
+        }
+        workgroupBarrier();
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0 + j * 8u], kk);
+            let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[j * 64u], 8u);
+            acc = coopMultiplyAdd(ma, mb, acc);
+        }
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
+
+const MATMUL_TERNARY_COOP_WGSL: &str = r#"
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage,read>       x:     array<f32>;   // [M,K]
+@group(0) @binding(1) var<storage,read>       tw:    array<u32>;   // packed ternary [N,K], 16 codes/word
+@group(0) @binding(2) var<storage,read>       scale: array<f32>;   // [N] absmean
+@group(0) @binding(3) var<storage,read_write> c:     array<f32>;   // [M,N]
+@group(0) @binding(4) var<uniform>            dims:  vec4<u32>;    // M, K, N, _
+var<workgroup> bs: array<f32, 64>;
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // Same cooperative-matrix (tensor-core) structure as MATMUL_Q8_0_COOP: unpack a weight TILE into shared
+    // memory, then let the matrix units do the multiply-accumulate. This is deliberately NOT multiply-free —
+    // the point is to test whether tensor cores beat multiply-free scalar arithmetic on a GPU. Ternary's real
+    // GPU advantage is 16× fewer weight BYTES; this kernel is what actually cashes it.
+    let kk = dims.y; let nn = dims.z;
+    let m0 = wid.y * 8u; let n0 = wid.x * 8u; let t = lid.x;
+    let ci = m0 * nn + n0;
+    var acc = coopLoadT<coop_mat8x8<f32, C>>(&c[ci], nn);
+    for (var k0: u32 = 0u; k0 < kk; k0 = k0 + 8u) {
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let i = t + e * 32u; let nl = i / 8u; let kl = i % 8u;
+            let n = n0 + nl; let k = k0 + kl;
+            let widx = n * kk + k;
+            let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;  // 0=-1, 1=0, 2=+1
+            bs[kl * 8u + nl] = f32(i32(code) - 1) * scale[n];
+        }
+        workgroupBarrier();
+        let ma = coopLoadT<coop_mat8x8<f32, A>>(&x[m0 * kk + k0], kk);
+        let mb = coopLoadT<coop_mat8x8<f32, B>>(&bs[0], 8u);
+        acc = coopMultiplyAdd(ma, mb, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[ci], nn);
+}
+"#;
+
+const MATMUL_TERNARY_MF_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read>        tw: array<u32>;
+@group(0) @binding(2) var<storage,read>        scale: array<f32>;
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(4) var<uniform>             info: vec4<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    // GENUINELY MULTIPLY-FREE: accumulate +x / −x / skip. `select` is branchless (no warp divergence),
+    // so this is the honest test of whether removing the multiply helps on a GPU — where fused
+    // multiply-add is already a single instruction, unlike CPUs where BitNet.cpp/T-MAC win big.
+    var pos = 0.0; var neg = 0.0;
+    for (var i: u32 = 0u; i < in_dim; i = i + 1u) {
+        let widx = o * in_dim + i;
+        let code = (tw[widx / 16u] >> (2u * (widx % 16u))) & 3u;   // 0=−1, 1=0, 2=+1
+        let xv = x[r * in_dim + i];
+        pos = pos + select(0.0, xv, code == 2u);
+        neg = neg + select(0.0, xv, code == 0u);
+    }
+    out[idx] = (pos - neg) * scale[o];
 }
 "#;
 
@@ -3208,10 +3534,11 @@ const QUANT_ROW_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        inp: array<f32>;
 @group(0) @binding(1) var<storage,read>        scale: array<f32>; // [rows]
 @group(0) @binding(2) var<storage,read_write>  out: array<u32>;
-@group(0) @binding(3) var<storage,read>        info: array<u32>;  // rows, cols, bits, bitcast(qmax)
+@group(0) @binding(3) var<storage,read>        info: array<u32>;  // rows, cols, bits, bitcast(qmax), row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let w = gid.x; let rows = info[0]; let cols = info[1]; let bits = info[2]; let qmax = bitcast<f32>(info[3]);
+    let rows = info[0]; let cols = info[1]; let bits = info[2]; let qmax = bitcast<f32>(info[3]);
+    let w = gid.x + gid.y * info[4]; // 2D grid: words can exceed the 65535-workgroup 1D cap
     let per = 32u / bits; let n = rows * cols; let words = (n + per - 1u) / per;
     if (w >= words) { return; }
     let mask = (1u << bits) - 1u;

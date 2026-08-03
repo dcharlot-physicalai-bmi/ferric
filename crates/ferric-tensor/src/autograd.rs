@@ -12,7 +12,7 @@
 //!
 //! Validated by a finite-difference gradient check and by actually training an MLP (loss ↓).
 
-use crate::Tensor;
+use crate::{QMatrix, QRow, Tensor};
 use ferric_core::Context;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -111,6 +111,17 @@ impl Var {
                 vec![g.matmul(&p[1].transpose(r - 1, r - 2)), p[0].transpose(r - 1, r - 2).matmul(g)]
             }))
     }
+    /// Matmul against a FROZEN quantized weight `w` [out, in], WITHOUT dequantizing it to fp — the
+    /// scalable fine-tuning path (LoRA around frozen quantized weights on large models). Forward =
+    /// `x·Wᵀ` via the compact quant kernel. Backward needs `grad_x = g·W`, which contracts the `out`
+    /// dim; that's `g·(Wᵀ)ᵀ` = `matmul_qweight` against a row-wise-quantized transpose `wt` [in, out]
+    /// (int8, ~¼ the fp memory; built once at setup and kept — the fp transpose is transient). The
+    /// weight is frozen (no grad_w); grad flows only to `x`. `wt`'s int8 requant is the only approximation.
+    pub fn matmul_qf(&self, w: &QMatrix, wt: &Arc<QRow>) -> Var {
+        let out = self.0.value.matmul_q(w);
+        let wt = wt.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| { p[0].accumulate(&g.matmul_qweight(&wt)); }))
+    }
     /// 2D convolution (NHWC × HWIO → NHWO, like [`Tensor::conv2d`]). First-order gradients only
     /// (no double-backward): dX is the stride-aware transposed convolution, dW the input×grad
     /// correlation — both portable WGSL. The forward routes through the tensor units under
@@ -138,6 +149,143 @@ impl Var {
         Var::node_d(out, vec![self.clone()],
             Box::new(|g, p| { p[0].accumulate(&g.neg()); }),
             Box::new(|g, _p| vec![g.neg()]))
+    }
+    /// SiLU/swish `x·σ(x)` — the current-model FFN activation. VJP: `σ(x) + x·σ(x)·(1−σ(x))`.
+    /// First-order only (training); add a differentiable VJP if second-order through SiLU is needed.
+    pub fn silu(&self) -> Var {
+        let out = self.0.value.silu();
+        let x = self.0.value.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            let sig = x.sigmoid();
+            let deriv = sig.add(&x.mul(&sig).mul(&sig.scalar(1.0).sub(&sig)));
+            p[0].accumulate(&g.mul(&deriv));
+        }))
+    }
+    /// Materialize a contiguous copy (identity on values; grad passes straight through) — needed
+    /// before a matmul whose input is a transposed/permuted view, as in multi-head attention.
+    pub fn contiguous(&self) -> Var {
+        let out = self.0.value.contiguous();
+        Var::node(out, vec![self.clone()], Box::new(|g, p| p[0].accumulate(g)))
+    }
+    /// Broadcast to `shape` (repeat singleton/absent dims) — for GQA head-repeat in attention. The
+    /// VJP sums the gradient back over the broadcast dims (handled by `accumulate`'s un-broadcast).
+    pub fn broadcast_to(&self, shape: &[usize]) -> Var {
+        let out = self.0.value.broadcast_to(shape);
+        Var::node(out, vec![self.clone()], Box::new(|g, p| p[0].accumulate(g)))
+    }
+    /// RoPE (rotary position embedding) over `[.., n_heads·head_dim]`. It's an orthogonal rotation
+    /// `R(θ)`, so the VJP is the transpose `R(−θ) = flip₂(R(θ)(flip₂(g)))` where `flip₂` negates the
+    /// second half of each head's dims. First-order (training) — enables grad through rope to the q/k
+    /// projections when fine-tuning attention.
+    pub fn rope(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Var {
+        let out = self.0.value.rope(n_heads, head_dim, base, offset);
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            let flip2 = |t: &Tensor| -> Tensor {
+                let rows = t.numel() / (n_heads * head_dim);
+                let t3 = t.reshape(&[rows, n_heads, head_dim]);
+                let a = t3.narrow(2, 0, head_dim / 2).contiguous();
+                let b = t3.narrow(2, head_dim / 2, head_dim / 2).contiguous().neg();
+                a.cat(&b, 2).reshape(&t.shape)
+            };
+            p[0].accumulate(&flip2(&flip2(g).rope(n_heads, head_dim, base, offset)));
+        }))
+    }
+    /// RoPE from a PRECOMPUTED cos/sin table (split-half rotate_half, `Tensor::apply_rope_costable`) — for
+    /// Instella's YaRN rope. First-order VJP: a plane rotation R(θ) is orthogonal, so its transpose is
+    /// R(−θ) = the SAME op with sin negated (cos is even, sin odd). cos/sin are constants; grad flows only
+    /// to `self` (→ the q/k projection weights when QAT-ing attention).
+    pub fn apply_rope_costable(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize) -> Var {
+        let out = self.0.value.apply_rope_costable(cos, sin, n_heads, head_dim);
+        let (cos, neg_sin) = (cos.clone(), sin.neg());
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            p[0].accumulate(&g.apply_rope_costable(&cos, &neg_sin, n_heads, head_dim));
+        }))
+    }
+    /// **Selective scan** — the Mamba/SSM linear recurrence `h_t = a_t ⊙ h_{t-1} + b_t`, returning all states
+    /// `h` stacked as `[T, D]` (`a`, `b` are `[T, D]`; the per-step decay `a_t` is the "selective" input-dependent
+    /// gate). This is the state-space backbone: a FIXED-size state replaces the growing KV cache.
+    ///
+    /// VJP (exact, analytic): the recurrence is linear in `h`, so the adjoint runs the SAME recurrence
+    /// BACKWARD in time — `g_t = ḡ_t + a_{t+1} ⊙ g_{t+1}`, then `∂L/∂b_t = g_t` and `∂L/∂a_t = g_t ⊙ h_{t-1}`.
+    /// Computing it directly (rather than unrolling T graph nodes) keeps the graph O(1) in sequence length.
+    pub fn selective_scan(a: &Var, b: &Var) -> Var {
+        let (av, bv) = (a.0.value.clone(), b.0.value.clone());
+        assert_eq!(av.shape, bv.shape, "selective_scan: a and b must share shape [T, D]");
+        let (t, d) = (av.shape[0], av.shape[1]);
+        let ctx = av.ctx_arc();
+        // forward: sequential scan on host (deterministic; a fused GPU scan is the later optimization)
+        let (ah, bh) = (pollster::block_on(av.to_vec()), pollster::block_on(bv.to_vec()));
+        let mut hh = vec![0f32; t * d];
+        for i in 0..t {
+            for j in 0..d {
+                let prev = if i == 0 { 0.0 } else { hh[(i - 1) * d + j] };
+                hh[i * d + j] = ah[i * d + j] * prev + bh[i * d + j];
+            }
+        }
+        let out = Tensor::from_vec(&ctx, &hh, &[t, d]);
+        let (ah2, hh2) = (ah, hh);
+        Var::node(out, vec![a.clone(), b.clone()], Box::new(move |g, p| {
+            let gh = pollster::block_on(g.contiguous().to_vec());
+            let mut ga = vec![0f32; t * d];
+            let mut gb = vec![0f32; t * d];
+            let mut carry = vec![0f32; d]; // g_{t+1} ⊙ a_{t+1}, propagated backward
+            for i in (0..t).rev() {
+                for j in 0..d {
+                    let gt = gh[i * d + j] + carry[j];      // total adjoint of h_t
+                    gb[i * d + j] = gt;                      // ∂L/∂b_t
+                    let prev = if i == 0 { 0.0 } else { hh2[(i - 1) * d + j] };
+                    ga[i * d + j] = gt * prev;               // ∂L/∂a_t = g_t ⊙ h_{t-1}
+                    carry[j] = gt * ah2[i * d + j];          // feed a_t ⊙ g_t to step t-1
+                }
+            }
+            p[0].accumulate(&Tensor::from_vec(&ctx, &ga, &[t, d]));
+            p[1].accumulate(&Tensor::from_vec(&ctx, &gb, &[t, d]));
+        }))
+    }
+    /// Narrow (slice) `len` elements from `start` along `dim`. First-order VJP scatters the grad back into
+    /// a zero tensor of the original size (cat with zero pads) — for MLA q/k/v splits + per-token MoE.
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Var {
+        let full = self.0.value.shape[dim];
+        let ctx = self.0.value.ctx_arc();
+        let out = self.0.value.narrow(dim, start, len);
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            let g = g.contiguous();
+            let mut acc = g.clone();
+            if start > 0 { let mut s = g.shape.clone(); s[dim] = start; acc = Tensor::zeros(&ctx, &s).cat(&acc, dim); }
+            let after = full - start - len;
+            if after > 0 { let mut s = acc.shape.clone(); s[dim] = after; acc = acc.cat(&Tensor::zeros(&ctx, &s), dim); }
+            p[0].accumulate(&acc);
+        }))
+    }
+    /// Concatenate two Vars along `dim`. First-order VJP narrows the grad back to each input's slice.
+    pub fn cat(&self, other: &Var, dim: usize) -> Var {
+        let (n0, n1) = (self.0.value.shape[dim], other.0.value.shape[dim]);
+        let out = self.0.value.cat(&other.0.value, dim);
+        Var::node(out, vec![self.clone(), other.clone()], Box::new(move |g, p| {
+            let g = g.contiguous();
+            p[0].accumulate(&g.narrow(dim, 0, n0).contiguous());
+            p[1].accumulate(&g.narrow(dim, n0, n1).contiguous());
+        }))
+    }
+    /// RMSNorm `x · rsqrt(mean(x²)+eps) · weight` over the last dim — the current-model normalization.
+    /// Both `x` and the learnable `weight` receive gradients (the exact analytic VJP, first-order).
+    pub fn rmsnorm(&self, weight: &Var, eps: f32) -> Var {
+        let x = self.0.value.clone();
+        let w = weight.0.value.clone();
+        let last = x.rank() - 1;
+        let dd = x.shape[last] as f32;
+        let ms = x.mul(&x).sum(&[last], true).mul(&x.scalar(1.0 / dd)); // mean(x²) [.,1]
+        let r = x.scalar(1.0).div(&ms.add(&x.scalar(eps)).sqrt());     // rsqrt [.,1]
+        let out = x.mul(&r).mul(&w);
+        Var::node(out, vec![self.clone(), weight.clone()], Box::new(move |g, p| {
+            // grad_w = Σ g·x·r  (accumulate un-broadcasts [.,d] → weight's shape)
+            p[1].accumulate(&g.mul(&x).mul(&r));
+            // grad_x = r·[ w·g − (r²·x/d)·S ],  S = Σ_d (g·w·x)
+            let s = g.mul(&w).mul(&x).sum(&[last], true);
+            let a = w.mul(g);
+            let b = r.mul(&r).mul(&x).mul(&x.scalar(1.0 / dd)).mul(&s);
+            p[0].accumulate(&r.mul(&a.sub(&b)));
+        }))
     }
     /// Transpose two dims; gradient transposes back.
     pub fn transpose(&self, a: usize, b: usize) -> Var {
@@ -194,6 +342,15 @@ impl Var {
         Var::node_d(out, vec![self.clone()],
             Box::new(move |g, p| { p[0].accumulate(&g.mul(&x.sin()).neg()); }),
             Box::new(|g, p| vec![g.mul(&p[0].sin()).neg()]))  // d/dx cos x = −sin x (differentiable in x)
+    }
+    /// Elementwise tanh. d/dx tanh x = 1 − tanh²x. First-order (training) — enables learned tanh-unit
+    /// energies (e.g. neural-Lyapunov heads) where the activation's inner weights are trained.
+    pub fn tanh(&self) -> Var {
+        let out = self.0.value.tanh();
+        let o2 = out.clone();
+        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
+            p[0].accumulate(&g.mul(&o2.scalar(1.0).sub(&o2.mul(&o2))));  // g·(1−tanh²x)
+        }))
     }
     /// Elementwise sqrt. d/dx √x = 0.5/√x. (Enables L2-normalization and VICReg std.)
     pub fn sqrt(&self) -> Var {
