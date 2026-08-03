@@ -236,3 +236,132 @@ accumulation. Scale applied **once per group**, not per element.
 
 8 GB → 32.69 s/token; 224 GB → 19.21 s/token. **28× the RAM buys ~1.7× the speed**; I/O is 41–77% of wall
 clock. Their own framing: *"The point was never the speed."* The point is that it runs at all.
+
+---
+
+# Extracted mechanisms — ds4 / DwarfStar
+
+## ⭐ Role-based quantization: the exact map, and *why* it is asymmetric
+
+No role metadata exists in the file format. Roles are derived from **tensor name** at load time; precision
+rides the ordinary per-tensor GGUF type id.
+
+| role | 2-bit build | bpw |
+|---|---|---|
+| routed `gate` (w1), routed `up` (w3) | **IQ2_XXS** | 2.0625 |
+| routed `down` (w2) | **Q2_K** | 2.625 |
+| attention projections, shared expert, output head | Q8_0 | 8.5 |
+| router / `ffn_gate_inp` | F16 | — |
+| norms, biases, all 1-D | F32 | — |
+
+**Why quantizing only routed experts is enough**: they are `3 × 43 × 256 × 4096 × 2048` = 277.0B of the
+284B total = **97.5% of all parameters**. Leaving router, shared experts, projections and norms at full
+precision costs ~2.5% of the weights and buys back the accuracy the 2-bit experts lose.
+
+### The mechanism behind `down` > `up`/`gate` — this is the transferable idea
+
+- IQ2_XXS is a **sign-symmetric codebook with no zero and no offset term** (magnitudes {1,3,5,7} with
+  signs stored separately, one f16 block scale refined by a 4-bit per-32 nibble).
+- Q2_K carries **both `d` and `dmin`** — an *affine* quantizer with per-16 scale *and* min.
+- `gate`/`up` consume the **RMSNorm'd hidden state: near-symmetric about zero**.
+  `down` consumes the **SwiGLU product: gated and one-sided.**
+
+With symmetric inputs, symmetric weight error partially **cancels** across the dot product; with one-sided
+inputs it **accumulates coherently**. So the layer whose *input distribution is one-sided* needs the lower
+weight error, and an affine quantizer's offset is what buys it.
+
+**Bearing on Ferric's ternary work.** Ternary {−1,0,+1} is a *symmetric* quantizer. The 16B QAT ternarized
+**uniformly**, so this predicts `down_proj` was the weak link — a sharper and more mechanistic hypothesis
+than the layer-position split (first/last f32) already tested, which came back null. Testable cheaply on
+the existing harness: ternary gate/up, affine-or-higher `down`.
+
+### The asymmetry is kernel-enabled, not merely statistical
+`gate` and `up` are computed by one fused kernel that reads the activation **once** and applies it to two
+weight rows (`kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32`) — which is why the loader *hard-exits* if their
+types differ (`ds4.c:5043`). `down` is a separate kernel fused with the 6-expert weighted sum
+(`..._q2_K_sum6_f32`), so giving it a different type costs nothing. **Design the quantization split and
+the kernel fusion together, or the split has no place to live.**
+
+## The same failure, finer grain — colibri's int8 MTP head
+
+`eh_proj [D, 2D]` multiplies `[embedding_norm ; hidden_norm]`, whose two column halves differ **~20–30× in
+scale** (embedding-half absmax ~0.05, hidden-half ~1.5). Per-row int4 uses **one** scale per row, so every
+embedding-half weight lands below half a step and `rint` rounds the **entire half to exact zeros** (packed
+`0x88`). MTP draft acceptance: **0–4% at int4, 39–59% at int8.**
+
+**The escape hatch is the real lesson**: group-scaled (gs64) int4 does **not** fail. The pathology is
+specifically *one scale spanning two populations*, not the bit width. Any Ferric quantizer that puts one
+scale across heterogeneous columns inherits this bug, silently — the model still emits plausible tokens.
+
+## imatrix calibration — what is actually measured
+
+Two statistics, matching the two roles, collected by hooking the real prefill graph (inference math is
+unchanged):
+- **gate/up**: `Σ x²` over the FFN-normalized activation
+- **down**: `Σ mid²` over the routed SwiGLU row **after route weighting**
+
+Accumulated per `(layer, expert)`, divided by that expert's own visit count; **experts never selected get
+an all-1.0 vector**. Entry into the quantizer is importance × local magnitude:
+```c
+sigma2    = Σ(x[j]²) / 256;
+weight[i] = imatrix[i] * sqrtf(sigma2 + x[i]*x[i]);
+```
+Corpus: 4,690 records / ~2.92M tokens, exactly balanced think/nothink, pre-rendered **with the real chat
+template** so calibration sees the special-token patterns agents actually produce.
+
+Measured benefit is modest and honestly reported: **−1.95% NLL** (0.1774 → 0.1739) over 100 continuations.
+
+## Determinism: ds4 takes the *opposite* side from kimi-k3
+
+ds4 builds with `-ffast-math` and `--use_fast_math`; kimi-k3-in-c refuses both so its scalar / OpenMP /
+AVX2 paths stay bit-identical. **Ferric sides with kimi-k3** — bit-reproducibility is the differentiator.
+Worth noting ds4 still needs determinism where it *must* have it, and pays for it explicitly: fixed-tree
+`__fadd_rn` combine kernels to match single-GPU reduction order, and a `moe_scatter_sorted_pairs_
+deterministic_kernel` because "atomic append order changes logits."
+
+## ⭐ Do not trust `cudaDeviceCanAccessPeer`
+
+At init, ds4 probes **every ordered GPU pair** with 4 sizes {4 KiB, 256 KiB, 1 MiB, 16 MiB} × 4 iterations,
+byte-compares, and demotes that **direction** to a pinned-host bounce on a single mismatch — because an
+RTX 6000 Ada was observed **silently corrupting peer copies while returning success**. Ferric should adopt
+this stance for any multi-device path: capability bits are a claim, a byte-compare is evidence.
+
+## Speculative decoding: greedy prefix match, no rejection sampling
+
+DSpark accepts a draft token only on **exact top-1 equality** (`if (row_tops[i-1] != drafts[i]) break;`).
+No `max(0, p−q)` residual, no resampling; the speculative path is only reachable at `temperature <= 0`.
+"Correctness-gated" therefore means **bit-identical committed token stream vs non-speculative decode**,
+and the test enforces exactly that: run each prompt twice, `cmp -s`, fail on any byte difference.
+
+Rollback detail worth copying: the raw sliding-window KV ring is **deliberately not restored** (it is
+append-only and will be overwritten by replay); only compressor/indexer frontiers and row counters rewind.
+
+## Honest reading of the quality claims
+
+The README says the 2-bit quants are "verified to be actually high quality." What is actually committed:
+- The **only** quantified 2-bit-vs-4-bit delta in the repo is for **GLM 5.2, not DeepSeek Flash**:
+  first-token match 95→92 /100, API top-1 0.942→0.890, pair-order 0.880→0.800.
+- **No** committed q2-vs-q4-vs-FP NLL for Flash; no per-benchmark drop; no aggregate eval score.
+- The MODEL_CARD benchmark table is **upstream FP4+FP8 numbers, never re-measured on the quantized GGUFs.**
+- Release blockers are *relative* (regression vs last-known-good), not an absolute bar.
+
+Treat "2-bit is fine" as **supported in direction, unquantified in magnitude** — the same standard applied
+to kimi-k3's single-sample timings. Ferric's role-based experiment should therefore report a real
+perplexity delta, which is the number none of the three projects published.
+
+## Corrections to earlier claims in this plan
+
+Both verified against source, and both were overstated in the summary that opened this document:
+- The **1.66× is pipeline parallelism over TCP, not RDMA tensor parallelism** — and the baseline column is
+  a *Q2* single-process run against a *Q4* distributed run, which favours the baseline.
+- **120 t/s on 8×L40S is aggregate over 16 concurrent sessions** (~7.5 t/s per stream), not single-stream.
+
+## Bonus: DeepSeek V4 routing is not standard MoE
+
+1. **The first 3 layers route by deterministic token-id hash**, not learned top-k —
+   `ffn_gate_tid2eid` is an `I32[6, 129280]` lookup indexed directly by token id. Side effect worth
+   exploiting: for those layers the expert set is knowable **from the token alone**, which is a free,
+   exact prefetch signal for streaming.
+2. **Router scores are `sqrt(softplus(logit))`, not softmax**, normalized only *after* top-k selection,
+   then scaled by 1.5. Selection uses *biased* scores; combining weights use the *unbiased* ones — the
+   same selection/weighting split kimi-k3 lists among its five silent-wrong-model invariants.
