@@ -82,5 +82,7 @@ impl Llama {
     }
 }
 
+pub mod cosmos;
 pub mod qwen35;
 pub mod qwen3;
+pub mod unipc;

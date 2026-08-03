@@ -14,6 +14,13 @@ pub struct STensor {
 
 /// Parse a safetensors byte buffer into name → f32 tensor. `__metadata__` is skipped.
 pub fn safetensors(bytes: &[u8]) -> Result<HashMap<String, STensor>, String> {
+    safetensors_filtered(bytes, |_| true)
+}
+
+/// Like [`safetensors`], but only dequantizes tensors whose name passes `keep` — so a multi-component
+/// checkpoint (e.g. a mixture-of-transformers whose shards also hold a diffusion tower + vision
+/// encoder) can materialize just the subset needed, without paying f32 memory for the rest.
+pub fn safetensors_filtered(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Result<HashMap<String, STensor>, String> {
     if bytes.len() < 8 {
         return Err("safetensors: too short".into());
     }
@@ -28,7 +35,7 @@ pub fn safetensors(bytes: &[u8]) -> Result<HashMap<String, STensor>, String> {
 
     let mut out = HashMap::new();
     for (name, v) in obj {
-        if name == "__metadata__" {
+        if name == "__metadata__" || !keep(name) {
             continue;
         }
         let dtype = v["dtype"].as_str().ok_or("missing dtype")?;

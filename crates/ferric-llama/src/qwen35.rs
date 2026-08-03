@@ -911,8 +911,10 @@ impl Qwen35 {
                         Mixer::Gdn(w) => self.gdn(&h, w, lc),
                         Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
                     };
-                    let xy = xin.add(&y);
-                    self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
+                    // Fuse the post-mixer residual add with the pre-FFN norm (one dispatch, two
+                    // outputs: the residual `xy` and its norm) — saves a dispatch every layer.
+                    let (xy, ffn_in) = xin.add_rmsnorm(&y, &l.post_norm, self.cfg.eps);
+                    self.ffn(&ffn_in, l).add(&xy)
                 });
             }
             if std::env::var("FERRIC_LAYER_SUMS").is_ok() {
@@ -949,8 +951,8 @@ impl Qwen35 {
                     Mixer::Gdn(w) => self.gdn(&h, w, lc),
                     Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
                 };
-                let xy = xin.add(&y);
-                self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
+                let (xy, ffn_in) = xin.add_rmsnorm(&y, &l.post_norm, self.cfg.eps);
+                self.ffn(&ffn_in, l).add(&xy)
             });
         }
         cache.pos += tokens.len();
@@ -994,8 +996,10 @@ impl Qwen35 {
                         Mixer::Gdn(w) => self.gdn(&h, w, lc),
                         Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
                     };
-                    let xy = xin.add(&y);
-                    self.ffn(&xy.rmsnorm(&l.post_norm, self.cfg.eps), l).add(&xy)
+                    // Fuse the post-mixer residual add with the pre-FFN norm (one dispatch, two
+                    // outputs: the residual `xy` and its norm) — saves a dispatch every layer.
+                    let (xy, ffn_in) = xin.add_rmsnorm(&y, &l.post_norm, self.cfg.eps);
+                    self.ffn(&ffn_in, l).add(&xy)
                 });
             }
         }

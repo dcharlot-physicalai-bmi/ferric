@@ -277,6 +277,18 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
+    /// LayerNorm over the last dim: `(x−mean)/sqrt(var+eps)·weight + bias` (SigLIP/ViT-style, with bias).
+    pub fn layernorm(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Tensor {
+        let c = self.contiguous();
+        let d = *c.shape.last().unwrap();
+        let rows = c.numel() / d;
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, LAYERNORM_WGSL, "layernorm",
+            &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), bias.contiguous().buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     /// Fused residual-add + RMSNorm: returns `(sum, rmsnorm(sum)·weight)` where `sum = self + other`.
     /// Every transformer layer boundary does exactly `xy = x + y; xy.rmsnorm(w)` and needs *both* the
     /// sum (as the next residual) and its norm (as the next block's input) — so folding the add into
@@ -313,6 +325,34 @@ impl Tensor {
         let t = c.numel() / (n_heads * head_dim);
         let out = empty(&self.ctx, c.numel());
         run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
+    /// Apply RoPE from a precomputed per-token cos/sin table with the **interleaved-pair** convention
+    /// (`rotate((x0,x1)) = (x0·c0 − x1·s0, x1·c1 + x0·s1)` on adjacent pairs) — used by V-JEPA 2's 3-axis
+    /// RoPE. cos/sin are each `[n_tokens, head_dim]` (per-index, already encoding the axis slices);
+    /// `self` is `[n_tokens, n_heads*head_dim]`, cos/sin broadcast across heads.
+    pub fn apply_rope_interleaved(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (n_heads * head_dim);
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, ROPE_INTERLEAVED_WGSL, "rope_il",
+            &[c.buf.as_ref(), cos.contiguous().buf.as_ref(), sin.contiguous().buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32])], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
+    /// Apply RoPE from a PRECOMPUTED per-token cos/sin table (each `[n_tokens, head_dim]`, the
+    /// `[freqs, freqs]`-doubled layout) with the split-half `rotate_half` convention — used for
+    /// Cosmos 3 Edge's interleaved 3-axis mRoPE, whose table `cosmos::interleaved_mrope` builds.
+    /// `self` is `[n_tokens, n_heads*head_dim]`; cos/sin broadcast across heads.
+    pub fn apply_rope_costable(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize) -> Tensor {
+        let c = self.contiguous();
+        let t = c.numel() / (n_heads * head_dim);
+        let out = empty(&self.ctx, c.numel());
+        run(&self.ctx, ROPE_COSTABLE_WGSL, "rope_ct",
+            &[c.buf.as_ref(), cos.contiguous().buf.as_ref(), sin.contiguous().buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -441,7 +481,8 @@ impl Tensor {
             return t;
         }
         let out = empty(&self.ctx, rows * out_f);
-        run(&self.ctx, MATMUL_BT_WGSL, "matmul_bt", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32])], groups(rows * out_f));
+        let (grid, rs) = groups2d(rows * out_f);
+        run(&self.ctx, MATMUL_BT_WGSL, "matmul_bt", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
     }
 
@@ -459,7 +500,8 @@ impl Tensor {
             return t;
         }
         let out = empty(&self.ctx, rows * out_f);
-        run(&self.ctx, MATMUL_BT_ACT_WGSL, "matmul_bt_act", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32, act])], groups(rows * out_f));
+        let (grid, rs) = groups2d(rows * out_f);
+        run(&self.ctx, MATMUL_BT_ACT_WGSL, "matmul_bt_act", &[x.buf.as_ref(), wc.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, out_f as u32, inn as u32, act, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, out_f])
     }
 
@@ -547,6 +589,35 @@ impl Tensor {
                   pad.0 as u32, pad.1 as u32, rs])],
             grid);
         Tensor::from_parts(&self.ctx, out, vec![n, ho, wo, o])
+    }
+
+    /// Direct 3D convolution for the Wan VAE decoder. `self` is `[T,H,W,C]` activations, `w` is
+    /// `[kT,kH,kW,C,O]` weights (transpose PyTorch's `[O,C,kT,kH,kW]`), `bias` is `[O]`. Spatial
+    /// padding `pad_hw` is symmetric; the temporal axis is NOT padded here — callers pre-pad T
+    /// causally (left-pad with `2*padT` zero frames). Returns `[To,Ho,Wo,O]`.
+    pub fn conv3d(&self, w: &Tensor, bias: &Tensor, stride: (usize, usize, usize), pad_hw: (usize, usize)) -> Tensor {
+        let x = self.contiguous();
+        let wc = w.contiguous();
+        let bc = bias.contiguous();
+        assert_eq!(x.rank(), 4, "conv3d activations must be [t,h,w,c]");
+        assert_eq!(wc.rank(), 5, "conv3d weights must be [kt,kh,kw,c,o]");
+        let (ti, hi, wi, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (kt, kh, kw, wcc, o) = (wc.shape[0], wc.shape[1], wc.shape[2], wc.shape[3], wc.shape[4]);
+        assert_eq!(c, wcc, "conv3d channel mismatch: activations {c} vs weights {wcc}");
+        let (st, sh, sw) = stride;
+        let (ph, pw) = pad_hw;
+        let to = (ti - kt) / st + 1;
+        let ho = (hi + 2 * ph - kh) / sh + 1;
+        let wo = (wi + 2 * pw - kw) / sw + 1;
+        let out = empty(&self.ctx, to * ho * wo * o);
+        let (grid, rs) = groups2d(to * ho * wo * o);
+        run(&self.ctx, CONV3D_WGSL, "conv3d",
+            &[&x.buf, &wc.buf, &bc.buf, &out,
+              &u32buf(&self.ctx, &[ti as u32, hi as u32, wi as u32, c as u32, kt as u32, kh as u32, kw as u32,
+                  o as u32, to as u32, ho as u32, wo as u32, st as u32, sh as u32, sw as u32,
+                  ph as u32, pw as u32, rs])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![to, ho, wo, o])
     }
 
     /// Input gradient of [`Self::conv2d`]: `self` is the output gradient `[n, ho, wo, o]`, `w` the
@@ -1287,6 +1358,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const LAYERNORM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read>        weight: array<f32>;
+@group(0) @binding(2) var<storage,read>        bias: array<f32>;
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(4) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    if (row >= rows) { return; }
+    let base = row * d;
+    var mean = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { mean = mean + x[base + j]; }
+    mean = mean / f32(d);
+    var vari = 0.0;
+    for (var j: u32 = 0u; j < d; j = j + 1u) { let c = x[base + j] - mean; vari = vari + c * c; }
+    let inv = 1.0 / sqrt(vari / f32(d) + eps);
+    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = (x[base + j] - mean) * inv * weight[j] + bias[j]; }
+}
+"#;
+
 // Fused (a+b) then RMSNorm — one workgroup-thread per row, two outputs (the sum and its norm).
 const ADD_RMSNORM_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        a: array<f32>;
@@ -1361,6 +1453,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x1 = x[o + c]; let x2 = x[o + c + half];
         out[o + c] = x1 * cs - x2 * sn;
         out[o + c + half] = x2 * cs + x1 * sn;
+    }
+}
+"#;
+
+// Apply RoPE from a per-token cos/sin table (per-index), INTERLEAVED-pair convention (V-JEPA 2):
+// out[2j]=x[2j]·cos[2j]−x[2j+1]·sin[2j]; out[2j+1]=x[2j+1]·cos[2j+1]+x[2j]·sin[2j+1].
+const ROPE_INTERLEAVED_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:   array<f32>;   // [N, h*dh]
+@group(0) @binding(1) var<storage,read>        cs:  array<f32>;   // [N, dh]
+@group(0) @binding(2) var<storage,read>        sn:  array<f32>;   // [N, dh]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(4) var<storage,read>        info: array<u32>;  // N, h, dh
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = info[0]; let h = info[1]; let dh = info[2];
+    let id = gid.x; if (id >= n * h) { return; }
+    let i = id / h; let head = id % h; let half = dh / 2u;
+    let o = (i * h + head) * dh; let ct = i * dh;
+    for (var j: u32 = 0u; j < half; j = j + 1u) {
+        let k = 2u * j;
+        let x0 = x[o + k]; let x1 = x[o + k + 1u];
+        out[o + k]      = x0 * cs[ct + k]      - x1 * sn[ct + k];
+        out[o + k + 1u] = x1 * cs[ct + k + 1u] + x0 * sn[ct + k + 1u];
+    }
+}
+"#;
+
+// Apply RoPE from a precomputed per-token cos/sin table (doubled [freqs,freqs] layout), split-half
+// rotate_half convention. Matches ROPE_WGSL's rotation but reads angles from the table (mRoPE).
+const ROPE_COSTABLE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:   array<f32>;   // [N, h*dh]
+@group(0) @binding(1) var<storage,read>        cs:  array<f32>;   // [N, dh]
+@group(0) @binding(2) var<storage,read>        sn:  array<f32>;   // [N, dh]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;
+@group(0) @binding(4) var<storage,read>        info: array<u32>;  // N, h, dh
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = info[0]; let h = info[1]; let dh = info[2];
+    let id = gid.x; if (id >= n * h) { return; }
+    let i = id / h; let head = id % h; let half = dh / 2u;
+    let o = (i * h + head) * dh; let ct = i * dh;
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let cc = cs[ct + c]; let ss = sn[ct + c];
+        let x1 = x[o + c]; let x2 = x[o + c + half];
+        out[o + c] = x1 * cc - x2 * ss;
+        out[o + c + half] = x2 * cc + x1 * ss;
     }
 }
 "#;
@@ -1457,7 +1595,7 @@ const MATMUL_BT_ACT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;    // [rows, in]
 @group(0) @binding(1) var<storage,read>        w: array<f32>;    // [out, in]
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
-@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in, act
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in, act, rs
 fn act(v: f32, a: u32) -> f32 {
     switch (a) {
         case 1u: { return max(v, 0.0); }
@@ -1474,7 +1612,7 @@ fn act(v: f32, a: u32) -> f32 {
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    let idx = gid.x + gid.y * info[4]; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
     if (idx >= rows * o_dim) { return; }
     let o = idx % o_dim; let r = idx / o_dim;
     var acc = 0.0;
@@ -1487,10 +1625,10 @@ const MATMUL_BT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;    // [rows, in]
 @group(0) @binding(1) var<storage,read>        w: array<f32>;    // [out, in]  (HF layout)
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>;  // [rows, out]
-@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, out, in, rs
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
+    let idx = gid.x + gid.y * info[3]; let rows = info[0]; let o_dim = info[1]; let in_dim = info[2];
     if (idx >= rows * o_dim) { return; }
     let o = idx % o_dim; let r = idx / o_dim;
     var acc = 0.0;
@@ -1527,6 +1665,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let wb = (ky * kw + kx) * c * o + oc;
             for (var ci: u32 = 0u; ci < c; ci = ci + 1u) {
                 acc = acc + x[xb + ci] * wt[wb + ci * o];
+            }
+        }
+    }
+    out[i] = acc;
+}
+"#;
+
+// Direct 3D convolution, [T,H,W,C] activations × [kT,kH,kW,C,O] weights → [To,Ho,Wo,O]. Symmetric
+// spatial padding (ph,pw); temporal is unpadded (callers pre-pad T causally). One thread per output.
+const CONV3D_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;    // [Ti,Hi,Wi,C]
+@group(0) @binding(1) var<storage,read>        wt: array<f32>;   // [kT,kH,kW,C,O]
+@group(0) @binding(2) var<storage,read>        bias: array<f32>; // [O]
+@group(0) @binding(3) var<storage,read_write>  out: array<f32>;  // [To,Ho,Wo,O]
+@group(0) @binding(4) var<storage,read>        info: array<u32>; // Ti,Hi,Wi,C,kT,kH,kW,O,To,Ho,Wo,st,sh,sw,ph,pw,rs
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let rs = info[16];
+    let i = gid.x + gid.y * rs;
+    let ti = info[0]; let hi = info[1]; let wi = info[2]; let c = info[3];
+    let kt = info[4]; let kh = info[5]; let kw = info[6]; let o = info[7];
+    let ho = info[9]; let wo = info[10];
+    let st = info[11]; let sh = info[12]; let sw = info[13]; let ph = info[14]; let pw = info[15];
+    if (i >= info[8] * ho * wo * o) { return; }
+    let oc = i % o; let r1 = i / o;
+    let xo = r1 % wo; let r2 = r1 / wo;
+    let yo = r2 % ho; let tob = r2 / ho;
+    var acc = bias[oc];
+    for (var a: u32 = 0u; a < kt; a = a + 1u) {
+        let it = tob * st + a;
+        for (var ky: u32 = 0u; ky < kh; ky = ky + 1u) {
+            let yi = i32(yo * sh) + i32(ky) - i32(ph);
+            if (yi < 0 || yi >= i32(hi)) { continue; }
+            for (var kx: u32 = 0u; kx < kw; kx = kx + 1u) {
+                let xi = i32(xo * sw) + i32(kx) - i32(pw);
+                if (xi < 0 || xi >= i32(wi)) { continue; }
+                let xb = ((it * hi + u32(yi)) * wi + u32(xi)) * c;
+                let wb = (((a * kh + ky) * kw + kx) * c) * o + oc;
+                for (var ci: u32 = 0u; ci < c; ci = ci + 1u) {
+                    acc = acc + x[xb + ci] * wt[wb + ci * o];
+                }
             }
         }
     }

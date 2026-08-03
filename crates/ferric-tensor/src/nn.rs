@@ -14,6 +14,27 @@ pub fn linear_hf(x: &Tensor, w: &Tensor) -> Tensor { x.matmul_bt(w) }
 /// Weight-quantized HF linear: W is a per-row int4/int8 [out,in]; y = x·Wᵀ, W dequantized on the fly.
 pub fn linear_hf_q(x: &Tensor, w: &crate::QRow) -> Tensor { x.matmul_qweight(w) }
 
+/// Factored (low-rank / 2-core tensor-network) HF linear. Instead of one dense `W` [out,in], the
+/// layer carries two cores `u` [out,r] and `v` [r,in] with `W ≈ u·v`. Computed as `y = (x·vᵀ)·uᵀ`
+/// on the SAME `matmul_bt` GPU kernel the dense path uses — so the saving is end-to-end, not a
+/// standalone kernel: the dense layer touches `out·in` weights and multiplies, the factored layer
+/// touches `r·(out+in)` of each. At r ≪ min(out,in) that is the compression ratio in both memory
+/// and MACs, on whatever backend the runtime is already on. Correct only when the layer is (near)
+/// low-rank — which, per the topic's bench 1, means TRAINING the factored form, not squeezing a
+/// dense one. No intermediate is materialized beyond the [rows,r] bottleneck activation.
+pub fn linear_factored(x: &Tensor, u: &Tensor, v: &Tensor) -> Tensor {
+    x.matmul_bt(v).matmul_bt(u)
+}
+
+/// Factored HF linear with the activation fused into the OUTER projection's epilogue (one extra
+/// kernel over `linear_factored`, no separate activation pass). The inner projection stays linear
+/// (the bottleneck is not a nonlinearity); the outer `u` matmul applies `act` in its epilogue —
+/// act: 0 identity, 1 relu, 2 silu, 3 gelu, 4 sigmoid. This is the drop-in for a factored MLP
+/// hidden layer or gate: `silu(x·Wᵀ)` becomes `linear_factored_act(x, u, v, 2)`.
+pub fn linear_factored_act(x: &Tensor, u: &Tensor, v: &Tensor, act: u32) -> Tensor {
+    x.matmul_bt(v).matmul_bt_act(u, act)
+}
+
 /// Causal multi-head attention with grouped-query attention, composed from general ops (+ fused
 /// softmax). q is [T, n_heads·dh]; k/v are [T, n_kv_heads·dh]. Returns [T, n_heads·dh].
 pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, softcap: f32) -> Tensor {
@@ -145,6 +166,45 @@ pub fn bidirectional_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usiz
     let (kh, vh) = (kv_heads(k), kv_heads(v));
     let probs = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)).softmax(2); // no mask
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
+}
+
+/// Rectangular full (non-causal) attention: `Tq` queries over `Tk` keys/values, no mask — the
+/// diffusion-tower stream of Cosmos's dual-stream joint attention (Q_DM over [K_AR; K_DM]).
+pub fn full_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+    let (tq, d) = (q.shape[0], q.shape[1]);
+    let tk = k.shape[0];
+    let dh = d / n_heads;
+    let g = n_heads / n_kv_heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh = q.reshape(&[tq, n_heads, dh]).permute(&[1, 0, 2]).contiguous();
+    let kv = |x: &Tensor| {
+        let hx = x.reshape(&[tk, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous();
+        hx.reshape(&[n_kv_heads, 1, tk, dh]).broadcast_to(&[n_kv_heads, g, tk, dh]).reshape(&[n_heads, tk, dh])
+    };
+    let (kh, vh) = (kv(k), kv(v));
+    let probs = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)).softmax(2); // [nh, Tq, Tk]
+    probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[tq, d])
+}
+
+/// Like [`full_attention_kv`] but with an arbitrary ADDITIVE attention mask `mask` of shape `[Tq, Tk]`
+/// (0 = allowed, −∞ = masked), added to the scaled scores before softmax. Broadcasts over heads.
+/// Used for V-JEPA 2-AC's block-causal frame attention.
+pub fn masked_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, n_heads: usize, n_kv_heads: usize) -> Tensor {
+    let (tq, d) = (q.shape[0], q.shape[1]);
+    let tk = k.shape[0];
+    let dh = d / n_heads;
+    let g = n_heads / n_kv_heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh = q.reshape(&[tq, n_heads, dh]).permute(&[1, 0, 2]).contiguous();
+    let kv = |x: &Tensor| {
+        let hx = x.reshape(&[tk, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous();
+        hx.reshape(&[n_kv_heads, 1, tk, dh]).broadcast_to(&[n_kv_heads, g, tk, dh]).reshape(&[n_heads, tk, dh])
+    };
+    let (kh, vh) = (kv(k), kv(v));
+    let scores = qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)); // [nh, Tq, Tk]
+    let scores = scores.add(&mask.reshape(&[1, tq, tk]).broadcast_to(&[n_heads, tq, tk]));
+    let probs = scores.softmax(2);
+    probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[tq, d])
 }
 
 /// Additive causal mask [T,T]: 0 on/below the diagonal, −∞ above (broadcasts over heads on add).

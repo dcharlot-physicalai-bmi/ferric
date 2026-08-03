@@ -157,6 +157,16 @@ pub struct Qwen3 {
     lm_head: QMatrix,
     embd_type: u32,
     rope_freqs: Option<Tensor>, // Llama-3 rope-scaling factors [head_dim/2]; None for Qwen
+    /// GPTQ calibration hook: when Some, each linear's input activation is captured (name → tensor) during
+    /// the forward, for building per-layer input Hessians. None (default) = zero overhead.
+    pub cap: std::cell::RefCell<Option<Vec<(String, Tensor)>>>,
+}
+impl Qwen3 {
+    /// Start/stop capturing linear-input activations for GPTQ calibration.
+    pub fn set_capture(&self, on: bool) { *self.cap.borrow_mut() = if on { Some(Vec::new()) } else { None }; }
+    /// Take the captured (name, activation) pairs, leaving capture off.
+    pub fn take_capture(&self) -> Vec<(String, Tensor)> { self.cap.borrow_mut().take().unwrap_or_default() }
+    fn grab(&self, name: String, t: &Tensor) { if let Some(v) = self.cap.borrow_mut().as_mut() { v.push((name, t.clone())); } }
 }
 
 impl Qwen3 {
@@ -222,6 +232,7 @@ impl Qwen3 {
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         Ok(Qwen3 {
+            cap: std::cell::RefCell::new(None),
             tok_embd: g.raw("token_embd.weight")?,
             out_norm: nrm("output_norm.weight", cfg.n_embd)?,
             lm_head: qm(ctx, g, head)?,
@@ -258,8 +269,9 @@ impl Qwen3 {
         }
     }
 
-    fn attn(&self, h: &Tensor, l: &Layer, cache: &mut (KvBuf, KvBuf), offset: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, l: &Layer, cache: &mut (KvBuf, KvBuf), offset: usize, il: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
+        self.grab(format!("l{il}.qkv"), h); // GPTQ calibration: capture wqkv input
         // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
         let qkv = l.wqkv.matmul(h);
         let qkv = match &l.qkv_bias { Some(bias) => qkv.add(bias), None => qkv };
@@ -296,10 +308,12 @@ impl Qwen3 {
         } else {
             nn::causal_attention(&q, &kc, &vc, nh, nkv, sc)
         };
+        self.grab(format!("l{il}.wo"), &o); // GPTQ calibration: capture wo input
         o.matmul_q(&l.wo)
     }
 
-    fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
+    fn ffn(&self, h: &Tensor, l: &Layer, il: usize) -> Tensor {
+        self.grab(format!("l{il}.ffn_gu"), h); // GPTQ calibration: capture ffn_gate_up input
         // Gemma uses GEGLU (gelu gate) not SwiGLU (silu), so it can't use the silu-fused fast paths:
         // project gate|up, gelu the gate half, multiply by the up half, then the down projection.
         if self.cfg.is_gemma {
@@ -315,7 +329,9 @@ impl Qwen3 {
             if let Some(o) = h.try_ffn_mega(gu, &l.ffn_down, l.ffn_gate_out) { return o; }
         }
         // staged: gate_up + SwiGLU (one fused kernel when gate|up is a k-quant) → down projection.
-        l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out).matmul_q(&l.ffn_down)
+        let sw = l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out);
+        self.grab(format!("l{il}.ffn_down"), &sw); // GPTQ calibration: capture ffn_down input
+        sw.matmul_q(&l.ffn_down)
     }
 
     /// Prefill (stateless): logits [T, n_vocab].
@@ -337,26 +353,26 @@ impl Qwen3 {
             let xin = &x;
             if profiling {
                 // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
-                let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos));
+                let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il));
                 prof(&self.ctx, "attn");
-                x = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l).add(&xy) });
+                x = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
                 prof(&self.ctx, "ffn");
             } else if self.cfg.is_gemma {
                 // Gemma normalizes the attn AND ffn *outputs* (post-norms) before each residual add:
                 //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
                 let eps = self.cfg.eps;
                 x = batch(&self.ctx, || {
-                    let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos);
+                    let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il);
                     let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
-                    let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l);
+                    let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
                     x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
                 });
             } else {
                 x = batch(&self.ctx, || {
-                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos);
+                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
                     // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
                     let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                    self.ffn(&xy_n, l).add(&xy)
+                    self.ffn(&xy_n, l, il).add(&xy)
                 });
             }
         }
@@ -375,6 +391,62 @@ impl Qwen3 {
         });
         prof(&self.ctx, "lm_head");
         out
+    }
+
+    /// The frozen quantized LM head [n_vocab, n_embd] — for `Var::matmul_qf` (LoRA around it without
+    /// dequantizing to fp).
+    pub fn lm_head(&self) -> &ferric_tensor::QMatrix { &self.lm_head }
+
+    /// The hidden state ENTERING block `first` (output of block `first−1`, before its attn_norm) — the
+    /// frozen input a multi-block fine-tuner reconstructs the last `n_layer−first` blocks on top of.
+    pub fn hidden_before_block(&self, tokens: &[u32], first: usize) -> Tensor {
+        use ferric_tensor::batch;
+        let mut cache = Cache::new(&self.cfg);
+        let mut x = self.embed(tokens);
+        let pos = cache.pos;
+        for (il, l) in self.layers.iter().enumerate().take(first) {
+            let lc = &mut cache.kv[il];
+            let xin = &x;
+            x = batch(&self.ctx, || {
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
+                self.ffn(&xy_n, l, il).add(&xy)
+            });
+        }
+        x
+    }
+
+    /// The hidden state ENTERING the last transformer block — `hidden_before_block(tokens, n_layer−1)`.
+    pub fn block_input_last(&self, tokens: &[u32]) -> Tensor {
+        self.hidden_before_block(tokens, self.layers.len() - 1)
+    }
+
+    /// The post-attention residual entering the LAST block's FFN (`x + attn(rmsnorm(x))` of the final
+    /// layer) — the frozen intermediate a fine-tuner reconstructs the last FFN on top of. Every earlier
+    /// block runs normally; the last block computes only attention + residual and stops before its FFN.
+    /// (Non-Gemma path; Qwen3 is non-Gemma.)
+    pub fn ffn_input_last(&self, tokens: &[u32]) -> Tensor {
+        use ferric_tensor::batch;
+        let mut cache = Cache::new(&self.cfg);
+        let mut x = self.embed(tokens);
+        let pos = cache.pos;
+        let last = self.layers.len() - 1;
+        for (il, l) in self.layers.iter().enumerate() {
+            let lc = &mut cache.kv[il];
+            let xin = &x;
+            if il == last {
+                return batch(&self.ctx, || {
+                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                    xin.add(&y) // post-attention residual, BEFORE the FFN
+                });
+            }
+            x = batch(&self.ctx, || {
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
+                self.ffn(&xy_n, l, il).add(&xy)
+            });
+        }
+        unreachable!()
     }
 
     /// The final hidden state `out_norm(x)` — shape [T, n_embd] — for embedding models. No lm_head; the
