@@ -26,7 +26,7 @@ fn main() {
 
     println!("=== per-call cost breakdown (N=1024, same shape, cache hot) ===");
     time("full bmm_resident", 50, &mut || {
-        g.bmm_resident(a.buffer(), 0, b.buffer(), 0, out.buffer(), 1, nn, nn, nn).unwrap();
+        g.bmm_resident(a.buf_arc(), 0, b.buf_arc(), 0, out.buf_arc(), 1, nn, nn, nn).unwrap();
     });
     time("wgpu submit([]) + poll-wait", 200, &mut || {
         ctx.queue.submit([]);
@@ -54,7 +54,7 @@ fn main() {
     ctx.queue.submit([]);
     device_sync(&ctx);
     time("bmm_resident tiny (pure overhead)", 200, &mut || {
-        g.bmm_resident(t1.buffer(), 0, t2.buffer(), 0, t3.buffer(), 1, 64, 64, 64).unwrap();
+        g.bmm_resident(t1.buf_arc(), 0, t2.buf_arc(), 0, t3.buf_arc(), 1, 64, 64, 64).unwrap();
     });
     // isolate: per-call residency-set construction on wgpu buffers
     let ra = metal4::wgpu_buffer_raw(t1.buffer()).unwrap();

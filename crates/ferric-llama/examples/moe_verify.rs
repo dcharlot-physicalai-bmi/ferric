@@ -48,8 +48,20 @@ async fn run() {
     }
     let mut y_ref = vec![0.0f32; d];
     for i in 0..d { y_ref[i] = (0..eff).map(|j| wd[i * eff + j] * mid[j]).sum(); }
-    let y_gpu = ht.matmul_q(&moe.experts[e].gate_up).swiglu(eff).matmul_q(&moe.experts[e].down).to_vec().await;
-    let md: f32 = y_ref.iter().zip(&y_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-    let scale: f32 = y_ref.iter().map(|x| x.abs()).fold(0.0, f32::max);
-    println!("expert {e}: max|Δ|={md:.6} (scale {scale:.4}) first3 ref={:?} gpu={:?}", &y_ref[..3], &y_gpu[..3]);
+    // `experts` became an enum (Slab / Slab8 / PerExpert) when the batched-kernel fast path landed; it is no
+    // longer indexable. This check verifies ONE expert's SwiGLU against a CPU reference, which needs
+    // individually-addressable weights — i.e. the PerExpert fallback. The slab variants pack every expert into
+    // one buffer per projection and are verified by the batched-kernel path instead.
+    match &moe.experts {
+        ferric_llama::qwen35::MoeExperts::PerExpert(v) => {
+            let ex = &v[e];
+            let y_gpu = ht.matmul_q(&ex.gate_up).swiglu(eff).matmul_q(&ex.down).to_vec().await;
+            let md: f32 = y_ref.iter().zip(&y_gpu).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let scale: f32 = y_ref.iter().map(|x| x.abs()).fold(0.0, f32::max);
+            println!("expert {e}: max|Δ|={md:.6} (scale {scale:.4}) first3 ref={:?} gpu={:?}", &y_ref[..3], &y_gpu[..3]);
+            assert!(md < 1e-2 * scale.max(1e-3), "expert {e} GPU path disagrees with CPU reference");
+        }
+        _ => println!("expert {e}: SKIPPED — model loaded as a packed slab, so per-expert weights are not \
+individually addressable. The slab path is verified by the batched-kernel check instead."),
+    }
 }

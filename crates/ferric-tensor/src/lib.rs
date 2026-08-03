@@ -75,6 +75,10 @@ impl Tensor {
     /// The underlying wgpu buffer (external interop — e.g. handing tensors to the Metal-4 resident
     /// path or other raw-backend consumers). Offsets/strides still apply; see `offset`/`strides`.
     pub fn buffer(&self) -> &wgpu::Buffer { &self.buf }
+    /// The refcounted buffer. `Metal4`'s resident API (`bmm_resident`, `linear_resident`) is public and takes
+    /// `&Arc<wgpu::Buffer>`, but `buffer()` hands out a plain `&wgpu::Buffer` — so there was no way to call
+    /// those entry points from outside this crate. In-crate callers reached the private field directly.
+    pub fn buf_arc(&self) -> &Arc<wgpu::Buffer> { &self.buf }
     pub fn rank(&self) -> usize { self.shape.len() }
     pub fn is_contiguous(&self) -> bool { self.strides == contig_strides(&self.shape) && self.offset == 0 }
 
