@@ -1,0 +1,16 @@
+[package]
+name = "ferric-tier"
+description = "Ferric: the memory hierarchy. Run models larger than memory by streaming weights, where placement decides speed but never results. Pure Rust, no_std-friendly core, browser-safe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["cache", "streaming", "moe", "inference", "wasm"]
+categories = ["caching", "science", "wasm"]
+
+# No dependencies. The policy core is arithmetic over integers; the only I/O is behind the `Backing`
+# trait, which the caller implements. That is what lets this compile to wasm and run in the browser,
+# and what lets the placement-invariance test run in CI with no checkpoint on disk.
+[dependencies]
