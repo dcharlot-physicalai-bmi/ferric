@@ -1,17 +1,24 @@
-//! AMD Instella-MoE — the novel **Gated Multi-head Latent Attention** block, in pure Rust, verified
-//! layer-exact against AMD's real `MLAGatedAttention` (a step-by-step reference that matched the HF module
-//! at maxΔ=0.0). This is DeepSeek-V3 MLA (KV-compression, nope/rope split, interleaved YaRN rope) plus the
-//! Instella delta: `attn_output * sigmoid(gate_proj(x))` before o_proj. Weights + I/O + intermediates come
-//! from `~/.cache/ferric/instella_ref/gmla.safetensors`.
+//! AMD Instella-MoE — **Gated Multi-head Latent Attention**, verified layer-exact against AMD's real
+//! `MLAGatedAttention` module (a step-by-step reference that matched the HF module at maxΔ=0.0).
+//!
+//! This is DeepSeek-V3 MLA (KV-compression, nope/rope split, interleaved YaRN rope) plus the Instella
+//! delta: `attn_output * sigmoid(gate_proj(x))` before `o_proj`.
+//!
+//! **The implementation now lives in `ferric_llama::mla`**, not in this file. That is deliberate: MLA
+//! exists to shrink the KV cache, which makes it the attention a memory-tiered engine wants, so it has to
+//! be a library API rather than example code. This example is what keeps the promotion honest — it runs
+//! the same comparison against the same reference tensors, but **through the shipped library path**, so
+//! the layer-exactness claim is about the code that ships and not about a copy of it that has since
+//! drifted.
+//!
+//! Weights + I/O + intermediates come from `~/.cache/ferric/instella_ref/gmla.safetensors`.
 //!   cargo run -p ferric-llama --example instella_gmla --release
 use ferric_core::{max_abs_diff, Context};
+use ferric_llama::mla::{CachePolicy, Mla, MlaConfig, MlaWeights};
 use ferric_load::safetensors;
-use ferric_tensor::{nn, Tensor};
+use ferric_tensor::Tensor;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-const EPS: f32 = 1e-6;
-const SCALING: f32 = 0.16562687709876717; // DeepSeek-V3 MLA scaling with YaRN mscale (from the reference)
 
 fn main() { pollster::block_on(run()); }
 async fn run() {
@@ -22,55 +29,52 @@ async fn run() {
     let w: HashMap<String, ferric_load::STensor> = w.into_iter().collect();
     let g = |n: &str| { let s = &w[n]; Tensor::from_vec(&ctx, &s.data, &s.shape) };
 
-    let (h, qk, nope, rope, vh, kvl) = (16usize, 128usize, 96usize, 32usize, 128usize, 512usize);
-    let hs = g("hs");                    // [S, 2048]
+    let cfg = MlaConfig {
+        n_heads: 16,
+        qk_nope_dim: 96,
+        qk_rope_dim: 32,
+        v_head_dim: 128,
+        kv_lora_rank: 512,
+        // DeepSeek-V3 MLA scaling with YaRN mscale, taken from the reference rather than derived —
+        // 1/sqrt(128) would be 0.0884, which is a different model.
+        scaling: 0.16562687709876717,
+        eps: 1e-6,
+        rope_interleaved: true,
+    };
+    let mla = Mla::new(
+        cfg,
+        MlaWeights {
+            q_proj: g("q_proj.weight"),
+            kv_a_proj_with_mqa: g("kv_a_proj_with_mqa.weight"),
+            kv_a_layernorm: g("kv_a_layernorm.weight"),
+            kv_b_proj: g("kv_b_proj.weight"),
+            o_proj: g("o_proj.weight"),
+            gate_proj: Some(g("gate_proj.weight")),
+        },
+    );
+
+    let hs = g("hs");
+    let (cos, sin) = (g("cos"), g("sin"));
     let s = hs.shape[0];
-    let (cos, sin) = (g("cos"), g("sin"));  // [S, 32]
 
-    // transformers' apply_rotary_pos_emb_interleave = de-interleave (a0,b0,a1,b1..)→(a0..,b0..) then
-    // split-half rope with the doubled cos/sin table. So: de-interleave, then apply_rope_costable.
-    let deint = |x: &Tensor, rows: usize| x.reshape(&[rows, rope / 2, 2]).transpose(1, 2).contiguous().reshape(&[rows, rope]);
+    let out = mla.forward(&hs, &cos, &sin);
 
-    // ---- Q: full projection, split nope/rope, rope on the rope part ----
-    let q = hs.matmul_bt(&g("q_proj.weight")).reshape(&[s, h, qk]);   // [S,H,128]
-    let q_pass = q.narrow(2, 0, nope).contiguous();                  // [S,H,96]
-    let q_rot = deint(&q.narrow(2, nope, rope).contiguous(), s * h)  // de-interleave each head's 32
-        .reshape(&[s, h * rope])
-        .apply_rope_costable(&cos, &sin, h, rope).reshape(&[s, h, rope]); // [S,H,32]
-
-    // ---- KV: compress → layernorm → up-project → split nope/value ; rope on the shared MQA rope part ----
-    let ckv = hs.matmul_bt(&g("kv_a_proj_with_mqa.weight"));         // [S,544]
-    let k_passc = ckv.narrow(1, 0, kvl).contiguous();               // [S,512]
-    let k_rot = ckv.narrow(1, kvl, rope).contiguous();             // [S,32]
-    let kb = k_passc.rmsnorm(&g("kv_a_layernorm.weight"), EPS)
-        .matmul_bt(&g("kv_b_proj.weight")).reshape(&[s, h, nope + vh]); // [S,H,224]
-    let k_nope = kb.narrow(2, 0, nope).contiguous();                // [S,H,96]
-    let value = kb.narrow(2, nope, vh).contiguous();                // [S,H,128]
-    let k_rot_roped = deint(&k_rot, s).apply_rope_costable(&cos, &sin, 1, rope);   // [S,32] (shared across heads)
-    let d_krot = max_abs_diff(&k_rot_roped.to_vec().await, &g("krot_post").to_vec().await);
-    println!("  [dbg] k_rot post-rope maxΔ = {d_krot:.3e}  (isolates the rope convention)");
-    let k_rot = k_rot_roped.reshape(&[s, 1, rope]).broadcast_to(&[s, h, rope]).contiguous(); // [S,H,32]
-
-    // ---- assemble Q,K,V as [S, H*128] and run causal attention with the custom scaling ----
-    let qh = q_pass.cat(&q_rot, 2).reshape(&[s, h * qk]);
-    let kh = k_nope.cat(&k_rot, 2).reshape(&[s, h * qk]);
-    let vv = value.reshape(&[s, h * vh]);
-    let qh = qh.mul(&qh.scalar(SCALING * (qk as f32).sqrt()));       // pre-scale so 1/√dh · qh = SCALING·qh
-    let ao = nn::causal_attention(&qh, &kh, &vv, h, h, 0.0);         // [S,2048]
-
-    // ---- the Instella gate + output projection ----
-    let gate = hs.matmul_bt(&g("gate_proj.weight")).sigmoid();       // [S,2048]
-    let ao_gated = ao.mul(&gate);
-    let out = ao_gated.matmul_bt(&g("o_proj.weight"));               // [S,2048]
-
-    // ---- verify against AMD's real module (and a couple intermediates) ----
-    let d_gate = max_abs_diff(&gate.to_vec().await, &g("gate").to_vec().await);
-    let d_ao = max_abs_diff(&ao_gated.to_vec().await, &g("ao_pregate").to_vec().await); // note: ao_pregate is pre-gate
     let d_out = max_abs_diff(&out.to_vec().await, &g("out").to_vec().await);
-    println!("Instella Gated-MLA in Ferric vs AMD real module (S={s}, {h} heads):");
-    println!("  gate  maxΔ = {d_gate:.3e}");
-    println!("  attn·gate vs pre-gate maxΔ = {d_ao:.3e}  (sanity — differs by the gate, expected nonzero)");
+    println!("Instella Gated-MLA via ferric_llama::mla vs AMD's real module (S={s}, {} heads):", cfg.n_heads);
     println!("  OUTPUT maxΔ = {d_out:.3e}  ->  {}", if d_out < 2e-4 { "MATCH ✓" } else { "MISMATCH ✗" });
-    assert!(d_out < 2e-4, "Instella Gated-MLA diverged: {d_out}");
-    println!("\n✅ AMD Instella-MoE's Gated Multi-head Latent Attention runs layer-exact in pure Rust Ferric.");
+    assert!(d_out < 2e-4, "Instella Gated-MLA diverged after promotion to src/: {d_out}");
+
+    // The reason MLA is worth having in a tiered engine, in the model's own numbers.
+    println!(
+        "\n  KV cache per position per layer:  dense {} floats  ->  latent {} floats  ({:.1}x smaller)",
+        cfg.dense_cache_floats(), cfg.latent_cache_floats(), cfg.latent_compression()
+    );
+    println!(
+        "  at f32: latent {} B/pos, expanded {} B/pos — the trade `ferric_llama::mla::CachePolicy` makes\n  \
+         explicit rather than baking in, because it sets the caller's context-length ceiling.",
+        CachePolicy::Latent.bytes_per_position(&cfg),
+        CachePolicy::Expanded.bytes_per_position(&cfg)
+    );
+
+    println!("\n✅ Gated-MLA runs layer-exact in pure Rust Ferric — from the LIBRARY, not from this example.");
 }
