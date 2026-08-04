@@ -13,6 +13,9 @@
 //! Run: `cargo run -p ferric-tensor --example efa_s2_nl --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded). Replaces the local
+// round-to-nearest implementation this example used to carry: the naive form can NARROW an
+// interval and so assert a bound it has not earned. See ferric-certify.
 
 const MU: f64 = 1.0;
 const R0: f64 = 0.10;
@@ -38,25 +41,16 @@ fn feat(j: usize) -> (f64, f64, f64) { // (a,b,c) for tanh(a x1 + b x2 + c)
 fn f(x1: f64, x2: f64) -> (f64, f64) { (-x2, x1 + MU * (x1 * x1 - 1.0) * x2) }
 
 // ---- interval kernel ----
-#[derive(Clone, Copy)]
-struct Iv { lo: f64, hi: f64 }
-impl Iv {
-    fn add(self, o: Iv) -> Iv { Iv { lo: self.lo + o.lo, hi: self.hi + o.hi } }
-    fn mul(self, o: Iv) -> Iv { let (a,b,c,d)=(self.lo*o.lo,self.lo*o.hi,self.hi*o.lo,self.hi*o.hi); Iv{lo:a.min(b).min(c).min(d),hi:a.max(b).max(c).max(d)} }
-    fn scale(self, k: f64) -> Iv { if k>=0.0 {Iv{lo:self.lo*k,hi:self.hi*k}} else {Iv{lo:self.hi*k,hi:self.lo*k}} }
-    fn sq(self) -> Iv { if self.lo>=0.0 {Iv{lo:self.lo*self.lo,hi:self.hi*self.hi}} else if self.hi<=0.0 {Iv{lo:self.hi*self.hi,hi:self.lo*self.lo}} else {Iv{lo:0.0,hi:(self.lo*self.lo).max(self.hi*self.hi)}} }
-    fn amax(self) -> f64 { self.lo.abs().max(self.hi.abs()) }
-}
 // f and its partials as intervals over a box
 fn f_iv(x1: Iv, x2: Iv) -> (Iv, Iv) { // f1=-x2 ; f2 = x1 + μ(x1²−1)x2
     let f1 = x2.scale(-1.0);
-    let f2 = x1.add(x1.sq().add(Iv { lo: -1.0, hi: -1.0 }).mul(x2).scale(MU));
+    let f2 = x1.add(x1.sq().add(Iv::new(-1.0, -1.0)).mul(x2).scale(MU));
     (f1, f2)
 }
 fn df_iv(x1: Iv, x2: Iv) -> (Iv, Iv, Iv, Iv) { // ∂f1/∂x1, ∂f1/∂x2, ∂f2/∂x1, ∂f2/∂x2
-    (Iv { lo: 0.0, hi: 0.0 }, Iv { lo: -1.0, hi: -1.0 },
-     Iv { lo: 1.0, hi: 1.0 }.add(x1.mul(x2).scale(2.0 * MU)),   // 1 + 2μ x1 x2
-     x1.sq().add(Iv { lo: -1.0, hi: -1.0 }).scale(MU))          // μ(x1²−1)
+    (Iv::new(0.0, 0.0), Iv::new(-1.0, -1.0),
+     Iv::new(1.0, 1.0).add(x1.mul(x2).scale(2.0 * MU)),   // 1 + 2μ x1 x2
+     x1.sq().add(Iv::new(-1.0, -1.0)).scale(MU))          // μ(x1²−1)
 }
 
 // exact g(x)=V̇+α‖x‖² and h(x)=V−δ‖x‖² at a point, for params (pa,pb,pc, w[..])
@@ -72,9 +66,9 @@ fn h_at(x1: f64, x2: f64, p: &[f64], head: bool) -> f64 { let (v,_,_)=v_grad(x1,
 
 // tight per-box tanh derivative intervals: φ=tanh(z), φ′=1−φ², φ″=−2φφ′ over z∈[lo,hi]
 fn tanh_ivs(z: Iv) -> (Iv, Iv) { // returns (φ′, φ″) as intervals
-    let t = Iv { lo: z.lo.tanh(), hi: z.hi.tanh() };      // tanh monotone ↑
+    let t = Iv::new(z.lo.tanh(), z.hi.tanh());      // tanh monotone ↑
     let t2 = t.sq();
-    let tp = Iv { lo: 1.0 - t2.hi, hi: 1.0 - t2.lo };     // 1 − tanh²
+    let tp = Iv::new(1.0 - t2.hi, 1.0 - t2.lo);     // 1 − tanh²
     let tpp = t.mul(tp).scale(-2.0);                      // −2·tanh·(1−tanh²)
     (tp, tpp)
 }
@@ -86,7 +80,7 @@ fn box_bounds(x1: Iv, x2: Iv, p: &[f64], head: bool) -> (f64, f64) {
     let (f1, f2) = f_iv(x1, x2);
     let (df11, df12, df21, df22) = df_iv(x1, x2);
     let (pa, pb, pc) = (p[0], p[1], p[2]);
-    let z = Iv { lo: 0.0, hi: 0.0 };
+    let z = Iv::new(0.0, 0.0);
     // ∇V and Hessian(V) as intervals over the box (quadratic + head)
     let mut vx1 = x1.scale(2.0*pa).add(x2.scale(2.0*pb));  // ∂V/∂x1
     let mut vx2 = x1.scale(2.0*pb).add(x2.scale(2.0*pc));  // ∂V/∂x2

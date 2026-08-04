@@ -14,8 +14,10 @@ use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_tokenizer::Bpe;
 use std::collections::HashMap;
-use std::f64::consts::PI;
 use std::sync::Arc;
+use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded). Replaces the local
+// round-to-nearest implementation this example used to carry: the naive form can NARROW an
+// interval and so assert a bound it has not earned. See ferric-certify.
 
 fn byte_decoder() -> HashMap<char, u8> {
     let mut m = HashMap::new(); let mut n = 0u32;
@@ -65,28 +67,10 @@ impl Solver {
 // f(x)=[x2 ; −sin x1 − d·x2]. P from the linearization's Lyapunov eqn AᵀP+PA=−I (A=[[0,1],[−1,−d]]):
 //   P=[[1/d + d/2, 1/2],[1/2, 1/d]].  We then SOUNDLY check V̇+α‖x‖² < 0 over the box via interval
 //   arithmetic + adaptive refinement (natural extension, sound sin-interval). Certified ⇒ real proof.
-#[derive(Clone, Copy)] struct Iv { lo: f64, hi: f64 }
-impl Iv {
-    fn add(self,o:Iv)->Iv{Iv{lo:self.lo+o.lo,hi:self.hi+o.hi}}
-    fn mul(self,o:Iv)->Iv{let(a,b,c,d)=(self.lo*o.lo,self.lo*o.hi,self.hi*o.lo,self.hi*o.hi);Iv{lo:a.min(b).min(c).min(d),hi:a.max(b).max(c).max(d)}}
-    fn scale(self,k:f64)->Iv{if k>=0.0{Iv{lo:self.lo*k,hi:self.hi*k}}else{Iv{lo:self.hi*k,hi:self.lo*k}}}
-    fn sq(self)->Iv{if self.lo>=0.0{Iv{lo:self.lo*self.lo,hi:self.hi*self.hi}}else if self.hi<=0.0{Iv{lo:self.hi*self.hi,hi:self.lo*self.lo}}else{Iv{lo:0.0,hi:(self.lo*self.lo).max(self.hi*self.hi)}}}
-}
-fn sin_iv(x: Iv) -> Iv { // sound range of sin over [lo,hi]
-    let mut lo = x.lo.sin().min(x.hi.sin()); let mut hi = x.lo.sin().max(x.hi.sin());
-    // extrema at π/2 + kπ inside the interval give ±1
-    let mut k = ((x.lo - PI/2.0)/PI).floor() as i64 - 1;
-    while (k as f64)*PI + PI/2.0 <= x.hi + 1e-12 {
-        let e = (k as f64)*PI + PI/2.0;
-        if e >= x.lo - 1e-12 && e <= x.hi + 1e-12 { let s = e.sin(); lo = lo.min(s); hi = hi.max(s); }
-        k += 1;
-    }
-    Iv { lo, hi }
-}
 const R0: f64 = 0.05; const ALPHA: f64 = 0.005;
 fn gbox(x1: Iv, x2: Iv, a: f64, b: f64, c: f64, d: f64) -> f64 { // upper bound of V̇+α‖x‖² over box (natural)
     let f1 = x2;
-    let f2 = sin_iv(x1).scale(-1.0).add(x2.scale(-d));                // −sin x1 − d x2
+    let f2 = (x1).sin().scale(-1.0).add(x2.scale(-d));                // −sin x1 − d x2
     let vx1 = x1.scale(2.0*a).add(x2.scale(2.0*b));                   // ∂V/∂x1
     let vx2 = x1.scale(2.0*b).add(x2.scale(2.0*c));                   // ∂V/∂x2
     let g = vx1.mul(f1).add(vx2.mul(f2)).add(x1.sq().add(x2.sq()).scale(ALPHA));

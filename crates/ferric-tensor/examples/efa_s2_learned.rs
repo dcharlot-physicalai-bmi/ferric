@@ -12,6 +12,9 @@
 //! Run: `cargo run -p ferric-tensor --example efa_s2_learned --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded). Replaces the local
+// round-to-nearest implementation this example used to carry: the naive form can NARROW an
+// interval and so assert a bound it has not earned. See ferric-certify.
 
 const MU: f64 = 1.0;
 const R0: f64 = 0.10;
@@ -38,24 +41,15 @@ fn hf(p: &[f64], j: usize) -> (f64, f64, f64, f64) { (p[3+4*j], p[3+4*j+1], p[3+
 fn f(x1: f64, x2: f64) -> (f64, f64) { (-x2, x1 + MU * (x1 * x1 - 1.0) * x2) }
 
 // ---- interval kernel ----
-#[derive(Clone, Copy)]
-struct Iv { lo: f64, hi: f64 }
-impl Iv {
-    fn add(self, o: Iv) -> Iv { Iv { lo: self.lo + o.lo, hi: self.hi + o.hi } }
-    fn mul(self, o: Iv) -> Iv { let (a,b,c,d)=(self.lo*o.lo,self.lo*o.hi,self.hi*o.lo,self.hi*o.hi); Iv{lo:a.min(b).min(c).min(d),hi:a.max(b).max(c).max(d)} }
-    fn scale(self, k: f64) -> Iv { if k>=0.0 {Iv{lo:self.lo*k,hi:self.hi*k}} else {Iv{lo:self.hi*k,hi:self.lo*k}} }
-    fn sq(self) -> Iv { if self.lo>=0.0 {Iv{lo:self.lo*self.lo,hi:self.hi*self.hi}} else if self.hi<=0.0 {Iv{lo:self.hi*self.hi,hi:self.lo*self.lo}} else {Iv{lo:0.0,hi:(self.lo*self.lo).max(self.hi*self.hi)}} }
-    fn amax(self) -> f64 { self.lo.abs().max(self.hi.abs()) }
-}
 fn f_iv(x1: Iv, x2: Iv) -> (Iv, Iv) {
     let f1 = x2.scale(-1.0);
-    let f2 = x1.add(x1.sq().add(Iv { lo: -1.0, hi: -1.0 }).mul(x2).scale(MU));
+    let f2 = x1.add(x1.sq().add(Iv::new(-1.0, -1.0)).mul(x2).scale(MU));
     (f1, f2)
 }
 fn df_iv(x1: Iv, x2: Iv) -> (Iv, Iv, Iv, Iv) {
-    (Iv { lo: 0.0, hi: 0.0 }, Iv { lo: -1.0, hi: -1.0 },
-     Iv { lo: 1.0, hi: 1.0 }.add(x1.mul(x2).scale(2.0 * MU)),
-     x1.sq().add(Iv { lo: -1.0, hi: -1.0 }).scale(MU))
+    (Iv::new(0.0, 0.0), Iv::new(-1.0, -1.0),
+     Iv::new(1.0, 1.0).add(x1.mul(x2).scale(2.0 * MU)),
+     x1.sq().add(Iv::new(-1.0, -1.0)).scale(MU))
 }
 fn v_grad(x1: f64, x2: f64, p: &[f64], head: bool) -> (f64, f64, f64) {
     let (mut v, mut g1, mut g2) = (p[0]*x1*x1 + 2.0*p[1]*x1*x2 + p[2]*x2*x2,
@@ -69,9 +63,9 @@ fn h_at(x1: f64, x2: f64, p: &[f64], head: bool) -> f64 { let (v,_,_)=v_grad(x1,
 fn v_at(x1: f64, x2: f64, p: &[f64], head: bool) -> f64 { v_grad(x1, x2, p, head).0 }
 
 fn tanh_ivs(z: Iv) -> (Iv, Iv) {
-    let t = Iv { lo: z.lo.tanh(), hi: z.hi.tanh() };
+    let t = Iv::new(z.lo.tanh(), z.hi.tanh());
     let t2 = t.sq();
-    let tp = Iv { lo: 1.0 - t2.hi, hi: 1.0 - t2.lo };
+    let tp = Iv::new(1.0 - t2.hi, 1.0 - t2.lo);
     let tpp = t.mul(tp).scale(-2.0);
     (tp, tpp)
 }
@@ -123,16 +117,16 @@ fn verify(p: &[f64], head: bool, rr: f64) -> (usize, Vec<(f64, f64)>) {
 const MAXD2: u32 = 9; // natural extension is looser (dependency problem) ⇒ deeper refinement
 fn gh_nat(x1: Iv, x2: Iv, p: &[f64], head: bool) -> (Iv, Iv) { // (h, g) by direct interval evaluation
     let f1 = x2.scale(-1.0);
-    let f2 = x1.add(x1.sq().add(Iv { lo: -1.0, hi: -1.0 }).mul(x2).scale(MU)); // x1 + μ(x1²−1)x2
+    let f2 = x1.add(x1.sq().add(Iv::new(-1.0, -1.0)).mul(x2).scale(MU)); // x1 + μ(x1²−1)x2
     let (x1sq, x2sq, x1x2) = (x1.sq(), x2.sq(), x1.mul(x2));
     let (pa, pb, pc) = (p[0], p[1], p[2]);
     let mut vv  = x1sq.scale(pa).add(x1x2.scale(2.0*pb)).add(x2sq.scale(pc)); // V
     let mut vx1 = x1.scale(2.0*pa).add(x2.scale(2.0*pb));                     // ∂V/∂x1
     let mut vx2 = x1.scale(2.0*pb).add(x2.scale(2.0*pc));                     // ∂V/∂x2
     if head { for j in 0..K { let (w, a, b, c) = hf(p, j);
-        let z = x1.scale(a).add(x2.scale(b)).add(Iv { lo: c, hi: c });
-        let t = Iv { lo: z.lo.tanh(), hi: z.hi.tanh() };                      // tanh monotone
-        let t2 = t.sq(); let tp = Iv { lo: 1.0 - t2.hi, hi: 1.0 - t2.lo };    // 1 − tanh²
+        let z = x1.scale(a).add(x2.scale(b)).add(Iv::new(c, c));
+        let t = Iv::new(z.lo.tanh(), z.hi.tanh());                      // tanh monotone
+        let t2 = t.sq(); let tp = Iv::new(1.0 - t2.hi, 1.0 - t2.lo);    // 1 − tanh²
         vv  = vv.add(t.scale(w));
         vx1 = vx1.add(tp.scale(a).scale(w));
         vx2 = vx2.add(tp.scale(b).scale(w));
