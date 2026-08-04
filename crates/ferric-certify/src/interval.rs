@@ -67,6 +67,22 @@ impl Iv {
     #[inline]
     pub fn is_negative(self) -> bool { self.hi < 0.0 }
 
+    /// Largest absolute value attained anywhere in the interval: `max(|lo|, |hi|)`.
+    ///
+    /// This is the quantity a **mean-value (centered) form** needs. Bounding a function over a box as
+    /// `f(centre) ± Σ|∂f/∂xᵢ|·rᵢ` requires a bound on each derivative's magnitude over the whole box, and
+    /// that bound is exactly this. It is in the library because every example that wrote a centered form
+    /// reimplemented it, and because the obvious wrong version — `hi.abs()` — is correct precisely when
+    /// the interval does not straddle zero, i.e. right up until it matters.
+    #[inline]
+    pub fn amax(self) -> f64 { self.lo.abs().max(self.hi.abs()) }
+
+    /// Smallest absolute value attained: `0` when the interval straddles zero.
+    #[inline]
+    pub fn amin(self) -> f64 {
+        if self.lo <= 0.0 && self.hi >= 0.0 { 0.0 } else { self.lo.abs().min(self.hi.abs()) }
+    }
+
     #[inline]
     pub fn add(self, o: Iv) -> Iv { outward(self.lo + o.lo, self.hi + o.hi) }
 
@@ -251,6 +267,28 @@ mod tests {
         assert!(Iv::new(-1.0, 1.0).recip().is_none());
         assert!(Iv::new(0.0, 1.0).recip().is_none(), "a bound AT zero is still unbounded");
         assert!(Iv::new(1.0, 2.0).recip().is_some());
+    }
+
+    #[test]
+    fn amax_and_amin_are_right_across_zero() {
+        // The failure mode: `hi.abs()` looks correct until the interval straddles zero, which is exactly
+        // when a derivative bound matters most.
+        let straddling = Iv::new(-5.0, 2.0);
+        assert_eq!(straddling.amax(), 5.0, "amax must consider the lower bound");
+        assert_eq!(straddling.amin(), 0.0, "an interval containing 0 attains 0");
+        assert_eq!(Iv::new(2.0, 5.0).amax(), 5.0);
+        assert_eq!(Iv::new(2.0, 5.0).amin(), 2.0);
+        assert_eq!(Iv::new(-5.0, -2.0).amax(), 5.0);
+        assert_eq!(Iv::new(-5.0, -2.0).amin(), 2.0);
+        // Sampled: no point in the interval may exceed amax or undercut amin.
+        let mut r = Rng(7);
+        for _ in 0..5000 {
+            let (a, b) = (r.in_range(-9.0, 9.0), r.in_range(-9.0, 9.0));
+            let iv = Iv::new(a.min(b), a.max(b));
+            let x = r.in_range(iv.lo, iv.hi);
+            assert!(x.abs() <= iv.amax() + 1e-12, "{x} exceeds amax of {iv:?}");
+            assert!(x.abs() >= iv.amin() - 1e-12, "{x} undercuts amin of {iv:?}");
+        }
     }
 
     #[test]

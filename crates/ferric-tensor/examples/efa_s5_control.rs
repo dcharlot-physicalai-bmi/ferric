@@ -12,6 +12,9 @@
 use ferric_tensor::{Adam, Tensor, Var};
 use std::f64::consts::PI;
 use std::sync::Arc;
+use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded). Replaces the local
+// round-to-nearest implementation this example used to carry: the naive form can NARROW an
+// interval and so assert a bound it has not earned. See ferric-certify.
 
 const CD: f64 = 0.20;      // plant damping
 const R0: f64 = 0.05;
@@ -25,27 +28,10 @@ fn u_of(x1: f64, x2: f64, k1: f64, k2: f64) -> f64 { -(k1*x1 + k2*x2) }
 // closed-loop plant with controller (k1,k2)
 fn fcl(x1: f64, x2: f64, k1: f64, k2: f64) -> (f64, f64) { (x2, x1.sin() - CD*x2 + u_of(x1,x2,k1,k2)) }
 
-#[derive(Clone, Copy)] struct Iv { lo: f64, hi: f64 }
-impl Iv {
-    fn add(self,o:Iv)->Iv{Iv{lo:self.lo+o.lo,hi:self.hi+o.hi}}
-    fn mul(self,o:Iv)->Iv{let(a,b,c,d)=(self.lo*o.lo,self.lo*o.hi,self.hi*o.lo,self.hi*o.hi);Iv{lo:a.min(b).min(c).min(d),hi:a.max(b).max(c).max(d)}}
-    fn scale(self,k:f64)->Iv{if k>=0.0{Iv{lo:self.lo*k,hi:self.hi*k}}else{Iv{lo:self.hi*k,hi:self.lo*k}}}
-    fn sq(self)->Iv{if self.lo>=0.0{Iv{lo:self.lo*self.lo,hi:self.hi*self.hi}}else if self.hi<=0.0{Iv{lo:self.hi*self.hi,hi:self.lo*self.lo}}else{Iv{lo:0.0,hi:(self.lo*self.lo).max(self.hi*self.hi)}}}
-}
-fn sin_iv(x: Iv) -> Iv {
-    let mut lo = x.lo.sin().min(x.hi.sin()); let mut hi = x.lo.sin().max(x.hi.sin());
-    let mut k = ((x.lo - PI/2.0)/PI).floor() as i64 - 1;
-    while (k as f64)*PI + PI/2.0 <= x.hi + 1e-12 {
-        let e = (k as f64)*PI + PI/2.0;
-        if e >= x.lo - 1e-12 && e <= x.hi + 1e-12 { let s = e.sin(); lo = lo.min(s); hi = hi.max(s); }
-        k += 1;
-    }
-    Iv { lo, hi }
-}
 // sound upper bound of V̇+α‖x‖² over a box for the CLOSED loop (natural interval extension)
 fn gbox(x1: Iv, x2: Iv, a: f64, b: f64, c: f64, k1: f64, k2: f64) -> f64 {
     let f1 = x2;
-    let f2 = sin_iv(x1).add(x2.scale(-CD)).add(x1.scale(-k1)).add(x2.scale(-k2)); // sin x1 − c x2 − k1 x1 − k2 x2
+    let f2 = (x1).sin().add(x2.scale(-CD)).add(x1.scale(-k1)).add(x2.scale(-k2)); // sin x1 − c x2 − k1 x1 − k2 x2
     let vx1 = x1.scale(2.0*a).add(x2.scale(2.0*b));
     let vx2 = x1.scale(2.0*b).add(x2.scale(2.0*c));
     vx1.mul(f1).add(vx2.mul(f2)).add(x1.sq().add(x2.sq()).scale(ALPHA)).hi

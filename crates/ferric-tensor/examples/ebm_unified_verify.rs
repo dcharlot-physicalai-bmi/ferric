@@ -101,10 +101,17 @@ fn bound_action(c1: f64, c2: f64, r1: f64, r2: f64, u: f64) -> f64 {
     dvc + gd1.abs() * r1 + gd2.abs() * r2 + rem + ALPHA * ss_hi
 }
 /// greedy = OR over torques: certified if SOME torque contracts the whole box
+
+/// Conservative soundness margin — see `ebm_cert_verify` for the swept methodology. Every operation in
+/// the Taylor bound is round-to-nearest f64, so the true bound can sit slightly ABOVE the computed one;
+/// `bound + EPS < 0` makes the accept decision robust rather than resting on the sign of a value that may
+/// be a rounding artifact. `CERT_EPS=0` restores the original behaviour.
+const DEFAULT_EPS: f64 = 1e-9;
+fn cert_eps() -> f64 { std::env::var("CERT_EPS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_EPS) }
 fn box_certified(c1: f64, c2: f64, r1: f64, r2: f64) -> bool {
     let mut best = f64::INFINITY;
     for i in 0..NCAND { let b = bound_action(c1, c2, r1, r2, torque(i)); if b < best { best = b; } }
-    best < 0.0
+    best + cert_eps() < 0.0
 }
 fn in_region(c1: f64, c2: f64, r1: f64, r2: f64) -> bool {
     let lo = (c1.abs() - r1).max(0.0).powi(2) + (c2.abs() - r2).max(0.0).powi(2);

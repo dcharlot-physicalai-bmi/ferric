@@ -16,6 +16,9 @@
 //! Run: `cargo run -p ferric-tensor --example efa_discover_verify --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded) — replaces the
+// local round-to-nearest implementation this example used to carry. See ferric-certify: the naive
+// version can narrow an interval and so assert a bound it has not earned.
 
 // ---- system + certificate constants ----
 const CD: f64 = 0.5;      // damping
@@ -28,38 +31,6 @@ const DELTA_T: f64 = 0.10;
 const GB: usize = 80;     // verifier grid: GB×GB boxes over [−R,R]²
 
 // ================= the SOUND verifier (trusted kernel, f64 interval arithmetic) =================
-#[derive(Clone, Copy)]
-struct Iv { lo: f64, hi: f64 }
-impl Iv {
-    fn n(x: f64) -> Iv { Iv { lo: x, hi: x } }
-    fn add(self, o: Iv) -> Iv { Iv { lo: self.lo + o.lo, hi: self.hi + o.hi } }
-    fn sub(self, o: Iv) -> Iv { Iv { lo: self.lo - o.hi, hi: self.hi - o.lo } }
-    fn mul(self, o: Iv) -> Iv {
-        let (a, b, c, d) = (self.lo * o.lo, self.lo * o.hi, self.hi * o.lo, self.hi * o.hi);
-        Iv { lo: a.min(b).min(c).min(d), hi: a.max(b).max(c).max(d) }
-    }
-    fn scale(self, k: f64) -> Iv { if k >= 0.0 { Iv { lo: self.lo * k, hi: self.hi * k } } else { Iv { lo: self.hi * k, hi: self.lo * k } } }
-    fn sq(self) -> Iv { // sound square of an interval
-        if self.lo >= 0.0 { Iv { lo: self.lo * self.lo, hi: self.hi * self.hi } }
-        else if self.hi <= 0.0 { Iv { lo: self.hi * self.hi, hi: self.lo * self.lo } }
-        else { Iv { lo: 0.0, hi: (self.lo * self.lo).max(self.hi * self.hi) } }
-    }
-}
-// sound enclosures of sin/cos over [a,b] (check the extrema inside the range)
-fn trig_iv(iv: Iv, off: f64, f: fn(f64) -> f64) -> Iv { // off = phase of the +1 extremum
-    let (a, b) = (iv.lo, iv.hi);
-    let (mut lo, mut hi) = (f(a).min(f(b)), f(a).max(f(b)));
-    let kmin = ((a - off) / std::f64::consts::PI).floor() as i64 - 1;
-    let kmax = ((b - off) / std::f64::consts::PI).ceil() as i64 + 1;
-    for k in kmin..=kmax {
-        let x = off + (k as f64) * std::f64::consts::PI;
-        if x >= a && x <= b { let s = f(x); lo = lo.min(s); hi = hi.max(s); }
-    }
-    Iv { lo, hi }
-}
-fn sin_iv(iv: Iv) -> Iv { trig_iv(iv, std::f64::consts::FRAC_PI_2, f64::sin) }
-fn cos_iv(iv: Iv) -> Iv { trig_iv(iv, 0.0, f64::cos) }
-
 // g(x) = V̇ + α‖x‖²  and  h(x) = V − δ‖x‖²  at a point (exact)
 fn g_at(x1: f64, x2: f64, a: f64, b: f64, cc: f64) -> f64 {
     let (f1, f2) = (x2, -x1.sin() - CD * x2);
@@ -75,7 +46,7 @@ fn absmax(iv: Iv) -> f64 { iv.lo.abs().max(iv.hi.abs()) }
 fn box_bounds(x1: Iv, x2: Iv, a: f64, b: f64, cc: f64) -> (f64, f64) {
     let (c1, c2) = ((x1.lo + x1.hi) / 2.0, (x2.lo + x2.hi) / 2.0);
     let r = ((x1.hi - x1.lo).max(x2.hi - x2.lo)) / 2.0;
-    let (s1, co1) = (sin_iv(x1), cos_iv(x1));
+    let (s1, co1) = (x1.sin(), x1.cos());
     // ∂g/∂x₁ = 2[a·x₂ − b·sin x₁ − b·x₁·cos x₁ − CD·b·x₂ − cc·x₂·cos x₁] + 2α·x₁
     let dgx1 = x2.scale(2.0 * a).sub(s1.scale(2.0 * b)).sub(x1.mul(co1).scale(2.0 * b))
         .sub(x2.scale(2.0 * CD * b)).sub(x2.mul(co1).scale(2.0 * cc)).add(x1.scale(2.0 * ALPHA));
@@ -100,7 +71,7 @@ fn certify_box(x1: Iv, x2: Iv, a: f64, b: f64, cc: f64, depth: u32) -> Option<(f
     let (m1, m2) = ((x1.lo + x1.hi) / 2.0, (x2.lo + x2.hi) / 2.0);
     for &(a1, b1) in &[(x1.lo, m1), (m1, x1.hi)] {
         for &(a2, b2) in &[(x2.lo, m2), (m2, x2.hi)] {
-            if let Some(w) = certify_box(Iv { lo: a1, hi: b1 }, Iv { lo: a2, hi: b2 }, a, b, cc, depth - 1) { return Some(w); }
+            if let Some(w) = certify_box(Iv::new(a1, b1), Iv::new(a2, b2), a, b, cc, depth - 1) { return Some(w); }
         }
     }
     None
@@ -111,7 +82,7 @@ fn verify(a: f64, b: f64, cc: f64) -> (usize, Vec<(f64, f64)>) {
     let step = 2.0 * R / GB as f64;
     for i in 0..GB { for j in 0..GB {
         let (lo1, lo2) = (-R + i as f64 * step, -R + j as f64 * step);
-        if let Some(w) = certify_box(Iv { lo: lo1, hi: lo1 + step }, Iv { lo: lo2, hi: lo2 + step }, a, b, cc, MAXD) { ce.push(w); }
+        if let Some(w) = certify_box(Iv::new(lo1, lo1 + step), Iv::new(lo2, lo2 + step), a, b, cc, MAXD) { ce.push(w); }
     }}
     (ce.len(), ce)
 }
