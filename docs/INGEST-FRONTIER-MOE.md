@@ -1,3 +1,48 @@
+# Frontier-MoE ingest — outcome
+
+**Status: complete.** All seven work items shipped. This document is now a record, not a plan: the
+sections below run roughly chronologically — the plan, then the extracted mechanisms, then what happened
+when the source projects' claims were *tested*.
+
+## What shipped
+
+| crate / module | capability |
+|---|---|
+| `ferric-tier` | memory hierarchy — pinned-prefix layers, hotness-LFU experts, overlapped reads, KV sessions |
+| `ferric-dist` | pipeline parallel with prefix-hash guards |
+| `ferric-gguf::imatrix` | importance calibration from real activations, llama.cpp `.dat` compatible |
+| `ferric-gguf::quantplan` | role-based precision + selective calibration + scale-span guard |
+| `ferric-llama::mla` | Multi-head Latent Attention, promoted from examples, still layer-exact (maxΔ 5.96e-7) |
+| `ferric-llama::instella` | DeepSeekMoE `noaux_tc` router, promoted, re-verified (routed maxΔ 0.000e0) |
+| `ferric-llama::stream` | dense-path weight streaming |
+
+**The capability is real, not only tested.** A transformer generates with **4% of its layer weights
+resident**, token ids identical at every budget (`stream_generate`). A real MoE runs under **137
+evictions** with byte-identical delivery (`moe_streaming`).
+
+## ⚠️ Three of the source projects' claims did NOT survive testing
+
+Each is now a shipped default that **contradicts** a straight port, and each is a test:
+
+1. **`gate` is the fragile FFN role, not `down`.** ds4 spends extra bits on `down`; its stated mechanism
+   (one-sided SwiGLU input) did not transfer, and `down` measured *least* sensitive. At identical
+   parameter count, fan-in and input: gate +5.849 nats vs up +4.561, worse on **6/6** chunks.
+2. **The imatrix must NOT be applied to `gate`** (+4.156 nats, **0/6**), though it helps `up` and `down`
+   as published. Importance weighting assumes a linearly-consumed output, which a SiLU gate is not. None
+   of the three projects states this limitation.
+3. **LRU is provably worthless for layer streaming** — cyclic access means a hit rate of exactly zero at
+   any capacity below the layer count. Confirmed on a real model: an expert cache spanning layers scored
+   **0.0%** until it held `n_layers × top_k`.
+
+## What Ferric does that none of the three do
+
+They advertise placement-invariance in a README; **Ferric enforces it in CI** (`placement_invariance.rs`,
+plus token-identity end to end). And Ferric ships the read/compute overlap kimi-k3 explicitly declined to
+write — it cited a concurrent-writer hazard, which **Rust's ownership removes**, because the buffer is
+moved to the reader and moved back rather than shared.
+
+---
+
 # Ingest plan — frontier-MoE-on-consumer-hardware
 
 Three independent projects converged in 2026 on the same capability Ferric lacks: **running models far
@@ -8,6 +53,12 @@ larger than memory by streaming weights from disk, where placement affects speed
 | [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) | 2.78T params in **8.24 GB RSS** (1.56 TB ckpt) | C99, no BLAS/GPU; 4-bit experts, MLA, trunk streaming |
 | [colibri](https://github.com/JustVugg/colibri) | 744B–2.8T | int4 trunk resident, 19,456 experts streamed, LRU + learned pinning, 1-layer prefetch |
 | [ds4 / DwarfStar](https://github.com/antirez/ds4) | DeepSeek V4, GLM 5.2 | **asymmetric role-based 2-bit**, imatrix, SSD streaming, Thunderbolt-RDMA distributed |
+
+⚠️ Headline speed figures from these projects are weaker than they read, and were overstated in the
+first draft of this document. ds4's **1.66× is prefill *pipeline* parallelism** (not RDMA TP) comparing a
+*Q2* single-process run against a *Q4* distributed one; **120 t/s on 8×L40S is aggregate over 16
+sessions** (~7.5 t/s each); and colibri measures distributed **decode 19.4% *slower*** than
+single-process. Distributing buys capacity, not speed — see the `ferric-dist` section.
 
 A fourth, independent confirmation: **KTransformers** (Tsinghua, SOSP 2025) does expert-granularity
 CPU↔GPU offload with the same shape. Four implementations, one technique — this is settled, not speculative.
@@ -349,13 +400,6 @@ Treat "2-bit is fine" as **supported in direction, unquantified in magnitude** �
 to kimi-k3's single-sample timings. Ferric's role-based experiment should therefore report a real
 perplexity delta, which is the number none of the three projects published.
 
-## Corrections to earlier claims in this plan
-
-Both verified against source, and both were overstated in the summary that opened this document:
-- The **1.66× is pipeline parallelism over TCP, not RDMA tensor parallelism** — and the baseline column is
-  a *Q2* single-process run against a *Q4* distributed run, which favours the baseline.
-- **120 t/s on 8×L40S is aggregate over 16 concurrent sessions** (~7.5 t/s per stream), not single-stream.
-
 ## Bonus: DeepSeek V4 routing is not standard MoE
 
 1. **The first 3 layers route by deterministic token-id hash**, not learned top-k —
@@ -616,3 +660,57 @@ a dead worker is never recorded as having refused.
 
 Dependency-free; `Transport` is a trait, so the entire protocol — including failure and recovery — is
 tested in-process with no sockets and no second machine. 31 tests.
+
+---
+
+# BUILT: dense-path streaming — a model that runs on 4% of its weights
+
+`ferric-llama::stream` + `examples/stream_generate.rs`. The MoE half of the capability is
+`moe_streaming`; this is the half that lets a model exceed memory outright.
+
+Every weight in the layer builder goes through `GgufSource`, so streaming required **no change to the
+model's arithmetic** — only a source whose bytes come from the tier. `LayerBytes` slices the contiguous
+run the tier delivered; everything else delegates to the file. Residency lives inside `Qwen3` because the
+model is what knows the access order, and that order is what makes a pinned prefix right.
+
+```
+    budget   pinned   built/reused   vs resident (5 runs)   token ids
+  resident    24/24        24/-              1.0x          identical
+   15.9 MB     0/24       288/0          8.4 - 11.3x       identical
+   95.1 MB     4/24       244/44         7.0 - 10.1x       identical
+  190.2 MB    10/24       178/110         5.3 -  7.7x      identical
+```
+
+**Identical token ids, not merely identical delivered bytes** — which is what rules out a stale slot, a
+mis-sliced tensor, or a layer built from the wrong run. Greedy decode, so the token stream is a
+deterministic function of the weights rather than a statement about an RNG.
+
+## The cost is the rebuild, not the read — which was not the expected answer
+
+The first version rebuilt every layer on every visit, and its wall clock **barely moved as the byte-cache
+hit rate went 0% → 41.7%**. That is what showed the disk read was not the bottleneck. Building pinned
+layers once removes 110 of 288 rebuilds at the 190 MB rung.
+
+Reported as ranges because wall clock here carries ~20% run-to-run spread: a first write-up said
+"9.5× → 5.3×" from single samples, and re-running the same rung gave 7.7×, 6.3×, 6.4×. **The
+deterministic evidence is the rebuild count**, which reproduces exactly.
+
+A counterintuitive artifact worth not misreading: the tier's byte-level hit rate **fell** (41.7% → 5.6%)
+*as a result of* that speedup, because a pinned layer stops calling the tier once built. The tier now sees
+only the streamed remainder. `built/reused` is the honest reuse figure.
+
+## Overlap pays once the device is slower than RAM
+
+The read/compute overlap is worth little on a warm page cache — consistent with the rebuild dominating —
+but that is not the regime streaming exists for. Measured against an injected per-read delay
+(`stream_overlap.rs`), token ids identical throughout:
+
+```
+  read delay      0 us        500 us       2000 us       8000 us
+  speedup      1.16/1.09x   1.33/1.26x   1.53/1.54x   1.50/1.52x
+               noise floor               reproducible   saturated
+```
+
+Saturation is where the read exceeds the compute available to hide it behind. The injection seam
+(`stream::open_with`) exists precisely because **a tier cannot be evaluated against a device faster than
+the thing it is meant to hide.**
