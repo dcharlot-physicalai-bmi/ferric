@@ -1,5 +1,7 @@
 //! Ferric web — proves the SAME pure-Rust kernels (ferric-core) run in the browser on WebGPU.
 //! The matmul WGSL, the Context, the readback — all identical to native; only the target changes.
+pub mod stream;
+
 use ferric_core::{demo, matmul_cpu, max_abs_diff, Context};
 use ferric_gguf::{parse, GgufSource, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};

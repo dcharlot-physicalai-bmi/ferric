@@ -249,12 +249,14 @@ impl Qwen3 {
     /// every production streaming engine — they are a small share of the parameters and are touched on
     /// every token regardless. Slower than resident by design: the saving is memory, the cost is
     /// re-uploading each layer per visit.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_streaming(ctx: &Arc<Context>, path: &str, budget_bytes: u64) -> Result<Qwen3, String> {
         Self::load_streaming_with(ctx, path, budget_bytes, None, true)
     }
 
     /// Streamed load with an explicit backing and overlap setting — the seam a benchmark needs in order
     /// to measure the tier against a device slower than a warm page cache.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_streaming_with(
         ctx: &Arc<Context>,
         path: &str,

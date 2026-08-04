@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ferric — streaming inference in the browser</title>
+<style>
+  :root { color-scheme: light dark; --fg:#111; --dim:#666; --line:#d8d8d8; --acc:#1f6feb; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e6e6e6; --dim:#999; --line:#333; --acc:#58a6ff; } }
+  body { font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg);
+         max-width: 62rem; margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.15rem; margin: 0 0 .3rem; letter-spacing: -.01em; }
+  p.sub { color: var(--dim); margin: 0 0 1.75rem; }
+  fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 1rem 1.15rem; margin: 0 0 1rem; }
+  legend { color: var(--dim); padding: 0 .4rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
+  label { display: block; margin: .55rem 0 .15rem; color: var(--dim); font-size: .82rem; }
+  input, textarea { width: 100%; font: inherit; padding: .45rem .55rem; border: 1px solid var(--line);
+                    border-radius: 4px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .5rem 1.1rem; border: 1px solid var(--acc); background: var(--acc);
+           color: #fff; border-radius: 4px; cursor: pointer; }
+  button[disabled] { opacity: .45; cursor: not-allowed; }
+  pre { background: color-mix(in srgb, var(--fg) 5%, transparent); border: 1px solid var(--line);
+        border-radius: 6px; padding: .85rem 1rem; overflow-x: auto; white-space: pre-wrap; margin: .6rem 0 0; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1rem; }
+  .note { color: var(--dim); font-size: .82rem; }
+</style>
+
+<h1>Ferric — streaming inference in the browser</h1>
+<p class="sub">A model larger than the tab can hold, fetched by HTTP Range and run on WebGPU.</p>
+
+<fieldset>
+  <legend>model</legend>
+  <label>Checkpoint URL — must be served with <code>Accept-Ranges: bytes</code> and CORS</label>
+  <input id="url" value="./model.gguf">
+  <div class="row">
+    <div><label>Layer-weight budget (MB)</label><input id="budget" type="number" value="64"></div>
+    <div><label>Tokens to generate</label><input id="ntok" type="number" value="24"></div>
+  </div>
+  <label>Prompt</label>
+  <textarea id="prompt" rows="2">The capital of France is</textarea>
+  <p></p>
+  <button id="go">Load and generate</button>
+  <span class="note" id="status"></span>
+</fieldset>
+
+<pre id="out">Ready.</pre>
+
+<script type="module">
+import init, { FerricStream } from './pkg/ferric_web.js';
+
+const $ = id => document.getElementById(id);
+const out = $('out');
+const log = s => { out.textContent += '\n' + s; out.scrollTop = out.scrollHeight; };
+const set = s => { out.textContent = s; };
+
+let fetched = 0, requests = 0;
+
+/// The byte-fetcher handed to Ferric.
+///
+/// Deliberately supplied by the page rather than baked into the wasm: swap this for the Cache API, a
+/// service worker, OPFS, or an authenticated endpoint and nothing inside Ferric changes.
+function makeFetcher(url) {
+  return async (offset, length) => {
+    const end = offset + length - 1;
+    const r = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+    // A host that ignores Range answers 200 with the WHOLE body. Ferric refuses that by length, but
+    // saying so here turns a confusing error into an obvious one.
+    if (r.status !== 206 && length < (await r.clone().arrayBuffer()).byteLength) {
+      throw new Error(`server returned ${r.status}, not 206 Partial Content — it is ignoring Range`);
+    }
+    const buf = new Uint8Array(await r.arrayBuffer());
+    requests++; fetched += buf.byteLength;
+    return buf;
+  };
+}
+
+$('go').onclick = async () => {
+  const btn = $('go');
+  btn.disabled = true;
+  fetched = 0; requests = 0;
+  const url = $('url').value.trim();
+  const budget = Math.round(Number($('budget').value) * 1e6);
+
+  try {
+    if (!navigator.gpu) throw new Error('WebGPU unavailable — needs Chrome/Edge 113+, Safari 18+, or Firefox with the flag.');
+    set('initialising wasm…');
+    await init();
+
+    log('HEAD ' + url);
+    const head = await fetch(url, { method: 'HEAD' });
+    if (!head.ok) throw new Error(`HEAD failed: ${head.status}`);
+    const total = Number(head.headers.get('content-length'));
+    if (!total) throw new Error('no content-length — cannot plan without the file size');
+    if (head.headers.get('accept-ranges') !== 'bytes')
+      log('  ⚠ no Accept-Ranges: bytes — the host may not support range requests');
+    log(`  ${(total / 1e6).toFixed(1)} MB`);
+
+    log(`\nopening with a ${(budget / 1e6).toFixed(0)} MB layer budget…`);
+    const t0 = performance.now();
+    const s = await FerricStream.open(makeFetcher(url), total, budget);
+    const plan = JSON.parse(s.plan());
+    log(`  ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    log(`  layers ${plan.layers}, pinned ${plan.pinned} (${(plan.hit_rate * 100).toFixed(1)}% reuse)`);
+    log(`  layer weights ${(plan.layer_bytes / 1e6).toFixed(1)} MB of ${(plan.total_bytes / 1e6).toFixed(1)} MB`);
+    log(`  header ${(plan.header_bytes / 1e6).toFixed(2)} MB · resident ${(plan.resident_bytes / 1e6).toFixed(1)} MB`);
+    log(`  fetched so far ${(fetched / 1e6).toFixed(1)} MB in ${requests} range requests`);
+
+    log('\ngenerating…');
+    const t1 = performance.now();
+    const text = await s.generate($('prompt').value, Number($('ntok').value));
+    const ms = performance.now() - t1;
+    log(`\n${$('prompt').value}${text}`);
+    log(`\n  ${(ms / Number($('ntok').value)).toFixed(0)} ms/token`);
+    log(`  resident ${(s.resident_bytes() / 1e6).toFixed(1)} MB · fetched ${(s.fetched_bytes() / 1e6).toFixed(1)} MB total`);
+  } catch (e) {
+    log('\n✗ ' + (e && e.message ? e.message : e));
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>

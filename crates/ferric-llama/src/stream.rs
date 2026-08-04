@@ -60,7 +60,9 @@
 use crate::qwen3::{build_layer, Cfg, Layer};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufFile, GgufSource, Meta, TensorInfo};
-use ferric_tier::{plan_layers, Backing, FileBacking, LayerCache, LayerDesc, LayerPlan, PrefetchCache};
+use ferric_tier::{plan_layers, Backing, LayerCache, LayerDesc, LayerPlan};
+#[cfg(not(target_arch = "wasm32"))]
+use ferric_tier::{FileBacking, PrefetchCache};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -134,6 +136,10 @@ impl std::ops::Deref for LayerRef<'_> {
 /// is — see the module docs.
 enum Tier2 {
     Sync(LayerCache),
+    /// Reads issued one layer ahead on a worker thread. Native only — wasm has no threads, and there the
+    /// equivalent is `StagedBacking`: the caller fetches ahead from async code and the synchronous read
+    /// finds the bytes already there. Same one-ahead idea, different mechanism for the same reason.
+    #[cfg(not(target_arch = "wasm32"))]
     Overlapped(PrefetchCache),
 }
 
@@ -165,9 +171,11 @@ impl LayerStream {
     pub fn hit_rate(&self) -> f64 {
         match &*self.cache.borrow() {
             Tier2::Sync(c) => c.stats().hit_rate(),
+            #[cfg(not(target_arch = "wasm32"))]
             Tier2::Overlapped(c) => c.stats().overlap_rate(),
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn overlapped(&self) -> bool { matches!(&*self.cache.borrow(), Tier2::Overlapped(_)) }
 
     /// Materialise layer `il`.
@@ -191,6 +199,7 @@ impl LayerStream {
         let mut cache = self.cache.borrow_mut();
         let bytes = match &mut *cache {
             Tier2::Sync(c) => c.bind(il as u32, &*self.backing).map(|(b, _)| b),
+            #[cfg(not(target_arch = "wasm32"))]
             Tier2::Overlapped(c) => c.bind(il as u32).map(|(b, _)| b),
         }
         .map_err(|e| format!("tier bind for layer {il}: {e}"))?;
@@ -205,6 +214,7 @@ impl LayerStream {
 /// Contiguity is what makes one layer one read. It is a property of how the converter emitted the file,
 /// not a guarantee — so it is checked, and a gap is reported with its size rather than silently included
 /// in the read (which would inflate every byte figure and quietly pull in other tensors' data).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn layer_runs(g: &GgufFile) -> Result<Vec<LayerDesc>, String> {
     layer_runs_of(&g.tensors, g.data_start())
 }
@@ -245,6 +255,7 @@ pub fn layer_runs_of(tensors: &[TensorInfo], data_start: u64) -> Result<Vec<Laye
 }
 
 /// Build a [`LayerStream`] for `path` under a byte budget for layer weights.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open(ctx: &Arc<Context>, path: &str, budget_bytes: u64, cfg: Cfg) -> Result<LayerStream, String> {
     let backing = Arc::new(FileBacking::open(path).map_err(|e| e.to_string())?);
     open_with(ctx, path, backing, budget_bytes, cfg, true)
@@ -264,18 +275,27 @@ pub fn open_with(
     overlap: bool,
 ) -> Result<LayerStream, String> {
     let file = GgufFile::open(path)?;
-    let runs = layer_runs(&file)?;
+    let runs = layer_runs_of(&file.tensors, file.data_start())?;
     let plan = plan_layers(&runs, budget_bytes, 0, 4096);
     if !plan.fits(budget_bytes) {
         return Err(format!(
             "budget {budget_bytes} B cannot hold even one streaming slot (needs {} B)", plan.spent));
     }
+    #[cfg(not(target_arch = "wasm32"))]
     let cache = if overlap {
         let mut c = PrefetchCache::new(plan.clone(), runs.clone(), Arc::clone(&backing))
             .map_err(|e| e.to_string())?;
         c.prefill().map_err(|e| e.to_string())?;
         Tier2::Overlapped(c)
     } else {
+        let mut c = LayerCache::new(plan.clone(), runs.clone());
+        c.prefill(&*backing).map_err(|e| e.to_string())?;
+        Tier2::Sync(c)
+    };
+    // wasm has no threads: the overlap there is StagedBacking, driven by the caller from async code.
+    #[cfg(target_arch = "wasm32")]
+    let cache = {
+        let _ = overlap;
         let mut c = LayerCache::new(plan.clone(), runs.clone());
         c.prefill(&*backing).map_err(|e| e.to_string())?;
         Tier2::Sync(c)
