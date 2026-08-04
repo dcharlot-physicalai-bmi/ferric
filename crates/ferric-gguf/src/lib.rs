@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 // ---- ggml tensor type codes we handle ----
 pub mod imatrix;
+pub mod quantplan;
 
 const F32: u32 = 0;
 const F16T: u32 = 1;
