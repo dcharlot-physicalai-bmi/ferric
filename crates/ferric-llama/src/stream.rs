@@ -206,9 +206,18 @@ impl LayerStream {
 /// not a guarantee — so it is checked, and a gap is reported with its size rather than silently included
 /// in the read (which would inflate every byte figure and quietly pull in other tensors' data).
 pub fn layer_runs(g: &GgufFile) -> Result<Vec<LayerDesc>, String> {
-    let base = g.data_start();
+    layer_runs_of(&g.tensors, g.data_start())
+}
+
+/// Layer runs from a tensor table — the embodiment-independent form.
+///
+/// Takes the pieces rather than a reader, so the browser (`GgufBacked` over staged fetches) and the
+/// native path (`GgufFile`) compute the identical plan from the identical inputs. A second
+/// implementation for wasm would be a second place for this to drift.
+pub fn layer_runs_of(tensors: &[TensorInfo], data_start: u64) -> Result<Vec<LayerDesc>, String> {
+    let base = data_start;
     let mut per: Vec<Vec<(u64, u64)>> = Vec::new();
-    for t in &g.tensors {
+    for t in tensors {
         let Some(rest) = t.name.strip_prefix("blk.") else { continue };
         let Some((idx, _)) = rest.split_once('.') else { continue };
         let Ok(il) = idx.parse::<usize>() else { continue };
