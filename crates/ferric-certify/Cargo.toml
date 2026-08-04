@@ -1,0 +1,15 @@
+[package]
+name = "ferric-certify"
+description = "Ferric: sound interval arithmetic and branch-and-bound certification. Proves a property holds over a continuous domain, or returns a counterexample — with outward rounding, so a certificate is a proof rather than an estimate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["interval-arithmetic", "verification", "lyapunov", "control", "no-std"]
+categories = ["mathematics", "science", "algorithms"]
+
+# No dependencies, and nothing platform-specific: a certificate should be checkable anywhere, including
+# in a browser and on a microcontroller.
+[dependencies]
