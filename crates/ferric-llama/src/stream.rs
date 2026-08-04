@@ -40,13 +40,27 @@
 //! The tier now sees only the streamed remainder — a smaller and harder workload. `built/reused` is the
 //! honest reuse figure.
 //!
+//! ## Overlap
+//!
+//! Reads are issued one layer ahead on a worker thread ([`ferric_tier::PrefetchCache`]). On a warm page
+//! cache that is worth little — which is consistent with the rebuild dominating above — but it is not the
+//! regime streaming exists for. Measured against a backing with an injected per-read delay
+//! (`examples/stream_overlap.rs`), token ids identical throughout:
+//!
+//! ```text
+//!   read delay   0 us -> 1.1-1.2x (noise floor)   2000 us -> 1.53x   8000 us -> 1.50x (saturated)
+//! ```
+//!
+//! The saturation point is where the read exceeds the compute available to hide it behind. Pass
+//! `overlap: false` to [`open_with`] to compare.
+//!
 //! This path remains **slower than resident by design**; the point is that it runs at all when resident
 //! is not an option. The saving is memory; the cost is bandwidth.
 
 use crate::qwen3::{build_layer, Cfg, Layer};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufFile, GgufSource, Meta, TensorInfo};
-use ferric_tier::{plan_layers, Backing, FileBacking, LayerCache, LayerDesc, LayerPlan};
+use ferric_tier::{plan_layers, Backing, FileBacking, LayerCache, LayerDesc, LayerPlan, PrefetchCache};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -113,10 +127,20 @@ impl std::ops::Deref for LayerRef<'_> {
 }
 
 /// Owns everything a streamed model needs to rebuild a layer on demand.
+/// Which tier the stream binds through.
+///
+/// Both implement the same pinned-prefix policy; `Overlapped` additionally reads layer *L+1* on a worker
+/// thread while the caller is still using *L*. Whether that pays depends entirely on how slow the backing
+/// is — see the module docs.
+enum Tier2 {
+    Sync(LayerCache),
+    Overlapped(PrefetchCache),
+}
+
 pub struct LayerStream {
     file: GgufFile,
-    cache: std::cell::RefCell<LayerCache>,
-    backing: Arc<FileBacking>,
+    cache: std::cell::RefCell<Tier2>,
+    backing: Arc<dyn Backing + Send + Sync>,
     plan: LayerPlan,
     /// Precomputed layer runs. Recomputing these per bind meant re-walking the whole tensor table on
     /// every layer of every token — an O(tensors) scan on the hot path.
@@ -136,7 +160,15 @@ pub struct LayerStream {
 
 impl LayerStream {
     pub fn plan(&self) -> &LayerPlan { &self.plan }
-    pub fn stats(&self) -> ferric_tier::LayerStats { self.cache.borrow().stats() }
+    /// Byte-cache hit rate. Note this counts only binds that reach the tier — a pinned layer stops
+    /// calling it once built, so this measures the streamed remainder, not overall reuse.
+    pub fn hit_rate(&self) -> f64 {
+        match &*self.cache.borrow() {
+            Tier2::Sync(c) => c.stats().hit_rate(),
+            Tier2::Overlapped(c) => c.stats().overlap_rate(),
+        }
+    }
+    pub fn overlapped(&self) -> bool { matches!(&*self.cache.borrow(), Tier2::Overlapped(_)) }
 
     /// Materialise layer `il`.
     ///
@@ -157,9 +189,11 @@ impl LayerStream {
 
     fn build(&self, il: usize) -> Result<Layer, String> {
         let mut cache = self.cache.borrow_mut();
-        let (bytes, _tier) = cache
-            .bind(il as u32, &*self.backing)
-            .map_err(|e| format!("tier bind for layer {il}: {e}"))?;
+        let bytes = match &mut *cache {
+            Tier2::Sync(c) => c.bind(il as u32, &*self.backing).map(|(b, _)| b),
+            Tier2::Overlapped(c) => c.bind(il as u32).map(|(b, _)| b),
+        }
+        .map_err(|e| format!("tier bind for layer {il}: {e}"))?;
         let src = LayerBytes { inner: &self.file, run_start: self.runs[il].offset, bytes };
         self.rebuilds.set(self.rebuilds.get() + 1);
         build_layer(&self.ctx, &src, &self.cfg, il)
@@ -202,11 +236,23 @@ pub fn layer_runs(g: &GgufFile) -> Result<Vec<LayerDesc>, String> {
 }
 
 /// Build a [`LayerStream`] for `path` under a byte budget for layer weights.
-pub fn open(
+pub fn open(ctx: &Arc<Context>, path: &str, budget_bytes: u64, cfg: Cfg) -> Result<LayerStream, String> {
+    let backing = Arc::new(FileBacking::open(path).map_err(|e| e.to_string())?);
+    open_with(ctx, path, backing, budget_bytes, cfg, true)
+}
+
+/// Build a stream over a caller-supplied backing.
+///
+/// The injection point exists so the tier can be measured against a *slow* device without one — on a
+/// local SSD with a warm page cache the read is not the bottleneck, which makes it impossible to tell
+/// from timings alone whether the overlap is doing anything.
+pub fn open_with(
     ctx: &Arc<Context>,
     path: &str,
+    backing: Arc<dyn Backing + Send + Sync>,
     budget_bytes: u64,
     cfg: Cfg,
+    overlap: bool,
 ) -> Result<LayerStream, String> {
     let file = GgufFile::open(path)?;
     let runs = layer_runs(&file)?;
@@ -215,9 +261,16 @@ pub fn open(
         return Err(format!(
             "budget {budget_bytes} B cannot hold even one streaming slot (needs {} B)", plan.spent));
     }
-    let backing = Arc::new(FileBacking::open(path).map_err(|e| e.to_string())?);
-    let mut cache = LayerCache::new(plan.clone(), runs.clone());
-    cache.prefill(&*backing).map_err(|e| e.to_string())?;
+    let cache = if overlap {
+        let mut c = PrefetchCache::new(plan.clone(), runs.clone(), Arc::clone(&backing))
+            .map_err(|e| e.to_string())?;
+        c.prefill().map_err(|e| e.to_string())?;
+        Tier2::Overlapped(c)
+    } else {
+        let mut c = LayerCache::new(plan.clone(), runs.clone());
+        c.prefill(&*backing).map_err(|e| e.to_string())?;
+        Tier2::Sync(c)
+    };
     let n_layer = runs.len();
     Ok(LayerStream {
         file,

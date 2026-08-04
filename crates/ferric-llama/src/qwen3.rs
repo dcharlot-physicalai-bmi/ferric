@@ -250,12 +250,28 @@ impl Qwen3 {
     /// every token regardless. Slower than resident by design: the saving is memory, the cost is
     /// re-uploading each layer per visit.
     pub fn load_streaming(ctx: &Arc<Context>, path: &str, budget_bytes: u64) -> Result<Qwen3, String> {
+        Self::load_streaming_with(ctx, path, budget_bytes, None, true)
+    }
+
+    /// Streamed load with an explicit backing and overlap setting — the seam a benchmark needs in order
+    /// to measure the tier against a device slower than a warm page cache.
+    pub fn load_streaming_with(
+        ctx: &Arc<Context>,
+        path: &str,
+        budget_bytes: u64,
+        backing: Option<Arc<dyn ferric_tier::Backing + Send + Sync>>,
+        overlap: bool,
+    ) -> Result<Qwen3, String> {
         let file = ferric_gguf::GgufFile::open(path)?;
         let cfg = Cfg::from_gguf(&file)?;
         // Build everything EXCEPT the layers, so peak memory never includes the full weight set — a
         // load path that materialised them first and then dropped them would defeat the purpose.
         let mut m = Self::load_inner(ctx, &file, false)?;
-        m.stream = Some(crate::stream::open(ctx, path, budget_bytes, cfg)?);
+        let b = match backing {
+            Some(b) => b,
+            None => Arc::new(ferric_tier::FileBacking::open(path).map_err(|e| e.to_string())?),
+        };
+        m.stream = Some(crate::stream::open_with(ctx, path, b, budget_bytes, cfg, overlap)?);
         Ok(m)
     }
 
