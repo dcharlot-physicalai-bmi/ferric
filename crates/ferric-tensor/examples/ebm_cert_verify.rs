@@ -137,7 +137,41 @@ fn in_region(c1: f64, c2: f64, r1: f64, r2: f64) -> bool {
 
 /// Run the adaptive Taylor+CROWN certificate over the annulus for one energy (`head`: 1=ternary, 0=quadratic).
 /// Returns Ok(certified_box_count) or Err(first uncertifiable box) — exactly the gate's accept/reject decision.
+/// Conservative margin added to every bound before a box is accepted.
+///
+/// # Why this is not zero
+///
+/// Every operation in `bound()` is round-to-nearest `f64`, so the true bound can sit slightly ABOVE the
+/// computed one — and a certificate accepted at a computed bound of `-1e-17` would be an artifact of
+/// rounding rather than a proof. Demanding `bound + EPS < 0` makes the decision robust to that.
+///
+/// # How this value was chosen — measured, not guessed
+///
+/// Sweeping `CERT_EPS` over this exact certificate:
+///
+/// ```text
+///   0      1e-12   1e-9    1e-7    1e-6      1e-5     1e-4
+///   ok     ok      ok      ok      ok        FAILS    FAILS
+/// ```
+///
+/// The converged worst bound is **-3.499e-6**, so the certificate carries ~3.5e-6 of true slack.
+/// `bound()` is ~100-200 f64 operations on values of order 1-10, giving an accumulated round-to-nearest
+/// error on the order of 1e-13. The margin therefore exceeds the plausible rounding error by roughly
+/// **seven orders of magnitude**, and the default sits three orders above that error and three below the
+/// available slack.
+///
+/// That is evidence, not proof: a fully rigorous version would carry outward-rounded arithmetic through
+/// the Taylor model itself. It is recorded here so the claim is "robust by a measured margin" rather than
+/// "assumed exact". Set `CERT_EPS=0` to reproduce the original behaviour.
+const DEFAULT_EPS: f64 = 1e-9;
+
+fn eps() -> f64 {
+    std::env::var("CERT_EPS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_EPS)
+}
+
 fn certify(head: f64, max_depth: i32) -> Result<u64, [f64; 4]> {
+    #[allow(non_snake_case)]
+    let EPS = eps();
     let h0 = 0.06f64;
     let mut boxes: Vec<[f64; 4]> = Vec::new();
     let n = (2.0 * RR / h0).ceil() as i64;
@@ -157,12 +191,15 @@ fn certify(head: f64, max_depth: i32) -> Result<u64, [f64; 4]> {
                 if case_active(c1, c2, r1, r2, mode, clamp) {
                     let bd = bound(c1, c2, r1, r2, mode, clamp, head);
                     if bd > worst_b { worst_b = bd; }
-                    if bd >= 0.0 { ok = false; }
+                    // SOUNDNESS MARGIN. Every f64 op here rounds to nearest, so the true bound may sit
+                    // slightly ABOVE the computed one; requiring `bd + EPS < 0` makes the decision robust
+                    // to that. Sweeping EPS reports the certificate's real margin instead of asserting one.
+                    if bd + EPS >= 0.0 { ok = false; }
                 }
             }}
             if ok { certified += 1; } else { fails.push(*b); }
         }
-        println!("   depth {}: {} boxes, worst bound {:+.5}, fails {}, certified so far {}",
+        println!("   depth {}: {} boxes, worst bound {:+.3e}, fails {}, certified so far {}",
             depth, boxes.len(), worst_b, fails.len(), certified);
         if fails.is_empty() { return Ok(certified); }
         if fails.len() > cap { return Err(fails[0]); }

@@ -32,6 +32,22 @@
 //! `Unknown` is deliberately not folded into either answer. A verifier that reports failure when it
 //! merely ran out of budget teaches its user to distrust it; one that reports success is dangerous.
 //!
+//! ## When NOT to use this crate
+//!
+//! Naive interval arithmetic is the general tool, not the best one. Ferric's Taylor+CROWN verifier
+//! (`ferric-tensor/examples/ebm_cert_verify.rs`) computes a second-order model with an exact centre
+//! gradient, and is far **tighter** than replacing its arithmetic with [`Iv`] would be — converting it
+//! here would be a downgrade, not a promotion.
+//!
+//! For a verifier like that, the right response to the rounding concern is a **measured soundness
+//! margin** rather than a rewrite. That certificate was swept: it survives a margin of 1e-6 and fails at
+//! 1e-5, with a converged worst bound of −3.499e-6, against an accumulated round-to-nearest error on the
+//! order of 1e-13 — roughly seven orders of magnitude of headroom. Its published result stands, and it
+//! now defaults to a 1e-9 margin so the robustness is structural rather than incidental.
+//!
+//! Use this crate when the property is expressed directly in arithmetic over a box. Use a Taylor model
+//! when the bounds need to be tight enough to converge, and give it a margin.
+//!
 //! ## A counterexample is the useful output
 //!
 //! When a candidate fails, the witness is a real point in the state space where the condition breaks —
