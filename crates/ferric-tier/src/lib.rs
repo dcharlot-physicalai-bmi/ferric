@@ -50,6 +50,9 @@ mod expert;
 /// (fetch, OPFS, or an in-memory buffer).
 #[cfg(not(target_arch = "wasm32"))]
 mod file;
+/// Disk-backed KV session checkpoints. Filesystem, so not on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod kvstore;
 mod layer;
 mod plan;
 /// Threads, so not on wasm — the browser gets the synchronous [`LayerCache`], which is the same policy

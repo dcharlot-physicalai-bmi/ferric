@@ -487,3 +487,66 @@ is protected by spending *bits* on it, not by calibrating it.
 
 *Scope: single-plane ternary at 0.5B, one model family. The mechanism predicts this holds wherever a
 gated activation is used, but that is a prediction, not a measurement.*
+
+---
+
+# BUILT: persistent KV sessions — and the premise, measured
+
+`ferric_tier::kvstore`. A 25k-token agent prompt costs tens of seconds of prefill and is very nearly the
+same bytes every request; storing the attention state turns that into a disk read. The payload is opaque,
+so the module owns a checkpoint's *identity and safety* rather than its layout, and works for any model.
+
+## The key is the rendered BYTE prefix, not the token sequence
+
+Not the obvious choice, and everything else follows from it. A model samples a token whose text a client
+may later send back as *two* differently-tokenised tokens. Key on tokens and that request misses,
+re-prefills, and looks like a cache that "just doesn't work sometimes". Key on bytes and it hits, because
+bytes are what both sides agree on. A checkpoint answers exactly one question: **are these bytes a prefix
+of the incoming prompt?**
+
+## ⭐ The premise, verified rather than assumed
+
+The API returns a **byte range** for the un-cached suffix, never a token slice, because slicing an
+already-tokenised prompt at a cache boundary is claimed to yield a sequence the model never cached. That
+claim is load-bearing, so it was measured against the real Qwen tokenizer
+(`cargo run -p ferric-llama --example bpe_boundary`):
+
+```
+split points tested: 163
+concatenation matches the whole-text tokenisation:  27  (16.6%)
+concatenation DIFFERS:                             136  (83.4%)
+```
+
+**83.4% — the common case, not an edge case.** A resume path that slices tokens is wrong most of the time
+it is used, and wrong *silently*: no error, just degraded output. Returning a byte range makes the bug
+inexpressible rather than merely discouraged.
+
+(This also corrected my own first write-up, which asserted the failure rate was low and that "most split
+points happen to be clean". The measurement says the reverse.)
+
+## Everything else guards a silent failure
+
+Each validation rung exists because the corresponding mistake produces plausible output rather than an
+error, and every one is a test:
+
+- **model id** — a checkpoint is meaningless to a different model, and nothing in the bytes reveals it.
+- **payload ABI** — bytes from an older layout parse cleanly and are simply the wrong numbers.
+- **re-hash the stored text against its own filename** — catches a copied or renamed checkpoint being
+  served for bytes it does not represent.
+- **literal prefix compare** — turns a hash collision from a wrong answer into an error.
+- **only files named by their content hash are parsed** — a stray temp file is never a checkpoint.
+- **temp-file + rename** — a crash mid-write leaves the previous checkpoint intact, not a half-file that
+  parses.
+
+## Store placement is what makes checkpoints shareable
+
+`store_len` trims the tail (the last tokens are the most likely to retokenise once more text is appended)
+and aligns down. Alignment is the part that matters: independent sessions then land on the **same**
+offsets and can reuse each other's checkpoints, instead of each writing a unique frontier nothing else
+can hit.
+
+Eviction scores **token density with a decaying hit bonus** — `(hits·2^(−age/half_life) + 1) · tokens /
+bytes`, doubled for anchors — because the cache's job is tokens-not-prefilled per byte held, and a
+checkpoint popular yesterday should not hold space forever.
+
+Dependency-free (SHA-1 inline, as the source engines also do), and `#[cfg]`-ed off for wasm.
