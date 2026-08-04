@@ -34,6 +34,12 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --verbose
 
+      # The unit + integration suites. These were absent from CI entirely, which meant the
+      # placement-invariance test, the prefix-hash guards, the interval-arithmetic soundness check and
+      # every other assertion in the workspace ran only on a developer's machine. They take ~1.5s.
+      - name: Test workspace
+        run: cargo test --workspace --verbose
+
       - name: Build browser target (wasm32 + WebGPU)
         run: cargo build -p ferric-core --target wasm32-unknown-unknown
 
@@ -104,3 +110,43 @@ jobs:
           cargo run -p ferric-tokenizer --example roundtrip
           cargo run -p ferric-tensor --example devices
           cargo run -p ferric-tensor --example fabric
+
+  macos-metal:
+    name: build + validate (real Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --verbose
+
+      - name: Test workspace
+        run: cargo test --workspace --verbose
+
+      - name: Build browser target (wasm32 + WebGPU)
+        run: cargo build -p ferric-core --target wasm32-unknown-unknown
+
+      # Ferric's differentiating claim is bit-reproducible output ACROSS FABRICS. The Linux job runs on
+      # lavapipe — a software rasterizer — so until now no CI job had ever executed a Ferric kernel on a
+      # hardware backend, and Metal is the one fabric a hosted runner can actually provide. A determinism
+      # guarantee tested on exactly one software implementation is not tested.
+      - name: Validate — kernels on real Metal
+        run: |
+          for ex in transformer_block decoder_layer tiny_llm generate; do
+            echo "::group::$ex"; cargo run -p ferric-core --example $ex; echo "::endgroup::"
+          done
+          cargo run -p ferric-tensor --example devices
+          cargo run -p ferric-tensor --example fabric
+          cargo run -p ferric-tensor --example dtypes
+          cargo run -p ferric-tensor --example general
+
+      # Certificates and the tier policy are pure arithmetic and must agree everywhere. If a result here
+      # differs from the Linux job, something is platform-dependent that must not be.
+      - name: Validate — certificate re-verification (must match Linux exactly)
+        run: cargo run -p ferric-tensor --example ebm_cert_verify

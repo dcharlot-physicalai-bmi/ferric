@@ -5,6 +5,7 @@
 //! (Reduced to 8 experts at real dims — same math as the 64-expert model; real weights come at full-model.)
 //!   cargo run -p ferric-llama --example instella_moe --release
 use ferric_core::{max_abs_diff, Context};
+use ferric_llama::instella::{route, MoeConfig};
 use ferric_load::safetensors;
 use ferric_tensor::{Tensor};
 use std::collections::HashMap;
@@ -22,21 +23,12 @@ async fn run() {
     let x = g("x");                       // [S, H]
     let s = x.shape[0];
 
-    // ---- router (host-side: top-k is a gather/sort) ----
+    // ---- router: now ferric_llama::instella::route, not a copy of it ----
     let logits = x.matmul_bt(&g("gate_w")).to_vec().await;    // [S, E]
     let bias = g("gate_bias").to_vec().await;                 // [E]
-    let sig = |z: f32| 1.0 / (1.0 + (-z).exp());
-    let mut sel: Vec<Vec<(usize, f32)>> = Vec::new();         // per token: (expert, weight)
-    for t in 0..s {
-        let scores: Vec<f32> = (0..e).map(|j| sig(logits[t * e + j])).collect();
-        let sfc: Vec<f32> = (0..e).map(|j| scores[j] + bias[j]).collect();
-        let mut order: Vec<usize> = (0..e).collect();
-        order.sort_by(|&a, &b| sfc[b].total_cmp(&sfc[a]));
-        let top: Vec<usize> = order[..topk].to_vec();
-        let mut wsum = 0.0; for &j in &top { wsum += scores[j]; }
-        wsum += 1e-20;
-        sel.push(top.iter().map(|&j| (j, scores[j] / wsum * scale)).collect());
-    }
+    let mcfg = MoeConfig { hidden: hdim, inter, n_experts: e, top_k: topk, routed_scale: scale };
+    let sel: Vec<Vec<(usize, f32)>> =
+        (0..s).map(|t| route(&logits[t * e..(t + 1) * e], &bias, &mcfg)).collect();
 
     // ---- experts (device matmuls per selected expert) + host accumulate into routed ----
     let mut routed = vec![0f32; s * hdim];
