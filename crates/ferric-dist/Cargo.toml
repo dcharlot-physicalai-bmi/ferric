@@ -1,0 +1,15 @@
+[package]
+name = "ferric-dist"
+description = "Ferric: pipeline-parallel inference across machines. Layer-span routing with prefix-hash guards, so a stale worker refuses work rather than silently answering for the wrong position."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["distributed", "inference", "pipeline", "protocol"]
+categories = ["network-programming", "science"]
+
+# No dependencies. Transport is a trait the caller implements, which is what lets the whole protocol —
+# including the failure and recovery paths — be tested in-process with no sockets and no second machine.
+[dependencies]

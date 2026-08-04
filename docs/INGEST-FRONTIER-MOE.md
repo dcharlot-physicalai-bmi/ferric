@@ -550,3 +550,69 @@ bytes`, doubled for anchors — because the cache's job is tokens-not-prefilled 
 checkpoint popular yesterday should not hold space forever.
 
 Dependency-free (SHA-1 inline, as the source engines also do), and `#[cfg]`-ed off for wasm.
+
+---
+
+# BUILT: distributed pipeline — `ferric-dist`
+
+The last plan item, and the one where the honest framing had to come first.
+
+## What distributing is actually for: capacity, not speed
+
+The measured record from the three sources is sober, and the ingest doc's own opening figures were
+overstated until corrected:
+
+- ds4's headline **1.66× is *prefill* pipeline parallelism**, and its baseline column compares a Q2
+  single-process run against a Q4 distributed one — which favours the baseline, as its README concedes.
+- colibri measures distributed **decode 19.4% *slower*** than single-process.
+- "120 t/s on 8×L40S" is **aggregate over 16 sessions**, ~7.5 t/s per stream.
+
+The reason is structural: **prefill pipelines, decode does not.** Prefill is one pass over many tokens, so
+chunks can occupy every stage at once. Decode is strictly autoregressive — token *t+1* cannot start until
+*t* has traversed the whole chain — so every step pays the full round trip. So `ferric-dist` ships the
+correctness layer and makes no speed claim.
+
+## ⭐ Prefix-hash guards — the reason this can be trusted
+
+A worker's KV state is *implicit*: nothing in a request says "you must currently hold exactly these 8,000
+tokens". A worker that restarts, or a request retried against a replacement, or two interleaved sessions,
+can hand a worker continuation work while it holds the wrong state.
+
+**It will not fail. It computes attention against whatever KV it has and returns a confident wrong
+answer** — and because a pipeline moves *activations* rather than text, nothing downstream can tell.
+
+Every request therefore carries a rolling FNV-1a-64 over every token processed so far, and a worker
+refuses work whose hash does not match its own. Two properties the tests pin:
+
+- **a refusal leaves the session byte-identical** — a guard that mutated state on the way to rejecting
+  would turn one recoverable mismatch into a permanently desynchronised worker, and the replay meant to
+  fix it would fail too;
+- **recovery is transparent**: a mid-session restart plus replay produces *byte-identical* output to a run
+  where nothing failed. Not close — identical. `without_the_guard_a_restart_would_corrupt_the_result`
+  runs the same scenario unguarded and asserts the answer differs, so the guard's value is measured
+  rather than asserted.
+
+A rolling hash rather than a token count because a count answers "how many?" and the failure is "*which*
+ones?" — two sessions of equal length collide on a count.
+
+## Routing refuses rather than guesses
+
+Exact adjacency: gapless, non-overlapping, starting at layer 0, ending at a worker with the output head.
+Each condition, relaxed, yields a route that *runs and returns wrong numbers* — a gap silently skips
+layers and produces a plausible continuation from a shallower model.
+
+**An API flaw surfaced here that a test caught.** `plan_route` originally *inferred* which model to serve
+by trying each one present. A fleet serving two checkpoints would then get a valid route for whichever
+sorted first, with every downstream check agreeing it was fine. The model is now a required parameter:
+the caller knows which checkpoint it wants, and asking is free.
+
+## Failure taxonomy — different faults, different remedies
+
+- **Refusal**: the worker is alive and correct to refuse. Keep the route, replay the agreed transcript.
+- **Transport failure**: the route itself is gone. Drop it and await a replacement.
+
+Conflating them makes a coordinator replay forever into a socket that will never answer, so a test asserts
+a dead worker is never recorded as having refused.
+
+Dependency-free; `Transport` is a trait, so the entire protocol — including failure and recovery — is
+tested in-process with no sockets and no second machine. 31 tests.
