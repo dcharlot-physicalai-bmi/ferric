@@ -10,6 +10,8 @@ use half::f16;
 use std::collections::HashMap;
 
 // ---- ggml tensor type codes we handle ----
+pub mod imatrix;
+
 const F32: u32 = 0;
 const F16T: u32 = 1;
 const BF16T: u32 = 30; // brain-float16: f32's top 16 bits (seen on qwen35moe's final-layer routers)

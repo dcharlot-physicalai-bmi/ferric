@@ -421,3 +421,69 @@ by testing the mechanism rather than copying the configuration.
 
 *Scope: single-plane ternary at 0.5B, where absolute degradation is severe by design (the relative ordering
 is what is under test). Whether the ordering holds at 16B and at gentler quantization is not established.*
+
+---
+
+# TESTED: imatrix calibration — and the layer it must NOT be applied to
+
+`ferric-gguf::imatrix` closes a total capability gap (Ferric had no importance matrix; every production
+2-bit engine depends on one). Importance is collected from **real activations** — Ferric's Qwen3 already
+exposed the four projection inputs via `set_capture`/`take_capture`, and they line up exactly with what
+ds4 measures, so no model change was needed:
+
+| projection | its input |
+|---|---|
+| `ffn_gate` / `ffn_up` | the FFN-normalised hidden state |
+| `ffn_down` | the SwiGLU product, *after* gating |
+| `wqkv` / `wo` | attention-normalised hidden / attention output |
+
+`cargo run -p ferric-llama --example imatrix_ternary --release` — Qwen2.5-0.5B, 8 calibration chunks
+disjoint from 6 eval chunks, NLL in nats/token:
+
+| role (ternary) | plain | imatrix | Δ | paired |
+|---|---|---|---|---|
+| gate only | +5.641 | **+9.798** | **+4.156** | imatrix better on **0/6** |
+| up only | +3.844 | +3.582 | −0.262 | 4/6 |
+| down only | +2.938 | +2.471 | −0.467 | **6/6** |
+| all FFN | +10.417 | +10.028 | −0.389 | 4/6 |
+
+The gains on `up`/`down` are in the range ds4 publishes (−1.95% NLL). **The `gate` regression is not.**
+
+## Ruling out the obvious explanation first
+
+A skewed importance vector can satisfy the weighted objective by preserving a few high-energy channels
+and zeroing the rest — scoring well while destroying the tensor. Measured, this is **not** what happens:
+
+| capture | max/median | top-1 share | zeros plain→imatrix |
+|---|---|---|---|
+| `l0.ffn_gu` | 23.2 | 2.3% | 52.9% → 54.2% |
+| `l0.ffn_down` | 68.3 | 0.9% | 53.4% → 52.7% |
+
+The quantizer is not degenerating. The result stands.
+
+## What it means
+
+`gate` and `up` share the **same importance vector, the same input, and the same shape**. Calibration
+helps one and devastates the other, so the difference is entirely in how their outputs are consumed.
+
+**Importance weighting minimises error in `Wx` weighted by input energy — the right proxy only when the
+output is consumed LINEARLY.** `up`'s output is (it multiplies `silu(gate)`). `gate`'s is not: it passes
+through SiLU, whose behaviour near zero decides which units gate *off*. Moving error toward low-energy
+channels changes *which units cross zero*, which is a discrete change in the gating pattern rather than a
+small perturbation of a linear map.
+
+This is a limitation of imatrix calibration as a technique, not of this implementation — and none of the
+three source projects states it. It also explains their configuration: ds4 applies imatrix to routed
+experts of a **MoE**, where the analogous gate is the router (kept at F16 and never quantized at all).
+
+## Actionable, and measured rather than inferred
+
+    all-FFN ternary:   plain +10.417   uniform-imatrix +10.028   SELECTIVE +9.553 nats
+
+**Apply the imatrix to `up`, `down` and the attention projections; do not apply it to `gate`.** Selective
+calibration beats both uniform choices. Combined with the earlier role finding — `gate` is the most
+fragile role at equal parameter count — the picture is consistent: `gate` is the layer to protect, and it
+is protected by spending *bits* on it, not by calibrating it.
+
+*Scope: single-plane ternary at 0.5B, one model family. The mechanism predicts this holds wherever a
+gated activation is used, but that is a prediction, not a measurement.*
