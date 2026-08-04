@@ -19,6 +19,7 @@ ferric-gguf = { path = "../ferric-gguf", version = "0.1" }
 pollster = "1.0.1" # MoE routing reads router logits back mid-forward (eager tensors → cheap)
 
 [dev-dependencies]
+ferric-tier = { path = "../ferric-tier" }
 ferric-certify = { path = "../ferric-certify" }
 pollster = "1.0.1"
 serde_json = "1"

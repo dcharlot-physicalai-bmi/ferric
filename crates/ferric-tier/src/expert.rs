@@ -17,6 +17,18 @@
 //!
 //! ## Decay, and why a "pin" is softer than it looks
 //!
+//! ## Sizing: below one token's working set, no policy helps
+//!
+//! Measured on a real MoE (`ferric-llama/examples/moe_streaming.rs`): a cache spanning 6 layers scored a
+//! **0.0% hit rate at both 7 and 10 entries**, and 75% at 48. Iterating layers 0..N every token makes the
+//! combined `(layer, expert)` access **cyclic**, which is the same pathology that makes an LRU worthless
+//! for layer streaming — an entry is evicted before the walk comes back to it.
+//!
+//! So the floor is not a tuning preference: an expert cache must hold at least `n_layers × top_k` entries
+//! to score at all. Below that the policy is irrelevant and only the size matters; above it, policy is
+//! what closes the Belady gap. [`ExpertCache::new`] enforces only the per-STEP minimum (`top_k + 1`),
+//! because it cannot know the layer count — the caller owns this one.
+//!
 //! Hotness is halved every [`DECAY_TOKENS`] tokens so an expert that was hot during one phase of a
 //! generation does not hold a slot forever. This has a consequence worth stating because the systems that
 //! ship it do not: seeding hotness from a startup popularity list produces a pin that **decays to nothing
