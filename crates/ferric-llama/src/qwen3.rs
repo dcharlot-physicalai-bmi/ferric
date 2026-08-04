@@ -396,7 +396,7 @@ impl Qwen3 {
             // IS the eviction, and it is why steady-state memory tracks the budget rather than the model.
             let streamed;
             let l = match &self.stream {
-                Some(s) => { streamed = s.layer(il).expect("streamed layer"); &streamed }
+                Some(s) => { streamed = s.layer(il).expect("streamed layer"); &*streamed }
                 None => &self.layers[il],
             };
             let lc = &mut cache.kv[il];

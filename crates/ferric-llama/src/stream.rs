@@ -17,9 +17,31 @@
 //!
 //! ## What it costs
 //!
-//! A streamed layer is rebuilt per visit, which means re-uploading its weights to the GPU every token.
-//! That is real work and this path is **slower than resident** — the point is that it runs at all when
-//! resident is not an option. The saving is memory; the cost is bandwidth.
+//! Measured on Qwen2.5-0.5B, greedy decode, against a fully-resident run. **The `built/reused` counts
+//! are exact and reproduce identically every run; the milliseconds do not** — wall clock on this machine
+//! carries roughly 20% run-to-run spread, so the ratios are given as observed ranges rather than points.
+//!
+//! ```text
+//!     budget   pinned   built/reused   vs resident (5 runs)
+//!   resident    24/24        24/-              1.0x
+//!    15.9 MB     0/24       288/0          8.4 - 11.3x
+//!    95.1 MB     4/24       244/44         7.0 - 10.1x
+//!   190.2 MB    10/24       178/110         5.3 - 7.7x
+//! ```
+//!
+//! **The dominant cost is rebuilding a layer's GPU tensors, not the disk read.** That was not the
+//! expected answer. The first version rebuilt every layer on every visit, and its wall clock barely moved
+//! as the byte-cache hit rate went 0% → 41.7% — which is what showed I/O was not the bottleneck. Building
+//! pinned layers **once** removes 110 of 288 rebuilds at the 190 MB rung, and the timing improved with
+//! it; the deterministic evidence is the rebuild count, not the millisecond figure.
+//!
+//! A corollary worth knowing when reading the numbers: the tier's byte-level hit rate *fell* (41.7% →
+//! 5.6%) as a direct result of that speedup, because a pinned layer stops calling the tier once built.
+//! The tier now sees only the streamed remainder — a smaller and harder workload. `built/reused` is the
+//! honest reuse figure.
+//!
+//! This path remains **slower than resident by design**; the point is that it runs at all when resident
+//! is not an option. The saving is memory; the cost is bandwidth.
 
 use crate::qwen3::{build_layer, Cfg, Layer};
 use ferric_core::Context;
@@ -72,37 +94,75 @@ impl GgufSource for LayerBytes<'_> {
     }
 }
 
+/// A layer for one forward step: borrowed when pinned, owned when streamed.
+///
+/// The distinction is the whole optimisation. A *pinned* layer's bytes never leave memory, so rebuilding
+/// its GPU tensors on every visit is pure waste — measured, it was the dominant cost, not the I/O: at a
+/// budget with a 41.7% byte-cache hit rate the wall clock barely moved, because every layer was rebuilt
+/// regardless. Pinned layers are now built **once**.
+pub enum LayerRef<'a> {
+    Pinned(&'a Layer),
+    Built(Layer),
+}
+
+impl std::ops::Deref for LayerRef<'_> {
+    type Target = Layer;
+    fn deref(&self) -> &Layer {
+        match self { LayerRef::Pinned(l) => l, LayerRef::Built(l) => l }
+    }
+}
+
 /// Owns everything a streamed model needs to rebuild a layer on demand.
 pub struct LayerStream {
     file: GgufFile,
     cache: std::cell::RefCell<LayerCache>,
     backing: Arc<FileBacking>,
     plan: LayerPlan,
+    /// Precomputed layer runs. Recomputing these per bind meant re-walking the whole tensor table on
+    /// every layer of every token — an O(tensors) scan on the hot path.
+    runs: Vec<LayerDesc>,
     ctx: Arc<Context>,
     cfg: Cfg,
+    /// Built layers for the pinned prefix. `OnceCell` rather than `RefCell` because a pinned layer is
+    /// written exactly once and read forever — which is also what lets `layer()` hand back a borrow
+    /// instead of a clone.
+    pinned: Vec<std::cell::OnceCell<Layer>>,
     /// Layers rebuilt so far — a counter, not a cache. Reported so a caller can see the cost it is
     /// paying rather than infer it.
     pub rebuilds: std::cell::Cell<u64>,
+    /// Runs where the layer was already built and resident.
+    pub reuses: std::cell::Cell<u64>,
 }
 
 impl LayerStream {
     pub fn plan(&self) -> &LayerPlan { &self.plan }
     pub fn stats(&self) -> ferric_tier::LayerStats { self.cache.borrow().stats() }
 
-    /// Materialise layer `il`: fetch its run through the tier, then build from those bytes.
-    pub fn layer(&self, il: usize) -> Result<Layer, String> {
+    /// Materialise layer `il`.
+    ///
+    /// A pinned layer is built on first touch and then simply borrowed. A streamed one is fetched through
+    /// the tier and rebuilt, and dropped by the caller at the end of the step — that drop is the eviction.
+    pub fn layer(&self, il: usize) -> Result<LayerRef<'_>, String> {
+        if il < self.plan.npin {
+            if let Some(l) = self.pinned[il].get() {
+                self.reuses.set(self.reuses.get() + 1);
+                return Ok(LayerRef::Pinned(l));
+            }
+            let built = self.build(il)?;
+            let _ = self.pinned[il].set(built);
+            return Ok(LayerRef::Pinned(self.pinned[il].get().expect("just set")));
+        }
+        Ok(LayerRef::Built(self.build(il)?))
+    }
+
+    fn build(&self, il: usize) -> Result<Layer, String> {
         let mut cache = self.cache.borrow_mut();
         let (bytes, _tier) = cache
             .bind(il as u32, &*self.backing)
             .map_err(|e| format!("tier bind for layer {il}: {e}"))?;
-        let run_start = self.run_start(il);
-        let src = LayerBytes { inner: &self.file, run_start, bytes };
+        let src = LayerBytes { inner: &self.file, run_start: self.runs[il].offset, bytes };
         self.rebuilds.set(self.rebuilds.get() + 1);
         build_layer(&self.ctx, &src, &self.cfg, il)
-    }
-
-    fn run_start(&self, il: usize) -> u64 {
-        layer_runs(&self.file).map(|v| v[il].offset).unwrap_or(0)
     }
 }
 
@@ -156,15 +216,19 @@ pub fn open(
             "budget {budget_bytes} B cannot hold even one streaming slot (needs {} B)", plan.spent));
     }
     let backing = Arc::new(FileBacking::open(path).map_err(|e| e.to_string())?);
-    let mut cache = LayerCache::new(plan.clone(), runs);
+    let mut cache = LayerCache::new(plan.clone(), runs.clone());
     cache.prefill(&*backing).map_err(|e| e.to_string())?;
+    let n_layer = runs.len();
     Ok(LayerStream {
         file,
         cache: std::cell::RefCell::new(cache),
         backing,
         plan,
+        runs,
         ctx: ctx.clone(),
         cfg,
+        pinned: (0..n_layer).map(|_| std::cell::OnceCell::new()).collect(),
         rebuilds: std::cell::Cell::new(0),
+        reuses: std::cell::Cell::new(0),
     })
 }

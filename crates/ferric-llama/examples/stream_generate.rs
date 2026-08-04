@@ -72,11 +72,13 @@ async fn run() {
 
     // ---- reference: fully resident ----
     let resident = Qwen3::load(&ctx, &g).unwrap();
+    let t0 = std::time::Instant::now();
     let ref_ids = generate(&resident, &prompt, GEN).await;
+    let res_ms = t0.elapsed().as_secs_f64() * 1000.0 / GEN as f64;
     drop(resident);
-    println!("  {:>12}  {:>8}  {:>9}  {:>10}   {}", "budget", "pinned", "hit rate", "rebuilds", "generated token ids");
-    println!("  {:-<96}", "");
-    println!("  {:>12}  {:>8}  {:>9}  {:>10}   {:?}", "resident", "24/24", "100.0%", 0, &ref_ids[..GEN.min(8)]);
+    println!("  {:>12}  {:>8}  {:>9}  {:>9}  {:>8}  {:>5}/{:<5}  {}", "budget", "pinned", "hit rate", "ms/token", "vs res", "built", "reused", "token ids");
+    println!("  {:-<100}", "");
+    println!("  {:>12}  {:>8}  {:>9}  {:>9.1}  {:>8}  {:>5}/{:<5}  {:?}", "resident", "24/24", "100.0%", res_ms, "1.0x", 24, "-", &ref_ids[..GEN.min(4)]);
 
     // ---- the ladder ----
     let mut streamed_any = false;
@@ -85,10 +87,12 @@ async fn run() {
             Ok(m) => m,
             Err(e) => { println!("  {:>9.1} MB  rejected: {e}", budget as f64 / 1e6); continue; }
         };
+        let t = std::time::Instant::now();
         let ids = generate(&m, &prompt, GEN).await;
-        let (plan, st, rebuilds) = {
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / GEN as f64;
+        let (plan, st, rebuilds, reuses) = {
             let s = m.stream.as_ref().unwrap();
-            (s.plan().clone(), s.stats(), s.rebuilds.get())
+            (s.plan().clone(), s.stats(), s.rebuilds.get(), s.reuses.get())
         };
         assert_eq!(
             ids, ref_ids,
@@ -96,8 +100,9 @@ async fn run() {
              weights come from, never what the model says", budget as f64 / 1e6
         );
         if plan.npin < runs.len() { streamed_any = true; }
-        println!("  {:>9.1} MB  {:>4}/{:<3}  {:>8.1}%  {:>10}   {:?}",
-                 budget as f64 / 1e6, plan.npin, runs.len(), 100.0 * st.hit_rate(), rebuilds, &ids[..GEN.min(8)]);
+        println!("  {:>9.1} MB  {:>4}/{:<3}  {:>8.1}%  {:>9.1}  {:>7.1}x  {:>5}/{:<5}  {:?}",
+                 budget as f64 / 1e6, plan.npin, runs.len(), 100.0 * st.hit_rate(), ms, ms / res_ms,
+                 rebuilds, reuses, &ids[..GEN.min(4)]);
     }
 
     // Anti-vacuity: identical tokens are trivially true if every budget happened to pin everything.
@@ -107,6 +112,17 @@ async fn run() {
              100.0 * (biggest + 4096) as f64 / total as f64);
     println!("     Not merely identical delivered bytes — identical OUTPUT, which is what rules out a");
     println!("     stale slot, a mis-sliced tensor, or a layer built from the wrong run.");
-    println!("\n     The saving is memory and the cost is bandwidth: a streamed layer is rebuilt on every");
-    println!("     visit, so this path is slower than resident by design. It runs when resident cannot.");
+    println!();
+    println!("  COST: roughly 5-11x slower than resident depending on budget. Treat the ms column as");
+    println!("  indicative — it carries ~20% run-to-run spread on this machine. `built/reused` is exact");
+    println!("  and reproduces every run, and it is where the real finding is: the dominant cost is");
+    println!("  REBUILDING a layer's GPU tensors, not the disk read. Building pinned layers once removes");
+    println!("  110 of 288 rebuilds at the 190 MB rung.");
+    println!();
+    println!("  Read the `hit rate` column carefully: it FELL (41.7% -> 5.6%) when this got faster,");
+    println!("  because a pinned layer no longer calls the tier at all after its first build. The tier now");
+    println!("  only sees the streamed remainder, so its hit rate measures a smaller, harder workload.");
+    println!("  `built/reused` is the honest reuse figure.");
+    println!();
+    println!("     The saving is memory; the cost is bandwidth. It runs when resident cannot.");
 }
