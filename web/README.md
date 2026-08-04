@@ -58,9 +58,39 @@ makes exact rather than speculative. A read of un-staged bytes is `TierError::No
 `cargo run -p ferric-llama --example stream_embodiments --release` asserts this path produces
 **byte-identical logits** to a file handle and to an in-memory buffer (`max|Δ| = 0.000e0`, same argmax).
 
-## Status
+## Verified in a real browser
 
-The tier, the reader, the staging seam and the plan are verified natively — that is the code that could be
-subtly wrong. **The JS glue in `index.html` and `FerricStream`'s wasm-bindgen surface have not been
-executed in a browser here**; they compile, the bundle builds (830 KB), the exports are present, and the
-server serves correct 206 responses. Treat browser execution itself as unverified until someone runs it.
+Chrome + WebGPU, driven over CDP against `serve.py`, Qwen2.5-0.5B, 64 MB layer budget:
+
+```
+opening with a 64 MB layer budget…
+  ready in 0.4s
+  layers 24, pinned 3 (12.5% reuse)
+  layer weights 380.5 MB of 675.7 MB
+  fetched so far 358.9 MB in 9 range requests
+
+The capital of France is Paris. It is
+  290 ms/token
+```
+
+It generates. The output is correct text, from Range-fetched weights, on WebGPU.
+
+## ⚠️ What it does NOT yet do: reduce peak memory
+
+`peak resident 686.5 MB` against a 64 MB budget. That is not a bug in the tier — it is a structural limit
+worth naming precisely:
+
+**`forward_cached` walks all layers synchronously, with no point at which it can await a fetch.** So every
+streamed layer must be staged *before* a step begins, and peak residency within a step is the whole layer
+set. Releasing between tokens bounds the *steady* state (`now 353.6 MB`) but not the peak.
+
+So today the browser path buys **incremental loading and byte-identical output**, not a smaller footprint.
+The budget bounds what the tier *pins*, not what the tab holds.
+
+Fixing it needs a forward that **yields per layer** so a fetch can be awaited mid-step — an architectural
+change to the model, not to this directory. The native path does not have this problem because a thread
+can block on a read; the browser cannot.
+
+This was found by running it, not by reading it. An earlier version also called the *resident* loader
+after staging only the pinned prefix, and the browser caught that too — `NotStaged` naming the missing
+range instead of returning zeros, which is exactly what that error exists for.

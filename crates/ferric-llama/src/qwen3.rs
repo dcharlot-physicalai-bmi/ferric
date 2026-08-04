@@ -277,6 +277,20 @@ impl Qwen3 {
         Ok(m)
     }
 
+    /// Load everything EXCEPT the layers, then attach a stream that materialises them on demand.
+    ///
+    /// The constructor a browser uses: no path, no filesystem, and peak memory never includes the full
+    /// weight set — a load path that built the layers and then dropped them would defeat the purpose.
+    pub fn from_stream(
+        ctx: &Arc<Context>,
+        g: &impl GgufSource,
+        stream: crate::stream::LayerStream,
+    ) -> Result<Qwen3, String> {
+        let mut m = Self::load_inner(ctx, g, false)?;
+        m.stream = Some(stream);
+        Ok(m)
+    }
+
     fn load_inner(ctx: &Arc<Context>, g: &impl GgufSource, resident: bool) -> Result<Qwen3, String> {
         let cfg = Cfg::from_gguf(g)?;
         let mut layers = Vec::with_capacity(cfg.n_layer);

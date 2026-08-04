@@ -108,7 +108,10 @@ $('go').onclick = async () => {
     const ms = performance.now() - t1;
     log(`\n${$('prompt').value}${text}`);
     log(`\n  ${(ms / Number($('ntok').value)).toFixed(0)} ms/token`);
-    log(`  resident ${(s.resident_bytes() / 1e6).toFixed(1)} MB · fetched ${(s.fetched_bytes() / 1e6).toFixed(1)} MB total`);
+    log(`  peak resident ${(s.peak_bytes() / 1e6).toFixed(1)} MB · now ${(s.resident_bytes() / 1e6).toFixed(1)} MB · fetched ${(s.fetched_bytes() / 1e6).toFixed(1)} MB`);
+    log(`
+  note: peak is the whole layer set — forward_cached cannot yield mid-step, so every streamed`);
+    log(`  layer must be staged before it begins. The budget bounds what the tier PINS, not peak memory.`);
   } catch (e) {
     log('\n✗ ' + (e && e.message ? e.message : e));
   } finally {

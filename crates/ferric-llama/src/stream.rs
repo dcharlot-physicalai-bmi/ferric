@@ -59,7 +59,9 @@
 
 use crate::qwen3::{build_layer, Cfg, Layer};
 use ferric_core::Context;
-use ferric_gguf::{deq_raw, GgufFile, GgufSource, Meta, TensorInfo};
+use ferric_gguf::backed::GgufBacked;
+use ferric_gguf::deq_raw;
+use ferric_gguf::{GgufFile, GgufSource, Meta, TensorInfo};
 use ferric_tier::{plan_layers, Backing, LayerCache, LayerDesc, LayerPlan};
 #[cfg(not(target_arch = "wasm32"))]
 use ferric_tier::{FileBacking, PrefetchCache};
@@ -72,7 +74,7 @@ use std::sync::Arc;
 /// The slicing is what makes a layer exactly one read: a layer's tensors form a contiguous run, so their
 /// absolute offsets map to `abs - run_start` inside the fetched buffer.
 pub struct LayerBytes<'a> {
-    inner: &'a GgufFile,
+    inner: &'a GgufBacked,
     run_start: u64,
     bytes: &'a [u8],
 }
@@ -144,7 +146,7 @@ enum Tier2 {
 }
 
 pub struct LayerStream {
-    file: GgufFile,
+    src: GgufBacked,
     cache: std::cell::RefCell<Tier2>,
     backing: Arc<dyn Backing + Send + Sync>,
     plan: LayerPlan,
@@ -203,10 +205,44 @@ impl LayerStream {
             Tier2::Overlapped(c) => c.bind(il as u32).map(|(b, _)| b),
         }
         .map_err(|e| format!("tier bind for layer {il}: {e}"))?;
-        let src = LayerBytes { inner: &self.file, run_start: self.runs[il].offset, bytes };
+        let src = LayerBytes { inner: &self.src, run_start: self.runs[il].offset, bytes };
         self.rebuilds.set(self.rebuilds.get() + 1);
         build_layer(&self.ctx, &src, &self.cfg, il)
     }
+}
+
+/// Build a stream from an already-open reader — the constructor a browser uses.
+///
+/// Takes the pieces rather than a path so wasm never touches the filesystem, and so both embodiments
+/// derive the identical plan from the identical inputs.
+pub fn open_from_source(
+    ctx: &Arc<Context>,
+    src: GgufBacked,
+    backing: Arc<dyn Backing + Send + Sync>,
+    budget_bytes: u64,
+    cfg: Cfg,
+) -> Result<LayerStream, String> {
+    let runs = layer_runs_of(&src.tensors, src.data_start())?;
+    let plan = plan_layers(&runs, budget_bytes, 0, 4096);
+    if !plan.fits(budget_bytes) {
+        return Err(format!(
+            "budget {budget_bytes} B cannot hold one streaming slot (needs {} B)", plan.spent));
+    }
+    let mut c = LayerCache::new(plan.clone(), runs.clone());
+    c.prefill(&*backing).map_err(|e| e.to_string())?;
+    let n_layer = runs.len();
+    Ok(LayerStream {
+        src,
+        cache: std::cell::RefCell::new(Tier2::Sync(c)),
+        backing,
+        plan,
+        runs,
+        ctx: ctx.clone(),
+        cfg,
+        pinned: (0..n_layer).map(|_| std::cell::OnceCell::new()).collect(),
+        rebuilds: std::cell::Cell::new(0),
+        reuses: std::cell::Cell::new(0),
+    })
 }
 
 /// Group a checkpoint's tensors into per-layer runs, **verifying each is contiguous**.
@@ -275,6 +311,10 @@ pub fn open_with(
     overlap: bool,
 ) -> Result<LayerStream, String> {
     let file = GgufFile::open(path)?;
+    let (header, _) = ferric_gguf::backed::header_probe(
+        &*backing, u64::MAX, 1 << 20, 64 << 20)
+        .or_else(|_| std::fs::read(path).map(|b| { let n = b.len(); (b, n) }).map_err(|e| e.to_string()))?;
+    let src = GgufBacked::new(header, Arc::clone(&backing))?;
     let runs = layer_runs_of(&file.tensors, file.data_start())?;
     let plan = plan_layers(&runs, budget_bytes, 0, 4096);
     if !plan.fits(budget_bytes) {
@@ -302,7 +342,7 @@ pub fn open_with(
     };
     let n_layer = runs.len();
     Ok(LayerStream {
-        file,
+        src,
         cache: std::cell::RefCell::new(cache),
         backing,
         plan,

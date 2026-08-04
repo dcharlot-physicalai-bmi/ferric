@@ -109,8 +109,13 @@ impl FerricStream {
                 budget_bytes / 1e6, plan.spent as f64 / 1e6)));
         }
 
-        // Stage everything the model needs resident: the non-layer tensors, plus the pinned prefix. Each
-        // is one range request, which is why a contiguous layer run matters.
+        // Stage what stays resident: the non-layer tensors (embeddings, norms, head) plus the pinned
+        // prefix. Each is one range request, which is why a contiguous layer run matters.
+        //
+        // Streamed layers are deliberately NOT staged here — they are fetched per step. An earlier
+        // version called Qwen3::load (the RESIDENT loader, which builds every layer) after staging only
+        // the prefix, and the browser caught it exactly as designed: `NotStaged` naming the missing
+        // range rather than returning zeros.
         for t in src.tensors.clone() {
             let is_layer = t.name.starts_with("blk.");
             if is_layer { continue; }
@@ -144,7 +149,14 @@ impl FerricStream {
 
         let ctx = Arc::new(ferric_core::Context::new().await
             .map_err(|e| JsValue::from_str(&format!("no WebGPU adapter: {e:?}")))?);
-        let model = Qwen3::load(&ctx, &src).map_err(|e| JsValue::from_str(&e))?;
+        let cfg = ferric_llama::qwen3::Cfg::from_gguf(&src).map_err(|e| JsValue::from_str(&e))?;
+        // The streaming path, not the resident one: layers are materialised per visit from staged bytes.
+        let src2 = GgufBacked::new(header.clone(), Arc::clone(&backing))
+            .map_err(|e| JsValue::from_str(&e))?;
+        let ls = ferric_llama::stream::open_from_source(
+            &ctx, src2, Arc::clone(&backing), budget_bytes as u64, cfg)
+            .map_err(|e| JsValue::from_str(&e))?;
+        let model = Qwen3::from_stream(&ctx, &src, ls).map_err(|e| JsValue::from_str(&e))?;
 
         Ok(FerricStream { model, staged, fetcher, runs, plan, bpe, total, header_len })
     }
@@ -153,14 +165,16 @@ impl FerricStream {
     pub fn plan(&self) -> String {
         format!(
             "{{\"layers\":{},\"pinned\":{},\"hit_rate\":{:.4},\"layer_bytes\":{},\"total_bytes\":{},\
-              \"header_bytes\":{},\"resident_bytes\":{},\"fetched_bytes\":{}}}",
+              \"header_bytes\":{},\"resident_bytes\":{},\"peak_bytes\":{},\"fetched_bytes\":{}}}",
             self.runs.len(), self.plan.npin, self.plan.hit_rate(),
             self.runs.iter().map(|r| r.bytes).sum::<u64>(), self.total,
-            self.header_len, self.staged.resident_bytes(), self.staged.staged_total()
+            self.header_len, self.staged.resident_bytes(), self.staged.peak_bytes(), self.staged.staged_total()
         )
     }
 
     pub fn resident_bytes(&self) -> f64 { self.staged.resident_bytes() as f64 }
+    /// Peak residency observed — the number a budget claim must be judged against, not the trough.
+    pub fn peak_bytes(&self) -> f64 { self.staged.peak_bytes() as f64 }
     /// Total bytes pulled over the wire — the figure that matters on a metered link.
     pub fn fetched_bytes(&self) -> f64 { self.staged.staged_total() as f64 }
     pub fn n_layers(&self) -> usize { self.runs.len() }
@@ -187,7 +201,22 @@ impl FerricStream {
         }
     }
 
-    /// Greedy generation. Bytes are staged before each step, so the synchronous forward never misses.
+    /// Greedy generation.
+    ///
+    /// # A real limitation, stated rather than hidden
+    ///
+    /// `forward_cached` walks all layers **synchronously**, with no point at which it can await a fetch.
+    /// So every streamed layer must be staged *before* the step begins, and peak residency during a step
+    /// is the whole layer set — the budget bounds what the *tier* pins, not what the browser holds.
+    ///
+    /// Measured on Qwen2.5-0.5B: a 64 MB budget pins 3 of 24 layers, and peak residency is still the full
+    /// 686 MB. So this currently buys **incremental loading and identical output**, not reduced peak
+    /// memory. Streamed layers are released between tokens, which bounds the *steady* state, but the peak
+    /// is set by the forward.
+    ///
+    /// Fixing it properly needs a forward that yields per layer so a fetch can be awaited mid-step. That
+    /// is an architectural change to the model, not to this file, and it is the honest next step rather
+    /// than something to paper over with a smaller number.
     pub async fn generate(&mut self, prompt: &str, n: usize) -> Result<String, JsValue> {
         let mut all = self.bpe.encode(prompt);
         let mut cache = Cache::new(&self.model.cfg);
@@ -204,6 +233,8 @@ impl FerricStream {
             for (i, &x) in last.iter().enumerate() { if x > bv { bv = x; best = i as u32; } }
             all.push(best);
             out.push_str(&self.bpe.decode(&[best]));
+            // Bound the steady state between steps. Peak within a step is unaffected — see the note above.
+            self.release_streamed();
         }
         Ok(out)
     }

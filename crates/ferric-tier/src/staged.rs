@@ -76,6 +76,9 @@ pub struct StagedBacking {
     resident: Mutex<u64>,
     /// Bytes ever staged, for accounting.
     staged_total: Mutex<u64>,
+    /// Highest residency observed. A budget claim has to be judged against the PEAK; reporting only the
+    /// current figure lets a caller release everything and quote the trough.
+    peak: Mutex<u64>,
 }
 
 impl StagedBacking {
@@ -88,6 +91,8 @@ impl StagedBacking {
         let mut res = self.resident.lock().unwrap();
         *res += n;
         if let Some(p) = prev { *res -= p.len() as u64; }
+        let mut pk = self.peak.lock().unwrap();
+        if *res > *pk { *pk = *res; }
         *self.staged_total.lock().unwrap() += n;
     }
 
@@ -104,6 +109,9 @@ impl StagedBacking {
 
     /// Bytes currently staged.
     pub fn resident_bytes(&self) -> u64 { *self.resident.lock().unwrap() }
+
+    /// Highest residency ever observed — the figure a memory budget must be judged against.
+    pub fn peak_bytes(&self) -> u64 { *self.peak.lock().unwrap() }
 
     pub fn is_staged(&self, offset: u64, len: usize) -> bool {
         self.copy_into(offset, &mut vec![0u8; len]).is_ok()
@@ -200,6 +208,7 @@ mod tests {
         assert!(s.read_at(4096, &mut vec![0u8; 8]).is_ok());
         s.release(4096);
         assert_eq!(s.resident_bytes(), 0);
+        assert_eq!(s.peak_bytes(), 8192, "peak must survive the releases — it is what a budget is judged on");
         s.release(999_999); // releasing something never staged must not corrupt the count
         assert_eq!(s.resident_bytes(), 0);
     }
