@@ -10,6 +10,7 @@ use half::f16;
 use std::collections::HashMap;
 
 // ---- ggml tensor type codes we handle ----
+pub mod backed;
 pub mod imatrix;
 pub mod quantplan;
 

@@ -54,6 +54,8 @@ mod file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod kvstore;
 mod layer;
+/// In-memory and asynchronously-staged backings. No filesystem, so these are the wasm/browser path.
+mod staged;
 mod plan;
 /// Threads, so not on wasm — the browser gets the synchronous [`LayerCache`], which is the same policy
 /// without the overlap.
@@ -64,6 +66,7 @@ pub use expert::{ExpertCache, ExpertStats};
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileBacking;
 pub use layer::{LayerCache, LayerStats};
+pub use staged::{SliceBacking, StagedBacking};
 pub use plan::{align_up, plan_layers, LayerDesc, LayerPlan, RING_SLOTS};
 #[cfg(not(target_arch = "wasm32"))]
 pub use prefetch::{PrefetchCache, PrefetchStats};
@@ -122,6 +125,11 @@ pub enum TierError {
     BudgetTooSmall { need: u64, have: u64 },
     /// A weight id outside the configured shape.
     OutOfRange(WeightId),
+    /// A synchronous read asked for bytes that were never staged.
+    ///
+    /// Only reachable on the asynchronous path ([`StagedBacking`]): a browser cannot block a sync read on
+    /// a fetch, so an un-prefetched range must fail loudly rather than stall or return zeros.
+    NotStaged { offset: u64, len: usize },
 }
 
 impl core::fmt::Display for TierError {
@@ -133,6 +141,8 @@ impl core::fmt::Display for TierError {
                 write!(f, "budget too small: need {need} bytes, have {have}")
             }
             TierError::OutOfRange(id) => write!(f, "weight out of range: {id:?}"),
+            TierError::NotStaged { offset, len } => write!(
+                f, "bytes not staged: [{offset}, {}) — the prefetch missed this range", offset + *len as u64),
         }
     }
 }

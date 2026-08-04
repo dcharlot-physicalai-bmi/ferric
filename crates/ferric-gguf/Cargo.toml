@@ -11,6 +11,7 @@ keywords = ["gguf", "quantization", "llama", "llm", "ai"]
 categories = ["parser-implementations", "science"]
 
 [dependencies]
+ferric-tier = { path = "../ferric-tier", version = "0.1" }
 half = "2"
 
 [dev-dependencies]
