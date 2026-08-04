@@ -84,6 +84,7 @@ impl Llama {
 
 pub mod instella;
 pub mod mla;
+pub mod stream;
 pub mod cosmos;
 pub mod qwen35;
 pub mod qwen3;

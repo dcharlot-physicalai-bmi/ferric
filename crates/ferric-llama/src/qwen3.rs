@@ -150,6 +150,9 @@ impl Cache {
 
 pub struct Qwen3 {
     pub cfg: Cfg,
+    /// Set when layer weights are streamed rather than resident. `None` is the ordinary path and costs
+    /// nothing — the branch in `run_layers` is one `Option` check per layer.
+    pub stream: Option<crate::stream::LayerStream>,
     ctx: Arc<Context>,
     tok_embd: Vec<u8>, // Q2_0 rows, gathered + dequantized on the CPU (avoids parking the table on GPU)
     layers: Vec<Layer>,
@@ -161,25 +164,21 @@ pub struct Qwen3 {
     /// the forward, for building per-layer input Hessians. None (default) = zero overhead.
     pub cap: std::cell::RefCell<Option<Vec<(String, Tensor)>>>,
 }
-impl Qwen3 {
-    /// Start/stop capturing linear-input activations for GPTQ calibration.
-    pub fn set_capture(&self, on: bool) { *self.cap.borrow_mut() = if on { Some(Vec::new()) } else { None }; }
-    /// Take the captured (name, activation) pairs, leaving capture off.
-    pub fn take_capture(&self) -> Vec<(String, Tensor)> { self.cap.borrow_mut().take().unwrap_or_default() }
-    fn grab(&self, name: String, t: &Tensor) { if let Some(v) = self.cap.borrow_mut().as_mut() { v.push((name, t.clone())); } }
-}
-
-impl Qwen3 {
-    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen3, String> {
-        let cfg = Cfg::from_gguf(g)?;
-        let mut layers = Vec::with_capacity(cfg.n_layer);
-        // Gemma's `(1+w)` RMSNorm is folded into the weight at GGUF-conversion time (llama.cpp adds 1 to
-        // every `*_norm` weight), so at runtime it's a plain rmsnorm·weight — no offset here. `nrm` just
-        // loads a norm tensor (kept as one helper so the Gemma post-norms load the same way).
-        let nrm = |name: &str, n: usize| -> Result<Tensor, String> {
-            Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[n]))
-        };
-        for il in 0..cfg.n_layer {
+/// Build one transformer layer from a weight source.
+///
+/// Extracted from `Qwen3::load` unchanged, so a layer can also be built **on demand** from bytes a tier
+/// has just fetched — which is what [`Qwen3::load_streaming`] needs. Every weight here goes through
+/// `GgufSource`, and that is the property which makes streaming a matter of swapping the source rather
+/// than rewriting the model.
+pub fn build_layer(
+    ctx: &Arc<Context>,
+    g: &impl GgufSource,
+    cfg: &Cfg,
+    il: usize,
+) -> Result<Layer, String> {
+    let nrm = |name: &str, n: usize| -> Result<Tensor, String> {
+        Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[n]))
+    };
             let b = |s: &str| format!("blk.{il}.{s}");
             let qkv_bias = if cfg.qkv_bias {
                 let mut bias = g.dequant(&b("attn_q.bias"))?;
@@ -211,7 +210,7 @@ impl Qwen3 {
             // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
             let rope_base = if !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
             let window = if is_local { cfg.sliding_window } else { 0 };
-            layers.push(Layer {
+            Ok(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
                 ffn_norm: nrm(&b("ffn_norm.weight"), cfg.n_embd)?,
                 q_norm: if cfg.has_qk_norm { Some(nrm(&b("attn_q_norm.weight"), cfg.head_dim)?) } else { None },
@@ -228,7 +227,51 @@ impl Qwen3 {
                 post_ffn_norm: if cfg.is_gemma { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
                 rope_base,
                 window,
-            });
+            })
+}
+
+impl Qwen3 {
+    /// Start/stop capturing linear-input activations for GPTQ calibration.
+    pub fn set_capture(&self, on: bool) { *self.cap.borrow_mut() = if on { Some(Vec::new()) } else { None }; }
+    /// Take the captured (name, activation) pairs, leaving capture off.
+    pub fn take_capture(&self) -> Vec<(String, Tensor)> { self.cap.borrow_mut().take().unwrap_or_default() }
+    fn grab(&self, name: String, t: &Tensor) { if let Some(v) = self.cap.borrow_mut().as_mut() { v.push((name, t.clone())); } }
+}
+
+impl Qwen3 {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen3, String> {
+        Self::load_inner(ctx, g, true)
+    }
+
+    /// Load with layer weights **streamed** from `path` under a byte budget.
+    ///
+    /// Only the layer weights stream; embeddings, norms and the LM head stay resident, which mirrors
+    /// every production streaming engine — they are a small share of the parameters and are touched on
+    /// every token regardless. Slower than resident by design: the saving is memory, the cost is
+    /// re-uploading each layer per visit.
+    pub fn load_streaming(ctx: &Arc<Context>, path: &str, budget_bytes: u64) -> Result<Qwen3, String> {
+        let file = ferric_gguf::GgufFile::open(path)?;
+        let cfg = Cfg::from_gguf(&file)?;
+        // Build everything EXCEPT the layers, so peak memory never includes the full weight set — a
+        // load path that materialised them first and then dropped them would defeat the purpose.
+        let mut m = Self::load_inner(ctx, &file, false)?;
+        m.stream = Some(crate::stream::open(ctx, path, budget_bytes, cfg)?);
+        Ok(m)
+    }
+
+    fn load_inner(ctx: &Arc<Context>, g: &impl GgufSource, resident: bool) -> Result<Qwen3, String> {
+        let cfg = Cfg::from_gguf(g)?;
+        let mut layers = Vec::with_capacity(cfg.n_layer);
+        // Gemma's `(1+w)` RMSNorm is folded into the weight at GGUF-conversion time (llama.cpp adds 1 to
+        // every `*_norm` weight), so at runtime it's a plain rmsnorm·weight — no offset here. `nrm` just
+        // loads a norm tensor (kept as one helper so the Gemma post-norms load the same way).
+        let nrm = |name: &str, n: usize| -> Result<Tensor, String> {
+            Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[n]))
+        };
+        if resident {
+            for il in 0..cfg.n_layer {
+                layers.push(build_layer(ctx, g, &cfg, il)?);
+            }
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         Ok(Qwen3 {
@@ -241,7 +284,7 @@ impl Qwen3 {
                 let n = t.dims[0] as usize;
                 f32t(ctx, g, "rope_freqs.weight", &[n])
             }).transpose()?,
-            cfg, ctx: ctx.clone(), layers,
+            cfg, ctx: ctx.clone(), layers, stream: None,
         })
     }
 
@@ -348,7 +391,14 @@ impl Qwen3 {
         let mut x = self.embed(tokens);
         prof(&self.ctx, "embed");
         let pos = cache.pos;
-        for (il, l) in self.layers.iter().enumerate() {
+        for il in 0..self.cfg.n_layer {
+            // A streamed layer is materialised here and dropped at the end of the iteration — that drop
+            // IS the eviction, and it is why steady-state memory tracks the budget rather than the model.
+            let streamed;
+            let l = match &self.stream {
+                Some(s) => { streamed = s.layer(il).expect("streamed layer"); &streamed }
+                None => &self.layers[il],
+            };
             let lc = &mut cache.kv[il];
             let xin = &x;
             if profiling {
