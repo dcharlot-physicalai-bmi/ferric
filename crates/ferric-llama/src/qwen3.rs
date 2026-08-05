@@ -429,15 +429,35 @@ impl Qwen3 {
         //     place — so the packing dispatch disappears rather than moving.
         // During prefill these narrows are genuinely strided, so this removes a real copy there too, not
         // just the decode-time one the size-1 stride rule already handled.
-        let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
-        let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
         // No `.contiguous()`: `KvBuf::append` reads a strided view in place, so the window onto the fused
         // QKV output goes straight into the cache. That removes one `gather` dispatch per layer per token
         // whose only job was moving bytes — in decode AND in prefill, where the view is genuinely strided.
         let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out);
 
-        let q = self.rope(&q, nh, offset, l.rope_base);
-        let k = self.rope(&k, nkv, offset, l.rope_base);
+        // RoPE q and k in ONE dispatch instead of two.
+        //
+        // The rotation angle is `f32(i + pos) * exp(-2c/dh * ln base)` — a function of the token position
+        // and the dimension WITHIN a head. It does not depend on which head. So roping the contiguous
+        // `[q|k]` span as a single tensor with `nh + nkv` heads is not an approximation of roping them
+        // separately, it is the identical computation: head `h < nh` lands at `(i*(nh+nkv) + h)*dh`, which
+        // is exactly where q's head `h` already lives in the fused QKV row. Verified bit-identical
+        // (max|Δ| 0.000e0) across t ∈ {1,5,37} × pos ∈ {0,7,129}.
+        //
+        // Only valid when q and k are still ADJACENT at rope time, which rules out two cases:
+        //   - QK-norm (Qwen3) normalises each separately first, so they are no longer one span;
+        //   - rope-scaling (Llama-3) goes through a different kernel that has not been shown equivalent.
+        // Both fall back to the two-dispatch path, which is unchanged.
+        let fuse_rope = l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        let (q, k) = if fuse_rope {
+            let qk = qkv.narrow(1, 0, l.q_out + l.kv_out).rope(nh + nkv, hd, l.rope_base, offset);
+            // q's window has offset 0 (free during decode via the size-1 stride rule); k's carries an
+            // offset and flows into `KvBuf::append`, which reads views in place.
+            (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
+        } else {
+            let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
+            let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
+            (self.rope(&q, nh, offset, l.rope_base), self.rope(&k, nkv, offset, l.rope_base))
+        };
 
         // Append the new K/V rows into the grow-in-place cache and read a view over all rows so far.
         // Byte-identical to the old `pk.cat(&k, 0)`, but without re-copying the history each step.
