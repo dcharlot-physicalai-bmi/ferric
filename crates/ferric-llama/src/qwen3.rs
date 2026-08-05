@@ -423,9 +423,18 @@ impl Qwen3 {
             Some(w) => x.reshape(&[t, n, hd]).rmsnorm(w, self.cfg.eps).reshape(&[t, n * hd]),
             None => x,
         };
-        let q = qn(qkv.narrow(1, 0, l.q_out).contiguous(), nh, &l.q_norm);
-        let k = qn(qkv.narrow(1, l.q_out, l.kv_out).contiguous(), nkv, &l.k_norm);
-        let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out).contiguous();
+        // No `.contiguous()` on these windows either, and it is correct on BOTH branches of `qn`:
+        //   - QK-norm present (Qwen3): `reshape` materialises internally, exactly as before.
+        //   - QK-norm absent (Qwen2/Llama): the view flows into `rope`, which reads a row-major window in
+        //     place — so the packing dispatch disappears rather than moving.
+        // During prefill these narrows are genuinely strided, so this removes a real copy there too, not
+        // just the decode-time one the size-1 stride rule already handled.
+        let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
+        let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
+        // No `.contiguous()`: `KvBuf::append` reads a strided view in place, so the window onto the fused
+        // QKV output goes straight into the cache. That removes one `gather` dispatch per layer per token
+        // whose only job was moving bytes — in decode AND in prefill, where the view is genuinely strided.
+        let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out);
 
         let q = self.rope(&q, nh, offset, l.rope_base);
         let k = self.rope(&k, nkv, offset, l.rope_base);

@@ -87,10 +87,23 @@ impl Tensor {
     /// path: during decode `t == 1`, so `qkv.narrow(1, 0, q_out)` is *physically* contiguous while the
     /// naive predicate calls it strided and forces a materialising copy every layer, every token.
     ///
-    /// `offset == 0` deliberately stays required. A nonzero-offset view is contiguous in the same sense,
-    /// but only 9 kernels here thread `offset` through, so handing one to the rest would read from the
-    /// wrong place. Removing that restriction means auditing every kernel first — see
-    /// `examples/dispatch_budget.rs`, which measures what the remaining copies cost.
+    /// `offset == 0` deliberately stays required, and the reason is stronger than it first looked. An
+    /// audit of all 57 kernels found that exactly **three** thread a tensor's `offset` into every read:
+    /// `cat`, `gather` and `binary`. The other 52 index from element 0. (An earlier version of this
+    /// comment said "9", counted by grepping `offset as u32` — which double-counts call sites and, worse,
+    /// catches `rope`/`rope_scaled`, whose `offset` parameter is the **sequence position**, not a buffer
+    /// offset. The error ran in the dangerous direction: it made this guard look optional.)
+    ///
+    /// Two of the hazards are not kernels at all, which is what makes relaxing this genuinely unsafe:
+    /// `reshape` and `reduce` both rely on `contiguous()` having materialised, and read from the buffer
+    /// start. Both are corrected below, but the invariant is now explicit rather than accidental:
+    /// **`contiguous()` returns a tensor whose data begins at its `offset`, and callers that ignore
+    /// `offset` must not consume its result.**
+    ///
+    /// There is also a platform trap: `metal4_linear` honours offsets while its WGSL fallbacks
+    /// `matmul_bt` / `matmul_bt_act` do not, so relaxing this would make correctness depend on macOS and
+    /// `FERRIC_METAL4` — silently. `examples/dispatch_budget.rs` measures what the remaining copies cost;
+    /// the intended fix is a fused split kernel at the one call site that needs it, not 52 kernel edits.
     pub fn is_contiguous(&self) -> bool {
         if self.offset != 0 { return false; }
         let c = contig_strides(&self.shape);
@@ -131,7 +144,11 @@ impl Tensor {
     pub fn reshape(&self, shape: &[usize]) -> Tensor {
         assert_eq!(numel(shape), self.numel(), "reshape changes numel");
         let c = self.contiguous();
-        Tensor { ctx: c.ctx, buf: c.buf, strides: contig_strides(shape), shape: shape.to_vec(), offset: 0 }
+        // Carry `c.offset` rather than hardcoding 0. Today `contiguous()` always materialises when the
+        // offset is nonzero, so this is identical — but hardcoding it meant that the moment that stopped
+        // being true, every reshape would silently alias the HEAD of the parent buffer. Shapes and numel
+        // still match, nothing asserts, and the model emits fluent wrong text.
+        Tensor { ctx: c.ctx, buf: c.buf, strides: contig_strides(shape), shape: shape.to_vec(), offset: c.offset }
     }
     pub fn permute(&self, perm: &[usize]) -> Tensor {
         assert_eq!(perm.len(), self.rank(), "permute rank mismatch");
@@ -340,10 +357,24 @@ impl Tensor {
 
     /// Rotary position embedding (NeoX rotate-half) on a [T, n_heads·head_dim] tensor.
     pub fn rope(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
-        let c = self.contiguous();
+        // A rank-2 row-major window is read in place; anything else is packed first. The kernel addresses
+        // the input as (src_off + row * src_row_stride + col), which describes exactly that family of
+        // views and nothing more — a permuted or higher-rank view must still be materialised, and saying
+        // so here is far cheaper than a shader that quietly reads the wrong elements.
+        let owned;
+        let c = if self.rank() == 2 && self.strides[1] == 1 {
+            self
+        } else {
+            owned = self.contiguous();
+            &owned
+        };
         let t = c.numel() / (n_heads * head_dim);
         let out = empty(&self.ctx, c.numel());
-        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])], groups(t * n_heads));
+        // `src_row_stride` lets a strided window (e.g. `qkv.narrow(1, ..)`) be read in place rather than
+        // packed first — one fewer `gather` dispatch per layer per token. A packed input gives
+        // src_off = 0 and src_row_stride = h*dh, which reduces ib to exactly the old shared base.
+        let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
+        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, c.offset as u32, srs as u32])], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -708,6 +739,10 @@ impl Tensor {
         // Large reduced axes go through staged grid-stride passes so the work parallelizes —
         // the plain kernel gives each output ONE thread, catastrophic when outer is small
         // (a scalar sum over 8M elements = one thread, ~100 ms).
+        // The reduce kernels index from element 0, so this discards `moved`'s offset. Sound only while
+        // `contiguous()` materialises a fresh packed buffer. Asserted rather than assumed: if that
+        // invariant ever changes, this fails loudly here instead of quietly reducing the wrong elements.
+        debug_assert_eq!(moved.offset, 0, "reduce reads from the buffer start; contiguous() must materialise");
         let mut src = moved.buf.clone();
         let mut red = red;
         while red > 4096 {
@@ -845,24 +880,62 @@ impl Tensor {
     }
 }
 
-// A tiny copy kernel: dst[dst_off + i] = src[i]. Used to append K/V rows into a preallocated cache
-// buffer in place. Dispatched through `run()`, so it inherits batch ordering + buffer retention.
+// Append K/V rows into a preallocated cache buffer in place, reading a **strided rank-2 view** of the
+// source directly rather than a packed copy of it.
+//
+// That last part is the point. The V tensor arrives as `qkv.narrow(1, off, kv_out)` — a window onto the
+// fused QKV output — and the previous version called `.contiguous()` on it, which is a whole extra
+// `gather` dispatch per layer per token doing nothing but moving bytes. Reading the view in place folds
+// that copy into the write that was happening anyway: 2 dispatches become 1.
+//
+// Both source terms are seeded from the *tensor's* `offset` and `strides`, which is the `gather`/`cat`
+// pattern. It is deliberately NOT the `rope` pattern, where a parameter named `offset` is the sequence
+// position — see `Tensor::is_contiguous`.
+//
+// Dispatched through `run()`, so it inherits batch ordering + buffer retention.
 const KV_WRITE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>       src: array<f32>;
 @group(0) @binding(1) var<storage,read_write> dst: array<f32>;
-@group(0) @binding(2) var<uniform>            info: vec4<u32>;   // dst_off, n, grid_w, _
+// info[0] = (dst_off, n, grid_w, src_off);  info[1] = (cols, row_stride, _, _)
+@group(0) @binding(2) var<uniform>            info: array<vec4<u32>, 2>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * info.z;
-    if (i < info.y) { dst[info.x + i] = src[i]; }
+    let i = gid.x + gid.y * info[0].z;
+    if (i >= info[0].y) { return; }
+    let cols = info[1].x;
+    let r = i / cols;
+    let c = i - r * cols;
+    dst[info[0].x + i] = src[info[0].w + r * info[1].y + c];
 }
 "#;
+/// Copy `src` (a rank-2 `[rows, cols]` tensor, possibly a strided/offset **view**) into `dst` starting at
+/// element `dst_off`, packed.
+///
+/// `src` is NOT materialised first. It does not need to be: the kernel reads through `src.offset` and
+/// `src.strides[0]`, so a window onto a larger buffer is read in place. This is correct for both decode
+/// (`rows == 1`, a contiguous run at an offset) and prefill (`rows > 1`, genuinely strided).
 fn write_rows(ctx: &Context, dst: &wgpu::Buffer, dst_off: usize, src: &Tensor) {
-    let src = src.contiguous();
+    assert_eq!(src.rank(), 2, "write_rows expects a 2D [rows, cols] tensor");
     let n = src.numel();
     if n == 0 { return; }
+    let (rows, cols) = (src.shape[0], src.shape[1]);
+    // Only a row-major view can be read by (row_stride, +1) addressing. Anything else — a permute, a
+    // narrow along dim 1 of a >2D tensor flattened oddly — must still be packed first, and saying so
+    // here is cheaper than a shader that silently reads the wrong elements.
+    let src_owned;
+    let v = if src.strides[1] == 1 {
+        src
+    } else {
+        src_owned = src.contiguous();
+        &src_owned
+    };
+    let row_stride = if rows > 1 { v.strides[0] } else { cols };
     let (grid, rs) = groups2d(n);
-    run(ctx, KV_WRITE_WGSL, "kv_write", &[&src.buf, dst, &unibuf(ctx, &[dst_off as u32, n as u32, rs, 0])], grid);
+    run(ctx, KV_WRITE_WGSL, "kv_write",
+        &[&v.buf, dst, &unibuf(ctx, &[
+            dst_off as u32, n as u32, rs, v.offset as u32,
+            cols as u32, row_stride as u32, 0, 0,
+        ])], grid);
 }
 
 /// A **grow-in-place K/V cache buffer**. Instead of re-concatenating the whole history every decode
@@ -1126,7 +1199,13 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
     });
     DISPATCHES.with(|c| c.set(c.get() + 1));
-    if std::env::var_os("FERRIC_TRACE_KERNELS").is_some() { eprintln!("KERNEL\t{label}"); }
+    // Kernel-name tracing, cached: this sits on the hot path (hundreds of dispatches per token), so the
+    // env lookup happens once rather than per dispatch. Worth keeping — tracing labels is what showed the
+    // per-token cost was 3 `gather` copies per layer rather than the attention everyone assumes.
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("FERRIC_TRACE_KERNELS").is_some()) {
+        eprintln!("KERNEL\t{label}");
+    }
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
         pass.set_pipeline(&pipe);
@@ -1502,19 +1581,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const ROPE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-@group(0) @binding(2) var<storage,read>        info: array<u32>; // t, h, dh, bitcast(base), offset
+// info: t, h, dh, bitcast(base), pos_off, src_off, src_row_stride
+//
+// `pos_off` (info[4]) is the SEQUENCE POSITION — the token's index in the stream. `src_off` (info[5]) is
+// the input tensor's BUFFER offset. They are different things that have both been called "offset", and
+// conflating them is the standard way to get this wrong; they are kept in separate slots deliberately.
+@group(0) @binding(2) var<storage,read>        info: array<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]); let off = info[4];
     let id = gid.x; if (id >= t * h) { return; }
     let i = id / h; let head = id % h; let half = dh / 2u;
-    let o = (i * h + head) * dh; let lb = log(base);
+    // Input and output bases MUST stay separate. `out` is allocated packed at exactly numel, so folding
+    // src_off into a single shared base would push every write past the end — and WGSL silently discards
+    // out-of-bounds stores, which would make rope return zeros with no crash and no error.
+    let ob = (i * h + head) * dh;
+    let ib = info[5] + i * info[6] + head * dh;
+    let lb = log(base);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
         let inv = exp(-2.0 * f32(c) / f32(dh) * lb);
         let ang = f32(i + off) * inv; let cs = cos(ang); let sn = sin(ang);
-        let x1 = x[o + c]; let x2 = x[o + c + half];
-        out[o + c] = x1 * cs - x2 * sn;
-        out[o + c + half] = x2 * cs + x1 * sn;
+        let x1 = x[ib + c]; let x2 = x[ib + c + half];
+        out[ob + c] = x1 * cs - x2 * sn;
+        out[ob + c + half] = x2 * cs + x1 * sn;
     }
 }
 "#;

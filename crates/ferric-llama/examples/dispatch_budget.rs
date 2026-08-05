@@ -110,22 +110,23 @@ async fn run() {
     println!("  At Chrome's OWN 33 µs that is {chrome_ms:.1} ms/token of launch overhead against {ms:.1} ms/token");
     println!("  measured natively — so in a browser Ferric is dispatch-bound, not compute-bound. Firefox");
     println!("  projects to {ff_ms:.0} ms/token of overhead alone.\n");
-    println!("  Tracing the kernels shows QKV, flash-attention and add+rmsnorm are ALREADY fused (4");
-    println!("  matmuls, 1 fattn, 1 add_rmsnorm per layer). The fat was elsewhere: `gather` — pure");
-    println!("  data movement doing no math — ran 3x per layer, materialising the q/k/v slices of the");
-    println!("  fused QKV output. During decode t==1, so those slices are PHYSICALLY contiguous and the");
-    println!("  copies were only there because the stride predicate ignored that a size-1 dimension");
-    println!("  constrains nothing. Fixing it removed the q copy: 410 -> {per_tok:.0} dispatches/token.\n");
-    println!("  Still open, and now precisely priced: k and v keep their copies (2/layer = 48/token, 12%)");
-    println!("  because their views carry a nonzero offset and only 9 kernels thread `offset` through.");
-    println!("  Closing it means auditing those kernels or splitting QKV in one dispatch — worth doing,");
-    println!("  and worth doing deliberately rather than by loosening a safety check.");
+    println!("  Tracing the kernels showed QKV, flash-attention and add+rmsnorm were ALREADY fused. The");
+    println!("  fat was `gather` — pure data movement doing no math — running 3x per layer to pack the");
+    println!("  q/k/v windows of the fused QKV output. All three are now gone (410 -> {per_tok:.0}/token,");
+    println!("  a 17.6% cut), by teaching the two kernels that actually consume those windows to read a");
+    println!("  strided view in place: `kv_write` and `rope`.\n");
+    println!("  What was NOT done matters more. The tempting fix was to relax the `offset == 0` guard in");
+    println!("  is_contiguous() so every view could skip packing. An audit of all 57 kernels found only");
+    println!("  THREE honour a tensor's buffer offset (cat, gather, binary); 52 index from element 0.");
+    println!("  Worse, two hazards are not kernels at all — `reshape` and `reduce` read from the buffer");
+    println!("  start — and `metal4_linear` honours offsets while its WGSL fallback does not, which would");
+    println!("  have made correctness depend on macOS, silently. Two kernels changed instead of 52.");
 
     // Regression guard at the MEASURED value, not an aspirational one — a threshold that passes today
     // while the number is bad teaches nothing. This fails if the count grows.
     assert!(
-        per_layer <= 16.5,
-        "{per_layer:.1} dispatches per layer per token, up from the 16.1 measured when this was written. \
+        per_layer <= 14.5,
+        "{per_layer:.1} dispatches per layer per token, up from the 14.1 measured when this was written. \
          Dispatch count is Ferric's portability budget: at Firefox's ~1040 µs this is {ff_ms:.0} ms/token \
          of pure launch overhead."
     );

@@ -43,9 +43,21 @@ This section previously said Ferric was already "the right shape" here because i
 
 `batch` collapses *queue submissions* — ~1 per layer, genuinely good. But the Firefox penalty is per **dispatch**, and dispatches were **410 per token, 17.1 per layer**. Submission batching does not protect against this cliff at all. At Chrome's *own* 33 µs that is 13.5 ms/token of pure launch overhead — so in a browser Ferric is dispatch-bound, not compute-bound.
 
-Tracing which kernels those were corrected the obvious next guess too. QKV, flash-attention and add+rmsnorm are **already fused**. The fat was `gather` — pure data movement doing no math — running 3× per layer to materialise the q/k/v slices of the fused QKV output. During decode `t == 1`, so those slices are *physically* contiguous; the copies existed only because the contiguity predicate compared a size-1 dimension's stride, which constrains nothing. Fixing the predicate removed the q copy: **410 → 386 dispatches/token**, with every exactness check unchanged.
+Tracing which kernels those were corrected the obvious next guess too. QKV, flash-attention and add+rmsnorm are **already fused**. The fat was `gather` — pure data movement doing no math — running 3× per layer to materialise the q/k/v windows of the fused QKV output.
 
-The k and v copies remain (2/layer, 48/token, 12%) because their views carry a nonzero offset and only 9 kernels thread `offset` through. That is worth closing deliberately — by auditing those kernels or splitting QKV in one dispatch — rather than by loosening a safety check. `dispatch_budget` asserts the count so a future change that fans out fails there instead of quietly becoming a Firefox cliff.
+All three are now gone: **410 → 338 dispatches/token, a 17.6% cut**, with every exactness check unchanged and `gather` at literally zero per token. In the browser, where the analysis said Ferric is dispatch-bound rather than compute-bound, that shows up directly: the headed-Chrome demo went **495 → 271 ms/token, 1.83×**, on the same model and prompt.
+
+### What was deliberately *not* done, and why it matters more
+
+The tempting fix was to relax the `offset == 0` guard in `is_contiguous()` so every view could skip packing. A 15-agent audit of all 57 kernels — each SAFE verdict then handed to an adversarial skeptic — killed that idea:
+
+- **Only 3 kernels honour a tensor's buffer offset** (`cat`, `gather`, `binary`). 52 index from element 0. An earlier comment in this repo claimed "9", counted by grepping `offset as u32`; that grep double-counts call sites and, worse, catches `rope`/`rope_scaled`, whose `offset` parameter is the **sequence position**. The error ran in the dangerous direction — it made the guard look optional.
+- **Two hazards are not kernels at all.** `reshape` kept the buffer but hardcoded `offset: 0`; `reduce` discarded the tensor wrapper entirely. Both were correct only because `contiguous()` always materialises. Relax the guard and every `reshape` silently aliases the head of the parent buffer — same shapes, same numel, no assert, fluent wrong text.
+- **It would have introduced a platform split.** `metal4_linear` honours offsets while its WGSL fallbacks `matmul_bt`/`matmul_bt_act` do not, so correctness would have become macOS-and-`FERRIC_METAL4`-dependent, silently.
+
+So the fix was two kernels, not 52: `kv_write` and `rope` now read a **row-major strided view in place** (`src_off` and `src_row_stride` as their own info slots, never reusing the rope-position slot). One subtlety was load-bearing — `out` is allocated at exactly `numel`, so folding the source offset into rope's single shared base would have pushed every write past the end, and **WGSL silently discards out-of-bounds stores**, so rope would have returned zeros with no crash. Input and output bases are kept separate.
+
+`reshape` and `reduce` were fixed anyway (a no-op today, a landmine otherwise), and `dispatch_budget` asserts the per-layer count so a future fan-out fails there instead of quietly becoming a Firefox cliff.
 
 ## Closed since: chunked prefill, and a ceiling that was not where anyone would look
 
@@ -84,6 +96,5 @@ own history, fluent and wrong).
 
 ## Still open
 
-- **The k/v slice copies** — 48 dispatches/token (12%), priced above; needs an `offset` audit or a one-dispatch QKV split.
 - **Disaggregated prefill/decode** — matters at multi-GPU scale, which is not Ferric's near-term shape.
 - **Wiring `ferric-kv` into `qwen3::Cache`** — the crate is complete and tested; the model still uses the contiguous cache.
