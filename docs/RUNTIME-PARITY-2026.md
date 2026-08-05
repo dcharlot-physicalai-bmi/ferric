@@ -119,3 +119,39 @@ own history, fluent and wrong).
 
 - **Disaggregated prefill/decode** — matters at multi-GPU scale, which is not Ferric's near-term shape.
 - **Wiring `ferric-kv` into `qwen3::Cache`** — the crate is complete and tested; the model still uses the contiguous cache.
+
+
+## Where decode time actually goes (profiled, 2026-08-05)
+
+Four bottleneck hypotheses were proposed and falsified this session. Rather than propose a fifth, the
+decode loop was profiled with `sample` and the candidates measured directly. What is now **established**:
+
+| claim | verdict | evidence |
+|---|---|---|
+| dispatch-launch-bound | **false** | 410 → 290 dispatches/token (−29%) changed decode by 0.00 ms |
+| memory-bandwidth-bound | **false** | "47 GB/s" was bytes ÷ wall clock, and wall clock is ~half host time |
+| CPU-bound by 14× | **false** | measured on a busy machine; does not reproduce |
+| logits readback (608 KB/token) | **false** | 0.45 ms/token, 4% of a step |
+| info-buffer allocation | **real but unfixable this way** | 1.29 ms/token; pooling made it *worse* (1.47–1.78) |
+
+The profile: **62.9% of main-thread time is `__psynch_cvwait`**, plus 6.3% `mach_msg2_trap` — about 69%
+**blocked**, not computing. The main thread is not CPU-saturated. Everything else is scattered below 1%
+(wgpu resource-tracker drop glue, SipHash, Metal's range allocator, `memset`) with no hot function.
+
+So the shape is: **10.81 ms/token = 5.79 ms host + 4.95 ms device, fully serialised.** Single-sequence
+greedy decode has a hard dependency — token *N+1* needs token *N*'s output — so the host cannot run ahead
+and the device idles while commands are built, and vice versa. There is no hot spot to fix because the
+cost is the *round trip*, ~290 dispatches deep, once per token.
+
+That reframes the remedies, and notably the most promising one is already built:
+
+- **Batch sequences.** `ferric_kv::Scheduler` (continuous batching) amortises one host build across many
+  sequences, which is precisely the axis this structure penalises. Its measured win was per-request
+  latency; this suggests it should also lift aggregate throughput, which has not been measured.
+- **Reduce host build time.** ~4 ms of the 5.79 remains unattributed by `host_ns()`; the profile shows it
+  is diffuse rather than concentrated, so this is death-by-a-thousand-cuts, not one fix.
+- **Speculative decoding** would break the serial dependency — the only remedy that attacks the structure
+  rather than its symptoms.
+
+The lesson for anyone continuing: this file has recorded four confident wrong answers. Do not add a
+fifth without a host/device split *and* an A/B against a baseline built from a `git worktree`.
