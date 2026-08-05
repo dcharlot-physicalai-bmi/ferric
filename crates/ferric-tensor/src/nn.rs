@@ -208,6 +208,59 @@ pub fn masked_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, n_
 }
 
 /// Additive causal mask [T,T]: 0 on/below the diagonal, −∞ above (broadcasts over heads on add).
+/// Causal attention where the queries are the **last `t_q` positions** of a longer history.
+///
+/// The case between full prefill (`t_q == t_kv`) and single-token decode (`t_q == 1`), and Ferric had
+/// neither a kernel nor a mask for it. Two capabilities need exactly this:
+///
+/// - **prefix caching** — the shared prompt's KV is already in the cache, so only the new suffix is
+///   prefilled against a much longer history;
+/// - **chunked prefill** — a long prompt processed in bounded pieces instead of one quadratic pass, which
+///   is what keeps peak activation memory flat.
+///
+/// Query `i` sits at absolute position `offset + i`, where `offset = t_kv − t_q`, and attends to keys
+/// `0 ..= offset + i`. Getting that offset wrong is a silent bug: the model still produces fluent text,
+/// having simply attended to the wrong span.
+pub fn chunked_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    softcap: f32,
+) -> Tensor {
+    let (tq, d) = (q.shape[0], q.shape[1]);
+    let tkv = k.shape[0];
+    assert!(tkv >= tq, "chunked_attention: {tq} queries against a shorter {tkv}-key history");
+    if tq == tkv { return causal_attention(q, k, v, n_heads, n_kv_heads, softcap); }
+    let dh = d / n_heads;
+    let g = n_heads / n_kv_heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh = q.reshape(&[tq, n_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nh, tq, dh]
+    let kv_heads = |x: &Tensor| {
+        let hx = x.reshape(&[tkv, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous(); // [nkv, tkv, dh]
+        hx.reshape(&[n_kv_heads, 1, tkv, dh]).broadcast_to(&[n_kv_heads, g, tkv, dh])
+            .reshape(&[n_heads, tkv, dh])
+    };
+    let (kh, vh) = (kv_heads(k), kv_heads(v));
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap); // [nh, tq, tkv]
+    let probs = scores.add(&offset_causal_mask(q, tq, tkv)).softmax(2);
+    let ctx = probs.matmul(&vh);                                                            // [nh, tq, dh]
+    ctx.permute(&[1, 0, 2]).reshape(&[tq, d])
+}
+
+/// Mask for [`chunked_attention`]: row `i` may see keys up to `(t_kv − t_q) + i`.
+fn offset_causal_mask(like: &Tensor, tq: usize, tkv: usize) -> Tensor {
+    let off = tkv - tq;
+    let mut m = vec![0.0f32; tq * tkv];
+    for i in 0..tq {
+        for j in (off + i + 1)..tkv {
+            m[i * tkv + j] = -1e30;
+        }
+    }
+    Tensor::from_vec(&like.ctx_arc(), &m, &[tq, tkv])
+}
+
 fn causal_mask(like: &Tensor, t: usize) -> Tensor {
     let mut m = vec![0.0f32; t * t];
     for i in 0..t {

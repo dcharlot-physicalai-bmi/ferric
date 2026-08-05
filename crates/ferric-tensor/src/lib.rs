@@ -884,6 +884,28 @@ impl KvBuf {
         self.len = need;
         Tensor::from_arc(ctx, self.buf.clone().unwrap(), &[self.len, width])
     }
+
+    /// A new cache holding a **copy** of this one's first `rows`.
+    ///
+    /// This is what makes prefix reuse possible with a contiguous cache: a request sharing a long prompt
+    /// gets that prompt's KV copied device-to-device instead of recomputed. On a 24-layer model an 8k
+    /// shared prefix is on the order of a hundred megabytes of copy against *seconds* of prefill.
+    ///
+    /// A copy rather than a shared `Arc`: `append` writes in place, so two sequences pointing at one
+    /// buffer would overwrite each other's history — silently, since both would still read
+    /// plausible-looking KV.
+    pub fn clone_prefix(&self, ctx: &Arc<Context>, rows: usize) -> KvBuf {
+        let rows = rows.min(self.len);
+        if rows == 0 || self.width == 0 { return KvBuf::default(); }
+        let cap = rows.max(64);
+        let nb = Arc::new(empty(ctx, cap * self.width));
+        let src = Tensor::from_arc(ctx, self.buf.clone().expect("len>0 implies a buffer"), &[rows, self.width]);
+        write_rows(ctx, &nb, 0, &src);
+        KvBuf { buf: Some(nb), len: rows, cap, width: self.width }
+    }
+
+    /// Row width in elements, or 0 before the first append.
+    pub fn width(&self) -> usize { self.width }
 }
 
 // ---------- device plumbing (uses ferric-core Context's public device/queue) ----------

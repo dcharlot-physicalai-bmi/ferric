@@ -146,6 +146,13 @@ pub struct Cache {
 }
 impl Cache {
     pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() } }
+    /// Per-layer (K, V) buffers — for a prefix cache that copies them.
+    pub fn layers(&self) -> &[(KvBuf, KvBuf)] { &self.kv }
+    /// Install pre-computed KV, e.g. a prefix copied from an earlier request.
+    ///
+    /// The caller must set [`Cache::pos`] to match; `crate::prefix::PrefixCache::seed` does both, and
+    /// getting them out of step means the model ropes the next token at the wrong position.
+    pub fn set_layers(&mut self, kv: Vec<(KvBuf, KvBuf)>) { self.kv = kv; }
 }
 
 /// Where the token-embedding rows come from.
@@ -442,7 +449,9 @@ impl Qwen3 {
         } else if t == s && s <= 65535 && hd <= 128 && sc == 0.0 {
             q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
         } else {
-            nn::causal_attention(&q, &kc, &vc, nh, nkv, sc)
+            // chunked_attention delegates to causal_attention when q covers the whole history, so
+            // this one call serves full prefill, prefix-cached suffixes and chunked prefill alike.
+            nn::chunked_attention(&q, &kc, &vc, nh, nkv, sc)
         };
         self.grab(format!("l{il}.wo"), &o); // GPTQ calibration: capture wo input
         o.matmul_q(&l.wo)
