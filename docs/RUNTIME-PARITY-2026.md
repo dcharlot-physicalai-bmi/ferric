@@ -37,7 +37,15 @@ COW *was* written first. It came out when its test turned out to assert nothing 
 
 ## A cross-fabric finding worth acting on
 
-**Firefox's WebGPU per-dispatch cost is ~1,040 µs against Chrome's 33 µs — 30× worse** ([browser benchmark data](https://deciphertech.io/blogs/how-browser-llm-inference-became-production-ready-in-2026-what-the-benchmark-data-reveals/)). Any design that issues many small dispatches per token is not portable; it is Chrome-only with a Firefox-shaped cliff. Ferric batches into 10 regions per layer via `ferric_tensor::batch`, which is the right shape — but this is a portability budget worth measuring against, not assuming.
+**Firefox's WebGPU per-dispatch cost is ~1,040 µs against Chrome's 33 µs — 30× worse** ([browser benchmark data](https://deciphertech.io/blogs/how-browser-llm-inference-became-production-ready-in-2026-what-the-benchmark-data-reveals/)). Any design that issues many small dispatches per token is not portable; it is Chrome-only with a Firefox-shaped cliff.
+
+This section previously said Ferric was already "the right shape" here because it batches into regions per layer via `ferric_tensor::batch`. **Measuring it overturned that** (`examples/dispatch_budget.rs`, exact host-side counts, no timing involved):
+
+`batch` collapses *queue submissions* — ~1 per layer, genuinely good. But the Firefox penalty is per **dispatch**, and dispatches were **410 per token, 17.1 per layer**. Submission batching does not protect against this cliff at all. At Chrome's *own* 33 µs that is 13.5 ms/token of pure launch overhead — so in a browser Ferric is dispatch-bound, not compute-bound.
+
+Tracing which kernels those were corrected the obvious next guess too. QKV, flash-attention and add+rmsnorm are **already fused**. The fat was `gather` — pure data movement doing no math — running 3× per layer to materialise the q/k/v slices of the fused QKV output. During decode `t == 1`, so those slices are *physically* contiguous; the copies existed only because the contiguity predicate compared a size-1 dimension's stride, which constrains nothing. Fixing the predicate removed the q copy: **410 → 386 dispatches/token**, with every exactness check unchanged.
+
+The k and v copies remain (2/layer, 48/token, 12%) because their views carry a nonzero offset and only 9 kernels thread `offset` through. That is worth closing deliberately — by auditing those kernels or splitting QKV in one dispatch — rather than by loosening a safety check. `dispatch_budget` asserts the count so a future change that fans out fails there instead of quietly becoming a Firefox cliff.
 
 ## Closed since: chunked prefill, and a ceiling that was not where anyone would look
 
@@ -76,5 +84,6 @@ own history, fluent and wrong).
 
 ## Still open
 
+- **The k/v slice copies** — 48 dispatches/token (12%), priced above; needs an `offset` audit or a one-dispatch QKV split.
 - **Disaggregated prefill/decode** — matters at multi-GPU scale, which is not Ferric's near-term shape.
 - **Wiring `ferric-kv` into `qwen3::Cache`** — the crate is complete and tested; the model still uses the contiguous cache.

@@ -80,7 +80,22 @@ impl Tensor {
     /// those entry points from outside this crate. In-crate callers reached the private field directly.
     pub fn buf_arc(&self) -> &Arc<wgpu::Buffer> { &self.buf }
     pub fn rank(&self) -> usize { self.shape.len() }
-    pub fn is_contiguous(&self) -> bool { self.strides == contig_strides(&self.shape) && self.offset == 0 }
+    /// Is this view already laid out as a packed row-major buffer?
+    ///
+    /// A dimension of extent 1 imposes no constraint on its stride — there is no second element for it to
+    /// reach — so comparing it against the packed stride reports a false negative. That matters on the hot
+    /// path: during decode `t == 1`, so `qkv.narrow(1, 0, q_out)` is *physically* contiguous while the
+    /// naive predicate calls it strided and forces a materialising copy every layer, every token.
+    ///
+    /// `offset == 0` deliberately stays required. A nonzero-offset view is contiguous in the same sense,
+    /// but only 9 kernels here thread `offset` through, so handing one to the rest would read from the
+    /// wrong place. Removing that restriction means auditing every kernel first — see
+    /// `examples/dispatch_budget.rs`, which measures what the remaining copies cost.
+    pub fn is_contiguous(&self) -> bool {
+        if self.offset != 0 { return false; }
+        let c = contig_strides(&self.shape);
+        self.shape.iter().zip(&self.strides).zip(&c).all(|((&d, &s), &cs)| d == 1 || s == cs)
+    }
 
     // ---- construction / io ----
     pub fn from_vec(ctx: &Arc<Context>, data: &[f32], shape: &[usize]) -> Tensor {
@@ -1111,6 +1126,7 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
     });
     DISPATCHES.with(|c| c.set(c.get() + 1));
+    if std::env::var_os("FERRIC_TRACE_KERNELS").is_some() { eprintln!("KERNEL\t{label}"); }
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
         pass.set_pipeline(&pipe);
