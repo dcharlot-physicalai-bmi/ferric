@@ -35,7 +35,9 @@
 #![forbid(unsafe_code)]
 
 mod radix;
+mod sched;
 pub use radix::{RadixIndex, SharedPrefix};
+pub use sched::{Batch, Idle, Request, Running, Scheduler};
 
 /// A physical block id — an index into whatever storage the caller owns.
 pub type BlockId = u32;

@@ -430,7 +430,9 @@ impl Tensor {
         let c = self.contiguous();
         let t = c.numel() / (2 * d);
         let out = empty(&self.ctx, t * d);
-        run(&self.ctx, SWIGLU_WGSL, "swiglu", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[(t * d) as u32, d as u32])], groups(t * d));
+        let (grid, rs) = groups2d(t * d);
+        run(&self.ctx, SWIGLU_WGSL, "swiglu",
+            &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[(t * d) as u32, d as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![t, d])
     }
 
@@ -671,7 +673,8 @@ impl Tensor {
         let c = self.contiguous();
         let out = empty(&self.ctx, idx.len() * d);
         let idxbuf = u32buf(&self.ctx, idx);
-        run(&self.ctx, GATHER_ROWS_WGSL, "gather_rows", &[c.buf.as_ref(), &idxbuf, &out, &u32buf(&self.ctx, &[idx.len() as u32, d as u32])], groups(idx.len() * d));
+        let (ggrid, grs) = groups2d(idx.len() * d);
+        run(&self.ctx, GATHER_ROWS_WGSL, "gather_rows", &[c.buf.as_ref(), &idxbuf, &out, &u32buf(&self.ctx, &[idx.len() as u32, d as u32, grs])], ggrid);
         Tensor::from_parts(&self.ctx, out, vec![idx.len(), d])
     }
     pub(crate) fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
@@ -1083,7 +1086,24 @@ enum Seg {
 pub fn op_counters() -> (u64, u64) { (DISPATCHES.with(|c| c.get()), SUBMITS.with(|c| c.get())) }
 pub fn reset_op_counters() { DISPATCHES.with(|c| c.set(0)); SUBMITS.with(|c| c.set(0)); }
 
+/// Every backend caps workgroups-per-dimension; WebGPU's floor is 65,535 and wgpu enforces it.
+///
+/// Exceeding it is not a slowdown — the driver rejects the dispatch. A per-element kernel over a large
+/// matrix hits this quickly: a one-pass 1024-token prefill on a 14-head model already asks for 155,648
+/// groups in x. The proper fix is to fold the excess into y and have the shader linearise via
+/// `num_workgroups`, which is a change to every shader; until then this turns an opaque validation error
+/// into one that names the kernel and says what to do.
+const MAX_WORKGROUPS_PER_DIM: u32 = 65_535;
+
 fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32, u32, u32)) {
+    assert!(
+        g.0 <= MAX_WORKGROUPS_PER_DIM && g.1 <= MAX_WORKGROUPS_PER_DIM && g.2 <= MAX_WORKGROUPS_PER_DIM,
+        "kernel '{label}' asked for {:?} workgroups; the per-dimension limit is {MAX_WORKGROUPS_PER_DIM}. \
+         This is a hard driver limit on every fabric, not a memory-pressure slowdown. Either process the \
+         input in chunks (see nn::chunked_attention and examples/chunked_prefill.rs) or fold the excess \
+         into the y dimension and linearise in the shader via num_workgroups.",
+        g
+    );
     let pipe = pipeline_for(ctx, wgsl, label);
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
@@ -1818,7 +1838,8 @@ const GATHER_ROWS_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read>        info: array<u32>; // n, d
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n = info[0]; let d = info[1]; let t = gid.x;
+    // 2D grid: idx.len()*d exceeds the 65,535-workgroup 1D cap on any wide model at long context.
+    let n = info[0]; let d = info[1]; let t = gid.x + gid.y * info[2];
     if (t >= n * d) { return; }
     let i = t / d; let j = t % d;
     out[i * d + j] = table[idx[i] * d + j];
@@ -1847,10 +1868,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const SWIGLU_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        gu:  array<f32>;   // [t, 2d]
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;   // [t, d]
-@group(0) @binding(2) var<storage,read>        info: array<u32>;  // n(=t·d), d
+@group(0) @binding(2) var<storage,read>        info: array<u32>;  // n(=t·d), d, row_stride
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x; let n = info[0]; let d = info[1];
+    // 2D grid: n = t·d exceeds the 65,535-workgroup 1D cap at ~862 tokens on a 4864-wide FFN, which is
+    // LINEAR in prompt length — the ceiling was the SwiGLU elementwise kernel, not attention.
+    let i = gid.x + gid.y * info[2]; let n = info[0]; let d = info[1];
     if (i >= n) { return; }
     let row = i / d; let col = i % d;
     let g = gu[row * 2u * d + col];
