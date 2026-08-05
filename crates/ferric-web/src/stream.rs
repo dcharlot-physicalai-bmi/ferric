@@ -56,6 +56,15 @@ async fn fetch_range(f: &js_sys::Function, offset: u64, len: usize) -> Result<Ve
     Ok(arr.to_vec())
 }
 
+/// Tokens per prefill chunk in the browser.
+///
+/// A single-pass prefill materialises a `[T, T]` score matrix per head — quadratic in the prompt. A tab
+/// is the tightest memory budget of any embodiment Ferric runs in, so the prompt is fed in bounded
+/// pieces: peak becomes `[CHUNK, T]`, flat in the chunk rather than quadratic in the prompt. Predictions
+/// are unaffected — chunking changes only how the same attention is scheduled, which is asserted against
+/// a full-attention reference in `ferric-tensor/examples/chunked_attn.rs`.
+const PREFILL_CHUNK: usize = 128;
+
 #[wasm_bindgen]
 pub struct FerricStream {
     model: Qwen3,
@@ -222,40 +231,58 @@ impl FerricStream {
     /// [`Qwen3::step_layer`] can be awaited between layers; a monolithic forward cannot pause, and on
     /// wasm there is no thread to block on a read, which is what previously pinned the peak at the entire
     /// weight set regardless of the budget.
+    /// One forward pass over `toks`, streaming each layer's weights in and releasing them behind it.
+    ///
+    /// Split out of `generate` so a long prompt can be fed in chunks without duplicating the staging
+    /// logic — the release pattern here is what actually bounds the tab's peak, and having two copies of
+    /// it would be how they drift apart.
+    async fn forward_slice(&mut self, toks: &[u32], cache: &mut Cache) -> Result<Vec<f32>, JsValue> {
+        let npin = self.plan.npin;
+        // Stage only the embedding rows this step will look up — a few KB out of 144.6 MB.
+        for &t in toks {
+            let (off, rb) = self.model.embd_row_extent(t, self.embd_base);
+            if !self.staged.is_staged(off, rb) {
+                let b = fetch_range(&self.fetcher, off, rb).await?;
+                self.staged.stage(off, b);
+            }
+        }
+        let mut st = self.model.step_begin(toks, cache);
+        while let Some(il) = st.next_layer() {
+            if il >= npin {
+                let d = self.runs[il];
+                if !self.staged.is_staged(d.offset, d.bytes as usize) {
+                    let b = fetch_range(&self.fetcher, d.offset, d.bytes as usize).await?;
+                    self.staged.stage(d.offset, b);
+                }
+            }
+            let done = self.model.step_layer(&mut st, cache);
+            // The tier copied these bytes into its own slot during the bind, so the staged range can
+            // go immediately — this release is what actually bounds the peak.
+            if il > npin { self.staged.release(self.runs[il - 1].offset); }
+            if done { break; }
+        }
+        if self.runs.len() > npin { self.staged.release(self.runs[self.runs.len() - 1].offset); }
+        Ok(self.model.step_finish(st, cache).to_vec().await)
+    }
+
     pub async fn generate(&mut self, prompt: &str, n: usize) -> Result<String, JsValue> {
         let mut all = self.bpe.encode(prompt);
         let mut cache = Cache::new(&self.model.cfg);
         let mut fed = 0usize;
         let mut out = String::new();
-        let npin = self.plan.npin;
 
         for _ in 0..n {
-            // Stage only the embedding rows this step will look up — a few KB out of 144.6 MB.
-            for &t in &all[fed..] {
-                let (off, rb) = self.model.embd_row_extent(t, self.embd_base);
-                if !self.staged.is_staged(off, rb) {
-                    let b = fetch_range(&self.fetcher, off, rb).await?;
-                    self.staged.stage(off, b);
-                }
+            // Chunked prefill. Only the first iteration has more than one pending token, so this costs
+            // nothing during decode and bounds the peak exactly where it would otherwise be quadratic.
+            let mut logits = Vec::new();
+            let mut i = fed;
+            loop {
+                let end = (i + PREFILL_CHUNK).min(all.len());
+                let slice = all[i..end].to_vec();
+                logits = self.forward_slice(&slice, &mut cache).await?;
+                i = end;
+                if i >= all.len() { break; }
             }
-            let mut st = self.model.step_begin(&all[fed..], &cache);
-            while let Some(il) = st.next_layer() {
-                if il >= npin {
-                    let d = self.runs[il];
-                    if !self.staged.is_staged(d.offset, d.bytes as usize) {
-                        let b = fetch_range(&self.fetcher, d.offset, d.bytes as usize).await?;
-                        self.staged.stage(d.offset, b);
-                    }
-                }
-                let done = self.model.step_layer(&mut st, &mut cache);
-                // The tier copied these bytes into its own slot during the bind, so the staged range can
-                // go immediately — this release is what actually bounds the peak.
-                if il > npin { self.staged.release(self.runs[il - 1].offset); }
-                if done { break; }
-            }
-            if self.runs.len() > npin { self.staged.release(self.runs[self.runs.len() - 1].offset); }
-
-            let logits = self.model.step_finish(st, &mut cache).to_vec().await;
             fed = all.len();
             let v = self.model.cfg.n_vocab;
             let last = &logits[logits.len() - v..];
