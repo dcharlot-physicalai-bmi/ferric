@@ -66,6 +66,9 @@ pub struct FerricStream {
     bpe: Bpe,
     total: u64,
     header_len: usize,
+    /// Embeddings, norms and the LM head: resident regardless of the budget, and on a small model with a
+    /// large vocabulary they DOMINATE. Reported so a peak figure is explicable rather than surprising.
+    nonlayer_bytes: u64,
 }
 
 #[wasm_bindgen]
@@ -116,10 +119,11 @@ impl FerricStream {
         // version called Qwen3::load (the RESIDENT loader, which builds every layer) after staging only
         // the prefix, and the browser caught it exactly as designed: `NotStaged` naming the missing
         // range rather than returning zeros.
+        let mut nonlayer_bytes = 0u64;
         for t in src.tensors.clone() {
-            let is_layer = t.name.starts_with("blk.");
-            if is_layer { continue; }
+            if t.name.starts_with("blk.") { continue; }
             let (off, sz) = src.extent(&t.name).ok_or_else(|| JsValue::from_str("bad extent"))?;
+            nonlayer_bytes += sz as u64;
             if !staged.is_staged(off, sz) {
                 let b = fetch_range(&fetcher, off, sz).await?;
                 staged.stage(off, b);
@@ -158,17 +162,19 @@ impl FerricStream {
             .map_err(|e| JsValue::from_str(&e))?;
         let model = Qwen3::from_stream(&ctx, &src, ls).map_err(|e| JsValue::from_str(&e))?;
 
-        Ok(FerricStream { model, staged, fetcher, runs, plan, bpe, total, header_len })
+        Ok(FerricStream { model, staged, fetcher, runs, plan, bpe, total, header_len, nonlayer_bytes })
     }
 
     /// What the budget bought, as JSON — for a caller that wants to show it before generating.
     pub fn plan(&self) -> String {
         format!(
             "{{\"layers\":{},\"pinned\":{},\"hit_rate\":{:.4},\"layer_bytes\":{},\"total_bytes\":{},\
-              \"header_bytes\":{},\"resident_bytes\":{},\"peak_bytes\":{},\"fetched_bytes\":{}}}",
+              \"header_bytes\":{},\"nonlayer_bytes\":{},\"resident_bytes\":{},\"peak_bytes\":{},\
+               \"fetched_bytes\":{}}}",
             self.runs.len(), self.plan.npin, self.plan.hit_rate(),
             self.runs.iter().map(|r| r.bytes).sum::<u64>(), self.total,
-            self.header_len, self.staged.resident_bytes(), self.staged.peak_bytes(), self.staged.staged_total()
+            self.header_len, self.nonlayer_bytes, self.staged.resident_bytes(),
+            self.staged.peak_bytes(), self.staged.staged_total()
         )
     }
 
@@ -201,31 +207,39 @@ impl FerricStream {
         }
     }
 
-    /// Greedy generation.
+    /// Greedy generation, streaming one layer at a time.
     ///
-    /// # A real limitation, stated rather than hidden
-    ///
-    /// `forward_cached` walks all layers **synchronously**, with no point at which it can await a fetch.
-    /// So every streamed layer must be staged *before* the step begins, and peak residency during a step
-    /// is the whole layer set — the budget bounds what the *tier* pins, not what the browser holds.
-    ///
-    /// Measured on Qwen2.5-0.5B: a 64 MB budget pins 3 of 24 layers, and peak residency is still the full
-    /// 686 MB. So this currently buys **incremental loading and identical output**, not reduced peak
-    /// memory. Streamed layers are released between tokens, which bounds the *steady* state, but the peak
-    /// is set by the forward.
-    ///
-    /// Fixing it properly needs a forward that yields per layer so a fetch can be awaited mid-step. That
-    /// is an architectural change to the model, not to this file, and it is the honest next step rather
-    /// than something to paper over with a smaller number.
+    /// The loop stages layer *il*, applies it, then releases *il−1* — so peak residency is the pinned set
+    /// plus a couple of layers rather than the whole model. That is only possible because
+    /// [`Qwen3::step_layer`] can be awaited between layers; a monolithic forward cannot pause, and on
+    /// wasm there is no thread to block on a read, which is what previously pinned the peak at the entire
+    /// weight set regardless of the budget.
     pub async fn generate(&mut self, prompt: &str, n: usize) -> Result<String, JsValue> {
         let mut all = self.bpe.encode(prompt);
         let mut cache = Cache::new(&self.model.cfg);
         let mut fed = 0usize;
         let mut out = String::new();
+        let npin = self.plan.npin;
+
         for _ in 0..n {
-            self.stage_streamed().await?;
-            let logits = self.model.forward_cached(&all[fed..], &mut cache).to_vec().await;
-            cache.pos = all.len();
+            let mut st = self.model.step_begin(&all[fed..], &cache);
+            while let Some(il) = st.next_layer() {
+                if il >= npin {
+                    let d = self.runs[il];
+                    if !self.staged.is_staged(d.offset, d.bytes as usize) {
+                        let b = fetch_range(&self.fetcher, d.offset, d.bytes as usize).await?;
+                        self.staged.stage(d.offset, b);
+                    }
+                }
+                let done = self.model.step_layer(&mut st, &mut cache);
+                // The tier copied these bytes into its own slot during the bind, so the staged range can
+                // go immediately — this release is what actually bounds the peak.
+                if il > npin { self.staged.release(self.runs[il - 1].offset); }
+                if done { break; }
+            }
+            if self.runs.len() > npin { self.staged.release(self.runs[self.runs.len() - 1].offset); }
+
+            let logits = self.model.step_finish(st, &mut cache).to_vec().await;
             fed = all.len();
             let v = self.model.cfg.n_vocab;
             let last = &logits[logits.len() - v..];
@@ -233,8 +247,6 @@ impl FerricStream {
             for (i, &x) in last.iter().enumerate() { if x > bv { bv = x; best = i as u32; } }
             all.push(best);
             out.push_str(&self.bpe.decode(&[best]));
-            // Bound the steady state between steps. Peak within a step is unaffected — see the note above.
-            self.release_streamed();
         }
         Ok(out)
     }

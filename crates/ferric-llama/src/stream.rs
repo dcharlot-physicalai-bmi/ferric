@@ -120,13 +120,15 @@ impl GgufSource for LayerBytes<'_> {
 /// regardless. Pinned layers are now built **once**.
 pub enum LayerRef<'a> {
     Pinned(&'a Layer),
+    /// A resident (non-streamed) layer, borrowed from the model.
+    Borrowed(&'a Layer),
     Built(Layer),
 }
 
 impl std::ops::Deref for LayerRef<'_> {
     type Target = Layer;
     fn deref(&self) -> &Layer {
-        match self { LayerRef::Pinned(l) => l, LayerRef::Built(l) => l }
+        match self { LayerRef::Pinned(l) | LayerRef::Borrowed(l) => l, LayerRef::Built(l) => l }
     }
 }
 

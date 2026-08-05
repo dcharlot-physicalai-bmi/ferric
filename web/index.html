@@ -109,9 +109,13 @@ $('go').onclick = async () => {
     log(`\n${$('prompt').value}${text}`);
     log(`\n  ${(ms / Number($('ntok').value)).toFixed(0)} ms/token`);
     log(`  peak resident ${(s.peak_bytes() / 1e6).toFixed(1)} MB · now ${(s.resident_bytes() / 1e6).toFixed(1)} MB · fetched ${(s.fetched_bytes() / 1e6).toFixed(1)} MB`);
-    log(`
-  note: peak is the whole layer set — forward_cached cannot yield mid-step, so every streamed`);
-    log(`  layer must be staged before it begins. The budget bounds what the tier PINS, not peak memory.`);
+    const nl = plan.nonlayer_bytes / 1e6, pk = s.peak_bytes() / 1e6;
+    const pinMB = plan.pinned * (plan.layer_bytes / plan.layers) / 1e6;
+    log(`\n  where the peak goes: ${nl.toFixed(0)} MB embeddings + LM head (resident regardless of budget)`);
+    log(`  + ${pinMB.toFixed(0)} MB pinned layers + layers in flight  =  ${pk.toFixed(0)} MB peak.`);
+    log(`\n  The budget bounds LAYER weights, and it is doing that. On this model the embedding and head`);
+    log(`  are ${(100 * plan.nonlayer_bytes / plan.total_bytes).toFixed(0)}% of the file, so streaming layers can only do so much — the reverse of a`);
+    log(`  frontier MoE, where routed experts are ~97% of the parameters and streaming them is the game.`);
   } catch (e) {
     log('\n✗ ' + (e && e.message ? e.message : e));
   } finally {

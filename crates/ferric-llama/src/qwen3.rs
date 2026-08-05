@@ -230,6 +230,29 @@ pub fn build_layer(
             })
 }
 
+/// A forward pass paused between layers.
+///
+/// Exists for callers that must **await** something mid-pass — a browser fetching the next layer's
+/// weights. A loop that runs to completion cannot do that, and on wasm there is no thread to block on a
+/// read, so without this the entire layer set must be resident before a step begins. That is precisely
+/// what capped the browser path's peak memory at the whole model regardless of its budget.
+pub struct Step {
+    x: Tensor,
+    pos: usize,
+    il: usize,
+    n_layer: usize,
+    n_tokens: usize,
+}
+
+impl Step {
+    /// The layer [`Qwen3::step_layer`] will apply next, or `None` when the layers are done.
+    ///
+    /// A caller stages *this* layer's weights before calling `step_layer`, and may release the previous
+    /// one afterwards — which is what bounds peak residency to the pinned set plus one layer.
+    pub fn next_layer(&self) -> Option<usize> { (self.il < self.n_layer).then_some(self.il) }
+    pub fn layers_done(&self) -> usize { self.il }
+}
+
 impl Qwen3 {
     /// Start/stop capturing linear-input activations for GPTQ calibration.
     pub fn set_capture(&self, on: bool) { *self.cap.borrow_mut() = if on { Some(Vec::new()) } else { None }; }
@@ -417,46 +440,96 @@ impl Qwen3 {
 
     /// Run embed + all transformer layers, carrying K/V in `cache`. Returns the last layer's hidden
     /// state `x` (BEFORE the final norm / lm_head) — shared by decode (→ logits) and embedding (→ pooled).
-    fn run_layers(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+    /// One transformer layer, applied to `x`. Extracted from `run_layers` unchanged.
+    ///
+    /// Pulling it out is what makes a **stepping** forward possible: a caller that must await something
+    /// between layers — a browser fetching the next layer's weights — cannot use a loop that runs to
+    /// completion. See [`Qwen3::step_layer`].
+    fn apply_layer(&self, x: &Tensor, l: &Layer, lc: &mut (KvBuf, KvBuf), pos: usize, il: usize) -> Tensor {
         use ferric_tensor::{batch, prof};
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
+        let mut out;
+        let xin = x;
+        if profiling {
+            // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
+            let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il));
+            prof(&self.ctx, "attn");
+            out = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
+            prof(&self.ctx, "ffn");
+        } else if self.cfg.is_gemma {
+            // Gemma normalizes the attn AND ffn *outputs* (post-norms) before each residual add:
+            //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
+            let eps = self.cfg.eps;
+            out = batch(&self.ctx, || {
+                let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il);
+                let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
+                let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
+            });
+        } else {
+            out = batch(&self.ctx, || {
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
+                let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
+                self.ffn(&xy_n, l, il).add(&xy)
+            });
+        }
+
+        out
+    }
+
+    /// The layer at `il`: resident, or materialised from the tier.
+    fn layer_ref(&self, il: usize) -> crate::stream::LayerRef<'_> {
+        match &self.stream {
+            Some(s) => s.layer(il).expect("streamed layer"),
+            None => crate::stream::LayerRef::Borrowed(&self.layers[il]),
+        }
+    }
+
+    /// Begin a forward pass that can be advanced one layer at a time.
+    pub fn step_begin(&self, tokens: &[u32], cache: &Cache) -> Step {
+        Step {
+            x: self.embed(tokens),
+            pos: cache.pos,
+            il: 0,
+            n_layer: self.cfg.n_layer,
+            n_tokens: tokens.len(),
+        }
+    }
+
+    /// Apply the next layer. Returns `true` when all layers are done.
+    ///
+    /// The caller owns what happens between calls, which is the entire point: stage the weights for
+    /// `step.next_layer()`, call this, release the layer before it.
+    pub fn step_layer(&self, step: &mut Step, cache: &mut Cache) -> bool {
+        let Some(il) = step.next_layer() else { return true };
+        let l = self.layer_ref(il);
+        step.x = self.apply_layer(&step.x, &l, &mut cache.kv[il], step.pos, il);
+        step.il += 1;
+        step.il >= step.n_layer
+    }
+
+    /// Final norm + LM head, and advance the cache. Consumes the step.
+    pub fn step_finish(&self, step: Step, cache: &mut Cache) -> Tensor {
+        use ferric_tensor::batch;
+        debug_assert!(step.next_layer().is_none(), "step_finish called before every layer ran");
+        cache.pos += step.n_tokens;
+        let sc = self.cfg.final_softcap;
+        batch(&self.ctx, || {
+            let l = step.x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
+            if sc > 0.0 { l.softcap(sc) } else { l }
+        })
+    }
+
+    fn run_layers(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+        use ferric_tensor::prof;
         let mut x = self.embed(tokens);
         prof(&self.ctx, "embed");
         let pos = cache.pos;
         for il in 0..self.cfg.n_layer {
-            // A streamed layer is materialised here and dropped at the end of the iteration — that drop
-            // IS the eviction, and it is why steady-state memory tracks the budget rather than the model.
-            let streamed;
-            let l = match &self.stream {
-                Some(s) => { streamed = s.layer(il).expect("streamed layer"); &*streamed }
-                None => &self.layers[il],
-            };
-            let lc = &mut cache.kv[il];
-            let xin = &x;
-            if profiling {
-                // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
-                let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il));
-                prof(&self.ctx, "attn");
-                x = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
-                prof(&self.ctx, "ffn");
-            } else if self.cfg.is_gemma {
-                // Gemma normalizes the attn AND ffn *outputs* (post-norms) before each residual add:
-                //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
-                let eps = self.cfg.eps;
-                x = batch(&self.ctx, || {
-                    let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il);
-                    let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
-                    let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
-                    x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
-                });
-            } else {
-                x = batch(&self.ctx, || {
-                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
-                    // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
-                    let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                    self.ffn(&xy_n, l, il).add(&xy)
-                });
-            }
+            // A streamed layer is dropped at the end of the iteration — that drop IS the eviction.
+            let l = self.layer_ref(il);
+            x = self.apply_layer(&x, &l, &mut cache.kv[il], pos, il);
         }
         cache.pos += tokens.len();
         x

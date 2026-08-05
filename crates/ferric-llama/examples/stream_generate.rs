@@ -92,7 +92,7 @@ async fn run() {
         let ms = t.elapsed().as_secs_f64() * 1000.0 / GEN as f64;
         let (plan, st, rebuilds, reuses) = {
             let s = m.stream.as_ref().unwrap();
-            (s.plan().clone(), s.stats(), s.rebuilds.get(), s.reuses.get())
+            (s.plan().clone(), s.hit_rate(), s.rebuilds.get(), s.reuses.get())
         };
         assert_eq!(
             ids, ref_ids,
@@ -101,7 +101,7 @@ async fn run() {
         );
         if plan.npin < runs.len() { streamed_any = true; }
         println!("  {:>9.1} MB  {:>4}/{:<3}  {:>8.1}%  {:>9.1}  {:>7.1}x  {:>5}/{:<5}  {:?}",
-                 budget as f64 / 1e6, plan.npin, runs.len(), 100.0 * st.hit_rate(), ms, ms / res_ms,
+                 budget as f64 / 1e6, plan.npin, runs.len(), 100.0 * st, ms, ms / res_ms,
                  rebuilds, reuses, &ids[..GEN.min(4)]);
     }
 

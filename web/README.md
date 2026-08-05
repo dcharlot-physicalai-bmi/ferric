@@ -73,24 +73,30 @@ The capital of France is Paris. It is
   290 ms/token
 ```
 
-It generates. The output is correct text, from Range-fetched weights, on WebGPU.
+It generates. Correct text, from Range-fetched weights, on WebGPU.
 
-## ⚠️ What it does NOT yet do: reduce peak memory
+## Where the peak actually goes
 
-`peak resident 686.5 MB` against a 64 MB budget. That is not a bug in the tier — it is a structural limit
-worth naming precisely:
+```
+peak resident 385.3 MB
+  289 MB  embeddings + LM head   <- resident regardless of budget (43% of this file)
+   48 MB  pinned layers (3 of 24, from the 64 MB budget)
+   ~48 MB layers in flight
+```
 
-**`forward_cached` walks all layers synchronously, with no point at which it can await a fetch.** So every
-streamed layer must be staged *before* a step begins, and peak residency within a step is the whole layer
-set. Releasing between tokens bounds the *steady* state (`now 353.6 MB`) but not the peak.
+**The budget bounds layer weights, and it is doing that.** What it cannot bound is the embedding and LM
+head, which on Qwen2.5-0.5B are 144.6 MB *each* — a 152k vocabulary against 24 small layers.
 
-So today the browser path buys **incremental loading and byte-identical output**, not a smaller footprint.
-The budget bounds what the tier *pins*, not what the tab holds.
+That is the reverse of the models this machinery was built for: in a frontier MoE the routed experts are
+~97% of the parameters and the embedding share is negligible, which is exactly why those engines stream
+experts. On a small model with a large vocabulary, streaming layers can only do so much.
 
-Fixing it needs a forward that **yields per layer** so a fetch can be awaited mid-step — an architectural
-change to the model, not to this directory. The native path does not have this problem because a thread
-can block on a read; the browser cannot.
+Getting here took two fixes, both found by *running* it rather than reading it:
 
-This was found by running it, not by reading it. An earlier version also called the *resident* loader
-after staging only the pinned prefix, and the browser caught that too — `NotStaged` naming the missing
-range instead of returning zeros, which is exactly what that error exists for.
+1. `FerricStream::open` called the **resident** loader after staging only the pinned prefix. The browser
+   reported `bytes not staged: [579609952, 579613536)` — named the range, refused to return zeros, which
+   is exactly what that error exists for.
+2. Peak was **686.5 MB**, the whole model, because `forward_cached` walks every layer synchronously with
+   no point at which it can await a fetch. Fixed by [`Qwen3::step_layer`], a forward that can be advanced
+   one layer at a time: stage layer *il*, apply it, release *il−1*. Verified bit-identical to the
+   monolithic forward (`max|Δ| = 0.000e0`, same argmax, same KV position) before being relied on.

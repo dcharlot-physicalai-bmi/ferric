@@ -102,7 +102,34 @@ async fn run() {
     println!("  and fetch is not, so bytes must be staged BEFORE the forward pass reads them. A miss is");
     println!("  `{}`,", "TierError::NotStaged");
     println!("  which names the range — because returning zeros would produce a model that runs and lies.");
-    println!("\n  Layer weights: {:.1} MB of {:.1} MB. A budgeted browser releases runs as the tier evicts",
-             layer_bytes as f64 / 1e6, total as f64 / 1e6);
-    println!("  them; this run staged everything, which is the honest upper bound on residency.");
+    println!("\n  Layer weights: {:.1} MB of {:.1} MB.", layer_bytes as f64 / 1e6, total as f64 / 1e6);
+
+    // ---------- 4. the STEPPING forward, which is what bounds a browser's peak ----------
+    // A monolithic forward cannot pause, so every streamed layer must be resident before it starts —
+    // which is what pinned the browser's peak at the whole model regardless of budget. Stepping lets a
+    // caller stage one layer, apply it, release the previous. It must produce identical logits.
+    let g = GgufBacked::new(header.clone(), Arc::clone(&file_b)).unwrap();
+    let m = Qwen3::load(&ctx, &g).unwrap();
+    let mut c1 = Cache::new(&m.cfg);
+    let whole = m.forward_cached(&prompt, &mut c1).to_vec().await;
+
+    let mut c2 = Cache::new(&m.cfg);
+    let mut st = m.step_begin(&prompt, &c2);
+    let mut applied = 0usize;
+    while let Some(il) = st.next_layer() {
+        assert_eq!(il, applied, "steps must run in order");
+        // A browser awaits a fetch here, and releases layer il-1 after the call.
+        if m.step_layer(&mut st, &mut c2) { break; }
+        applied += 1;
+    }
+    let stepped = m.step_finish(st, &mut c2).to_vec().await;
+    let d_step = max_abs_diff(&whole, &stepped);
+    println!("  {:<28} {:>12}  {:>14.3e}   {}", "stepping forward", "per-layer", d_step,
+             arg(&stepped[stepped.len() - 151936..]));
+    assert_eq!(d_step, 0.0, "the stepping forward changed the logits");
+    assert_eq!(c1.pos, c2.pos, "stepping left the KV cache at a different position");
+    println!("\n  ✅ The STEPPING forward is bit-identical to the monolithic one, so a browser can stage");
+    println!("     one layer at a time and release the previous — bounding peak residency to the pinned");
+    println!("     set plus one layer instead of the whole model.");
 }
+
