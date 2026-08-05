@@ -8,22 +8,29 @@
 //! ## ⚠ Read this before reading the table
 //!
 //! This example was written to chase a "~7× matmul gap" — 526 MB per token in 11.30 ms = 47 GB/s against
-//! a 463 GB/s device. **That gap does not exist.** Splitting the decode step into host time and device
-//! time settles it:
+//! a 463 GB/s device. **That framing is wrong**, and so was the correction that replaced it. Both are
+//! recorded here because the way each failed is the useful part.
 //!
-//!   - CPU (encode + queue):   **17.18 ms/token**
-//!   - GPU (wait + readback):   **1.24 ms/token**
+//! A first host/device split reported **17.18 ms CPU against 1.24 ms GPU** and was written up as
+//! "CPU-bound by 14×". **It does not reproduce.** That run happened while the machine was building
+//! several cargo targets — a bench on a busy machine is a bench of whatever else is running, which is a
+//! rule this repo already had and I broke anyway.
 //!
-//! 525 MB in 1.24 ms is **423 GB/s** — about 91% of this device's read roofline. The kernels are fine.
-//! Ferric is **CPU-bound by roughly 14×**: the host cannot build command buffers fast enough to keep the
-//! GPU busy, and `47 GB/s` was bytes divided by a wall time that was almost entirely host-side.
+//! Measured on a quiet machine, both variants in one process:
 //!
-//! That also explains the earlier null result. Cutting 410 → 290 dispatches changed nothing because
-//! dispatch *launch* was never the cost either; per-dispatch **host work** is — `run()` builds a fresh
-//! `BindGroup` and a fresh uniform buffer on every single dispatch, and those allocations do not
-//! pipeline against GPU execution.
+//! | | ms/token |
+//! |---|---|
+//! | plain decode loop | **10.81** |
+//! | build phase (host) | 5.79 |
+//! | await phase (GPU) | 4.95 |
 //!
-//! So the lever is caching bind groups and uniform buffers per (pipeline, shape), not tuning WGSL.
+//! So it is **roughly balanced**, not 14× anything. Of the 5.79 ms of host time, instrumentation
+//! accounts for 1.77 ms: **info-buffer creation 1.29 ms**, bind groups 0.30, pipeline lookup 0.11,
+//! pass encoding 0.06. The remaining ~4 ms is host work elsewhere in the tensor/model path.
+//!
+//! The one clean, actionable item is the first line of that breakdown: `run()` allocates a **fresh**
+//! uniform/storage buffer for the info array on every dispatch, ~290 times per token, costing 1.29 ms —
+//! 12% of a decode step — to move a few dozen bytes.
 //!
 //! ## What the table below still tells you
 //!

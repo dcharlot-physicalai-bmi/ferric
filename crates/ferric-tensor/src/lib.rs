@@ -1218,17 +1218,26 @@ fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
     })
 }
 fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
+    let _t = std::time::Instant::now();
+    let _g = scopeguard_ns(_t, 3);
     ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("info"), contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     })
 }
 pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
+    let _t = std::time::Instant::now();
+    let _g = scopeguard_ns(_t, 3);
     ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("uinfo"), contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     })
 }
+/// Charge the elapsed time of the enclosing scope to a HOST_NS slot on drop.
+struct NsGuard(std::time::Instant, usize);
+impl Drop for NsGuard { fn drop(&mut self) { add_ns(self.1, self.0.elapsed().as_nanos() as u64); } }
+fn scopeguard_ns(t: std::time::Instant, slot: usize) -> NsGuard { NsGuard(t, slot) }
+
 fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 /// 2D workgroup grid for large launches: a 1D grid caps at 65535 workgroups. Returns the grid plus
 /// `row_stride` (threads per grid row = gx·64) so the kernel can reconstruct a flat index.
@@ -1311,6 +1320,18 @@ pub fn reset_op_counters() { DISPATCHES.with(|c| c.set(0)); SUBMITS.with(|c| c.s
 /// into one that names the kernel and says what to do.
 const MAX_WORKGROUPS_PER_DIM: u32 = 65_535;
 
+thread_local! {
+    /// Host-side cost breakdown in nanoseconds: (pipeline lookup, bind group, encode, buffer creation).
+    pub(crate) static HOST_NS: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+/// (pipeline_ns, bindgroup_ns, encode_ns, bufcreate_ns) since the last reset.
+pub fn host_ns() -> (u64, u64, u64, u64) { HOST_NS.with(|c| c.get()) }
+pub fn reset_host_ns() { HOST_NS.with(|c| c.set((0, 0, 0, 0))); }
+fn add_ns(slot: usize, ns: u64) {
+    HOST_NS.with(|c| { let mut v = c.get();
+        match slot { 0 => v.0 += ns, 1 => v.1 += ns, 2 => v.2 += ns, _ => v.3 += ns }; c.set(v); });
+}
+
 fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32, u32, u32)) {
     assert!(
         g.0 <= MAX_WORKGROUPS_PER_DIM && g.1 <= MAX_WORKGROUPS_PER_DIM && g.2 <= MAX_WORKGROUPS_PER_DIM,
@@ -1320,12 +1341,16 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
          into the y dimension and linearise in the shader via num_workgroups.",
         g
     );
+    let _t = std::time::Instant::now();
     let pipe = pipeline_for(ctx, wgsl, label);
+    add_ns(0, _t.elapsed().as_nanos() as u64);
+    let _t = std::time::Instant::now();
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
     });
+    add_ns(1, _t.elapsed().as_nanos() as u64);
     DISPATCHES.with(|c| c.set(c.get() + 1));
     // Kernel-name tracing, cached: this sits on the hot path (hundreds of dispatches per token), so the
     // env lookup happens once rather than per dispatch. Worth keeping — tracing labels is what showed the
@@ -1335,10 +1360,13 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         eprintln!("KERNEL\t{label}");
     }
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
+        let _t = std::time::Instant::now();
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
+        drop(pass);
+        add_ns(2, _t.elapsed().as_nanos() as u64);
     };
     // If a batch is open, append to its current (or a fresh) Wgsl segment and defer the submit;
     // otherwise submit this op alone. `bg` comes back out when unbatched.
