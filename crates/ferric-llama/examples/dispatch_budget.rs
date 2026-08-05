@@ -114,8 +114,10 @@ async fn run() {
     println!("  fat was `gather` — pure data movement doing no math — running 3x per layer to pack the");
     println!("  q/k/v windows of the fused QKV output. All three are now gone (410 -> {per_tok:.0}/token,");
     println!("  a 17.6% cut), by teaching the two kernels that actually consume those windows to read a");
-    println!("  strided view in place: `kv_write` and `rope`. Fusing the q and k RoPE into one dispatch");
-    println!("  took it to {per_tok:.0}/token — 410 -> {per_tok:.0} is 23.4% off the launch cost.\n");
+    println!("  strided view in place: `kv_write` and `rope`. Two more fusions followed, each verified");
+    println!("  byte-identical before being wired in: the q and k RoPE into one dispatch (they are one");
+    println!("  contiguous span and the angle does not depend on head index), and the K and V cache");
+    println!("  appends into one (`append2`). 410 -> {per_tok:.0} is 29.3% off the launch cost.\n");
     println!("  What was NOT done matters more. The tempting fix was to relax the `offset == 0` guard in");
     println!("  is_contiguous() so every view could skip packing. An audit of all 57 kernels found only");
     println!("  THREE honour a tensor's buffer offset (cat, gather, binary); 52 index from element 0.");
@@ -126,8 +128,8 @@ async fn run() {
     // Regression guard at the MEASURED value, not an aspirational one — a threshold that passes today
     // while the number is bad teaches nothing. This fails if the count grows.
     assert!(
-        per_layer <= 13.5,
-        "{per_layer:.1} dispatches per layer per token, up from the 13.1 measured when this was written. \
+        per_layer <= 12.5,
+        "{per_layer:.1} dispatches per layer per token, up from the 12.1 measured when this was written. \
          Dispatch count is Ferric's portability budget: at Firefox's ~1040 µs this is {ff_ms:.0} ms/token \
          of pure launch overhead."
     );

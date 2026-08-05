@@ -908,6 +908,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     dst[info[0].x + i] = src[info[0].w + r * info[1].y + c];
 }
 "#;
+// The same copy, for TWO independent (src -> dst) pairs in ONE dispatch.
+//
+// K and V are appended to the cache at the same point in every layer, into different buffers. Issuing
+// them as two dispatches costs 2 launches per layer per token, and launches are ~85% of a decode step
+// (see ferric-tensor/examples/dispatch_vs_submit.rs). Threads below `na` serve pair A, the rest pair B.
+//
+// The two sources may have different strides and offsets — K is a window onto the roped Q|K output, V a
+// window onto the fused QKV output — so each pair carries its own (offset, row_stride, cols).
+const KV_WRITE2_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       sa: array<f32>;
+@group(0) @binding(1) var<storage,read>       sb: array<f32>;
+@group(0) @binding(2) var<storage,read_write> da: array<f32>;
+@group(0) @binding(3) var<storage,read_write> db: array<f32>;
+// info[0] = (na, nb, grid_w, _)
+// info[1] = (a_dst_off, a_src_off, a_cols, a_row_stride)
+// info[2] = (b_dst_off, b_src_off, b_cols, b_row_stride)
+@group(0) @binding(4) var<uniform>            info: array<vec4<u32>, 3>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[0].z;
+    if (i < info[0].x) {
+        let r = i / info[1].z;
+        let c = i - r * info[1].z;
+        da[info[1].x + i] = sa[info[1].y + r * info[1].w + c];
+    } else if (i < info[0].x + info[0].y) {
+        let j = i - info[0].x;
+        let r = j / info[2].z;
+        let c = j - r * info[2].z;
+        db[info[2].x + j] = sb[info[2].y + r * info[2].w + c];
+    }
+}
+"#;
+
+/// `(offset, row_stride, cols)` for reading a rank-2 row-major view in place, packing it first if it is
+/// not one. Shared by the single- and double-destination writers so they cannot disagree about what
+/// counts as readable in place.
+fn row_major_src<'a>(src: &'a Tensor, owned: &'a mut Option<Tensor>) -> (&'a Tensor, u32, u32, u32) {
+    let v = if src.strides[1] == 1 {
+        src
+    } else {
+        *owned = Some(src.contiguous());
+        owned.as_ref().unwrap()
+    };
+    let (rows, cols) = (v.shape[0], v.shape[1]);
+    let row_stride = if rows > 1 { v.strides[0] } else { cols };
+    (v, v.offset as u32, row_stride as u32, cols as u32)
+}
+
 /// Copy `src` (a rank-2 `[rows, cols]` tensor, possibly a strided/offset **view**) into `dst` starting at
 /// element `dst_off`, packed.
 ///
@@ -936,6 +984,30 @@ fn write_rows(ctx: &Context, dst: &wgpu::Buffer, dst_off: usize, src: &Tensor) {
             dst_off as u32, n as u32, rs, v.offset as u32,
             cols as u32, row_stride as u32, 0, 0,
         ])], grid);
+}
+
+/// Two `write_rows` in one dispatch. Returns false if it declined, so the caller can fall back.
+fn write_rows2(
+    ctx: &Context,
+    a: (&wgpu::Buffer, usize, &Tensor),
+    b: (&wgpu::Buffer, usize, &Tensor),
+) -> bool {
+    let (da, a_off, sa) = a;
+    let (db, b_off, sb) = b;
+    if sa.rank() != 2 || sb.rank() != 2 { return false; }
+    let (na, nb) = (sa.numel(), sb.numel());
+    if na == 0 || nb == 0 { return false; }
+    let (mut oa, mut ob) = (None, None);
+    let (va, a_src, a_rs, a_cols) = row_major_src(sa, &mut oa);
+    let (vb, b_src, b_rs, b_cols) = row_major_src(sb, &mut ob);
+    let (grid, rs) = groups2d(na + nb);
+    run(ctx, KV_WRITE2_WGSL, "kv_write2",
+        &[&va.buf, &vb.buf, da, db, &unibuf(ctx, &[
+            na as u32, nb as u32, rs, 0,
+            a_off as u32, a_src, a_cols, a_rs,
+            b_off as u32, b_src, b_cols, b_rs,
+        ])], grid);
+    true
 }
 
 /// A **grow-in-place K/V cache buffer**. Instead of re-concatenating the whole history every decode
@@ -976,6 +1048,35 @@ impl KvBuf {
         Tensor::from_arc(ctx, self.buf.clone().unwrap(), &[self.len, width])
     }
 
+    /// Make room for `t` more rows and return `(buffer, destination element offset)`.
+    ///
+    /// Split out of [`append`](Self::append) so that two caches can be written by a **single** dispatch:
+    /// reserve both, issue one fused write, then take both views. `len` is bumped here, so a caller that
+    /// reserves must go on to write — the rows are accounted for either way.
+    pub fn reserve(&mut self, ctx: &Arc<Context>, t: usize, width: usize) -> (Arc<wgpu::Buffer>, usize) {
+        if self.width == 0 { self.width = width; }
+        assert_eq!(width, self.width, "KvBuf width changed");
+        let need = self.len + t;
+        if self.cap < need {
+            let new_cap = need.max(self.cap * 2).max(64);
+            let nb = Arc::new(empty(ctx, new_cap * width));
+            if self.len > 0 {
+                let old = Tensor::from_arc(ctx, self.buf.clone().unwrap(), &[self.len, width]);
+                write_rows(ctx, &nb, 0, &old);
+            }
+            self.buf = Some(nb);
+            self.cap = new_cap;
+        }
+        let off = self.len * width;
+        self.len = need;
+        (self.buf.clone().unwrap(), off)
+    }
+
+    /// Contiguous `[len, width]` view over everything written so far.
+    pub fn view(&self, ctx: &Arc<Context>) -> Tensor {
+        Tensor::from_arc(ctx, self.buf.clone().expect("view before any append"), &[self.len, self.width])
+    }
+
     /// A new cache holding a **copy** of this one's first `rows`.
     ///
     /// This is what makes prefix reuse possible with a contiguous cache: a request sharing a long prompt
@@ -997,6 +1098,33 @@ impl KvBuf {
 
     /// Row width in elements, or 0 before the first append.
     pub fn width(&self) -> usize { self.width }
+}
+
+/// Append to **two** caches in a single dispatch, returning both views.
+///
+/// K and V are appended at the same point in every layer, so issuing them separately spends two GPU
+/// launches where one will do — and launches are ~85% of a decode step (see
+/// `examples/dispatch_vs_submit.rs`). Byte-identical to two [`KvBuf::append`] calls.
+///
+/// Growth is handled inside `reserve`, which may issue its own copy; that is amortised (log T times) and
+/// is why this returns views rather than assuming the buffers were already large enough.
+pub fn append2(
+    ctx: &Arc<Context>,
+    ka: &mut KvBuf, ks: &Tensor,
+    va: &mut KvBuf, vs: &Tensor,
+) -> (Tensor, Tensor) {
+    assert_eq!(ks.rank(), 2, "append2 expects 2D [t, width] tensors");
+    assert_eq!(vs.rank(), 2, "append2 expects 2D [t, width] tensors");
+    assert_eq!(ks.shape[0], vs.shape[0], "K and V must append the same number of rows");
+    let (kbuf, koff) = ka.reserve(ctx, ks.shape[0], ks.shape[1]);
+    let (vbuf, voff) = va.reserve(ctx, vs.shape[0], vs.shape[1]);
+    if !write_rows2(ctx, (&kbuf, koff, ks), (&vbuf, voff, vs)) {
+        // Declined (an empty or non-rank-2 source). The rows are already accounted for by `reserve`, so
+        // fall back to writing them individually rather than leaving the cache short.
+        write_rows(ctx, &kbuf, koff, ks);
+        write_rows(ctx, &vbuf, voff, vs);
+    }
+    (ka.view(ctx), va.view(ctx))
 }
 
 // ---------- device plumbing (uses ferric-core Context's public device/queue) ----------

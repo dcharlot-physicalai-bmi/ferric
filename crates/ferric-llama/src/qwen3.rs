@@ -460,9 +460,11 @@ impl Qwen3 {
         };
 
         // Append the new K/V rows into the grow-in-place cache and read a view over all rows so far.
-        // Byte-identical to the old `pk.cat(&k, 0)`, but without re-copying the history each step.
-        let kc = cache.0.append(&self.ctx, &k);
-        let vc = cache.1.append(&self.ctx, &v);
+        // Byte-identical to the old `pk.cat(&k, 0)`, but without re-copying the history each step —
+        // and in ONE dispatch rather than two, since K and V land at the same point in every layer.
+        // Verified byte-identical to two separate appends across GQA widths, strided source windows and
+        // cache growth in `ferric-tensor/examples/kv_append2.rs`.
+        let (kc, vc) = ferric_tensor::append2(&self.ctx, &mut cache.0, &k, &mut cache.1, &v);
         // decode: fused single-query; prefill: flash (O(T) memory, no [nh,T,T] matrix) up to its
         // shared-memory limit, else the composed causal path. All three are the same math.
         let s = kc.shape[0];
