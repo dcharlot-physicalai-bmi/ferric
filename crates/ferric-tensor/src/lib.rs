@@ -1217,6 +1217,25 @@ fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
         mapped_at_creation: false,
     })
 }
+
+// ---- why the info buffers are NOT pooled ----
+//
+// `run()` needs a small buffer holding each kernel's info/uniform array, and allocates a fresh one per
+// dispatch. That is ~290 allocations per decode token costing 1.29 ms — 12% of a decode step (measured;
+// see `host_ns` and examples/matvec_roofline.rs). It looks like obvious waste.
+//
+// It was pooled, and pooling made it WORSE. A ring of pre-allocated buffers rewritten with
+// `queue.write_buffer` measured 1.47-1.78 ms/token against 1.29 for straight allocation, with total
+// decode time unchanged inside noise (10.77-11.79 vs 10.81). `write_buffer` routes through wgpu's
+// staging belt — its own allocation, copy, and bookkeeping — which for a few dozen bytes costs more than
+// `create_buffer_init` does outright.
+//
+// Recorded here because "allocating per dispatch is obviously wasteful" is exactly the kind of claim
+// that gets re-implemented by the next person. Two candidates remain untested and are the real options:
+// packing every info array of a token into ONE buffer read at dynamic offsets, or native push constants
+// (not available on the WebGPU baseline). Neither is a small change, and neither should be attempted
+// without an A/B like the one above.
+
 fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
     let _t = std::time::Instant::now();
     let _g = scopeguard_ns(_t, 3);
