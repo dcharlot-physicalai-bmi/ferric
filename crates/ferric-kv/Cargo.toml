@@ -1,0 +1,15 @@
+[package]
+name = "ferric-kv"
+description = "Ferric: paged KV cache with radix prefix sharing — block tables, copy-on-write, and cross-request reuse. Pure policy, no GPU, wasm-clean."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["kv-cache", "paged-attention", "inference", "serving", "wasm"]
+categories = ["caching", "science"]
+
+# No dependencies. The block table, the allocator and the radix index are integer bookkeeping; the tensor
+# storage they describe is the caller's. That is what lets the whole policy be tested without a GPU.
+[dependencies]
