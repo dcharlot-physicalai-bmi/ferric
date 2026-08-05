@@ -45,7 +45,28 @@ This section previously said Ferric was already "the right shape" here because i
 
 Tracing which kernels those were corrected the obvious next guess too. QKV, flash-attention and add+rmsnorm are **already fused**. The fat was `gather` — pure data movement doing no math — running 3× per layer to materialise the q/k/v windows of the fused QKV output.
 
-All three are now gone: **410 → 338 dispatches/token, a 17.6% cut**, with every exactness check unchanged and `gather` at literally zero per token. In the browser, where the analysis said Ferric is dispatch-bound rather than compute-bound, that shows up directly: the headed-Chrome demo went **495 → 271 ms/token, 1.83×**, on the same model and prompt.
+All three are now gone, and two further fusions followed (q|k RoPE into one dispatch; the K and V cache appends into one), each verified byte-identical before being wired in: **410 → 290 dispatches/token, a 29% cut**, with `gather` at literally zero per token.
+
+### ⚠ And it made no difference. The correction matters more than the optimisation.
+
+This section previously claimed the browser went "495 → 271 ms/token, 1.83×". That was a **single-sample comparison of a fetch-bound metric** — at a 64 MB budget the demo re-fetches ~3.5 GB of layer weights per run, so its ms/token measures range-request traffic, not compute. Repeated, it spreads 491–1622 ms/token. The claim was noise.
+
+Measured properly — all layers pinned so nothing is fetched during generation, median of repeated runs, baseline built from `f88b4d8` in a separate worktree:
+
+| | dispatches/token | native decode | browser decode |
+|---|---|---|---|
+| baseline (`f88b4d8`) | 410 | **11.30 ms/token** | 25–29 ms/token |
+| after all fusions | 290 (−29%) | **11.30 ms/token** | 25–27 ms/token |
+
+**Identical.** The microbenchmark predicted ~3.4 ms/token of savings and delivered zero.
+
+The reasoning error is worth stating plainly, because it is a general one: `dispatch_vs_submit` measures per-dispatch cost using **empty** kernels, which is launch latency against an idle GPU. Multiplying that by a model's dispatch count assumes launch cost is *additive* with compute. It is not — a GPU pipelines, so a dispatch carrying real work has its setup overlapped with the previous dispatch's execution, and the cost hides behind compute. "85% of a decode step is launch overhead" was false.
+
+### What Ferric is actually bound by
+
+Measured the same day: Ferric moves ~526 MB of q8_0 weights per decode token in 11.30 ms — **47 GB/s**. On the same machine `examples/bandwidth` reads at **463 GB/s**, and llama.cpp sustains **~326 GB/s** decoding a 27B model. So Ferric runs at roughly **10% of roofline and ~7× off llama.cpp**, and the gap is in matmul kernel efficiency — weight streaming, tiling, dequant — which no amount of dispatch fusion touches. That is the real target.
+
+The fusions were kept: they are correctness-preserving, verified byte-identical, and a simpler program. And a fabric charging ~1,040 µs per dispatch (the published Firefox figure) may serialise where this one pipelines — but that is an **unverified hypothesis**, since no Firefox measurement has been taken.
 
 ### What was deliberately *not* done, and why it matters more
 

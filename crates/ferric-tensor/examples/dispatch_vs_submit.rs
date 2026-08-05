@@ -21,9 +21,29 @@
 //! The ops are deliberately tiny (16×16), so the GPU is doing almost no arithmetic and what is left is
 //! overhead. That is the point — this measures the floor, not throughput.
 //!
-//! Note what this can and cannot say: it is a *native* measurement (Metal/Vulkan here). Browser
-//! per-dispatch costs are higher and this cannot measure them. What it CAN settle is the ratio — whether
-//! dispatch or submit dominates on a real driver — and that is what the optimisation direction rests on.
+//! ## ⚠ What this measures, and the extrapolation it does NOT license
+//!
+//! These ops are empty of arithmetic. So what is measured is **launch latency when the GPU has nothing
+//! else to do** — and that is NOT the marginal cost of a dispatch that carries real work.
+//!
+//! Multiplying the per-dispatch figure below by a model's dispatch count gives a number that looks like
+//! "overhead per token". It is wrong, and it was believed here for a while. A GPU pipelines command
+//! submission against execution: while one dispatch computes, the next is being set up. Launch cost
+//! hides behind compute instead of adding to it.
+//!
+//! The falsifying experiment: Ferric's decode path went from **410 to 290 dispatches per token** across a
+//! series of verified fusions, a 29% cut. Median decode time, 7 runs of 24 tokens each, before and after:
+//! **11.30 ms/token and 11.30 ms/token.** Identical. In the browser, likewise unchanged (25-29 ms/token
+//! both sides). The prediction from this microbenchmark was ~3.4 ms/token of savings. It got zero.
+//!
+//! What Ferric is actually bound by, measured the same day: it moves ~526 MB of q8_0 weights per decode
+//! token in 11.30 ms — **47 GB/s**, against 463 GB/s of raw read bandwidth on this machine and ~326 GB/s
+//! that llama.cpp sustains on it. The gap is matmul kernel efficiency, roughly 7x, and no amount of
+//! dispatch fusion touches it.
+//!
+//! So: this file still measures a real thing (launch latency, and the dispatch/submit ratio), and that
+//! matters where launches genuinely serialise — a fabric charging ~1,040 µs per dispatch, or any path
+//! issuing many empty dispatches. It does not license a per-token overhead estimate for a model.
 //!
 //!   cargo run -p ferric-tensor --example dispatch_vs_submit --release
 use ferric_core::Context;
@@ -96,22 +116,20 @@ async fn run() {
     println!("    dispatch overhead  {d_cost:>7.2} ms/token");
     println!("    submit overhead    {s_cost:>7.2} ms/token");
 
-    if d_cost > s_cost {
-        println!("\n  ✅ DISPATCH count dominates, by {:.0}x. Fusing kernels is the right lever and the", d_cost / s_cost.max(1e-9));
-        println!("     410 -> 338 reduction was aimed at the correct quantity.\n");
-        println!("     The scale is the surprise: {d_cost:.2} ms/token of launch overhead against a measured");
-        println!("     decode of ~11 ms/token means most of a decode step is spent LAUNCHING work, not");
-        println!("     doing it — natively, on Metal, before any browser is involved. Note also that the");
-        println!("     {per_dispatch_us:.0} µs measured here sits close to the ~33 µs published for Chrome, which is a");
-        println!("     useful check on the browser projection rather than a coincidence.");
-    } else {
-        println!("\n  ⚠ SUBMIT count dominates on this fabric — {:.1}x the dispatch overhead. Further kernel", s_cost / d_cost.max(1e-9));
-        println!("     fusion buys little HERE; the lever is submission batching, which Ferric already does");
-        println!("     (~1 per layer). Note this does NOT overturn the browser argument: the published");
-        println!("     Firefox figure is explicitly per-dispatch and ~30x Chrome's, so a fabric can charge");
-        println!("     differently. It does mean the native win from fusion is small and the browser win");
-        println!("     is the one to claim — measured there, not projected from here.");
-    }
+    println!("\n  A dispatch costs more than a submit here, so BETWEEN THE TWO, dispatch count is the");
+    println!("  one worth reducing — Ferric already batches submissions to ~1 per layer.\n");
+
+    println!("  ⚠ DO NOT multiply the per-dispatch figure by a model's dispatch count.");
+    println!("  Naively that predicts {d_cost:.2} ms/token of overhead against {s_cost:.2} ms of submit cost, and it");
+    println!("  is wrong. These ops are EMPTY, so this is launch latency with an idle GPU. A dispatch that");
+    println!("  carries real work overlaps its setup with the previous one's execution; the cost hides");
+    println!("  behind compute rather than adding to it.\n");
+    println!("  Falsified directly: Ferric's decode went 410 -> 290 dispatches/token (-29%) across verified");
+    println!("  fusions. Median decode, 7 runs x 24 tokens, before and after: 11.30 and 11.30 ms/token.");
+    println!("  Identical. Browser likewise unchanged. This microbenchmark predicted ~3.4 ms/token saved.\n");
+    println!("  Ferric's real bound, measured the same day: ~526 MB of q8_0 weights per token in 11.30 ms");
+    println!("  = 47 GB/s, against 463 GB/s raw read bandwidth here and ~326 GB/s that llama.cpp sustains.");
+    println!("  The gap is matmul kernel efficiency (~7x), which no dispatch fusion touches.");
 
     // Guard the experiment itself: if batching did not actually reduce submissions, every number above is
     // measuring nothing and the conclusion would be drawn from noise.

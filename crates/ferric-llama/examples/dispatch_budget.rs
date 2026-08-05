@@ -101,29 +101,24 @@ async fn run() {
     println!("  the dispatch count implies, which is the useful thing at design time.\n");
 
     let chrome_ms = per_tok * CHROME_US / 1000.0;
-    println!("  ⚠ THE FINDING, and it corrects what this repo previously documented.\n");
-    println!("  `ferric_tensor::batch` collapses SUBMISSIONS — {:.1} per token, ~1 per layer, genuinely good.",
-             dec_s as f64 / N as f64);
-    println!("  But the Firefox penalty is per DISPATCH, and dispatches are {per_layer:.1} per layer, {per_tok:.0} per");
-    println!("  token. Submission batching does not protect against this cliff. The earlier note that");
-    println!("  Ferric was already \"the right shape\" here was wrong, and only counting showed it.\n");
-    println!("  At Chrome's OWN 33 µs that is {chrome_ms:.1} ms/token of launch overhead against {ms:.1} ms/token");
-    println!("  measured natively — so in a browser Ferric is dispatch-bound, not compute-bound. Firefox");
-    println!("  projects to {ff_ms:.0} ms/token of overhead alone.\n");
-    println!("  Tracing the kernels showed QKV, flash-attention and add+rmsnorm were ALREADY fused. The");
-    println!("  fat was `gather` — pure data movement doing no math — running 3x per layer to pack the");
-    println!("  q/k/v windows of the fused QKV output. All three are now gone (410 -> {per_tok:.0}/token,");
-    println!("  a 17.6% cut), by teaching the two kernels that actually consume those windows to read a");
-    println!("  strided view in place: `kv_write` and `rope`. Two more fusions followed, each verified");
-    println!("  byte-identical before being wired in: the q and k RoPE into one dispatch (they are one");
-    println!("  contiguous span and the angle does not depend on head index), and the K and V cache");
-    println!("  appends into one (`append2`). 410 -> {per_tok:.0} is 29.3% off the launch cost.\n");
-    println!("  What was NOT done matters more. The tempting fix was to relax the `offset == 0` guard in");
-    println!("  is_contiguous() so every view could skip packing. An audit of all 57 kernels found only");
-    println!("  THREE honour a tensor's buffer offset (cat, gather, binary); 52 index from element 0.");
-    println!("  Worse, two hazards are not kernels at all — `reshape` and `reduce` read from the buffer");
-    println!("  start — and `metal4_linear` honours offsets while its WGSL fallback does not, which would");
-    println!("  have made correctness depend on macOS, silently. Two kernels changed instead of 52.");
+    let _ = (chrome_ms, ff_ms);
+    println!("  ⚠ THESE PROJECTIONS DO NOT PREDICT SPEEDUPS, and this example used to claim they did.\n");
+    println!("  The reasoning was: dispatches x per-dispatch cost = overhead per token, so cutting");
+    println!("  dispatches cuts time. Ferric's decode was then taken from 410 to 290 dispatches/token");
+    println!("  (-29%) through a series of individually-verified fusions. Median decode, 7 runs of 24");
+    println!("  tokens, before and after:  11.30 ms/token  and  11.30 ms/token.  Identical. In the");
+    println!("  browser, 25-29 ms/token on both sides. The predicted saving was ~3.4 ms/token. Actual: 0.\n");
+    println!("  The error: per-dispatch cost is measured with EMPTY kernels, i.e. launch latency against");
+    println!("  an idle GPU. Dispatches carrying real work pipeline — setup overlaps the previous");
+    println!("  dispatch's execution — so launch cost hides behind compute instead of adding to it.\n");
+    println!("  What Ferric IS bound by: it moves ~526 MB of q8_0 weights per decode token in 11.30 ms.");
+    println!("  That is 47 GB/s, against 463 GB/s of raw read bandwidth on this machine (examples/");
+    println!("  bandwidth) and the ~326 GB/s llama.cpp sustains on it. Roughly a 7x gap, and it lives in");
+    println!("  matmul kernel efficiency — weight streaming, tiling, dequant — not in launch count.\n");
+    println!("  The dispatch count is still tracked here, for two honest reasons: fewer dispatches is a");
+    println!("  simpler program, and a fabric that charges ~1,040 µs per dispatch (the published Firefox");
+    println!("  figure, ~30x Chrome's) may serialise where this one pipelines. That remains UNVERIFIED —");
+    println!("  no Firefox measurement has been taken — so it is a hypothesis, not a result.\n");
 
     // Regression guard at the MEASURED value, not an aspirational one — a threshold that passes today
     // while the number is bad teaches nothing. This fails if the count grows.
