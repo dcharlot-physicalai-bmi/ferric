@@ -145,9 +145,29 @@ cost is the *round trip*, ~290 dispatches deep, once per token.
 
 That reframes the remedies, and notably the most promising one is already built:
 
-- **Batch sequences.** `ferric_kv::Scheduler` (continuous batching) amortises one host build across many
-  sequences, which is precisely the axis this structure penalises. Its measured win was per-request
-  latency; this suggests it should also lift aggregate throughput, which has not been measured.
+- **Batch sequences — and this does NOT currently work.** It was tempting to assume
+  `ferric_kv::Scheduler` amortises one host build across many sequences. It cannot:
+  `Qwen3::forward_cached(tokens, cache)` takes exactly **one** sequence's cache, so a step with N live
+  sequences issues N separate forward passes — N host builds, N GPU round trips. Measured
+  (`examples/batch_throughput.rs`, settled machine, median of 5):
+
+  | live sequences | ms/step | tokens/sec | vs 1 seq |
+  |---|---|---|---|
+  | 1 | 11.15 | 89.7 | 1.00× |
+  | 2 | 22.47 | 89.0 | 0.99× |
+  | 4 | 44.52 | 89.8 | 1.00× |
+  | 8 | 89.54 | 89.3 | 1.00× |
+
+  Exactly flat. Cost is perfectly linear in the sequence count. The scheduler removes head-of-line
+  blocking — a real and measured win on per-request *latency* — but cannot amortise work the execution
+  layer has no way to share.
+
+  The fix is a **batched decode**: stack N sequences' tokens into `[N, d]` and run one forward, which
+  needs each sequence's KV attended separately inside one kernel. That is exactly what paged attention
+  provides, and why `ferric-kv`'s `PagedKv` is complete, tested, and unwired. **This is the largest
+  identified opportunity in the runtime: up to 8× aggregate throughput at 8 concurrent sequences**, and
+  unlike the four falsified hypotheses above it rests on a structural fact about the code rather than on
+  an interpretation of a timing.
 - **Reduce host build time.** ~4 ms of the 5.79 remains unattributed by `host_ns()`; the profile shows it
   is diffuse rather than concentrated, so this is death-by-a-thousand-cuts, not one fix.
 - **Speculative decoding** would break the serial dependency — the only remedy that attacks the structure
