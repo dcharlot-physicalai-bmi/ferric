@@ -78,25 +78,36 @@ It generates. Correct text, from Range-fetched weights, on WebGPU.
 ## Where the peak actually goes
 
 ```
-peak resident 385.3 MB
-  289 MB  embeddings + LM head   <- resident regardless of budget (43% of this file)
-   48 MB  pinned layers (3 of 24, from the 64 MB budget)
-   ~48 MB layers in flight
+peak resident 240.7 MB          (was 686.5 MB when this path first ran)
+  145 MB  LM head            <- all rows needed for an argmax over the vocabulary
+   48 MB  pinned layers      <- 3 of 24, from the 64 MB budget
+  ~48 MB  layers in flight
+    5 KB  embedding rows     <- staged per step, not the 144.6 MB table
 ```
 
-**The budget bounds layer weights, and it is doing that.** What it cannot bound is the embedding and LM
-head, which on Qwen2.5-0.5B are 144.6 MB *each* — a 152k vocabulary against 24 small layers.
+**The budget bounds layer weights, and it is doing that.** Two things sit outside it, for different
+reasons:
 
-That is the reverse of the models this machinery was built for: in a frontier MoE the routed experts are
-~97% of the parameters and the embedding share is negligible, which is exactly why those engines stream
-experts. On a small model with a large vocabulary, streaming layers can only do so much.
+- **The embedding table is no longer resident.** `embed` only ever gathers the prompt's rows, so holding
+  all 144.6 MB bought nothing. Rows are staged per step — **4.8 KB instead of 144.6 MB, 30,387× less**,
+  with identical logits.
+- **The LM head stays resident by choice.** Greedy decoding needs a max over the whole vocabulary each
+  step, so *every* row is read every token. Streaming it would cost its full 144.6 MB in traffic per
+  token — worse than holding it. This is a real trade, not an oversight.
 
-Getting here took two fixes, both found by *running* it rather than reading it:
+On a frontier MoE the arithmetic inverts: routed experts are ~97% of the parameters and the head is
+negligible, which is exactly why those engines stream experts. On a 0.5B model with a 152k vocabulary,
+the head is the floor.
+
+Getting here took three fixes, all found by *running* it rather than reading it:
 
 1. `FerricStream::open` called the **resident** loader after staging only the pinned prefix. The browser
    reported `bytes not staged: [579609952, 579613536)` — named the range, refused to return zeros, which
    is exactly what that error exists for.
 2. Peak was **686.5 MB**, the whole model, because `forward_cached` walks every layer synchronously with
-   no point at which it can await a fetch. Fixed by [`Qwen3::step_layer`], a forward that can be advanced
+   no point at which it can await a fetch. Fixed by `Qwen3::step_layer`, a forward that can be advanced
    one layer at a time: stage layer *il*, apply it, release *il−1*. Verified bit-identical to the
    monolithic forward (`max|Δ| = 0.000e0`, same argmax, same KV position) before being relied on.
+   **686.5 → 385.3 MB.**
+3. The remaining peak was dominated by a 144.6 MB embedding table that `embed` never needs in full.
+   Streaming its rows took **385.3 → 240.7 MB**, and cold-start traffic from 358.9 MB to 214.2 MB.

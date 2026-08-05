@@ -128,6 +128,47 @@ async fn run() {
              arg(&stepped[stepped.len() - 151936..]));
     assert_eq!(d_step, 0.0, "the stepping forward changed the logits");
     assert_eq!(c1.pos, c2.pos, "stepping left the KV cache at a different position");
+    // ---------- 5. streamed EMBEDDINGS: the table is 21% of this checkpoint ----------
+    // embed() only ever gathers the prompt's rows, so holding the whole 144.6 MB table is pure resident
+    // weight for no benefit. Fetching rows on demand must not change a single logit.
+    let staged_e = Arc::new(StagedBacking::new());
+    staged_e.stage(0, header.clone());
+    let src_e = GgufBacked::new(header.clone(), Arc::clone(&file_b)).unwrap();
+    let (ebase, esz) = src_e.extent("token_embd.weight").unwrap();
+    for t in &src_e.tensors {
+        if t.name == "token_embd.weight" { continue; }         // deliberately NOT staged in full
+        let (off, sz) = src_e.extent(&t.name).unwrap();
+        let mut b = vec![0u8; sz];
+        file_b.read_at(off, &mut b).unwrap();
+        staged_e.stage(off, b);
+    }
+    let se_dyn: Arc<dyn Backing + Send + Sync> = staged_e.clone();
+    let g_e = GgufBacked::new(header.clone(), Arc::clone(&se_dyn)).unwrap();
+    // token_embd is absent from the staged set, so a resident load would fail here — stage the header
+    // range it needs by loading through the FILE, then switch the table to streamed.
+    let g_full = GgufBacked::new(header.clone(), Arc::clone(&file_b)).unwrap();
+    let mut m_e = Qwen3::load(&ctx, &g_full).unwrap();
+    m_e.stream_embeddings(Arc::clone(&se_dyn), ebase);
+    // Stage ONLY the rows this prompt touches.
+    let mut row_bytes_total = 0usize;
+    for &t in &prompt {
+        let (off, rb) = m_e.embd_row_extent(t, ebase);
+        let mut b = vec![0u8; rb];
+        file_b.read_at(off, &mut b).unwrap();
+        staged_e.stage(off, b);
+        row_bytes_total += rb;
+    }
+    let _ = g_e;
+    let mut c3 = Cache::new(&m_e.cfg);
+    let l_emb = m_e.forward_cached(&prompt, &mut c3).to_vec().await;
+    let d_emb = max_abs_diff(&reference, &l_emb);
+    println!("  {:<28} {:>11.1}K  {:>14.3e}   {}", "streamed embeddings",
+             row_bytes_total as f64 / 1e3, d_emb, arg(&l_emb[l_emb.len() - 151936..]));
+    assert_eq!(d_emb, 0.0, "streaming the embedding table changed the logits");
+    println!("     ({} rows staged = {:.1} KB, versus {:.1} MB for the whole table — {:.0}x less)",
+             prompt.len(), row_bytes_total as f64 / 1e3, esz as f64 / 1e6,
+             esz as f64 / row_bytes_total as f64);
+
     println!("\n  ✅ The STEPPING forward is bit-identical to the monolithic one, so a browser can stage");
     println!("     one layer at a time and release the previous — bounding peak residency to the pinned");
     println!("     set plus one layer instead of the whole model.");

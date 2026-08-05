@@ -148,13 +148,25 @@ impl Cache {
     pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() } }
 }
 
+/// Where the token-embedding rows come from.
+///
+/// `embed` already gathers only the prompt's rows — it never needs the whole table — so on a large
+/// vocabulary the table is pure resident weight for no benefit. On Qwen2.5-0.5B `token_embd` is 144.6 MB
+/// against 380 MB of layers, and a prompt touches a few kilobytes of it.
+enum EmbdTable {
+    Resident(Vec<u8>),
+    /// Rows fetched per lookup. The caller must have them available — in a browser that means staged, and
+    /// the tokens are known before the forward, so it is exact rather than speculative.
+    Streamed { backing: Arc<dyn ferric_tier::Backing + Send + Sync>, base: u64 },
+}
+
 pub struct Qwen3 {
     pub cfg: Cfg,
     /// Set when layer weights are streamed rather than resident. `None` is the ordinary path and costs
     /// nothing — the branch in `run_layers` is one `Option` check per layer.
     pub stream: Option<crate::stream::LayerStream>,
     ctx: Arc<Context>,
-    tok_embd: Vec<u8>, // Q2_0 rows, gathered + dequantized on the CPU (avoids parking the table on GPU)
+    tok_embd: EmbdTable,
     layers: Vec<Layer>,
     out_norm: Tensor,
     lm_head: QMatrix,
@@ -308,13 +320,28 @@ impl Qwen3 {
         ctx: &Arc<Context>,
         g: &impl GgufSource,
         stream: crate::stream::LayerStream,
+        embd: Option<(Arc<dyn ferric_tier::Backing + Send + Sync>, u64)>,
     ) -> Result<Qwen3, String> {
-        let mut m = Self::load_inner(ctx, g, false)?;
+        let mut m = Self::load_inner_embd(ctx, g, false, embd)?;
         m.stream = Some(stream);
         Ok(m)
     }
 
     fn load_inner(ctx: &Arc<Context>, g: &impl GgufSource, resident: bool) -> Result<Qwen3, String> {
+        Self::load_inner_embd(ctx, g, resident, None)
+    }
+
+    /// `embd = Some((backing, base))` streams the token-embedding table instead of loading it.
+    ///
+    /// Skipping the load matters rather than loading-then-freeing: on this model the table is 144.6 MB,
+    /// and a path that materialised it first would put that in the peak — which is the number a memory
+    /// budget is judged on.
+    fn load_inner_embd(
+        ctx: &Arc<Context>,
+        g: &impl GgufSource,
+        resident: bool,
+        embd: Option<(Arc<dyn ferric_tier::Backing + Send + Sync>, u64)>,
+    ) -> Result<Qwen3, String> {
         let cfg = Cfg::from_gguf(g)?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         // Gemma's `(1+w)` RMSNorm is folded into the weight at GGUF-conversion time (llama.cpp adds 1 to
@@ -331,7 +358,10 @@ impl Qwen3 {
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         Ok(Qwen3 {
             cap: std::cell::RefCell::new(None),
-            tok_embd: g.raw("token_embd.weight")?,
+            tok_embd: match &embd {
+                Some((b, base)) => EmbdTable::Streamed { backing: Arc::clone(b), base: *base },
+                None => EmbdTable::Resident(g.raw("token_embd.weight")?),
+            },
             out_norm: nrm("output_norm.weight", cfg.n_embd)?,
             lm_head: qm(ctx, g, head)?,
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
@@ -349,9 +379,17 @@ impl Qwen3 {
         // table is stored (Q2_0/Q4_K/…) — beats parking the whole table on the GPU for a gather.
         let row_bytes = ferric_gguf::type_size(self.embd_type, d).expect("embd type");
         let mut v = Vec::with_capacity(tokens.len() * d);
+        let mut scratch = vec![0u8; row_bytes];
         for &t in tokens {
             let off = t as usize * row_bytes;
-            v.extend(deq_raw(&self.tok_embd[off..off + row_bytes], d, self.embd_type).expect("embed row"));
+            let row: &[u8] = match &self.tok_embd {
+                EmbdTable::Resident(tbl) => &tbl[off..off + row_bytes],
+                EmbdTable::Streamed { backing, base } => {
+                    backing.read_at(base + off as u64, &mut scratch).expect("embedding row not available");
+                    &scratch
+                }
+            };
+            v.extend(deq_raw(row, d, self.embd_type).expect("embed row"));
         }
         // Gemma scales the token embeddings by √n_embd (identity elsewhere, embd_scale == 1.0).
         if self.cfg.embd_scale != 1.0 { for x in &mut v { *x *= self.cfg.embd_scale; } }
@@ -546,6 +584,24 @@ impl Qwen3 {
         });
         prof(&self.ctx, "lm_head");
         out
+    }
+
+    /// Fetch embedding rows on demand instead of holding the whole table.
+    ///
+    /// `base` is the table's absolute byte offset. Frees the resident copy, so peak drops by the table's
+    /// full size — 144.6 MB on Qwen2.5-0.5B, where it is 21% of the checkpoint and is touched a few
+    /// kilobytes at a time.
+    ///
+    /// The caller owns availability: with a `StagedBacking` the rows for the current tokens must be
+    /// staged first, and a miss is `NotStaged` naming the range rather than a wrong embedding.
+    pub fn stream_embeddings(&mut self, backing: Arc<dyn ferric_tier::Backing + Send + Sync>, base: u64) {
+        self.tok_embd = EmbdTable::Streamed { backing, base };
+    }
+
+    /// Byte range of one embedding row, for a caller that must stage it.
+    pub fn embd_row_extent(&self, token: u32, base: u64) -> (u64, usize) {
+        let rb = ferric_gguf::type_size(self.embd_type, self.cfg.n_embd).expect("embd type");
+        (base + token as u64 * rb as u64, rb)
     }
 
     /// The frozen quantized LM head [n_vocab, n_embd] — for `Var::matmul_qf` (LoRA around it without

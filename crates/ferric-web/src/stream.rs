@@ -66,6 +66,8 @@ pub struct FerricStream {
     bpe: Bpe,
     total: u64,
     header_len: usize,
+    embd_base: u64,
+    embd_bytes: u64,
     /// Embeddings, norms and the LM head: resident regardless of the budget, and on a small model with a
     /// large vocabulary they DOMINATE. Reported so a peak figure is explicable rather than surprising.
     nonlayer_bytes: u64,
@@ -119,9 +121,13 @@ impl FerricStream {
         // version called Qwen3::load (the RESIDENT loader, which builds every layer) after staging only
         // the prefix, and the browser caught it exactly as designed: `NotStaged` naming the missing
         // range rather than returning zeros.
+        // The embedding table is deliberately NOT staged: `embed` only ever gathers the prompt's rows,
+        // so holding all 144.6 MB of it is pure resident weight. Rows are staged per step instead.
+        let (embd_base, embd_sz) = src.extent("token_embd.weight")
+            .ok_or_else(|| JsValue::from_str("no token_embd.weight"))?;
         let mut nonlayer_bytes = 0u64;
         for t in src.tensors.clone() {
-            if t.name.starts_with("blk.") { continue; }
+            if t.name.starts_with("blk.") || t.name == "token_embd.weight" { continue; }
             let (off, sz) = src.extent(&t.name).ok_or_else(|| JsValue::from_str("bad extent"))?;
             nonlayer_bytes += sz as u64;
             if !staged.is_staged(off, sz) {
@@ -160,9 +166,11 @@ impl FerricStream {
         let ls = ferric_llama::stream::open_from_source(
             &ctx, src2, Arc::clone(&backing), budget_bytes as u64, cfg)
             .map_err(|e| JsValue::from_str(&e))?;
-        let model = Qwen3::from_stream(&ctx, &src, ls).map_err(|e| JsValue::from_str(&e))?;
+        let model = Qwen3::from_stream(&ctx, &src, ls, Some((Arc::clone(&backing), embd_base)))
+            .map_err(|e| JsValue::from_str(&e))?;
 
-        Ok(FerricStream { model, staged, fetcher, runs, plan, bpe, total, header_len, nonlayer_bytes })
+        Ok(FerricStream { model, staged, fetcher, runs, plan, bpe, total, header_len, nonlayer_bytes,
+                          embd_base, embd_bytes: embd_sz as u64 })
     }
 
     /// What the budget bought, as JSON — for a caller that wants to show it before generating.
@@ -222,6 +230,14 @@ impl FerricStream {
         let npin = self.plan.npin;
 
         for _ in 0..n {
+            // Stage only the embedding rows this step will look up — a few KB out of 144.6 MB.
+            for &t in &all[fed..] {
+                let (off, rb) = self.model.embd_row_extent(t, self.embd_base);
+                if !self.staged.is_staged(off, rb) {
+                    let b = fetch_range(&self.fetcher, off, rb).await?;
+                    self.staged.stage(off, b);
+                }
+            }
             let mut st = self.model.step_begin(&all[fed..], &cache);
             while let Some(il) = st.next_layer() {
                 if il >= npin {
