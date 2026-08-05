@@ -26,9 +26,31 @@ use ferric_gguf::{GgufFile, GgufSource};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use std::sync::Arc;
 
+/// 1-minute load average, or None if it cannot be read.
+///
+/// This benchmark reports timings, and a timing taken on a contended machine is a measurement of the
+/// contention. That is not hypothetical here: the first run of this file reported 8.6 tok/s and had
+/// 4 sequences finishing SLOWER than 8, at load average 64.7. Re-run at 4.6 it was clean and
+/// self-consistent. So the guard is part of the benchmark, not a nicety.
+fn load_avg() -> Option<f64> {
+    let out = std::process::Command::new("uptime").output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let tail = s.split("load average").nth(1)?;
+    tail.trim_start_matches(|c: char| !c.is_ascii_digit()).split(&[',', ' '][..]).next()?.parse().ok()
+}
+
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
+    if let Some(l) = load_avg() {
+        println!("  machine load average: {l:.2}");
+        assert!(
+            l < 8.0,
+            "load average {l:.2} is too high to time anything. This benchmark measured 8.6 tok/s with \
+             nonsensical scaling at load 64.7, and 89.7 tok/s with exactly linear scaling at load 4.6 — \
+             same code, same machine. Wait for it to settle and re-run."
+        );
+    }
     let home = std::env::var("HOME").unwrap();
     let path = format!("{home}/.cache/ferric/hub/Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf");
     let g = GgufFile::open(&path).unwrap();

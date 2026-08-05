@@ -164,10 +164,33 @@ That reframes the remedies, and notably the most promising one is already built:
 
   The fix is a **batched decode**: stack N sequences' tokens into `[N, d]` and run one forward, which
   needs each sequence's KV attended separately inside one kernel. That is exactly what paged attention
-  provides, and why `ferric-kv`'s `PagedKv` is complete, tested, and unwired. **This is the largest
-  identified opportunity in the runtime: up to 8× aggregate throughput at 8 concurrent sequences**, and
-  unlike the four falsified hypotheses above it rests on a structural fact about the code rather than on
-  an interpretation of a timing.
+  provides, and why `ferric-kv`'s `PagedKv` is complete, tested, and unwired. Unlike the four falsified
+  hypotheses above, this rests on a structural fact about the code rather than on an interpretation of
+  a timing: one forward reads the 525 MB of weights **once**, N forwards read it N times.
+
+  **How much is actually available — spiked, not assumed.** Comparing one N-token forward against N
+  single-token forwards isolates exactly that amortisation, using existing code:
+
+  | N | N × 1-token | 1 × N-token | speedup |
+  |---|---|---|---|
+  | 2 | 21.7 ms | 18.8 ms | 1.16× |
+  | 4 | 42.6 ms | 19.4 ms | 2.20× |
+  | 8 | 87.1 ms | 24.9 ms | **3.50×** |
+
+  So roughly **3.5× at 8 sequences, not the naive 8×** — attention work grows with N, and the host build
+  does not vanish. Still the largest available win by a wide margin, and now with a realistic target
+  rather than a ceiling.
+
+  ⚠ Caveat on those numbers: taken at load average 12.4, which is higher than ideal. The trend is
+  monotonic and the N=1 row agrees with independent measurements, so the shape is trustworthy; the exact
+  multipliers should be re-taken on a quiet machine before anyone quotes them. A later attempt at load
+  40 produced nonsense (N=1 at 0.58×) and was discarded — `batch_throughput.rs` now refuses to run above
+  load 8 for exactly this reason.
+
+  **Implementation cost, scoped:** the matmuls batch for free. What needs work is (1) RoPE taking
+  per-row positions instead of a scalar — a kernel change, since each sequence sits at a different
+  position; (2) attention per sequence, because KV lengths differ; (3) per-sequence KV append. Items
+  (2) and (3) are what paged attention subsumes.
 - **Reduce host build time.** ~4 ms of the 5.79 remains unattributed by `host_ns()`; the profile shows it
   is diffuse rather than concentrated, so this is death-by-a-thousand-cuts, not one fix.
 - **Speculative decoding** would break the serial dependency — the only remedy that attacks the structure
