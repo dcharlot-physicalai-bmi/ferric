@@ -41,7 +41,13 @@ jobs:
         run: cargo test --workspace --verbose
 
       - name: Build browser target (wasm32 + WebGPU)
-        run: cargo build -p ferric-core --target wasm32-unknown-unknown
+        # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
+        # than asserted in a doc. ferric-kv in particular documents its scheduler tests as running
+        # "on any target including wasm" — that only means something if wasm is actually compiled.
+        run: |
+          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer; do
+            echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
+          done
 
       # Every example validates its GPU result against a reference (CPU / onnxruntime / numpy).
       # Skips run_projectors (needs the SmolVLA-derived fixtures that aren't committed).
@@ -80,6 +86,7 @@ jobs:
           cargo run -p ferric-tensor --example slice
           cargo run -p ferric-tensor --example cat
           cargo run -p ferric-tensor --example flash
+          cargo run -p ferric-tensor --example chunked_attn
           cargo run -p ferric-tensor --example gdn_state
           cargo run -p ferric-tensor --example fattn
           cargo run -p ferric-tensor --example overhead
@@ -130,7 +137,13 @@ jobs:
         run: cargo test --workspace --verbose
 
       - name: Build browser target (wasm32 + WebGPU)
-        run: cargo build -p ferric-core --target wasm32-unknown-unknown
+        # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
+        # than asserted in a doc. ferric-kv in particular documents its scheduler tests as running
+        # "on any target including wasm" — that only means something if wasm is actually compiled.
+        run: |
+          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer; do
+            echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
+          done
 
       # Ferric's differentiating claim is bit-reproducible output ACROSS FABRICS. The Linux job runs on
       # lavapipe — a software rasterizer — so until now no CI job had ever executed a Ferric kernel on a
@@ -145,6 +158,10 @@ jobs:
           cargo run -p ferric-tensor --example fabric
           cargo run -p ferric-tensor --example dtypes
           cargo run -p ferric-tensor --example general
+          # New kernel path (chunked prefill). Runs on BOTH jobs deliberately: lavapipe above and real
+          # Metal here, because a mask-offset bug that only appears on one fabric is exactly the kind
+          # of thing a single-backend CI cannot see.
+          cargo run -p ferric-tensor --example chunked_attn
 
       # Certificates and the tier policy are pure arithmetic and must agree everywhere. If a result here
       # differs from the Linux job, something is platform-dependent that must not be.
