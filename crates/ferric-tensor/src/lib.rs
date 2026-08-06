@@ -374,7 +374,28 @@ impl Tensor {
         // packed first — one fewer `gather` dispatch per layer per token. A packed input gives
         // src_off = 0 and src_row_stride = h*dh, which reduces ib to exactly the old shared base.
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
-        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, c.offset as u32, srs as u32])], groups(t * n_heads));
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, c.offset as u32, srs as u32];
+        info.extend((0..t).map(|i| (offset + i) as u32));
+        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
+    /// RoPE where every row carries its **own absolute position**.
+    ///
+    /// [`rope`](Self::rope) assumes rows are consecutive (`offset + i`), which holds for one sequence.
+    /// Batched decode puts N *different* sequences in one call, each at whatever position its own history
+    /// has reached, so the positions must be given explicitly. Same kernel, same math — only where the
+    /// angle's position comes from differs.
+    pub fn rope_at(&self, n_heads: usize, head_dim: usize, base: f32, positions: &[u32]) -> Tensor {
+        let owned;
+        let c = if self.rank() == 2 && self.strides[1] == 1 { self } else { owned = self.contiguous(); &owned };
+        let t = c.numel() / (n_heads * head_dim);
+        assert_eq!(positions.len(), t, "rope_at needs one position per row: {t} rows, {} given", positions.len());
+        let out = empty(&self.ctx, c.numel());
+        let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0u32, c.offset as u32, srs as u32];
+        info.extend_from_slice(positions);
+        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -1745,7 +1766,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let o = (i * h + head) * dh; let lb = log(base);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
         let inv = exp(-2.0 * f32(c) / f32(dh) * lb) * scale[c];
-        let ang = f32(i + off) * inv; let cs = cos(ang); let sn = sin(ang);
+        // Per-row position. Batched decode puts N sequences in one call, each at a DIFFERENT position,
+        // so a scalar base + row index cannot express it. info[7 + i] is that row's absolute position;
+        // the single-sequence path fills it with off + i and is unchanged.
+        let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
         let x1 = x[o + c]; let x2 = x[o + c + half];
         out[o + c] = x1 * cs - x2 * sn;
         out[o + c + half] = x2 * cs + x1 * sn;
@@ -1756,7 +1780,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const ROPE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-// info: t, h, dh, bitcast(base), pos_off, src_off, src_row_stride
+// info: t, h, dh, bitcast(base), pos_off, src_off, src_row_stride, then t per-row positions
 //
 // `pos_off` (info[4]) is the SEQUENCE POSITION — the token's index in the stream. `src_off` (info[5]) is
 // the input tensor's BUFFER offset. They are different things that have both been called "offset", and
@@ -1775,7 +1799,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let lb = log(base);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
         let inv = exp(-2.0 * f32(c) / f32(dh) * lb);
-        let ang = f32(i + off) * inv; let cs = cos(ang); let sn = sin(ang);
+        // Per-row position. Batched decode puts N sequences in one call, each at a DIFFERENT position,
+        // so a scalar base + row index cannot express it. info[7 + i] is that row's absolute position;
+        // the single-sequence path fills it with off + i and is unchanged.
+        let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
         let x1 = x[ib + c]; let x2 = x[ib + c + half];
         out[ob + c] = x1 * cs - x2 * sn;
         out[ob + c + half] = x2 * cs + x1 * sn;

@@ -148,6 +148,8 @@ impl Cache {
     pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() } }
     /// Per-layer (K, V) buffers — for a prefix cache that copies them.
     pub fn layers(&self) -> &[(KvBuf, KvBuf)] { &self.kv }
+    /// Mutable access to layer `il`'s (K, V) — used by batched decode, which walks N caches per layer.
+    pub fn kv_mut(&mut self, il: usize) -> &mut (KvBuf, KvBuf) { &mut self.kv[il] }
     /// Install pre-computed KV, e.g. a prefix copied from an earlier request.
     ///
     /// The caller must set [`Cache::pos`] to match; `crate::prefix::PrefixCache::seed` does both, and
@@ -554,6 +556,100 @@ impl Qwen3 {
         }
 
         out
+    }
+
+    /// Attention for **N independent sequences**, one token each.
+    ///
+    /// The whole point is the first line: `wqkv.matmul` runs once over `[N, d]` instead of N times over
+    /// `[1, d]`, so the 525 MB of weights are read **once for N tokens** rather than N times. That is the
+    /// entire source of the win — decode is a weight-streaming problem, and batching is what amortises it.
+    ///
+    /// What cannot be batched is attention itself: sequence `i` attends *its own* KV history, at *its own*
+    /// position, and those histories have different lengths. So the per-sequence work stays a loop, and
+    /// only the projections are shared. (Paged attention is what would collapse that loop too.)
+    fn attn_batch(&self, h: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        let (n, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
+        debug_assert_eq!(n, caches.len(), "one row per sequence");
+
+        let qkv = l.wqkv.matmul(h);                                  // <-- batched: the win
+        let qkv = match &l.qkv_bias { Some(bias) => qkv.add(bias), None => qkv };
+        let qn = |x: Tensor, hn: usize, norm: &Option<Tensor>| match norm {
+            Some(w) => x.reshape(&[n, hn, hd]).rmsnorm(w, self.cfg.eps).reshape(&[n, hn * hd]),
+            None => x,
+        };
+
+        // Each row sits at a different absolute position, which is exactly what `rope_at` exists for.
+        let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
+        let fuse = l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        let (q, k) = if fuse {
+            let qk = qkv.narrow(1, 0, l.q_out + l.kv_out).rope_at(nh + nkv, hd, l.rope_base, &positions);
+            (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
+        } else {
+            let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
+            let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
+            (q.rope_at(nh, hd, l.rope_base, &positions), k.rope_at(nkv, hd, l.rope_base, &positions))
+        };
+        let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out);
+
+        let sc = self.cfg.attn_softcap;
+        let win = if std::env::var("FERRIC_NOWINDOW").is_ok() { 0 } else { l.window };
+        let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+        for (i, c) in caches.iter_mut().enumerate() {
+            let (ki, vi) = (k.narrow(0, i, 1), v.narrow(0, i, 1));
+            let lc = c.kv_mut(il);
+            let (kc, vc) = ferric_tensor::append2(&self.ctx, &mut lc.0, &ki, &mut lc.1, &vi);
+            let qi = q.narrow(0, i, 1).contiguous();
+            outs.push(if win > 0 { nn::decode_attention_win(&qi, &kc, &vc, nh, nkv, win, sc) }
+                      else { nn::decode_attention(&qi, &kc, &vc, nh, nkv, sc) });
+        }
+        let o = outs.iter().skip(1).fold(outs[0].clone(), |acc, t| acc.cat(t, 0));
+        o.matmul_q(&l.wo)                                            // <-- batched again
+    }
+
+    /// One layer for N sequences. Identical structure to `apply_layer`; only attention differs.
+    fn apply_layer_batch(&self, x: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        use ferric_tensor::batch;
+        let xin = x;
+        if self.cfg.is_gemma {
+            let eps = self.cfg.eps;
+            batch(&self.ctx, || {
+                let a = self.attn_batch(&xin.rmsnorm(&l.attn_norm, eps), l, caches, il);
+                let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
+                let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
+            })
+        } else {
+            batch(&self.ctx, || {
+                let y = self.attn_batch(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, caches, il);
+                let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
+                self.ffn(&xy_n, l, il).add(&xy)
+            })
+        }
+    }
+
+    /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
+    ///
+    /// `tokens[i]` is the next token for `caches[i]`. Returns `[N, n_vocab]` logits — row `i` belongs to
+    /// sequence `i`.
+    ///
+    /// Every sequence's logits are **identical** to calling `forward_cached` on it alone; batching changes
+    /// only how the work is scheduled. That is asserted in `examples/batched_decode.rs`, because a batched
+    /// path that crossed sequences would still emit fluent text.
+    pub fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        use ferric_tensor::batch;
+        assert_eq!(tokens.len(), caches.len(), "one token per sequence");
+        assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
+        let mut x = self.embed(tokens);
+        for il in 0..self.cfg.n_layer {
+            let l = self.layer_ref(il);
+            x = self.apply_layer_batch(&x, &l, caches, il);
+        }
+        for c in caches.iter_mut() { c.pos += 1; }
+        let sc = self.cfg.final_softcap;
+        batch(&self.ctx, || {
+            let lg = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
+            if sc > 0.0 { lg.softcap(sc) } else { lg }
+        })
     }
 
     /// The layer at `il`: resident, or materialised from the tier.

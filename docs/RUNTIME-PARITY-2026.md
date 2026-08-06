@@ -187,10 +187,29 @@ That reframes the remedies, and notably the most promising one is already built:
   40 produced nonsense (N=1 at 0.58×) and was discarded — `batch_throughput.rs` now refuses to run above
   load 8 for exactly this reason.
 
-  **Implementation cost, scoped:** the matmuls batch for free. What needs work is (1) RoPE taking
-  per-row positions instead of a scalar — a kernel change, since each sequence sits at a different
-  position; (2) attention per sequence, because KV lengths differ; (3) per-sequence KV append. Items
-  (2) and (3) are what paged attention subsumes.
+  ### ✅ Built — `Qwen3::forward_batch`
+
+  All three pieces landed: `Tensor::rope_at` (per-row absolute positions, since each sequence sits
+  wherever its own history reached), a per-sequence attention loop, and per-sequence KV append.
+
+  | seqs | N separate | 1 batched | speedup |
+  |---|---|---|---|
+  | 1 | 10.79 ms | 10.78 ms | 1.00× |
+  | 2 | 21.73 ms | 13.28 ms | 1.64× |
+  | 4 | 43.10 ms | 18.14 ms | 2.38× |
+  | 8 | 86.48 ms | 29.61 ms | **2.92×** |
+
+  Against the 3.5× spike, which had no per-sequence attention loop — that loop is the difference, and it
+  is exactly what paged attention would fold away. **This is the first change this session that moved a
+  wall-clock number**, after four falsified hypotheses that did not.
+
+  Correctness is asserted before any timing: every sequence's tokens must be **identical** to decoding it
+  alone, checked over 24 steps at 2/4/8 sequences with deliberately *unequal* prompt lengths so a shared
+  RoPE position or a crossed cache cannot cancel out. A batched path that leaked between sequences would
+  still emit fluent text; there is no crash to catch it.
+
+  Still open: fold the per-sequence attention loop into one paged-attention kernel, which is the
+  remaining gap between 2.92× and linear.
 - **Reduce host build time.** ~4 ms of the 5.79 remains unattributed by `host_ns()`; the profile shows it
   is diffuse rather than concentrated, so this is death-by-a-thousand-cuts, not one fix.
 - **Speculative decoding** would break the serial dependency — the only remedy that attacks the structure
