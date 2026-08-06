@@ -92,7 +92,16 @@ async fn run_static(m: &Qwen3, cfg: &Cfg, prompts: &[(u64, Vec<u32>, usize)], ba
     out
 }
 
-/// Continuous batching: `ferric-kv`'s scheduler decides, and a request retires the step it finishes.
+/// Continuous batching: `ferric_kv::Scheduler` decides, and every decode in a step runs in ONE forward.
+///
+/// This is the pairing that makes both halves pay. The scheduler removes head-of-line blocking — a short
+/// request retires the step it finishes rather than waiting for the batch. `forward_batch` then executes
+/// the whole step's decodes in a single pass, so the ~525 MB of weights are read once for the step
+/// instead of once per sequence. Without the second half the scheduler improves latency and nothing
+/// else: `examples/batch_throughput.rs` measured that at exactly 1.00x scaling.
+///
+/// Prefills stay separate — they carry different token counts per sequence, so they do not stack into a
+/// uniform `[N, d]`. Only the decodes batch, which is where the steady-state cost lives anyway.
 async fn run_continuous(m: &Qwen3, cfg: &Cfg, prompts: &[(u64, Vec<u32>, usize)], max_seqs: usize)
     -> Vec<(u64, usize, Vec<u32>)>
 {
@@ -102,9 +111,10 @@ async fn run_continuous(m: &Qwen3, cfg: &Cfg, prompts: &[(u64, Vec<u32>, usize)]
         s.submit(Request::new(*id, toks.clone(), *n));
     }
 
-    // Model state per *sequence* id. The scheduler hands back finished `Request`s (keyed by request id),
-    // so the seq->id map is snapshotted each step — looking state up by request id would silently miss.
-    let mut state: HashMap<u64, (Cache, u32, Vec<u32>)> = HashMap::new();
+    // One live sequence's model state. Held in a slab rather than a map because a step needs many
+    // `&mut Cache` at once, and a HashMap cannot hand out disjoint mutable borrows by key.
+    struct Slot { seq: u64, cache: Cache, next: u32, gen: Vec<u32> }
+    let mut slots: Vec<Slot> = Vec::new();
     let mut out = Vec::new();
     let mut step = 0usize;
 
@@ -117,30 +127,43 @@ async fn run_continuous(m: &Qwen3, cfg: &Cfg, prompts: &[(u64, Vec<u32>, usize)]
         step += 1;
         let seq_of: HashMap<u64, u64> = s.running().iter().map(|r| (r.req.id, r.seq)).collect();
 
-        let mut produced: Vec<(u64, u32)> = Vec::new();
+        // ---- prefills: one call each, since token counts differ ----
         for &(seq, start, n) in &batch.work {
             let running = s.running().iter().find(|r| r.seq == seq).expect("batch names a running seq");
-            // The scheduler encodes a decode as start == tokens.len() and a prefill as start == filled,
-            // which is strictly below it. That distinction is exact — inferring it from `n == 1` would
-            // misread a one-token prefill chunk as a decode.
-            let is_decode = start == running.req.tokens.len();
-            if is_decode {
-                let e = state.get_mut(&seq).expect("decode before prefill");
-                let tok = e.1;
-                e.2.push(tok);
-                e.1 = decode_one(m, &mut e.0, tok, n_vocab).await;
-                produced.push((seq, tok));
-            } else {
-                let toks = running.req.tokens[start..start + n].to_vec();
-                let e = state.entry(seq).or_insert_with(|| (Cache::new(cfg), 0, Vec::new()));
-                let l = m.forward_cached(&toks, &mut e.0).to_vec().await;
-                e.1 = argmax(&l, n_vocab);
+            // A decode is encoded as start == tokens.len(); a prefill as start == filled, strictly below.
+            // Inferring from `n == 1` would misread a one-token prefill chunk as a decode.
+            if start == running.req.tokens.len() { continue }
+            let toks = running.req.tokens[start..start + n].to_vec();
+            if !slots.iter().any(|sl| sl.seq == seq) {
+                slots.push(Slot { seq, cache: Cache::new(cfg), next: 0, gen: Vec::new() });
+            }
+            let sl = slots.iter_mut().find(|sl| sl.seq == seq).unwrap();
+            let l = m.forward_cached(&toks, &mut sl.cache).to_vec().await;
+            sl.next = argmax(&l, n_vocab);
+        }
+
+        // ---- decodes: ALL of them in one forward pass ----
+        let decoding: Vec<u64> = batch.work.iter()
+            .filter(|&&(seq, start, _)| s.running().iter().any(|r| r.seq == seq && start == r.req.tokens.len()))
+            .map(|&(seq, _, _)| seq)
+            .collect();
+
+        let mut produced: Vec<(u64, u32)> = Vec::new();
+        if !decoding.is_empty() {
+            // One `iter_mut` yields disjoint `&mut` for exactly the slots decoding this step.
+            let mut picked: Vec<&mut Slot> = slots.iter_mut().filter(|sl| decoding.contains(&sl.seq)).collect();
+            let toks: Vec<u32> = picked.iter().map(|sl| sl.next).collect();
+            for (sl, &t) in picked.iter_mut().zip(&toks) { sl.gen.push(t); produced.push((sl.seq, t)); }
+            let mut caches: Vec<&mut Cache> = picked.iter_mut().map(|sl| &mut sl.cache).collect();
+            let logits = m.forward_batch(&toks, &mut caches).to_vec().await;
+            for (i, sl) in picked.iter_mut().enumerate() {
+                sl.next = argmax(&logits[i * n_vocab..(i + 1) * n_vocab], n_vocab);
             }
         }
 
         for done in s.complete(&batch, &produced) {
             let seq = seq_of.get(&done.id).copied().expect("a finished request was running this step");
-            let gen = state.remove(&seq).map(|e| e.2).unwrap_or_default();
+            let gen = slots.iter().position(|sl| sl.seq == seq).map(|i| slots.remove(i).gen).unwrap_or_default();
             out.push((done.id, step, gen));
         }
         if step > 10_000 { panic!("continuous batching did not terminate"); }
@@ -227,10 +250,15 @@ async fn run() {
     let short_cont: usize = prompts.iter().filter(|(_, _, n)| *n <= 3)
         .filter_map(|(id, _, _)| cont.iter().find(|(i, _, _)| i == id).map(|(_, s, _)| *s)).sum();
 
-    println!("\n  ✅ The 3-token requests wait {short_static} steps under static batching and {short_cont} under");
-    println!("     continuous — {:.1}x less. That is the whole point: throughput can look identical while",
+    println!("\n  ✅ Two wins, and they come from two different pieces.\n");
+    println!("     LATENCY: the 3-token requests wait {short_static} steps under static batching and {short_cont} under");
+    println!("     continuous — {:.1}x less. That is the scheduler: a request retires the step it finishes",
              short_static as f64 / short_cont.max(1) as f64);
-    println!("     every individual request is slow, so the measurement is per-request latency, not");
-    println!("     tokens/sec. The scheduler is `ferric-kv`'s, unit-tested in microseconds on any target");
-    println!("     including wasm; this is the same logic deciding what a real model runs.");
+    println!("     instead of waiting for the longest in its batch.\n");
+    println!("     THROUGHPUT: {:.2}x on wall clock, and that is NOT the scheduler — it is `forward_batch`",
+             static_ms / cont_ms);
+    println!("     executing a whole step's decodes in one pass, so the ~525 MB of weights are read once");
+    println!("     per step rather than once per sequence. Scheduling alone gave exactly 1.00x scaling");
+    println!("     (examples/batch_throughput.rs); it decides WHAT runs but cannot amortise anything.\n");
+    println!("     Both halves are needed, and neither substitutes for the other.");
 }

@@ -208,8 +208,27 @@ That reframes the remedies, and notably the most promising one is already built:
   RoPE position or a crossed cache cannot cancel out. A batched path that leaked between sequences would
   still emit fluent text; there is no crash to catch it.
 
-  Still open: fold the per-sequence attention loop into one paged-attention kernel, which is the
-  remaining gap between 2.92× and linear.
+  ### ✅ Wired: scheduler + batched execution
+
+  `examples/continuous_batching.rs` now runs a whole step's decodes through `forward_batch`, which is the
+  pairing that makes both halves pay. Measured on 6 uneven requests (quiet machine, load 5.8):
+
+  | | wall | total wait (steps) | 3-token requests |
+  |---|---|---|---|
+  | static batching | 1244 ms | 408 | 272 |
+  | continuous + batched | **772 ms** | 106 | **16** |
+
+  **17× latency and 1.61× throughput, from two different mechanisms.** The latency win is the scheduler —
+  a request retires the step it finishes instead of waiting for the longest in its batch. The throughput
+  win is `forward_batch` — the weights are read once per step rather than once per sequence. Scheduling
+  alone measured exactly 1.00× scaling; it decides *what* runs but cannot amortise anything. Neither half
+  substitutes for the other, which is worth stating because the scheduler shipped first and looked like
+  it should have delivered both.
+
+  Tokens remain identical to the static baseline throughout.
+
+  Still open: fold the per-sequence attention loop into one paged-attention kernel — the remaining gap
+  between 2.92× and linear, and the last use for `ferric-kv`'s `PagedKv`.
 - **Reduce host build time.** ~4 ms of the 5.79 remains unattributed by `host_ns()`; the profile shows it
   is diffuse rather than concentrated, so this is death-by-a-thousand-cuts, not one fix.
 - **Speculative decoding** would break the serial dependency — the only remedy that attacks the structure
