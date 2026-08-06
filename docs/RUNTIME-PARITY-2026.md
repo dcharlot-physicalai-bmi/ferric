@@ -236,3 +236,33 @@ That reframes the remedies, and notably the most promising one is already built:
 
 The lesson for anyone continuing: this file has recorded four confident wrong answers. Do not add a
 fifth without a host/device split *and* an A/B against a baseline built from a `git worktree`.
+
+
+## Split-KV decode attention (2026-08-06) — the on-device parallelism gap
+
+The 2026-08 ingest sweep's top-ranked item, and it is the one axis none of this session's other work
+touched. `fused_decode_attention` dispatches **one workgroup per query head** and walks the whole KV
+cache *serially inside* it. A 14-head model at 32k context = 14 workgroups on a device with hundreds of
+cores. Paged KV, continuous batching and batched decode all parallelise across *sequences* — and at
+batch 1, the case an on-device runtime exists for, there is only one.
+
+`FUSED_ATTN_SPLIT_WGSL` partitions the KV axis across `nh × splits` workgroups, each emitting an
+**unnormalised** partial (accumulator + running max + running sum); `FUSED_ATTN_COMBINE_WGSL` merges
+them. The merge is the same `exp(m_old - m_new)` rescale the kernel already applied between chunks,
+applied across partitions instead — so no new math, only a new decomposition.
+
+**Correctness, measured across 24 shape × length combinations** (nh ∈ {4,8,14,32}, GQA ratios 1–4,
+dh ∈ {64,96,128}, S ∈ {1 … 32768}): worst deviation **7.8e-8**, and **exactly 0** below the length gate
+where the original single-dispatch path still runs. Not bit-identical — the merge reduces in a different
+order — which is a deliberate decision recorded rather than glossed: short-context decode, where
+reproducibility matters most for tests, is untouched.
+
+`decode_splits` gates on ≥512 keys per split and caps total workgroups at 256; `FERRIC_SPLITKV`
+overrides for A/B.
+
+⚠ **Not yet timed.** The machine has been at load 27–76 from unrelated work for the entire window, and
+this session already published two contaminated benchmarks before adding load guards. The kernel-level
+A/B and — more importantly — the end-to-end decode tok/s at 1k/8k/32k context on Metal, Vulkan and Chrome
+remain **unmeasured**. Do not claim a win from this until they exist: attention is only a share of a
+decode step, and this session's repeated lesson is that a kernel-isolation improvement need not move the
+wall clock at all.

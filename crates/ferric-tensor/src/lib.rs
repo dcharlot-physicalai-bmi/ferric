@@ -533,10 +533,25 @@ impl Tensor {
         assert!(dh <= 128, "fused_decode_attention: head_dim ≤ 128");
         let out = empty(&self.ctx, nh * dh);
         let scale = 1.0 / (dh as f32).sqrt();
-        run(&self.ctx, FUSED_ATTN_WGSL, "fattn",
-            &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &out,
-              &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, s as u32, scale.to_bits(), 0, 0, 0])],
-            (nh as u32, 1, 1));
+        let splits = decode_splits(s, nh);
+        if splits > 1 {
+            // Split-KV: partition the cache across workgroups, then merge. Two dispatches instead of
+            // one, which is why it is gated on there being enough keys for the extra launch to pay.
+            let part = empty(&self.ctx, nh * splits * (dh + 2));
+            run(&self.ctx, FUSED_ATTN_SPLIT_WGSL, "fattn_split",
+                &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &part,
+                  &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, s as u32,
+                                       scale.to_bits(), splits as u32, 0, 0])],
+                (nh as u32, splits as u32, 1));
+            run(&self.ctx, FUSED_ATTN_COMBINE_WGSL, "fattn_combine",
+                &[&part, &out, &unibuf(&self.ctx, &[nh as u32, dh as u32, splits as u32, 0])],
+                (nh as u32, 1, 1));
+        } else {
+            run(&self.ctx, FUSED_ATTN_WGSL, "fattn",
+                &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &out,
+                  &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, s as u32, scale.to_bits(), 0, 0, 0])],
+                (nh as u32, 1, 1));
+        }
         Tensor::from_parts(&self.ctx, out, vec![1, nh * dh])
     }
 
@@ -1277,6 +1292,29 @@ pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
 struct NsGuard(std::time::Instant, usize);
 impl Drop for NsGuard { fn drop(&mut self) { add_ns(self.1, self.0.elapsed().as_nanos() as u64); } }
 fn scopeguard_ns(t: std::time::Instant, slot: usize) -> NsGuard { NsGuard(t, slot) }
+
+/// How many KV partitions to split a decode attention across.
+///
+/// `fattn` gives one workgroup per query head, so a 14-head model occupies 14 workgroups no matter how
+/// long the cache is — on a device with hundreds of cores that is nearly idle. Splitting the KV axis
+/// creates `nh * splits` workgroups instead.
+///
+/// Two guards, both earning their place: each split must keep at least `MIN_KEYS_PER_SPLIT` keys, or the
+/// partitions are too small to amortise their own setup and the combine pass; and total workgroups are
+/// capped so a huge head count does not spawn thousands of tiny ones. Below the threshold this returns 1
+/// and the original single-dispatch path runs unchanged.
+///
+/// wgpu exposes no core count, so these are tuned constants rather than a derived value. `FERRIC_SPLITKV`
+/// overrides for A/B (0 or 1 disables).
+fn decode_splits(s: usize, nh: usize) -> usize {
+    if let Ok(v) = std::env::var("FERRIC_SPLITKV") {
+        if let Ok(n) = v.parse::<usize>() { return n.max(1); }
+    }
+    const MIN_KEYS_PER_SPLIT: usize = 512;
+    const MAX_WORKGROUPS: usize = 256;
+    if nh == 0 || s < 2 * MIN_KEYS_PER_SPLIT { return 1; }
+    (s / MIN_KEYS_PER_SPLIT).min(MAX_WORKGROUPS / nh.max(1)).max(1)
+}
 
 fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
 /// 2D workgroup grid for large launches: a 1D grid caps at 65535 workgroups. Returns the grid plus
@@ -2294,6 +2332,106 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         workgroupBarrier();
     }
     if (t < dh) { out[head * dh + t] = accd / l_run; }
+}
+"#;
+
+
+// **Split-KV decode attention** (flash-decoding). Same math as FUSED_ATTN_WGSL, but the KV axis is
+// partitioned across workgroups instead of walked serially inside one.
+//
+// The problem it solves: `fattn` dispatches (nh, 1, 1) — one workgroup per query head — and each
+// workgroup loops the whole cache in 2048-key chunks. At batch 1 with a long context, that is 14-32
+// workgroups on a device with hundreds of cores: almost entirely idle. Paged KV, continuous batching and
+// batched decode all parallelise across SEQUENCES and do nothing here, because there is only one.
+//
+// Each workgroup now owns one (head, split) and emits an UNNORMALISED partial: the accumulator, plus the
+// running max and sum needed to merge it. `FUSED_ATTN_COMBINE_WGSL` does the merge. That merge is the
+// same rescale already used between chunks — `corr = exp(m_old - m_new)` — applied across partitions.
+const FUSED_ATTN_SPLIT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        q:    array<f32>;
+@group(0) @binding(1) var<storage,read>        k:    array<f32>;
+@group(0) @binding(2) var<storage,read>        v:    array<f32>;
+@group(0) @binding(3) var<storage,read_write>  part: array<f32>;  // [nh, splits, dh+2]
+struct Info { a: vec4<u32>, b: vec4<u32> }        // a=(nh,nkv,dh,S); b=(scale,splits,_,_)
+@group(0) @binding(4) var<uniform>             info: Info;
+var<workgroup> qs: array<f32, 128>;
+var<workgroup> sc: array<f32, 2048>;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let nh = info.a.x; let nkv = info.a.y; let dh = info.a.z; let s = info.a.w;
+    let scale = bitcast<f32>(info.b.x); let splits = info.b.y;
+    let head = wg.x; let sp = wg.y; let t = lid.x;
+    let g = nh / nkv; let kvh = head / g;
+    let qbase = head * dh; let kvbase = kvh * dh;
+    let pbase = (head * splits + sp) * (dh + 2u);
+
+    // Contiguous key range for this split. Ranges partition [0, s) exactly, so every key is counted once.
+    let per = (s + splits - 1u) / splits;
+    let beg = sp * per;
+    let end = min(s, beg + per);
+
+    if (t < dh) { qs[t] = q[qbase + t]; }
+    workgroupBarrier();
+
+    var m_run = -3.0e38; var l_run = 0.0; var accd = 0.0;
+    for (var c0 = beg; c0 < end; c0 = c0 + 2048u) {
+        let clen = min(2048u, end - c0);
+        for (var i = t; i < clen; i = i + 128u) {
+            var dot = 0.0; let kb = (c0 + i) * nkv * dh + kvbase;
+            for (var d = 0u; d < dh; d = d + 1u) { dot = dot + qs[d] * k[kb + d]; }
+            sc[i] = dot * scale;
+        }
+        workgroupBarrier();
+        var cm = -3.0e38;
+        for (var i = t; i < clen; i = i + 128u) { cm = max(cm, sc[i]); }
+        red[t] = cm; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = max(red[t], red[t + stride]); } workgroupBarrier(); }
+        let m_new = max(m_run, red[0]); let corr = exp(m_run - m_new); workgroupBarrier();
+        var cs = 0.0;
+        for (var i = t; i < clen; i = i + 128u) { let e = exp(sc[i] - m_new); sc[i] = e; cs = cs + e; }
+        red[t] = cs; workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) { if (t < stride) { red[t] = red[t] + red[t + stride]; } workgroupBarrier(); }
+        l_run = l_run * corr + red[0];
+        if (t < dh) {
+            var a = 0.0;
+            for (var i = 0u; i < clen; i = i + 1u) { a = a + sc[i] * v[(c0 + i) * nkv * dh + kvbase + t]; }
+            accd = accd * corr + a;
+        }
+        m_run = m_new;
+        workgroupBarrier();
+    }
+    // UNNORMALISED — dividing by l_run here would lose the information the merge needs.
+    if (t < dh) { part[pbase + t] = accd; }
+    if (t == 0u) { part[pbase + dh] = m_run; part[pbase + dh + 1u] = l_run; }
+}
+"#;
+
+// Merge the per-split partials. One workgroup per head; thread `t` owns output element `t`.
+//
+// An empty split (beg >= end, possible when splits does not divide S) leaves m = -3.0e38 and l = 0, so
+// its weight `exp(m - M)` is 0 and it contributes nothing — no special case needed.
+const FUSED_ATTN_COMBINE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        part: array<f32>;  // [nh, splits, dh+2]
+@group(0) @binding(1) var<storage,read_write>  out:  array<f32>;  // [nh·dh]
+struct Info { a: vec4<u32> }                      // (nh, dh, splits, _)
+@group(0) @binding(2) var<uniform>             info: Info;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let dh = info.a.y; let splits = info.a.z;
+    let head = wg.x; let t = lid.x;
+    if (t >= dh) { return; }
+    let row = dh + 2u;
+    var M = -3.0e38;
+    for (var j = 0u; j < splits; j = j + 1u) { M = max(M, part[(head * splits + j) * row + dh]); }
+    var L = 0.0; var A = 0.0;
+    for (var j = 0u; j < splits; j = j + 1u) {
+        let b = (head * splits + j) * row;
+        let w = exp(part[b + dh] - M);
+        L = L + part[b + dh + 1u] * w;
+        A = A + part[b + t] * w;
+    }
+    out[head * dh + t] = A / L;
 }
 "#;
 
