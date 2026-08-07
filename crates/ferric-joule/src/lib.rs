@@ -68,6 +68,40 @@ impl Class {
     }
 }
 
+/// What the meter's number actually encloses.
+///
+/// This moves the answer more than the technology does. Google measured the SAME Gemini prompt on the
+/// SAME fleet at 0.10 Wh accelerator-only and 0.24 Wh counting host CPU, DRAM, provisioned-idle machines
+/// and facility overhead: **2.4x from accounting alone** (arXiv:2508.15734). Across published methods one
+/// model on one task spans 6.2x. A joules figure without its boundary is not a measurement, so this rides
+/// with every reading and `Saving::claimable` refuses a comparison whose two arms enclose different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boundary {
+    /// The accelerator itself.
+    pub accelerator: bool,
+    /// Host CPU and DRAM. Excluded by most published figures.
+    pub host: bool,
+    /// Provisioned-but-idle capacity. The term that makes a fleet number honest.
+    pub idle: bool,
+    /// Facility overhead (PUE). Datacenter figures that omit it understate by 10-30%.
+    pub facility: bool,
+}
+
+impl Boundary {
+    /// What a hardware counter on a single device sees: the silicon, nothing around it.
+    pub const DEVICE: Boundary = Boundary { accelerator: true, host: false, idle: false, facility: false };
+    /// Whole system at the wall, which is what a battery or a plug meter reads.
+    pub const SYSTEM: Boundary = Boundary { accelerator: true, host: true, idle: true, facility: false };
+    pub fn label(&self) -> String {
+        let mut v = vec![];
+        if self.accelerator { v.push("accel"); }
+        if self.host { v.push("host"); }
+        if self.idle { v.push("idle"); }
+        if self.facility { v.push("pue"); }
+        if v.is_empty() { "unspecified".into() } else { v.join("+") }
+    }
+}
+
 /// Energy consumed over an interval, with provenance attached.
 #[derive(Debug, Clone, Copy)]
 pub struct Reading {
@@ -76,6 +110,8 @@ pub struct Reading {
     pub class: Class,
     /// Which sensor or model produced this, named so a reader can go and check it.
     pub source: &'static str,
+    /// What the number encloses. See [`Boundary`].
+    pub boundary: Boundary,
 }
 
 impl Reading {
@@ -91,7 +127,8 @@ impl Reading {
 impl std::fmt::Display for Reading {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:.3} J over {:.3} s ({:.1} W) [{} via {}]",
-               self.joules, self.seconds, self.watts(), self.class.label(), self.source)
+               self.joules, self.seconds, self.watts(), self.class.label(),
+               format!("{} :: {}", self.source, self.boundary.label()))
     }
 }
 
@@ -105,6 +142,8 @@ pub trait Meter {
     fn read_joules(&self) -> Option<f64>;
     fn class(&self) -> Class;
     fn source(&self) -> &'static str;
+    /// What this meter's number encloses. See [`Boundary`].
+    fn boundary(&self) -> Boundary;
 
     /// Whether this meter can currently produce readings. Checked before a run rather than after, so a
     /// benchmark fails at the start instead of producing hours of nothing.
@@ -126,6 +165,7 @@ pub fn measure<M: Meter, T>(meter: &M, f: impl FnOnce() -> T) -> (T, Option<Read
     let reading = match (e0, e1) {
         (Some(a), Some(b)) if b >= a => Some(Reading {
             joules: b - a, seconds: dt, class: meter.class(), source: meter.source(),
+            boundary: meter.boundary(),
         }),
         // A counter that went backwards wrapped or was reset. Report nothing rather than a wrong number.
         _ => None,
@@ -142,9 +182,16 @@ pub fn measure<M: Meter, T>(meter: &M, f: impl FnOnce() -> T) -> (T, Option<Read
 pub struct Saving {
     pub baseline: Reading,
     pub candidate: Reading,
-    /// Tasks completed by each arm. Kept because a saving that did less work is not a saving, and this
-    /// is the field's second most common error after the broken baseline.
+    /// Tasks ATTEMPTED by each arm.
     pub tasks: u64,
+    /// Tasks that SUCCEEDED. This is the denominator that matters, and it is separate from `tasks`
+    /// because unattended automation pays full price for its failures.
+    ///
+    /// Measured: in one agentic run, 2,256 J of 3,614 J (62.4%) went to a failed attempt before the
+    /// successful retry (arXiv:2605.22883). On GAIA, the model burning 7.31 kJ per query scored 16.4%
+    /// and the one burning 1.18 kJ scored 5.5% (arXiv:2511.07885) — per *successful* goal that is
+    /// 44.6 kJ against 21.5 kJ, which reverses the ranking energy-per-query gives you.
+    pub successes: u64,
 }
 
 impl Saving {
@@ -164,8 +211,16 @@ impl Saving {
         self.baseline.seconds / self.candidate.seconds
     }
 
-    /// Joules per task, both arms. The metric that actually matters.
-    pub fn per_task(&self) -> (f64, f64) {
+    /// Joules per SUCCESSFUL task, both arms. The metric that actually matters.
+    ///
+    /// Energy per query flatters anything that fails cheaply; energy per token flatters anything
+    /// terse. Neither is a unit of useful work.
+    pub fn per_success(&self) -> (f64, f64) {
+        (self.baseline.per_task(self.successes), self.candidate.per_task(self.successes))
+    }
+
+    /// Joules per attempt, which is what most published figures actually report.
+    pub fn per_attempt(&self) -> (f64, f64) {
         (self.baseline.per_task(self.tasks), self.candidate.per_task(self.tasks))
     }
 
@@ -185,8 +240,14 @@ impl Saving {
         if self.baseline.source != self.candidate.source {
             return Err("the two arms were measured by different meters, so the difference is not attributable");
         }
+        if self.baseline.boundary != self.candidate.boundary {
+            return Err("the two arms enclose different things: accounting alone moves a figure 2.4x, so this difference is not attributable to the method");
+        }
         if self.tasks == 0 {
             return Err("no task count was recorded, so joules-per-task is undefined");
+        }
+        if self.successes == 0 {
+            return Err("no successes recorded: energy per successful task is the unit, and zero successes at any energy is not an efficiency result");
         }
         if self.baseline.seconds < 1.0 || self.candidate.seconds < 1.0 {
             return Err("an arm ran for under a second, which is inside the noise of every sensor listed in this crate");
@@ -197,10 +258,10 @@ impl Saving {
 
 impl std::fmt::Display for Saving {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (b, c) = self.per_task();
+        let (b, c) = self.per_success();
         writeln!(f, "  baseline   {}", self.baseline)?;
         writeln!(f, "  candidate  {}", self.candidate)?;
-        writeln!(f, "  per task   {b:.4} J -> {c:.4} J over {} tasks", self.tasks)?;
+        writeln!(f, "  per success {b:.4} J -> {c:.4} J  ({}/{} succeeded)", self.successes, self.tasks)?;
         write!(f, "  saving     {:.1}% energy, {:.2}x speed [{}]  {}",
                self.percent(), self.speedup(), self.class().label(),
                match self.claimable() {
@@ -223,6 +284,7 @@ impl std::fmt::Display for Saving {
 pub fn compare<M: Meter>(
     meter: &M,
     tasks: u64,
+    successes: u64,
     reps: usize,
     mut baseline: impl FnMut(),
     mut candidate: impl FnMut(),
@@ -248,9 +310,10 @@ pub fn compare<M: Meter>(
 
     let n = reps as f64;
     Some(Saving {
-        baseline: Reading { joules: bj / n, seconds: bs / n, class: meter.class(), source: meter.source() },
-        candidate: Reading { joules: cj / n, seconds: cs / n, class: meter.class(), source: meter.source() },
+        baseline: Reading { joules: bj / n, seconds: bs / n, class: meter.class(), source: meter.source(), boundary: meter.boundary() },
+        candidate: Reading { joules: cj / n, seconds: cs / n, class: meter.class(), source: meter.source(), boundary: meter.boundary() },
         tasks,
+        successes,
     })
 }
 
@@ -277,6 +340,7 @@ impl Meter for Rapl {
     }
     fn class(&self) -> Class { Class::Measured }
     fn source(&self) -> &'static str { "rapl:package" }
+    fn boundary(&self) -> Boundary { Boundary { accelerator: false, host: true, idle: true, facility: false } }
 }
 
 /// NVIDIA board power via `nvidia-smi`, integrated over the interval.
@@ -316,6 +380,7 @@ impl Meter for NvidiaSmi {
     }
     fn class(&self) -> Class { Class::Derived }
     fn source(&self) -> &'static str { "nvidia-smi:board" }
+    fn boundary(&self) -> Boundary { Boundary::DEVICE }
 }
 
 /// Apple battery discharge: whole-system power, readable without root.
@@ -362,6 +427,7 @@ impl Meter for MacBattery {
     }
     fn class(&self) -> Class { Class::Derived }
     fn source(&self) -> &'static str { "macos:battery-discharge" }
+    fn boundary(&self) -> Boundary { Boundary::SYSTEM }
 }
 
 /// Nameplate arithmetic. Present so that sizing work has something to use, and classed `Estimated` so
@@ -381,6 +447,7 @@ impl Meter for Nameplate {
     fn read_joules(&self) -> Option<f64> { Some(self.watts * self.start.elapsed().as_secs_f64()) }
     fn class(&self) -> Class { Class::Estimated }
     fn source(&self) -> &'static str { "nameplate:tdp" }
+    fn boundary(&self) -> Boundary { Boundary::SYSTEM }
 }
 
 /// Pick the best meter this machine can actually provide, best first.
@@ -438,6 +505,7 @@ impl<'a, M: Meter> Session<'a, M> {
             seconds: self.start_t.elapsed().as_secs_f64(),
             class: self.meter.class(),
             source: self.meter.source(),
+            boundary: self.meter.boundary(),
         }, self.tasks))
     }
 }
@@ -466,6 +534,7 @@ mod tests {
         }
         fn class(&self) -> Class { self.class }
         fn source(&self) -> &'static str { "fake" }
+        fn boundary(&self) -> Boundary { Boundary::DEVICE }
     }
 
     struct Dead;
@@ -473,6 +542,7 @@ mod tests {
         fn read_joules(&self) -> Option<f64> { None }
         fn class(&self) -> Class { Class::Measured }
         fn source(&self) -> &'static str { "dead" }
+        fn boundary(&self) -> Boundary { Boundary::DEVICE }
     }
 
     #[test]
@@ -481,7 +551,7 @@ mod tests {
         // efficient run, so a broken sensor must not be able to look like a win.
         let (_, r) = measure(&Dead, || std::hint::black_box(1 + 1));
         assert!(r.is_none(), "a dead meter produced a reading");
-        assert!(compare(&Dead, 1, 1, || {}, || {}).is_none(), "a dead meter produced a saving");
+        assert!(compare(&Dead, 1, 1, 1, || {}, || {}).is_none(), "a dead meter produced a saving");
     }
 
     #[test]
@@ -489,8 +559,9 @@ mod tests {
         // Enforced by there being no constructor. This test documents the intent so that adding one
         // later is a visible decision rather than a convenience someone slipped in.
         let m = Fake::new(1.0, Class::Measured);
-        let s = compare(&m, 10, 1, || {}, || {}).expect("meter is available");
+        let s = compare(&m, 10, 10, 1, || {}, || {}).expect("meter is available");
         assert_eq!(s.tasks, 10);
+        assert_eq!(s.successes, 10);
         // The only public path to Saving is compare(); the struct's fields are readable but there is no
         // way to fabricate the readings without a Meter having produced them.
         let _ = s.baseline;
@@ -500,7 +571,7 @@ mod tests {
     fn an_estimate_may_not_back_a_claim() {
         let est = Nameplate::new(50.0);
         std::thread::sleep(Duration::from_millis(1100));
-        let s = compare(&est, 100, 1, || std::thread::sleep(Duration::from_millis(1100)),
+        let s = compare(&est, 100, 100, 1, || std::thread::sleep(Duration::from_millis(1100)),
                                        || std::thread::sleep(Duration::from_millis(1100)))
             .expect("nameplate is always available");
         assert_eq!(s.class(), Class::Estimated);
@@ -510,7 +581,7 @@ mod tests {
     #[test]
     fn a_sub_second_arm_is_refused_because_it_is_inside_sensor_noise() {
         let m = Fake::new(1.0, Class::Measured);
-        let s = compare(&m, 5, 1, || {}, || {}).unwrap();
+        let s = compare(&m, 5, 5, 1, || {}, || {}).unwrap();
         assert!(s.claimable().is_err(), "a run of microseconds was accepted as claimable");
     }
 
@@ -526,35 +597,36 @@ mod tests {
             }
             fn class(&self) -> Class { Class::Measured }
             fn source(&self) -> &'static str { "ramp" }
+            fn boundary(&self) -> Boundary { Boundary::DEVICE }
         }
         // `available()` consumes a sample, so start the ramp accounting after it.
         let r = Ramp { n: std::cell::Cell::new(0) };
         let (_, b) = measure(&r, || {});
         let (_, c) = measure(&r, || {});
-        let s = Saving { baseline: b.unwrap(), candidate: c.unwrap(), tasks: 1 };
+        let s = Saving { baseline: b.unwrap(), candidate: c.unwrap(), tasks: 1, successes: 1 };
         assert!(s.fraction() < 0.0, "a worse candidate was not reported as negative");
         assert!((s.percent() + 200.0).abs() < 1e-6, "expected -200%, got {}", s.percent());
     }
 
     #[test]
     fn the_weaker_class_wins_a_comparison() {
-        let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "x" };
-        let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Estimated, source: "x" };
-        let s = Saving { baseline: a, candidate: b, tasks: 1 };
+        let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "x", boundary: Boundary::DEVICE };
+        let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Estimated, source: "x", boundary: Boundary::DEVICE };
+        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: 1 };
         assert_eq!(s.class(), Class::Estimated, "a comparison claimed to be stronger than its weaker arm");
     }
 
     #[test]
     fn mismatched_meters_are_not_comparable() {
-        let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "rapl:package" };
-        let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Measured, source: "nvidia-smi:board" };
-        let s = Saving { baseline: a, candidate: b, tasks: 1 };
+        let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "rapl:package", boundary: Boundary::DEVICE };
+        let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Measured, source: "nvidia-smi:board", boundary: Boundary::DEVICE };
+        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: 1 };
         assert!(s.claimable().is_err(), "energy from two different sensors was accepted as a difference");
     }
 
     #[test]
     fn joules_per_task_is_the_reported_metric() {
-        let r = Reading { joules: 100.0, seconds: 10.0, class: Class::Measured, source: "x" };
+        let r = Reading { joules: 100.0, seconds: 10.0, class: Class::Measured, source: "x", boundary: Boundary::DEVICE };
         assert_eq!(r.per_task(50), 2.0);
         assert_eq!(r.watts(), 10.0);
         assert!(r.per_task(0).is_nan(), "zero tasks must not silently divide");
@@ -564,5 +636,61 @@ mod tests {
     fn capability_report_names_what_is_missing() {
         let s = capability_report();
         assert!(s.contains("rapl") && s.contains("battery"), "report omits a backend");
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    struct M(Boundary);
+    impl Meter for M {
+        fn read_joules(&self) -> Option<f64> { Some(0.0) }
+        fn class(&self) -> Class { Class::Measured }
+        fn source(&self) -> &'static str { "m" }
+        fn boundary(&self) -> Boundary { self.0 }
+    }
+
+    #[test]
+    fn arms_that_enclose_different_things_are_not_comparable() {
+        // The failure this exists for: Google measured the SAME prompt on the SAME fleet at 0.10 Wh
+        // accelerator-only and 0.24 Wh counting host, idle and facility. 2.4x from accounting alone.
+        // Comparing across that boundary attributes an accounting choice to a method.
+        let dev = Reading { joules: 100.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+        let sys = Reading { joules: 42.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::SYSTEM };
+        let s = Saving { baseline: sys, candidate: dev, tasks: 10, successes: 10 };
+        assert!(s.claimable().is_err(), "a cross-boundary comparison was accepted");
+        assert!(s.claimable().unwrap_err().contains("enclose different things"));
+    }
+
+    #[test]
+    fn zero_successes_is_never_an_efficiency_result() {
+        // On GAIA the model burning 7.31 kJ/query scored 16.4% and the one burning 1.18 kJ scored 5.5%.
+        // Per query the cheap one wins; per SUCCESS it is 21.5 kJ against 44.6 kJ and the ranking holds
+        // only because both succeeded sometimes. At zero successes there is no efficiency at any energy.
+        let r = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+        let s = Saving { baseline: r, candidate: r, tasks: 100, successes: 0 };
+        assert!(s.claimable().unwrap_err().contains("no successes"));
+    }
+
+    #[test]
+    fn energy_per_success_can_reverse_energy_per_attempt() {
+        // The whole reason `successes` is a separate field.
+        let cheap = Reading { joules: 1180.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+        let dear  = Reading { joules: 7310.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+        // 1000 attempts each; the expensive arm succeeds 3x as often.
+        let s = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: 164 };
+        let t = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: 55 };
+        // Per attempt the cheap arm always looks better; per success depends on which denominator is real.
+        let (_, cheap_per_attempt) = s.per_attempt();
+        assert!(cheap_per_attempt < 7.31, "per-attempt arithmetic broke");
+        assert!(s.per_success().1 < t.per_success().1, "more successes must lower joules per success");
+    }
+
+    #[test]
+    fn every_meter_declares_a_boundary() {
+        assert_eq!(M(Boundary::DEVICE).boundary().label(), "accel");
+        assert_eq!(M(Boundary::SYSTEM).boundary().label(), "accel+host+idle");
+        assert_eq!(Nameplate::new(1.0).boundary(), Boundary::SYSTEM);
     }
 }
