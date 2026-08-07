@@ -35,7 +35,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod ladder;
+pub use budget::{Budget, Budgeted, Outcome, Stop};
 pub use ladder::{Ladder, Routed, Trail};
 
 use std::time::{Duration, Instant};
