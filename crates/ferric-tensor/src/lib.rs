@@ -35,7 +35,7 @@ pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub mod sciml; // physics-informed / scientific-ML building blocks (SIREN PINN net + differentiable deriv)
 pub use autograd::{grad, Var};
 pub use sciml::{deriv, Mlp, Siren};
-pub use dtype::{DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
+pub use dtype::{Iq4XsWeights, DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).

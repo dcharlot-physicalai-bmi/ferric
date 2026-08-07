@@ -2997,6 +2997,102 @@ const Q6_K_BODY: &str = r#"
             }
 "#;
 
+
+// ---- IQ4_XS: 4-bit non-linear codebook, 256-value super-block ----
+//
+// Layout (136 bytes): f16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]. Eight sub-blocks of 32 values;
+// sub-block `ib` carries a 6-bit scale assembled from a nibble of `scales_l[ib/2]` and two bits of
+// `scales_h` at bit 2*ib, giving `dl = d * (ls - 32)`. Each byte of `qs` holds two 4-bit indices into a
+// FIXED 16-entry codebook, so the dequantised value is `dl * kvalues[idx]` and the levels are
+// deliberately non-uniform. That codebook is why this is "IQ": the quantiser fits indices to a curve
+// rather than a linear grid.
+//
+// Ported directly from this workspace's CPU reference (`ferric_gguf::deq_iq4_xs`), which is the
+// authority the GPU path is asserted exact against.
+const IQ4_XS_HELPERS: &str = r#"
+const KV: array<i32, 16> = array<i32, 16>(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+fn qsb(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+"#;
+const IQ4_XS_BODY: &str = r#"
+            let cb = bi * 32u; let ab = bi * 3u;
+            let d = unpack2x16float(aux[ab]).x;
+            let scales_h = aux[ab + 1u];
+            let xbb = r * in_dim + blk * 256u;
+            for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
+                // 6-bit sub-scale: low nibble from scales_l[ib/2], high 2 bits from scales_h at 2*ib.
+                let sl = (aux[ab + 2u] >> (8u * (ib >> 1u))) & 0xffu;
+                let lo = (sl >> (4u * (ib & 1u))) & 0x0Fu;
+                let hi = (scales_h >> (2u * ib)) & 3u;
+                let dl = d * f32(i32(lo | (hi << 4u)) - 32);
+                let xh = xbb + ib * 32u; let qo = ib * 16u;
+                for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+                    let b = qsb(cb, qo + j);
+                    acc = acc + x[xh + j]        * dl * f32(KV[b & 0x0Fu]);
+                    acc = acc + x[xh + j + 16u]  * dl * f32(KV[b >> 4u]);
+                }
+            }
+"#;
+
+/// Packed **IQ4_XS** weights: `[out, in]`, `in` a multiple of 256.
+///
+/// Replaces the `Dense` dequant-on-load fallback, which held the whole weight as f32 on the GPU. That
+/// fallback is correct and was an 8x memory blow-up over the 4.25 bits/weight this format actually
+/// costs, which is the entire reason it was worth writing a kernel for.
+pub struct Iq4XsWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 32 u32/block: qs[128]
+    aux: Arc<wgpu::Buffer>,   // 3 u32/block: [d|_, scales_h, scales_l packed]
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Iq4XsWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Iq4XsWeights {
+        assert_eq!(cols % 256, 0, "IQ4_XS cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 136, "unexpected IQ4_XS byte length");
+        let nblk = rows * (cols / 256);
+        let mut codes: Vec<u32> = vec![0; nblk * 32];
+        let mut aux: Vec<u32> = vec![0; nblk * 3];
+        let word = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        for b in 0..nblk {
+            let src = &bytes[b * 136..b * 136 + 136];
+            aux[b * 3] = u16::from_le_bytes([src[0], src[1]]) as u32;      // f16 d
+            aux[b * 3 + 1] = u16::from_le_bytes([src[2], src[3]]) as u32;  // scales_h
+            aux[b * 3 + 2] = word(src, 4);                                 // scales_l[4]
+            for w in 0..32 { codes[b * 32 + w] = word(src, 8 + w * 4); }   // qs[128]
+        }
+        let mk = |label: &str, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Iq4XsWeights { ctx: ctx.clone(), codes: mk("iq4xs.codes", &codes), aux: mk("iq4xs.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 136 }
+}
+
+impl Tensor {
+    /// `y = x·Wᵀ` where `W` is packed **IQ4_XS**, dequantised per sub-block in-kernel.
+    pub fn matmul_iq4_xs(&self, w: &Iq4XsWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
+        };
+        let src = wgsl.replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_XS_BODY);
+        run(&self.ctx, &src, "matmul_iq4_xs",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
 const MATMUL_Q6_K_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<f32>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
