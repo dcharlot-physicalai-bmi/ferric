@@ -35,6 +35,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ladder;
+pub use ladder::{Ladder, Routed, Trail};
+
 use std::time::{Duration, Instant};
 
 /// How a joule figure was arrived at. This rides with every reading and never gets dropped.
