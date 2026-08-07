@@ -36,8 +36,10 @@
 #![forbid(unsafe_code)]
 
 pub mod budget;
+pub mod fabric;
 pub mod ladder;
 pub use budget::{Budget, Budgeted, Outcome, Stop};
+pub use fabric::{Capability, Fabric, Split, Unit};
 pub use ladder::{Ladder, Routed, Trail};
 
 use std::time::{Duration, Instant};
