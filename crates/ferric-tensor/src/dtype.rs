@@ -3844,3 +3844,128 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 "#;
+
+/// **Every format the loader can READ must be explicitly classified as packed or deliberately dense.**
+///
+/// This exists because of a bug that produced no error anywhere. `Iq4XsWeights` and `matmul_iq4_xs`
+/// were written, tested and correct, and the model never called them: [`QMatrix::block_bytes`] did not
+/// list ggml type 23, so `qm()` took the `from_dense` branch and every IQ4 weight was dequantised to
+/// f32 on load. The model ran, 8x fatter, exactly as if the kernel had not been written. The kernel's
+/// own test passed throughout, because it tested the kernel and not the path to it.
+///
+/// Three tables have to agree and nothing was asserting it: `ferric_gguf::type_size` (what we can
+/// decode), [`QMatrix::block_bytes`] (what the loader's gate believes we can run packed), and
+/// [`QShard::build`]'s match arms (what actually constructs a packed weight). IQ4_XS had the third
+/// without the second. `packed_formats_do_not_land_on_the_dense_fallback` goes through
+/// `QMatrix::from_bytes`, so it exercises the real path and covers all three at once.
+///
+/// **What it catches automatically:** a new format added to `ferric-gguf` that nobody wires up, and a
+/// packed format silently dropped out of `block_bytes`.
+///
+/// **What it cannot catch, stated plainly:** a kernel written for a type already sitting in
+/// `DENSE_BY_DESIGN` without moving its entry. Nothing in Rust can see that a `matmul_*` appeared. The
+/// mitigation is that each entry below carries the reason it is dense, so writing the kernel means
+/// coming here to falsify a comment.
+#[cfg(test)]
+mod format_reachability {
+    use super::*;
+
+    /// Types with a native packed kernel. Must be in `block_bytes`.
+    const PACKED: &[(u32, &str)] = &[
+        (2, "Q4_0"), (3, "Q4_1"), (6, "Q5_0"), (7, "Q5_1"), (8, "Q8_0"),
+        (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"),
+        (20, "IQ4_NL"), (23, "IQ4_XS"),
+        (42, "Q2_0"),
+    ];
+
+    /// Types the loader decodes to f32 and runs dense, each with the reason. Must NOT be in
+    /// `block_bytes` — an entry here that gains a kernel has to move to `PACKED`.
+    const DENSE_BY_DESIGN: &[(u32, &str, &str)] = &[
+        (0,  "F32",   "not a block quant; f32 already is the dense representation"),
+        (1,  "F16",   "not a block quant; widening to f32 is the whole conversion"),
+        (30, "BF16",  "not a block quant; widening to f32 is the whole conversion"),
+        (35, "TQ2_0", "llama.cpp ternary: no packed kernel written (Q2_0/42 is the PrismML one that has one)"),
+        (41, "Q1_0",  "PrismML 1-bit: no packed kernel written"),
+    ];
+
+    /// Probe `type_size` rather than importing a list, so a format added to ferric-gguf shows up here
+    /// without anyone remembering to mirror it.
+    fn readable_types() -> Vec<u32> {
+        (0u32..=64).filter(|&t| ferric_gguf::type_size(t, 256).is_ok()).collect()
+    }
+
+    #[test]
+    fn every_readable_format_is_classified() {
+        let mut unclassified = Vec::new();
+        for ty in readable_types() {
+            let packed = PACKED.iter().any(|&(t, _)| t == ty);
+            let dense = DENSE_BY_DESIGN.iter().any(|&(t, _, _)| t == ty);
+            assert!(!(packed && dense), "ggml type {ty} is in BOTH tables");
+            if !packed && !dense { unclassified.push(ty); }
+        }
+        assert!(unclassified.is_empty(),
+            "ggml types {unclassified:?} can be decoded by ferric-gguf but are classified neither packed \
+             nor deliberately dense. Add each to PACKED (and to QMatrix::block_bytes) if it has a kernel, \
+             or to DENSE_BY_DESIGN with the reason. Leaving it unclassified is how IQ4_XS shipped with a \
+             correct, tested, unreachable kernel.");
+    }
+
+    #[test]
+    fn packed_formats_are_reachable_from_block_bytes() {
+        for &(ty, name) in PACKED {
+            assert!(QMatrix::block_bytes(ty).is_some(),
+                "{name} (ggml type {ty}) has a packed kernel but block_bytes does not list it, so the \
+                 loader will take the from_dense branch and the kernel will never run. This is the exact \
+                 IQ4_XS bug.");
+        }
+        for &(ty, name, why) in DENSE_BY_DESIGN {
+            assert!(QMatrix::block_bytes(ty).is_none(),
+                "{name} (ggml type {ty}) is listed as dense-by-design ({why}) but block_bytes claims a \
+                 packed kernel. One of the two is wrong.");
+        }
+    }
+
+    /// The table check above compares two lists. This one walks the actual path a weight takes.
+    #[test]
+    fn packed_formats_do_not_land_on_the_dense_fallback() {
+        // A silent skip here would be a green test that checked nothing, which is the whole failure
+        // mode this module exists to prevent. Say so on the way past.
+        let ctx = match pollster::block_on(ferric_core::Context::new()) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("SKIPPED packed_formats_do_not_land_on_the_dense_fallback: no GPU context \
+                           ({e:?}). The table checks still ran; the real-path check did NOT.");
+                return;
+            }
+        };
+        let mut checked = 0usize;
+        // 256 columns satisfies every block size in play (32, 128 and 256 all divide it).
+        let (rows, cols) = (4usize, 256usize);
+        for &(ty, name) in PACKED {
+            let nbytes = ferric_gguf::type_size(ty, rows * cols)
+                .unwrap_or_else(|e| panic!("{name}: type_size failed: {e}"));
+            let bytes = vec![0u8; nbytes];
+            // Reproduce the LOADER'S branch, not a direct call to the packed constructor. `qm()` in
+            // ferric-llama gates on `block_bytes(ty).is_some()`, so calling `from_bytes` unconditionally
+            // here would test `QShard::build`'s table while stepping over the gate that was actually
+            // wrong. Verified by negative control: with type 23 removed from `block_bytes`, a direct
+            // `from_bytes` still passed and only this form fails.
+            let qm = if QMatrix::block_bytes(ty).is_some() {
+                QMatrix::from_bytes(&ctx, &bytes, ty, rows, cols)
+                    .unwrap_or_else(|e| panic!("{name}: from_bytes failed: {e}"))
+            } else {
+                let deq = ferric_gguf::deq_raw(&bytes, rows * cols, ty)
+                    .unwrap_or_else(|e| panic!("{name}: deq_raw failed: {e}"));
+                QMatrix::from_dense(&ctx, &deq, rows, cols)
+            };
+            for sh in &qm.shards {
+                assert!(!matches!(sh, QShard::Dense(_)),
+                    "{name} (ggml type {ty}) fell through to the f32 dense fallback despite being listed \
+                     as packed. The weight would load at 4x-8x its format's size and run the wrong kernel.");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, PACKED.len(), "not every packed format was exercised");
+        eprintln!("real-path check: {checked} packed formats built a non-Dense shard on a live GPU");
+    }
+}

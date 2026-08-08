@@ -75,7 +75,9 @@ async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     let home = std::env::var("HOME").unwrap();
 
-    println!("\n  {:>8} {:>10} {:>13} {:>13} {:>11}", "format", "file MB", "ms/token", "MB/token", "vs Q8_0");
+    println!("\n  {:>8} {:>10} {:>13} {:>13} {:>11}", "format", "file MB", "ms/token", "MB/token*", "vs Q8_0");
+    println!("  (* MB/token excludes token_embd, which is gathered per row and is not always stored in");
+    println!("     the format the file is named for — see the per-format note below.)");
     println!("  {:-<60}", "");
 
     let mut rows: Vec<(&'static str, f64, f64, f64)> = Vec::new();
@@ -116,8 +118,19 @@ async fn run() {
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let ms = samples[REPS / 2];
 
-        // Bytes the decode path actually streams per token: every weight is read once.
-        let mb_per_token = file_mb;
+        // Bytes the decode path actually streams per token. NOT the file size, and the difference is a
+        // confound rather than a rounding detail: `embed()` gathers only the prompt's rows out of
+        // token_embd, so the embedding table is never streamed, and quantisers do not store it in the
+        // format the file is named for. This IQ4_XS build keeps token_embd at **Q8_0** — 136.1 M params,
+        // ~145 MB of its 349 MB. Charging that to the format would credit a lighter-embedding build with
+        // a saving its weights never made. Reported per format so the reader can see it move.
+        let embd_ty = g.tensor("token_embd.weight").map(|t| t.ggml_type).unwrap_or(0);
+        let embd_mb = g.tensor("token_embd.weight")
+            .and_then(|t| ferric_gguf::type_size(t.ggml_type, t.dims.iter().product::<u64>() as usize).ok())
+            .unwrap_or(0) as f64 / 1e6;
+        let mb_per_token = file_mb - embd_mb;
+        let embd_name = match embd_ty { 8 => "Q8_0", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 20 => "IQ4_NL", 23 => "IQ4_XS", _ => "other" };
+        println!("  {name:>8}  token_embd is {embd_name} ({embd_mb:.0} MB) — excluded from bytes/token");
         if *name == "Q8_0" { q8_ms = ms; }
         rows.push((name, file_mb, ms, mb_per_token));
         println!("  {name:>8} {file_mb:>10.1} {ms:>13.2} {mb_per_token:>13.1} {:>10}", "");
@@ -127,9 +140,11 @@ async fn run() {
 
     println!("\n  {:>8} {:>13} {:>13} {:>14}", "format", "ms/token", "vs Q8_0", "MB/ms (eff.)");
     println!("  {:-<52}", "");
-    for (name, mb, ms, _) in &rows {
+    for (name, _, ms, streamed_mb) in &rows {
         let rel = if q8_ms > 0.0 { ms / q8_ms } else { f64::NAN };
-        println!("  {name:>8} {ms:>13.2} {rel:>12.2}x {:>13.1}", mb / ms);
+        // Effective bandwidth uses the STREAMED bytes, not the file size: token_embd is gathered per
+        // row, so including it would credit each format with bandwidth it never used.
+        println!("  {name:>8} {ms:>13.2} {rel:>12.2}x {:>13.1}", streamed_mb / ms);
     }
 
     // ---- what this actually shows ----
@@ -137,13 +152,15 @@ async fn run() {
     // The first version of this example concluded "CROSSOVER FOUND" because the smallest format was the
     // slowest. That was wrong, and the way it was wrong is the point.
     let best = rows.iter().min_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).unwrap();
-    let smallest = rows.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-    println!("\n  Fastest per token: {} at {:.2} ms.  Smallest on disk: {} at {:.1} MB.",
-             best.0, best.2, smallest.0, smallest.1);
+    let smallest = rows.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap()).unwrap();
+    println!("\n  Fastest per token: {} at {:.2} ms.  Fewest streamed bytes: {} at {:.1} MB.",
+             best.0, best.2, smallest.0, smallest.3);
 
     // The tell: if time were tracking bytes, the ordering by time would match the ordering by size.
+    // Ordered by STREAMED bytes (index 3), not file size (index 1) — ranking by file size would let a
+    // build's choice of token_embd format reorder the table without any weight kernel changing.
     let mut by_size = rows.clone();
-    by_size.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    by_size.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
     let mut by_time = rows.clone();
     by_time.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
     let monotonic = by_size.iter().map(|r| r.0).eq(by_time.iter().map(|r| r.0));
