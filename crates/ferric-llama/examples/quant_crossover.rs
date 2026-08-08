@@ -39,10 +39,16 @@ const FORMATS: &[(&str, &str)] = &[
     ("Q5_K_M", "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q5_k_m.gguf"),
     ("Q6_K",   "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q6_k.gguf"),
     ("Q8_0",   "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf"),
-    // IQ4_XS is included ONLY to show what a missing kernel looks like. Ferric has no native packed
-    // kernel for it (dtype.rs:808, :901): the loader dequantizes to f32 and hands that to the dense
-    // path, an 8x memory blow-up. Its number measures that fallback, NOT the format.
-    ("IQ4_XS*", "bartowski_Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-IQ4_XS.gguf"),
+    // This row used to measure a MISSING kernel and said so. It no longer does, and the history is
+    // worth keeping because of how the gap hid: `Iq4XsWeights`/`matmul_iq4_xs` existed and passed
+    // their own test, but `QMatrix::block_bytes` did not list ggml type 23, so the loader took the
+    // `from_dense` branch and the kernel was unreachable. Nothing errored — the model just ran fatter.
+    //
+    // Reaching it also required IQ4_NL: this file is 250.5 M params of IQ4_NL against 104.6 M of
+    // IQ4_XS, because IQ4_XS needs rows divisible by 256 and n_embd here is 896. Both kernels now run
+    // and both match the CPU dequant to 3.6e-7 (see `iq4_real_weights.rs`), so 72% of the model's
+    // parameters are packed rather than f32 and this row finally measures the FORMAT.
+    ("IQ4_XS", "bartowski_Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-IQ4_XS.gguf"),
 ];
 
 const DECODE_TOKENS: usize = 24;

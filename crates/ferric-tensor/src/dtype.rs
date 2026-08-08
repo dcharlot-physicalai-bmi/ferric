@@ -805,7 +805,9 @@ pub enum QShard {
     Q5_K(Q5_KWeights),
     Q6_K(Q6_KWeights),
     Q8_0(Q8_0Weights),
-    /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_XS/IQ4_NL): the weight
+    Iq4Xs(Iq4XsWeights),
+    Iq4Nl(Iq4NlWeights),
+    /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_NL): the weight
     /// is dequantized to f32 on load and run through a plain matmul. Correct and format-complete, at
     /// the cost of f32 weight memory — a native kernel can replace it later purely as a speed/size win.
     Dense(DenseWeight),
@@ -831,8 +833,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -843,6 +845,8 @@ impl QShard {
             12 => QShard::Q4_K(Q4_KWeights::from_bytes(ctx, bytes, rows, cols)),
             13 => QShard::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
             14 => QShard::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            20 => QShard::Iq4Nl(Iq4NlWeights::from_bytes(ctx, bytes, rows, cols)),
+            23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
             // Types with no native packed kernel take the dense fallback via `QMatrix::from_dense`
             // (the loader dequantizes them), so they never reach this packed-build path.
@@ -874,6 +878,8 @@ impl QMatrix {
             12 => Some((256, 144)),// Q4_K
             13 => Some((256, 176)),// Q5_K
             14 => Some((256, 210)),// Q6_K
+            20 => Some((32, 18)),  // IQ4_NL
+            23 => Some((256, 136)),// IQ4_XS
             42 => Some((128, 34)), // Q2_0
             _ => None,
         }
@@ -991,6 +997,8 @@ impl Tensor {
             QShard::Q5_K(w) => self.matmul_q5_k(w),
             QShard::Q6_K(w) => self.matmul_q6_k(w),
             QShard::Q8_0(w) => self.matmul_q8_0(w),
+            QShard::Iq4Xs(w) => self.matmul_iq4_xs(w),
+            QShard::Iq4Nl(w) => self.matmul_iq4_nl(w),
             QShard::Dense(w) => self.matmul(&w.wt),
         }
     }
@@ -3087,6 +3095,87 @@ impl Tensor {
         };
         let src = wgsl.replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_XS_BODY);
         run(&self.ctx, &src, "matmul_iq4_xs",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
+/// The 32-value block body. Same codebook and same nibble order as IQ4_XS, minus the 6-bit sub-scales:
+/// IQ4_NL has one `d` per 32 values, so there is nothing between `d` and the codebook lookup.
+const IQ4_NL_BODY: &str = r#"
+            let cb = bi * 4u;
+            let d = unpack2x16float(aux[bi]).x;
+            let xbb = r * in_dim + blk * 32u;
+            for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+                let b = qsb(cb, j);
+                acc = acc + x[xbb + j]       * d * f32(KV[b & 0x0Fu]);
+                acc = acc + x[xbb + j + 16u] * d * f32(KV[b >> 4u]);
+            }
+"#;
+
+/// Packed **IQ4_NL** weights: `[out, in]`, `in` a multiple of 32.
+///
+/// Worth writing for a reason that only shows up on a real checkpoint. A file distributed as "IQ4_XS"
+/// is mostly *not* IQ4_XS: measured on `bartowski/Qwen2.5-0.5B-Instruct-IQ4_XS.gguf`, IQ4_XS covers 24
+/// tensors / 104.6 M params (only the rows whose length divides 256), while **IQ4_NL covers 120
+/// tensors / 250.5 M params** — the majority of the model. Wiring IQ4_XS alone leaves 51% of the
+/// weights on the f32 dense fallback, so the format's byte cost is never actually paid at runtime.
+pub struct Iq4NlWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 4 u32/block: qs[16]
+    aux: Arc<wgpu::Buffer>,   // 1 u32/block: f16 d in the low half
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Iq4NlWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Iq4NlWeights {
+        assert_eq!(cols % 32, 0, "IQ4_NL cols must be a multiple of 32");
+        assert_eq!(bytes.len(), rows * (cols / 32) * 18, "unexpected IQ4_NL byte length");
+        let nblk = rows * (cols / 32);
+        let mut codes: Vec<u32> = vec![0; nblk * 4];
+        let mut aux: Vec<u32> = vec![0; nblk];
+        for b in 0..nblk {
+            let src = &bytes[b * 18..b * 18 + 18];
+            aux[b] = u16::from_le_bytes([src[0], src[1]]) as u32; // f16 d
+            for w in 0..4 {
+                codes[b * 4 + w] = u32::from_le_bytes([src[2 + w * 4], src[3 + w * 4], src[4 + w * 4], src[5 + w * 4]]);
+            }
+        }
+        let mk = |label: &str, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Iq4NlWeights { ctx: ctx.clone(), codes: mk("iq4nl.codes", &codes), aux: mk("iq4nl.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 18 }
+}
+
+impl Tensor {
+    /// `y = x·Wᵀ` where `W` is packed **IQ4_NL**, dequantised per 32-value block in-kernel.
+    pub fn matmul_iq4_nl(&self, w: &Iq4NlWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
+        };
+        // The shared template walks 256-value super-blocks; IQ4_NL's are 32. Anchored on the whole
+        // expression, not the bare literal `256u`: the file has 17 of those and this must hit exactly
+        // the one that sets the block stride. Asserted rather than trusted, because a future edit to
+        // the template would otherwise silently produce a kernel that reads 1/8th of each weight.
+        debug_assert_eq!(wgsl.matches("in_dim / 256u").count(), 1,
+            "IQ4_NL rewrites the template's block stride and expects exactly one site");
+        let src = wgsl.replace("in_dim / 256u", "in_dim / 32u")
+            .replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_NL_BODY);
+        run(&self.ctx, &src, "matmul_iq4_nl",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
