@@ -12,7 +12,7 @@
 //! BEST single unit rather than the worst.
 use ferric_core::Context;
 use ferric_joule::{Fabric, Unit};
-use ferric_tensor::{cpu, Q8_0Weights, Tensor};
+use ferric_tensor::{cpu_simd as cpu, Q8_0Weights, Tensor};
 use std::sync::Arc as StdArc;
 use std::sync::Arc;
 

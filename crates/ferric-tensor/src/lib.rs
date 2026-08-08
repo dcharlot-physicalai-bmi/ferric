@@ -20,6 +20,7 @@ use wgpu::util::DeviceExt;
 
 pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
+pub mod cpu_simd; // CPU vector-unit kernels + worker pool: the fabric's second compute unit
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)
 pub mod nn; // transformer blocks expressed on the general runtime
