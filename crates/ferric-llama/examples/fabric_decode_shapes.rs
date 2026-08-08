@@ -189,14 +189,43 @@ async fn run() {
     println!("  {:-<66}", "");
     let mut crossover: Option<usize> = None;
     let mut ceiling_ever = 0.0f64;
+    let mut min_cpu_us = f64::INFINITY;
+    let mut sweep: Vec<(usize, f64)> = Vec::new();
     for rows in [128usize, 512, 2048, 8192, 16384] {
         let t = measure(896, rows).await;
         let (s, c) = (t.speedup(), t.ceiling());
         ceiling_ever = ceiling_ever.max(c);
+        min_cpu_us = min_cpu_us.min(t.cpu_us);
+        sweep.push((rows, t.cpu_us));
         if s > 1.0 && crossover.is_none() { crossover = Some(rows); }
         println!("  {rows:>7} {:>9.1}u {:>9.1}u {:>8.1}u {:>8.1}u {s:>7.2}x {c:>8.2}x",
                  t.gpu_pipelined_us, t.gpu_sync_us, t.cpu_us, t.split_us());
     }
+
+    // ---- the empty-pool number is not a floor, and the sweep is what shows it ----
+    //
+    // A CPU arm doing real arithmetic came in BELOW the empty round trip through the same pool, on two
+    // separate runs at different machine loads. Reproducible, so it is not drift. The empty job returns
+    // instantly, which makes all 18 workers hit the results channel in the same instant; a real job
+    // staggers them. The empty-pool measurement therefore times a contention pile-up that no actual
+    // workload produces, and OVERSTATES the fixed cost.
+    //
+    // The honest measurement of a fixed cost is the intercept of time against work. Taken from the two
+    // smallest sweep points, because marginal cost per row falls with size (0.061 -> 0.037 us/row across
+    // this sweep, as longer contiguous spans use the cache better) and a global fit over a curve with
+    // changing slope would report the fit, not the machine.
+    let (r0, c0) = sweep[0];
+    let (r1, c1) = sweep[1];
+    let slope = (c1 - c0) / (r1 - r0) as f64;
+    let intercept = c0 - r0 as f64 * slope;
+    println!("\n  Pool coordination, two ways:");
+    println!("    empty-job round trip:     {coord_us:>6.1} us   <- overstates; 18 workers reply at once");
+    println!("    intercept of the sweep:   {intercept:>6.1} us   <- fixed cost, from {r0} and {r1} rows");
+    println!("    marginal arithmetic:      {slope:>6.4} us/row at these sizes");
+    if min_cpu_us < coord_us {
+        println!("    (the {min_cpu_us:.1} us CPU arm below the {coord_us:.1} us \"floor\" is what exposed this)");
+    }
+    let coord_us = intercept;
 
     // ---- what it means for the decode-path wiring ----
     let biggest_decode = DECODE_SHAPES.iter().map(|s| s.2).max().unwrap();

@@ -31,6 +31,47 @@
 //! strictly worse than one unit. [`Split::wall_seconds`] therefore reports `max`, not `sum`, and
 //! [`Split::speedup_vs_best_single`] compares against the best single unit rather than against the
 //! slowest, because beating the worse option is not an achievement.
+//!
+//! ## ⛔ Measured: this must NOT be wired into the decode path, and the reason is not the hardware
+//!
+//! `ferric-llama/examples/fabric_decode_shapes.rs`, at Qwen2.5-0.5B's real decode geometry, both arms
+//! agreeing **exactly** (max abs err 0.000e0). Run three times at machine loads 2.97, 3.69 and 4.12;
+//! the table below is the quietest run, and **the conclusion is the same in all three**:
+//!
+//! | op | in | out | gpu pipelined | gpu synced | cpu | split | vs pipelined |
+//! |---|---|---|---|---|---|---|---|
+//! | qkv | 896 | 1152 | 102.9 us | 354.0 us | 124.5 us | 151.7 us | **0.68x** |
+//! | wo | 896 | 896 | 72.4 us | 278.0 us | 114.9 us | 140.8 us | **0.51x** |
+//! | gate_up | 896 | 9728 | 150.8 us | 387.3 us | 420.5 us | 261.1 us | **0.58x** |
+//! | down | 4864 | 896 | 74.6 us | 284.6 us | 256.7 us | 194.5 us | **0.38x** |
+//!
+//! Swept 128 → 16384 output rows, the split pays at **no size in the range**, in any run: across all
+//! three the full spread is **0.30x–0.86x**. Two costs, and only one of them is about compute:
+//!
+//! 1. **The sync the split forces, and the baseline does not pay.** Unsplit, the GPU queue pipelines
+//!    and nothing blocks until the logits are read for the argmax. Split, both arms must finish before
+//!    the next op consumes their concatenation. That readback costs **3–4x** the pipelined dispatch
+//!    and is charged entirely to the split. This is the term that decides it.
+//! 2. **Fixed coordination ~57.6 us** per pool dispatch+collect. Decode is 96 matmuls per token, so
+//!    coordination alone adds **~5.5 ms per token** — half the entire ~11 ms decode step, before a
+//!    single row is computed anywhere.
+//!
+//! That 57.6 us is the intercept of CPU time against rows, not the round trip of an empty job. The
+//! empty-job version reads **65.2 us** and is wrong in a specific way worth remembering: with no work
+//! to do, all 18 workers reply in the same instant and the measurement times a contention pile-up that
+//! no real workload creates. It was caught because a CPU arm doing genuine arithmetic came in *below*
+//! its own supposed floor, on two separate runs.
+//!
+//! Even granting a physically unavailable best case — free coordination *and* no sync penalty — the
+//! ceiling is 1.93x at 128 rows falling to 1.18x at 8192.
+//!
+//! **The hardware argument survives; the granularity does not.** On raw throughput the CPU is close:
+//! 110.7 us against the GPU's 78.4 us on qkv, a 1.4x gap, which is exactly why splitting looked
+//! attractive. What kills it is the coordination model, not the silicon. So the redirection this
+//! measurement points at is **coarser granularity** — hand the CPU an entire independent sequence from
+//! a batch, or a whole layer, so one sync amortises over many matmuls instead of one. Per-matmul
+//! row-span splitting is the wrong unit of work at decode, and the earlier 1.07x on a large synthetic
+//! matmul was a measurement of a size decode never reaches.
 
 use crate::{Class, Meter, Reading};
 
