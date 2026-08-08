@@ -47,6 +47,16 @@ pub enum Unit {
     CpuSimd,
     /// A fixed-function neural accelerator: Apple's ANE, a Qualcomm HTP, an Intel NPU. Very efficient on
     /// the shapes it supports and useless outside them, which is why it is a unit and not a backend.
+    ///
+    /// ⚠ **Declared, not implemented, and it will not arrive the way `CpuSimd` did.** Checked on this
+    /// hardware: CoreML is present and the ANE is visible in IOKit, but it does not accept a dispatched
+    /// kernel. You compile a model *graph* to `.mlmodelc` and the framework decides what lands on ANE
+    /// versus GPU versus CPU, in fp16, on the op shapes it supports. There is no path to handing it a
+    /// Q8_0 matvec and getting a span of rows back, which is the contract [`Fabric::split`] assumes.
+    ///
+    /// So filling this variant is not the next increment after `CpuSimd`. It is a second execution model
+    /// living beside the kernel-dispatch one, and pretending otherwise would put a unit in the fabric
+    /// that silently never receives work.
     Npu,
 }
 
