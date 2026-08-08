@@ -13,6 +13,7 @@
 use ferric_core::Context;
 use ferric_joule::{Fabric, Unit};
 use ferric_tensor::{cpu, Q8_0Weights, Tensor};
+use std::sync::Arc as StdArc;
 use std::sync::Arc;
 
 fn load_avg() -> Option<f64> {
@@ -82,16 +83,23 @@ async fn run() {
     let row_bytes = (cols / 32) * 34;
     let w_gpu_part = Q8_0Weights::from_bytes(&ctx, &raw[..gpu_rows * row_bytes], gpu_rows, cols);
 
+    // Persistent pool: created ONCE, outside the timed region, which is the whole point. Per-call
+    // std::thread::scope spent 78% of the wall clock on spawn and join.
+    let pool = cpu::Pool::new(threads);
+    let xa = StdArc::new(xv.clone());
+    let wa = StdArc::new(raw.clone());
+    // Warm the pool and the GPU pipeline so neither arm pays first-call cost inside the measurement.
+    let _ = cpu::matvec_q8_0_pooled(&pool, StdArc::clone(&xa), StdArc::clone(&wa), cols, gpu_rows, rows);
+    let _ = x.matmul_q8_0(&w_gpu_part).to_vec().await;
+
     let t0 = std::time::Instant::now();
-    // The CPU arm runs on its own threads while the GPU arm is in flight. This overlap IS the win.
-    let cpu_handle = std::thread::scope(|sc| {
-        let h = sc.spawn(|| cpu::matvec_q8_0_span(&xv, &raw, cols, gpu_rows, rows, threads));
-        let gpu_part = pollster::block_on(async { x.matmul_q8_0(&w_gpu_part).to_vec().await });
-        let cpu_part = h.join().expect("cpu arm panicked");
-        (gpu_part, cpu_part)
+    // The CPU arm runs on parked workers while the GPU arm is in flight. This overlap IS the win.
+    let (gpu_part, cpu_part) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| cpu::matvec_q8_0_pooled(&pool, StdArc::clone(&xa), StdArc::clone(&wa), cols, gpu_rows, rows));
+        let g = pollster::block_on(async { x.matmul_q8_0(&w_gpu_part).to_vec().await });
+        (g, h.join().expect("cpu arm panicked"))
     });
     let wall = t0.elapsed().as_secs_f64();
-    let (gpu_part, cpu_part) = cpu_handle;
 
     let mut joined = gpu_part;
     joined.extend(cpu_part);

@@ -217,3 +217,194 @@ mod tests {
         assert!(cpu_threads() >= 1);
     }
 }
+
+// ---- persistent worker pool ----
+
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::{Arc, Mutex};
+
+/// A job handed to one worker: compute a contiguous span of output rows.
+type Job = Box<dyn FnOnce() -> (usize, Vec<f32>) + Send + 'static>;
+
+/// Long-lived worker threads, so a split does not pay thread creation on every call.
+///
+/// Measured motivation: splitting one matmul across GPU and CPU with `std::thread::scope` spent **4.2 ms
+/// of a 5.4 ms total on coordination**, a 78% overhead that turned a predicted 1.33x win into a measured
+/// 0.30x regression. Spawning 18 threads costs more than the arithmetic when the arithmetic is
+/// milliseconds. The threads here are created once and parked on a channel between jobs.
+///
+/// Data reaches workers through `Arc`, not borrows, so no scope is needed and the pool can outlive any
+/// individual call. That is the whole reason this is safe without a lifetime escape hatch.
+pub struct Pool {
+    tx: Option<Sender<Job>>,
+    /// Behind a `Mutex` for two reasons that are really one. It makes `Pool` `Sync`, so a `&Pool` can be
+    /// handed to a scoped thread while another unit works. And it serialises `run`, which is required
+    /// for correctness rather than merely convenient: two overlapping `run` calls on one receiver would
+    /// steal each other's results and each would return a mix of the other's rows.
+    results: Mutex<Receiver<(usize, Vec<f32>)>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Pool {
+    /// Start `n` workers. They park immediately and cost nothing until given work.
+    pub fn new(n: usize) -> Pool {
+        let n = n.max(1);
+        let (tx, rx) = channel::<Job>();
+        let (rtx, results) = channel::<(usize, Vec<f32>)>();
+        let rx = Arc::new(Mutex::new(rx));
+        let workers = (0..n).map(|_| {
+            let rx = Arc::clone(&rx);
+            let rtx = rtx.clone();
+            std::thread::spawn(move || loop {
+                // Lock only to take a job, never while running one, so workers do not serialise.
+                let job = { rx.lock().expect("pool mutex poisoned").recv() };
+                match job {
+                    Ok(job) => { let _ = rtx.send(job()); }
+                    Err(_) => break, // sender dropped: shut down
+                }
+            })
+        }).collect();
+        Pool { tx: Some(tx), results: Mutex::new(results), workers }
+    }
+
+    pub fn threads(&self) -> usize { self.workers.len() }
+
+    /// Run `spans.len()` jobs and collect their outputs in span order.
+    ///
+    /// Results arrive out of order over the channel and are reordered by index here, because a caller
+    /// concatenating them needs row order and the completion order is whatever the scheduler chose.
+    pub fn run<F>(&self, spans: usize, make: F) -> Vec<Vec<f32>>
+    where F: Fn(usize) -> Job {
+        // Held across the whole call, so a concurrent `run` waits rather than consuming our results.
+        let rx = self.results.lock().expect("pool mutex poisoned");
+        let tx = self.tx.as_ref().expect("pool is shut down");
+        for i in 0..spans { tx.send(make(i)).expect("worker threads have exited"); }
+        let mut out: Vec<Option<Vec<f32>>> = (0..spans).map(|_| None).collect();
+        for _ in 0..spans {
+            let (i, v) = rx.recv().expect("a worker died before reporting");
+            out[i] = Some(v);
+        }
+        out.into_iter().map(|o| o.expect("every span must report exactly once")).collect()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Dropping the sender ends every worker's recv loop; then join so no thread outlives the pool.
+        self.tx = None;
+        for w in self.workers.drain(..) { let _ = w.join(); }
+    }
+}
+
+/// `y = x · Wᵀ` for Q8_0 on a persistent pool, over the row span `[lo, hi)`.
+///
+/// `x` and `w` are `Arc`s so workers own their handles rather than borrowing, which is what lets the
+/// pool outlive the call.
+pub fn matvec_q8_0_pooled(
+    pool: &Pool,
+    x: Arc<Vec<f32>>,
+    w: Arc<Vec<u8>>,
+    cols: usize,
+    lo: usize,
+    hi: usize,
+) -> Vec<f32> {
+    assert!(lo <= hi, "empty or inverted span");
+    let rows = hi - lo;
+    if rows == 0 { return Vec::new(); }
+    let row_bytes = (cols / Q8_0_VALS) * Q8_0_BLOCK;
+    let spans = pool.threads().min(rows);
+    let per = rows.div_ceil(spans);
+
+    let parts = pool.run(spans, |i| {
+        let (x, w) = (Arc::clone(&x), Arc::clone(&w));
+        let a = lo + i * per;
+        let b = (a + per).min(hi);
+        Box::new(move || {
+            let mut v = Vec::with_capacity(b.saturating_sub(a));
+            for r in a..b {
+                v.push(row_q8_0(&x, &w[r * row_bytes..(r + 1) * row_bytes], cols));
+            }
+            (i, v)
+        }) as Job
+    });
+    parts.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn synth_raw(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut rnd = || { s = s.wrapping_mul(1664525).wrapping_add(1013904223); (s >> 16) as u16 };
+        let mut raw = Vec::with_capacity(rows * (cols / 32) * 34);
+        for _ in 0..rows * (cols / 32) {
+            raw.extend_from_slice(&(0x1C00u16 | (rnd() & 0x3F)).to_le_bytes());
+            for _ in 0..32 { raw.push((rnd() & 0xFF) as u8); }
+        }
+        raw
+    }
+
+    #[test]
+    fn pooled_matches_the_single_threaded_answer() {
+        let (rows, cols) = (256usize, 128usize);
+        let raw = Arc::new(synth_raw(rows, cols, 5));
+        let x = Arc::new((0..cols).map(|i| ((i * 31 % 97) as f32 - 48.0) / 48.0).collect::<Vec<f32>>());
+        let want = matvec_q8_0(&x, &raw, rows, cols);
+        for n in [1usize, 2, 5, 16] {
+            let pool = Pool::new(n);
+            let got = matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, 0, rows);
+            assert_eq!(got, want, "pool of {n} changed the result");
+        }
+    }
+
+    #[test]
+    fn results_are_reordered_into_span_order() {
+        // Workers finish out of order; the caller concatenates and needs ROW order. If this ever broke,
+        // the weights would be applied to the right values in the wrong places: fluent, wrong output.
+        let (rows, cols) = (200usize, 64usize);
+        let raw = Arc::new(synth_raw(rows, cols, 11));
+        let x = Arc::new(vec![0.5f32; cols]);
+        let pool = Pool::new(8);
+        let got = matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, 0, rows);
+        let want = matvec_q8_0(&x, &raw, rows, cols);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn spans_still_compose_through_the_pool() {
+        let (rows, cols) = (128usize, 64usize);
+        let raw = Arc::new(synth_raw(rows, cols, 2));
+        let x = Arc::new(vec![-1.25f32; cols]);
+        let pool = Pool::new(4);
+        let whole = matvec_q8_0(&x, &raw, rows, cols);
+        for cut in [0usize, 1, 63, 127, 128] {
+            let mut j = matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, 0, cut);
+            j.extend(matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, cut, rows));
+            assert_eq!(j, whole, "cut at {cut} did not reassemble through the pool");
+        }
+    }
+
+    #[test]
+    fn a_pool_can_be_reused_without_respawning() {
+        // The entire point. If each call respawned, this would be no better than thread::scope.
+        let (rows, cols) = (64usize, 32usize);
+        let raw = Arc::new(synth_raw(rows, cols, 9));
+        let x = Arc::new(vec![1.0f32; cols]);
+        let pool = Pool::new(4);
+        let first = matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, 0, rows);
+        for _ in 0..20 {
+            let again = matvec_q8_0_pooled(&pool, Arc::clone(&x), Arc::clone(&raw), cols, 0, rows);
+            assert_eq!(again, first, "a reused pool drifted");
+        }
+    }
+
+    #[test]
+    fn dropping_the_pool_joins_every_worker() {
+        // A leaked thread outliving its pool would keep a core warm forever, which on a battery-powered
+        // device is exactly the failure this whole crate exists to avoid.
+        let pool = Pool::new(4);
+        assert_eq!(pool.threads(), 4);
+        drop(pool); // must not hang: Drop clears the sender, workers exit, join returns
+    }
+}
