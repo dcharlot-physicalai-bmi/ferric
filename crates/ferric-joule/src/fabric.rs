@@ -200,11 +200,15 @@ impl Split {
         (self.items as f64 / best) / self.wall_seconds()
     }
 
-    /// Whether splitting is actually worth it here.
+    /// Whether splitting **looks** worth it, from calibration alone.
     ///
-    /// Returns the reason when it is not. The common case this catches: one unit is so much faster than
-    /// the others that its share is nearly everything, and the coordination cost of involving the rest
-    /// exceeds what they contribute.
+    /// ⚠ This is a PREDICTION and it does not include coordination cost: thread spawn and join, a second
+    /// dispatch, and the buffer setup each unit needs. Measured on a 4.5 MB matmul on an 18-core machine,
+    /// this returned a predicted 1.61x while the split actually ran 1.6x SLOWER than the best single
+    /// unit, because the whole job took 0.5 ms and spawning threads cost more than the work.
+    ///
+    /// So treat an `Ok` here as permission to run the A/B, never as the result of one. Use
+    /// [`measured_speedup`] to settle it, which is the only thing that does.
     pub fn worthwhile(&self) -> Result<(), String> {
         if self.shares.len() < 2 {
             return Err("only one unit: nothing to split across".into());
@@ -218,6 +222,25 @@ impl Split {
                                 of dispatching to two units and joining them"));
         }
         Ok(())
+    }
+
+    /// The only honest verdict: run both arms and compare wall clock.
+    ///
+    /// `split_secs` is the measured concurrent wall time of the split; `single_secs` the measured time
+    /// of the best single unit on the same work. Returns the real ratio, which is frequently below 1.0
+    /// on small workloads however good the prediction looked.
+    ///
+    /// The gap between this and [`speedup_vs_best_single`] is exactly the coordination cost, and naming
+    /// it is more useful than pretending calibration captured it.
+    pub fn measured_speedup(&self, split_secs: f64, single_secs: f64) -> f64 {
+        if split_secs <= 0.0 { return f64::NAN; }
+        single_secs / split_secs
+    }
+
+    /// Coordination cost implied by a measurement: the time the split spent on something other than the
+    /// work itself. Positive means overhead, which is the normal case.
+    pub fn coordination_seconds(&self, split_secs: f64) -> f64 {
+        split_secs - self.wall_seconds()
     }
 
     /// Energy per item under this split, for comparison against a single unit's figure.
@@ -293,6 +316,21 @@ mod tests {
         // 100 items at 1 J + 100 at 4 J = 500 J, i.e. 2.5 J/item against the GPU's 1.0 J/item alone.
         assert!((s.joules().unwrap() - 500.0).abs() < 1e-9);
         assert!(s.joules_per_item().unwrap() > 1.0, "the split must be reported as less efficient per item");
+    }
+
+    #[test]
+    fn a_prediction_is_not_a_measurement_and_the_api_says_so() {
+        // Measured on a 4.5 MB matmul, 18 cores: predicted 1.61x, actual 1.6x SLOWER, because the job
+        // took 0.5 ms and spawning threads cost more than the work. This is the guard against reading
+        // worthwhile() as a verdict.
+        let f = Fabric { caps: vec![cap(Unit::Gpu, 4_831_613.0, None), cap(Unit::CpuSimd, 7_864_944.0, None)] };
+        let s = f.split(4096).unwrap();
+        assert!(s.worthwhile().is_ok(), "calibration predicts a win");
+        assert!(s.speedup_vs_best_single() > 1.5, "predicted speedup");
+        // The A/B that settles it: 0.8 ms split against 0.5 ms single.
+        let real = s.measured_speedup(0.0008, 0.0005);
+        assert!(real < 1.0, "measured {real:.2}x should be a regression");
+        assert!(s.coordination_seconds(0.0008) > 0.0, "coordination cost must be visible");
     }
 
     #[test]
