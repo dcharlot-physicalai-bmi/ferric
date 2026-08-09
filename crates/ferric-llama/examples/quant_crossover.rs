@@ -173,19 +173,45 @@ async fn run() {
         println!("  Ordered by time:                                 {}",
                  by_time.iter().map(|r| r.0).collect::<Vec<_>>().join(" < "));
         println!("  A smaller format that runs SLOWER than a larger one is not a bytes-versus-dequant");
-        println!("  tradeoff. It is a kernel that has not been written or tuned. IQ4_XS has no native");
-        println!("  packed kernel in this runtime at all: the loader dequantizes to f32 and runs the");
-        println!("  dense path, an 8x memory blow-up, so its column measures a missing kernel.\n");
+        println!("  tradeoff. It is a kernel that has not been written or tuned. Every format in this");
+        println!("  table now HAS a native packed kernel — IQ4_XS/IQ4_NL were wired in 2026-08-08 and");
+        println!("  moved that row from slowest to second-fastest — so what remains is tuning, not");
+        println!("  absence.\n");
     }
+
+    // ---- where the headroom is, stated as a bound rather than a promise ----
+    //
+    // Effective bandwidth (streamed bytes / time) differs 2-3x across formats on the SAME device and
+    // the same memory system. That spread is kernel quality, because the bytes are already accounted
+    // for. Projecting each format onto the best observed rate says how much of each row is format and
+    // how much is us.
+    //
+    // It is an UPPER BOUND and not a target: a 4-bit codebook format does strictly more dequant work
+    // per byte than Q8_0, so equal MB/ms is not physically available to it. The projection brackets
+    // the prize; it does not predict it.
+    let best_rate = rows.iter().map(|r| r.3 / r.2).fold(0.0f64, f64::max);
+    let best_rate_fmt = rows.iter().max_by(|a, b| (a.3 / a.2).partial_cmp(&(b.3 / b.2)).unwrap()).unwrap().0;
+    println!("  Best effective bandwidth here: {best_rate:.1} MB/ms ({best_rate_fmt}). Projecting every");
+    println!("  format onto that rate isolates format from kernel:\n");
+    println!("    {:>8} {:>12} {:>14} {:>13}", "format", "actual ms", "at best rate", "headroom");
+    for (name, _, ms, mb) in &rows {
+        let ideal = mb / best_rate;
+        println!("    {name:>8} {ms:>10.2} ms {ideal:>12.2} ms {:>12.2}x", ms / ideal);
+    }
+    let (fewest, fewest_mb) = rows.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
+        .map(|r| (r.0, r.3)).unwrap();
+    println!("\n  {fewest} streams the fewest bytes ({fewest_mb:.0} MB) and carries the most headroom, which");
+    println!("  makes it the kernel worth tuning next rather than the one to write off.\n");
     println!("  So what this measures is THIS RUNTIME'S KERNEL QUALITY PER FORMAT, which is a real and");
     println!("  useful result, just not the one the example set out to get. The published crossover");
     println!("  question (SINTEF: Q8_0 optimum on a Pi 4, lower widths costing more joules) needs every");
     println!("  format to have a comparably tuned kernel before the comparison means anything. Here it");
     println!("  is answered by whichever kernel happened to get attention.\n");
-    println!("  The actionable finding: {} is the fastest format on this device and should be the", best.0);
-    println!("  default. {} and the IQ4 family are the kernels worth writing next, and until they are",
+    println!("  The actionable finding: {} is the fastest format on this device and remains the", best.0);
+    println!("  default. {} is now the slowest and the least tuned relative to its byte count, so it is",
              rows.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).map(|r| r.0).unwrap_or("?"));
-    println!("  written, no statement about the physical crossover can be made from this runtime.\n");
+    println!("  the next kernel to work on. Until the spread in the headroom column closes, no statement");
+    println!("  about the PHYSICAL crossover can be made from this runtime — only about ours.\n");
     println!("  This is the field's own caution landing on us: on identical Snapdragon silicon, two");
     println!("  runtimes differ 13x on the same model from kernel quality alone, against ~1.3x from the");
     println!("  architecture choice. Measure the kernel before theorising about the format.");

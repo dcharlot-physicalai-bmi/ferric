@@ -6,7 +6,7 @@
 //! Numerics are validated against a plain-Rust CPU reference so "runs everywhere" also means
 //! "computes the same everywhere".
 
-use std::borrow::Cow;
+
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -229,6 +229,40 @@ impl Context {
             mapped_at_creation: false,
         })
     }
+    /// Compile WGSL to a shader module, honouring `FERRIC_UNCHECKED_SHADERS`.
+    ///
+    /// WebGPU mandates bounds checks on every buffer and array access, and they are not free: LlamaWeb
+    /// measured **14% of decode and 23% of prefill** attributable to them, up to 42% on some devices.
+    /// That is a large enough share to be worth measuring on this runtime rather than inheriting as a
+    /// given, and wgpu exposes the switch — `create_shader_module_trusted`. **No fork change is needed**;
+    /// an earlier note in this workspace assumed one was.
+    ///
+    /// # Safety and why this is off by default
+    ///
+    /// Unchecked means an out-of-bounds access in any kernel is undefined behaviour rather than a
+    /// clamped read. Ferric's kernels compute indices from uniform-buffer dimensions, so a wrong
+    /// `info` value becomes a wild read instead of a harmless clamp. It is therefore:
+    ///   * **opt-in by environment variable**, never a default,
+    ///   * **native-only** — under WebGPU the browser enforces its own checks and this must not be
+    ///     reachable from the wasm build at all.
+    ///
+    /// Use it to measure the tax, and to ship only behind an explicit, documented flag.
+    fn shader_module(&self, label: &str, src: String) -> wgpu::ShaderModule {
+        let desc = wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if unchecked_shaders() {
+            // SAFETY: opt-in via FERRIC_UNCHECKED_SHADERS. The caller has asserted that every kernel
+            // indexes in bounds; nothing here can verify that, which is exactly why it is not a default.
+            return unsafe {
+                self.device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+            };
+        }
+        self.device.create_shader_module(desc)
+    }
+
     /// Compile a WGSL compute pipeline (entry `main`, auto bind-group layout).
     /// Kernels that reference `det_` get the deterministic-math preamble
     /// prepended — the exact-ops transcendentals that keep every kernel on the
@@ -239,10 +273,7 @@ impl Context {
         } else {
             wgsl.to_string()
         };
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
-        });
+        let module = self.shader_module(label, src);
         self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(label),
             layout: None,
@@ -311,15 +342,12 @@ impl Context {
             mapped_at_creation: false,
         });
 
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("matmul"),
-            // Same det-math preamble rule as Context::pipeline — this raw path
-            // must never drift from the portable-det kernels.
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
-                "{}\n{MATMUL_WGSL}",
-                kernels::DET_MATH_WGSL
-            ))),
-        });
+        // Same det-math preamble rule as Context::pipeline, and routed through the same
+        // `shader_module` helper so the bounds-check policy cannot drift between the two paths.
+        let shader = self.shader_module(
+            "matmul",
+            format!("{}\n{MATMUL_WGSL}", kernels::DET_MATH_WGSL),
+        );
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("matmul"),
             layout: None,
@@ -414,4 +442,14 @@ pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 /// Max absolute difference between two equal-length vectors.
 pub fn max_abs_diff(x: &[f32], y: &[f32]) -> f32 {
     x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
+}
+
+/// `FERRIC_UNCHECKED_SHADERS=1` compiles kernels with WebGPU's mandatory bounds checks relaxed.
+///
+/// Read once: the value cannot change meaningfully mid-process, and a per-compile `var()` would put a
+/// lock on a path that runs for every kernel.
+#[cfg(not(target_arch = "wasm32"))]
+fn unchecked_shaders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("FERRIC_UNCHECKED_SHADERS").as_deref(), Ok("1") | Ok("true")))
 }
