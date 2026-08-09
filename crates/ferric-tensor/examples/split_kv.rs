@@ -114,48 +114,68 @@ async fn run() {
     }
     std::env::remove_var("FERRIC_SPLITKV");
 
-    // ---- below the gate: is the gate in the right place, or merely untested there? ----
+    // ---- the gate, in two dimensions, because one is not enough to set a constant ----
     //
-    // The sweep above wins at EVERY length it tries, including its shortest. That is not a clean
-    // result, it is a truncated one: `decode_splits` refuses to split below 2*MIN_KEYS_PER_SPLIT
-    // (1024), so the sweep started exactly where the gate stops mattering and never probed the
-    // region the gate actually governs. A sweep that only samples where the answer is already known
-    // cannot tell a correct threshold from an arbitrary one.
+    // The sweep above wins at EVERY length it tries, including its shortest. That is truncated rather
+    // than clean: `decode_splits` refuses to split below 2*MIN_KEYS_PER_SPLIT (1024), so the sweep
+    // started exactly at the first length the gate permits and never sampled the region the gate
+    // governs.
     //
-    // So force the split count past the gate and find where two dispatches stop paying for one.
-    println!("\n  Below the gate — forced splits, to test the threshold rather than assume it.");
-    println!("  (decode_splits refuses to split under S={}; these override it.)\n", 2 * 512);
-    println!("  {:>7} {:>12} {:>11} {:>11} {:>11}", "S", "1 workgroup", "2 splits", "4 splits", "best");
-    println!("  {:-<56}", "");
-    for &s in &[128usize, 256, 512, 768, 1024] {
+    // A first probe at splits in {1,2,4} showed 4 splits beating 1 by 2.2x at S=512 and 4.8x at S=768,
+    // both below the gate. That is enough to say the threshold is wrong and NOT enough to say what it
+    // should be: picking a constant off three columns would be fitting the rule to the sample. So this
+    // sweeps both axes and reports the argmin, and the constant follows from the table.
+    println!("\n  Gate calibration — context x split count. The heuristic currently refuses to split");
+    println!("  below S=1024 and uses S/512 splits above it. Best column tells whether that is right.\n");
+    const SPLITS: &[usize] = &[1, 2, 4, 8, 16];
+    print!("  {:>7}", "S");
+    for n in SPLITS { print!(" {:>9}", format!("{n} split")); }
+    println!(" {:>7} {:>9}", "best", "vs 1");
+    println!("  {:-<72}", "");
+    let mut recommend: Vec<(usize, usize)> = Vec::new();
+    for &s in &[128usize, 256, 512, 768, 1024, 2048, 4096] {
         let q = Tensor::from_vec(&ctx, &fill(nh * dh, 7), &[1, nh * dh]);
         let k = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 11), &[s, nkv * dh]);
         let v = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 22), &[s, nkv * dh]);
-        let bench_n = |n: usize| {
-            let (q, k, v) = (&q, &k, &v);
-            async move {
-                std::env::set_var("FERRIC_SPLITKV", n.to_string());
-                let _ = q.fused_decode_attention(k, v, nh, nkv, dh).to_vec().await;
-                let mut ms = Vec::new();
-                for _ in 0..7 {
-                    let t0 = std::time::Instant::now();
-                    let mut last = None;
-                    for _ in 0..20 { last = Some(q.fused_decode_attention(k, v, nh, nkv, dh)); }
-                    let _ = last.unwrap().to_vec().await;
-                    ms.push(t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
-                }
-                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                ms[3]
+        let mut times = Vec::new();
+        for &n in SPLITS {
+            std::env::set_var("FERRIC_SPLITKV", n.to_string());
+            let _ = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
+            let mut ms = Vec::new();
+            for _ in 0..7 {
+                let t0 = std::time::Instant::now();
+                let mut last = None;
+                for _ in 0..20 { last = Some(q.fused_decode_attention(&k, &v, nh, nkv, dh)); }
+                let _ = last.unwrap().to_vec().await;
+                ms.push(t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
             }
-        };
-        let (one, two, four) = (bench_n(1).await, bench_n(2).await, bench_n(4).await);
-        let best = if one <= two && one <= four { "1" } else if two <= four { "2" } else { "4" };
-        println!("  {s:>7} {one:>9.3} ms {two:>8.3} ms {four:>8.3} ms {best:>11}");
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            times.push(ms[3]);
+        }
+        let bi = (0..times.len()).min_by(|&a, &b| times[a].partial_cmp(&times[b]).unwrap()).unwrap();
+        print!("  {s:>7}");
+        for t in &times { print!(" {t:>9.3}"); }
+        println!(" {:>7} {:>8.2}x", SPLITS[bi], times[0] / times[bi]);
+        recommend.push((s, SPLITS[bi]));
     }
     std::env::remove_var("FERRIC_SPLITKV");
-    println!("\n  If \"best\" is 2 or 4 anywhere below S=1024, MIN_KEYS_PER_SPLIT (512) is too high and");
-    println!("  the gate is leaving a win on the floor. If it is 1 all the way up, the gate is right");
-    println!("  and the sweep above simply started at the correct place.");
+
+    println!("\n  Measured optimum per context: {}",
+             recommend.iter().map(|(s, n)| format!("S={s}→{n}")).collect::<Vec<_>>().join("  "));
+    let first_split = recommend.iter().find(|(_, n)| *n > 1).map(|(s, _)| *s);
+    match first_split {
+        Some(s0) if s0 < 1024 => {
+            println!("  ⚠ Splitting first pays at S={s0}, below the current gate of 1024, so the gate is");
+            println!("    leaving a win on the floor for every context between {s0} and 1024.");
+            // keys-per-split implied by the measured optimum at the smallest winning length
+            let n0 = recommend.iter().find(|(s, _)| *s == s0).unwrap().1;
+            println!("    Implied MIN_KEYS_PER_SPLIT at that point: {} (currently 512).", s0 / n0);
+        }
+        Some(s0) => println!("  Splitting first pays at S={s0}; the gate at 1024 is consistent with that."),
+        None => println!("  Splitting never pays in this range — the gate is right, or too permissive."),
+    }
+    println!("  Read the whole row before changing a constant: a single winning cell can be noise, and");
+    println!("  the optimum drifting with S is the reason this is a formula and not a threshold.\n");
 
     println!("\n  Read the crossover, not the peak. Two dispatches replace one, so split-KV should LOSE");
     println!("  at short context and win as the cache grows — if it wins everywhere the gate is too");

@@ -1,30 +1,44 @@
 //! **Where does going lower stop paying?** The quantization crossover, measured on one device class.
 //!
-//! An open empirical question with a decision-relevant answer, and it decides what this runtime should
-//! ship as its default.
-//!
 //! One side: SINTEF et al. wired a Joulescope JS110 in series at 2 MHz on a Raspberry Pi 4 and measured
 //! **Q8_0 as the energy optimum, with lower bit-widths costing MORE joules**. Llama 3.2 1B went
 //! 159.42 J/response at FP16 to 75.85 J at Q8_0, then back UP: Q4 variants averaged 83.95 J and Q3
 //! averaged 101.02 J, with Q3 also losing 20-40% accuracy (arXiv:2504.03360, ACM Trans. IoT 2026).
+//! The other side: essentially the entire compression layer, racing toward 1.58 bits. Both cannot be
+//! right across all hardware, and the crossover as a function of memory bandwidth, SIMD width and
+//! dequantisation cost is published nowhere.
 //!
-//! The other side: essentially the entire compression layer, racing toward 1.58 bits.
+//! ## ⚠ Rebuilt 2026-08-08: the first design reported absolute times, and they were not reproducible
 //!
-//! Both cannot be right across all hardware. The crossover as a function of memory bandwidth, SIMD
-//! width and dequantization cost is published nowhere.
+//! Repeating the original harness at machine loads of 2.17, 3.42, 3.78 and 3.91 — all of which passed
+//! its load gate — gave Q8_0 at **36.22, 12.52, 10.75 and 11.62 ms/token**, a 3.4x spread on identical
+//! work. Any ranking read off one such run is a ranking of runs.
 //!
-//! ## What this measures, and what it does not
+//! The structure of the noise is what makes it fixable. It is **bimodal and whole-run**: a process comes
+//! up in a ~11 ms regime or a ~37 ms regime and every format inside it moves together, which is a device
+//! clock/power state, not kernel quality. So within one process the factor is *common*, and it cancels
+//! in a ratio:
 //!
-//! **It does not measure joules.** This machine has no RAPL, no NVIDIA counter, and runs on mains power,
-//! so `ferric_joule::capability_report()` correctly reports that nothing is measurable here. Saying so
-//! is the point: a joules number from this machine would be arithmetic wearing a measurement's clothes.
+//! | run | Q4_K_M | Q5_K_M | Q6_K | Q8_0 | IQ4_XS |
+//! |---|---|---|---|---|---|
+//! | ~37 ms regime | 1.11 | 1.10 | 1.01 | 1.00 | 1.14 |
+//! | ~37 ms regime | 1.00 | 1.03 | 1.03 | 1.00 | 1.05 |
+//! | ~11 ms regime | 1.07 | 1.06 | 1.07 | 1.00 | 1.14 |
 //!
-//! What it measures is the mechanism underneath the energy result. Decode is weight-streaming bound, so
-//! per-token cost tracks **bytes moved** and **dequantisation work**. Lower bit-width cuts the first and
-//! raises the second, and the crossover is where the second wins. Time per token at fixed power is a
-//! faithful proxy for that trade, and the bytes-per-token column shows which term is moving.
+//! Note what this rules out: **one process per format would have been worse**, not better. It looks like
+//! the tidier design, but it gives every format an independent draw of the run-level factor and turns a
+//! cancelling common term into per-format noise.
 //!
-//! To turn this into joules, run it on a metered device. The harness is the same.
+//! So: all formats in one process (the factor cancels), **compare ratios rather than absolute times**,
+//! **rotate the order** each repeat so no format keeps the first or last slot, and repeat the whole
+//! process several times to see whether the ratios hold. The spread of the ratios is printed, and the
+//! run refuses to rank anything when that spread is as large as the differences it would rank.
+//!
+//! Withdrawn from the previous design: "IQ4_XS is the second-fastest format" and a "2-3x kernel-quality
+//! spread between formats". Both were differences between runs read as differences between formats.
+//!
+//! **Not joules.** No RAPL, no NVIDIA counter, mains power: `ferric_joule::capability_report()` reports
+//! nothing measurable, and a joules number from here would be arithmetic wearing a measurement's clothes.
 //!
 //!   cargo run -p ferric-llama --example quant_crossover --release
 use ferric_core::Context;
@@ -32,27 +46,26 @@ use ferric_gguf::{GgufFile, GgufSource};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use std::sync::Arc;
 
-/// Same model, same tokenizer, same prompt. Only the quantisation differs, which is the only way the
-/// comparison means anything.
+/// Same model, same tokenizer, same prompt. Only the quantisation differs.
 const FORMATS: &[(&str, &str)] = &[
     ("Q4_K_M", "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf"),
     ("Q5_K_M", "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q5_k_m.gguf"),
     ("Q6_K",   "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q6_k.gguf"),
     ("Q8_0",   "Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf"),
-    // This row used to measure a MISSING kernel and said so. It no longer does, and the history is
-    // worth keeping because of how the gap hid: `Iq4XsWeights`/`matmul_iq4_xs` existed and passed
-    // their own test, but `QMatrix::block_bytes` did not list ggml type 23, so the loader took the
-    // `from_dense` branch and the kernel was unreachable. Nothing errored — the model just ran fatter.
-    //
-    // Reaching it also required IQ4_NL: this file is 250.5 M params of IQ4_NL against 104.6 M of
-    // IQ4_XS, because IQ4_XS needs rows divisible by 256 and n_embd here is 896. Both kernels now run
-    // and both match the CPU dequant to 3.6e-7 (see `iq4_real_weights.rs`), so 72% of the model's
-    // parameters are packed rather than f32 and this row finally measures the FORMAT.
+    // IQ4_XS/IQ4_NL kernels were wired on 2026-08-08 — they existed and were correct, but
+    // `QMatrix::block_bytes` omitted ggml type 23 so the loader silently took the f32 dense fallback.
+    // 72% of this file's parameters are now packed; both kernels match the CPU dequant to 3.6e-7 on
+    // real weights (`iq4_real_weights.rs`).
     ("IQ4_XS", "bartowski_Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-IQ4_XS.gguf"),
 ];
 
+/// The format every ratio is taken against. Must be present or the run has no baseline.
+const BASELINE: &str = "Q8_0";
+
 const DECODE_TOKENS: usize = 24;
 const REPS: usize = 5;
+/// Independent processes. Each contributes one ratio per format; their spread is the noise floor.
+const REPEATS: usize = 4;
 
 fn load_avg() -> Option<f64> {
     let out = std::process::Command::new("uptime").output().ok()?;
@@ -61,164 +74,152 @@ fn load_avg() -> Option<f64> {
     tail.trim_start_matches(|c: char| !c.is_ascii_digit()).split(&[',', ' '][..]).next()?.parse().ok()
 }
 
-fn main() { pollster::block_on(run()); }
-async fn run() {
-    println!("Quantisation crossover — Qwen2.5-0.5B, one device class\n");
-    print!("{}", ferric_joule::capability_report());
-
-    if let Some(l) = load_avg() {
-        println!("  machine load average: {l:.2}");
-        assert!(l < 8.0, "load {l:.2} is too high to time anything; this same harness reported an \
-                          8.6x swing on a busy machine earlier today. Wait and re-run.");
+fn main() {
+    match std::env::var("FERRIC_XOVER_ROT") {
+        Ok(r) => pollster::block_on(child(r.parse().expect("rotation"))),
+        Err(_) => parent(),
     }
+}
 
-    let ctx = Arc::new(Context::new().await.unwrap());
+/// Measure every format once, in this process, starting at offset `rot`.
+///
+/// All formats share this process on purpose: the run-level clock factor is common to them here and
+/// divides out of the ratios the parent computes. `rot` rotates the visiting order so that across
+/// repeats no format is always measured first (cold caches) or last (whatever has accumulated).
+async fn child(rot: usize) {
     let home = std::env::var("HOME").unwrap();
-
-    println!("\n  {:>8} {:>10} {:>13} {:>13} {:>11}", "format", "file MB", "ms/token", "MB/token*", "vs Q8_0");
-    println!("  (* MB/token excludes token_embd, which is gathered per row and is not always stored in");
-    println!("     the format the file is named for — see the per-format note below.)");
-    println!("  {:-<60}", "");
-
-    let mut rows: Vec<(&'static str, f64, f64, f64)> = Vec::new();
-    let mut q8_ms = 0.0f64;
-
-    for (name, rel) in FORMATS {
+    let ctx = Arc::new(Context::new().await.unwrap());
+    let n = FORMATS.len();
+    for step in 0..n {
+        let i = (step + rot) % n;
+        let (name, rel) = FORMATS[i];
         let path = format!("{home}/.cache/ferric/hub/{rel}");
-        let Ok(g) = GgufFile::open(&path) else {
-            println!("  {name:>8}  (not present, skipped)");
-            continue;
-        };
+        let Ok(g) = GgufFile::open(&path) else { continue };
         let file_mb = std::fs::metadata(&path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
-        let Ok(m) = Qwen3::load(&ctx, &g) else {
-            println!("  {name:>8}  (unsupported by this loader, skipped)");
-            continue;
-        };
+        // token_embd is gathered per row by `embed()`, never streamed, and is not stored in the format
+        // the file is named for (this IQ4_XS build keeps it Q8_0, ~145 MB of 349 MB). Charging it to
+        // the format would credit a lighter-embedding build with a saving its weights never made.
+        let embd_mb = g.tensor("token_embd.weight")
+            .and_then(|t| ferric_gguf::type_size(t.ggml_type, t.dims.iter().product::<u64>() as usize).ok())
+            .unwrap_or(0) as f64 / 1e6;
+        let Ok(m) = Qwen3::load(&ctx, &g) else { continue };
         let vn = m.cfg.n_vocab;
         let am = |l: &[f32]| l[l.len() - vn..].iter().enumerate()
             .fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32;
 
-        // Warm: first pass compiles pipelines and faults the weights in.
         let mut c = Cache::new(&m.cfg);
-        let l = m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await;
-        let mut next = am(&l);
+        let mut next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
 
         let mut samples = Vec::with_capacity(REPS);
         for _ in 0..REPS {
             let mut c = Cache::new(&m.cfg);
-            let l = m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await;
-            next = am(&l);
+            next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
             let t0 = std::time::Instant::now();
             for _ in 0..DECODE_TOKENS {
-                let l = m.forward_cached(&[next], &mut c).to_vec().await;
-                next = am(&l);
+                next = am(&m.forward_cached(&[next], &mut c).to_vec().await);
             }
             samples.push(t0.elapsed().as_secs_f64() * 1000.0 / DECODE_TOKENS as f64);
         }
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let ms = samples[REPS / 2];
+        println!("RESULT {name} {} {}", samples[REPS / 2], file_mb - embd_mb);
+    }
+}
 
-        // Bytes the decode path actually streams per token. NOT the file size, and the difference is a
-        // confound rather than a rounding detail: `embed()` gathers only the prompt's rows out of
-        // token_embd, so the embedding table is never streamed, and quantisers do not store it in the
-        // format the file is named for. This IQ4_XS build keeps token_embd at **Q8_0** — 136.1 M params,
-        // ~145 MB of its 349 MB. Charging that to the format would credit a lighter-embedding build with
-        // a saving its weights never made. Reported per format so the reader can see it move.
-        let embd_ty = g.tensor("token_embd.weight").map(|t| t.ggml_type).unwrap_or(0);
-        let embd_mb = g.tensor("token_embd.weight")
-            .and_then(|t| ferric_gguf::type_size(t.ggml_type, t.dims.iter().product::<u64>() as usize).ok())
-            .unwrap_or(0) as f64 / 1e6;
-        let mb_per_token = file_mb - embd_mb;
-        let embd_name = match embd_ty { 8 => "Q8_0", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 20 => "IQ4_NL", 23 => "IQ4_XS", _ => "other" };
-        println!("  {name:>8}  token_embd is {embd_name} ({embd_mb:.0} MB) — excluded from bytes/token");
-        if *name == "Q8_0" { q8_ms = ms; }
-        rows.push((name, file_mb, ms, mb_per_token));
-        println!("  {name:>8} {file_mb:>10.1} {ms:>13.2} {mb_per_token:>13.1} {:>10}", "");
+fn med(v: &mut [f64]) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }
+
+fn parent() {
+    println!("Quantisation crossover — Qwen2.5-0.5B, ratios across rotated repeats\n");
+    print!("{}", ferric_joule::capability_report());
+    if let Some(l) = load_avg() {
+        println!("  machine load average: {l:.2}");
+        assert!(l < 4.0, "load {l:.2} is too high to time anything. Wait and re-run.");
     }
 
-    assert!(!rows.is_empty(), "no formats loaded; the comparison measured nothing");
+    let exe = std::env::current_exe().expect("current exe");
+    // per format: streamed MB, and one ratio-to-baseline per repeat
+    let mut mb: std::collections::HashMap<String, f64> = Default::default();
+    let mut ratios: std::collections::HashMap<String, Vec<f64>> = Default::default();
+    let mut abs_baseline: Vec<f64> = Vec::new();
 
-    println!("\n  {:>8} {:>13} {:>13} {:>14}", "format", "ms/token", "vs Q8_0", "MB/ms (eff.)");
-    println!("  {:-<52}", "");
-    for (name, _, ms, streamed_mb) in &rows {
-        let rel = if q8_ms > 0.0 { ms / q8_ms } else { f64::NAN };
-        // Effective bandwidth uses the STREAMED bytes, not the file size: token_embd is gathered per
-        // row, so including it would credit each format with bandwidth it never used.
-        println!("  {name:>8} {ms:>13.2} {rel:>12.2}x {:>13.1}", streamed_mb / ms);
+    for rep in 0..REPEATS {
+        let out = std::process::Command::new(&exe)
+            .env("FERRIC_XOVER_ROT", rep.to_string())
+            .output().expect("child failed");
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut run: Vec<(String, f64, f64)> = Vec::new();
+        for l in s.lines().filter(|l| l.starts_with("RESULT")) {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            run.push((f[1].to_string(), f[2].parse().unwrap(), f[3].parse().unwrap()));
+        }
+        let Some(base) = run.iter().find(|r| r.0 == BASELINE).map(|r| r.1) else {
+            println!("  repeat {rep}: no {BASELINE} baseline in this run, skipped");
+            continue;
+        };
+        abs_baseline.push(base);
+        for (name, ms, streamed) in run {
+            mb.insert(name.clone(), streamed);
+            ratios.entry(name).or_default().push(ms / base);
+        }
     }
+    assert!(ratios.len() > 1, "nothing to compare");
 
-    // ---- what this actually shows ----
-    //
-    // The first version of this example concluded "CROSSOVER FOUND" because the smallest format was the
-    // slowest. That was wrong, and the way it was wrong is the point.
-    let best = rows.iter().min_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).unwrap();
-    let smallest = rows.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap()).unwrap();
-    println!("\n  Fastest per token: {} at {:.2} ms.  Fewest streamed bytes: {} at {:.1} MB.",
-             best.0, best.2, smallest.0, smallest.3);
+    // Order the report by the FORMATS table so it reads consistently regardless of rotation.
+    let names: Vec<&str> = FORMATS.iter().map(|f| f.0).filter(|n| ratios.contains_key(*n)).collect();
 
-    // The tell: if time were tracking bytes, the ordering by time would match the ordering by size.
-    // Ordered by STREAMED bytes (index 3), not file size (index 1) — ranking by file size would let a
-    // build's choice of token_embd format reorder the table without any weight kernel changing.
-    let mut by_size = rows.clone();
-    by_size.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
-    let mut by_time = rows.clone();
-    by_time.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-    let monotonic = by_size.iter().map(|r| r.0).eq(by_time.iter().map(|r| r.0));
+    println!("\n  {REPEATS} independent processes, visiting order rotated each time, {REPS} reps per format.");
+    println!("  Absolute {BASELINE} time across those processes: {:.2} – {:.2} ms/token ({:.2}x).",
+             abs_baseline.iter().cloned().fold(f64::INFINITY, f64::min),
+             abs_baseline.iter().cloned().fold(0.0, f64::max),
+             abs_baseline.iter().cloned().fold(0.0, f64::max)
+                 / abs_baseline.iter().cloned().fold(f64::INFINITY, f64::min));
+    println!("  That swing is the device clock state, and it is why the table below is ratios.\n");
 
-    println!("\n  ⚠ THIS DOES NOT ANSWER THE CROSSOVER QUESTION, and saying why is more useful than a");
-    println!("  number that looks like it does.\n");
-    if !monotonic {
-        println!("  Time does not track size here. Ordered by bytes: {}",
-                 by_size.iter().map(|r| r.0).collect::<Vec<_>>().join(" < "));
-        println!("  Ordered by time:                                 {}",
-                 by_time.iter().map(|r| r.0).collect::<Vec<_>>().join(" < "));
-        println!("  A smaller format that runs SLOWER than a larger one is not a bytes-versus-dequant");
-        println!("  tradeoff. It is a kernel that has not been written or tuned. Every format in this");
-        println!("  table now HAS a native packed kernel — IQ4_XS/IQ4_NL were wired in 2026-08-08 and");
-        println!("  moved that row from slowest to second-fastest — so what remains is tuning, not");
-        println!("  absence.\n");
+    println!("  {:>8} {:>11} {:>12} {:>10} {:>10} {:>10}",
+             "format", "MB/token*", "ratio med", "min", "max", "ratio sprd");
+    println!("  {:-<66}", "");
+    let mut worst_spread = 0.0f64;
+    for n in &names {
+        let mut r = ratios[*n].clone();
+        let (lo, hi) = (r.iter().cloned().fold(f64::INFINITY, f64::min),
+                        r.iter().cloned().fold(0.0, f64::max));
+        let spread = if lo > 0.0 { hi / lo } else { f64::INFINITY };
+        if *n != BASELINE { worst_spread = worst_spread.max(spread); }
+        println!("  {n:>8} {:>11.1} {:>12.3} {lo:>10.3} {hi:>10.3} {spread:>9.2}x", mb[*n], med(&mut r));
     }
+    println!("\n  (* MB/token excludes token_embd — gathered per row, never streamed.)");
 
-    // ---- where the headroom is, stated as a bound rather than a promise ----
-    //
-    // Effective bandwidth (streamed bytes / time) differs 2-3x across formats on the SAME device and
-    // the same memory system. That spread is kernel quality, because the bytes are already accounted
-    // for. Projecting each format onto the best observed rate says how much of each row is format and
-    // how much is us.
-    //
-    // It is an UPPER BOUND and not a target: a 4-bit codebook format does strictly more dequant work
-    // per byte than Q8_0, so equal MB/ms is not physically available to it. The projection brackets
-    // the prize; it does not predict it.
-    let best_rate = rows.iter().map(|r| r.3 / r.2).fold(0.0f64, f64::max);
-    let best_rate_fmt = rows.iter().max_by(|a, b| (a.3 / a.2).partial_cmp(&(b.3 / b.2)).unwrap()).unwrap().0;
-    println!("  Best effective bandwidth here: {best_rate:.1} MB/ms ({best_rate_fmt}). Projecting every");
-    println!("  format onto that rate isolates format from kernel:\n");
-    println!("    {:>8} {:>12} {:>14} {:>13}", "format", "actual ms", "at best rate", "headroom");
-    for (name, _, ms, mb) in &rows {
-        let ideal = mb / best_rate;
-        println!("    {name:>8} {ms:>10.2} ms {ideal:>12.2} ms {:>12.2}x", ms / ideal);
+    // ---- can this table be read at all? ----
+    let meds: Vec<(f64, &str)> = names.iter().map(|n| (med(&mut ratios[*n].clone()), *n)).collect();
+    let best = meds.iter().cloned().fold((f64::INFINITY, ""), |a, b| if b.0 < a.0 { b } else { a });
+    let worst = meds.iter().cloned().fold((0.0, ""), |a, b| if b.0 > a.0 { b } else { a });
+    let signal = worst.0 / best.0;
+    println!("\n  Between-format signal (slowest/fastest median ratio): {signal:.2}x");
+    println!("  Worst within-format spread over identical repeats:    {worst_spread:.2}x");
+    if worst_spread >= signal {
+        println!("\n  ⛔ NOISE >= EFFECT. Repeating one format varies by {worst_spread:.2}x while the formats");
+        println!("  differ by {signal:.2}x, so this cannot rank them and nothing here should be quoted. The");
+        println!("  previous version of this harness was in exactly this state while printing a confident");
+        println!("  ordering. Fix the drift before reading the table.");
+        return;
     }
-    let (fewest, fewest_mb) = rows.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
-        .map(|r| (r.0, r.3)).unwrap();
-    println!("\n  {fewest} streams the fewest bytes ({fewest_mb:.0} MB) and carries the most headroom, which");
-    println!("  makes it the kernel worth tuning next rather than the one to write off.\n");
-    println!("  So what this measures is THIS RUNTIME'S KERNEL QUALITY PER FORMAT, which is a real and");
-    println!("  useful result, just not the one the example set out to get. The published crossover");
-    println!("  question (SINTEF: Q8_0 optimum on a Pi 4, lower widths costing more joules) needs every");
-    println!("  format to have a comparably tuned kernel before the comparison means anything. Here it");
-    println!("  is answered by whichever kernel happened to get attention.\n");
-    println!("  The actionable finding: {} is the fastest format on this device and remains the", best.0);
-    println!("  default. {} is now the slowest and the least tuned relative to its byte count, so it is",
-             rows.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).map(|r| r.0).unwrap_or("?"));
-    println!("  the next kernel to work on. Until the spread in the headroom column closes, no statement");
-    println!("  about the PHYSICAL crossover can be made from this runtime — only about ours.\n");
-    println!("  This is the field's own caution landing on us: on identical Snapdragon silicon, two");
-    println!("  runtimes differ 13x on the same model from kernel quality alone, against ~1.3x from the");
-    println!("  architecture choice. Measure the kernel before theorising about the format.");
+    println!("  → signal exceeds noise; the ordering is readable.\n");
 
-    println!("\n  ⚠ This is TIME, not joules. This machine has no readable power counter, and a joules");
-    println!("  figure from it would be arithmetic. Time per token at fixed power is a faithful proxy");
-    println!("  for the underlying trade (bytes moved vs dequant work) and nothing more. Run the same");
-    println!("  harness on a metered device to get the energy answer; ferric-joule is already wired to");
-    println!("  report which class the number belongs to.");
+    println!("  Fastest: {} ({:.3}x). Slowest: {} ({:.3}x).", best.1, best.0, worst.1, worst.0);
+
+    // ---- format vs kernel: bytes are already in the denominator, so what is left is the kernel ----
+    let rate = |n: &str| mb[n] / med(&mut ratios[n].clone());
+    let best_rate = names.iter().map(|n| rate(n)).fold(0.0f64, f64::max);
+    let best_fmt = names.iter().max_by(|a, b| rate(a).partial_cmp(&rate(b)).unwrap()).unwrap();
+    println!("\n  Relative bandwidth (MB per unit of {BASELINE}-time) isolates kernel from format. Best is");
+    println!("  {best_fmt}; projecting the others onto it is an UPPER BOUND, not a target — a 4-bit codebook");
+    println!("  does strictly more dequant work per byte, so equal bandwidth is not available to it.\n");
+    println!("    {:>8} {:>12} {:>14} {:>11}", "format", "ratio", "at best rate", "headroom");
+    for n in &names {
+        let ideal = mb[*n] / best_rate;
+        let r = med(&mut ratios[*n].clone());
+        println!("    {n:>8} {r:>12.3} {ideal:>14.3} {:>10.2}x", r / ideal);
+    }
+    println!("\n  ⚠ TIME, not joules — no readable power counter here. And this is THIS RUNTIME'S kernels");
+    println!("  per format, not the physical crossover: that needs every format comparably tuned, which");
+    println!("  the headroom column is how you check.");
 }
