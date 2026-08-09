@@ -132,44 +132,80 @@ async fn run() {
     for n in SPLITS { print!(" {:>9}", format!("{n} split")); }
     println!(" {:>7} {:>9}", "best", "vs 1");
     println!("  {:-<72}", "");
-    let mut recommend: Vec<(usize, usize)> = Vec::new();
+    // Three passes over the whole grid. The first version of this table reported an argmin from a
+    // single pass and the winners bounced (16, 2, 16, 8, 8, 8, 16) while the cells they beat were
+    // within 1-2% — that is an argmin of noise. What repeats show is which conclusions survive:
+    // "some split beats no split" has a 2-10x effect and holds, "the optimum is exactly n" does not.
+    const CAL_REPEATS: usize = 3;
+    // (context, best split count or 0 for a tie, speedup of the best split over no-split)
+    let mut recommend: Vec<(usize, usize, f64)> = Vec::new();
     for &s in &[128usize, 256, 512, 768, 1024, 2048, 4096] {
         let q = Tensor::from_vec(&ctx, &fill(nh * dh, 7), &[1, nh * dh]);
         let k = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 11), &[s, nkv * dh]);
         let v = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 22), &[s, nkv * dh]);
-        let mut times = Vec::new();
-        for &n in SPLITS {
-            std::env::set_var("FERRIC_SPLITKV", n.to_string());
-            let _ = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
-            let mut ms = Vec::new();
-            for _ in 0..7 {
-                let t0 = std::time::Instant::now();
-                let mut last = None;
-                for _ in 0..20 { last = Some(q.fused_decode_attention(&k, &v, nh, nkv, dh)); }
-                let _ = last.unwrap().to_vec().await;
-                ms.push(t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
+        // [split index][pass] so each cell can be reduced across passes.
+        let mut grid: Vec<Vec<f64>> = SPLITS.iter().map(|_| Vec::new()).collect();
+        for _ in 0..CAL_REPEATS {
+            for (si, &n) in SPLITS.iter().enumerate() {
+                std::env::set_var("FERRIC_SPLITKV", n.to_string());
+                let _ = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
+                let mut ms = Vec::new();
+                for _ in 0..7 {
+                    let t0 = std::time::Instant::now();
+                    let mut last = None;
+                    for _ in 0..20 { last = Some(q.fused_decode_attention(&k, &v, nh, nkv, dh)); }
+                    let _ = last.unwrap().to_vec().await;
+                    ms.push(t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
+                }
+                ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                grid[si].push(ms[3]);
             }
-            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            times.push(ms[3]);
         }
+        let times: Vec<f64> = grid.iter().map(|c| { let mut v = c.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }).collect();
         let bi = (0..times.len()).min_by(|&a, &b| times[a].partial_cmp(&times[b]).unwrap()).unwrap();
+        // How much of a lead the winner actually has over the best of the rest. Under ~10% it is a
+        // tie and naming a winner would be reporting noise.
+        let runner = (0..times.len()).filter(|&i| i != bi)
+            .map(|i| times[i]).fold(f64::INFINITY, f64::min);
+        let lead = runner / times[bi] - 1.0;
         print!("  {s:>7}");
         for t in &times { print!(" {t:>9.3}"); }
-        println!(" {:>7} {:>8.2}x", SPLITS[bi], times[0] / times[bi]);
-        recommend.push((s, SPLITS[bi]));
+        let tag = if lead < 0.10 { format!("{}~", SPLITS[bi]) } else { format!("{}", SPLITS[bi]) };
+        println!(" {tag:>7} {:>8.2}x", times[0] / times[bi]);
+        // TWO different questions, and collapsing them printed a wrong conclusion once already:
+        //   (a) does ANY split beat no-split?  -> the gate question
+        //   (b) WHICH split count is best?     -> the formula question
+        // At S=512 every count from 2 to 16 beats 1-split by 1.79x while tying with each other. Marking
+        // that row "tie" and then looking for the first non-tie row to answer (a) reported that
+        // splitting first pays at S=4096, which the table plainly contradicts.
+        let beats_one = times[0] / times[bi];
+        recommend.push((s, if lead < 0.10 { 0 } else { SPLITS[bi] }, beats_one));
     }
     std::env::remove_var("FERRIC_SPLITKV");
 
-    println!("\n  Measured optimum per context: {}",
-             recommend.iter().map(|(s, n)| format!("S={s}→{n}")).collect::<Vec<_>>().join("  "));
-    let first_split = recommend.iter().find(|(_, n)| *n > 1).map(|(s, _)| *s);
+    println!("\n  {CAL_REPEATS} passes over the grid, median per cell. A `~` marks a winner leading the");
+    println!("  runner-up by under 10%, i.e. a tie the argmin should not be trusted to break.");
+    println!("  Optimum per context: {}",
+             recommend.iter().map(|(s, n, _)| if *n == 0 { format!("S={s}→tie") } else { format!("S={s}→{n}") })
+                 .collect::<Vec<_>>().join("  "));
+    // The gate question is answered by "does splitting beat not splitting", independent of which count
+    // wins. 10% is the same tie threshold used above, applied to the right comparison this time.
+    let first_split = recommend.iter().find(|(_, _, beats)| *beats > 1.10).map(|(s, _, _)| *s);
     match first_split {
         Some(s0) if s0 < 1024 => {
             println!("  ⚠ Splitting first pays at S={s0}, below the current gate of 1024, so the gate is");
             println!("    leaving a win on the floor for every context between {s0} and 1024.");
             // keys-per-split implied by the measured optimum at the smallest winning length
-            let n0 = recommend.iter().find(|(s, _)| *s == s0).unwrap().1;
-            println!("    Implied MIN_KEYS_PER_SPLIT at that point: {} (currently 512).", s0 / n0);
+            let (_, n0, beats) = *recommend.iter().find(|(s, _, _)| *s == s0).unwrap();
+            println!("    At S={s0} splitting beats not splitting by {beats:.2}x.");
+            if n0 > 0 {
+                println!("    Implied MIN_KEYS_PER_SPLIT there: {} (currently 512).", s0 / n0);
+            } else {
+                println!("    Every split count ties there, so the data fixes the GATE but not the");
+                println!("    formula: lower the threshold, and leave the count rule until repeats");
+                println!("    separate the counts.");
+            }
         }
         Some(s0) => println!("  Splitting first pays at S={s0}; the gate at 1024 is consistent with that."),
         None => println!("  Splitting never pays in this range — the gate is right, or too permissive."),

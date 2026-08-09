@@ -89,40 +89,72 @@ fn main() {
 async fn child(rot: usize) {
     let home = std::env::var("HOME").unwrap();
     let ctx = Arc::new(Context::new().await.unwrap());
-    let n = FORMATS.len();
-    for step in 0..n {
-        let i = (step + rot) % n;
-        let (name, rel) = FORMATS[i];
+
+    // Load one model and return a closure-friendly bundle. Kept small so the baseline can stay
+    // resident while each candidate is loaded and dropped around it.
+    async fn measure(ctx: &Arc<Context>, home: &str, rel: &str) -> Option<(f64, f64)> {
         let path = format!("{home}/.cache/ferric/hub/{rel}");
-        let Ok(g) = GgufFile::open(&path) else { continue };
+        let g = GgufFile::open(&path).ok()?;
         let file_mb = std::fs::metadata(&path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
-        // token_embd is gathered per row by `embed()`, never streamed, and is not stored in the format
-        // the file is named for (this IQ4_XS build keeps it Q8_0, ~145 MB of 349 MB). Charging it to
-        // the format would credit a lighter-embedding build with a saving its weights never made.
         let embd_mb = g.tensor("token_embd.weight")
             .and_then(|t| ferric_gguf::type_size(t.ggml_type, t.dims.iter().product::<u64>() as usize).ok())
             .unwrap_or(0) as f64 / 1e6;
-        let Ok(m) = Qwen3::load(&ctx, &g) else { continue };
-        let vn = m.cfg.n_vocab;
-        let am = |l: &[f32]| l[l.len() - vn..].iter().enumerate()
-            .fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32;
-
-        let mut c = Cache::new(&m.cfg);
-        let mut next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
-
-        let mut samples = Vec::with_capacity(REPS);
-        for _ in 0..REPS {
-            let mut c = Cache::new(&m.cfg);
-            next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
-            let t0 = std::time::Instant::now();
-            for _ in 0..DECODE_TOKENS {
-                next = am(&m.forward_cached(&[next], &mut c).to_vec().await);
-            }
-            samples.push(t0.elapsed().as_secs_f64() * 1000.0 / DECODE_TOKENS as f64);
-        }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("RESULT {name} {} {}", samples[REPS / 2], file_mb - embd_mb);
+        let m = Qwen3::load(ctx, &g).ok()?;
+        Some((time_decode(&m).await, file_mb - embd_mb))
     }
+
+    // ---- bracketing ----
+    //
+    // Ratios assume the run-level clock factor is COMMON to everything in the process. The rotated-repeat
+    // version showed that assumption failing: most repeats put every format at 1.0-1.14x of Q8_0 and one
+    // put every format at ~1.6x, which is the regime switching partway THROUGH a process, not between
+    // processes. A single baseline measured once per process cannot see that.
+    //
+    // So the baseline is measured immediately before and immediately after each candidate, and the
+    // candidate is divided by the mean of its two neighbours. Drift slower than one measurement pair
+    // cancels; a regime change shows up as a gap between the bracketing pair, which is reported rather
+    // than averaged away. This is ordinary bracketing, the same reason a balance is re-zeroed between
+    // weighings rather than once at the start.
+    let base_rel = FORMATS.iter().find(|f| f.0 == BASELINE).expect("baseline format").1;
+    let n = FORMATS.len();
+    let mut prev_base = match measure(&ctx, &home, base_rel).await {
+        Some((t, mb)) => { println!("RESULT {BASELINE} 1.0 {mb} 0.0"); println!("BASEABS {t}"); t }
+        None => return,
+    };
+    for step in 0..n {
+        let i = (step + rot) % n;
+        let (name, rel) = FORMATS[i];
+        if name == BASELINE { continue; }
+        let Some((t, mb)) = measure(&ctx, &home, rel).await else { continue };
+        let Some((next_base, _)) = measure(&ctx, &home, base_rel).await else { continue };
+        println!("BASEABS {next_base}");
+        // Mean of the two brackets, plus how far apart they were: the drift this pair actually saw.
+        let base = 0.5 * (prev_base + next_base);
+        let drift = (next_base / prev_base).max(prev_base / next_base);
+        println!("RESULT {name} {} {mb} {}", t / base, drift - 1.0);
+        prev_base = next_base;
+    }
+}
+
+/// Median decode ms/token over `REPS` timed runs, cache rebuilt each time.
+async fn time_decode(m: &Qwen3) -> f64 {
+    let vn = m.cfg.n_vocab;
+    let am = |l: &[f32]| l[l.len() - vn..].iter().enumerate()
+        .fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32;
+    let mut c = Cache::new(&m.cfg);
+    let mut next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut c = Cache::new(&m.cfg);
+        next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
+        let t0 = std::time::Instant::now();
+        for _ in 0..DECODE_TOKENS {
+            next = am(&m.forward_cached(&[next], &mut c).to_vec().await);
+        }
+        samples.push(t0.elapsed().as_secs_f64() * 1000.0 / DECODE_TOKENS as f64);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples[REPS / 2]
 }
 
 fn med(v: &mut [f64]) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }
@@ -138,30 +170,58 @@ fn parent() {
     let exe = std::env::current_exe().expect("current exe");
     // per format: streamed MB, and one ratio-to-baseline per repeat
     let mut mb: std::collections::HashMap<String, f64> = Default::default();
-    let mut ratios: std::collections::HashMap<String, Vec<f64>> = Default::default();
+    // (ratio, bracket drift) so a measurement taken through a clock change can be rejected rather
+    // than averaged in. A start-of-run load gate cannot see a machine that gets busy mid-run; the
+    // brackets can, because they straddle exactly the interval the candidate was measured in.
+    let mut ratios: std::collections::HashMap<String, Vec<(f64, f64)>> = Default::default();
     let mut abs_baseline: Vec<f64> = Vec::new();
+    // Gap between the two baselines bracketing each candidate: the drift that pair actually saw.
+    let mut drifts: Vec<f64> = Vec::new();
 
     for rep in 0..REPEATS {
         let out = std::process::Command::new(&exe)
             .env("FERRIC_XOVER_ROT", rep.to_string())
             .output().expect("child failed");
         let s = String::from_utf8_lossy(&out.stdout);
-        let mut run: Vec<(String, f64, f64)> = Vec::new();
-        for l in s.lines().filter(|l| l.starts_with("RESULT")) {
+        // The child now divides by its own bracketing baselines, so the parent only collects.
+        let mut saw = false;
+        for l in s.lines() {
             let f: Vec<&str> = l.split_whitespace().collect();
-            run.push((f[1].to_string(), f[2].parse().unwrap(), f[3].parse().unwrap()));
+            match f.first() {
+                Some(&"RESULT") => {
+                    mb.insert(f[1].to_string(), f[3].parse().unwrap());
+                    let (r, d): (f64, f64) = (f[2].parse().unwrap(), f[4].parse().unwrap());
+                    ratios.entry(f[1].to_string()).or_default().push((r, d));
+                    drifts.push(d);
+                    saw = true;
+                }
+                Some(&"BASEABS") => abs_baseline.push(f[1].parse().unwrap()),
+                _ => {}
+            }
         }
-        let Some(base) = run.iter().find(|r| r.0 == BASELINE).map(|r| r.1) else {
-            println!("  repeat {rep}: no {BASELINE} baseline in this run, skipped");
-            continue;
-        };
-        abs_baseline.push(base);
-        for (name, ms, streamed) in run {
-            mb.insert(name.clone(), streamed);
-            ratios.entry(name).or_default().push(ms / base);
-        }
+        if !saw { println!("  repeat {rep}: child produced nothing, skipped"); }
     }
     assert!(ratios.len() > 1, "nothing to compare");
+
+    // ---- reject pairs measured through a disturbance ----
+    //
+    // If the baselines bracketing a candidate disagree by more than this, the clock moved while that
+    // candidate was being timed and its ratio is a ratio to a number that was changing. Dropping it is
+    // the honest move; keeping it and taking a median is how the first version of this harness produced
+    // a confident ordering out of a 3.4x swing.
+    const MAX_BRACKET_DRIFT: f64 = 0.15;
+    let before: usize = ratios.values().map(|v| v.len()).sum();
+    for v in ratios.values_mut() {
+        if v.iter().any(|(_, d)| *d <= MAX_BRACKET_DRIFT) {
+            v.retain(|(_, d)| *d <= MAX_BRACKET_DRIFT);
+        }
+    }
+    let after: usize = ratios.values().map(|v| v.len()).sum();
+    if after < before {
+        println!("\n  Rejected {}/{before} measurements whose bracketing baselines disagreed by more",
+                 before - after);
+        println!("  than {:.0}% — the device clock moved while they were being timed.", 100.0 * MAX_BRACKET_DRIFT);
+    }
 
     // Order the report by the FORMATS table so it reads consistently regardless of rotation.
     let names: Vec<&str> = FORMATS.iter().map(|f| f.0).filter(|n| ratios.contains_key(*n)).collect();
@@ -172,14 +232,20 @@ fn parent() {
              abs_baseline.iter().cloned().fold(0.0, f64::max),
              abs_baseline.iter().cloned().fold(0.0, f64::max)
                  / abs_baseline.iter().cloned().fold(f64::INFINITY, f64::min));
-    println!("  That swing is the device clock state, and it is why the table below is ratios.\n");
+    println!("  That swing is the device clock state, and it is why the table below is ratios.");
+    let worst_drift = drifts.iter().cloned().fold(0.0f64, f64::max);
+    let med_drift = { let mut d = drifts.clone(); if d.is_empty() { 0.0 } else { med(&mut d) } };
+    println!("  Baseline drift ACROSS each candidate's bracketing pair: median {:.1}%, worst {:.1}%.",
+             100.0 * med_drift, 100.0 * worst_drift);
+    println!("  A candidate whose brackets disagree badly was measured through a clock change; that is");
+    println!("  reported here rather than averaged into a number that looks solid.\n");
 
     println!("  {:>8} {:>11} {:>12} {:>10} {:>10} {:>10}",
              "format", "MB/token*", "ratio med", "min", "max", "ratio sprd");
     println!("  {:-<66}", "");
     let mut worst_spread = 0.0f64;
     for n in &names {
-        let mut r = ratios[*n].clone();
+        let mut r: Vec<f64> = ratios[*n].iter().map(|(x, _)| *x).collect();
         let (lo, hi) = (r.iter().cloned().fold(f64::INFINITY, f64::min),
                         r.iter().cloned().fold(0.0, f64::max));
         let spread = if lo > 0.0 { hi / lo } else { f64::INFINITY };
@@ -189,7 +255,8 @@ fn parent() {
     println!("\n  (* MB/token excludes token_embd — gathered per row, never streamed.)");
 
     // ---- can this table be read at all? ----
-    let meds: Vec<(f64, &str)> = names.iter().map(|n| (med(&mut ratios[*n].clone()), *n)).collect();
+    let rvals = |n: &str| -> Vec<f64> { ratios[n].iter().map(|(x, _)| *x).collect() };
+    let meds: Vec<(f64, &str)> = names.iter().map(|n| (med(&mut rvals(n)), *n)).collect();
     let best = meds.iter().cloned().fold((f64::INFINITY, ""), |a, b| if b.0 < a.0 { b } else { a });
     let worst = meds.iter().cloned().fold((0.0, ""), |a, b| if b.0 > a.0 { b } else { a });
     let signal = worst.0 / best.0;
@@ -207,7 +274,7 @@ fn parent() {
     println!("  Fastest: {} ({:.3}x). Slowest: {} ({:.3}x).", best.1, best.0, worst.1, worst.0);
 
     // ---- format vs kernel: bytes are already in the denominator, so what is left is the kernel ----
-    let rate = |n: &str| mb[n] / med(&mut ratios[n].clone());
+    let rate = |n: &str| mb[n] / med(&mut rvals(n));
     let best_rate = names.iter().map(|n| rate(n)).fold(0.0f64, f64::max);
     let best_fmt = names.iter().max_by(|a, b| rate(a).partial_cmp(&rate(b)).unwrap()).unwrap();
     println!("\n  Relative bandwidth (MB per unit of {BASELINE}-time) isolates kernel from format. Best is");
@@ -216,7 +283,7 @@ fn parent() {
     println!("    {:>8} {:>12} {:>14} {:>11}", "format", "ratio", "at best rate", "headroom");
     for n in &names {
         let ideal = mb[*n] / best_rate;
-        let r = med(&mut ratios[*n].clone());
+        let r = med(&mut rvals(n));
         println!("    {n:>8} {r:>12.3} {ideal:>14.3} {:>10.2}x", r / ideal);
     }
     println!("\n  ⚠ TIME, not joules — no readable power counter here. And this is THIS RUNTIME'S kernels");
