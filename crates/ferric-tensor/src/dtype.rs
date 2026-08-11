@@ -3021,23 +3021,52 @@ const IQ4_XS_HELPERS: &str = r#"
 const KV: array<i32, 16> = array<i32, 16>(-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
 fn qsb(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
 "#;
+/// Two changes from the obvious transcription of the format. **Kept for accuracy, NOT for speed — the
+/// speed hypothesis they were written to test was refuted.**
+///
+/// 1. **One `codes` load per four bytes.** `qsb` indexes `codes[cb + (i >> 2u)]`, so a loop over
+///    `j = 0..16` touches four distinct words while issuing sixteen loads. This reads each word once
+///    and shifts four bytes out of it.
+/// 2. **Scale the sub-block once, not every element.** `dl` is constant across a 32-value sub-block, so
+///    it leaves the inner loop: 1 multiply instead of 32.
+///
+/// The theory was that these explain IQ4_XS's headroom — it streams the fewest bytes of any format
+/// (204.8 MB/token vs Q8_0's 531.1) and is still the slowest, at 2.97x Q8_0's effective bandwidth.
+/// **Measured: no change.** IQ4_XS/Q8_0 went 1.143 → 1.147, a 0.4% move inside a 1.03x within-format
+/// spread. Sixteen loads of one address apparently cost what four do (they hit cache), and 32 f32
+/// multiplies are not what binds. **So the headroom is real but is NOT these two things**, and the next
+/// attempt should profile rather than assume — the remaining suspects are the serial 6-bit sub-scale
+/// unpack and the `KV` codebook lookup, neither of which Q8_0 pays at all.
+///
+/// What it did buy, measured on real checkpoint weights against `ferric_gguf`'s CPU dequant: **max
+/// relative error 3.586e-7 → 1.550e-7**, because (2) reassociates to `dl*(Σ x·kv)` and removes a
+/// rounding step per element. Not bit-identical to the previous kernel, and more accurate than it.
+/// `qsb` is retained because IQ4_NL still uses it.
 const IQ4_XS_BODY: &str = r#"
             let cb = bi * 32u; let ab = bi * 3u;
             let d = unpack2x16float(aux[ab]).x;
             let scales_h = aux[ab + 1u];
+            let scales_l = aux[ab + 2u];
             let xbb = r * in_dim + blk * 256u;
             for (var ib: u32 = 0u; ib < 8u; ib = ib + 1u) {
                 // 6-bit sub-scale: low nibble from scales_l[ib/2], high 2 bits from scales_h at 2*ib.
-                let sl = (aux[ab + 2u] >> (8u * (ib >> 1u))) & 0xffu;
+                let sl = (scales_l >> (8u * (ib >> 1u))) & 0xffu;
                 let lo = (sl >> (4u * (ib & 1u))) & 0x0Fu;
                 let hi = (scales_h >> (2u * ib)) & 3u;
                 let dl = d * f32(i32(lo | (hi << 4u)) - 32);
-                let xh = xbb + ib * 32u; let qo = ib * 16u;
-                for (var j: u32 = 0u; j < 16u; j = j + 1u) {
-                    let b = qsb(cb, qo + j);
-                    acc = acc + x[xh + j]        * dl * f32(KV[b & 0x0Fu]);
-                    acc = acc + x[xh + j + 16u]  * dl * f32(KV[b >> 4u]);
+                let xh = xbb + ib * 32u;
+                let w0 = cb + ib * 4u;   // the 4 u32 words holding this sub-block's 16 packed bytes
+                var sub = 0.0;
+                for (var w: u32 = 0u; w < 4u; w = w + 1u) {
+                    let word = codes[w0 + w];   // one load, four bytes used
+                    for (var t: u32 = 0u; t < 4u; t = t + 1u) {
+                        let b = (word >> (8u * t)) & 0xffu;
+                        let j = w * 4u + t;
+                        sub = sub + x[xh + j]       * f32(KV[b & 0x0Fu]);
+                        sub = sub + x[xh + j + 16u] * f32(KV[b >> 4u]);
+                    }
                 }
+                acc = acc + dl * sub;
             }
 "#;
 
