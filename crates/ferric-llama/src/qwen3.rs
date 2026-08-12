@@ -35,6 +35,29 @@ pub struct Cfg {
     pub gemma2: bool,      // Gemma-2 only: logit softcapping + uniform rope (Gemma-3 dropped both)
     pub attn_softcap: f32, // Gemma-2 attention-score softcap (50); 0 = none
     pub final_softcap: f32, // Gemma-2 final-logit softcap (30); 0 = none
+    /// **Per-layer** sliding-window flag, length `n_layer`. `true` = local (windowed) attention.
+    ///
+    /// A scalar `sliding_pattern` cannot express every schedule, and reading one where the file stores
+    /// an array is not a graceful degradation — `u()` returns `Err`, the fallback yields 0, and the
+    /// model silently runs every layer global. Muse Glimmer ships the schedule as an
+    /// `attention.sliding_window_pattern` array of 52 flags (1,1,1,0 repeating), so it is read directly
+    /// and the modular Gemma rule is used only to synthesise this vector when a scalar is what's there.
+    pub swa: Vec<bool>,
+    /// Multiplies the final logits, after the LM head and **before** `final_softcap`.
+    ///
+    /// Verified against llama.cpp's `muse-glimmer.cpp` rather than the model card: Meta's write-up
+    /// describes "extra query scaling to set the target logit scale", which reads as an *attention*
+    /// scale, but the graph applies `ggml_scale(cur, f_logit_scale)` after `lm_head` and keeps
+    /// `kq_scale = 1/sqrt(head_dim)`. Putting it on the queries would have produced fluent, wrong text.
+    pub logit_scale: f32,
+    /// Post-attention / post-FFN norms exist (Gemma, Muse Glimmer). Detected from the tensors present,
+    /// not from the architecture name, because two unrelated families use them.
+    pub post_norms: bool,
+    /// **NoPE on global layers**: RoPE is applied only to sliding-window layers, and the full-attention
+    /// layers carry no positional encoding at all. Muse Glimmer's design — local layers keep relative
+    /// order via RoPE while the global layers stay position-free. `hparams.is_swa(il)` gates the rope
+    /// call in llama.cpp's graph; this mirrors that.
+    pub nope_global: bool,
 }
 
 impl Cfg {
@@ -72,6 +95,28 @@ impl Cfg {
             gemma2,
             attn_softcap: f("attn_logit_softcapping").unwrap_or(0.0),
             final_softcap: f("final_logit_softcapping").unwrap_or(0.0),
+            swa: {
+                // Prefer the explicit per-layer array; fall back to the modular rule only when the
+                // file stores a scalar. Order matters: `u()` on an Arr returns Err, so checking the
+                // array FIRST is what stops a hybrid schedule from collapsing to all-global.
+                let n = u("block_count").unwrap_or(0);
+                match g.metadata().get(&format!("{arch}.attention.sliding_window_pattern")) {
+                    Some(Meta::Arr(a)) => a.iter().map(|m| match m {
+                        Meta::U(v) => *v != 0,
+                        Meta::I(v) => *v != 0,
+                        Meta::Bool(v) => *v,
+                        _ => false,
+                    }).collect(),
+                    _ => {
+                        let p = u("attention.sliding_window_pattern")
+                            .unwrap_or(if gemma2 { 2 } else if is_gemma { 6 } else { 0 });
+                        (0..n).map(|il| is_gemma && p > 0 && il % p != p - 1).collect()
+                    }
+                }
+            },
+            logit_scale: f("logit_scale").unwrap_or(1.0),
+            post_norms: g.tensor("blk.0.post_attention_norm.weight").is_some(),
+            nope_global: arch == "muse-glimmer",
         })
     }
 }
@@ -131,6 +176,12 @@ pub struct Layer {
     ffn_gate_up: Proj,
     ffn_gate_out: usize,
     ffn_down: QMatrix,
+    /// **Gated GQA** (Muse Glimmer): a sigmoid gate computed from the layer's *normed input* — not
+    /// from the attention output — and multiplied into the attention result BEFORE `wo`. Matches
+    /// llama.cpp: `gate = sigmoid(wqkv_gate · attn_inp); cur = cur * gate`.
+    attn_gate: Option<QMatrix>,
+    /// Whether this layer applies RoPE at all. False on Muse Glimmer's global layers (NoPE).
+    rope: bool,
     post_attn_norm: Option<Tensor>, // Gemma: normalizes the attn output before the residual add
     post_ffn_norm: Option<Tensor>,  // Gemma: normalizes the ffn output before the residual add
     rope_base: f32,                 // per-layer RoPE θ (Gemma alternates local 1e4 / global 1e6)
@@ -227,7 +278,7 @@ pub fn build_layer(
             // Gemma alternates attention: 1 global layer every 6 (full attn, θ=rope_base=1e6), the rest
             // local (sliding-window, θ=1e4). Non-Gemma layers are always full causal (window 0).
             // Local (sliding-window) layer unless it's the global one every `sliding_pattern` layers.
-            let is_local = cfg.is_gemma && cfg.sliding_pattern > 0 && il % cfg.sliding_pattern != cfg.sliding_pattern - 1;
+            let is_local = cfg.swa.get(il).copied().unwrap_or(false);
             // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
             let rope_base = if !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
             let window = if is_local { cfg.sliding_window } else { 0 };
@@ -244,8 +295,14 @@ pub fn build_layer(
                 ffn_gate_up,
                 ffn_gate_out,
                 ffn_down: qm(ctx, g, &b("ffn_down.weight"))?,
-                post_attn_norm: if cfg.is_gemma { Some(nrm(&b("post_attention_norm.weight"), cfg.n_embd)?) } else { None },
-                post_ffn_norm: if cfg.is_gemma { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
+                attn_gate: match g.tensor(&b("attn_gate.weight")) {
+                    Some(_) => Some(qm(ctx, g, &b("attn_gate.weight"))?),
+                    None => None,
+                },
+                // NoPE on the global layers; every other architecture ropes every layer.
+                rope: !cfg.nope_global || is_local,
+                post_attn_norm: if cfg.post_norms { Some(nrm(&b("post_attention_norm.weight"), cfg.n_embd)?) } else { None },
+                post_ffn_norm: if cfg.post_norms { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
                 rope_base,
                 window,
             })
@@ -414,6 +471,18 @@ impl Qwen3 {
         }
     }
 
+    /// LM head → `logit_scale` → `final_softcap`, in that order.
+    ///
+    /// One helper because three call sites (decode, stepped decode, profiled decode) applied the
+    /// softcap independently, and a fourth thing now has to happen between the matmul and the cap.
+    /// llama.cpp's order is `ggml_scale(cur, f_logit_scale)` and then the tanh cap, so scaling after
+    /// the cap — the easy mistake when bolting it on — would saturate against the wrong bound.
+    fn head(&self, x: &Tensor) -> Tensor {
+        let lg = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
+        let lg = if self.cfg.logit_scale != 1.0 { lg.mul(&lg.scalar(self.cfg.logit_scale)) } else { lg };
+        if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
+    }
+
     fn attn(&self, h: &Tensor, l: &Layer, cache: &mut (KvBuf, KvBuf), offset: usize, il: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         self.grab(format!("l{il}.qkv"), h); // GPTQ calibration: capture wqkv input
@@ -449,8 +518,14 @@ impl Qwen3 {
         //   - QK-norm (Qwen3) normalises each separately first, so they are no longer one span;
         //   - rope-scaling (Llama-3) goes through a different kernel that has not been shown equivalent.
         // Both fall back to the two-dispatch path, which is unchanged.
-        let fuse_rope = l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
-        let (q, k) = if fuse_rope {
+        let fuse_rope = l.rope && l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        let (q, k) = if !l.rope {
+            // NoPE layer (Muse Glimmer's global attention): QK-norm still applies, RoPE does not.
+            // Skipping the rotation is the whole difference — position enters this layer only through
+            // which keys exist in the cache, which is what "preserve information globally" means here.
+            (qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm),
+             qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm))
+        } else if fuse_rope {
             let qk = qkv.narrow(1, 0, l.q_out + l.kv_out).rope(nh + nkv, hd, l.rope_base, offset);
             // q's window has offset 0 (free during decode via the size-1 stride rule); k's carries an
             // offset and flows into `KvBuf::append`, which reads views in place.
@@ -485,6 +560,13 @@ impl Qwen3 {
             // chunked_attention delegates to causal_attention when q covers the whole history, so
             // this one call serves full prefill, prefix-cached suffixes and chunked prefill alike.
             nn::chunked_attention(&q, &kc, &vc, nh, nkv, sc)
+        };
+        // Gated GQA: the gate is a projection of the layer's NORMED INPUT `h`, not of the attention
+        // output, so it cannot be folded into `wo`. Sigmoid, then elementwise into the attention result
+        // before the output projection.
+        let o = match &l.attn_gate {
+            Some(wg) => o.mul(&h.matmul_q(wg).sigmoid()),
+            None => o,
         };
         self.grab(format!("l{il}.wo"), &o); // GPTQ calibration: capture wo input
         o.matmul_q(&l.wo)
@@ -536,8 +618,8 @@ impl Qwen3 {
             prof(&self.ctx, "attn");
             out = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
             prof(&self.ctx, "ffn");
-        } else if self.cfg.is_gemma {
-            // Gemma normalizes the attn AND ffn *outputs* (post-norms) before each residual add:
+        } else if self.cfg.post_norms {
+            // Gemma and Muse Glimmer normalize the attn AND ffn *outputs* (post-norms) before each add:
             //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
             let eps = self.cfg.eps;
             out = batch(&self.ctx, || {
@@ -645,11 +727,7 @@ impl Qwen3 {
             x = self.apply_layer_batch(&x, &l, caches, il);
         }
         for c in caches.iter_mut() { c.pos += 1; }
-        let sc = self.cfg.final_softcap;
-        batch(&self.ctx, || {
-            let lg = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
-            if sc > 0.0 { lg.softcap(sc) } else { lg }
-        })
+        batch(&self.ctx, || self.head(&x))
     }
 
     /// The layer at `il`: resident, or materialised from the tier.
@@ -688,11 +766,7 @@ impl Qwen3 {
         use ferric_tensor::batch;
         debug_assert!(step.next_layer().is_none(), "step_finish called before every layer ran");
         cache.pos += step.n_tokens;
-        let sc = self.cfg.final_softcap;
-        batch(&self.ctx, || {
-            let l = step.x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
-            if sc > 0.0 { l.softcap(sc) } else { l }
-        })
+        batch(&self.ctx, || self.head(&step.x))
     }
 
     fn run_layers(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
@@ -713,11 +787,7 @@ impl Qwen3 {
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
         let x = self.run_layers(tokens, cache);
-        let sc = self.cfg.final_softcap;
-        let out = batch(&self.ctx, || {
-            let l = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
-            if sc > 0.0 { l.softcap(sc) } else { l } // Gemma-2 final-logit softcap
-        });
+        let out = batch(&self.ctx, || self.head(&x));
         prof(&self.ctx, "lm_head");
         out
     }
