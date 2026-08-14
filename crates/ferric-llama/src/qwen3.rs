@@ -58,6 +58,24 @@ pub struct Cfg {
     /// order via RoPE while the global layers stay position-free. `hparams.is_swa(il)` gates the rope
     /// call in llama.cpp's graph; this mirrors that.
     pub nope_global: bool,
+    /// RoPE pairs consecutive dims (`2c`, `2c+1`) rather than split-half (`c`, `c+half`).
+    ///
+    /// llama.cpp calls these NORM and NEOX and resolves one per architecture. Muse Glimmer is NORM,
+    /// and its GGUF converter runs `_unpermute_for_rope` so the stored Q/K rows are already in that
+    /// order. Rotating the wrong pairs is invisible: it loads, the logits stay finite, and the text is
+    /// fluent nonsense.
+    pub rope_interleaved: bool,
+    /// Epsilon for the POST-attention / POST-FFN norms, which on Muse Glimmer is 1e-8 — not the
+    /// `attention.layer_norm_rms_epsilon` every other norm uses. llama.cpp hardcodes it with the
+    /// comment "Different to f_norm_rms_eps for post-attn / post-FFN norms".
+    pub post_norm_eps: f32,
+    /// Normalise the token embeddings to unit RMS with NO learned weight before layer 0.
+    ///
+    /// `muse-glimmer.cpp` does `build_norm(inpL, nullptr, nullptr, LLM_NORM_RMS, -1)`. Measured on this
+    /// checkpoint the table is *already* row-normalised (per-row RMS 0.062409..0.062552, ratio 1.0023),
+    /// so the op is within 0.3% of a uniform x16 — but it lands on the RESIDUAL, which the scale-
+    /// invariant RMSNorms downstream cannot recover.
+    pub embd_rmsnorm: bool,
 }
 
 impl Cfg {
@@ -117,6 +135,9 @@ impl Cfg {
             logit_scale: f("logit_scale").unwrap_or(1.0),
             post_norms: g.tensor("blk.0.post_attention_norm.weight").is_some(),
             nope_global: arch == "muse-glimmer",
+            rope_interleaved: arch == "muse-glimmer",
+            post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
+            embd_rmsnorm: arch == "muse-glimmer",
         })
     }
 }
@@ -280,7 +301,13 @@ pub fn build_layer(
             // Local (sliding-window) layer unless it's the global one every `sliding_pattern` layers.
             let is_local = cfg.swa.get(il).copied().unwrap_or(false);
             // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
-            let rope_base = if !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
+            // Gemma-3 alone uses a DUAL theta: local layers rotate at 1e4 while global layers use
+            // rope_base (1e6). Gemma-2 is uniform. This rule must stay keyed on `is_gemma` — it was
+            // keyed on `is_local` alone, and the moment `is_local` stopped meaning "Gemma local layer"
+            // every other windowed architecture silently had its theta replaced by 10000. Muse Glimmer
+            // rotates its local layers at rope_base = 500000; at 1e4 the model loads, produces finite
+            // logits, and emits newlines forever.
+            let rope_base = if cfg.is_gemma && !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
             let window = if is_local { cfg.sliding_window } else { 0 };
             Ok(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
@@ -459,6 +486,16 @@ impl Qwen3 {
         }
         // Gemma scales the token embeddings by √n_embd (identity elsewhere, embd_scale == 1.0).
         if self.cfg.embd_scale != 1.0 { for x in &mut v { *x *= self.cfg.embd_scale; } }
+        // Muse Glimmer normalises the embedding rows to unit RMS with NO learned weight before the
+        // first layer. Done on the CPU here because the rows were just dequantised here anyway.
+        if self.cfg.embd_rmsnorm && std::env::var("FERRIC_NO_EMBDNORM").is_err() {
+            let eps = self.cfg.eps;
+            for row in v.chunks_mut(d) {
+                let ms = row.iter().map(|x| x * x).sum::<f32>() / d as f32;
+                let inv = 1.0 / (ms + eps).sqrt();
+                for x in row.iter_mut() { *x *= inv; }
+            }
+        }
         Tensor::from_vec(&self.ctx, &v, &[tokens.len(), d])
     }
 
@@ -467,6 +504,7 @@ impl Qwen3 {
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
         match &self.rope_freqs {
             Some(fs) => x.rope_scaled(fs, n_heads, self.cfg.head_dim, base, offset),
+            None if self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err() => x.rope_interleaved(n_heads, self.cfg.head_dim, base, offset),
             None => x.rope(n_heads, self.cfg.head_dim, base, offset),
         }
     }
@@ -479,7 +517,9 @@ impl Qwen3 {
     /// the cap — the easy mistake when bolting it on — would saturate against the wrong bound.
     fn head(&self, x: &Tensor) -> Tensor {
         let lg = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
-        let lg = if self.cfg.logit_scale != 1.0 { lg.mul(&lg.scalar(self.cfg.logit_scale)) } else { lg };
+        let lg = if self.cfg.logit_scale != 1.0 && std::env::var("FERRIC_NOLOGITSCALE").is_err() {
+            lg.mul(&lg.scalar(self.cfg.logit_scale))
+        } else { lg };
         if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
     }
 
@@ -518,8 +558,9 @@ impl Qwen3 {
         //   - QK-norm (Qwen3) normalises each separately first, so they are no longer one span;
         //   - rope-scaling (Llama-3) goes through a different kernel that has not been shown equivalent.
         // Both fall back to the two-dispatch path, which is unchanged.
-        let fuse_rope = l.rope && l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
-        let (q, k) = if !l.rope {
+        let fuse_rope = (l.rope || std::env::var("FERRIC_NONOPE").is_ok()) && l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        let nope = !l.rope && std::env::var("FERRIC_NONOPE").is_err();
+        let (q, k) = if nope {
             // NoPE layer (Muse Glimmer's global attention): QK-norm still applies, RoPE does not.
             // Skipping the rotation is the whole difference — position enters this layer only through
             // which keys exist in the cache, which is what "preserve information globally" means here.
@@ -564,9 +605,13 @@ impl Qwen3 {
         // Gated GQA: the gate is a projection of the layer's NORMED INPUT `h`, not of the attention
         // output, so it cannot be folded into `wo`. Sigmoid, then elementwise into the attention result
         // before the output projection.
+        // FERRIC_NOGATE / FERRIC_NONOPE / FERRIC_NOLOGITSCALE exist so a new architecture's pieces can
+        // be ablated one at a time against the same binary and the same weights. A 30B model gives no
+        // useful signal from reading the code once it is structurally plausible; it gives a lot from
+        // turning one thing off.
         let o = match &l.attn_gate {
-            Some(wg) => o.mul(&h.matmul_q(wg).sigmoid()),
-            None => o,
+            Some(wg) if std::env::var("FERRIC_NOGATE").is_err() => o.mul(&h.matmul_q(wg).sigmoid()),
+            _ => o,
         };
         self.grab(format!("l{il}.wo"), &o); // GPTQ calibration: capture wo input
         o.matmul_q(&l.wo)
@@ -622,11 +667,33 @@ impl Qwen3 {
             // Gemma and Muse Glimmer normalize the attn AND ffn *outputs* (post-norms) before each add:
             //   x = x + post_attn_norm(attn(input_norm(x))); x = x + post_ffn_norm(ffn(pre_ffn_norm(x)))
             let eps = self.cfg.eps;
+            // FERRIC_POSTNORM=off|sum ablates this. `off` drops the post-norms entirely (plain
+            // pre-norm residual); `sum` normalises the RESIDUAL SUM rather than the branch output,
+            // which is the other reading of "post-norm ... then residual added" and produces a
+            // different model from the same weights.
+            let mode = std::env::var("FERRIC_POSTNORM").unwrap_or_default();
             out = batch(&self.ctx, || {
                 let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il);
-                let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
-                let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
-                x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
+                match mode.as_str() {
+                    "off" => {
+                        let x1 = xin.add(&a);
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        x1.add(&f)
+                    }
+                    "sum" => {
+                        let x1 = xin.add(&a).rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps);
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        x1.add(&f).rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps)
+                    }
+                    _ => {
+                        // POST norms use their own epsilon (1e-8 on Muse Glimmer); the PRE norms use
+                        // the model's rms eps. Same tensor op, different constant.
+                        let pe = if std::env::var("FERRIC_POSTEPS").is_ok() { eps } else { self.cfg.post_norm_eps };
+                        let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), pe));
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), pe))
+                    }
+                }
             });
         } else {
             out = batch(&self.ctx, || {

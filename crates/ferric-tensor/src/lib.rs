@@ -356,8 +356,31 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
+    /// The rope kernel with its pair layout substituted in. Both variants come from one source so the
+    /// angle computation cannot drift between them.
+    fn rope_src(interleaved: bool) -> String {
+        if interleaved {
+            ROPE_WGSL.replace("__PAIRLO__", "2u * c").replace("__PAIRHI__", "2u * c + 1u")
+        } else {
+            ROPE_WGSL.replace("__PAIRLO__", "c").replace("__PAIRHI__", "c + half")
+        }
+    }
+
+    /// Rotary position embedding, **interleaved (ggml NORM)**: partners are `2c` and `2c+1`.
+    ///
+    /// llama.cpp resolves each architecture to NORM or NEOX; Muse Glimmer is NORM, and its GGUF
+    /// converter permutes Q/K rows out of HF's rotate-half layout to match. Running NEOX on those rows
+    /// rotates the wrong pairs — no error, finite logits, garbage text.
+    pub fn rope_interleaved(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        self.rope_impl(n_heads, head_dim, base, offset, true)
+    }
+
     /// Rotary position embedding (NeoX rotate-half) on a [T, n_heads·head_dim] tensor.
     pub fn rope(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        self.rope_impl(n_heads, head_dim, base, offset, false)
+    }
+
+    fn rope_impl(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize, interleaved: bool) -> Tensor {
         // A rank-2 row-major window is read in place; anything else is packed first. The kernel addresses
         // the input as (src_off + row * src_row_stride + col), which describes exactly that family of
         // views and nothing more — a permuted or higher-rank view must still be materialised, and saying
@@ -377,7 +400,7 @@ impl Tensor {
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
         let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, c.offset as u32, srs as u32];
         info.extend((0..t).map(|i| (offset + i) as u32));
-        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
+        run(&self.ctx, &Self::rope_src(interleaved), "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -396,7 +419,7 @@ impl Tensor {
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
         let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0u32, c.offset as u32, srs as u32];
         info.extend_from_slice(positions);
-        run(&self.ctx, ROPE_WGSL, "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
+        run(&self.ctx, &Self::rope_src(false), "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -1842,9 +1865,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // so a scalar base + row index cannot express it. info[7 + i] is that row's absolute position;
         // the single-sequence path fills it with off + i and is unchanged.
         let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
-        let x1 = x[ib + c]; let x2 = x[ib + c + half];
-        out[ob + c] = x1 * cs - x2 * sn;
-        out[ob + c + half] = x2 * cs + x1 * sn;
+        // __PAIRLO__/__PAIRHI__ select the rotary partner layout. ggml calls these NEOX (split-half,
+        // partners c and c+half) and NORM (interleaved, partners 2c and 2c+1); a model built for one
+        // and run with the other loads fine, produces finite logits, and emits fluent garbage.
+        let p0 = __PAIRLO__; let p1 = __PAIRHI__;
+        let x1 = x[ib + p0]; let x2 = x[ib + p1];
+        out[ob + p0] = x1 * cs - x2 * sn;
+        out[ob + p1] = x2 * cs + x1 * sn;
     }
 }
 "#;
