@@ -40,6 +40,24 @@ fn short(m: &Meta) -> String {
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: gguf_probe <file.gguf>");
+
+    // `--tensor` on a big checkpoint must not slurp the file. GgufFile parses a bounded header prefix
+    // and seeks for tensor data, so a 25 GB MoE is as cheap to inspect as a 1 GB dense model.
+    if std::env::args().nth(2).as_deref() == Some("--tensor") {
+        let name = std::env::args().nth(3).expect("--tensor NAME");
+        let gf = ferric_gguf::GgufFile::open(&path).expect("open");
+        let t = gf.tensor(&name).unwrap_or_else(|| panic!("no tensor {name}"));
+        let dims = t.dims.clone();
+        let v = ferric_gguf::GgufSource::dequant(&gf, &name).expect("dequant");
+        let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+        let mut neg = 0usize;
+        for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64; if x < 0.0 { neg += 1; } }
+        println!("{name} dims={dims:?} n={}", v.len());
+        println!("  min {mn:.6}  max {mx:.6}  mean {:.6}  negative {neg}/{}", sum / v.len() as f64, v.len());
+        println!("  first 8: {:?}", &v[..8.min(v.len())]);
+        return;
+    }
+
     let bytes = std::fs::read(&path).expect("read");
     println!("Probing {path}  ({:.1} MB of header read)\n", bytes.len() as f64 / 1e6);
 

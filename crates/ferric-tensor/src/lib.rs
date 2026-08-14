@@ -505,6 +505,49 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
+
+    /// **Mamba-2 selective scan** — the sequential state-space recurrence, per (head, head_dim) lane.
+    ///
+    /// ```text
+    /// h[t][p][n] = h[t-1][p][n] · dA[t][hd] + dtx[t][hd][p] · B[t][g][n]
+    /// y[t][hd][p] = Σ_n C[t][g][n] · h[t][p][n] + D[hd] · x[t][hd][p]
+    /// ```
+    /// where `hd` indexes heads, `p` head_dim, `n` state, and `g = hd / (n_head/n_group)` is the
+    /// B/C group this head reads (Mamba-2 shares B and C across a group of heads, which is what makes
+    /// it cheaper than Mamba-1's per-channel B/C).
+    ///
+    /// Deliberately takes **dA and dt·x already formed**. Whether `A` is stored as `A_log` needing
+    /// `-exp()` or already negated, and which slice of the input projection is which, are properties of
+    /// a *checkpoint convention* — getting them wrong yields finite, fluent, wrong output, so they are
+    /// resolved at the call site against the reference rather than baked into a kernel that cannot be
+    /// A/B'd. The recurrence itself is not in dispute.
+    ///
+    /// Shapes: `self` = x [T, n_head·head_dim]; `da` [T, n_head]; `b`/`c` [T, n_group·state];
+    /// `d_skip` [n_head]. Returns y [T, n_head·head_dim]. `h0` is the incoming state
+    /// [n_head·head_dim·state] (zeros at sequence start); the final state is written back into it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ssm_scan(&self, da: &Tensor, dt: &Tensor, b: &Tensor, c: &Tensor, d_skip: &Tensor,
+                    h0: &Tensor, n_head: usize, head_dim: usize, state: usize, n_group: usize) -> Tensor {
+        let x = self.contiguous();
+        let t = x.numel() / (n_head * head_dim);
+        assert_eq!(da.numel(), t * n_head, "da is [T, n_head]");
+        assert_eq!(dt.numel(), t * n_head, "dt is [T, n_head]");
+        assert_eq!(b.numel(), t * n_group * state, "b is [T, n_group*state]");
+        assert_eq!(c.numel(), t * n_group * state, "c is [T, n_group*state]");
+        assert_eq!(h0.numel(), n_head * head_dim * state, "h0 is [n_head*head_dim*state]");
+        let out = empty(&self.ctx, t * n_head * head_dim);
+        // One lane per (head, head_dim); each walks the whole sequence and owns `state` accumulators.
+        let lanes = n_head * head_dim;
+        let (grid, rs) = groups2d(lanes);
+        run(&self.ctx, SSM_SCAN_WGSL, "ssm_scan",
+            &[x.buf.as_ref(), da.contiguous().buf.as_ref(), dt.contiguous().buf.as_ref(),
+              b.contiguous().buf.as_ref(), c.contiguous().buf.as_ref(), d_skip.contiguous().buf.as_ref(),
+              h0.buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[t as u32, n_head as u32, head_dim as u32, state as u32, n_group as u32, rs])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, n_head * head_dim])
+    }
+
     /// Causal depthwise conv1d — the LFM2 / Liquid AI short-conv mixer. self is [T, C] (sequence ×
     /// channels), weight is [C, L] (per-channel kernel of length L). Causal: out[t] sees only t-L+1..t.
     pub fn depthwise_conv1d_causal(&self, weight: &Tensor, l: usize) -> Tensor {
@@ -1990,6 +2033,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+
+const SSM_SCAN_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:   array<f32>;  // [T, H*P]
+@group(0) @binding(1) var<storage,read>        da:  array<f32>;  // [T, H]   exp(dt*A), already formed
+@group(0) @binding(2) var<storage,read>        dt:  array<f32>;  // [T, H]   softplus'd timestep
+@group(0) @binding(3) var<storage,read>        bb:  array<f32>;  // [T, G*N]
+@group(0) @binding(4) var<storage,read>        cc:  array<f32>;  // [T, G*N]
+@group(0) @binding(5) var<storage,read>        dsk: array<f32>;  // [H]
+@group(0) @binding(6) var<storage,read_write>  h:   array<f32>;  // [H*P*N] carried state, updated
+@group(0) @binding(7) var<storage,read_write>  out: array<f32>;  // [T, H*P]
+@group(0) @binding(8) var<storage,read>        info: array<u32>;  // T, H, P, N, G, row_stride
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let nt = info[0]; let nh = info[1]; let np = info[2]; let ns = info[3];
+    let ng = info[4]; let rs = info[5];
+    let lane = gid.x + gid.y * rs;
+    if (lane >= nh * np) { return; }
+    let hd = lane / np;          // head index
+    let p  = lane % np;          // position within the head
+    let hpg = nh / ng;           // heads per B/C group
+    let g  = hd / hpg;           // this head's group
+    let hb = lane * ns;          // base of this lane's state block
+
+    let dv = dsk[hd];
+    for (var t: u32 = 0u; t < nt; t = t + 1u) {
+        let xv = x[t * nh * np + hd * np + p];
+        let a  = da[t * nh + hd];
+        let dtv = dt[t * nh + hd];
+        let bo = t * ng * ns + g * ns;
+        var acc = 0.0;
+        // One pass over the state: decay, inject dt*B*x, and read out through C. Fusing the update and
+        // the readout keeps the state in registers-adjacent memory instead of two sweeps over it.
+        for (var n: u32 = 0u; n < ns; n = n + 1u) {
+            let hv = h[hb + n] * a + dtv * bb[bo + n] * xv;
+            h[hb + n] = hv;
+            acc = acc + cc[bo + n] * hv;
+        }
+        out[t * nh * np + hd * np + p] = acc + dv * xv;
+    }
+}
+"#;
+
 const CONV1D_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;      // [T, C]
 @group(0) @binding(1) var<storage,read>        w: array<f32>;      // [C, L]
@@ -3112,5 +3198,74 @@ mod conv_grad_tests {
         }
         assert!(last < first * 0.5, "conv training must reduce loss: {first} → {last}");
         eprintln!("conv fit: loss {first:.5} → {last:.5}");
+    }
+}
+
+/// The Mamba-2 scan against a plain-Rust reference of the same recurrence.
+///
+/// Written before the checkpoint plumbing, and deliberately independent of it: this fixes the meaning
+/// of `ssm_scan` so that when a real model produces wrong text, the scan is already excluded and the
+/// remaining suspects are the conventions (split order, whether A is pre-negated) rather than the math.
+#[cfg(test)]
+mod ssm_scan_tests {
+    use super::*;
+
+    #[test]
+    fn scan_matches_cpu_reference() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED scan_matches_cpu_reference: no GPU context");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        // Nemotron 3.5 Lightning's real geometry, scaled down in T: 64 heads x 64 dim, 128 state,
+        // 8 B/C groups (so 8 heads share each group).
+        let (t, nh, np, ns, ng) = (7usize, 8usize, 4usize, 6usize, 2usize);
+        let mut seed = 12345u32;
+        let mut rnd = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); ((seed >> 9) as f32 / 4194304.0) - 1.0 };
+
+        let xv: Vec<f32> = (0..t * nh * np).map(|_| rnd()).collect();
+        // da is a decay in (0,1): exp(dt*A) with A negative. Keep it in range so the reference and the
+        // kernel agree to f32 rather than diverging through a growing state.
+        let dav: Vec<f32> = (0..t * nh).map(|_| 0.5 + 0.4 * (rnd().abs())).collect();
+        let dtv: Vec<f32> = (0..t * nh).map(|_| 0.1 + 0.5 * (rnd().abs())).collect();
+        let bv: Vec<f32> = (0..t * ng * ns).map(|_| rnd()).collect();
+        let cv: Vec<f32> = (0..t * ng * ns).map(|_| rnd()).collect();
+        let dv: Vec<f32> = (0..nh).map(|_| rnd()).collect();
+
+        // Reference: the recurrence, written the obvious way.
+        let hpg = nh / ng;
+        let mut h = vec![0f32; nh * np * ns];
+        let mut want = vec![0f32; t * nh * np];
+        for ti in 0..t {
+            for hd in 0..nh {
+                let g = hd / hpg;
+                for p in 0..np {
+                    let lane = hd * np + p;
+                    let x1 = xv[ti * nh * np + hd * np + p];
+                    let a = dav[ti * nh + hd];
+                    let dtt = dtv[ti * nh + hd];
+                    let mut acc = 0f32;
+                    for n in 0..ns {
+                        let hv = h[lane * ns + n] * a + dtt * bv[ti * ng * ns + g * ns + n] * x1;
+                        h[lane * ns + n] = hv;
+                        acc += cv[ti * ng * ns + g * ns + n] * hv;
+                    }
+                    want[ti * nh * np + hd * np + p] = acc + dv[hd] * x1;
+                }
+            }
+        }
+
+        let mk = |v: &[f32], shape: &[usize]| Tensor::from_vec(&ctx, v, shape);
+        let h0 = mk(&vec![0f32; nh * np * ns], &[nh * np * ns]);
+        let got = pollster::block_on(
+            mk(&xv, &[t, nh * np])
+                .ssm_scan(&mk(&dav, &[t, nh]), &mk(&dtv, &[t, nh]), &mk(&bv, &[t, ng * ns]),
+                          &mk(&cv, &[t, ng * ns]), &mk(&dv, &[nh]), &h0, nh, np, ns, ng)
+                .to_vec());
+
+        let scale = want.iter().fold(1e-6f32, |a, &v| a.max(v.abs()));
+        let err = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs())) / scale;
+        eprintln!("ssm_scan vs reference: rel max|Δ| {err:.3e} over {} outputs", want.len());
+        assert!(err < 1e-5, "ssm_scan differs from the reference recurrence by {err:.3e} relative");
     }
 }
