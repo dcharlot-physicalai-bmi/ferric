@@ -381,6 +381,19 @@ impl Tensor {
     }
 
     fn rope_impl(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize, interleaved: bool) -> Tensor {
+        self.rope_full(n_heads, head_dim, base, offset, interleaved, head_dim)
+    }
+
+    /// **Partial rope**: rotate only the first `n_rot` dims of each head; the rest pass through.
+    /// Nemotron-H rotates 84 of 128 (`rope.dimension_count`). `n_rot == head_dim` is the ordinary
+    /// full rotation every other architecture here uses.
+    pub fn rope_partial(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize, n_rot: usize) -> Tensor {
+        self.rope_full(n_heads, head_dim, base, offset, false, n_rot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rope_full(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize, interleaved: bool, n_rot: usize) -> Tensor {
+        assert!(n_rot <= head_dim && n_rot % 2 == 0, "n_rot must be even and <= head_dim");
         // A rank-2 row-major window is read in place; anything else is packed first. The kernel addresses
         // the input as (src_off + row * src_row_stride + col), which describes exactly that family of
         // views and nothing more — a permuted or higher-rank view must still be materialised, and saying
@@ -398,7 +411,8 @@ impl Tensor {
         // packed first — one fewer `gather` dispatch per layer per token. A packed input gives
         // src_off = 0 and src_row_stride = h*dh, which reduces ib to exactly the old shared base.
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
-        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, c.offset as u32, srs as u32];
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32,
+                            c.offset as u32, srs as u32, n_rot as u32];
         info.extend((0..t).map(|i| (offset + i) as u32));
         run(&self.ctx, &Self::rope_src(interleaved), "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
@@ -417,7 +431,8 @@ impl Tensor {
         assert_eq!(positions.len(), t, "rope_at needs one position per row: {t} rows, {} given", positions.len());
         let out = empty(&self.ctx, c.numel());
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
-        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0u32, c.offset as u32, srs as u32];
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0u32,
+                            c.offset as u32, srs as u32, head_dim as u32];
         info.extend_from_slice(positions);
         run(&self.ctx, &Self::rope_src(false), "rope", &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
@@ -1872,7 +1887,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var c: u32 = 0u; c < half; c = c + 1u) {
         let inv = exp(-2.0 * f32(c) / f32(dh) * lb) * scale[c];
         // Per-row position. Batched decode puts N sequences in one call, each at a DIFFERENT position,
-        // so a scalar base + row index cannot express it. info[7 + i] is that row's absolute position;
+        // so a scalar base + row index cannot express it. info[8 + i] is that row's absolute position;
         // the single-sequence path fills it with off + i and is unchanged.
         let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
         let x1 = x[o + c]; let x2 = x[o + c + half];
@@ -1885,7 +1900,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const ROPE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-// info: t, h, dh, bitcast(base), pos_off, src_off, src_row_stride, then t per-row positions
+// info: t, h, dh, bitcast(base), pos_off, src_off, src_row_stride, n_rot, then t per-row positions
 //
 // `pos_off` (info[4]) is the SEQUENCE POSITION — the token's index in the stream. `src_off` (info[5]) is
 // the input tensor's BUFFER offset. They are different things that have both been called "offset", and
@@ -1895,7 +1910,11 @@ const ROPE_WGSL: &str = r#"
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]); let off = info[4];
     let id = gid.x; if (id >= t * h) { return; }
-    let i = id / h; let head = id % h; let half = dh / 2u;
+    let i = id / h; let head = id % h;
+    // PARTIAL rope: only the first `n_rot` dims rotate; dims >= n_rot are copied. Nemotron-H rotates
+    // 84 of 128. n_rot == dh (what every other model here passes) leaves the copy loop empty and the
+    // rotation bit-identical, so this is not a behaviour change for full-rope architectures.
+    let n_rot = info[7]; let half = n_rot / 2u;
     // Input and output bases MUST stay separate. `out` is allocated packed at exactly numel, so folding
     // src_off into a single shared base would push every write past the end — and WGSL silently discards
     // out-of-bounds stores, which would make rope return zeros with no crash and no error.
@@ -1903,11 +1922,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ib = info[5] + i * info[6] + head * dh;
     let lb = log(base);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
-        let inv = exp(-2.0 * f32(c) / f32(dh) * lb);
+        let inv = exp(-2.0 * f32(c) / f32(n_rot) * lb);
         // Per-row position. Batched decode puts N sequences in one call, each at a DIFFERENT position,
         // so a scalar base + row index cannot express it. info[7 + i] is that row's absolute position;
         // the single-sequence path fills it with off + i and is unchanged.
-        let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
+        let ang = f32(info[8u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
         // __PAIRLO__/__PAIRHI__ select the rotary partner layout. ggml calls these NEOX (split-half,
         // partners c and c+half) and NORM (interleaved, partners 2c and 2c+1); a model built for one
         // and run with the other loads fine, produces finite logits, and emits fluent garbage.
@@ -1915,6 +1934,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x1 = x[ib + p0]; let x2 = x[ib + p1];
         out[ob + p0] = x1 * cs - x2 * sn;
         out[ob + p1] = x2 * cs + x1 * sn;
+    }
+    // Un-rotated tail. Without this the output buffer keeps whatever `empty()` left there.
+    for (var c: u32 = n_rot; c < dh; c = c + 1u) {
+        out[ob + c] = x[ib + c];
     }
 }
 "#;
@@ -3267,5 +3290,46 @@ mod ssm_scan_tests {
         let err = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs())) / scale;
         eprintln!("ssm_scan vs reference: rel max|Δ| {err:.3e} over {} outputs", want.len());
         assert!(err < 1e-5, "ssm_scan differs from the reference recurrence by {err:.3e} relative");
+    }
+}
+
+/// Partial rope: full-width equivalence, and that the un-rotated tail is actually copied.
+#[cfg(test)]
+mod rope_partial_tests {
+    use super::*;
+
+    #[test]
+    fn partial_rope_rotates_the_head_and_copies_the_tail() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED partial_rope: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (t, nh, dh) = (3usize, 2usize, 8usize);
+        let v: Vec<f32> = (0..t * nh * dh).map(|i| (i as f32 * 0.37).sin()).collect();
+        let x = Tensor::from_vec(&ctx, &v, &[t, nh * dh]);
+
+        // n_rot == head_dim must reproduce the ordinary rope exactly, or every existing model regresses.
+        let full = pollster::block_on(x.rope(nh, dh, 10000.0, 0).to_vec());
+        let same = pollster::block_on(x.rope_partial(nh, dh, 10000.0, 0, dh).to_vec());
+        let d0 = full.iter().zip(&same).fold(0f32, |a, (&p, &q)| a.max((p - q).abs()));
+        assert_eq!(d0, 0.0, "n_rot == head_dim must be bit-identical to rope()");
+
+        // n_rot < head_dim: dims >= n_rot pass through untouched. Left uninitialised this reads as
+        // whatever `empty()` had, which is the failure this asserts against.
+        let n_rot = 4usize;
+        let got = pollster::block_on(x.rope_partial(nh, dh, 10000.0, 5, n_rot).to_vec());
+        for i in 0..t {
+            for h in 0..nh {
+                for c in n_rot..dh {
+                    let idx = (i * nh + h) * dh + c;
+                    assert_eq!(got[idx], v[idx], "tail dim {c} of head {h} row {i} was not copied");
+                }
+            }
+        }
+        // And the rotated part must have actually changed (a no-op kernel would also pass the above).
+        let moved = (0..t * nh).any(|l| (0..n_rot).any(|c| got[l * dh + c] != v[l * dh + c]));
+        assert!(moved, "no dim inside n_rot changed — the rotation did not run");
+        eprintln!("partial rope: full-width bit-identical, tail copied, head rotated");
     }
 }
