@@ -1657,6 +1657,31 @@ impl Tensor {
               &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
         Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
     }
+    /// `matmul_q8_0_id_wsum` for a **Q5_0** expert down slab.
+    ///
+    /// Needed because the expert quant type VARIES BY LAYER in a real mixed-precision checkpoint:
+    /// Nemotron 3.5 Lightning Q4_K_M stores `ffn_down_exps` as Q8_0 in 11 blocks and Q5_0 in the other
+    /// 13. Assuming one type per role loads the first few blocks and then fails on a byte-length
+    /// assert, which is the good outcome; the bad one is a runtime that silently reinterprets bytes.
+    ///
+    /// `self` is [T, k, in]; returns [T, out_pe] with row t = Σ_s w_{t,s} · down_{e_{t,s}}(x_{t,s}).
+    pub fn matmul_q5_0_id_wsum(&self, w: &Q5_0Weights, selw: &Tensor, out_pe: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, k, inn) = if x.shape.len() == 3 { (x.shape[0], x.shape[1], x.shape[2]) } else { (1, x.shape[0], x.shape[1]) };
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let sw = selw.contiguous();
+        let n = t * out_pe;
+        let out = empty(&self.ctx, n);
+        let wg = n.div_ceil(64);
+        let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        run(&self.ctx, MATMUL_Q5_0_ID_WSUM_WGSL, "matmul_q5_0_id_wsum",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out, sw.buf.as_ref(),
+              &u32buf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
+    }
+
     /// **Batched selected-expert UP projection with ReLU² fused**, for a Q5_0 expert slab.
     ///
     /// Nemotron-H's MoE is `LLM_FFN_RELU_SQR`, not SwiGLU — which is *why* its checkpoints carry no
@@ -3480,6 +3505,55 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 // Q4_0, but each value gets a 5th (high) bit from qh — bit i for value i, bit i+16 for value i+16 —
 // and the offset is −16: value = ((nibble | (bit<<4)) − 16)·d.
 
+
+const MATMUL_Q5_0_ID_WSUM_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;  // [T, k, in]
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;        // [T, out_pe]
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>;
+@group(0) @binding(5) var<storage,read>        info:   array<u32>;        // k, out_pe, in, gw, tot
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = info[0]; let out_pe = info[1]; let in_dim = info[2]; let gw = info[3]; let tot = info[4];
+    let idx = gid.x + gid.y * gw;
+    if (idx >= tot) { return; }
+    let o = idx % out_pe;
+    let t = idx / out_pe;
+    let nblk = in_dim / 32u; let nwords = nblk * 4u;
+    var acc = 0.0;
+    for (var sl: u32 = 0u; sl < k; sl = sl + 1u) {
+        let wgt = selw[t * 2u * k + sl];
+        let e   = u32(selw[t * 2u * k + k + sl]);
+        let o_row = e * out_pe + o;
+        let xrow = (t * k + sl) * in_dim;
+        var dp = 0.0;
+        for (var w: u32 = 0u; w < nwords; w = w + 1u) {
+            let blk = w >> 2u;
+            let bi = o_row * nblk + blk;
+            let qh = scales[bi * 2u];
+            let d = unpack2x16float(scales[bi * 2u + 1u]).x;
+            let word = codes[o_row * nwords + w];
+            let base = (w & 3u) * 4u;
+            let xlo = (xrow + blk * 32u + base) >> 2u;
+            let lo = vec4<f32>(
+                f32(i32(( word         & 0xfu) | (((qh >> (base + 0u))  & 1u) << 4u)) - 16),
+                f32(i32(((word >> 8u)  & 0xfu) | (((qh >> (base + 1u))  & 1u) << 4u)) - 16),
+                f32(i32(((word >> 16u) & 0xfu) | (((qh >> (base + 2u))  & 1u) << 4u)) - 16),
+                f32(i32(((word >> 24u) & 0xfu) | (((qh >> (base + 3u))  & 1u) << 4u)) - 16));
+            let hi = vec4<f32>(
+                f32(i32(((word >> 4u)  & 0xfu) | (((qh >> (base + 16u)) & 1u) << 4u)) - 16),
+                f32(i32(((word >> 12u) & 0xfu) | (((qh >> (base + 17u)) & 1u) << 4u)) - 16),
+                f32(i32(((word >> 20u) & 0xfu) | (((qh >> (base + 18u)) & 1u) << 4u)) - 16),
+                f32(i32(((word >> 28u) & 0xfu) | (((qh >> (base + 19u)) & 1u) << 4u)) - 16));
+            dp = dp + (dot(x[xlo], lo) + dot(x[xlo + 4u], hi)) * d;
+        }
+        acc = acc + wgt * dp;
+    }
+    out[idx] = acc;
+}
+"#;
+
 const MATMUL_Q5_0_RELU2_ID_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
@@ -4094,6 +4168,43 @@ mod moe_relu2_id_tests {
             for _ in 0..16 { raw.push((rnd() & 0xFF) as u8); }      // qs
         }
         raw
+    }
+
+    /// The weighted-sum down kernel, same oracle. Written and NOT validated on the first pass, which
+    /// is exactly the kernel to suspect when a model runs and produces garbage.
+    #[test]
+    fn id_wsum_matches_dense_on_the_selected_expert() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED id_wsum: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (n_exp, out_pe, inn) = (4usize, 8usize, 64usize);
+        let raw = synth_q5_0(n_exp * out_pe, inn, 11);
+        let slab = Q5_0Weights::from_bytes(&ctx, &raw, n_exp * out_pe, inn);
+        let t = 3usize;
+        // x is [T, k, in]; with k = 1 that is [T, 1, in], i.e. one expert slot per token.
+        let xv: Vec<f32> = (0..t * inn).map(|i| ((i * 29 % 97) as f32 - 48.0) / 55.0).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[t, 1, inn]);
+        let x2 = Tensor::from_vec(&ctx, &xv, &[t, inn]);
+
+        for e in 0..n_exp {
+            let w = 0.5 + e as f32 * 0.25;   // a non-unit weight, so the wsum factor is exercised
+            let sel: Vec<f32> = (0..t).flat_map(|_| [w, e as f32]).collect();
+            let selw = Tensor::from_vec(&ctx, &sel, &[t, 2]);
+            let got = pollster::block_on(x.matmul_q5_0_id_wsum(&slab, &selw, out_pe).to_vec());
+
+            let row_bytes = (inn / 32) * 22;
+            let lo = e * out_pe * row_bytes;
+            let one = Q5_0Weights::from_bytes(&ctx, &raw[lo..lo + out_pe * row_bytes], out_pe, inn);
+            let want: Vec<f32> = pollster::block_on(x2.matmul_q5_0(&one).to_vec())
+                .into_iter().map(|v| v * w).collect();
+
+            let scale = want.iter().fold(1e-6f32, |a, &v| a.max(v.abs()));
+            let err = got.iter().zip(&want).fold(0f32, |a, (&g, &q)| a.max((g - q).abs())) / scale;
+            assert!(err < 1e-5, "expert {e}: id_wsum differs from dense by {err:.3e} relative");
+        }
+        eprintln!("id_wsum: all {n_exp} experts match dense x weight");
     }
 
     #[test]
