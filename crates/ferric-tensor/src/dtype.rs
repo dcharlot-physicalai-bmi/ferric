@@ -1657,6 +1657,33 @@ impl Tensor {
               &unibuf(&self.ctx, &[k as u32, out_pe as u32, inn as u32, gw as u32, n as u32, 0, 0, 0])], grid);
         Tensor::from_parts(&self.ctx, out, vec![t, out_pe])
     }
+    /// **Batched selected-expert UP projection with ReLU² fused**, for a Q5_0 expert slab.
+    ///
+    /// Nemotron-H's MoE is `LLM_FFN_RELU_SQR`, not SwiGLU — which is *why* its checkpoints carry no
+    /// `ffn_gate_exps` tensor at all. The existing `*_swiglu_id` kernels cannot serve it (they consume
+    /// a fused gate|up slab and apply silu), and dequantising 128 experts x 1856 x 2688 to f32 would
+    /// cost ~2.5 GB per layer across 23 layers, so the format needs its own indexed kernel.
+    ///
+    /// `self` is [T, in]; `selw` is the [T, 2k] buffer from `moe_topk` (weights, then expert ids);
+    /// returns [T, k, eff] with `max(x,0)^2` already applied.
+    pub fn matmul_q5_0_relu2_id(&self, w: &Q5_0Weights, selw: &Tensor, k: usize, eff: usize) -> Tensor {
+        let x = self.contiguous();
+        let (t, inn) = (x.shape[0], x.shape[1]);
+        assert!((1..=8).contains(&k), "k must be 1..=8");
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        assert_eq!(inn % 32, 0, "Q5_0 inner dim must be a multiple of 32");
+        let sw = selw.contiguous();
+        let n = t * k * eff;
+        let out = empty(&self.ctx, n);
+        let wg = n.div_ceil(64);
+        let gw = wg.min(32768);
+        let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        run(&self.ctx, MATMUL_Q5_0_RELU2_ID_WGSL, "matmul_q5_0_relu2_id",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.scales.as_ref(), &out, sw.buf.as_ref(),
+              &u32buf(&self.ctx, &[k as u32, eff as u32, inn as u32, gw as u32, n as u32])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, k, eff])
+    }
+
     /// `matmul_q4_k_swiglu_id` for a Q8_0 gate|up slab (the MTP draft block's expert format).
     pub fn matmul_q8_0_swiglu_id(&self, w: &Q8_0Weights, selw: &Tensor, k: usize, eff: usize) -> Tensor {
         let x = self.contiguous();
@@ -3452,6 +3479,53 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 // Q5_0 block = 32 values, 4 u32 code-words + [qh (u32), d (f16)] per block. Same nibble layout as
 // Q4_0, but each value gets a 5th (high) bit from qh — bit i for value i, bit i+16 for value i+16 —
 // and the offset is −16: value = ((nibble | (bit<<4)) − 16)·d.
+
+const MATMUL_Q5_0_RELU2_ID_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        scales: array<u32>;   // [qh, d] per block
+@group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(4) var<storage,read>        selw:   array<f32>;   // [T, w_0..w_{k-1} | id_0..id_{k-1}]
+@group(0) @binding(5) var<storage,read>        info:   array<u32>;   // k, eff, in, gw, tot
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = info[0]; let eff = info[1]; let in_dim = info[2]; let gw = info[3]; let tot = info[4];
+    let idx = gid.x + gid.y * gw;
+    if (idx >= tot) { return; }
+    let o  = idx % eff;
+    let ts = idx / eff;          // t*k + s
+    let s  = ts % k;
+    let t  = ts / k;
+    // Expert ids live in the SECOND half of each moe_topk row.
+    let e = u32(selw[t * 2u * k + k + s]);
+    let nblk = in_dim / 32u; let nwords = nblk * 4u;
+    let o_row = e * eff + o;     // the slab is [n_expert, eff, in] flattened over rows
+    var acc = 0.0;
+    for (var w: u32 = 0u; w < nwords; w = w + 1u) {
+        let blk = w >> 2u;
+        let bi = o_row * nblk + blk;
+        let qh = scales[bi * 2u];
+        let d = unpack2x16float(scales[bi * 2u + 1u]).x;
+        let word = codes[o_row * nwords + w];
+        let base = (w & 3u) * 4u;
+        let xlo = (t * in_dim + blk * 32u + base) >> 2u;
+        let lo = vec4<f32>(
+            f32(i32(( word         & 0xfu) | (((qh >> (base + 0u))  & 1u) << 4u)) - 16),
+            f32(i32(((word >> 8u)  & 0xfu) | (((qh >> (base + 1u))  & 1u) << 4u)) - 16),
+            f32(i32(((word >> 16u) & 0xfu) | (((qh >> (base + 2u))  & 1u) << 4u)) - 16),
+            f32(i32(((word >> 24u) & 0xfu) | (((qh >> (base + 3u))  & 1u) << 4u)) - 16));
+        let hi = vec4<f32>(
+            f32(i32(((word >> 4u)  & 0xfu) | (((qh >> (base + 16u)) & 1u) << 4u)) - 16),
+            f32(i32(((word >> 12u) & 0xfu) | (((qh >> (base + 17u)) & 1u) << 4u)) - 16),
+            f32(i32(((word >> 20u) & 0xfu) | (((qh >> (base + 18u)) & 1u) << 4u)) - 16),
+            f32(i32(((word >> 28u) & 0xfu) | (((qh >> (base + 19u)) & 1u) << 4u)) - 16));
+        acc = acc + (dot(x[xlo], lo) + dot(x[xlo + 4u], hi)) * d;
+    }
+    let a = max(acc, 0.0);
+    out[idx] = a * a;            // ReLU squared
+}
+"#;
+
 const MATMUL_Q5_0_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
@@ -3996,5 +4070,64 @@ mod format_reachability {
         }
         assert_eq!(checked, PACKED.len(), "not every packed format was exercised");
         eprintln!("real-path check: {checked} packed formats built a non-Dense shard on a live GPU");
+    }
+}
+
+/// The indexed ReLU² expert kernel against the trusted flat Q5_0 matmul.
+///
+/// The oracle is `matmul_q5_0` restricted to the selected expert's rows: if routing and the slab
+/// offset are right, picking expert `e` out of a 4-expert slab must equal running the dense kernel on
+/// that expert's rows alone. That isolates the two things this kernel adds — the expert offset and the
+/// activation — from the dequant math, which is already trusted.
+#[cfg(test)]
+mod moe_relu2_id_tests {
+    use super::*;
+
+    fn synth_q5_0(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut rnd = || { s = s.wrapping_mul(1664525).wrapping_add(1013904223); (s >> 16) as u16 };
+        let nblk = rows * (cols / 32);
+        let mut raw = Vec::with_capacity(nblk * 22);
+        for _ in 0..nblk {
+            raw.extend_from_slice(&0x2c00u16.to_le_bytes());        // f16 0.0625
+            raw.extend_from_slice(&(rnd() as u32).to_le_bytes());   // qh
+            for _ in 0..16 { raw.push((rnd() & 0xFF) as u8); }      // qs
+        }
+        raw
+    }
+
+    #[test]
+    fn relu2_id_matches_dense_on_the_selected_expert() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED relu2_id_matches_dense_on_the_selected_expert: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (n_exp, eff, inn) = (4usize, 8usize, 64usize);
+        let raw = synth_q5_0(n_exp * eff, inn, 3);
+        let slab = Q5_0Weights::from_bytes(&ctx, &raw, n_exp * eff, inn);
+
+        let t = 3usize;
+        let xv: Vec<f32> = (0..t * inn).map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[t, inn]);
+
+        for e in 0..n_exp {
+            // k = 1, every token routed to expert e. moe_topk layout: [w_0.., id_0..].
+            let sel: Vec<f32> = (0..t).flat_map(|_| [1.0f32, e as f32]).collect();
+            let selw = Tensor::from_vec(&ctx, &sel, &[t, 2]);
+            let got = pollster::block_on(x.matmul_q5_0_relu2_id(&slab, &selw, 1, eff).to_vec());
+
+            // Oracle: the dense kernel on just this expert's rows, then ReLU² by hand.
+            let row_bytes = (inn / 32) * 22;
+            let lo = e * eff * row_bytes;
+            let one = Q5_0Weights::from_bytes(&ctx, &raw[lo..lo + eff * row_bytes], eff, inn);
+            let want: Vec<f32> = pollster::block_on(x.matmul_q5_0(&one).to_vec())
+                .into_iter().map(|v| { let a = v.max(0.0); a * a }).collect();
+
+            let scale = want.iter().fold(1e-6f32, |a, &v| a.max(v.abs()));
+            let err = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs())) / scale;
+            assert!(err < 1e-5, "expert {e}: indexed kernel differs from dense by {err:.3e} relative");
+        }
+        eprintln!("relu2_id: all {n_exp} experts match the dense kernel exactly");
     }
 }

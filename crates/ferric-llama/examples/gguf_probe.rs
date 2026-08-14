@@ -71,37 +71,6 @@ fn main() {
         }
     };
 
-    // `--tensor NAME` dequantizes one tensor and prints statistics. Verifying a claim about weight
-    // VALUES (a norm that is a constant vector, an embedding table that is already row-normalised)
-    // needs the numbers, not the header.
-    if std::env::args().nth(2).as_deref() == Some("--tensor") {
-        let name = std::env::args().nth(3).expect("--tensor NAME");
-        let t = g.tensor(&name).unwrap_or_else(|| panic!("no tensor {name}"));
-        let dims = t.dims.clone();
-        let v = ferric_gguf::GgufSource::dequant(&g, &name).expect("dequant");
-        let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
-        for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64; }
-        let mean = sum / v.len() as f64;
-        let var: f64 = v.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / v.len() as f64;
-        println!("{name} dims={dims:?} n={}", v.len());
-        println!("  min {mn:.6}  max {mx:.6}  mean {mean:.6}  sd {:.6}", var.sqrt());
-        println!("  first 8: {:?}", &v[..8.min(v.len())]);
-        // Per-row RMS over the LAST dim, which is what "already row-normalised" would mean.
-        let d = *dims.first().unwrap_or(&1) as usize;
-        if d > 1 && v.len() % d == 0 && v.len() / d > 1 {
-            let rows = v.len() / d;
-            let step = (rows / 16).max(1);
-            let mut rms: Vec<f32> = Vec::new();
-            for r in (0..rows).step_by(step).take(16) {
-                let s: f32 = v[r * d..(r + 1) * d].iter().map(|x| x * x).sum();
-                rms.push((s / d as f32).sqrt());
-            }
-            let (lo, hi) = (rms.iter().cloned().fold(f32::MAX, f32::min), rms.iter().cloned().fold(0f32, f32::max));
-            println!("  per-row RMS over {d} (16 samples): min {lo:.6} max {hi:.6} ratio {:.4}", hi / lo);
-        }
-        return;
-    }
-
     // Optional second arg: dump one metadata value in full. Chat templates and tokenizer regexes are
     // the values you actually need verbatim, and they are exactly the ones a summary line truncates.
     if let Some(key) = std::env::args().nth(2) {
@@ -179,7 +148,7 @@ fn main() {
     // finite logits and fluent garbage rather than an error ----
     println!("\n  blk.0 tensor shapes:");
     let mut b0: Vec<&ferric_gguf::TensorInfo> = g.tensors.iter()
-        .filter(|t| t.name.starts_with("blk.0.") || !t.name.starts_with("blk.")).collect();
+        .filter(|t| t.name.starts_with(&std::env::var("PROBE_BLK").unwrap_or_else(|_| "blk.0.".into())) || !t.name.starts_with("blk.")).collect();
     b0.sort_by(|a, b| a.name.cmp(&b.name));
     for t in b0 {
         let ty = match t.ggml_type { 0=>"F32",1=>"F16",2=>"Q4_0",6=>"Q5_0",8=>"Q8_0",12=>"Q4_K",13=>"Q5_K",14=>"Q6_K",20=>"IQ4_NL",23=>"IQ4_XS",_=>"?" };
