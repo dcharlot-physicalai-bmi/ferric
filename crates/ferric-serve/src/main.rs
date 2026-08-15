@@ -32,18 +32,19 @@ use ferric_tensor::Tensor;
 /// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
 /// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
 /// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
-enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4) }
-enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache) }
+enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2) }
+enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache) }
 impl Model {
-    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab } }
-    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer } }
-    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d } }
+    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab, Model::DeepSeek2(m) => m.cfg.n_vocab } }
+    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer, Model::DeepSeek2(m) => m.cfg.n_layer } }
+    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d, Model::DeepSeek2(m) => m.cfg.d } }
     fn new_cache(&self) -> ModelCache {
         match self {
             Model::Dense(m) => ModelCache::Dense(qwen3::Cache::new(&m.cfg)),
             Model::Hybrid(m) => ModelCache::Hybrid(qwen35::Cache::new(&m.cfg)),
             Model::Lfm2(m) => ModelCache::Lfm2(ferric_llama::lfm2::Cache::new(&m.cfg)),
             Model::Gemma4(m) => ModelCache::Gemma4(ferric_llama::gemma4::Cache::new(&m.cfg)),
+            Model::DeepSeek2(m) => ModelCache::DeepSeek2(ferric_llama::deepseek2::Cache::new(&m.cfg)),
         }
     }
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
@@ -52,6 +53,7 @@ impl Model {
             (Model::Hybrid(m), ModelCache::Hybrid(c)) => m.forward_cached(tokens, c, m.cfg.n_layer),
             (Model::Lfm2(m), ModelCache::Lfm2(c)) => m.forward(tokens, c),
             (Model::Gemma4(m), ModelCache::Gemma4(c)) => m.forward(tokens, c),
+            (Model::DeepSeek2(m), ModelCache::DeepSeek2(c)) => m.forward(tokens, c),
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
@@ -70,6 +72,10 @@ impl Model {
             }
             Model::Gemma4(m) => {
                 let mut c = ferric_llama::gemma4::Cache::new(&m.cfg);
+                m.forward_hidden_cached(ids, &mut c)
+            }
+            Model::DeepSeek2(m) => {
+                let mut c = ferric_llama::deepseek2::Cache::new(&m.cfg);
                 m.forward_hidden_cached(ids, &mut c)
             }
         }
@@ -192,6 +198,8 @@ impl Engine {
                 Model::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).unwrap_or_else(|e| panic!("load lfm2: {e}"))),
             ferric_llama::arch::Runtime::Gemma4 =>
                 Model::Gemma4(ferric_llama::gemma4::Gemma4::load(&ctx, &g).unwrap_or_else(|e| panic!("load gemma4: {e}"))),
+            ferric_llama::arch::Runtime::DeepSeek2 =>
+                Model::DeepSeek2(ferric_llama::deepseek2::DeepSeek2::load(&ctx, &g).unwrap_or_else(|e| panic!("load deepseek2: {e}"))),
             // Cosmos loads from safetensors, so it cannot arrive down a GGUF path at all.
             ferric_llama::arch::Runtime::Cosmos =>
                 panic!("{arch} loads from safetensors, not GGUF; ferric-serve takes a GGUF"),

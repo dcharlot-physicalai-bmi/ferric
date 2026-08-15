@@ -505,9 +505,19 @@ impl Tensor {
         } else {
             ROPE_SCALED_WGSL.replace("__PAIRLO__", "c").replace("__PAIRHI__", "c + half")
         };
+        // ⚠ The kernel reads each row's position from info[8 + i]. This buffer used to hold FIVE
+        // u32s, so every one of those reads was out of bounds — and WGSL robust access returns 0, so
+        // the angle was always 0, cos = 1, sin = 0. `rope_scaled` applied NO ROTATION AT ALL.
+        //
+        // It is the silent-failure archetype: a rope that returns its input is a plain no-rope model,
+        // which still generates fluent text, still passes every shape and finiteness check, and only
+        // shows up as degraded quality. Found by diffing k_pe against llama-eval-callback and noticing
+        // the sum was unchanged by the rotation to within 0.04%.
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32, 0, 0, 0];
+        info.extend((0..t).map(|i| (offset + i) as u32));
         run(&self.ctx, &src, "rope_scaled",
             &[c.buf.as_ref(), &out, freq_scale.contiguous().buf.as_ref(),
-              &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])],
+              &u32buf(&self.ctx, &info)],
             groups(t * n_heads));
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
@@ -1948,7 +1958,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Per-row position. Batched decode puts N sequences in one call, each at a DIFFERENT position,
         // so a scalar base + row index cannot express it. info[8 + i] is that row's absolute position;
         // the single-sequence path fills it with off + i and is unchanged.
-        let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
+        let ang = f32(info[8u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
         let lo = __PAIRLO__; let hi = __PAIRHI__;
         let x1 = x[o + lo]; let x2 = x[o + hi];
         out[o + lo] = x1 * cs - x2 * sn;

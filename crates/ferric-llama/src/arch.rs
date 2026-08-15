@@ -45,6 +45,8 @@ pub enum Runtime {
     Lfm2,
     /// [`crate::gemma4`] — per-layer embeddings, shared KV, two head widths.
     Gemma4,
+    /// [`crate::deepseek2`] — multi-head latent attention + DeepSeekMoE.
+    DeepSeek2,
     /// [`crate::cosmos`] — loads from safetensors rather than GGUF.
     Cosmos,
 }
@@ -56,6 +58,7 @@ impl Runtime {
             Runtime::Hybrid => "hybrid",
             Runtime::Lfm2 => "lfm2",
             Runtime::Gemma4 => "gemma4",
+            Runtime::DeepSeek2 => "deepseek2",
             Runtime::Cosmos => "cosmos",
         }
     }
@@ -130,11 +133,11 @@ pub const REGISTRY: &[Arch] = &[
                   MoE variants (26B-A4B, 31B) are refused at load rather than silently ignored" },
 
     // ---- DeepSeek MLA + DeepSeekMoE -------------------------------------------------------
-    Arch { name: "deepseek2", runtime: Runtime::Dense, status: Status::Parts,
-           note: "loader WRITTEN but never executed — legacy attn_kv_b path, lite direct-Q only. \
-                  Config/YaRN/routing logic is unit-tested; the forward has not run on real weights, \
-                  so it must not take traffic. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants \
-                  are refused at load" },
+    Arch { name: "deepseek2", runtime: Runtime::DeepSeek2, status: Status::Loads,
+           note: "MLA (legacy attn_kv_b) + DeepSeekMoE, lite direct-Q. Block-0 tensors diffed against \
+                  llama-eval-callback (attn_norm/q/kv_cmpr/k_pe all match); generates correct text on \
+                  factual and code prompts. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants refused \
+                  at load" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -257,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "deepseek2 was promoted to `loads` once it generated correct text"]
     fn a_written_but_never_executed_loader_is_refused_by_name() {
         // deepseek2 has a complete loader whose config logic is unit-tested and whose forward has
         // never run on real weights. That is NOT the same as unsupported, and it is NOT servable:
@@ -300,7 +304,8 @@ mod tests {
         // renamed or removed would advertise support that cannot be dispatched.
         for a in REGISTRY {
             let served = match a.runtime {
-                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4 => true,
+                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4
+                    | Runtime::DeepSeek2 => true,
             };
             assert!(served, "{} names a runtime with no dispatch", a.name);
         }

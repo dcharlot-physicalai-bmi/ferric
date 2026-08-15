@@ -53,6 +53,25 @@ use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
+
+/// Env-gated tensor dump for bisecting against llama.cpp's `llama-eval-callback`, whose `ggml_debug`
+/// lines carry the same names (`attn_norm`, `q`, `kv_cmpr`, `k_pe`, `kv`, `attn_out`, `ffn_out`,
+/// `l_out`). Set `FERRIC_DUMP=<block index>`.
+///
+/// Prints shape, first values and summary stats. Stats alone are not enough — two tensors can share a
+/// mean and a range and still be permuted relative to each other, which is exactly the failure mode
+/// that a summary statistic hides.
+fn dump(tag: &str, il: usize, t: &Tensor) {
+    let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
+    if want.parse::<usize>().ok() != Some(il) { return }
+    let v = pollster::block_on(t.to_vec());
+    let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+    for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64; }
+    let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.5}")).collect();
+    println!("  [{il}] {tag:<12} {:?} n={} min {mn:+.5} max {mx:+.5} mean {:+.6}\n               {}",
+             t.shape, v.len(), sum / v.len() as f64, head.join(" "));
+}
+
 pub struct Cfg {
     pub n_layer: usize,
     pub d: usize,
@@ -96,8 +115,19 @@ impl Cfg {
     /// The YaRN scale applied to the RoPE output. Applies to the rope lanes only, so it cannot be
     /// folded into the attention scale.
     pub fn attn_factor(&self) -> f32 {
-        if self.yarn_factor <= 1.0 { return 1.0; }
-        1.0 / (1.0 + 0.1 * (self.yarn_factor).ln())
+        // ⚠ 1.0, NOT 1/(1 + 0.1·ln(factor)).
+        //
+        // ggml's `rope_yarn` does `mscale *= 1 + 0.1*logf(1/freq_scale)` INSIDE the kernel whenever
+        // ext_factor != 0. llama.cpp's deepseek2 graph pre-divides the attn_factor it passes in
+        // precisely so that multiply restores it — the comment there literally reads "first cancel the
+        // adjustment ... to get the original attn_factor". The NET scale on cos/sin is therefore
+        // attn_factor_org, which is 1.0 at the default.
+        //
+        // Applying the pre-divided value in a runtime whose rope kernel does NOT re-multiply it scales
+        // every rope lane by 0.73 and nothing says so. Caught by diffing k_pe against
+        // llama-eval-callback: 100.07 against the reference's 123.955, with every earlier tensor in
+        // the block matching to 4 significant figures.
+        1.0
     }
 
     /// `mscale`, whose square is folded into the attention scale.
@@ -363,6 +393,7 @@ impl DeepSeek2 {
 
         for (il, blk) in self.blocks.iter().enumerate() {
             let h = x.rmsnorm(&blk.attn_norm, eps);
+            dump("attn_norm", il, &h);
 
             // Q: [t, nh*qk] -> split each head into its nope and rope lanes.
             let q = h.matmul_q(&blk.q).reshape(&[t, nh, qk]);
@@ -371,12 +402,16 @@ impl DeepSeek2 {
                 .reshape(&[t, nh, rope]);
 
             // The compressed KV plus the SHARED rope vector: [t, r + rope].
+            dump("q", il, &q.reshape(&[t, nh * qk]));
             let kvp = h.matmul_q(&blk.kv_a_mqa);
             let kv_cmpr = kvp.narrow(1, 0, r).contiguous().rmsnorm(&blk.kv_a_norm, eps);
             let k_pe = self.rope_pe(&kvp.narrow(1, r, rope).contiguous(), 1, pos);
 
             // Decompress to per-head K-nope and V: [t, nh*(nope+vh)].
+            dump("kv_cmpr", il, &kv_cmpr);
+            dump("k_pe", il, &k_pe);
             let kv = kv_cmpr.matmul_q(&blk.kv_b).reshape(&[t, nh, nope + vh]);
+            dump("kv", il, &kv.reshape(&[t, nh * (nope + vh)]));
             let k_nope = kv.narrow(2, 0, nope).contiguous();
             let v = kv.narrow(2, nope, vh).contiguous().reshape(&[t, nh * vh]);
 
@@ -392,7 +427,10 @@ impl DeepSeek2 {
             // V is narrower than K here, so the attention helper cannot infer the value width from
             // the key width. Heads are 1:1 (no GQA) after decompression.
             let att = nn::causal_attention_split(&q_full, &kc, &vc, nh, qk, vh, 0.0);
-            x = x.add(&att.matmul_q(&blk.o));
+            dump("attn", il, &att);
+            let ao = att.matmul_q(&blk.o);
+            dump("attn_out", il, &ao);
+            x = x.add(&ao);
 
             let f = x.rmsnorm(&blk.ffn_norm, eps);
             let out = match &blk.ffn {
@@ -406,7 +444,9 @@ impl DeepSeek2 {
                     routed.add(&shared)
                 }
             };
+            dump("ffn_out", il, &out);
             x = x.add(&out);
+            dump("l_out", il, &x);
         }
 
         cache.pos += t;
@@ -462,12 +502,19 @@ mod tests {
     }
 
     #[test]
-    fn the_rope_scale_is_not_the_attention_scale() {
-        // Two different YaRN constants land in two different places. Collapsing them into one is the
-        // subtle version of this bug: attn_factor touches only the rope lanes, mscale² the whole score.
+    fn the_rope_output_is_not_rescaled_but_the_attention_score_is() {
+        // I originally had attn_factor = 1/(1 + 0.1·ln(factor)) = 0.7305, reasoning from the
+        // pre-division in llama.cpp's deepseek2 graph. That was wrong: ggml's `rope_yarn` RE-MULTIPLIES
+        // by the same term inside the kernel, so the pre-division exists only to cancel it and the NET
+        // scale on cos/sin is attn_factor_org = 1.0.
+        //
+        // Established by diffing k_pe against llama-eval-callback, not by re-reading: 123.88 against
+        // the reference's 123.955, where the 0.7305 version gave 100.07.
         let c = lite();
-        assert!((c.attn_factor() - 0.730521).abs() < 1e-5, "attn_factor {}", c.attn_factor());
-        assert_ne!(c.attn_factor(), c.mscale());
+        assert_eq!(c.attn_factor(), 1.0, "the rope output carries no extra YaRN scale");
+        // mscale² still very much applies, to the attention score. The two are NOT the same constant.
+        assert!((c.mscale() - 1.26078).abs() < 1e-4);
+        assert_ne!(c.attn_factor(), c.mscale(), "one is 1.0 and the other is not");
     }
 
     #[test]
