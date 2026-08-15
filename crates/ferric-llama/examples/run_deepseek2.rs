@@ -68,12 +68,24 @@ async fn run() {
     let mut next = argmax(&logits);
     let mut out = Vec::new();
     let t0 = std::time::Instant::now();
+    // FERRIC_NOCACHE=1 re-prefills the whole growing sequence every step instead of feeding one token
+    // against the carried cache. The two MUST agree: cached decode is only an optimisation of
+    // re-prefill. When they disagree, the model conventions are fine and the cache is the bug, which
+    // is a completely different place to look.
+    let nocache = std::env::var("FERRIC_NOCACHE").is_ok();
     for _ in 0..n_gen {
         if eos.contains(&next) { break; }
         out.push(next);
-        next = argmax(&m.forward(&[next], &mut cache).to_vec().await);
+        next = if nocache {
+            let mut fresh = Cache::new(c);
+            let seq: Vec<u32> = ids.iter().copied().chain(out.iter().copied()).collect();
+            argmax(&m.forward(&seq, &mut fresh).to_vec().await)
+        } else {
+            argmax(&m.forward(&[next], &mut cache).to_vec().await)
+        };
     }
     let dt = t0.elapsed();
+    if nocache { println!("  [FERRIC_NOCACHE: every step was a full re-prefill]"); }
 
     // GPT-2 byte-level vocab: map the printable-unicode aliases back to raw bytes.
     let mut u2b = std::collections::HashMap::new();

@@ -222,13 +222,20 @@ pub struct Expert { pub gate_up: QMatrix, pub down: QMatrix }
 /// The down-projection slab's quant format: Q4_K_M GGUFs alternate Q6_K and Q4_K on `down_exps`
 /// per layer, so BOTH need slab kernels — a Q4_K-down layer falling back to per-expert routing
 /// costs ~50 eager dispatches + a readback sync per token per layer.
-pub enum DownSlab { Q6(Q6_KWeights), Q4(Q4_KWeights) }
+/// `down_exps` quant varies PER LAYER inside one Q4_K_M file — DeepSeek-Coder-V2-Lite mixes Q8_0 and
+/// Q5_0 across its 26 MoE blocks, Nemotron-H does the same. A missing arm is a hard load error rather
+/// than a wrong answer, but it means one real checkpoint refuses on block 3 after loading blocks 0-2.
+pub enum DownSlab { Q6(Q6_KWeights), Q4(Q4_KWeights), Q8(ferric_tensor::Q8_0Weights), Q5(ferric_tensor::Q5_0Weights) }
 
 impl DownSlab {
     pub(crate) fn wsum(&self, mid: &Tensor, selw: &Tensor, d: usize) -> Tensor {
         match self {
             DownSlab::Q6(w) => mid.matmul_q6_k_id_wsum(w, selw, d),
             DownSlab::Q4(w) => mid.matmul_q4_k_id_wsum(w, selw, d),
+            // DeepSeek-V2 Q4_K_M stores down_exps as Q8_0. The kernel already existed; this enum
+            // simply had no arm for it, so a real checkpoint hit a load error rather than running.
+            DownSlab::Q8(w) => mid.matmul_q8_0_id_wsum(w, selw, d),
+            DownSlab::Q5(w) => mid.matmul_q5_0_id_wsum(w, selw, d),
         }
     }
 }

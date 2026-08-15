@@ -277,7 +277,10 @@ impl DeepSeek2 {
                     down: match dt.ggml_type {
                         14 => crate::qwen35::DownSlab::Q6(ferric_tensor::Q6_KWeights::from_bytes(ctx, &g.raw(&dn)?, drows, dd)),
                         12 => crate::qwen35::DownSlab::Q4(ferric_tensor::Q4_KWeights::from_bytes(ctx, &g.raw(&dn)?, drows, dd)),
-                        o => return Err(format!("down_exps type {o} has no slab kernel")),
+                        8 => crate::qwen35::DownSlab::Q8(ferric_tensor::Q8_0Weights::from_bytes(ctx, &g.raw(&dn)?, drows, dd)),
+                        6 => crate::qwen35::DownSlab::Q5(ferric_tensor::Q5_0Weights::from_bytes(ctx, &g.raw(&dn)?, drows, dd)),
+                        o => return Err(format!("blk.{il}.ffn_down_exps is quant type {o}, which has no \
+                            indexed-expert kernel (have Q4_K/12, Q5_0/6, Q6_K/14, Q8_0/8)")),
                     },
                     sh_gate: qm(&b("ffn_gate_shexp.weight"))?,
                     sh_up: qm(&b("ffn_up_shexp.weight"))?,
@@ -335,9 +338,13 @@ impl DeepSeek2 {
         // ⚠ INTERLEAVED. llama.cpp lists deepseek2 under "normal RoPE, operating on pairs of
         // consecutive head values" (ROPE_TYPE_NORM), not the split-half NEOX pairing every Qwen-family
         // model here uses. Rotating the wrong partners produces finite logits and wrong text.
-        let r = match &self.yarn {
-            Some(fs) => x.rope_scaled_interleaved(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
-            None => x.rope_interleaved(heads, cfg.qk_rope, cfg.rope_base, pos),
+        // A/B via FERRIC_ROPE_NEOX to settle the pairing empirically rather than by reading alone.
+        let neox = std::env::var("FERRIC_ROPE_NEOX").is_ok();
+        let r = match (&self.yarn, neox) {
+            (Some(fs), false) => x.rope_scaled_interleaved(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
+            (Some(fs), true) => x.rope_scaled(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
+            (None, false) => x.rope_interleaved(heads, cfg.qk_rope, cfg.rope_base, pos),
+            (None, true) => x.rope(heads, cfg.qk_rope, cfg.rope_base, pos),
         };
         let af = cfg.attn_factor();
         if (af - 1.0).abs() < 1e-9 { r } else { r.mul(&r.scalar(af)) }
