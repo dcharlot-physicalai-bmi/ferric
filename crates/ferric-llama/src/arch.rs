@@ -43,6 +43,8 @@ pub enum Runtime {
     Hybrid,
     /// [`crate::lfm2`] — short-conv / attention hybrid with real conv state.
     Lfm2,
+    /// [`crate::gemma4`] — per-layer embeddings, shared KV, two head widths.
+    Gemma4,
     /// [`crate::cosmos`] — loads from safetensors rather than GGUF.
     Cosmos,
 }
@@ -53,6 +55,7 @@ impl Runtime {
             Runtime::Dense => "dense",
             Runtime::Hybrid => "hybrid",
             Runtime::Lfm2 => "lfm2",
+            Runtime::Gemma4 => "gemma4",
             Runtime::Cosmos => "cosmos",
         }
     }
@@ -119,6 +122,12 @@ pub const REGISTRY: &[Arch] = &[
            note: "alternating SWA (pattern 2) + attn/final logit softcapping" },
     Arch { name: "gemma3", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; 1-in-6 global attention, local rope base 10000" },
+
+    // ---- Gemma 4 (2026-04-02) -------------------------------------------------------------
+    Arch { name: "gemma4", runtime: Runtime::Gemma4, status: Status::Loads,
+           note: "E2B/E4B dense path: per-layer embeddings, shared KV (blocks >= n-shared reuse 13/14), \
+                  head_dim 512 global / 256 swa, weightless V norm, GELU FFN, no attention scale. \
+                  MoE variants (26B-A4B, 31B) are refused at load rather than silently ignored" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -218,7 +227,7 @@ mod tests {
     fn an_unknown_architecture_is_refused_not_defaulted() {
         // THE bug this module exists for. Every one of these is a real 2026 architecture that the old
         // `else` branch would have loaded as a dense Qwen3 and generated fluent nonsense from.
-        for a in ["gemma4", "deepseek2", "glm4", "minimax", "hunyuan", "mimo", "kimi"] {
+        for a in ["deepseek2", "glm4", "minimax", "hunyuan", "mimo", "kimi"] {
             let e = resolve(a).unwrap_err();
             assert!(matches!(e, ArchError::Unsupported(_)), "{a} was not refused: {e:?}");
             // The message has to say what IS supported, or the refusal is useless to whoever hit it.
@@ -232,8 +241,12 @@ mod tests {
         // 2026 model would silently adopt 2025 assumptions about SWA pattern, embedding scale and
         // logit softcapping — and produce plausible output while doing it.
         assert!("gemma4".starts_with("gemma"), "premise of this test");
-        assert!(lookup("gemma4").is_none(), "gemma4 must not resolve until it is actually written");
-        assert!(lookup("gemma3").is_some());
+        // Both exist now, and they must land on DIFFERENT runtimes. Prefix matching would have sent
+        // gemma4 to the dense Gemma-3 path, which shares neither the KV schedule nor the head width.
+        let g3 = lookup("gemma3").expect("gemma3");
+        let g4 = lookup("gemma4").expect("gemma4");
+        assert_ne!(g3.runtime, g4.runtime, "gemma3 and gemma4 must not share a runtime");
+        assert_eq!(g4.runtime, Runtime::Gemma4);
     }
 
     #[test]
@@ -263,7 +276,7 @@ mod tests {
         // renamed or removed would advertise support that cannot be dispatched.
         for a in REGISTRY {
             let served = match a.runtime {
-                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos => true,
+                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4 => true,
             };
             assert!(served, "{} names a runtime with no dispatch", a.name);
         }

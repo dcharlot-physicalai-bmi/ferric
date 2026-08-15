@@ -458,9 +458,21 @@ impl Qwen3 {
             out_norm: nrm("output_norm.weight", cfg.n_embd)?,
             lm_head: qm(ctx, g, head)?,
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
+            // ⚠ RECIPROCAL. `rope_freqs.weight` holds ggml's `freq_factors`, which ggml applies as
+            // `theta / ff` (ops.cpp: `rope_yarn(theta/ff, …)`). Ferric's `rope_scaled` kernel instead
+            // MULTIPLIES each inverse frequency by its scale, so the factors must be inverted on the
+            // way in. Llama-3.2-1B ships values running 1.0 → 32.0 (1.0 on the high-frequency dims),
+            // so passing them through unchanged shortened the low-frequency wavelengths by 32x
+            // instead of stretching them — the exact inverse of the context extension they encode.
+            // Nothing errors and short prompts look fine; only long context degrades.
+            //
+            // The qwen35 path is unaffected: `yarn_freq_scale` there builds
+            // `(1/factor)·(1−ramp) + ramp`, already in multiplier form.
             rope_freqs: g.tensor("rope_freqs.weight").map(|t| {
                 let n = t.dims[0] as usize;
-                f32t(ctx, g, "rope_freqs.weight", &[n])
+                let f = g.dequant("rope_freqs.weight")?;
+                let inv: Vec<f32> = f[..n].iter().map(|&x| if x != 0.0 { 1.0 / x } else { 1.0 }).collect();
+                Ok::<_, String>(Tensor::from_vec(ctx, &inv, &[n]))
             }).transpose()?,
             cfg, ctx: ctx.clone(), layers, stream: None,
         })
