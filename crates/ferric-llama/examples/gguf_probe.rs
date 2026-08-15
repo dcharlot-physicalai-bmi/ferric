@@ -58,6 +58,18 @@ fn main() {
         return;
     }
 
+    // A metadata dump must NOT slurp the file either: asking a 17 GB checkpoint for one string used
+    // to read all 17 GB into RAM. GgufFile parses a bounded header prefix; only the full survey below
+    // needs the eager parse, and that is meant to be handed a truncated header.
+    if let Some(key) = std::env::args().nth(2) {
+        let gf = ferric_gguf::GgufFile::open(&path).expect("open");
+        match gf.metadata.get(&key) {
+            Some(Meta::Str(v)) => { println!("{v}"); return; }
+            Some(other) => { println!("{}", short(other)); return; }
+            None => { eprintln!("no such key: {key}"); std::process::exit(1); }
+        }
+    }
+
     let bytes = std::fs::read(&path).expect("read");
     println!("Probing {path}  ({:.1} MB of header read)\n", bytes.len() as f64 / 1e6);
 
@@ -70,16 +82,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-
-    // Optional second arg: dump one metadata value in full. Chat templates and tokenizer regexes are
-    // the values you actually need verbatim, and they are exactly the ones a summary line truncates.
-    if let Some(key) = std::env::args().nth(2) {
-        match g.metadata.get(&key) {
-            Some(Meta::Str(v)) => { println!("{v}"); return; }
-            Some(other) => { println!("{}", short(other)); return; }
-            None => { eprintln!("no such key: {key}"); std::process::exit(1); }
-        }
-    }
 
     let arch = match g.metadata.get("general.architecture") {
         Some(Meta::Str(s)) => s.clone(),

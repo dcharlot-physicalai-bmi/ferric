@@ -850,6 +850,29 @@ impl Qwen3 {
         x
     }
 
+    /// Feed **precomputed embeddings** instead of token ids — the multimodal entry point.
+    ///
+    /// A vision tower produces embedding rows, not tokens, so the image cannot go in through
+    /// `forward_cached`. `x` is `[T, n_embd]` and takes the place of the embedding gather; everything
+    /// downstream (position, cache, layers, head) is identical, which is the point — an image is a run
+    /// of rows in the same sequence, not a separate code path.
+    pub fn forward_embeds(&self, x: &Tensor, cache: &mut Cache) -> Tensor {
+        use ferric_tensor::batch;
+        assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
+        let t = x.shape[0];
+        let pos = cache.pos;
+        let mut h = x.clone();
+        for il in 0..self.cfg.n_layer {
+            let l = self.layer_ref(il);
+            h = self.apply_layer(&h, &l, &mut cache.kv[il], pos, il);
+        }
+        cache.pos += t;
+        batch(&self.ctx, || self.head(&h))
+    }
+
+    /// The embedding rows for `tokens`, so a caller can splice image rows in beside them.
+    pub fn embed_tokens(&self, tokens: &[u32]) -> Tensor { self.embed(tokens) }
+
     /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step. Returns logits.
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
