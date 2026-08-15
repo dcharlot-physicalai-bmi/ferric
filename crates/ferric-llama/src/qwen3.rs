@@ -16,6 +16,17 @@ use ferric_gguf::{deq_raw, GgufSource, Meta};
 use ferric_tensor::{nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
+
+/// Env-gated dump matching `llama-eval-callback`'s tensor names, for bisecting a divergence against
+/// the reference one tensor at a time. `FERRIC_DUMP=<block index>`.
+pub(crate) fn dump(tag: &str, il: usize, t: &Tensor) {
+    let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
+    if want.parse::<usize>().ok() != Some(il) { return }
+    let v = pollster::block_on(t.to_vec());
+    let sum: f64 = v.iter().map(|&x| x as f64).sum();
+    println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.6}", t.shape, v.len());
+}
+
 pub struct Cfg {
     pub n_embd: usize,
     pub n_layer: usize,
@@ -135,7 +146,16 @@ impl Cfg {
             logit_scale: f("logit_scale").unwrap_or(1.0),
             post_norms: g.tensor("blk.0.post_attention_norm.weight").is_some(),
             nope_global: arch == "muse-glimmer",
-            rope_interleaved: arch == "muse-glimmer" || std::env::var("FERRIC_ROPE_NORM").is_ok(),
+            // llama.cpp resolves NORM vs NEOX per architecture. `llama` is listed under "normal RoPE,
+            // operating on pairs of consecutive head values" — NORM — while the Qwen family this
+            // loader was written around is NEOX. One loader serves both, so this must be per-arch.
+            //
+            // Getting it wrong cost a `verified` badge: Llama-3.2-1B answered "The capital of France
+            // is located in the United States" with NEOX and "Paris. The Eiffel Tower is a famous"
+            // with NORM. Ġlocated beat ĠParis by 0.04 logits — near-miss, not noise, which is exactly
+            // why it read as working.
+            rope_interleaved: matches!(arch.as_str(), "muse-glimmer" | "llama")
+                || std::env::var("FERRIC_ROPE_NORM").is_ok(),
             post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
             embd_rmsnorm: arch == "muse-glimmer",
         })
@@ -523,6 +543,12 @@ impl Qwen3 {
     /// `rope_freqs` scaling; Qwen has none, so it's plain RoPE.
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
         match &self.rope_freqs {
+            // The scaled path must honour the pairing too. It did not: `rope_interleaved` was
+            // consulted only in the `None` arm, so any model with rope_freqs (every Llama-3.1+)
+            // silently got NEOX regardless — and an A/B on the flag appeared to "rule out" pairing
+            // while never actually changing anything.
+            Some(fs) if self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err() =>
+                x.rope_scaled_interleaved(fs, n_heads, self.cfg.head_dim, base, offset),
             Some(fs) => x.rope_scaled(fs, n_heads, self.cfg.head_dim, base, offset),
             None if self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err() => x.rope_interleaved(n_heads, self.cfg.head_dim, base, offset),
             None => x.rope(n_heads, self.cfg.head_dim, base, offset),
@@ -674,6 +700,8 @@ impl Qwen3 {
     /// completion. See [`Qwen3::step_layer`].
     fn apply_layer(&self, x: &Tensor, l: &Layer, lc: &mut (KvBuf, KvBuf), pos: usize, il: usize) -> Tensor {
         use ferric_tensor::{batch, prof};
+        dump("inpL", il, x);
+        dump("attn_norm", il, &x.rmsnorm(&l.attn_norm, self.cfg.eps));
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         let mut out;
         let xin = x;
