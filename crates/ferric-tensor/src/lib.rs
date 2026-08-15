@@ -36,6 +36,7 @@ pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub mod sciml; // physics-informed / scientific-ML building blocks (SIREN PINN net + differentiable deriv)
 pub use autograd::{grad, Var};
 pub use sciml::{deriv, Mlp, Siren};
+pub mod image; // PPM in, preprocessed tensor out — no image-codec dependency
 pub use dtype::{Iq4XsWeights, Iq4NlWeights, DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
@@ -561,6 +562,32 @@ impl Tensor {
               &u32buf(&self.ctx, &[t as u32, n_head as u32, head_dim as u32, state as u32, n_group as u32, rs])],
             grid);
         Tensor::from_parts(&self.ctx, out, vec![t, n_head * head_dim])
+    }
+
+
+    /// **Bilinear resize** of a `[H, W, C]` tensor to `[out_h, out_w, C]`, half-pixel centres.
+    ///
+    /// Two callers need exactly this and neither can use nearest-neighbour: preprocessing an image to
+    /// the encoder's fixed input size, and resizing a learned position-embedding grid to the patch
+    /// grid — which is what `resize_position_embeddings(GGML_SCALE_MODE_BILINEAR)` does in llama.cpp's
+    /// vision graphs.
+    ///
+    /// Matches ggml's `GGML_SCALE_MODE_BILINEAR`: `src = (dst + 0.5)/scale - 0.5`, clamped at the
+    /// edges. The half-pixel offset is not cosmetic — dropping it (`src = dst/scale`, "align corners")
+    /// shifts every sample by half a pixel, which survives as a plausible-looking image and a wrong
+    /// embedding.
+    pub fn resize_bilinear(&self, out_h: usize, out_w: usize) -> Tensor {
+        let c = self.contiguous();
+        assert_eq!(c.rank(), 3, "resize_bilinear expects [H, W, C]");
+        let (h, w, ch) = (c.shape[0], c.shape[1], c.shape[2]);
+        let out = empty(&self.ctx, out_h * out_w * ch);
+        let n = out_h * out_w * ch;
+        let (grid, rs) = groups2d(n);
+        run(&self.ctx, RESIZE_BILINEAR_WGSL, "resize_bilinear",
+            &[c.buf.as_ref(), &out,
+              &u32buf(&self.ctx, &[h as u32, w as u32, ch as u32, out_h as u32, out_w as u32, rs, n as u32])],
+            grid);
+        Tensor::from_parts(&self.ctx, out, vec![out_h, out_w, ch])
     }
 
     /// Causal depthwise conv1d — the LFM2 / Liquid AI short-conv mixer. self is [T, C] (sequence ×
@@ -2099,6 +2126,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+
+const RESIZE_BILINEAR_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:    array<f32>;   // [H, W, C]
+@group(0) @binding(1) var<storage,read_write>  out:  array<f32>;   // [OH, OW, C]
+@group(0) @binding(2) var<storage,read>        info: array<u32>;   // H, W, C, OH, OW, rs, tot
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let h = info[0]; let w = info[1]; let ch = info[2];
+    let oh = info[3]; let ow = info[4]; let rs = info[5]; let tot = info[6];
+    let idx = gid.x + gid.y * rs;
+    if (idx >= tot) { return; }
+    let c  = idx % ch;
+    let ox = (idx / ch) % ow;
+    let oy = idx / (ch * ow);
+    // Half-pixel centres, matching GGML_SCALE_MODE_BILINEAR.
+    let sx = (f32(ox) + 0.5) * f32(w) / f32(ow) - 0.5;
+    let sy = (f32(oy) + 0.5) * f32(h) / f32(oh) - 0.5;
+    let x0 = max(i32(floor(sx)), 0);
+    let y0 = max(i32(floor(sy)), 0);
+    let x1 = min(x0 + 1, i32(w) - 1);
+    let y1 = min(y0 + 1, i32(h) - 1);
+    let fx = clamp(sx - f32(x0), 0.0, 1.0);
+    let fy = clamp(sy - f32(y0), 0.0, 1.0);
+    let ux0 = u32(max(x0, 0)); let uy0 = u32(max(y0, 0));
+    let ux1 = u32(max(x1, 0)); let uy1 = u32(max(y1, 0));
+    let p00 = x[(uy0 * w + ux0) * ch + c];
+    let p01 = x[(uy0 * w + ux1) * ch + c];
+    let p10 = x[(uy1 * w + ux0) * ch + c];
+    let p11 = x[(uy1 * w + ux1) * ch + c];
+    let top = p00 + (p01 - p00) * fx;
+    let bot = p10 + (p11 - p10) * fx;
+    out[idx] = top + (bot - top) * fy;
+}
+"#;
+
 const CONV1D_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;      // [T, C]
 @group(0) @binding(1) var<storage,read>        w: array<f32>;      // [C, L]
@@ -3331,5 +3393,63 @@ mod rope_partial_tests {
         let moved = (0..t * nh).any(|l| (0..n_rot).any(|c| got[l * dh + c] != v[l * dh + c]));
         assert!(moved, "no dim inside n_rot changed — the rotation did not run");
         eprintln!("partial rope: full-width bit-identical, tail copied, head rotated");
+    }
+}
+
+/// Bilinear resize against a CPU reference, and against the properties that catch a half-pixel slip.
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    #[test]
+    fn bilinear_matches_reference_and_preserves_constants() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED bilinear resize: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (h, w, c) = (4usize, 5usize, 2usize);
+        let v: Vec<f32> = (0..h * w * c).map(|i| (i as f32 * 0.31).sin()).collect();
+        let x = Tensor::from_vec(&ctx, &v, &[h, w, c]);
+
+        // Identity: resizing to the same size must return the input EXACTLY. With the half-pixel
+        // offset this is true by construction; with align-corners it is also true, so this alone does
+        // not discriminate — the off-size case below does.
+        let same = pollster::block_on(x.resize_bilinear(h, w).to_vec());
+        let d0 = same.iter().zip(&v).fold(0f32, |a, (&p, &q)| a.max((p - q).abs()));
+        assert!(d0 < 1e-6, "identity resize differs by {d0:.3e}");
+
+        // A constant field must stay exactly constant at any size — catches edge-clamp errors that
+        // would pull in out-of-range samples.
+        let konst = Tensor::from_vec(&ctx, &vec![2.5f32; h * w * c], &[h, w, c]);
+        let up = pollster::block_on(konst.resize_bilinear(7, 9).to_vec());
+        let dk = up.iter().fold(0f32, |a, &p| a.max((p - 2.5).abs()));
+        assert!(dk < 1e-6, "constant field drifted by {dk:.3e} under resize");
+
+        // Off-size against a CPU reference using the SAME half-pixel rule.
+        let (oh, ow) = (7usize, 3usize);
+        let got = pollster::block_on(x.resize_bilinear(oh, ow).to_vec());
+        let at = |y: usize, xx: usize, cc: usize| v[(y * w + xx) * c + cc];
+        for oy in 0..oh {
+            for ox in 0..ow {
+                for cc in 0..c {
+                    let sx = (ox as f32 + 0.5) * w as f32 / ow as f32 - 0.5;
+                    let sy = (oy as f32 + 0.5) * h as f32 / oh as f32 - 0.5;
+                    let x0 = (sx.floor() as i32).max(0);
+                    let y0 = (sy.floor() as i32).max(0);
+                    let x1 = (x0 + 1).min(w as i32 - 1);
+                    let y1 = (y0 + 1).min(h as i32 - 1);
+                    let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+                    let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+                    let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+                    let top = at(y0, x0, cc) + (at(y0, x1, cc) - at(y0, x0, cc)) * fx;
+                    let bot = at(y1, x0, cc) + (at(y1, x1, cc) - at(y1, x0, cc)) * fx;
+                    let want = top + (bot - top) * fy;
+                    let g = got[(oy * ow + ox) * c + cc];
+                    assert!((g - want).abs() < 1e-5, "({oy},{ox},{cc}): {g} vs {want}");
+                }
+            }
+        }
+        eprintln!("resize_bilinear: identity exact, constants preserved, {oh}x{ow} matches reference");
     }
 }
