@@ -482,6 +482,39 @@ pub fn causal_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
+/// Causal attention where the **value head is narrower than the query/key head**.
+///
+/// Every other helper here derives one head width from `q.shape[1] / n_heads` and uses it for K and V
+/// alike. That is wrong for MLA: DeepSeek-V2 carries a 192-wide query/key head (128 non-positional +
+/// 64 RoPE) against a 128-wide value head. Reusing a same-width helper does not fail — it reshapes V
+/// to the wrong stride and reads value lanes belonging to the neighbouring head.
+///
+/// `k`/`v` may be longer than `q` (a decode step or a prefill chunk against a filled cache); the
+/// query block is taken to sit at the end, at offset `s - t`.
+pub fn causal_attention_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
+                              qk_dim: usize, v_dim: usize, softcap: f32) -> Tensor {
+    let t = q.shape[0];
+    let s = k.shape[0];
+    assert_eq!(q.shape[1], n_heads * qk_dim, "q width must be n_heads * qk_dim");
+    assert_eq!(k.shape[1], n_heads * qk_dim, "k width must be n_heads * qk_dim");
+    assert_eq!(v.shape[1], n_heads * v_dim, "v width must be n_heads * v_dim");
+    assert!(s >= t, "cache ({s}) shorter than the query block ({t})");
+    let scale = 1.0 / (qk_dim as f32).sqrt();
+    let qh = q.reshape(&[t, n_heads, qk_dim]).permute(&[1, 0, 2]).contiguous();  // [nh, t, qk]
+    let kh = k.reshape(&[s, n_heads, qk_dim]).permute(&[1, 0, 2]).contiguous();  // [nh, s, qk]
+    let vh = v.reshape(&[s, n_heads, v_dim]).permute(&[1, 0, 2]).contiguous();   // [nh, s, vd]
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap);
+    // Query row i is at absolute position off+i, so it may attend to keys 0..=off+i.
+    let off = s - t;
+    let mut m = vec![0.0f32; t * s];
+    for i in 0..t {
+        for j in (off + i + 1)..s { m[i * s + j] = -1e30; }
+    }
+    let mask = Tensor::from_vec(&q.ctx_arc(), &m, &[t, s]);
+    let probs = scores.add(&mask).softmax(2);
+    probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, n_heads * v_dim])
+}
+
 /// Chunked windowed attention must equal whole-history windowed attention.
 ///
 /// This is the property that makes chunked prefill safe on a sliding-window model: feeding the rows

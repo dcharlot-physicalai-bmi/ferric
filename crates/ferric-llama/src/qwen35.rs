@@ -225,7 +225,7 @@ pub struct Expert { pub gate_up: QMatrix, pub down: QMatrix }
 pub enum DownSlab { Q6(Q6_KWeights), Q4(Q4_KWeights) }
 
 impl DownSlab {
-    fn wsum(&self, mid: &Tensor, selw: &Tensor, d: usize) -> Tensor {
+    pub(crate) fn wsum(&self, mid: &Tensor, selw: &Tensor, d: usize) -> Tensor {
         match self {
             DownSlab::Q6(w) => mid.matmul_q6_k_id_wsum(w, selw, d),
             DownSlab::Q4(w) => mid.matmul_q4_k_id_wsum(w, selw, d),
@@ -375,7 +375,7 @@ pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) ->
 /// final θᵢ interpolates between the extrapolated (original) frequency and the /factor-compressed one,
 /// ramped between the correction dims derived from β_fast/β_slow. Returned as the multiplier the
 /// `rope_scaled` kernel applies to each standard inverse frequency.
-fn yarn_freq_scale(n_rot: usize, base: f32, factor: f32, orig_ctx: usize, beta_fast: f32, beta_slow: f32) -> Vec<f32> {
+pub(crate) fn yarn_freq_scale(n_rot: usize, base: f32, factor: f32, orig_ctx: usize, beta_fast: f32, beta_slow: f32) -> Vec<f32> {
     let corr_dim = |beta: f32| -> f32 {
         (n_rot as f32) * ((orig_ctx as f32) / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
     };

@@ -129,6 +129,13 @@ pub const REGISTRY: &[Arch] = &[
                   head_dim 512 global / 256 swa, weightless V norm, GELU FFN, no attention scale. \
                   MoE variants (26B-A4B, 31B) are refused at load rather than silently ignored" },
 
+    // ---- DeepSeek MLA + DeepSeekMoE -------------------------------------------------------
+    Arch { name: "deepseek2", runtime: Runtime::Dense, status: Status::Parts,
+           note: "loader WRITTEN but never executed — legacy attn_kv_b path, lite direct-Q only. \
+                  Config/YaRN/routing logic is unit-tested; the forward has not run on real weights, \
+                  so it must not take traffic. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants \
+                  are refused at load" },
+
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
            note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order" },
@@ -227,7 +234,7 @@ mod tests {
     fn an_unknown_architecture_is_refused_not_defaulted() {
         // THE bug this module exists for. Every one of these is a real 2026 architecture that the old
         // `else` branch would have loaded as a dense Qwen3 and generated fluent nonsense from.
-        for a in ["deepseek2", "glm4", "minimax", "hunyuan", "mimo", "kimi"] {
+        for a in ["glm4", "minimax", "hunyuan", "mimo", "kimi", "step3", "ernie4"] {
             let e = resolve(a).unwrap_err();
             assert!(matches!(e, ArchError::Unsupported(_)), "{a} was not refused: {e:?}");
             // The message has to say what IS supported, or the refusal is useless to whoever hit it.
@@ -247,6 +254,23 @@ mod tests {
         let g4 = lookup("gemma4").expect("gemma4");
         assert_ne!(g3.runtime, g4.runtime, "gemma3 and gemma4 must not share a runtime");
         assert_eq!(g4.runtime, Runtime::Gemma4);
+    }
+
+    #[test]
+    fn a_written_but_never_executed_loader_is_refused_by_name() {
+        // deepseek2 has a complete loader whose config logic is unit-tested and whose forward has
+        // never run on real weights. That is NOT the same as unsupported, and it is NOT servable:
+        // the registry says so out loud instead of letting it take traffic on the strength of
+        // compiling.
+        let e = resolve("deepseek2").unwrap_err();
+        match &e {
+            ArchError::NotRunnable(a) => {
+                assert_eq!(a.status, Status::Parts);
+                assert!(a.note.contains("never executed"), "the note must say why: {}", a.note);
+            }
+            other => panic!("deepseek2 should be known-but-not-runnable, got {other:?}"),
+        }
+        assert!(lookup("deepseek2").is_some(), "it must still be discoverable in the coverage table");
     }
 
     #[test]

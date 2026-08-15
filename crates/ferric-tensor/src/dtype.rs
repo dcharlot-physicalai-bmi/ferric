@@ -1576,6 +1576,20 @@ impl Tensor {
     /// → [T, 2k] for the `*_id` expert kernels to consume without any CPU round-trip. One thread
     /// per token, scanning its own contiguous logits row.
     pub fn moe_topk(&self, bias: Option<&Tensor>, k: usize, sigmoid: bool, scale: f32) -> Tensor {
+        self.moe_topk_ex(bias, k, sigmoid, scale, true)
+    }
+
+    /// [`Tensor::moe_topk`] with explicit control over renormalisation.
+    ///
+    /// `norm = true` divides the selected scores by their sum, so the routed weights sum to `scale`.
+    /// `norm = false` uses the raw scores — the selected top-k probabilities out of a softmax over ALL
+    /// experts, which sum to LESS than 1.
+    ///
+    /// This is not a tuning knob. llama.cpp reads it as `expert_weights_norm`, and it is **absent from
+    /// DeepSeek-V2 checkpoints**, where it defaults to false. Renormalising anyway rescales every
+    /// routed contribution by `1/Σp` — a token whose top-6 experts captured 40% of the mass gets its
+    /// MoE output multiplied by 2.5. Nothing errors; the model is simply a different model.
+    pub fn moe_topk_ex(&self, bias: Option<&Tensor>, k: usize, sigmoid: bool, scale: f32, norm: bool) -> Tensor {
         let x = self.contiguous();
         let (t, ne) = if x.shape.len() == 2 { (x.shape[0], x.shape[1]) } else { (1, x.numel()) };
         assert!((1..=8).contains(&k), "k must be 1..=8");
@@ -1589,7 +1603,7 @@ impl Tensor {
         };
         run(&self.ctx, MOE_TOPK_WGSL, "moe_topk",
             &[x.buf.as_ref(), bias_buf.as_ref(), &out,
-              &unibuf(&self.ctx, &[ne as u32, k as u32, sigmoid as u32, bias.is_some() as u32, scale.to_bits(), t as u32, 0, 0])],
+              &unibuf(&self.ctx, &[ne as u32, k as u32, sigmoid as u32, bias.is_some() as u32, scale.to_bits(), t as u32, norm as u32, 0])],
             (t as u32, 1, 1));
         Tensor::from_parts(&self.ctx, out, vec![t, 2 * k])
     }
@@ -2432,7 +2446,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out[ob + s] = sc; out[ob + k + s] = f32(bi);
         wsum = wsum + sc;
     }
-    for (var s = 0u; s < k; s = s + 1u) { out[ob + s] = out[ob + s] / wsum * scale; }
+    // info[1].z = renormalise. DeepSeek-V2 omits `expert_weights_norm`, which llama.cpp defaults to
+    // false: the routed weights stay the raw top-k probabilities and do NOT sum to 1.
+    let den = select(1.0, wsum, info[1].z != 0u);
+    for (var s = 0u; s < k; s = s + 1u) { out[ob + s] = out[ob + s] / den * scale; }
 }
 "#;
 
