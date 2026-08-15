@@ -15,12 +15,12 @@ name = "ferric-serve"
 path = "src/main.rs"
 
 [dependencies]
-ferric-core = { path = "../ferric-core", version = "0.1" }
-ferric-tensor = { path = "../ferric-tensor", version = "0.1" }
-ferric-gguf = { path = "../ferric-gguf", version = "0.1" }
-ferric-llama = { path = "../ferric-llama", version = "0.1" }
-ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.1" }
-ferric-agent = { path = "../ferric-agent", version = "0.1" }
+ferric-core = { path = "../ferric-core", version = "0.3" }
+ferric-tensor = { path = "../ferric-tensor", version = "0.3" }
+ferric-gguf = { path = "../ferric-gguf", version = "0.3" }
+ferric-llama = { path = "../ferric-llama", version = "0.3" }
+ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.3" }
+ferric-agent = { path = "../ferric-agent", version = "0.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 pollster = "0.4"
