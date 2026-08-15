@@ -142,11 +142,16 @@ pub const REGISTRY: &[Arch] = &[
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
-           note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order" },
+           note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order. ⚠ the YaRN long-rope \
+                  SUB-PATH is unverified: it ran through rope_scaled, which applied no rotation at \
+                  all until 2026-08-15, so any earlier check passed without exercising it" },
     Arch { name: "qwen35moe", runtime: Runtime::Hybrid, status: Status::Verified,
            note: "as qwen35 with an MoE FFN" },
     Arch { name: "laguna", runtime: Runtime::Hybrid, status: Status::Loads,
-           note: "shares the qwen35 runtime" },
+           note: "shares the qwen35 runtime; uses YaRN (factor 32, orig ctx 8192) so it DOES exercise \
+                  the rope_scaled path fixed on 2026-08-15. ⚠ NO REFERENCE AVAILABLE: llama.cpp \
+                  refuses this file with \"unknown model architecture: laguna\", so it cannot be \
+                  diffed against anything and must not be promoted on output that merely looks right" },
 
     // ---- short-conv hybrid ---------------------------------------------------------------
     Arch { name: "lfm2", runtime: Runtime::Lfm2, status: Status::Verified,
