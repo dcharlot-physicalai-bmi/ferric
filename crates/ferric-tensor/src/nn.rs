@@ -65,18 +65,25 @@ fn softcapped(scores: Tensor, cap: f32) -> Tensor { if cap > 0.0 { scores.softca
 /// cache (they contribute 0), so this is exact — just not memory-optimized.
 pub fn causal_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize, window: usize, softcap: f32) -> Tensor {
     let t = q.shape[0];
+    // The cache may hold MORE rows than this query block: chunked prefill feeds `t` new rows against
+    // a cache already `s` long. This used to reshape k/v to [t, ..] unconditionally, which panics on
+    // numel the moment t != s — so windowed models could not be chunk-prefilled at all, while the
+    // non-windowed path already handled it. Query i sits at absolute position `off + i`.
+    let s = k.shape[0];
+    assert!(s >= t, "cache ({s}) cannot be shorter than the query block ({t})");
+    let off = s - t;
     let d = q.shape[1];
     let dh = d / n_heads;
     let g = n_heads / n_kv_heads;
     let scale = 1.0 / (dh as f32).sqrt();
     let qh = q.reshape(&[t, n_heads, dh]).permute(&[1, 0, 2]).contiguous();
     let kv_heads = |x: &Tensor| {
-        let hx = x.reshape(&[t, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous();
-        hx.reshape(&[n_kv_heads, 1, t, dh]).broadcast_to(&[n_kv_heads, g, t, dh]).reshape(&[n_heads, t, dh])
+        let hx = x.reshape(&[s, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous();
+        hx.reshape(&[n_kv_heads, 1, s, dh]).broadcast_to(&[n_kv_heads, g, s, dh]).reshape(&[n_heads, s, dh])
     };
     let (kh, vh) = (kv_heads(k), kv_heads(v));
     let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap);
-    let probs = scores.add(&sliding_causal_mask(q, t, window)).softmax(2);
+    let probs = scores.add(&sliding_causal_mask_off(q, t, s, off, window)).softmax(2);
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
@@ -110,13 +117,21 @@ fn probs_matmul(probs: Tensor, vh: &Tensor, n_heads: usize, d: usize) -> Tensor 
 
 /// Additive banded mask: −inf where `j > i` (future) or `i − j >= window` (older than the window).
 fn sliding_causal_mask(like: &Tensor, t: usize, window: usize) -> Tensor {
-    let mut m = vec![0.0f32; t * t];
+    sliding_causal_mask_off(like, t, t, 0, window)
+}
+
+/// Banded causal mask for a query block that starts at absolute position `off` against `s` cached
+/// keys. Query `i` is at position `off + i`; key `j` at position `j`. `off == 0` (t == s) reproduces
+/// the whole-history mask exactly.
+fn sliding_causal_mask_off(like: &Tensor, t: usize, s: usize, off: usize, window: usize) -> Tensor {
+    let mut m = vec![0.0f32; t * s];
     for i in 0..t {
-        for j in 0..t {
-            if j > i || (window > 0 && i - j >= window) { m[i * t + j] = -1e30; }
+        let qi = off + i;
+        for j in 0..s {
+            if j > qi || (window > 0 && qi - j >= window) { m[i * s + j] = -1e30; }
         }
     }
-    Tensor::from_vec(&like.ctx_arc(), &m, &[t, t])
+    Tensor::from_vec(&like.ctx_arc(), &m, &[t, s])
 }
 
 /// Incremental-decode attention against a KV cache (one new query token vs all cached keys/values).
@@ -465,4 +480,51 @@ pub fn causal_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n
     let mask = Tensor::from_vec(&q.ctx_arc(), &m, &[t, s]);
     let probs = scores.add(&mask).softmax(2);
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
+}
+
+/// Chunked windowed attention must equal whole-history windowed attention.
+///
+/// This is the property that makes chunked prefill safe on a sliding-window model: feeding the rows
+/// in slices against a growing cache has to produce the SAME output as feeding them at once. It
+/// failed before by panicking on numel rather than returning a wrong answer, which was lucky.
+#[cfg(test)]
+mod windowed_chunk_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn chunked_equals_whole_history() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED chunked windowed attention: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (t, nh, nkv, dh, window) = (12usize, 4usize, 2usize, 8usize, 5usize);
+        let d = nh * dh;
+        let mk = |n: usize, seed: f32, cols: usize| {
+            let v: Vec<f32> = (0..n * cols).map(|i| ((i as f32 + seed) * 0.13).sin()).collect();
+            Tensor::from_vec(&ctx, &v, &[n, cols])
+        };
+        let (q, k, v) = (mk(t, 1.0, d), mk(t, 2.0, nkv * dh), mk(t, 3.0, nkv * dh));
+
+        let whole = pollster::block_on(causal_attention_win(&q, &k, &v, nh, nkv, window, 0.0).to_vec());
+
+        // Same rows, fed in chunks against a cache that grows: q chunk [off, off+len) sees k/v[0, off+len).
+        let mut chunked: Vec<f32> = Vec::new();
+        let mut off = 0usize;
+        while off < t {
+            let len = 5.min(t - off);
+            let s = off + len;
+            let qc = q.narrow(0, off, len).contiguous();
+            let kc = k.narrow(0, 0, s).contiguous();
+            let vc = v.narrow(0, 0, s).contiguous();
+            chunked.extend(pollster::block_on(causal_attention_win(&qc, &kc, &vc, nh, nkv, window, 0.0).to_vec()));
+            off = s;
+        }
+        assert_eq!(chunked.len(), whole.len());
+        let scale = whole.iter().fold(1e-6f32, |a, &x| a.max(x.abs()));
+        let err = chunked.iter().zip(&whole).fold(0f32, |a, (&c, &w)| a.max((c - w).abs())) / scale;
+        eprintln!("windowed chunked vs whole: rel max|Δ| {err:.3e} over {} values", whole.len());
+        assert!(err < 1e-5, "chunked windowed attention differs from whole-history by {err:.3e}");
+    }
 }

@@ -87,14 +87,13 @@ async fn run() {
     // computation with bounded peak memory — only the LAST chunk's logits are needed.
     let t0 = std::time::Instant::now();
     let mut cache = Cache::new(&m.cfg);
-    // ⚠ Chunking DOES NOT WORK on this model and the default is therefore the whole sequence.
-    // Muse Glimmer's local layers use `causal_attention_win`, which assumes the query block covers
-    // the whole history; with t=256 against a cache that has grown to 512 it reshapes to the wrong
-    // numel and panics. The non-windowed path is fine (`chunked_attention` delegates to
-    // `causal_attention` exactly when q covers the history), so this is a gap in the WINDOWED path,
-    // not in chunked prefill as an idea. Left as an env knob so the fix can be tested against it.
+    // Chunked by default. A single 1076-row forward through a 52-layer 6656-wide model allocates
+    // every layer's activations at full sequence length and gets SIGKILLed (exit 137, no message);
+    // the cache already carries state across calls, so slices are the same computation with bounded
+    // peak memory. `causal_attention_win` now accepts t < s (query block at offset s-t) and is
+    // asserted bit-identical to the whole-history path, so this is safe on windowed models too.
     let chunk: usize = std::env::var("FERRIC_PREFILL_CHUNK").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(t_total);
+        .and_then(|v| v.parse().ok()).unwrap_or(256);
     let mut logits: Vec<f32> = Vec::new();
     let mut off = 0usize;
     while off < t_total {
