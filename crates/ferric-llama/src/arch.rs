@@ -115,8 +115,16 @@ pub const REGISTRY: &[Arch] = &[
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked, incl. per-head QK RMSNorm" },
-    Arch { name: "llama", runtime: Runtime::Dense, status: Status::Verified,
-           note: "reference-checked; SentencePiece vocab path" },
+    // ⚠ DOWNGRADED 2026-08-15. Was marked `verified`. Llama-3.2-1B-Instruct Q4_K_M Q4_K_M generates
+    // "The capital of France is located in the United States" where llama-cli --temp 0 on the same
+    // ids gives "Paris." — top-1 Ġlocated 14.7175 vs ĠParis 14.6797, so the distribution is nearly
+    // right and the argmax is not. Independent of both rope fixes: identical output with rope_freqs
+    // disabled AND with NORM vs NEOX pairing, so the cause is elsewhere in the dense path.
+    // Whatever the original verification covered, it did not cover this checkpoint.
+    Arch { name: "llama", runtime: Runtime::Dense, status: Status::Loads,
+           note: "⚠ WRONG on Llama-3.2-1B-Instruct: diverges from llama-cli on a trivial factual \
+                  prompt. Earlier `verified` claim did not hold for this checkpoint. Under \
+                  investigation; SentencePiece/BPE vocab path" },
     Arch { name: "phi3", runtime: Runtime::Dense, status: Status::Loads,
            note: "shares the dense path and the SPM vocab; not diffed against the reference" },
     Arch { name: "gemma", runtime: Runtime::Dense, status: Status::Loads,

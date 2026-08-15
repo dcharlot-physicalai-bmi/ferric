@@ -135,7 +135,7 @@ impl Cfg {
             logit_scale: f("logit_scale").unwrap_or(1.0),
             post_norms: g.tensor("blk.0.post_attention_norm.weight").is_some(),
             nope_global: arch == "muse-glimmer",
-            rope_interleaved: arch == "muse-glimmer",
+            rope_interleaved: arch == "muse-glimmer" || std::env::var("FERRIC_ROPE_NORM").is_ok(),
             post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
             embd_rmsnorm: arch == "muse-glimmer",
         })
@@ -468,12 +468,12 @@ impl Qwen3 {
             //
             // The qwen35 path is unaffected: `yarn_freq_scale` there builds
             // `(1/factor)·(1−ramp) + ramp`, already in multiplier form.
-            rope_freqs: g.tensor("rope_freqs.weight").map(|t| {
+            rope_freqs: if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { None } else { g.tensor("rope_freqs.weight").map(|t| {
                 let n = t.dims[0] as usize;
                 let f = g.dequant("rope_freqs.weight")?;
                 let inv: Vec<f32> = f[..n].iter().map(|&x| if x != 0.0 { 1.0 / x } else { 1.0 }).collect();
                 Ok::<_, String>(Tensor::from_vec(ctx, &inv, &[n]))
-            }).transpose()?,
+            }).transpose()? },
             cfg, ctx: ctx.clone(), layers, stream: None,
         })
     }
