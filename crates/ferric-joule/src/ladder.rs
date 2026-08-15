@@ -111,11 +111,20 @@ impl<'a, T> Ladder<'a, T> {
         (None, trail)
     }
 
-    /// The success probability the cheap rung must exceed for escalation to be worth it.
+    /// The success probability the cheap rung must exceed for escalation to be worth it, **against a
+    /// single next rung**.
     ///
     /// `p > E_cheap / E_dear`. A rung 100x cheaper needs to be right only 1% of the time. Compute this
     /// before deploying a ladder, because a ladder whose cheap rung is nearly as expensive as its dear
     /// one is strictly worse than not routing.
+    ///
+    /// ## ⚠ This is conservative on a ladder deeper than two rungs
+    ///
+    /// The denominator here is the next rung's cost. The correct denominator is the expected cost of
+    /// the *entire remaining ladder*, `E(k+1) = E_{k+1} + (1-p_{k+1})·E(k+2) ≥ E_{k+1}`, so the true
+    /// threshold is **lower** than this one and the error is one-sided: this function declares a cheap
+    /// rung not worth trying in cases where trying it is demonstrably cheaper. Use
+    /// [`crate::router::Profile::break_even`] on any ladder with three or more rungs.
     pub fn break_even(e_cheap: f64, e_dear: f64) -> f64 {
         if e_dear <= 0.0 { return f64::NAN; }
         e_cheap / e_dear

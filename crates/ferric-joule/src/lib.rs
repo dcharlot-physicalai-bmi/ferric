@@ -38,9 +38,11 @@
 pub mod budget;
 pub mod fabric;
 pub mod ladder;
+pub mod router;
 pub use budget::{Budget, Budgeted, Outcome, Stop};
 pub use fabric::{Capability, Fabric, Split, Unit};
 pub use ladder::{Ladder, Routed, Trail};
+pub use router::{Calibration, Plan, PlanError, Predictor, Profile, Router, RungProfile, Uniform};
 
 use std::time::{Duration, Instant};
 

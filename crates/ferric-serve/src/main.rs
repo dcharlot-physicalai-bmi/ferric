@@ -32,19 +32,24 @@ use ferric_tensor::Tensor;
 /// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
 /// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
 /// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
-enum Model { Dense(Qwen3), Hybrid(Qwen35) }
-enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache) }
+enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2) }
+enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache) }
 impl Model {
-    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab } }
-    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer } }
-    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd } }
+    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab } }
+    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer } }
+    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d } }
     fn new_cache(&self) -> ModelCache {
-        match self { Model::Dense(m) => ModelCache::Dense(qwen3::Cache::new(&m.cfg)), Model::Hybrid(m) => ModelCache::Hybrid(qwen35::Cache::new(&m.cfg)) }
+        match self {
+            Model::Dense(m) => ModelCache::Dense(qwen3::Cache::new(&m.cfg)),
+            Model::Hybrid(m) => ModelCache::Hybrid(qwen35::Cache::new(&m.cfg)),
+            Model::Lfm2(m) => ModelCache::Lfm2(ferric_llama::lfm2::Cache::new(&m.cfg)),
+        }
     }
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
         match (self, cache) {
             (Model::Dense(m), ModelCache::Dense(c)) => m.forward_cached(tokens, c),
             (Model::Hybrid(m), ModelCache::Hybrid(c)) => m.forward_cached(tokens, c, m.cfg.n_layer),
+            (Model::Lfm2(m), ModelCache::Lfm2(c)) => m.forward(tokens, c),
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
@@ -56,6 +61,10 @@ impl Model {
             Model::Hybrid(m) => {
                 let mut c = qwen35::Cache::new(&m.cfg);
                 m.forward_hidden_cached(ids, &mut c, m.cfg.n_layer).rmsnorm(&m.out_norm, m.cfg.eps)
+            }
+            Model::Lfm2(m) => {
+                let mut c = ferric_llama::lfm2::Cache::new(&m.cfg);
+                m.forward_hidden_cached(ids, &mut c)
             }
         }
     }
@@ -161,15 +170,26 @@ impl Engine {
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
         // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
         for t in ["<end_of_turn>", "<|end|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
-        // Dispatch on architecture: the Qwen3.5/3.6 hybrid GGUFs declare `general.architecture = qwen35`
-        // (dense FFN) or `qwen35moe` (mixture-of-experts FFN) — both run on the Qwen35 hybrid runtime;
-        // everything else (qwen2/qwen3/llama/gemma/phi) is the dense path.
+        // Dispatch through the architecture REGISTRY, which refuses anything this runtime has not been
+        // taught. The previous form was `if starts_with("qwen35") … else { Dense }`, and that `else`
+        // was a catch-all: a gemma4 / deepseek2 / glm4 / minimax / hunyuan checkpoint loaded as a dense
+        // Qwen3, took whichever metadata keys happened to share names, defaulted the rest, and emitted
+        // fluent, confident, WRONG text with no error anywhere. Refusing is the feature.
         let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        let model = if arch.starts_with("qwen35") || arch == "laguna" {
-            Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}")))
-        } else {
-            Model::Dense(Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}")))
+        let entry = ferric_llama::arch::resolve(&arch).unwrap_or_else(|e| panic!("{e}"));
+        let model = match entry.runtime {
+            ferric_llama::arch::Runtime::Hybrid =>
+                Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}"))),
+            ferric_llama::arch::Runtime::Dense =>
+                Model::Dense(Qwen3::load(&ctx, &g).unwrap_or_else(|e| panic!("load model: {e}"))),
+            ferric_llama::arch::Runtime::Lfm2 =>
+                Model::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).unwrap_or_else(|e| panic!("load lfm2: {e}"))),
+            // Cosmos loads from safetensors, so it cannot arrive down a GGUF path at all.
+            ferric_llama::arch::Runtime::Cosmos =>
+                panic!("{arch} loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
         };
+        eprintln!("arch {arch:?} -> {} runtime ({}) — {}",
+                  entry.runtime.label(), entry.status.label(), entry.note);
         let u2b = byte_decoder();
         // Precompute each token's raw bytes (chars → bytes via u2b). A token containing any char not in
         // the byte map is a special token (e.g. <|im_end|>) → None → disallowed under a constraint.

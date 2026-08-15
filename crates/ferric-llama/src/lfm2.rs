@@ -152,6 +152,13 @@ impl Lfm2 {
     /// Feed `tokens`, carrying attention KV and conv state in `cache`. Prompt once, then one token
     /// per step — the per-token cost does not grow with how much has already been fed.
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+        self.forward_hidden_cached(tokens, cache).matmul_q(&self.head)
+    }
+
+    /// The final normed hidden state, before the output head — what LAST-pooling embedding
+    /// references pool over. Split out rather than duplicated so the served path and the embedding
+    /// path cannot drift: `forward` is this plus one matmul.
+    pub fn forward_hidden_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         let (d, n_head, head_dim, eps) = (self.cfg.d, self.cfg.n_head, self.cfg.head_dim, self.cfg.eps);
         let t = tokens.len();
         let pos = cache.pos;
@@ -205,6 +212,6 @@ impl Lfm2 {
             x = x.add(&hn.matmul_q(&blk.gate).silu().mul(&hn.matmul_q(&blk.up)).matmul_q(&blk.down));
         }
         cache.pos += t;
-        x.rmsnorm(&self.out_norm, eps).matmul_q(&self.head)
+        x.rmsnorm(&self.out_norm, eps)
     }
 }

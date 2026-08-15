@@ -92,3 +92,5 @@ pub mod qwen3;
 pub mod lfm2; // Liquid LFM2/LFM2.5 with real KV + conv state
 pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 pub mod unipc;
+
+pub mod arch; // general.architecture registry: what runs, and the refusal for what does not
