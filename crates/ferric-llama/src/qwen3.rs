@@ -27,6 +27,19 @@ pub(crate) fn dump(tag: &str, il: usize, t: &Tensor) {
     println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.6}", t.shape, v.len());
 }
 
+
+/// Whether `arch` uses NORM (interleaved, partners `2c`/`2c+1`) rather than NEOX (split-half) rope.
+///
+/// This loader defaults to NEOX because it was written around the Qwen family, so every NORM
+/// architecture it picks up rotates the wrong partners until it is named here. That is how `llama`
+/// held a `verified` badge while answering "The capital of France is located in the United States" —
+/// beating " Paris" by 0.04 logits, near enough to read as working.
+///
+/// Audited against llama.cpp's `llama_model_rope_type` switch, 2026-08-15.
+pub(crate) fn rope_is_interleaved(arch: &str) -> bool {
+    matches!(arch, "muse-glimmer" | "llama")
+}
+
 pub struct Cfg {
     pub n_embd: usize,
     pub n_layer: usize,
@@ -154,8 +167,7 @@ impl Cfg {
             // is located in the United States" with NEOX and "Paris. The Eiffel Tower is a famous"
             // with NORM. Ġlocated beat ĠParis by 0.04 logits — near-miss, not noise, which is exactly
             // why it read as working.
-            rope_interleaved: matches!(arch.as_str(), "muse-glimmer" | "llama")
-                || std::env::var("FERRIC_ROPE_NORM").is_ok(),
+            rope_interleaved: rope_is_interleaved(&arch) || std::env::var("FERRIC_ROPE_NORM").is_ok(),
             post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
             embd_rmsnorm: arch == "muse-glimmer",
         })
@@ -1021,5 +1033,39 @@ impl Qwen3 {
         let mut cache = Cache::new(&self.cfg);
         let x = self.run_layers(tokens, &mut cache);
         batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps))
+    }
+}
+
+#[cfg(test)]
+mod rope_type_tests {
+    use super::rope_is_interleaved;
+
+    /// Architectures served by this loader, with the rope type llama.cpp resolves for each.
+    /// Audited against its `llama_model_rope_type` switch on 2026-08-15.
+    const NORM_ARCHES: &[&str] = &["llama", "muse-glimmer"];
+    const NEOX_ARCHES: &[&str] = &["qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "gemma4", "lfm2"];
+
+    #[test]
+    fn every_norm_arch_is_interleaved_and_every_neox_arch_is_not() {
+        // Calls the SHIPPED predicate, not a copy of it. An earlier version of this test kept its own
+        // copy and passed happily when the real one was mutated — a check that cannot fail is worse
+        // than no check, because it also stops anyone else from writing a real one.
+        for a in NORM_ARCHES {
+            assert!(rope_is_interleaved(a), "{a} is NORM in llama.cpp; this loader would rotate NEOX pairs");
+        }
+        for a in NEOX_ARCHES {
+            assert!(!rope_is_interleaved(a), "{a} is NEOX in llama.cpp; this loader would rotate NORM pairs");
+        }
+    }
+
+    #[test]
+    fn every_dense_arch_in_the_registry_has_an_audited_rope_type() {
+        for a in NORM_ARCHES { assert!(!NEOX_ARCHES.contains(a), "{a} is in both lists"); }
+        for e in crate::arch::REGISTRY {
+            if e.runtime == crate::arch::Runtime::Dense {
+                assert!(NORM_ARCHES.contains(&e.name) || NEOX_ARCHES.contains(&e.name),
+                        "{} is served by the dense loader but its rope type was never audited", e.name);
+            }
+        }
     }
 }
