@@ -482,10 +482,30 @@ impl Tensor {
     /// RoPE with a per-frequency scale (`freq_scale` is `[head_dim/2]`) — Llama-3's rope-scaling, where
     /// `rope_freqs.weight` multiplies each inverse frequency to stretch the effective context window.
     pub fn rope_scaled(&self, freq_scale: &Tensor, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        self.rope_scaled_impl(freq_scale, n_heads, head_dim, base, offset, false)
+    }
+
+    /// [`Tensor::rope_scaled`] with **interleaved (ggml NORM)** pairing: partners are `2c` and `2c+1`.
+    ///
+    /// llama.cpp resolves each architecture to NORM or NEOX, and `deepseek2` is NORM — listed under
+    /// "normal RoPE, operating on pairs of consecutive head values". Running the split-half pairing on
+    /// those rows rotates the wrong partners: finite logits, no error, wrong text. A YaRN model needs
+    /// both the per-dim scale AND the right pairing, and having only the split-half scaled kernel is
+    /// how you silently get one of the two.
+    pub fn rope_scaled_interleaved(&self, freq_scale: &Tensor, n_heads: usize, head_dim: usize, base: f32, offset: usize) -> Tensor {
+        self.rope_scaled_impl(freq_scale, n_heads, head_dim, base, offset, true)
+    }
+
+    fn rope_scaled_impl(&self, freq_scale: &Tensor, n_heads: usize, head_dim: usize, base: f32, offset: usize, interleaved: bool) -> Tensor {
         let c = self.contiguous();
         let t = c.numel() / (n_heads * head_dim);
         let out = empty(&self.ctx, c.numel());
-        run(&self.ctx, ROPE_SCALED_WGSL, "rope_scaled",
+        let src = if interleaved {
+            ROPE_SCALED_WGSL.replace("__PAIRLO__", "2u * c").replace("__PAIRHI__", "2u * c + 1u")
+        } else {
+            ROPE_SCALED_WGSL.replace("__PAIRLO__", "c").replace("__PAIRHI__", "c + half")
+        };
+        run(&self.ctx, &src, "rope_scaled",
             &[c.buf.as_ref(), &out, freq_scale.contiguous().buf.as_ref(),
               &u32buf(&self.ctx, &[t as u32, n_heads as u32, head_dim as u32, base.to_bits(), offset as u32])],
             groups(t * n_heads));
@@ -1929,9 +1949,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // so a scalar base + row index cannot express it. info[8 + i] is that row's absolute position;
         // the single-sequence path fills it with off + i and is unchanged.
         let ang = f32(info[7u + i]) * inv; let cs = cos(ang); let sn = sin(ang);
-        let x1 = x[o + c]; let x2 = x[o + c + half];
-        out[o + c] = x1 * cs - x2 * sn;
-        out[o + c + half] = x2 * cs + x1 * sn;
+        let lo = __PAIRLO__; let hi = __PAIRHI__;
+        let x1 = x[o + lo]; let x2 = x[o + hi];
+        out[o + lo] = x1 * cs - x2 * sn;
+        out[o + hi] = x2 * cs + x1 * sn;
     }
 }
 "#;

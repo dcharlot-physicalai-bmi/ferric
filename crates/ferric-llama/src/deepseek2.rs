@@ -332,9 +332,12 @@ impl DeepSeek2 {
     /// attention scale the way `mscale²` can.
     fn rope_pe(&self, x: &Tensor, heads: usize, pos: usize) -> Tensor {
         let cfg = &self.cfg;
+        // ⚠ INTERLEAVED. llama.cpp lists deepseek2 under "normal RoPE, operating on pairs of
+        // consecutive head values" (ROPE_TYPE_NORM), not the split-half NEOX pairing every Qwen-family
+        // model here uses. Rotating the wrong partners produces finite logits and wrong text.
         let r = match &self.yarn {
-            Some(fs) => x.rope_scaled(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
-            None => x.rope(heads, cfg.qk_rope, cfg.rope_base, pos),
+            Some(fs) => x.rope_scaled_interleaved(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
+            None => x.rope_interleaved(heads, cfg.qk_rope, cfg.rope_base, pos),
         };
         let af = cfg.attn_factor();
         if (af - 1.0).abs() < 1e-9 { r } else { r.mul(&r.scalar(af)) }
