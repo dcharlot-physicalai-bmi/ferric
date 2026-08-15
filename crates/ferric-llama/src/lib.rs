@@ -89,4 +89,5 @@ pub mod stream;
 pub mod cosmos;
 pub mod qwen35;
 pub mod qwen3;
+pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 pub mod unipc;

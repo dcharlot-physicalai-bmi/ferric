@@ -466,7 +466,15 @@ impl Qwen3 {
         })
     }
 
-    pub fn embed(&self, tokens: &[u32]) -> Tensor {
+    /// `embed` without the weightless embedding norm — the row gather only.
+    ///
+    /// The token path normalises immediately; the multimodal path must not, because the norm has to
+    /// see the image rows too. Both call this.
+    pub fn embed_raw(&self, tokens: &[u32]) -> Tensor { self.embed_inner(tokens, false) }
+
+    pub fn embed(&self, tokens: &[u32]) -> Tensor { self.embed_inner(tokens, true) }
+
+    fn embed_inner(&self, tokens: &[u32], norm: bool) -> Tensor {
         let d = self.cfg.n_embd;
         // Gather + dequantize just the prompt's rows on the CPU, in whatever format the embedding
         // table is stored (Q2_0/Q4_K/…) — beats parking the whole table on the GPU for a gather.
@@ -488,7 +496,7 @@ impl Qwen3 {
         if self.cfg.embd_scale != 1.0 { for x in &mut v { *x *= self.cfg.embd_scale; } }
         // Muse Glimmer normalises the embedding rows to unit RMS with NO learned weight before the
         // first layer. Done on the CPU here because the rows were just dequantised here anyway.
-        if self.cfg.embd_rmsnorm && std::env::var("FERRIC_NO_EMBDNORM").is_err() {
+        if norm && self.cfg.embd_rmsnorm && std::env::var("FERRIC_NO_EMBDNORM").is_err() {
             let eps = self.cfg.eps;
             for row in v.chunks_mut(d) {
                 let ms = row.iter().map(|x| x * x).sum::<f32>() / d as f32;
@@ -861,7 +869,13 @@ impl Qwen3 {
         assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
         let t = x.shape[0];
         let pos = cache.pos;
-        let mut h = x.clone();
+        // The weightless embedding RMS norm applies to the WHOLE input row block, image rows
+        // included: llama.cpp normalises the OUTPUT of build_inp_embd, and build_inp_embd is exactly
+        // where multimodal embeddings are substituted for token ids. Skipping it here mixes unit-RMS
+        // text rows with a vision adapter's raw output (measured -44..86 on this model) and yields
+        // fluent text about the wrong subject — which is why `embed_tokens` returns RAW rows and the
+        // normalisation happens once, here, after the splice.
+        let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
             h = self.apply_layer(&h, &l, &mut cache.kv[il], pos, il);
@@ -870,8 +884,12 @@ impl Qwen3 {
         batch(&self.ctx, || self.head(&h))
     }
 
-    /// The embedding rows for `tokens`, so a caller can splice image rows in beside them.
-    pub fn embed_tokens(&self, tokens: &[u32]) -> Tensor { self.embed(tokens) }
+    /// **Raw** embedding rows for `tokens` — deliberately WITHOUT the weightless embedding norm.
+    ///
+    /// The norm belongs after the splice, applied once to text and image rows together, because that
+    /// is where the reference applies it. Normalising here would normalise the text twice and the
+    /// image never.
+    pub fn embed_tokens(&self, tokens: &[u32]) -> Tensor { self.embed_raw(tokens) }
 
     /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step. Returns logits.
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {

@@ -306,6 +306,18 @@ impl Tensor {
         sm.permute(&inv).contiguous()
     }
     /// RMSNorm over the last dim: x/sqrt(mean(x²)+eps)·weight (fused).
+    /// RMS norm with **no learned weight** — `x / sqrt(mean(x²) + eps)`, nothing else.
+    ///
+    /// Distinct from `rmsnorm` with a ones-vector only in that the caller does not have to invent the
+    /// ones. Muse Glimmer applies exactly this to the embedding rows before layer 0 (llama.cpp:
+    /// `build_norm(inpL, nullptr, nullptr, LLM_NORM_RMS, -1)`), and on the multimodal path it lands on
+    /// image rows as well as text ones.
+    pub fn rmsnorm_weightless(&self, eps: f32) -> Tensor {
+        let d = *self.shape.last().expect("rmsnorm_weightless needs a last dim");
+        let ones = Tensor::from_vec(&self.ctx, &vec![1f32; d], &[d]);
+        self.rmsnorm(&ones, eps)
+    }
+
     pub fn rmsnorm(&self, weight: &Tensor, eps: f32) -> Tensor {
         let c = self.contiguous();
         let d = *c.shape.last().unwrap();
