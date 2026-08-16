@@ -277,11 +277,39 @@ and **Ferric is achieving roughly a tenth of available bandwidth**. That ratio i
 not distributed across the system — it is concentrated in `matmul_q4_k_splitk` and
 `matmul_q6_k_splitk`.
 
-**This closes the diagnostic thread.** Orchestration is priced and nearly exhausted (setup 6%,
-dispatch overhead ~13%); the remaining order of magnitude is one kernel family failing to saturate
-memory bandwidth. The next work is a bandwidth-oriented rewrite of the quantised matmul — measured in
-GB/s against the 335 GB/s reference, not in ms/tok — and that is a different discipline from
-everything above it.
+### 7.2.4 ⚠ CORRECTION: most of the gap is NOT the matmul
+
+The paragraph that stood here recommended a bandwidth-oriented rewrite of the quantised matmul on the
+grounds that "the remaining order of magnitude is one kernel family failing to saturate memory
+bandwidth." **That was wrong, and `examples/bandwidth.rs` — which already existed, and whose header
+already stated this gap — refutes it in one run.**
+
+A WGSL compute shader that does *nothing but read*:
+
+```
+  scalar u32 (1 word/iter)   536.9M   4.84ms   111.0 GB/s
+  vec4<u32> (4 words/iter)   536.9M   6.24ms    86.0 GB/s
+```
+
+**111 GB/s is the ceiling for reading memory at all from WGSL here**, against llama.cpp Metal's
+~326 GB/s. (And the vectorised variant is *slower* than the scalar one, which is its own finding.)
+
+So the 10x decomposes into two very different halves:
+
+| | |
+|---|---|
+| 31 → 111 GB/s | **~3.5x, addressable by kernel work** |
+| 111 → 326 GB/s | **~3x, structural to the WGSL/wgpu path** |
+
+A perfect quantised matmul would still leave Ferric ~3x behind llama.cpp on this machine. That is a
+materially different claim from the one it replaces, and it has to be said before anyone promises
+parity: **part of the browser-first bet is paid for in bandwidth**, and the honest positioning is
+joules and reach, not throughput parity with a native Metal kernel.
+
+It also re-teaches the session's own lesson at the level of the codebase rather than the model: this
+was already known and written down in `bandwidth.rs`, and re-deriving it by arithmetic produced a
+confident wrong recommendation that one existing command corrected. **Run the bench that exists
+before proposing the work.**
 
 ### 7.3 The cost model is a template — and its objective is the one Ferric would change
 
