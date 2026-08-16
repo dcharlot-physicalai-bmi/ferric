@@ -872,3 +872,18 @@ fn send_sse(stream: &mut TcpStream, v: &Value) {
     let _ = stream.write_all(format!("data: {}\n\n", v).as_bytes());
     let _ = stream.flush();
 }
+
+/// Compile-time check that the engine crosses a thread boundary.
+///
+/// The continuous-batching wiring's whole shape depends on this. If `Engine` is `Send`, the accept
+/// loop can own it behind a mutex; if it is not, the model must stay pinned to one thread and
+/// requests must arrive by channel. wgpu's `Device`/`Queue` are `Send + Sync` on native but NOT on
+/// wasm32, so this also stops a native-only design from silently breaking the browser build.
+///
+/// Expressed as a const rather than a `#[test]` because **this crate is binary-only and has no lib
+/// target** — none of the server's logic is unit-testable today, which is worth fixing before it
+/// grows a scheduler.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<Engine>;
+};
