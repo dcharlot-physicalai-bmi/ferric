@@ -175,10 +175,33 @@ Separating setup from compute cut MNN's inference time by **7-8% on CPU and 49.5
 (Table 2: MI6 Vulkan 63.6 → 15.8 ms, ↓75.2%; P10 Vulkan 41.0 → 20.7 ms, ↓49.5%), because "setting up
 command buffer and its related command descriptions is time-consuming."
 
-WebGPU has exactly this cost — pipeline creation, bind groups, command encoding. **Ferric's
-64-224 ms/tok against llama.cpp's ~17 is unexplained, and this is the first specific hypothesis with
-a published magnitude behind it.** Measure per-dispatch setup versus compute before optimising
-kernels.
+WebGPU has exactly this cost — pipeline creation, bind groups, command encoding. Ferric's
+64-224 ms/tok against llama.cpp's ~17 was unexplained, and this was the first specific hypothesis
+with a published magnitude behind it.
+
+**⚠ MEASURED, AND REFUTED.** `run_ids` now prints the split. On Llama-3.2-1B, steady-state decode
+(counters reset after prefill):
+
+```
+decode 24 tok in 579.8 ms (24.2 ms/tok)
+host-side setup: 6.0% of wall (35.0 ms of 579.8 ms)
+  pipeline lookup     2.86 ms   bind groups     5.48 ms
+  pass recording      1.13 ms   submit         25.57 ms
+  5808 dispatches in 792 submits (242 dispatches/token)
+```
+
+Host-side setup is **6%**, not 50-75%. Pipelines are already cached by content hash and dispatches
+are already batched ~7:1 into submits, so MNN's GPU win does not transfer — Ferric had mostly done
+this already. The hypothesis was reasonable and wrong, and the measurement cost one run.
+
+**What the same number does expose: 242 dispatches per token** on a 16-layer 1B model — roughly 15
+per layer. Host time for those is cheap, but each carries GPU-side launch latency the host timer
+cannot see; at a conservative 20 µs that is ~5 ms/token, ~20% of the 24.2 ms. And llama.cpp runs this
+same checkpoint at 426.7 tok/s (2.3 ms/tok), a **10x gap**.
+
+So the lead is **operator fusion / dispatch count**, not command-buffer setup — which is MNN's
+*offline graph optimizer* (operator fusion, replacement) rather than its pre-inference stage. Next
+step is `FERRIC_TRACE_KERNELS` to see what those 15 dispatches per layer actually are.
 
 ### 7.3 The cost model is a template — and its objective is the one Ferric would change
 

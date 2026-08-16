@@ -69,11 +69,35 @@ async fn run() {
         .fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32;
     let mut next = am(&logits);
     let mut out = Vec::new();
+    // Reset AFTER prefill so the readout below describes steady-state decode, not one-off warmup.
+    ferric_tensor::reset_host_ns();
+    ferric_tensor::reset_op_counters();
+    let t_dec = std::time::Instant::now();
     for _ in 0..n {
         out.push(next);
         let l = m.forward_cached(&[next], &mut c).to_vec().await;
         next = am(&l);
     }
+    let dt = t_dec.elapsed();
     println!("\ngenerated ids: {out:?}");
+
+    // MNN (arXiv 2002.12418, Table 2) reports that decoupling command-buffer PREPARATION from
+    // execution is worth 7-8% on CPU and 49.5-75.2% on GPU, because "setting up command buffer and
+    // its related command descriptions is time-consuming". WebGPU pays the same tax. Print the split
+    // so the speed gap is answered with a number rather than an assumption.
+    {
+        let (pipe_ns, bg_ns, rec_ns, sub_ns) = ferric_tensor::host_ns();
+        let (disp, subs) = ferric_tensor::op_counters();
+        let host = pipe_ns + bg_ns + rec_ns + sub_ns;
+        let wall = dt.as_nanos() as u64;
+        println!("\ndecode {} tok in {:.1} ms ({:.1} ms/tok)",
+                 out.len(), wall as f64 / 1e6, wall as f64 / 1e6 / out.len().max(1) as f64);
+        println!("host-side setup: {:.1}% of wall ({:.1} ms of {:.1} ms)",
+                 100.0 * host as f64 / wall.max(1) as f64, host as f64 / 1e6, wall as f64 / 1e6);
+        println!("  pipeline lookup {:>8.2} ms   bind groups {:>8.2} ms", pipe_ns as f64 / 1e6, bg_ns as f64 / 1e6);
+        println!("  pass recording  {:>8.2} ms   submit      {:>8.2} ms", rec_ns as f64 / 1e6, sub_ns as f64 / 1e6);
+        println!("  {disp} dispatches in {subs} submits ({:.0} dispatches/token)",
+                 disp as f64 / out.len().max(1) as f64);
+    }
     println!("generated    : {}", out.iter().map(|&t| name(t)).collect::<Vec<_>>().join("|"));
 }
