@@ -98,3 +98,5 @@ pub mod arch; // general.architecture registry: what runs, and the refusal for w
 pub mod gemma4; // Google Gemma 4 (E2B/E4B): per-layer embeddings, shared KV, two head widths
 
 pub mod deepseek2; // DeepSeek-V2/V3/Coder-V2: MLA + DeepSeekMoE
+
+pub mod sched; // continuous batching: admission, retirement, slot reuse
