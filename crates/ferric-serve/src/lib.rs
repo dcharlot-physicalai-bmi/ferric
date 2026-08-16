@@ -57,6 +57,28 @@ impl Model {
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
+    /// Whether this runtime can advance N independent sequences in one forward.
+    ///
+    /// Only the dense path implements `forward_batch` today. The other four runtimes each carry a
+    /// **different** per-sequence state — gated-delta-net recurrence (qwen35), short-conv state
+    /// (lfm2), shared KV where later blocks read an earlier block's cache (gemma4), MLA latent KV with
+    /// asymmetric head widths (deepseek2) — so each needs its own batched forward and its own proof
+    /// that batching did not cross sequences.
+    ///
+    /// This exists so a server that gains continuous batching **falls back to serial** on the
+    /// runtimes that cannot support it, rather than silently mis-batching one. That failure would not
+    /// error: a batched path that leaked across sequences still emits fluent text, which is the whole
+    /// reason `examples/continuous_batching` re-runs every sequence solo and compares.
+    ///
+    /// Written as an exhaustive `match` on purpose — adding a runtime forces a decision here instead
+    /// of inheriting a default.
+    pub(crate) fn supports_batching(&self) -> bool {
+        match self {
+            Model::Dense(_) => true,
+            Model::Hybrid(_) | Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => false,
+        }
+    }
+
     fn forward_hidden(&self, ids: &[u32]) -> Tensor {
         match self {
             Model::Dense(m) => m.forward_hidden(ids),
@@ -909,5 +931,33 @@ mod tests {
         assert!(seen.iter().all(|&s| s), "some byte value has no alias at all");
         // The printable ASCII range must map to itself, or ordinary text decodes to nonsense.
         for b in 0x21u8..=0x7e { assert_eq!(m[&(b as char)], b, "ASCII {b} must be its own alias"); }
+    }
+}
+
+#[cfg(test)]
+mod batching_support {
+    /// Pins which runtimes implement batched decode, against the source rather than against a belief.
+    ///
+    /// An earlier version of this test looped over the other runtimes and asserted nothing — a dead
+    /// loop that read like coverage. That is the same vacuous-guard failure caught in the rope-type
+    /// audit, so this one asserts both directions explicitly.
+    #[test]
+    fn only_the_dense_runtime_implements_batched_decode() {
+        const NEEDLE: &str = "pub fn forward_batch";
+        assert!(include_str!("../../ferric-llama/src/qwen3.rs").contains(NEEDLE),
+                "the dense runtime must implement forward_batch — Model::supports_batching claims it does");
+        for (name, src) in [
+            ("qwen35",    include_str!("../../ferric-llama/src/qwen35.rs")),
+            ("lfm2",      include_str!("../../ferric-llama/src/lfm2.rs")),
+            ("gemma4",    include_str!("../../ferric-llama/src/gemma4.rs")),
+            ("deepseek2", include_str!("../../ferric-llama/src/deepseek2.rs")),
+        ] {
+            assert!(!src.contains(NEEDLE),
+                    "{name} now implements forward_batch — update Model::supports_batching, or the \
+                     server will keep serialising a runtime that could be batched");
+        }
+        // The reverse direction — a runtime losing forward_batch while still claimed — is caught by
+        // the first assertion, and a NEW runtime cannot default to `true` because
+        // Model::supports_batching is an exhaustive match the compiler forces you to extend.
     }
 }
