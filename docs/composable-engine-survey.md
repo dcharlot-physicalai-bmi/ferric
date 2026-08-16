@@ -149,7 +149,69 @@ and has barely reached analytics. Ferric sits in the quadrant China is contestin
 Velox article describes — so MNN, not Velox, is the sharper comparand for "universal on-device
 engine", and the honest differentiators against it remain pure Rust, browser-first, and joules.
 
-## 7. What this survey has not done
+## 7. ⭐ MNN read in full — and it beats Velox as Ferric's model
+
+Read arXiv 2002.12418 (pp. 3-7) rather than the abstract. Three things transfer, and one of them
+replaces the §4 priority-1 recommendation.
+
+### 7.1 Pre-inference: the answer to today's SIGKILL, and it is not Velox's
+
+MNN's central claim rests on an observation Velox cannot make: **in inference the shapes are known
+ahead of time.** "Since input size is determined or can be pre-processed to a target size, MNN can
+infer the exact required memory for the entire graph by virtually walking through all operations and
+summing up all allocation and freeing." It then pre-allocates one pool and reuses it every session.
+
+Velox spills because analytical query shapes are *unpredictable*. MNN pre-allocates because inference
+shapes are *predictable*. **Ferric is inference, so MNN's model fits and Velox's does not.** Today's
+exit-137 SIGKILL was a 1076-row prefill through a 52-layer model — a shape fully knowable before the
+first dispatch. The right fix is a pre-inference pass that computes peak memory and either
+pre-allocates or chooses a chunk size, not a `MemoryArbitrator`, and not a hand-set env var.
+
+**This supersedes §4 item 1.** Read MNN's pre-inference before DataFusion's memory pool.
+
+### 7.2 Preparation-execution decoupling is worth 50-75% on GPU
+
+Separating setup from compute cut MNN's inference time by **7-8% on CPU and 49.5-75.2% on GPU**
+(Table 2: MI6 Vulkan 63.6 → 15.8 ms, ↓75.2%; P10 Vulkan 41.0 → 20.7 ms, ↓49.5%), because "setting up
+command buffer and its related command descriptions is time-consuming."
+
+WebGPU has exactly this cost — pipeline creation, bind groups, command encoding. **Ferric's
+64-224 ms/tok against llama.cpp's ~17 is unexplained, and this is the first specific hypothesis with
+a published magnitude behind it.** Measure per-dispatch setup versus compute before optimising
+kernels.
+
+### 7.3 The cost model is a template — and its objective is the one Ferric would change
+
+MNN selects both algorithm and backend by minimising `C_total = C_algorithm + C_backend`, where
+
+```
+C_op = (MUL / FLOPS) × 1000                for CPU
+C_op = (MUL / FLOPS) × 1000 + t_schedule   for GPU   ← the extra term is command-buffer setup
+```
+
+That is a **time** cost model. `ferric_joule` already argues the objective should be joules, and this
+is the same structure with a different denominator — the identical "same problem, different cost
+function" position taken against Switchyard, but now at kernel/backend granularity rather than
+model-routing granularity. An energy-costed `C_op` picking CPU vs GPU per operator is a concrete,
+unclaimed application of today's router work.
+
+### 7.4 Other specifics worth having
+
+- **Backend abstraction is only 7 methods**: `onCreate`, `onExecuteBegin/End`, `onAcquireBuffer`,
+  `onReleaseBuffer`, `onClearBuffer`, `onCopyBuffer`. Hybrid scheduling falls out — conv on CPU and
+  the following ReLU on GPU *within one inference*. Ferric's `ferric-core::Context` is the analogue;
+  the question is whether it is that small.
+- **Winograd generator, not hardcoded matrices.** MNN notes TFLite/ncnn/Xiaomi hardcode A/B/G for
+  common sizes and "have relatively poor scalability in face of new cases"; MNN generates them for
+  any kernel size (with `f = 0.5` to limit numerical error). Same disease as hardcoding architecture
+  conventions — see §5.
+- **First mobile engine to use Strassen**, applied recursively with an explicit stopping inequality;
+  7.5-13.5% on large matmul (1024³: 1501 → 1299 ms).
+- **Design paradigm (Fig. 6)**: manual search (TFLite/ncnn) vs **semi-automated search (MNN)** vs
+  automated search/auto-tuning (TVM). MNN's pitch is that a cost model gets near-auto-tuned quality
+  without TVM's per-device tuning cost. Ferric is currently in the *manual* column.
+
+## 8. What this survey has not done
 
 - No verification of the ○ rows.
 - No read of Velox's newer siblings **Nimble, Axiom, Collagen** beyond their names.
