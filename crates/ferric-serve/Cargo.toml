@@ -10,6 +10,10 @@ homepage.workspace = true
 keywords = ["llm", "openai", "server", "inference", "ai"]
 categories = ["web-programming", "science"]
 
+[lib]
+name = "ferric_serve"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ferric-serve"
 path = "src/main.rs"
