@@ -96,7 +96,32 @@ Ranked by *adoption blocked per unit of work*, which is not the same as difficul
    second backend tree, not a tuning pass.
 8. **NPU backends** (CoreML/ANE, Hexagon, Ascend) — where on-device inference is going.
 
-## G. Not assessed
+## G. ⭐ RLM makes continuous batching load-bearing, not optional
+
+Verified 2026-08-16. Recursive Language Models (`alexzhang13/rlm`, MIT, 5.5k★) reach local models
+through their OpenAI client — the README says *"For local models, we recommend using vLLM (which
+interfaces with the OpenAI client)"*. `ferric-serve` is OpenAI-compatible, and it works **today, with
+no new code**:
+
+```
+/v1/models           → {"object":"list","data":[{"id":"ferric",…}]}
+/v1/chat/completions → {"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":15,"completion_tokens":1,"total_tokens":16}}
+```
+
+**And that is exactly where the single-request server stops being a nice-to-have gap.** RLM's whole
+shape is fan-out: `rlm_query_batched` spawns parallel sub-calls bounded by `max_concurrent_subcalls`,
+one per slice. Point that at Ferric and every parallel sub-call **serialises**, so the paradigm's
+central move degrades to a sequential loop — while `ferric_joule::recursion` shows the energy saving
+survives (parallelism buys latency, not joules) the *latency* case for recursion collapses entirely.
+
+So the scheduler in `ferric_llama::sched` is not a generic serving improvement. **It is the specific
+thing that makes Ferric usable as an RLM backend**, which is the fastest-moving harness paradigm in
+the field and the one whose reference implementation (`PrimeIntellect-ai/prime-agent`, 16.4k★) is
+being pushed daily. Wiring the scheduler into `ferric-serve` is now the highest-value remaining item
+in §F, ahead of MXFP4.
+
+## H. Not assessed
 
 CPU SIMD kernels; FP8; paged KV internals; guided-decoding coverage vs xgrammar/outlines; audio and
 video multimodal; scheduler fairness and preemption; observability surface.
