@@ -318,6 +318,51 @@ A microbenchmark taken on a busy machine is not a slow measurement, it is a **wr
 nothing about its output says so. Repeat before claiming, and repeat *especially* when the number
 supports a conclusion that would change strategy.
 
+### 7.2.5 ⛔ THIS WAS ALREADY DONE. Read `examples/matvec_roofline.rs` first.
+
+After all of the above, `examples/matvec_roofline.rs` turns out to contain the same investigation,
+already run, already written up — **including the same failure mode I repeated twice tonight.** Its
+header says, of an earlier "14x CPU-bound" claim:
+
+> "**It does not reproduce.** That run happened while the machine was building several cargo targets —
+> a bench on a busy machine is a bench of whatever else is running, **which is a rule this repo
+> already had and I broke anyway**."
+
+That is verbatim what happened to my 111 GB/s reading. The rule was in the repo. It was broken before.
+I broke it again, and then wrote the wrong conclusion into durable memory.
+
+**Its conclusions correct my framing:**
+
+| | |
+|---|---|
+| plain decode loop | **10.81 ms/token** |
+| build phase (host) | 5.79 |
+| await phase (GPU) | 4.95 |
+
+Roughly **balanced**, not GPU-bound. And on kernel quality:
+
+> "fixed cost per matmul call ≈ 0.05 ms, marginal throughput ≈ **340 GB/s**. The small shapes look
+> terrible in GB/s precisely because that fixed host cost dominates them — `lm_head` at 144 MB
+> amortises it and reaches **303 GB/s**; `o_proj` at 0.9 MB cannot and reports 14. Read the column as
+> 'how badly does per-call host overhead hurt this shape', not as kernel quality."
+
+**So the "~31 GB/s matmul" I derived is an aggregate that this file explicitly warns against reading
+as kernel quality.** At shapes large enough to amortise per-call cost the kernel already does
+~303-340 GB/s. The gap is **per-call overhead on small shapes**, not a slow inner loop, and my §7.2.4
+claim that "the entire 10x is addressable by kernel work" overstates it in the other direction.
+
+**The one clean actionable item, already identified and still unfixed:**
+
+> "`run()` allocates a **fresh** uniform/storage buffer for the info array on every dispatch, ~290
+> times per token, costing **1.29 ms — 12% of a decode step** — to move a few dozen bytes."
+
+Verified still present: `unibuf()` calls `create_buffer_init` per dispatch, at 48 call sites. A cached
+or ring-buffered info allocation is a bounded, named, pre-diagnosed 12% that nobody has taken.
+
+**Process rule, now three incidents deep: `ls examples/` before forming a performance hypothesis.**
+Ferric already has `bandwidth`, `matvec_roofline`, `dispatch_vs_submit`, `bench_q2_0`, `autotune`,
+`bench_fuse_mm`. Two of them held answers I spent this evening re-deriving badly.
+
 ## 8. What this survey has not done
 
 - No verification of the ○ rows.
