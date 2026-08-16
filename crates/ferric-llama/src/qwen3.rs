@@ -665,7 +665,12 @@ impl Qwen3 {
         } else {
             let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
             let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
-            (self.rope(&q, nh, offset, l.rope_base), self.rope(&k, nkv, offset, l.rope_base))
+            {
+                let (qr, kr) = (self.rope(&q, nh, offset, l.rope_base), self.rope(&k, nkv, offset, l.rope_base));
+                dump("Qcur_rope", il, &qr);
+                dump("Kcur_rope", il, &kr);
+                (qr, kr)
+            }
         };
 
         // Append the new K/V rows into the grow-in-place cache and read a view over all rows so far.
