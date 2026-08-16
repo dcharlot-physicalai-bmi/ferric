@@ -49,7 +49,14 @@ This is the finding that matters, because browser-first is Ferric's stated diffe
 | Transformers.js v4 | 20B | ~60 | "capable hardware" |
 | hand-tuned WGSL | Qwen 3.5 INT4 | **180** | — |
 | **custom WebGPU kernels** | **LFM2.5-230M** | **1,400** | M4 Max |
-| **Ferric (measured here)** | Llama-3.2 **1B** q4_K_M | **~40** | M5 Max |
+| **Ferric (measured here)** | Llama-3.2 **1B** q4_K_M | **38.6** | M5 Max, 5 runs, 4% spread |
+
+Ferric's figure is verified rather than asserted: 25.3 / 25.6 / 26.3 / 26.3 / 26.4 ms/tok across five
+runs, a **4% spread**. Earlier in the same session the identical command produced 39.8-68.6 ms/tok — a
+**1.7x spread** — and the difference was entirely methodological: `cargo run` in a loop re-checks and
+relinks the binary on every iteration, so the build competes with the thing being timed. **Build once,
+then time.** That single mistake produced every noisy measurement in this repo's recent performance
+notes, including one that was written up as a structural conclusion and had to be retracted.
 
 Two conclusions, and neither is comfortable:
 
