@@ -34,8 +34,14 @@ fn load_avg() -> Option<f64> {
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
+    // ⚠ This used to HARDCODE a Qwen path and ignore argv entirely, so passing any other checkpoint
+    // silently tested Qwen instead. Qwen has no rope_freqs, so the equivalence claim never covered the
+    // scaled-rope branch of attn_batch — a check that passed for the wrong reason.
     let home = std::env::var("HOME").unwrap();
-    let path = format!("{home}/.cache/ferric/hub/Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf");
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        format!("{home}/.cache/ferric/hub/Qwen_Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf")
+    });
+    println!("model: {path}");
     let g = GgufFile::open(&path).unwrap();
     let m = Qwen3::load(&ctx, &g).unwrap();
     let vn = m.cfg.n_vocab;

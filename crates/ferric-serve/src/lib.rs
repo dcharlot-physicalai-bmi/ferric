@@ -74,7 +74,9 @@ impl Model {
     /// of inheriting a default.
     pub(crate) fn supports_batching(&self) -> bool {
         match self {
-            Model::Dense(_) => true,
+            // Dense supports it only when the model does not need scaled or NORM-interleaved rope —
+            // rope_at implements neither, so batching such a model silently diverges from solo decode.
+            Model::Dense(m) => m.batching_supported(),
             Model::Hybrid(_) | Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => false,
         }
     }

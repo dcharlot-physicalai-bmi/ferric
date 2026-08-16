@@ -885,6 +885,15 @@ impl Qwen3 {
         }
     }
 
+    /// Whether [`Self::forward_batch`] is solo-equivalent for this model.
+    ///
+    /// False when the model needs scaled (`rope_freqs`/YaRN) or NORM-interleaved RoPE, because
+    /// `rope_at` — the per-row-position kernel the batched path uses — implements neither. Callers
+    /// should fall back to per-sequence `forward_cached` rather than batching a model this refuses.
+    pub fn batching_supported(&self) -> bool {
+        self.rope_freqs.is_none() && !self.cfg.rope_interleaved
+    }
+
     /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
     ///
     /// `tokens[i]` is the next token for `caches[i]`. Returns `[N, n_vocab]` logits — row `i` belongs to
@@ -895,6 +904,23 @@ impl Qwen3 {
     /// path that crossed sequences would still emit fluent text.
     pub fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
         use ferric_tensor::batch;
+        // ⚠ REFUSE rather than silently diverge. `attn_batch` ropes via `rope_at`, which applies
+        // per-row positions but has NO scaled and NO interleaved variant — so on a model with
+        // `rope_freqs` (every Llama-3.1+) or NORM pairing, the batched path drops the frequency
+        // scaling and rotates the wrong partners while `forward_cached` does neither.
+        //
+        // Demonstrated on Llama-3.2-1B: sequence 0 diverged from solo decode at token 2. It went
+        // unnoticed because `examples/batched_decode` hardcoded a Qwen path and ignored argv, and
+        // Qwen has no rope_freqs — so the equivalence claim never covered this branch.
+        //
+        // A panic is right here: the alternative is fluent, wrong text with no error. Lifting this
+        // needs `rope_at_scaled` / `rope_at_interleaved`, which is the same gap found in
+        // `rope_scaled` one layer along. See `Self::batching_supported`.
+        assert!(self.batching_supported(),
+                "forward_batch is not solo-equivalent on this model: rope_freqs={} interleaved={}. \
+                 rope_at has no scaled/interleaved variant, so the batched path would silently \
+                 diverge from forward_cached. Use forward_cached per sequence until rope_at covers it.",
+                self.rope_freqs.is_some(), self.cfg.rope_interleaved);
         assert_eq!(tokens.len(), caches.len(), "one token per sequence");
         assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
         let mut x = self.embed(tokens);
