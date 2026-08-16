@@ -200,8 +200,36 @@ cannot see; at a conservative 20 µs that is ~5 ms/token, ~20% of the 24.2 ms. A
 same checkpoint at 426.7 tok/s (2.3 ms/tok), a **10x gap**.
 
 So the lead is **operator fusion / dispatch count**, not command-buffer setup — which is MNN's
-*offline graph optimizer* (operator fusion, replacement) rather than its pre-inference stage. Next
-step is `FERRIC_TRACE_KERNELS` to see what those 15 dispatches per layer actually are.
+*offline graph optimizer* (operator fusion, replacement) rather than its pre-inference stage.
+
+### 7.2.1 The dispatch mix, traced
+
+`FERRIC_TRACE_KERNELS=1`, Llama-3.2-1B, one decode token over 16 layers:
+
+| kernel | /token | /layer | |
+|---|---|---|---|
+| `matmul_q4_k_splitk` | 48 | 3 | qkv, o, down |
+| `rmsnorm` | 33 | ~2 | |
+| **`rope_scaled`** | **32** | **2** | q and k dispatched SEPARATELY |
+| `matmul_q6_k_splitk` | 17 | ~1 | + lm_head |
+| `matmul_q4_k_swiglu` | 16 | 1 | gate\|up already fused ✔ |
+| `fattn`, `kv_write2`, `add_rmsnorm` | 16 ea | 1 | already fused ✔ |
+| **`gather`, `cat`, `binary`** | **16 ea** | **1 ea** | **pure data movement** |
+
+Two concrete targets, both bounded:
+
+1. **`gather` + `cat` + `binary` = 48 dispatches/token (20% of all dispatches) doing no arithmetic.**
+   This is the same class of finding that once showed the per-token cost was three `gather` copies
+   per layer rather than the attention everyone assumes; it is down to one, and the remaining three
+   movement kernels per layer are the next slice.
+2. **`rope_scaled` runs twice per layer.** A fused single-dispatch q+k rope already exists, but
+   `fuse_rope` requires `self.rope_freqs.is_none()` — the guard's comment says rope-scaling "goes
+   through a different kernel that has not been shown equivalent". That kernel has now been fixed and
+   verified tensor-exact against `llama-eval-callback` (§ rope work, 2026-08-15), so the guard is
+   revisitable and is worth 16 dispatches/token on every Llama-3.1+ and YaRN model.
+
+Reference point for the whole exercise: llama.cpp runs this same checkpoint at **426.7 tok/s
+(2.3 ms/tok)** against Ferric's 24.2 — a **10x** gap on the same machine.
 
 ### 7.3 The cost model is a template — and its objective is the one Ferric would change
 
