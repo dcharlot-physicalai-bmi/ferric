@@ -39,11 +39,13 @@ pub mod budget;
 pub mod compaction;
 pub mod fabric;
 pub mod ladder;
+pub mod recursion;
 pub mod router;
 pub use budget::{Budget, Budgeted, Outcome, Stop};
 pub use compaction::{Decision, FitError, Policy, StepCost};
 pub use fabric::{Capability, Fabric, Split, Unit};
 pub use ladder::{Ladder, Routed, Trail};
+pub use recursion::{Model as RecursionModel, Shape};
 pub use router::{Calibration, Plan, PlanError, Predictor, Profile, Router, RungProfile, Uniform};
 
 use std::time::{Duration, Instant};
