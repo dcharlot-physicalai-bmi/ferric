@@ -100,6 +100,13 @@ pub struct Cfg {
     /// so the op is within 0.3% of a uniform x16 — but it lands on the RESIDUAL, which the scale-
     /// invariant RMSNorms downstream cannot recover.
     pub embd_rmsnorm: bool,
+    /// YaRN context-extension factor from `rope.scaling.type == "yarn"`; 1.0 means none.
+    ///
+    /// This is a SEPARATE mechanism from the Llama-3 `rope_freqs.weight` tensor, and this loader used
+    /// to implement only that one — so any qwen3-arch checkpoint declaring YaRN (PrismML's Ternary
+    /// Bonsai declares factor 4) silently got no rope scaling at all.
+    pub yarn_factor: f32,
+    pub yarn_orig_ctx: usize,
 }
 
 impl Cfg {
@@ -170,6 +177,9 @@ impl Cfg {
             rope_interleaved: rope_is_interleaved(&arch) || std::env::var("FERRIC_ROPE_NORM").is_ok(),
             post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
             embd_rmsnorm: arch == "muse-glimmer",
+            yarn_factor: if matches!(g.metadata().get(&format!("{arch}.rope.scaling.type")), Some(Meta::Str(t)) if t == "yarn")
+                { f("rope.scaling.factor").unwrap_or(1.0) } else { 1.0 },
+            yarn_orig_ctx: u("rope.scaling.original_context_length").unwrap_or(0),
         })
     }
 }
@@ -500,7 +510,15 @@ impl Qwen3 {
             //
             // The qwen35 path is unaffected: `yarn_freq_scale` there builds
             // `(1/factor)·(1−ramp) + ramp`, already in multiplier form.
-            rope_freqs: if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { None } else { g.tensor("rope_freqs.weight").map(|t| {
+            // YaRN and Llama-3 rope scaling are different mechanisms that both end up as a per-dim
+            // multiplier on the inverse frequency. Llama-3 ships an explicit tensor of DIVISORS;
+            // YaRN is computed from metadata. Only one is ever present.
+            rope_freqs: if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { None }
+                else if g.tensor("rope_freqs.weight").is_none() && cfg.yarn_factor > 1.0 {
+                    let v = crate::qwen35::yarn_freq_scale(cfg.head_dim, cfg.rope_base, cfg.yarn_factor,
+                                                           cfg.yarn_orig_ctx, 32.0, 1.0);
+                    Some(Tensor::from_vec(ctx, &v, &[cfg.head_dim / 2]))
+                } else { g.tensor("rope_freqs.weight").map(|t| {
                 let n = t.dims[0] as usize;
                 let f = g.dequant("rope_freqs.weight")?;
                 let inv: Vec<f32> = f[..n].iter().map(|&x| if x != 0.0 { 1.0 / x } else { 1.0 }).collect();
@@ -554,6 +572,21 @@ impl Qwen3 {
     /// Full RoPE over head_dim (Qwen rotates the whole head). Llama-3 applies its per-frequency
     /// `rope_freqs` scaling; Qwen has none, so it's plain RoPE.
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
+        let r = self.rope_inner(x, n_heads, offset, base);
+        // YaRN scales cos/sin by (1 + 0.1·ln factor). Derivation from llama-context.cpp: the two
+        // adjustments there cancel to yarn_attn_factor = 1.0 for a non-DeepSeek model, and ggml's
+        // `rope_yarn` then re-multiplies by exactly this term inside the kernel. (The same arithmetic
+        // yields 1.0 for deepseek2, which is why that model wants no extra scale.)
+        //
+        // Llama-3 `rope_freqs` scaling carries NO such factor, so this is gated on YaRN specifically.
+        if self.cfg.yarn_factor > 1.0 {
+            let m = 1.0 + 0.1 * self.cfg.yarn_factor.ln();
+            return r.mul(&r.scalar(m));
+        }
+        r
+    }
+
+    fn rope_inner(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
         match &self.rope_freqs {
             // The scaled path must honour the pairing too. It did not: `rope_interleaved` was
             // consulted only in the `None` arm, so any model with rope_freqs (every Llama-3.1+)
