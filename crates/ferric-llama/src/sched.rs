@@ -76,6 +76,18 @@ impl Seq {
 #[derive(Debug)]
 pub struct Scheduler {
     max_batch: usize,
+    /// How many sequences may be admitted on a single step. `None` = fill every free slot at once.
+    ///
+    /// Admission is not free: `forward_batch` is the DECODE step, so each new sequence prefills alone
+    /// before joining. Filling five empty slots in one step therefore pays five sequential prefills
+    /// before any batched decode happens, and that burst is measurable — it is most of why batching
+    /// five short sequences measured 3.07x rather than the ~5x the weight-read argument suggests.
+    ///
+    /// Capping admission spreads that cost across steps. It is a genuine trade, not a free win: a low
+    /// cap reaches a full batch more slowly, so a server that is mostly idle should leave it `None`
+    /// and one under sustained load should cap it. Exposed rather than chosen because only the
+    /// deployment knows which it is.
+    max_admit_per_step: Option<usize>,
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
     next_id: u64,
@@ -90,7 +102,7 @@ impl Scheduler {
     pub fn new(max_batch: usize) -> Scheduler {
         assert!(max_batch > 0, "max_batch must be positive");
         Scheduler {
-            max_batch, waiting: VecDeque::new(), running: Vec::new(),
+            max_batch, max_admit_per_step: None, waiting: VecDeque::new(), running: Vec::new(),
             next_id: 0, admitted: 0, finished: 0, retired: Vec::new(),
         }
     }
@@ -104,6 +116,13 @@ impl Scheduler {
         id
     }
 
+    /// Cap how many sequences may be admitted per step. See [`Scheduler::max_admit_per_step`].
+    pub fn with_admit_cap(mut self, cap: usize) -> Scheduler {
+        assert!(cap > 0, "an admission cap of 0 would never admit anything");
+        self.max_admit_per_step = Some(cap);
+        self
+    }
+
     pub fn max_batch(&self) -> usize { self.max_batch }
     pub fn running(&self) -> &[Seq] { &self.running }
     pub fn waiting_len(&self) -> usize { self.waiting.len() }
@@ -114,7 +133,9 @@ impl Scheduler {
     /// This is where "continuous" happens: it is called every step, so a slot freed by a sequence
     /// finishing is refilled on the next step rather than at the end of the batch.
     pub fn step_batch(&mut self) -> Vec<SeqId> {
+        let mut admitted_now = 0usize;
         while self.running.len() < self.max_batch {
+            if self.max_admit_per_step.is_some_and(|c| admitted_now >= c) { break; }
             let Some(s) = self.waiting.pop_front() else { break };
             // A zero-budget request is retired without ever occupying a slot; admitting it would
             // consume a slot for one step to do nothing.
@@ -124,6 +145,7 @@ impl Scheduler {
                 continue;
             }
             self.admitted += 1;
+            admitted_now += 1;
             self.running.push(s);
         }
         self.running.iter().map(|s| s.id).collect()
@@ -286,6 +308,44 @@ mod tests {
         assert_eq!(s.pending(), [&[7u32, 8, 9][..]], "first step is the whole prompt");
         s.record(a, 42, false);
         assert_eq!(s.pending(), [&[42u32][..]], "afterwards, one token");
+    }
+
+    #[test]
+    fn an_admission_cap_bounds_the_prefill_burst() {
+        // Every admitted sequence prefills ALONE before it can join a batched decode, so filling n
+        // empty slots in one step costs n sequential prefills up front. That burst is most of why
+        // batching five short sequences measured 3.07x rather than ~5x.
+        let mut s = Scheduler::new(8).with_admit_cap(2);
+        for i in 0..8 { s.submit(vec![i as u32], 9); }
+        assert_eq!(drain_ids(&mut s).len(), 2, "at most 2 admitted on the first step");
+        assert_eq!(drain_ids(&mut s).len(), 4, "2 more on the second");
+        assert_eq!(drain_ids(&mut s).len(), 6);
+        assert_eq!(drain_ids(&mut s).len(), 8, "reaches a full batch, just not in one step");
+        assert_eq!(drain_ids(&mut s).len(), 8, "and stops at max_batch");
+    }
+
+    #[test]
+    fn without_a_cap_every_free_slot_fills_at_once() {
+        // The default must stay the eager one: a mostly-idle server should reach a full batch on the
+        // first step, and capping admission there would only add latency.
+        let mut s = Scheduler::new(8);
+        for i in 0..8 { s.submit(vec![i as u32], 9); }
+        assert_eq!(drain_ids(&mut s).len(), 8, "uncapped admission fills in one step");
+    }
+
+    #[test]
+    fn a_cap_still_refills_a_slot_freed_mid_flight() {
+        // The cap limits ADMISSION RATE, not refill. A freed slot must still be reusable, or the cap
+        // would silently convert continuous batching back into static batching.
+        let mut s = Scheduler::new(2).with_admit_cap(1);
+        let _a = s.submit(vec![1], 9);
+        let _b = s.submit(vec![2], 9);
+        assert_eq!(drain_ids(&mut s).len(), 1);
+        assert_eq!(drain_ids(&mut s).len(), 2, "second slot fills on the next step");
+        let first = s.running()[0].id;
+        s.record(first, 0, true);
+        let c = s.submit(vec![3], 9);
+        assert!(drain_ids(&mut s).contains(&c.0), "the freed slot took the new arrival");
     }
 
     #[test]
