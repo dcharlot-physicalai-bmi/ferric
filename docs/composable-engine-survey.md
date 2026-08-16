@@ -122,10 +122,35 @@ pass by that diff after hours of reasoning had produced wrong answers.
 That is a genuinely unclaimed layer, it is cheap, and it is the one place where being late to a
 model is a *bounded* cost rather than an open-ended debugging session.
 
-## 6. What this survey has not done
+## 6. ⭐ The Chinese ecosystem inverts the picture
 
-- No Chinese-ecosystem sweep (StarRocks, Doris, ByteDance/Alibaba internal engines), and given that
-  Chinese open models are 41% of HF downloads, that omission is likely to matter.
+Swept 2026-08-15, because Chinese open models are 41% of HF downloads and the omission looked
+dangerous. The finding is an **asymmetry**, and it is the opposite of the West's.
+
+**Analytics: no composable block located.** StarRocks (Apache-2.0, forked from Doris 2020),
+Apache Doris, and ByteDance's ByteHouse are vertically-integrated MPP databases — vectorized, SIMD,
+CBO, 3-10x operator gains, but shipped as *systems*, not as libraries you link. This review did not
+locate a Chinese Velox/DataFusion equivalent, and the search for "composable library reuse" in that
+cohort returned nothing. That is a located absence, not proof of one.
+
+**Edge inference: this is where the composability work is.** And it is exactly Ferric's ground.
+
+| project | owner | why it matters here |
+|---|---|---|
+| ✅ **MNN** | Alibaba | *"A Universal and Efficient Inference Engine"* (arXiv 2002.12418), plus MNN-LLM (arXiv 2506.10443). Multi-backend by design — CPU / GPU / NPU, and 3.6.1 (Jul 2026) added a **Qualcomm Hexagon DSP** backend. On-device LLM + Edge AI, battle-tested at Alibaba scale. **Ferric's closest global peer by mission**: universal, multi-backend, on-device. Read the architecture paper before making "runs everywhere" claims. |
+| ✅ **KTransformers** | kvcache-ai (Tsinghua) | *"A Flexible Framework for Experiencing Heterogeneous LLM Inference/Fine-tune Optimizations."* Module **injection** via YAML — the composability idea applied to inference optimisations rather than kernels. Runs 100B+ models on a single RTX 5090 (32 GB) via CPU/GPU heterogeneous compute; Ascend NPU support added Oct 2025. The architectural pattern is the ingest, not the CUDA. |
+| ✅ **CANN** | Huawei | Driver + runtime + libraries, deliberately CUDA-analogous for Ascend NPUs; its Graph Engine compiles whole-graph representations into execution plans. The vertically-integrated counter-model to composability. |
+| ○ ncnn, TNN | Tencent | Mobile ARM inference; ncnn shipped an x86 SIMD PixelShuffle speedup in 2026. |
+| ○ Paddle Lite (Baidu), MegEngine Lite (Megvii), OpenPPL (SenseTime), Bolt (Huawei), LMDeploy (Shanghai AI Lab) | — | The rest of the edge cohort; unverified. |
+
+**Why this matters for Ferric's positioning.** The West's composability push is analytics-first
+(Velox, DataFusion, Substrait) and has barely reached inference. China's is **edge-inference-first**
+and has barely reached analytics. Ferric sits in the quadrant China is contesting, not the one the
+Velox article describes — so MNN, not Velox, is the sharper comparand for "universal on-device
+engine", and the honest differentiators against it remain pure Rust, browser-first, and joules.
+
+## 7. What this survey has not done
+
 - No verification of the ○ rows.
 - No read of Velox's newer siblings **Nimble, Axiom, Collagen** beyond their names.
 - No cost or benchmark reproduction — every number quoted here is the vendor's.
