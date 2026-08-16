@@ -1431,12 +1431,53 @@ fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     })
 }
+thread_local! {
+    /// Content-keyed cache of uniform info buffers.
+    ///
+    /// `examples/matvec_roofline.rs` measured this allocation at **1.29 ms per token — 12% of a decode
+    /// step** — because `run()` built a fresh uniform buffer on every one of ~290 dispatches to move a
+    /// few dozen bytes.
+    ///
+    /// Keyed by CONTENT, which is what makes the reuse safe without any lifetime reasoning: these
+    /// buffers are written once at creation and never mutated, so two dispatches handed the same
+    /// buffer for the same bytes cannot race or read stale data. A slot-pool keyed by size would need
+    /// per-submit recycling to avoid exactly that; this does not.
+    ///
+    /// The hit rate is high because a transformer repeats shapes: every one of N layers issues the same
+    /// dispatches with the same dimensions, so one token's ~290 info buffers cover far fewer distinct
+    /// contents.
+    static UNIBUFS: std::cell::RefCell<std::collections::HashMap<(usize, u64), wgpu::Buffer>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
     let _t = std::time::Instant::now();
     let _g = scopeguard_ns(_t, 3);
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("uinfo"), contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    // Keyed on the device too, so a buffer from one GPU is never handed to another.
+    let key = ((&ctx.device as *const wgpu::Device) as usize, h.finish());
+    // Control arm for the A/B. Without an in-binary switch the only comparison is across builds,
+    // which is how a contended machine gets mistaken for a regression.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("FERRIC_NO_UNIBUF_CACHE").is_some()) {
+        return ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("uinfo"), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    }
+    UNIBUFS.with(|c| {
+        let mut m = c.borrow_mut();
+        // Bounded so a workload with genuinely unique info per dispatch degrades to the old behaviour
+        // rather than growing without limit.
+        if m.len() > 4096 { m.clear(); }
+        m.entry(key).or_insert_with(|| {
+            ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uinfo"), contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        }).clone()
     })
 }
 /// Charge the elapsed time of the enclosing scope to a HOST_NS slot on drop.

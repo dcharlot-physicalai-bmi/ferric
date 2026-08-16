@@ -99,7 +99,10 @@ async fn run() {
         println!("host-side setup: {:.1}% of wall ({:.1} ms of {:.1} ms)",
                  100.0 * host as f64 / wall.max(1) as f64, host as f64 / 1e6, wall as f64 / 1e6);
         println!("  pipeline lookup {:>8.2} ms   bind groups {:>8.2} ms", pipe_ns as f64 / 1e6, bg_ns as f64 / 1e6);
-        println!("  pass recording  {:>8.2} ms   submit      {:>8.2} ms", rec_ns as f64 / 1e6, sub_ns as f64 / 1e6);
+        // slot 3 is NOT just submit — `unibuf`/`u32buf` charge their allocation to it too, so the
+        // old "submit" label conflated queue submission with per-dispatch info-buffer creation and
+        // hid the single largest host cost behind a name that suggested nothing could be done.
+        println!("  pass recording  {:>8.2} ms   submit+infobuf {:>5.2} ms", rec_ns as f64 / 1e6, sub_ns as f64 / 1e6);
         println!("  {disp} dispatches in {subs} submits ({:.0} dispatches/token)",
                  disp as f64 / out.len().max(1) as f64);
     }
