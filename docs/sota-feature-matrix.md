@@ -148,8 +148,29 @@ the machine look *worse* than it is. **Neither direction is safe, and the conven
 dangerous** — I only re-ran this because the result flattered a conclusion I had already started
 building on.
 
-So §F item 1 stands, with the win now sized rather than assumed: on this workload a full batch of 4
-should approach ~4x throughput, since decode is bandwidth-bound and one weight read serves the batch.
+So §F item 1 stands, and the win is now **measured rather than reasoned**. Same five requests, same
+tokens, only `max_batch` changed (`examples/continuous_batching`, Qwen2.5-0.5B):
+
+| max_batch | batched steps | total |
+|---|---|---|
+| 1 | 15 | 970.21 ms |
+| 2 | 9 | 914.16 ms |
+| 3 | 7 | 672.84 ms |
+| **5** | **5** | **315.65 ms** |
+
+**3.07x** — real, and **short of the ~4-5x** I claimed one commit earlier from "one weight read serves
+the batch". Two reasons, both structural rather than tuning:
+
+1. **Prefill is still serial.** Each admitted request prefills alone before joining the batch, so a
+   full slate of 5 pays 5 sequential prefills up front. Chunked prefill interleaved into the decode
+   batch is the standard fix, and Ferric already has chunked prefill verified bit-identical — it is
+   the *scheduling* of it that is missing.
+2. **The batch drains.** Budgets are uneven by design in that example, so the batch is only full at
+   the start; average occupancy over the run is well below `max_batch`. `Scheduler::occupancy()`
+   exists to make exactly this visible.
+
+Both point at the same next lever, and neither is a reason to doubt the feature: 3.07x on five short
+sequences is a large win for a data-structure change with no kernel work.
 
 ## J. Not assessed
 
