@@ -277,70 +277,46 @@ and **Ferric is achieving roughly a tenth of available bandwidth**. That ratio i
 not distributed across the system — it is concentrated in `matmul_q4_k_splitk` and
 `matmul_q6_k_splitk`.
 
-### 7.2.4 ⚠ CORRECTION: most of the gap is NOT the matmul
+### 7.2.4 ⚠⚠ CORRECTION, THEN RE-CORRECTION — and the second one is the lesson
 
-The paragraph that stood here recommended a bandwidth-oriented rewrite of the quantised matmul on the
-grounds that "the remaining order of magnitude is one kernel family failing to saturate memory
-bandwidth." **That was wrong, and `examples/bandwidth.rs` — which already existed, and whose header
-already stated this gap — refutes it in one run.**
+**First correction (wrong).** One run of `examples/bandwidth.rs` reported a WGSL read ceiling of
+111 GB/s and I concluded ~3x of the gap was "structural to the WGSL/wgpu path", committed a
+positioning claim that Ferric should never promise throughput parity, and wrote it into durable
+memory.
 
-A WGSL compute shader that does *nothing but read*:
+**Re-measured, three times, on an idle machine:**
 
 ```
-  scalar u32 (1 word/iter)   536.9M   4.84ms   111.0 GB/s
-  vec4<u32> (4 words/iter)   536.9M   6.24ms    86.0 GB/s
+  scalar u32, wg64    385.7 / 399.8 / 473.6 GB/s
+  vec4<u32>, wg64     439.9 / 463.1 / 466.3 GB/s
+  wg128 401.8 · wg256 375.3 · wg512 290.0 · wg1024 172.8
 ```
 
-**111 GB/s is the ceiling for reading memory at all from WGSL here**, against llama.cpp Metal's
-~326 GB/s. (And the vectorised variant is *slower* than the scalar one, which is its own finding.)
+The 111 GB/s reading was an **outlier taken on a contended machine** — that run followed hours of
+10 GB model loads, full test suites and repeated inference. The identical configuration measures
+3.6x higher when the GPU is idle.
 
-So the 10x decomposes into two very different halves:
+**So the real picture is the opposite of what I committed:**
 
 | | |
 |---|---|
-| 31 → 111 GB/s | **~3.5x, addressable by kernel work** |
-| 111 → 326 GB/s | **~3x, structural to the WGSL/wgpu path** |
+| WGSL read ceiling | **~385-475 GB/s** |
+| llama.cpp effective stream | ~326 GB/s |
+| Ferric quantised matmul | ~31 GB/s |
 
-A perfect quantised matmul would still leave Ferric ~3x behind llama.cpp on this machine. That is a
-materially different claim from the one it replaces, and it has to be said before anyone promises
-parity: **part of the browser-first bet is paid for in bandwidth**, and the honest positioning is
-joules and reach, not throughput parity with a native Metal kernel.
+**WGSL reads memory faster than llama.cpp streams weights.** There is no structural bandwidth
+penalty. The matmul is ~13x below the read ceiling, and the *entire* 10x is addressable by kernel
+work. §7.2.3's original conclusion was right; the "correction" that replaced it was not. And vec4 is
+faster than scalar, as expected — that "anomaly" was the same artifact.
 
-It also re-teaches the session's own lesson at the level of the codebase rather than the model: this
-was already known and written down in `bandwidth.rs`, and re-deriving it by arithmetic produced a
-confident wrong recommendation that one existing command corrected. **Run the bench that exists
-before proposing the work.**
+**The lesson, which is worth more than the number.** Twice in one thread I drove a *positioning*
+claim from a *single unrepeated microbenchmark*. The first time the instrument already existed and I
+reasoned instead of running it; the second time I ran it once, on a machine I had just spent hours
+loading, and propagated the result into repo docs and durable memory inside ten minutes.
 
-### 7.3 The cost model is a template — and its objective is the one Ferric would change
-
-MNN selects both algorithm and backend by minimising `C_total = C_algorithm + C_backend`, where
-
-```
-C_op = (MUL / FLOPS) × 1000                for CPU
-C_op = (MUL / FLOPS) × 1000 + t_schedule   for GPU   ← the extra term is command-buffer setup
-```
-
-That is a **time** cost model. `ferric_joule` already argues the objective should be joules, and this
-is the same structure with a different denominator — the identical "same problem, different cost
-function" position taken against Switchyard, but now at kernel/backend granularity rather than
-model-routing granularity. An energy-costed `C_op` picking CPU vs GPU per operator is a concrete,
-unclaimed application of today's router work.
-
-### 7.4 Other specifics worth having
-
-- **Backend abstraction is only 7 methods**: `onCreate`, `onExecuteBegin/End`, `onAcquireBuffer`,
-  `onReleaseBuffer`, `onClearBuffer`, `onCopyBuffer`. Hybrid scheduling falls out — conv on CPU and
-  the following ReLU on GPU *within one inference*. Ferric's `ferric-core::Context` is the analogue;
-  the question is whether it is that small.
-- **Winograd generator, not hardcoded matrices.** MNN notes TFLite/ncnn/Xiaomi hardcode A/B/G for
-  common sizes and "have relatively poor scalability in face of new cases"; MNN generates them for
-  any kernel size (with `f = 0.5` to limit numerical error). Same disease as hardcoding architecture
-  conventions — see §5.
-- **First mobile engine to use Strassen**, applied recursively with an explicit stopping inequality;
-  7.5-13.5% on large matmul (1024³: 1501 → 1299 ms).
-- **Design paradigm (Fig. 6)**: manual search (TFLite/ncnn) vs **semi-automated search (MNN)** vs
-  automated search/auto-tuning (TVM). MNN's pitch is that a cost model gets near-auto-tuned quality
-  without TVM's per-device tuning cost. Ferric is currently in the *manual* column.
+A microbenchmark taken on a busy machine is not a slow measurement, it is a **wrong** one, and
+nothing about its output says so. Repeat before claiming, and repeat *especially* when the number
+supports a conclusion that would change strategy.
 
 ## 8. What this survey has not done
 

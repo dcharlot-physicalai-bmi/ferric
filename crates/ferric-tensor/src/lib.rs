@@ -2780,8 +2780,20 @@ pub async fn probe_read_bandwidth(ctx: &Arc<Context>, bytes: usize, per_thread: 
     });
     let nwg = 16384usize; // enough workgroups to fill the machine; each strides over the buffer
     let out = empty(ctx, nwg);
-    let wgsl = if per_thread == 4 { BW_VEC4_WGSL } else { BW_SCALAR_WGSL };
-    let unit = if per_thread == 4 { words / 4 } else { words };
+    // `per_thread` selects the variant: 1 = scalar wg64 (the original), 4 = vec4 wg64,
+    // 256/1024 = scalar at that workgroup size. Apple GPUs run 32-wide SIMD groups, so a 64-thread
+    // workgroup is only two of them and may not hide memory latency — worth measuring rather than
+    // assuming, since the ceiling this probe reports is load-bearing for Ferric's positioning.
+    let (wgsl_owned, unit);
+    match per_thread {
+        4 => { wgsl_owned = BW_VEC4_WGSL.to_string(); unit = words / 4; }
+        n if n >= 128 => {
+            wgsl_owned = BW_SCALAR_WGSL.replace("64u", &format!("{n}u")).replace("workgroup_size(64)", &format!("workgroup_size({n})")).replace("array<u32, 64>", &format!("array<u32, {n}>"));
+            unit = words;
+        }
+        _ => { wgsl_owned = BW_SCALAR_WGSL.to_string(); unit = words; }
+    }
+    let wgsl: &str = &wgsl_owned;
     let info = unibuf(ctx, &[unit as u32, nwg as u32, 0, 0]);
     // warm (shader compile + first touch)
     run(ctx, wgsl, "bw", &[&src, &out, &info], (nwg as u32, 1, 1));

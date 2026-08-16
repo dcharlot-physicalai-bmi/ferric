@@ -19,7 +19,9 @@ async fn run() {
     println!("Ferric · WGSL compute read-bandwidth probe (cold, buffer >> cache)\n");
     println!("  {:<26} {:>10} {:>11} {:>12}", "variant", "bytes", "time", "GB/s");
     for mb in [512usize] {
-        for (name, per_thread) in [("scalar u32 (1 word/iter)", 1u32), ("vec4<u32> (4 words/iter)", 4)] {
+        for (name, per_thread) in [("scalar u32, wg64", 1u32), ("vec4<u32>, wg64", 4),
+                                    ("scalar u32, wg128", 128), ("scalar u32, wg256", 256),
+                                    ("scalar u32, wg512", 512), ("scalar u32, wg1024", 1024)] {
             let (dt, bytes) = probe_read_bandwidth(&ctx, mb << 20, per_thread).await;
             println!("  {:<26} {:>9.1}M {:>9.2}ms {:>11.1}", name, bytes as f64 / 1e6, dt * 1e3, bytes as f64 / dt / 1e9);
         }
