@@ -172,6 +172,40 @@ the batch". Two reasons, both structural rather than tuning:
 Both point at the same next lever, and neither is a reason to doubt the feature: 3.07x on five short
 sequences is a large win for a data-structure change with no kernel work.
 
+## K. ⚠ Batched decode exists on ONE runtime of five
+
+Checked before starting the transport work rather than during it. `forward_batch` is implemented on:
+
+| runtime | batched decode | covers |
+|---|---|---|
+| `qwen3` (Dense) | ✅ | qwen2, qwen3, llama, phi3, gemma, gemma2, gemma3 |
+| `qwen35` (Hybrid) | ❌ | qwen35, qwen35moe, laguna |
+| `lfm2` | ❌ | lfm2 |
+| `gemma4` | ❌ | gemma4 |
+| `deepseek2` | ❌ | deepseek2 |
+
+So continuous batching in `ferric-serve` is **Dense-only** as things stand. That covers most
+architectures by count, and none of the four newest ones — including DeepSeek and Gemma 4, the two
+added this week, and the hybrid path that carries Ferric's ternary work.
+
+**This is not a small gap to close.** Batching requires advancing N independent sequences in one
+forward, and each of these runtimes carries a *different* per-sequence state:
+
+- `qwen35` — gated-delta-net recurrent state per layer, plus KV on the attention layers
+- `lfm2` — short-conv state (`l_cache-1` timesteps of the PRE-conv signal) plus KV
+- `gemma4` — KV, but with **shared** caches where blocks ≥15 read block 13/14
+- `deepseek2` — MLA latent KV with asymmetric head widths
+
+Each needs its own batched forward, and each is a place where a batched path that crossed sequences
+would still emit fluent text — the failure mode `examples/continuous_batching` checks for by
+re-running every sequence solo.
+
+**Consequence for the build order.** §F item 1 splits in two: wiring the transport (Dense-only, ships
+a real win for the majority path) and extending batched decode to the other four runtimes (four
+separate pieces of model work, each needing its own solo-equivalence proof). The first does not block
+on the second, and the server must fall back to serial rather than silently mis-batching a runtime
+that cannot.
+
 ## J. Not assessed
 
 CPU SIMD kernels; FP8; paged KV internals; guided-decoding coverage vs xgrammar/outlines; audio and
