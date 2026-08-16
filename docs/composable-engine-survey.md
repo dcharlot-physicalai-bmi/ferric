@@ -228,8 +228,28 @@ Two concrete targets, both bounded:
    verified tensor-exact against `llama-eval-callback` (§ rope work, 2026-08-15), so the guard is
    revisitable and is worth 16 dispatches/token on every Llama-3.1+ and YaRN model.
 
-Reference point for the whole exercise: llama.cpp runs this same checkpoint at **426.7 tok/s
-(2.3 ms/tok)** against Ferric's 24.2 — a **10x** gap on the same machine.
+### 7.2.2 Fusion done, and it prices the dispatch itself
+
+The rope fusion is shipped (target 2 above). A/B on the same prompt, `FERRIC_NO_FUSE_ROPE=1` as the
+control:
+
+| | dispatches/token | ms/tok |
+|---|---|---|
+| split (old) | 242 | 25.6 |
+| **fused** | **210** | **25.1** |
+
+Generated text is **token-identical** between the two, which is the check that matters.
+
+**13% fewer dispatches bought ~2% wall time.** Those two numbers together price a dispatch: 12 ms
+saved over 24 tokens × 32 removed dispatches ≈ **15 µs per dispatch**. At 210 dispatches/token that
+is ~3.2 ms of the 25.1 ms, i.e. **~13% of decode is launch overhead** — real, worth removing, and
+nowhere near the gap.
+
+**So the third hypothesis is bounded too.** Setup was 6%; dispatch overhead is ~13%; the remaining
+~10x against llama.cpp's 2.3 ms/tok is **kernel efficiency**, not orchestration. Fusing every
+remaining movement kernel would leave Ferric still ~8x behind. That is a more useful thing to know
+than another plausible story, and it redirects effort from the graph layer to the kernels
+(`matmul_q4_k_splitk` is 3 of every 15 dispatches per layer and is where the arithmetic actually is).
 
 ### 7.3 The cost model is a template — and its objective is the one Ferric would change
 

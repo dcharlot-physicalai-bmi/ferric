@@ -645,11 +645,20 @@ impl Qwen3 {
         // is exactly where q's head `h` already lives in the fused QKV row. Verified bit-identical
         // (max|Δ| 0.000e0) across t ∈ {1,5,37} × pos ∈ {0,7,129}.
         //
-        // Only valid when q and k are still ADJACENT at rope time, which rules out two cases:
-        //   - QK-norm (Qwen3) normalises each separately first, so they are no longer one span;
-        //   - rope-scaling (Llama-3) goes through a different kernel that has not been shown equivalent.
-        // Both fall back to the two-dispatch path, which is unchanged.
-        let fuse_rope = (l.rope || std::env::var("FERRIC_NONOPE").is_ok()) && l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        // Only valid when q and k are still ADJACENT at rope time, which rules out QK-norm (Qwen3),
+        // where each is normalised separately and they stop being one span.
+        //
+        // Rope-scaling USED to be excluded too, on the grounds that it "goes through a different
+        // kernel that has not been shown equivalent". That was the right call at the time and is no
+        // longer: `rope_scaled` was applying no rotation at all (its per-row positions were read out
+        // of bounds), and the fixed kernel is now verified tensor-exact against llama-eval-callback
+        // — post-rope Q 369.233694 vs the reference's 369.233734. The scale is per-DIMENSION, not
+        // per-head, so it factors out of the head axis exactly as the base rotation does and the
+        // fused span is the identical computation. Worth one dispatch per layer on every Llama-3.1+
+        // and every YaRN model, which is 16/token on a 1B and scales with depth.
+        let fuse_rope = (l.rope || std::env::var("FERRIC_NONOPE").is_ok())
+            && l.q_norm.is_none() && l.k_norm.is_none()
+            && std::env::var("FERRIC_NO_FUSE_ROPE").is_err();
         let nope = !l.rope && std::env::var("FERRIC_NONOPE").is_err();
         let (q, k) = if nope {
             // NoPE layer (Muse Glimmer's global attention): QK-norm still applies, RoPE does not.
@@ -658,7 +667,9 @@ impl Qwen3 {
             (qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm),
              qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm))
         } else if fuse_rope {
-            let qk = qkv.narrow(1, 0, l.q_out + l.kv_out).rope(nh + nkv, hd, l.rope_base, offset);
+            // Go through `self.rope` so the fused span picks up rope_freqs/YaRN and the NORM/NEOX
+            // pairing exactly as the split path does; `head_dim` is shared, only the head count differs.
+            let qk = self.rope(&qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv, offset, l.rope_base);
             // q's window has offset 0 (free during decode via the size-1 stride rule); k's carries an
             // offset and flows into `KvBuf::append`, which reads views in place.
             (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
