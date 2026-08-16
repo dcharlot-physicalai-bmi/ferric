@@ -19,7 +19,7 @@ in `composable-engine-survey.md`.
 | Chunked prefill | ✅ | verified bit-identical to whole-history, incl. windowed models |
 | Prefix cache | ⚠ | **one slot**. SGLang's RadixAttention generalises to a radix tree over arbitrary branching — the shape agent loops actually produce |
 | Speculative decoding | ⚠ | a draft/verify path exists; **not verified EAGLE-class**. EAGLE 3.1 (vLLM) and EAGLE3 dynamic-tree kernels (TensorRT-LLM) both shipped in the last 45 days |
-| **Continuous batching** | ❌ | `ferric-serve`: *"One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up."* **This is the single biggest serving gap.** |
+| **Continuous batching** | ❌ | `ferric-serve`: *"One request at a time…"* — but ⚠ **the serialization claim does not survive a first measurement**, see §I. Still absent as a feature; the size of the win is now unclear. |
 | Paged / block KV cache | ❓ | contiguous `KvBuf` today; paging is what makes many-session serving memory-viable |
 | Multi-model in one process | ❌ | SGLang ships it; vLLM does not |
 | Disaggregated prefill/decode | ❌ | standard in large deployments |
@@ -121,7 +121,34 @@ the field and the one whose reference implementation (`PrimeIntellect-ai/prime-a
 being pushed daily. Wiring the scheduler into `ferric-serve` is now the highest-value remaining item
 in §F, ahead of MXFP4.
 
-## H. Not assessed
+## I. ⚠ The "one request at a time" claim is not confirmed
+
+Measured 2026-08-16 against the running server, 24 max_tokens, Llama-3.2-1B:
+
+```
+1 request       0.56 s
+4 concurrent    0.98 s total
+```
+
+**1.75x for 4x the work**, not the ~4x a strictly serialized server implies (~2.2 s). Something is
+overlapping that the crate docs say does not.
+
+**No conclusion is drawn from this.** One run, one prompt, short generations where fixed overhead is
+a large share, and an early stop would shorten some requests more than others. Today already produced
+three retracted claims built on single unrepeated measurements, and this is the same shape.
+
+What it does establish is that **the motivation for continuous batching was never measured** — the
+"the GPU serializes anyway" line has sat in the crate docs as an assumption. Before building the TCP
+wiring, the honest first step is to measure the serialization properly: repeated runs, longer
+generations, fixed token counts, and per-request timings rather than a wall-clock total. If the
+server already overlaps meaningfully, the batching win is smaller than §F assumes and the build order
+should change.
+
+Continuous batching remains absent either way — a scheduler that keeps a batch full is still the
+right architecture for RLM-style fan-out (§G). What is now in question is the *magnitude*, and that
+is exactly the kind of number that should not be asserted.
+
+## J. Not assessed
 
 CPU SIMD kernels; FP8; paged KV internals; guided-decoding coverage vs xgrammar/outlines; audio and
 video multimodal; scheduler fairness and preemption; observability surface.
