@@ -121,32 +121,35 @@ the field and the one whose reference implementation (`PrimeIntellect-ai/prime-a
 being pushed daily. Wiring the scheduler into `ferric-serve` is now the highest-value remaining item
 in §F, ahead of MXFP4.
 
-## I. ⚠ The "one request at a time" claim is not confirmed
+## I. ✅ Serialization CONFIRMED — and the first measurement was wrong
 
-Measured 2026-08-16 against the running server, 24 max_tokens, Llama-3.2-1B:
+Measured properly on 2026-08-16: 64 max_tokens so decode dominates fixed overhead, per-request
+timings rather than a wall-clock total, and `completion_tokens`/`finish_reason` reported so an early
+stop cannot masquerade as concurrency.
 
 ```
-1 request       0.56 s
-4 concurrent    0.98 s total
+SEQUENTIAL baseline   2.05s  2.06s  2.28s          (all out=64, finish=stop)
+4 CONCURRENT          2.67s  4.71s  7.06s  8.87s   (all out=64, finish=stop)
+wall total 9.12s
 ```
 
-**1.75x for 4x the work**, not the ~4x a strictly serialized server implies (~2.2 s). Something is
-overlapping that the crate docs say does not.
+**The staircase is the evidence.** Each request completes ~2.1 s after the previous — 2.67 → 4.71
+(+2.04) → 7.06 (+2.35) → 8.87 (+1.81) — which is queueing, not overlap. Wall total 9.12 s against a
+2.06 s single request is **4.4x for 4x the work**. The crate docs are right: the server serializes.
 
-**No conclusion is drawn from this.** One run, one prompt, short generations where fixed overhead is
-a large share, and an early stop would shorten some requests more than others. Today already produced
-three retracted claims built on single unrepeated measurements, and this is the same shape.
+**My earlier measurement said 1.75x and was wrong.** It used 24 max_tokens, where fixed overhead is a
+large share of each request and the signal is swamped. The error was in the *experiment design*, not
+the machine — the same class as timing inside a `cargo run` loop, and the fix was the same: make the
+thing being measured dominate what surrounds it.
 
-What it does establish is that **the motivation for continuous batching was never measured** — the
-"the GPU serializes anyway" line has sat in the crate docs as an assumption. Before building the TCP
-wiring, the honest first step is to measure the serialization properly: repeated runs, longer
-generations, fixed token counts, and per-request timings rather than a wall-clock total. If the
-server already overlaps meaningfully, the batching win is smaller than §F assumes and the build order
-should change.
+Worth noting which way each error pointed. The bad short-generation run made the server look *better*
+than it is and would have talked me out of building continuous batching; the bad `cargo run` loop made
+the machine look *worse* than it is. **Neither direction is safe, and the convenient one is the more
+dangerous** — I only re-ran this because the result flattered a conclusion I had already started
+building on.
 
-Continuous batching remains absent either way — a scheduler that keeps a batch full is still the
-right architecture for RLM-style fan-out (§G). What is now in question is the *magnitude*, and that
-is exactly the kind of number that should not be asserted.
+So §F item 1 stands, with the win now sized rather than assumed: on this workload a full batch of 4
+should approach ~4x throughput, since decode is bandwidth-bound and one weight read serves the batch.
 
 ## J. Not assessed
 
