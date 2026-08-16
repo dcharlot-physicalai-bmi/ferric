@@ -838,14 +838,20 @@ impl Qwen3 {
 
         // Each row sits at a different absolute position, which is exactly what `rope_at` exists for.
         let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
-        let fuse = l.q_norm.is_none() && l.k_norm.is_none() && self.rope_freqs.is_none();
+        // The batched rope must use the SAME convention as the solo path — pairing and per-dimension
+        // scale both — or the two silently disagree. They did: `rope_at` was NEOX-only and unscaled,
+        // so Llama-3.2 diverged from `forward_cached` at token 2 with no error.
+        let il_pair = self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err();
+        let fs = self.rope_freqs.as_ref();
+        let rope_rows = |x: Tensor, heads: usize| x.rope_at_ex(heads, hd, l.rope_base, &positions, fs, il_pair);
+        let fuse = l.q_norm.is_none() && l.k_norm.is_none();
         let (q, k) = if fuse {
-            let qk = qkv.narrow(1, 0, l.q_out + l.kv_out).rope_at(nh + nkv, hd, l.rope_base, &positions);
+            let qk = rope_rows(qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv);
             (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
         } else {
             let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
             let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
-            (q.rope_at(nh, hd, l.rope_base, &positions), k.rope_at(nkv, hd, l.rope_base, &positions))
+            (rope_rows(q, nh), rope_rows(k, nkv))
         };
         let v = qkv.narrow(1, l.q_out + l.kv_out, l.kv_out);
 
@@ -890,9 +896,7 @@ impl Qwen3 {
     /// False when the model needs scaled (`rope_freqs`/YaRN) or NORM-interleaved RoPE, because
     /// `rope_at` — the per-row-position kernel the batched path uses — implements neither. Callers
     /// should fall back to per-sequence `forward_cached` rather than batching a model this refuses.
-    pub fn batching_supported(&self) -> bool {
-        self.rope_freqs.is_none() && !self.cfg.rope_interleaved
-    }
+    pub fn batching_supported(&self) -> bool { true }
 
     /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
     ///

@@ -451,6 +451,51 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
+    /// [`Tensor::rope_at`] with the pairing and per-dimension scale a model actually needs.
+    ///
+    /// `rope_at` was NEOX-only and unscaled, which made batched decode **silently diverge** from
+    /// `forward_cached` on every model with `rope_freqs` or NORM pairing: the batched path dropped the
+    /// frequency scaling and rotated the wrong partners, with no error and fluent output. Demonstrated
+    /// on Llama-3.2-1B, where sequence 0 diverged at token 2.
+    ///
+    /// Both variants reuse existing kernels rather than adding one — `ROPE_SCALED_WGSL` already takes
+    /// per-row positions at `info[8 + i]`, and both rope kernels take the same `__PAIRLO__`/`__PAIRHI__`
+    /// pairing substitution. The capability was one parameter away the whole time.
+    pub fn rope_at_ex(&self, n_heads: usize, head_dim: usize, base: f32, positions: &[u32],
+                      freq_scale: Option<&Tensor>, interleaved: bool) -> Tensor {
+        let owned;
+        let c = if self.rank() == 2 && self.strides[1] == 1 { self } else { owned = self.contiguous(); &owned };
+        let t = c.numel() / (n_heads * head_dim);
+        assert_eq!(positions.len(), t, "rope_at_ex needs one position per row: {t} rows, {} given", positions.len());
+        let out = empty(&self.ctx, c.numel());
+        match freq_scale {
+            None => {
+                let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
+                let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0u32,
+                                    c.offset as u32, srs as u32, head_dim as u32];
+                info.extend_from_slice(positions);
+                run(&self.ctx, &Self::rope_src(interleaved), "rope",
+                    &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
+            }
+            Some(fs) => {
+                // ROPE_SCALED_WGSL reads its per-row position from info[8 + i], so arbitrary positions
+                // drop straight in where the single-sequence path writes `offset + i`.
+                let src = if interleaved {
+                    ROPE_SCALED_WGSL.replace("__PAIRLO__", "2u * c").replace("__PAIRHI__", "2u * c + 1u")
+                } else {
+                    ROPE_SCALED_WGSL.replace("__PAIRLO__", "c").replace("__PAIRHI__", "c + half")
+                };
+                let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(), 0, 0, 0, 0];
+                info.extend_from_slice(positions);
+                let cc = c.contiguous();
+                run(&self.ctx, &src, "rope_scaled",
+                    &[cc.buf.as_ref(), &out, fs.contiguous().buf.as_ref(), &u32buf(&self.ctx, &info)],
+                    groups(t * n_heads));
+            }
+        }
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     /// Apply RoPE from a precomputed per-token cos/sin table with the **interleaved-pair** convention
     /// (`rotate((x0,x1)) = (x0·c0 − x1·s0, x1·c1 + x0·s1)` on adjacent pairs) — used by V-JEPA 2's 3-axis
     /// RoPE. cos/sin are each `[n_tokens, head_dim]` (per-index, already encoding the axis slices);
