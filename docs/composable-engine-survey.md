@@ -248,8 +248,40 @@ nowhere near the gap.
 **So the third hypothesis is bounded too.** Setup was 6%; dispatch overhead is ~13%; the remaining
 ~10x against llama.cpp's 2.3 ms/tok is **kernel efficiency**, not orchestration. Fusing every
 remaining movement kernel would leave Ferric still ~8x behind. That is a more useful thing to know
-than another plausible story, and it redirects effort from the graph layer to the kernels
-(`matmul_q4_k_splitk` is 3 of every 15 dispatches per layer and is where the arithmetic actually is).
+than another plausible story, and it redirects effort from the graph layer to the kernels.
+
+### 7.2.3 The diagnosis, quantified: the quantised matmul is ~10x off memory bandwidth
+
+`FERRIC_PROFILE=1` (read ratios only — the profile device-syncs at every boundary and costs ~20%):
+
+```
+── profile (ms, 464.8 total) ──
+  attn      216.9  46.7%      ffn       191.3  41.2%
+  lm_head    49.9  10.7%      embed       6.7   1.4%
+```
+
+`attn` here is the whole block — qkv matmul, rope, `fattn`, o matmul — and at a 6-30 token context the
+attention math itself is negligible, so **~88% of decode is matmul**, and `lm_head` alone (one
+`[2048 × 128256]` Q6_K matmul) is 10.7%.
+
+Decode of a 1B model is **memory-bandwidth-bound**: every weight is read once per token.
+Llama-3.2-1B-Q4_K_M is ~0.77 GB, so
+
+```
+Ferric     0.77 GB / 25.1 ms  ≈   31 GB/s
+llama.cpp  0.77 GB /  2.3 ms  ≈  335 GB/s
+```
+
+Apple-silicon unified memory offers on the order of 100-400 GB/s, so llama.cpp is running near peak
+and **Ferric is achieving roughly a tenth of available bandwidth**. That ratio is the 10x, and it is
+not distributed across the system — it is concentrated in `matmul_q4_k_splitk` and
+`matmul_q6_k_splitk`.
+
+**This closes the diagnostic thread.** Orchestration is priced and nearly exhausted (setup 6%,
+dispatch overhead ~13%); the remaining order of magnitude is one kernel family failing to saturate
+memory bandwidth. The next work is a bandwidth-oriented rewrite of the quantised matmul — measured in
+GB/s against the 335 GB/s reference, not in ms/tok — and that is a different discipline from
+everything above it.
 
 ### 7.3 The cost model is a template — and its objective is the one Ferric would change
 

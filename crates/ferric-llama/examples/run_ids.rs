@@ -79,6 +79,10 @@ async fn run() {
         next = am(&l);
     }
     let dt = t_dec.elapsed();
+    // Per-category GPU breakdown when FERRIC_PROFILE=1. Note the profile itself costs ~27%
+    // (25.1 -> 31.9 ms/tok) because `prof` device-syncs at every boundary to attribute time — so read
+    // the RATIOS, never the absolute ms, from a profiled run.
+    ferric_tensor::prof_report();
     println!("\ngenerated ids: {out:?}");
 
     // MNN (arXiv 2002.12418, Table 2) reports that decoupling command-buffer PREPARATION from
