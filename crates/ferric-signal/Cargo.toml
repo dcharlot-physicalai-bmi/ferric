@@ -1,0 +1,21 @@
+[package]
+name = "ferric-signal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["sensor", "tokenizer", "time-series", "quantization", "physical-ai"]
+categories = ["science", "encoding"]
+description = "Open sensor-language tokenization for physical signals: finite scalar quantization, patching, a hybrid signal+text vocabulary, and a determinism receipt."
+
+[dependencies]
+ferric-core = { path = "../ferric-core", version = "0.3" }
+ferric-tensor = { path = "../ferric-tensor", version = "0.3" }
+pollster = "1.0.1"
+
+[dev-dependencies]
+ferric-joule = { path = "../ferric-joule", version = "0.3" }
+pollster = "1.0.1"
