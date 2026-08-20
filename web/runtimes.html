@@ -24,6 +24,26 @@ try {
   // prompt in it — the in-tab model supplies language competence, the web supplies the facts. This is
   // the architectural reason a 450 MB ternary model in a browser is not a compromise.
   let prompt = q.get('prompt') || 'The capital of France is';
+  // Corpus-scale "weights on the outside": ?corpus=<url> fetches a document set, EMBEDS every chunk
+  // and the question IN-TAB, ranks by cosine, and grounds generation in the winners. Retrieval and
+  // generation are both local; only the corpus is remote. The chosen chunk index is rendered as a
+  // receipt so the driver can assert retrieval picked the RIGHT knowledge, not just any knowledge.
+  const corpusUrl = q.get('corpus');
+  if (corpusUrl) {
+    S('embedding corpus');
+    const chunks = (await (await fetch(corpusUrl)).text()).split(/\n\s*\n/).map(c => c.trim()).filter(c => c);
+    const qv = await m.embed(prompt);
+    const scored = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const cv = await m.embed(chunks[i]);
+      let dot = 0; for (let k = 0; k < qv.length; k++) dot += qv[k] * cv[k];
+      scored.push([dot, i]);
+    }
+    scored.sort((x, y) => y[0] - x[0]);
+    const top = scored.slice(0, 2);
+    document.getElementById('info').textContent += ' · retrieved ' + top.map(([s,i]) => i + ':' + s.toFixed(3)).join(' ');
+    prompt = 'Context:\n' + top.map(([_, i]) => chunks[i]).join('\n') + '\n\nQuestion: ' + prompt + '\nAnswer:';
+  }
   const ctxUrl = q.get('ctx');
   if (ctxUrl) {
     S('fetching context');

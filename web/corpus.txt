@@ -1,0 +1,15 @@
+The Loop Lab measures robot energy as joules per successful task, charging every failed attempt to the task rather than reporting per-attempt averages.
+
+Gemma 4 replaced the start_of_turn and end_of_turn chat markers of earlier Gemma generations with the tokens <|turn> and <turn|>, both typed as control tokens in the vocabulary.
+
+Ferric's browser runtime ships as a 0.95 megabyte wasm bundle; the entire LLM runtime is smaller than most pages' JavaScript, and it drives WebGPU through the browser's own Dawn and Tint stack.
+
+DeepSeek V4 Flash stores dense weights as FP8 E4M3 under E8M0 block scales of 128 elements, and its routed experts in MXFP4, with no fp16 or bf16 distribution existing at all.
+
+PrismML's ternary Bonsai models store weights at 2.125 bits per weight in group-128 blocks, small enough that the 1.7B model occupies roughly 450 megabytes on disk.
+
+The lightning indexer in DeepSeek V4 drives sparse attention with a top-k of 512 positions, using its own compressor stack separate from the attention path.
+
+LFM2 is a conv-attention hybrid in which only six of sixteen blocks carry a KV cache; the short-convolution blocks carry a rolling window bounded by l_cache rather than context length.
+
+Grouped-K quantization shares one scale per channel across 32 tokens instead of 32 consecutive channels, which is the axis change that makes 4-bit KV caches usable.

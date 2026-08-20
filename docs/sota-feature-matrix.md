@@ -548,3 +548,14 @@ per-read permute+contiguous over the whole history. Bit-identical to the two-pas
 formats (zero differing bits; both index-math mutations caught), and batched decode re-verified
 solo-equivalent through the fused path on lfm2 (n=2..8), gemma4 (n=2..4, past the sliding window) and
 deepseek2 (n=2/4). Grouped-K now costs a bounded f32 staging tail and nothing per read.
+
+**In-tab corpus retrieval (2026-08-20): one ternary model is BOTH retriever and generator.**
+`?corpus=<url>` fetches a document set; the page embeds every chunk AND the question locally via
+`embed()`, ranks by cosine, grounds generation in the winners, and renders the chosen chunk index as
+a receipt the driver asserts on. On an 8-chunk corpus of distinct technical facts, bonsai-1.7B
+(ternary, ~450 MB, NOT embedding-trained) ranked the correct chunk FIRST (cosine 0.819 vs 0.772
+runner-up) and answered "0.95" — a fact postdating all training data. Retrieval and generation both
+local, only the corpus remote, with an auditable record of which knowledge grounded the answer. The
+two assertions are separate BY DESIGN: a wrong ranking is caught even when generation gets lucky,
+and a generation failure is isolated from retrieval — the subject-vs-claim discipline applied to the
+demo itself.
