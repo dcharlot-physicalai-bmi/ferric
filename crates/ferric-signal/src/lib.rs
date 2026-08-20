@@ -32,6 +32,8 @@
 //!   backends, held to each other numerically so the model that trains is the model that runs.
 //! - [`receipt`] — a recomputable claim that these tokens came from that signal, in the flat
 //!   key/value form `ferroscope` carries inside an MCAP recording.
+//! - [`synth`] — parameterized synthetic physical processes with known ground truth, the data
+//!   generator behind every measured number in this crate.
 //! - [`store`] — saving and loading weights, so a trained model can leave the process that
 //!   trained it and a receipt can digest real bytes rather than a seed.
 //! - [`train`] — the straight-through estimator, without which the gradient through the discrete
@@ -58,6 +60,7 @@ pub mod patch;
 pub mod receipt;
 pub mod sha256;
 pub mod store;
+pub mod synth;
 pub mod tower;
 pub mod train;
 pub mod vocab;

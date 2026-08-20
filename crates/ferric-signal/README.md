@@ -70,6 +70,40 @@ different parameters — a faster decay, a wider duty cycle, a different chirp s
 20% chance is the memorisation signature: the architecture learns the mapping, and has nothing to
 generalise from. **That gap is what a real corpus would close.**
 
+### Scaling the synthetic corpus
+
+Train on N variants per process (bounded parameter families from `synth`), hold out a disjoint set,
+and guard the split **where the model looks**: any held-out example whose token sequence also
+appears in training is excluded and counted, because per-example normalization cancels each
+family's affine parameters and raw-signal distinctness proves nothing downstream of a lossy
+front end.
+
+| variants/kind | train acc | held-out (guarded) | excluded as token-identical |
+|---|---|---|---|
+| 1 | 5/5 | 6/16 (38%) | 4 of 20 |
+| 2 | 10/10 | 7/16 (44%) | 4 of 20 |
+| 4 | 20/20 | 8/16 (50%) | 4 of 20 |
+| 8 | 40/40 | 8/15 (53%) | 5 of 20 |
+| 16 | 80/80 | 9/15 (60%) | 5 of 20 |
+
+Chance is 20%. Tripling the training steps at 8 and 16 variants moves nothing (60% both), and the
+random-label control lands exactly at chance (3/15), printed next to its realized label agreement so
+the null is readable. With 15–16 scored examples a single step of the curve is within noise; the
+evidence is the monotone climb across five sizes. Three readings:
+
+- **Data, not compute, is still the binding constraint at 16 variants per process.** The curve is
+  climbing when it stops being measured, and 3x compute does not move it.
+- **The untrained tokenizer is a ceiling, and the split guard is what exposes it.** Every thermal
+  example — train or held-out — collapses to shared token sequences: an untrained encoder cannot
+  separate smooth decay rates at all, so that family contributes nothing to either side of the
+  split. The next lever is training the tokenizer (`train_tower` shows it trains), not scaling
+  the LM.
+- The first version of this experiment reported a higher, non-monotone curve, and it was wrong:
+  held-out examples were token-identical to training examples, and denser sampling made that more
+  likely — a curve partly manufactured by its own x-axis. The split guard, the control calibration
+  and the per-batch class balance all came out of an adversarial review of the protocol; the
+  numbers above are the sound ones.
+
 ## What is NOT here
 
 **There are no published weights for real sensors.** Everything above is synthetic, with labels the
