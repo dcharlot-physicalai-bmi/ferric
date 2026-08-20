@@ -33,7 +33,7 @@
 //! experts and running a much smaller model than the file describes.
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
-use ferric_tensor::kvquant::{KvqFmt, QKvCache};
+use ferric_tensor::kvquant::{KvStore, KvqFmt};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -163,7 +163,7 @@ pub struct Cache {
     /// Sized `n_layer` like `kv` even though only the first `kv_from_start` entries are ever written:
     /// [`Cfg::kv_src`] indexes this by block, and a shorter vector would make every shared block's
     /// read an index computation instead of a lookup.
-    q: Vec<(QKvCache, QKvCache)>,
+    q: Vec<(KvStore, KvStore)>,
     fmt: Option<KvqFmt>,
 }
 
@@ -188,10 +188,23 @@ impl Cache {
             Some(f) => Cache {
                 pos: 0,
                 kv: Vec::new(),
-                q: (0..cfg.n_layer).map(|_| (QKvCache::new(f), QKvCache::new(f))).collect(),
+                // K's axis comes from the same predicate every runtime consults; V stays per-block.
+                q: (0..cfg.n_layer).map(|_| (crate::qwen3::k_store_from_env(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
             },
         }
+    }
+
+    /// Explicit KV configuration — the browser constructor: a wasm32 tab has no environment for the
+    /// axis env var to be read from. Same shape as `qwen3`/`lfm2`.
+    pub fn with_kv_config(cfg: &Cfg, fmt: Option<KvqFmt>, grouped_k: bool) -> Cache {
+        let mut c = Cache::with_kvq(cfg, fmt);
+        if let Some(f) = fmt {
+            if grouped_k {
+                c.q = (0..cfg.n_layer).map(|_| (KvStore::grouped(f), KvStore::block(f))).collect();
+            }
+        }
+        c
     }
 
     /// The KV-cache quantization format in force, or `None` for f32.

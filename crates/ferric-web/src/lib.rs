@@ -717,13 +717,8 @@ impl FerricModel {
             WebRuntime::Dense(_) => WebCache::Dense(Cache::with_kv_config(self.dense_cfg(), self.kv_fmt, self.kv_grouped_k)),
             WebRuntime::Lfm2(m) => WebCache::Lfm2(
                 ferric_llama::lfm2::Cache::with_kv_config(&m.cfg, self.kv_fmt, self.kv_grouped_k)),
-            WebRuntime::Gemma4(m) => {
-                if self.kv_grouped_k {
-                    return Err(JsValue::from_str("grouped K is wired on the dense runtime only today; \
-                                                  call setKvCache(fmt, false) for gemma4"));
-                }
-                WebCache::Gemma4(ferric_llama::gemma4::Cache::with_kvq(&m.cfg, self.kv_fmt))
-            }
+            WebRuntime::Gemma4(m) => WebCache::Gemma4(
+                ferric_llama::gemma4::Cache::with_kv_config(&m.cfg, self.kv_fmt, self.kv_grouped_k)),
         };
         let mut seq = ids.clone();
         let mut emitted = String::new();

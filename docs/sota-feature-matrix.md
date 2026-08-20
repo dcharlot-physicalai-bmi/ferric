@@ -538,3 +538,13 @@ edge-native architecture. Batched decode composed untouched (solo-equivalent n=2
 q4_0), because the axis lives in the TYPE rather than in per-runtime flags. In-tab receipt:
 `16 layers · lfm2 · BrowserWebGpu · kv q4_0 K:grouped`, identical output, **37.6 tok/s** — the
 fastest LFM2 tab run recorded, quantized KV being less memory traffic on a bandwidth-bound decode.
+
+**Fleet-uniform + fused (2026-08-20):** gemma4 and deepseek2 joined `KvStore`, so ONE type, one env
+var and one constructor shape carry the K axis across all five runtimes. gemma4's measured spread
+matches the pattern (q4_0 block diverges at token **1**, grouped at **7**, q8_0-grouped **never** —
+third architecture, same ordering). And the grouped layout's last overhead is gone: a **fused
+transposing dequantize** derives each output element's source block in index math, replacing the
+per-read permute+contiguous over the whole history. Bit-identical to the two-pass oracle on all three
+formats (zero differing bits; both index-math mutations caught), and batched decode re-verified
+solo-equivalent through the fused path on lfm2 (n=2..8), gemma4 (n=2..4, past the sliding window) and
+deepseek2 (n=2/4). Grouped-K now costs a bounded f32 staging tail and nothing per read.

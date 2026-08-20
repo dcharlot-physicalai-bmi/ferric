@@ -50,7 +50,7 @@
 //! own conversion script applied — so the value in the file is not the value in the formula.
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
-use ferric_tensor::kvquant::{KvqFmt, QKvCache};
+use ferric_tensor::kvquant::{KvStore, KvqFmt};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -260,7 +260,7 @@ pub struct Cache {
     kv: Vec<(KvBuf, KvBuf)>,
     /// Block-quantized twin of `kv`. **Empty unless KV quantization is on**, and when it is on `kv` is
     /// the empty one — holding both would spend the memory the quantization exists to save.
-    q: Vec<(QKvCache, QKvCache)>,
+    q: Vec<(KvStore, KvStore)>,
     fmt: Option<KvqFmt>,
 }
 
@@ -294,7 +294,8 @@ impl Cache {
             Some(f) => Cache {
                 pos: 0,
                 kv: Vec::new(),
-                q: (0..cfg.n_layer).map(|_| (QKvCache::new(f), QKvCache::new(f))).collect(),
+                // K's axis comes from the same predicate every runtime consults; V stays per-block.
+                q: (0..cfg.n_layer).map(|_| (crate::qwen3::k_store_from_env(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
             },
         }

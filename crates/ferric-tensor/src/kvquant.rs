@@ -130,6 +130,83 @@ pub struct QKvCache {
     ctx: Option<Arc<Context>>,
 }
 
+/// Fused transposing dequantize for the GROUPED layout — the permute folded into index math.
+///
+/// [`GroupedKvCache::dequantize`] paid two passes: the block dequantize (rows in `[ngroups*width,
+/// GROUP]` order) and then a permute+contiguous over the whole cache to turn stored-transposed back
+/// into `[rows, width]`. Attention reads the cache EVERY step, so that second pass was per-token
+/// overhead proportional to the entire history. Here one invocation per output element derives its
+/// source block directly: row `r`, channel `c` lives in block `(r/GROUP)*width + c`, lane `r%GROUP` —
+/// same arithmetic per element as the two-pass path, so the results are BIT-identical, which is
+/// exactly what the test demands (the old path stays as the oracle).
+///
+///   info[0] = (n, grid_w, width, GROUP)   info[1] = (rows, 0, 0, 0)
+const DEQUANT_GROUPED_Q8_0_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(1) var<storage,read>       scales: array<u32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;
+@group(0) @binding(3) var<uniform>            info:   array<vec4<u32>, 2>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[0].y;
+    if (i >= info[0].x) { return; }
+    let width = info[0].z;
+    let g = (i / width) / info[0].w;
+    let j = (i / width) % info[0].w;
+    let b = g * width + (i % width);
+    let sw = unpack2x16float(scales[b >> 1u]);
+    let d = select(sw.y, sw.x, (b & 1u) == 0u);
+    let word = codes[b * 8u + (j >> 2u)];
+    let q = i32(word << (24u - 8u * (j & 3u))) >> 24u;
+    out[i] = f32(q) * d;
+}
+"#;
+
+const DEQUANT_GROUPED_Q4_0_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(1) var<storage,read>       scales: array<u32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;
+@group(0) @binding(3) var<uniform>            info:   array<vec4<u32>, 2>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[0].y;
+    if (i >= info[0].x) { return; }
+    let width = info[0].z;
+    let g = (i / width) / info[0].w;
+    let j = (i / width) % info[0].w;
+    let b = g * width + (i % width);
+    let sw = unpack2x16float(scales[b >> 1u]);
+    let d = select(sw.y, sw.x, (b & 1u) == 0u);
+    let byte_i = j & 15u;
+    let word = codes[b * 4u + (byte_i >> 2u)];
+    let byte = (word >> (8u * (byte_i & 3u))) & 255u;
+    let nib = select(byte >> 4u, byte & 15u, j < 16u);
+    out[i] = (f32(nib) - 8.0) * d;
+}
+"#;
+
+const DEQUANT_GROUPED_Q4_1_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>       codes:  array<u32>;
+@group(0) @binding(1) var<storage,read>       scales: array<u32>;
+@group(0) @binding(2) var<storage,read_write> out:    array<f32>;
+@group(0) @binding(3) var<uniform>            info:   array<vec4<u32>, 2>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[0].y;
+    if (i >= info[0].x) { return; }
+    let width = info[0].z;
+    let g = (i / width) / info[0].w;
+    let j = (i / width) % info[0].w;
+    let b = g * width + (i % width);
+    let dm = unpack2x16float(scales[b]);
+    let byte_i = j & 15u;
+    let word = codes[b * 4u + (byte_i >> 2u)];
+    let byte = (word >> (8u * (byte_i & 3u))) & 255u;
+    let nib = select(byte >> 4u, byte & 15u, j < 16u);
+    out[i] = f32(nib) * dm.x + dm.y;
+}
+"#;
+
 /// Tokens per group in [`GroupedKvCache`]. Fixed at the block size so a group's transpose is exactly
 /// one block per channel, which is what lets this reuse [`QKvCache`] instead of new kernels.
 pub const GROUP: usize = QK;
@@ -222,15 +299,26 @@ impl GroupedKvCache {
         let complete = if done == 0 {
             None
         } else {
-            let ngroups = done / GROUP;
-            // `[ngroups*width, GROUP]` as stored -> `[ngroups, width, GROUP]` -> `[ngroups, GROUP,
-            // width]` -> `[done, width]`. Row `g*GROUP + j`, channel `c` comes from block `g*width+c`
-            // lane `j`, which is exactly this permute.
-            Some(self.inner.dequantize(ctx)
-                .reshape(&[ngroups, self.width, GROUP])
-                .permute(&[0, 2, 1])
-                .contiguous()
-                .reshape(&[done, self.width]))
+            // ONE pass: each output element derives its source block directly (row r, channel c ->
+            // block (r/GROUP)*width + c, lane r%GROUP), so the transpose costs no second kernel over
+            // the history. Attention reads the cache every step; the permute+contiguous this replaces
+            // was per-token overhead proportional to the whole cache. Same per-element arithmetic as
+            // the two-pass path — `grouped_roundtrip_paths_agree` holds them bit-identical.
+            let n = done * self.width;
+            let out = empty(ctx, n);
+            let (grid, gw) = groups2d(n);
+            let wgsl = match self.inner.fmt() {
+                KvqFmt::Q8_0 => DEQUANT_GROUPED_Q8_0_WGSL,
+                KvqFmt::Q4_0 => DEQUANT_GROUPED_Q4_0_WGSL,
+                KvqFmt::Q4_1 => DEQUANT_GROUPED_Q4_1_WGSL,
+            };
+            run(ctx, wgsl, "kvq_dequant_grouped",
+                &[self.inner.codes().expect("done>0 implies buffers").as_ref(),
+                  self.inner.scales().expect("done>0 implies buffers").as_ref(),
+                  &out,
+                  &unibuf(ctx, &[n as u32, gw, self.width as u32, GROUP as u32, 0, 0, 0, 0])],
+                grid);
+            Some(Tensor::from_parts(ctx, out, vec![done, self.width]))
         };
         match (complete, &self.staged) {
             (Some(c), Some(st)) => c.cat(st, 0),
@@ -1485,6 +1573,48 @@ mod tests {
     }
 
     // ---- GPU kernels against the CPU reference ------------------------------------------------
+
+    /// The fused transposing dequantize must be BIT-identical to the two-pass oracle it replaced.
+    ///
+    /// The oracle — block dequantize then reshape/permute/contiguous — still exists as `inner`'s own
+    /// path, so it is reconstructed here rather than kept as dead shipping code. Identical per-element
+    /// arithmetic means identical bits, not merely close: any deviation is an index-mapping bug in the
+    /// fused kernel (group/lane swapped, block row mis-derived), which is precisely the class of
+    /// silent wrongness a tolerance would absorb.
+    #[test]
+    fn grouped_fused_dequant_matches_the_two_pass_oracle_bit_for_bit() {
+        let Some(ctx) = ctx() else { return };
+        let width = 96usize; // 3 blocks per row on the inner store: not a power of two, on purpose
+        let rows = 2 * GROUP; // two full groups, no staged tail (the tail is f32 both ways)
+        let v: Vec<f32> = (0..rows * width).map(|i| {
+            let (r, c) = (i / width, i % width);
+            let base = (r as f32 * 0.13 + c as f32 * 1.9).sin();
+            if c % 16 == 5 { base * 25.0 } else { base }
+        }).collect();
+        let src = Tensor::from_vec(&ctx, &v, &[rows, width]);
+
+        for fmt in KvqFmt::ALL {
+            let mut g = GroupedKvCache::new(fmt);
+            g.append(&ctx, &src);
+            let fused = pollster::block_on(g.dequantize(&ctx).to_vec());
+
+            // The oracle, reconstructed: [ngroups*width, GROUP] -> permute -> [rows, width].
+            let ngroups = rows / GROUP;
+            let oracle = pollster::block_on(
+                g.inner.dequantize(&ctx)
+                    .reshape(&[ngroups, width, GROUP])
+                    .permute(&[0, 2, 1])
+                    .contiguous()
+                    .reshape(&[rows, width])
+                    .to_vec());
+            assert_eq!(fused.len(), oracle.len(), "{}: shape", fmt.name());
+            let diff = fused.iter().zip(&oracle)
+                .filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            assert_eq!(diff, 0,
+                       "{}: fused dequant differs from the two-pass oracle in {diff} of {} elements — \
+                        the transpose-in-index-math is wrong somewhere", fmt.name(), fused.len());
+        }
+    }
 
     #[test]
     fn gpu_quantize_matches_the_exact_codes() {
