@@ -23,6 +23,7 @@ pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod cpu_simd; // CPU vector-unit kernels + worker pool: the fabric's second compute unit
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)
+pub mod kvquant; // block-quantized KV cache: q8_0/q4_0/q4_1 blocks that grow one row at a time
 pub mod nn; // transformer blocks expressed on the general runtime
 pub mod optim; // optimizers (Adam)
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
@@ -37,7 +38,7 @@ pub mod sciml; // physics-informed / scientific-ML building blocks (SIREN PINN n
 pub use autograd::{grad, Var};
 pub use sciml::{deriv, Mlp, Siren};
 pub mod image; // PPM in, preprocessed tensor out — no image-codec dependency
-pub use dtype::{Iq4XsWeights, Iq4NlWeights, DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
+pub use dtype::{Iq4XsWeights, Iq4NlWeights, Mxfp4Weights, DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
 
 /// A general N-D f32 tensor: an Arc-shared device buffer viewed through (shape, strides, offset).
@@ -219,7 +220,31 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, shape)
     }
 
+    /// A **private** copy of this tensor's contents in a buffer nobody else holds.
+    ///
+    /// [`Tensor::contiguous`] is deliberately not this: for an already-contiguous input it returns
+    /// `self.clone()`, and since [`Tensor`]'s buffer is an `Arc<wgpu::Buffer>`, that shares the same
+    /// GPU allocation. Sharing is right for read-only use and is why decode is cheap. It is wrong for
+    /// any kernel that writes its input **in place**, where every other handle silently observes the
+    /// write — including handles taken specifically to undo it. See
+    /// `examples/gdn_state_aliasing.rs`, which reproduces exactly that against a snapshot.
+    pub fn deep_copy(&self) -> Tensor {
+        let src = self.contiguous();
+        let n = src.numel();
+        // The copy must see every dispatch queued before it, or it duplicates stale contents — the
+        // same ordering hazard `readback` flushes for.
+        flush_batch(&self.ctx);
+        let dst = empty(&self.ctx, n);
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src.buf.as_ref(), (src.offset * 4) as u64, &dst, 0, (n * 4) as u64);
+        self.ctx.queue.submit([enc.finish()]);
+        Tensor::from_parts(&self.ctx, dst, src.shape.clone())
+    }
+
     /// Materialize a (possibly strided/broadcast) view into a fresh contiguous buffer.
+    ///
+    /// ⚠ Returns `self.clone()` — the SAME device buffer — when the input is already contiguous. If
+    /// you need a buffer you can write without the caller seeing it, use [`Tensor::deep_copy`].
     pub fn contiguous(&self) -> Tensor {
         if self.is_contiguous() {
             return self.clone();
@@ -584,8 +609,19 @@ impl Tensor {
         let (q, k, v, gb) = (self.contiguous(), k.contiguous(), v.contiguous(), gb.contiguous());
         let t = q.numel() / (h * dk);
         let out = empty(&self.ctx, t * h * dv);
-        // The kernel reads and writes state in place, so hand it a buffer it owns either way.
+        // The kernel reads and writes state IN PLACE, so it must be handed a buffer no one else holds.
+        // `contiguous()` does NOT provide that — for an already-contiguous input (which a carried
+        // state always is) it returns `self.clone()`, the same `Arc<wgpu::Buffer>`. This read as
+        // correct for a long time because the ordinary decode loop reassigns `st = new_st` every step,
+        // so aliasing and copying are indistinguishable there. They are not indistinguishable to
+        // anyone holding a second handle: `qwen35::Cache::snapshot()` takes one for speculative-decode
+        // rollback, and the draft steps were advancing the very state the rollback restores.
+        //
+        // Copy-on-write, so the common path keeps costing nothing: copy only when another handle
+        // exists. `strong_count == 1` means the caller's is the only one, since every handle is a
+        // separate Arc clone.
         let st = match state {
+            Some(s) if Arc::strong_count(&s.buf) > 1 => s.deep_copy(),
             Some(s) => s.contiguous(),
             None => Tensor::zeros(&self.ctx, &[h, dv, dk]),
         };

@@ -807,6 +807,7 @@ pub enum QShard {
     Q8_0(Q8_0Weights),
     Iq4Xs(Iq4XsWeights),
     Iq4Nl(Iq4NlWeights),
+    Mxfp4(Mxfp4Weights),
     /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_NL): the weight
     /// is dequantized to f32 on load and run through a plain matmul. Correct and format-complete, at
     /// the cost of f32 weight memory — a native kernel can replace it later purely as a speed/size win.
@@ -833,8 +834,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -847,6 +848,7 @@ impl QShard {
             14 => QShard::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
             20 => QShard::Iq4Nl(Iq4NlWeights::from_bytes(ctx, bytes, rows, cols)),
             23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
+            39 => QShard::Mxfp4(Mxfp4Weights::from_bytes(ctx, bytes, rows, cols)),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
             // Types with no native packed kernel take the dense fallback via `QMatrix::from_dense`
             // (the loader dequantizes them), so they never reach this packed-build path.
@@ -880,6 +882,7 @@ impl QMatrix {
             14 => Some((256, 210)),// Q6_K
             20 => Some((32, 18)),  // IQ4_NL
             23 => Some((256, 136)),// IQ4_XS
+            39 => Some((32, 17)),  // MXFP4
             42 => Some((128, 34)), // Q2_0
             _ => None,
         }
@@ -999,6 +1002,7 @@ impl Tensor {
             QShard::Q8_0(w) => self.matmul_q8_0(w),
             QShard::Iq4Xs(w) => self.matmul_iq4_xs(w),
             QShard::Iq4Nl(w) => self.matmul_iq4_nl(w),
+            QShard::Mxfp4(w) => self.matmul_mxfp4(w),
             QShard::Dense(w) => self.matmul(&w.wt),
         }
     }
@@ -3280,6 +3284,142 @@ impl Tensor {
     }
 }
 
+/// **MXFP4** in-kernel dequant helpers — the E2M1 value table and the E8M0 scale, in the *ggml*
+/// arithmetic rather than the obvious one.
+///
+/// `KM` is the OCP E2M1 table stored **doubled** (`{0,1,2,3,4,6,8,12}` = 2x `{0,.5,1,1.5,2,3,4,6}`),
+/// so the shared scale it pairs with is `2^(e−128)`, not `2^(e−127)`. That halving is ggml's own
+/// arithmetic and it is the one thing a from-the-spec implementation gets wrong: `2^(e−127)` at
+/// `e = 255` is `2^128`, **not representable in f32**, so forming the scale first sends every element
+/// of such a block to `±inf` where ggml returns finite values for the small codes
+/// (`e=255, code=1 → 0x7f000000 = 2^127`). `2^(e−128)` tops out at the representable `2^127`.
+///
+/// **`e8m0h` returns the scale SPLIT IN TWO, and that is a GPU-specific requirement the scalar path
+/// does not have.** `ferric_gguf::e8m0_half_to_f32` hands back a single f32 and builds the two bottom
+/// exponents (`2^−128`, `2^−127`) as subnormal bit patterns, which is exact on the CPU. Transliterated
+/// literally it loses data on the fabric: **this device flushes f32 subnormals to zero** (probed
+/// independently with an elementwise multiply, see `device_keeps_subnormals`), so a subnormal *scale*
+/// is zeroed the instant it is read and takes the whole block's weights with it — **56 of the 4096
+/// (scale, code) pairs came back zero, of which only 16 had answers that were subnormal at all**. The
+/// other 40 were ordinary normal-range f32 values destroyed by a subnormal intermediate.
+///
+/// So the scale is returned as `2^(a−64) · 2^(b−64)` with `a = e>>1`, `b = e−a`. Both exponents land
+/// in `[−64, 64]`, so **neither factor is ever subnormal and neither ever overflows**, for every one
+/// of the 256 scale bytes. `(KM · d.x) · d.y` then reproduces ggml bit for bit: the first product
+/// peaks at `12·2^63 ≈ 2^66.6` (finite), and only the second can saturate — which is exactly where
+/// ggml saturates too. What remains after this is irreducible: 16 pairs whose *answer* is genuinely
+/// below `f32::MIN_POSITIVE`, which no arrangement of multiplies can make a flush-to-zero device
+/// represent. Those are values under `1.2e−38`; the tests pin them as flushed rather than ignore them.
+///
+/// The table is integral, so `i32` holds it exactly and `f32(...)` is lossless — same shape as
+/// `IQ4_XS_HELPERS`. `mxsc` unpacks the scale byte of block `bi` from the 4-blocks-per-word `aux`,
+/// which is what keeps the resident footprint at the format's own 17 bytes per block instead of 20.
+const MXFP4_HELPERS: &str = r#"
+const KM: array<i32, 16> = array<i32, 16>(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+fn qsb(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn mxsc(bi: u32) -> u32 { return (aux[bi >> 2u] >> (8u * (bi & 3u))) & 0xffu; }
+fn e8m0h(e: u32) -> vec2<f32> {
+    let a = e >> 1u;
+    let b = e - a;
+    return vec2<f32>(bitcast<f32>((a + 63u) << 23u), bitcast<f32>((b + 63u) << 23u));
+}
+"#;
+
+/// The 32-value MXFP4 block body. Same low-half/high-half nibble split as Q4_0 and IQ4_NL: element
+/// `j` is the LOW nibble of `qs[j]` and element `j+16` the HIGH nibble.
+///
+/// The weight is formed **before** it meets the activation — `x · (KM[c] · d)`, not `x · d · KM[c]`.
+/// That is deliberate and it is the order the f32 dense fallback uses: the dense path materialises
+/// `w = KM[c]·d` and then multiplies, so any other association would disagree with it exactly where
+/// the product saturates (a block at `e = 255` whose weight is `inf` must contribute `inf`, whatever
+/// the activation is, rather than a finite `x·d·KM`).
+const MXFP4_BODY: &str = r#"
+            let cb = bi * 4u;
+            let d = e8m0h(mxsc(bi));
+            let xbb = r * in_dim + blk * 32u;
+            for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+                let b = qsb(cb, j);
+                acc = acc + x[xbb + j]       * ((f32(KM[b & 0x0Fu]) * d.x) * d.y);
+                acc = acc + x[xbb + j + 16u] * ((f32(KM[b >> 4u]) * d.x) * d.y);
+            }
+"#;
+
+/// Packed **MXFP4** (OCP Microscaling FP4, ggml type 39) weights: `[out, in]`, `in` a multiple of 32.
+///
+/// This is the format GPT-OSS ships in, and the *only* reason it exists is that the weights fit:
+/// 17 bytes per 32 values = 0.53125 bytes/element = 4.25 bpw. Running it through the f32 dense
+/// fallback — which is what happened until this type had a kernel — costs 4 bytes/element, **7.53x**
+/// the format's own footprint, which gives up precisely the property the format was chosen for.
+///
+/// The GPU layout keeps that 7.53x rather than most of it. `codes` is the 16 `qs` bytes as 4 u32
+/// (16 B/block); `aux` packs the single E8M0 scale byte **four blocks to a word** (1 B/block), so the
+/// resident total is 17 bytes per block — bit-for-bit the on-disk size, with no padding. The obvious
+/// one-word-per-scale layout that IQ4_NL/Q4_0 use would cost 20 B/block (0.625 B/elem); it is only
+/// their `f16` scale that makes a whole word the natural unit, and MXFP4's scale is one byte.
+pub struct Mxfp4Weights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 4 u32/block: qs[16]
+    aux: Arc<wgpu::Buffer>,   // 1 BYTE/block: the E8M0 scale, 4 blocks packed per u32
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Mxfp4Weights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Mxfp4Weights {
+        assert_eq!(cols % 32, 0, "MXFP4 cols must be a multiple of 32");
+        assert_eq!(bytes.len(), rows * (cols / 32) * 17, "unexpected MXFP4 byte length");
+        let nblk = rows * (cols / 32);
+        let mut codes: Vec<u32> = vec![0; nblk * 4];
+        let mut aux: Vec<u32> = vec![0; nblk.div_ceil(4)];
+        for b in 0..nblk {
+            let src = &bytes[b * 17..b * 17 + 17]; // e, qs[16]
+            aux[b >> 2] |= (src[0] as u32) << (8 * (b & 3));
+            for w in 0..4 {
+                codes[b * 4 + w] = u32::from_le_bytes([src[1 + w * 4], src[2 + w * 4], src[3 + w * 4], src[4 + w * 4]]);
+            }
+        }
+        let mk = |label: &str, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Mxfp4Weights { ctx: ctx.clone(), codes: mk("mxfp4.codes", &codes), aux: mk("mxfp4.aux", &aux), rows, cols }
+    }
+    /// On-disk block size, which here is also the exact resident size (see the struct docs).
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 17 }
+    /// The bytes actually allocated on the GPU, read back from the buffers rather than computed from
+    /// the format — so a layout change cannot leave the memory claim describing the old one.
+    pub fn gpu_bytes(&self) -> usize { (self.codes.size() + self.aux.size()) as usize }
+}
+
+impl Tensor {
+    /// `y = x·Wᵀ` where `W` is packed **MXFP4**, dequantised per 32-value block in-kernel.
+    pub fn matmul_mxfp4(&self, w: &Mxfp4Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
+        };
+        // Same template-stride rewrite as IQ4_NL: the shared body walks 256-value super-blocks and
+        // MXFP4's are 32. Anchored on the whole expression, and asserted rather than trusted — a
+        // template edit that moved this would otherwise silently read 1/8th of every weight.
+        debug_assert_eq!(wgsl.matches("in_dim / 256u").count(), 1,
+            "MXFP4 rewrites the template's block stride and expects exactly one site");
+        let src = wgsl.replace("in_dim / 256u", "in_dim / 32u")
+            .replace("__HELPERS__", MXFP4_HELPERS).replace("__BODY__", MXFP4_BODY);
+        run(&self.ctx, &src, "matmul_mxfp4",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
 const MATMUL_Q6_K_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<f32>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;
@@ -4069,6 +4209,7 @@ mod format_reachability {
         (2, "Q4_0"), (3, "Q4_1"), (6, "Q5_0"), (7, "Q5_1"), (8, "Q8_0"),
         (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"),
         (20, "IQ4_NL"), (23, "IQ4_XS"),
+        (39, "MXFP4"),
         (42, "Q2_0"),
     ];
 
@@ -4257,5 +4398,282 @@ mod moe_relu2_id_tests {
             assert!(err < 1e-5, "expert {e}: indexed kernel differs from dense by {err:.3e} relative");
         }
         eprintln!("relu2_id: all {n_exp} experts match the dense kernel exactly");
+    }
+}
+
+/// **The MXFP4 packed kernel against the scalar dequant that is itself bit-diffed against ggml.**
+///
+/// The oracle is `ferric_gguf::deq_raw(.., 39)`, which is pinned to
+/// `ggml_get_type_traits(GGML_TYPE_MXFP4)->to_float` over the full 4096-pair (E8M0 scale x E2M1 code)
+/// grid and over 11.1 M real checkpoint elements. So the question here is only whether the WGSL says
+/// the same thing as the Rust — and "close" is the wrong bar, because a microscaling dequant is
+/// exact-representable: every output is a table entry times a power of two, so the kernel is either
+/// bit-identical or wrong.
+///
+/// **Both tests recover weights exactly rather than comparing sums under a tolerance.** A matmul of
+/// random activations against a 4-bit weight hides a wrong nibble inside an accumulation, and the
+/// tolerance needed to pass legitimately is wide enough to pass illegitimately too. Instead each test
+/// arranges the activations so that every output element is one product plus exact zeros, which makes
+/// the GPU's accumulator reproduce a single dequantized weight with no rounding at all — and then
+/// compares `f32::to_bits`, which sees the `+0.0`/`−0.0` distinction that `==` cannot.
+///
+/// The two tests split the work: the grid covers **every** (scale, code) pair including the
+/// saturating ends nobody's file contains, and the identity probe covers **layout** — nibble halves,
+/// the 17-byte stride, the 4-blocks-per-word scale packing and multi-block rows — on pseudo-random
+/// blocks. They also cover the two dispatch templates: shapes are chosen so `q2_0_split_k` routes the
+/// grid's second half through the flat kernel and everything else through split-K, because the two
+/// have different reduction structure and a bug can live in one alone.
+#[cfg(test)]
+mod mxfp4_kernel_tests {
+    use super::*;
+
+    const MXFP4: u32 = 39;
+
+    /// **Does this fabric keep f32 subnormals, or flush them to zero?**
+    ///
+    /// Probed with an ordinary elementwise multiply — a kernel with nothing whatsoever to do with
+    /// MXFP4 — so the answer is a measured property of the device rather than an excuse manufactured
+    /// by the code under test. `1e-30 · 1e-9 = 1e-39` is below f32's smallest **normal** (1.18e-38)
+    /// and well above its smallest subnormal (1.4e-45), so an IEEE-complete device returns it and a
+    /// flush-to-zero device returns exactly 0.
+    fn device_keeps_subnormals(ctx: &Arc<Context>) -> bool {
+        let a = Tensor::from_vec(ctx, &[1e-30f32], &[1, 1]);
+        let b = Tensor::from_vec(ctx, &[1e-9f32], &[1, 1]);
+        pollster::block_on(a.mul(&b).to_vec())[0] != 0.0
+    }
+
+    /// One 17-byte block: scale byte `e`, and `code` placed in the low nibble of `qs[0]` (element 0)
+    /// or the high nibble (element 16). Every other nibble is 0, whose table entry is `+0.0`.
+    fn probe_block(e: u8, code: u8, high: bool) -> [u8; 17] {
+        let mut b = [0u8; 17];
+        b[0] = e;
+        b[1] = if high { code << 4 } else { code };
+        b
+    }
+
+    /// Every one of the 256 E8M0 scale bytes x 16 E2M1 codes x both nibble halves — 8192 blocks, one
+    /// per weight row — read back through the kernel and compared to the scalar oracle on bits.
+    ///
+    /// The activation is a constant `m` per row, so `acc = Σⱼ m·wⱼ` collapses to `m·w` exactly (31 of
+    /// the 32 terms are `m·0.0`). `m` differs per activation row so a kernel that ignored `r` in
+    /// `x[r·in_dim + …]` would produce equal rows and fail; the multipliers are powers of two so the
+    /// product stays exact even where `w` is subnormal.
+    ///
+    /// This is the test the task description warned about: `2^(e−127)` overflows at `e = 255` where
+    /// ggml is finite, and a kernel that computes the scale before the table lookup passes every
+    /// realistic exponent and fails only here.
+    #[test]
+    fn mxfp4_kernel_matches_ggml_over_the_full_e8m0_x_e2m1_grid() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED mxfp4_kernel_matches_ggml_over_the_full_e8m0_x_e2m1_grid: no GPU. \
+                       NOTHING about the kernel was checked.");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+
+        // 8192 rows = 256 scales x 16 codes x {low, high}. Row order is (e, code, half).
+        let mut raw: Vec<u8> = Vec::with_capacity(8192 * 17);
+        let mut want: Vec<f32> = Vec::with_capacity(8192);
+        for e in 0..=255u8 {
+            for code in 0..16u8 {
+                for &high in &[false, true] {
+                    let blk = probe_block(e, code, high);
+                    raw.extend_from_slice(&blk);
+                    let deq = ferric_gguf::deq_raw(&blk, 32, MXFP4).expect("scalar oracle");
+                    want.push(deq[if high { 16 } else { 0 }]);
+                }
+            }
+        }
+        assert_eq!(want.len(), 4096 * 2, "the grid must be every (scale, code) pair, both halves");
+
+        // Two shapes so both dispatch templates run. q2_0_split_k(rows, n_out): rows<=2 → split-K;
+        // rows>2 with n_out >= 16384 → flat. Asserted, not assumed — the routing is a plain function
+        // and this pins which branch each half of the test is actually taking.
+        assert!(q2_0_split_k(1, 8192), "grid part 1 was meant to exercise the split-K kernel");
+        assert!(!q2_0_split_k(3, 16384), "grid part 2 was meant to exercise the flat kernel");
+
+        // ---- split-K: 1 activation row, 8192 weight rows ----
+        let w = Mxfp4Weights::from_bytes(&ctx, &raw, 8192, 32);
+        let x = Tensor::from_vec(&ctx, &vec![1.0f32; 32], &[1, 32]);
+        let got = pollster::block_on(x.matmul_mxfp4(&w).to_vec());
+        // A divergence is EXCUSED only if the exact answer is a subnormal f32 AND this device was
+        // independently measured not to keep subnormals AND the kernel returned a clean zero. Every
+        // other difference is a kernel bug and fails. The excused population is derived from the
+        // ORACLE (|want| below f32::MIN_POSITIVE), never from what happened to differ, so a kernel
+        // that lost a normal-range value cannot be absorbed into it.
+        let keeps_sub = device_keeps_subnormals(&ctx);
+        let want_subnormal = |v: f32| v != 0.0 && v.abs() < f32::MIN_POSITIVE;
+        let n_subnormal = want.iter().filter(|&&v| want_subnormal(v)).count();
+        let mut flushed = 0usize;
+        let mut ndiff = 0usize;
+        let mut first = None;
+        for i in 0..8192 {
+            if got[i].to_bits() == want[i].to_bits() { continue; }
+            if !keeps_sub && want_subnormal(want[i]) && got[i] == 0.0 { flushed += 1; continue; }
+            ndiff += 1;
+            if first.is_none() { first = Some(i); }
+        }
+        if let Some(i) = first {
+            let (e, code, high) = (i / 32, (i / 2) % 16, i % 2 == 1);
+            panic!("split-K MXFP4 kernel differs from ggml on {ndiff}/8192 (scale,code) probes at values \
+                    the device CAN represent; first at e={e} code={code} high={high}: gpu {} (0x{:08x}) \
+                    vs ggml {} (0x{:08x})",
+                   got[i], got[i].to_bits(), want[i], want[i].to_bits());
+        }
+        // Flush-to-zero must be TOTAL, not selective: if the device drops subnormals it must drop all
+        // 16 of them. A kernel that formed a subnormal INTERMEDIATE would take normal-range results
+        // down with it and land here with flushed > n_subnormal — which is exactly how the first
+        // version of this kernel behaved (56 lost, of which only 16 were subnormal answers).
+        assert_eq!(flushed, if keeps_sub { 0 } else { n_subnormal },
+            "device keeps_subnormals={keeps_sub}: expected {} flushed-to-zero results, saw {flushed}. \
+             Anything else means the kernel is destroying values the device could have represented.",
+            if keeps_sub { 0 } else { n_subnormal });
+
+        // ---- flat: 3 activation rows with different constants, 16384 weight rows (grid twice) ----
+        let mut raw2 = raw.clone();
+        raw2.extend_from_slice(&raw);
+        let w2 = Mxfp4Weights::from_bytes(&ctx, &raw2, 16384, 32);
+        let mults = [1.0f32, 2.0, 4.0];
+        let xv: Vec<f32> = mults.iter().flat_map(|&m| std::iter::repeat(m).take(32)).collect();
+        let x2 = Tensor::from_vec(&ctx, &xv, &[3, 32]);
+        let got2 = pollster::block_on(x2.matmul_mxfp4(&w2).to_vec());
+        let mut ndiff2 = 0usize;
+        let mut flushed2 = 0usize;
+        let mut first2 = None;
+        for (r, &m) in mults.iter().enumerate() {
+            for o in 0..16384usize {
+                let w0 = want[o % 8192];
+                let exp = m * w0;
+                let g = got2[r * 16384 + o];
+                if g.to_bits() == exp.to_bits() { continue; }
+                // Classify on the WEIGHT, not on m*w. The device drops the subnormal the moment the
+                // kernel forms it, so a subnormal weight is lost even when m lifts the exact product
+                // back into the normal range — measured: with the predicate on m*w instead, 56 of
+                // these read as kernel bugs across m in {1,2,4}, all of them this one effect.
+                if !keeps_sub && want_subnormal(w0) && g == 0.0 { flushed2 += 1; continue; }
+                ndiff2 += 1;
+                if first2.is_none() { first2 = Some((r, o, g, exp)); }
+            }
+        }
+        if let Some((r, o, g, exp)) = first2 {
+            let i = o % 8192;
+            panic!("flat MXFP4 kernel differs on {ndiff2}/49152; first at act-row {r} (x={}) weight-row {o} \
+                    (e={} code={} high={}): gpu {g} (0x{:08x}) vs expected {exp} (0x{:08x})",
+                   mults[r], i / 32, (i / 2) % 16, i % 2 == 1, g.to_bits(), exp.to_bits());
+        }
+        assert_eq!(flushed2, if keeps_sub { 0 } else { mults.len() * 2 * n_subnormal },
+            "flat kernel: expected {} flushed subnormal weights over {} activation rows x 2 grid \
+             copies, saw {flushed2}", if keeps_sub { 0 } else { mults.len() * 2 * n_subnormal }, mults.len());
+        eprintln!("MXFP4: bit-identical to ggml on all 4096 (E8M0, E2M1) pairs x 2 nibble halves, \
+                   split-K and flat kernels, 3 activation rows ({} probes). device keeps subnormals: \
+                   {keeps_sub}; results below f32::MIN_POSITIVE flushed to zero: {flushed}/{n_subnormal}",
+                  8192 + 49152);
+    }
+
+    /// Pseudo-random blocks over the exponent range a real checkpoint uses, read back **weight by
+    /// weight** with an identity activation: `x = I[cols,cols]` makes `out[j][o] = w[o][j]` exactly,
+    /// so every one of the `rows·cols` weights is compared to the scalar oracle on bits.
+    ///
+    /// This is what the grid cannot see: multi-block rows (so the 17-byte stride and the
+    /// 4-blocks-per-word scale unpack must both be right), both nibble halves in every byte, and the
+    /// `o · nblk + blk` block indexing. A stride or scale-packing error moves every weight after the
+    /// first block and shows up as thousands of differences, not a rounding wobble.
+    #[test]
+    fn mxfp4_kernel_recovers_every_weight_of_a_multi_block_row() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED mxfp4_kernel_recovers_every_weight_of_a_multi_block_row: no GPU. \
+                       NOTHING about the kernel was checked.");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (rows, cols) = (48usize, 128usize);      // 4 blocks per row, 192 blocks total
+        let nblk = rows * (cols / 32);
+        let mut s = 0x9E37_79B9u32;
+        let mut rnd = || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        let mut raw = Vec::with_capacity(nblk * 17);
+        for _ in 0..nblk {
+            // Scale bytes 0x6C..0x8B: 2^-19 .. 2^12, the band a requantized checkpoint actually lands
+            // in. Deliberately several distinct exponents per row, so a block read at the wrong
+            // stride picks up a neighbour's scale and cannot pass by luck.
+            raw.push(0x6C + (rnd() % 32) as u8);
+            for _ in 0..16 { raw.push((rnd() % 256) as u8) }
+        }
+        let want = ferric_gguf::deq_raw(&raw, rows * cols, MXFP4).expect("scalar oracle");
+        assert!(want.iter().any(|v| *v != 0.0), "degenerate fixture: every oracle weight is zero");
+
+        let w = Mxfp4Weights::from_bytes(&ctx, &raw, rows, cols);
+        let mut eye = vec![0.0f32; cols * cols];
+        for j in 0..cols { eye[j * cols + j] = 1.0; }
+        let x = Tensor::from_vec(&ctx, &eye, &[cols, cols]);
+        let got = pollster::block_on(x.matmul_mxfp4(&w).to_vec());   // [cols, rows], got[j*rows+o] = w[o][j]
+
+        let mut ndiff = 0usize;
+        let mut first = None;
+        for o in 0..rows {
+            for j in 0..cols {
+                let g = got[j * rows + o];
+                let e = want[o * cols + j];
+                if g.to_bits() != e.to_bits() {
+                    ndiff += 1;
+                    if first.is_none() { first = Some((o, j, g, e)); }
+                }
+            }
+        }
+        if let Some((o, j, g, e)) = first {
+            panic!("MXFP4 kernel recovered {ndiff}/{} weights wrongly; first at row {o} col {j} \
+                    (block {} of the row, {} nibble): gpu {g} (0x{:08x}) vs ggml-equivalent {e} (0x{:08x})",
+                   rows * cols, j / 32, if j % 32 < 16 { "low" } else { "high" }, g.to_bits(), e.to_bits());
+        }
+        eprintln!("MXFP4: all {} weights of a {rows}x{cols} ({} blocks/row) tensor recovered bit-exactly",
+                  rows * cols, cols / 32);
+    }
+
+    /// The point of the format. Resident bytes are read back from the **live GPU buffers**
+    /// (`wgpu::Buffer::size()`), not computed from the block formula, so a layout that padded
+    /// differently than the doc claims would be caught here rather than described correctly and
+    /// implemented wrongly.
+    #[test]
+    fn mxfp4_resident_bytes_are_the_formats_own_and_not_f32() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED mxfp4_resident_bytes_are_the_formats_own_and_not_f32: no GPU.");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let (rows, cols) = (256usize, 512usize);
+        let nblk = rows * (cols / 32);
+        let raw = vec![0x7Fu8; nblk * 17];
+        let dense = rows * cols * 4;
+
+        // ⚠ GO THROUGH `QMatrix::from_bytes`, NOT `Mxfp4Weights::from_bytes`. This test previously
+        // constructed the packed weight directly and asked its size — which is compact whether or not
+        // a loader ever ROUTES an MXFP4 tensor to it. Mutating `block_bytes(39)` to `None`, which sends
+        // every real MXFP4 weight down the f32 dense fallback, left that version green. The claim in
+        // this test's own name is about what a loaded weight costs, so the loader path is the subject.
+        // Half one of the residency claim, and the half that lives in ANOTHER CRATE. Every loader
+        // picks its path with `if QMatrix::block_bytes(ty).is_some() { from_bytes } else
+        // { from_dense }` — see `ferric_llama::qwen35::qm`, which the dense runtime also uses. So
+        // `block_bytes(39)` returning `None` silently routes every real MXFP4 tensor to the f32 dense
+        // fallback. Nothing in ferric-llama's suite covers that today, and a ferric-tensor test cannot
+        // reach it, so the published predicate is asserted here where it is defined.
+        assert_eq!(QMatrix::block_bytes(39), Some((32, 17)),
+                   "block_bytes is the predicate every loader uses to choose the packed path over the \
+                    f32 fallback; `None` here costs ~7.5x resident memory and still generates correct \
+                    text, so no output check would catch it");
+        // Half two: given the loader does choose `from_bytes`, the type actually reaches a packed shard.
+        let m = QMatrix::from_bytes(&ctx, &raw, 39, rows, cols).expect("MXFP4 must load as a QMatrix");
+        assert_eq!(m.n_shards(), 1, "one shard for a lone MXFP4 tensor");
+        assert!(matches!(m.shards[0], QShard::Mxfp4(_)),
+                "MXFP4 must reach the packed shard. A `QShard::Dense` here means `block_bytes(39)` or \
+                 `QShard::build`'s type arm stopped routing it, and the weight is silently f32-resident \
+                 at ~7.5x the format's footprint — which still generates correct text, so nothing else \
+                 would notice.");
+        let packed = m.nbytes();
+        assert_eq!(packed, raw.len(),
+            "MXFP4 should be resident at exactly its on-disk size; buffers hold {packed} B for a \
+             {} B tensor", raw.len());
+        assert_eq!(packed as f64 / (rows * cols) as f64, 0.53125, "4.25 bits/weight is the format");
+        eprintln!("MXFP4 resident: {packed} B ({:.5} B/elem) vs {dense} B f32 ({:.2}x) — through \
+                   QMatrix::from_bytes, from live buffer sizes",
+                  packed as f64 / (rows * cols) as f64, dense as f64 / packed as f64);
     }
 }
