@@ -482,3 +482,29 @@ decodes the same bytes into NaN-bearing garbage, and the wrong bias shifts every
 Still open on the format: nothing — layout, size, bias and element decode are all verified against the
 file or bit-exact against a reference on the file's own bytes. Open overall: the forward graph, and
 whether OTHER quantizers' V4 files match this one (only a single native F8 file exists publicly).
+
+## O. Browser runtimes: demonstrated in a REAL Chrome tab (2026-08-20)
+
+`web/runtimes.html` + a puppeteer driver run the shipped wasm bundle (0.95 MB — the entire runtime)
+in headless Chrome with WebGPU, Dawn/Tint compiling the WGSL rather than our patched naga. This rung
+exists because compiling to wasm32 proves nothing about running: `std::time::Instant` LINKS on wasm
+and only panics at runtime, so this session's per-dispatch profiling crashed every tab while every
+`cargo check --target wasm32` reported 0 errors in good faith. Fixed with a one-place `profclock`
+shim (native Instant, wasm no-op; decode fingerprint bit-identical).
+
+| tab run | verdict |
+|---|---|
+| LFM2.5-1.2B Q4_K_M (700 MB), f32 KV | ✅ " Paris. The city is known…" — word-identical to native, 6.8 tok/s cold / ~20 warm |
+| same, **q8_0 KV** | ✅ identical output, receipt `kv q8_0 K:block` asserted IN FORCE on the page |
+| gemma4 E2B Q4_K_M (3.27 GB) | ❌ `TypeError: Failed to fetch` — Chrome refuses the whole-file response into an ArrayBuffer. NOT the server (curl delivers all 3,427,880,384 bytes in 2.4 s), NOT wasm, NOT WebGPU: the load path's shape |
+
+Two harness lessons, both now permanent in the driver: Chrome's persistent profile serves CACHED
+pages for the same URL (`setCacheEnabled(false)` — never test a page you may not be running), and
+the page renders its KV line AFTER applying the config so it is a receipt, not a default.
+
+**The gemma4 blocker is the whole-file load path, precisely located.** `FerricModel::load(Vec<u8>)`
+requires fetch → ArrayBuffer → copy, three simultaneous multi-GB tenants. The fix that changes the
+ceiling is a STREAMING load — read the response body in chunks into wasm, upload weights as they
+arrive, never hold the file twice — and `ferric-gguf`'s `Backing`/`GgufBacked`/`header_probe` were
+built for exactly that access pattern. Until then the honest browser matrix is: dense family + LFM2
+proven in-tab; gemma4 wired and native-proven but tab-blocked on load shape, not on capability.
