@@ -5,6 +5,7 @@ pub mod stream;
 use ferric_core::{demo, matmul_cpu, max_abs_diff, Context};
 use ferric_gguf::{parse, GgufSource, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
+use ferric_tensor::kvquant::KvqFmt;
 use ferric_tensor::Tensor;
 use ferric_tokenizer::{Bpe, Spm};
 use std::collections::HashMap;
@@ -375,10 +376,24 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
 /// **Stateful model handle** — load a GGUF ONCE (weights uploaded to the GPU once), then generate
 /// many times. The per-call `bonsai_*` functions reload every call (fine for a one-shot demo, far too
 /// slow for an app); the AI SDK provider and any real workload should hold a `FerricModel`.
+/// Which runtime a loaded browser model runs on.
+///
+/// `FerricModel` bound the DENSE runtime alone until 2026-08-20, which silently narrowed "Ferric runs
+/// in the browser" to the qwen/llama/gemma-3 families. LFM2 is the first addition on purpose: at
+/// ~700 MB (1.2B Q4_K_M) it fits comfortably inside wasm32's 4 GB address space, and its conv/attn
+/// hybrid was designed for exactly this class of device. Dispatch is by `general.architecture`
+/// through the same match shape the native server uses — an UNKNOWN arch is refused by name, never
+/// routed to a plausible-looking default (that is how `llama` once held a `verified` badge while
+/// answering from the wrong continent).
+enum WebRuntime {
+    Dense(Qwen3),
+    Lfm2(ferric_llama::lfm2::Lfm2),
+}
+
 #[wasm_bindgen]
 pub struct FerricModel {
     ctx: Arc<Context>,
-    model: Qwen3,
+    model: WebRuntime,
     bpe: Bpe,
     /// SentencePiece tokenizer (Gemma / Phi-3 / Mistral / Llama-2 — `tokenizer.ggml.model == "llama"`);
     /// when set, text goes through it instead of the byte-level `bpe`. Lets the browser run those families.
@@ -397,6 +412,20 @@ pub struct FerricModel {
     /// prompt tokenizes them to their special ids instead of BPE-ing the literal text (essential for
     /// ChatML/Gemma chat + tool-calling to behave as the model was trained).
     specials: Vec<(String, u32)>,
+    /// Every token id that ends generation, resolved from THIS model's metadata and vocabulary.
+    ///
+    /// `run` used to hardcode Qwen's pair (151645/151643) — correct for Qwen, silently wrong for every
+    /// other family this loader claims to serve: a Gemma or LFM2 model would generate past its own
+    /// end-of-turn and keep going until `steps` ran out.
+    eos_set: Vec<u32>,
+    /// KV cache format, and whether K uses the token-grouped layout.
+    ///
+    /// Carried on the model rather than read from the environment because **there is no environment in
+    /// a browser**: `std::env::var` always errs on `wasm32-unknown-unknown`, so `Cache::new` pins a tab
+    /// to an f32 cache no matter what. Memory is the binding constraint here far more than it is
+    /// natively, so this is the one knob that most needs to be reachable.
+    kv_fmt: Option<KvqFmt>,
+    kv_grouped_k: bool,
 }
 
 #[wasm_bindgen]
@@ -447,13 +476,47 @@ impl FerricModel {
             if ctrl && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest match first
+        // The stop set: the declared eos plus every conventional end marker that the tokenizer marks
+        // as a CONTROL token. Union rather than either/or, because chat checkpoints routinely declare
+        // one id and emit the other (Qwen declares 151643 <|endoftext|> and chats end at 151645
+        // <|im_end|>). The control-type gate is load-bearing: Qwen's vocabulary contains "</s>" as an
+        // ORDINARY token (id 128247, token_type 1), so a surface-form union alone would falsely stop
+        // generation inside any HTML/XML the model writes. Measured, not hypothesised — the first
+        // version of this union picked it up.
+        let ttypes: Vec<i64> = match g.metadata().get("tokenizer.ggml.token_type") {
+            Some(Meta::Arr(a)) => a.iter().map(|m| match m { Meta::I(v) => *v, Meta::U(v) => *v as i64, _ => 0 }).collect(),
+            _ => Vec::new(),
+        };
+        let is_control = |id: u32| ttypes.get(id as usize).is_none_or(|&t| t == 3);
+        let mut eos_set: Vec<u32> = eos_id.into_iter().collect();
+        for name in ["<|im_end|>", "<|endoftext|>", "</s>", "<eos>", "<end_of_turn>", "<|eot_id|>"] {
+            if let Some((_, id)) = specials.iter().find(|(t, _)| t == name) {
+                if is_control(*id) && !eos_set.contains(id) { eos_set.push(*id); }
+            }
+        }
         let ctx = Arc::new(Context::new().await.map_err(err)?);
-        let model = Qwen3::load(&ctx, &g).map_err(err)?;
-        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, specials })
+        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        let model = match arch.as_str() {
+            "lfm2" => WebRuntime::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).map_err(err)?),
+            // Everything the dense loader genuinely serves; it feature-detects within this family.
+            "qwen2" | "qwen3" | "llama" | "phi3" | "gemma" | "gemma2" | "gemma3" | "" =>
+                WebRuntime::Dense(Qwen3::load(&ctx, &g).map_err(err)?),
+            other => return Err(err(format!(
+                "architecture {other:?} has no browser runtime yet (browser: dense family + lfm2; \
+                 native additionally runs qwen35/gemma4/deepseek2). Refusing rather than mis-running \
+                 it through the dense loader — that fails as fluent wrong text, not as an error."))),
+        };
+        // Default OFF, exactly as native: quantizing the KV cache trades accuracy for memory and that
+        // is the caller's decision. `set_kv_cache` opts in.
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, specials, eos_set,
+                         kv_fmt: None, kv_grouped_k: false })
     }
 
     /// `#layers · backend` — a small readiness string for the UI.
-    pub fn info(&self) -> String { format!("{} layers · {:?}", self.model.cfg.n_layer, self.ctx.backend) }
+    pub fn info(&self) -> String {
+        let kind = match &self.model { WebRuntime::Dense(_) => "dense", WebRuntime::Lfm2(_) => "lfm2" };
+        format!("{} layers · {kind} · {:?}", self.n_layer(), self.ctx.backend)
+    }
 
     fn detok(&self, ids: &[u32]) -> String {
         if let Some(sp) = &self.spm { return sp.decode(ids); }
@@ -512,13 +575,19 @@ impl FerricModel {
     /// Embed `text` → an L2-normalized vector (last-token pooling), for on-device semantic search / RAG.
     /// Only meaningful on an embedding model (e.g. Qwen3-Embedding); returns a Float32Array to JS.
     pub async fn embed(&self, text: String) -> std::result::Result<Vec<f32>, JsValue> {
-        let n = self.model.cfg.n_embd;
+        // Dense-only: the trained embedding checkpoints (Qwen3-Embedding) are dense, and LFM2 has no
+        // LAST-pooling embedding reference to compare against. Refuse with a message rather than pool
+        // an arbitrary hidden state and hand back plausible cosine scores that mean nothing.
+        let WebRuntime::Dense(m) = &self.model else {
+            return Err(JsValue::from_str("embed() is available on dense embedding models only"));
+        };
+        let n = m.cfg.n_embd;
         // Raw piece tokenization (like native Engine::embed) — embeddings embed literal text, so DON'T
         // split on control tokens or prepend BOS; only the trained EOS is appended below.
         let mut ids = self.enc_piece(&text, true);
         if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } } // Qwen3-Embedding pools the EOS position
         if ids.is_empty() { return Ok(vec![0.0; n]); }
-        let v = self.model.forward_hidden(&ids).to_vec().await; // [T·n_embd]
+        let v = m.forward_hidden(&ids).to_vec().await; // [T·n_embd]
         let t = (v.len() / n).max(1);
         let last = &v[(t - 1) * n..t * n]; // last-token pool (the appended EOS when present)
         let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
@@ -526,28 +595,117 @@ impl FerricModel {
     }
 }
 
+#[wasm_bindgen]
 impl FerricModel {
+    /// **Quantize the KV cache**, the single largest context-per-GB lever available in a tab.
+    ///
+    /// `fmt` is `"off"` (default), `"q8_0"`, `"q4_0"` or `"q4_1"`. `grouped_k` picks the token-grouped
+    /// layout for K, which is what makes 4-bit usable at all: on qwen2.5-0.5b it moves q4_0 from
+    /// perplexity 106.6 to 32.2 against an f32 cache's 31.2, at 7.11x the context per GB. With
+    /// `grouped_k = false` the same 4-bit cache collapses into a repeating loop.
+    ///
+    /// An unrecognised `fmt` is an ERROR rather than a silent fallback to f32: a typo would otherwise
+    /// leave the tab running full-precision KV while the caller believed it had shrunk it four-fold,
+    /// and the only symptom would be memory that failed to drop.
+    #[wasm_bindgen(js_name = setKvCache)]
+    pub fn set_kv_cache(&mut self, fmt: &str, grouped_k: bool) -> std::result::Result<(), JsValue> {
+        self.kv_fmt = match fmt.trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "f32" | "none" => None,
+            "q8_0" => Some(KvqFmt::Q8_0),
+            "q4_0" => Some(KvqFmt::Q4_0),
+            "q4_1" => Some(KvqFmt::Q4_1),
+            other => return Err(JsValue::from_str(&format!(
+                "setKvCache: {other:?} is not a KV cache format. Use \"off\", \"q8_0\", \"q4_0\" or \"q4_1\"."))),
+        };
+        self.kv_grouped_k = grouped_k;
+        Ok(())
+    }
+
+    /// What the KV cache is currently configured as, for a UI to display or a test to assert.
+    #[wasm_bindgen(js_name = kvCache)]
+    pub fn kv_cache(&self) -> String {
+        match self.kv_fmt {
+            None => "f32".into(),
+            Some(f) => format!("{} K:{}", f.name(), if self.kv_grouped_k { "grouped" } else { "block" }),
+        }
+    }
+}
+
+/// Per-runtime cache, mirrored from [`WebRuntime`] — constructed from the model kind, never guessed.
+enum WebCache {
+    Dense(Cache),
+    Lfm2(ferric_llama::lfm2::Cache),
+}
+
+impl FerricModel {
+    fn n_vocab(&self) -> usize {
+        match &self.model { WebRuntime::Dense(m) => m.cfg.n_vocab, WebRuntime::Lfm2(m) => m.cfg.n_vocab }
+    }
+    fn n_layer(&self) -> usize {
+        match &self.model { WebRuntime::Dense(m) => m.cfg.n_layer, WebRuntime::Lfm2(m) => m.cfg.n_layer }
+    }
+    /// The dense config, on the paths that are dense-only (embeddings, grouped-K). Panics on lfm2 by
+    /// design: those call sites must refuse earlier with a real message.
+    fn dense_cfg(&self) -> &ferric_llama::qwen3::Cfg {
+        match &self.model {
+            WebRuntime::Dense(m) => &m.cfg,
+            WebRuntime::Lfm2(_) => unreachable!("dense_cfg on lfm2 — the caller must gate first"),
+        }
+    }
+    /// `run` without JS callback types — the seam that lets the SAME code path be exercised natively.
+    ///
+    /// The browser build is verified by compiling to wasm32; whether the model GENERATES correctly is
+    /// verified here, natively, on the identical `WebRuntime` dispatch. A separate native path would
+    /// re-open the gap this exists to close: proving one thing and shipping another.
+    /// The resolved stop set — exposed for the native smoke test to assert on, since a wrong eos set
+    /// does not fail generation, it just runs past the end-of-turn until `steps` expires.
+    #[doc(hidden)]
+    pub fn eos_ids(&self) -> Vec<u32> { self.eos_set.clone() }
+
+    #[doc(hidden)]
+    pub async fn generate_plain(&self, prompt: &str, steps: usize) -> std::result::Result<String, JsValue> {
+        self.run(prompt, steps, None, &|_, _| {}).await
+    }
+
     async fn run(&self, prompt: &str, steps: usize, mut guide: Option<&mut ferric_agent::guide::Guide<'_>>, emit: &dyn Fn(&str, &str)) -> std::result::Result<String, JsValue> {
-        let c = &self.model.cfg;
+        let n_vocab = self.n_vocab();
         let ids = self.encode(prompt);
         if ids.is_empty() { return Err(JsValue::from_str("prompt encoded to zero tokens")); }
-        let eos = |t: u32| t == 151645 || t == 151643;
-        let mut cache = Cache::new(c);
+        // From the model's own metadata — the hardcoded Qwen pair generated past every other family's
+        // end-of-turn. Empty set means "no known stop", which runs to `steps` and says so honestly.
+        let eos = |t: u32| self.eos_set.contains(&t);
+        // Each runtime carries its own cache type; the loop below only ever needs "logits for these
+        // tokens, continuing this cache", so the dispatch lives in one closure-shaped match.
+        let mut cache = match &self.model {
+            WebRuntime::Dense(_) => WebCache::Dense(Cache::with_kv_config(self.dense_cfg(), self.kv_fmt, self.kv_grouped_k)),
+            WebRuntime::Lfm2(m) => {
+                if self.kv_grouped_k {
+                    return Err(JsValue::from_str("grouped K is wired on the dense runtime only today; \
+                                                  call setKvCache(fmt, false) for lfm2"));
+                }
+                WebCache::Lfm2(ferric_llama::lfm2::Cache::with_kvq(&m.cfg, self.kv_fmt))
+            }
+        };
         let mut seq = ids.clone();
         let mut emitted = String::new();
         for step in 0..steps {
-            let logits = if step == 0 { self.model.forward_cached(&ids, &mut cache) } else { self.model.forward_cached(&seq[seq.len() - 1..], &mut cache) };
+            let toks = if step == 0 { &ids[..] } else { &seq[seq.len() - 1..] };
+            let logits = match (&self.model, &mut cache) {
+                (WebRuntime::Dense(m), WebCache::Dense(c)) => m.forward_cached(toks, c),
+                (WebRuntime::Lfm2(m), WebCache::Lfm2(c)) => m.forward(toks, c),
+                _ => unreachable!("cache kind is constructed from the model kind above"),
+            };
             let v = logits.to_vec().await;
-            let row = &v[v.len() - c.n_vocab..];
+            let row = &v[v.len() - n_vocab..];
             let next = if let Some(g) = guide.as_deref() {
                 let can_stop = g.can_stop();
                 let (mut best, mut bl) = (None, f32::NEG_INFINITY);
-                for i in 0..c.n_vocab {
+                for i in 0..n_vocab {
                     let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&ch| a.step(ch)) } _ => false } };
                     if ok && row[i] > bl { bl = row[i]; best = Some(i as u32); }
                 }
                 match best { Some(t) => t, None => break }
-            } else { (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32 };
+            } else { (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32 };
             if eos(next) { break; }
             if let Some(g) = guide.as_deref_mut() { if let Some(b) = &self.token_bytes[next as usize] { for &ch in b { g.step(ch); } } }
             seq.push(next);
