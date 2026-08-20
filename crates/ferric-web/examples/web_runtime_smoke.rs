@@ -13,6 +13,7 @@ async fn run() {
     let bytes = std::fs::read(path).expect("read model");
     let m = ferric_web::FerricModel::load(bytes).await.expect("load");
     println!("info: {}", m.info());
+    println!("prompt ids: {:?}", m.encode_ids(prompt));
     let eos = m.eos_ids();
     println!("eos_set: {eos:?}");
     // The hardcoded pair this replaced was Qwen's {151645, 151643}. For a Qwen checkpoint the resolved

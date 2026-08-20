@@ -388,6 +388,10 @@ fn gpt2_byte_decoder() -> HashMap<char, u8> {
 enum WebRuntime {
     Dense(Qwen3),
     Lfm2(ferric_llama::lfm2::Lfm2),
+    /// Gemma 4 E2B fits a tab at Q4_K_M (~2.4 GB inside wasm32's 4 GB); the Q8_0 distribution
+    /// (4.7 GB) does not, so the browser story for this family is a requantized file by necessity,
+    /// not preference.
+    Gemma4(ferric_llama::gemma4::Gemma4),
 }
 
 #[wasm_bindgen]
@@ -441,7 +445,15 @@ impl FerricModel {
         };
         let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
         // SentencePiece (Gemma/Phi/Mistral/Llama-2) vs byte-level BPE (Qwen/Llama-3), from the GGUF.
-        let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "llama");
+        //
+        // "gemma4" routes to SPM despite ALSO shipping a merges list, and the evidence is a bug this
+        // check caused: its vocabulary is ▁-convention ('▁world') while Bpe::encode byte-maps spaces
+        // to the GPT-2 'Ġ' convention, so every space stranded as the lone 'Ġ' token (id 245237) that
+        // no merge could join — "The capital of France" became [The, Ġ, capital, Ġ, ...]. Q8_0 was
+        // robust enough to answer " Paris." through the garbage, which MASKED it; the Q4 requant was
+        // not, which exposed it. The file carries real scores for all 262,144 tokens, and scored
+        // greedy merge (Spm) is the algorithm that matches its piece style.
+        let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "llama" || s == "gemma4");
         let (bpe, spm) = if is_spm {
             let scores: Vec<f32> = match g.metadata().get("tokenizer.ggml.scores") {
                 Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
@@ -470,10 +482,21 @@ impl FerricModel {
         let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let eos_id = match g.metadata().get("tokenizer.ggml.eos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_eos = matches!(g.metadata().get("tokenizer.ggml.add_eos_token"), Some(Meta::Bool(true)));
+        // Control tokens are read from `tokenizer.ggml.token_type` (3 = CONTROL) FIRST, with the old
+        // surface heuristic kept only as a fallback for files that omit the array. The heuristic alone
+        // is a trap that has now bitten twice in one day: Gemma 4 renamed its chat markers to
+        // `<|turn>` / `<turn|>`, which match NEITHER `<|…|>` nor the hardcoded name list — so a
+        // chat-templated prompt would BPE the literal marker text instead of emitting ids 105/106,
+        // and generation would run through the end-of-turn it never knew existed.
+        let ttypes: Vec<i64> = match g.metadata().get("tokenizer.ggml.token_type") {
+            Some(Meta::Arr(a)) => a.iter().map(|m| match m { Meta::I(v) => *v, Meta::U(v) => *v as i64, _ => 0 }).collect(),
+            _ => Vec::new(),
+        };
         let mut specials: Vec<(String, u32)> = toks.iter().enumerate().filter_map(|(i, t)| {
-            let ctrl = (t.starts_with("<|") && t.ends_with("|>"))
+            let by_type = ttypes.get(i).is_some_and(|&ty| ty == 3);
+            let by_surface = (t.starts_with("<|") && t.ends_with("|>"))
                 || matches!(t.as_str(), "<s>" | "</s>" | "<bos>" | "<eos>" | "<pad>" | "<unk>" | "<mask>" | "<start_of_turn>" | "<end_of_turn>");
-            if ctrl && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
+            if (by_type || by_surface) && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest match first
         // The stop set: the declared eos plus every conventional end marker that the tokenizer marks
@@ -483,13 +506,10 @@ impl FerricModel {
         // ORDINARY token (id 128247, token_type 1), so a surface-form union alone would falsely stop
         // generation inside any HTML/XML the model writes. Measured, not hypothesised — the first
         // version of this union picked it up.
-        let ttypes: Vec<i64> = match g.metadata().get("tokenizer.ggml.token_type") {
-            Some(Meta::Arr(a)) => a.iter().map(|m| match m { Meta::I(v) => *v, Meta::U(v) => *v as i64, _ => 0 }).collect(),
-            _ => Vec::new(),
-        };
         let is_control = |id: u32| ttypes.get(id as usize).is_none_or(|&t| t == 3);
         let mut eos_set: Vec<u32> = eos_id.into_iter().collect();
-        for name in ["<|im_end|>", "<|endoftext|>", "</s>", "<eos>", "<end_of_turn>", "<|eot_id|>"] {
+        // `<turn|>` is Gemma 4's end-of-turn (id 106, CONTROL) — the family renamed its markers.
+        for name in ["<|im_end|>", "<|endoftext|>", "</s>", "<eos>", "<end_of_turn>", "<|eot_id|>", "<turn|>"] {
             if let Some((_, id)) = specials.iter().find(|(t, _)| t == name) {
                 if is_control(*id) && !eos_set.contains(id) { eos_set.push(*id); }
             }
@@ -498,12 +518,13 @@ impl FerricModel {
         let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
         let model = match arch.as_str() {
             "lfm2" => WebRuntime::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).map_err(err)?),
+            "gemma4" => WebRuntime::Gemma4(ferric_llama::gemma4::Gemma4::load(&ctx, &g).map_err(err)?),
             // Everything the dense loader genuinely serves; it feature-detects within this family.
             "qwen2" | "qwen3" | "llama" | "phi3" | "gemma" | "gemma2" | "gemma3" | "" =>
                 WebRuntime::Dense(Qwen3::load(&ctx, &g).map_err(err)?),
             other => return Err(err(format!(
-                "architecture {other:?} has no browser runtime yet (browser: dense family + lfm2; \
-                 native additionally runs qwen35/gemma4/deepseek2). Refusing rather than mis-running \
+                "architecture {other:?} has no browser runtime yet (browser: dense family + lfm2 + gemma4; \
+                 native additionally runs qwen35/deepseek2). Refusing rather than mis-running \
                  it through the dense loader — that fails as fluent wrong text, not as an error."))),
         };
         // Default OFF, exactly as native: quantizing the KV cache trades accuracy for memory and that
@@ -514,7 +535,9 @@ impl FerricModel {
 
     /// `#layers · backend` — a small readiness string for the UI.
     pub fn info(&self) -> String {
-        let kind = match &self.model { WebRuntime::Dense(_) => "dense", WebRuntime::Lfm2(_) => "lfm2" };
+        let kind = match &self.model {
+            WebRuntime::Dense(_) => "dense", WebRuntime::Lfm2(_) => "lfm2", WebRuntime::Gemma4(_) => "gemma4",
+        };
         format!("{} layers · {kind} · {:?}", self.n_layer(), self.ctx.backend)
     }
 
@@ -635,21 +658,30 @@ impl FerricModel {
 enum WebCache {
     Dense(Cache),
     Lfm2(ferric_llama::lfm2::Cache),
+    Gemma4(ferric_llama::gemma4::Cache),
 }
 
 impl FerricModel {
     fn n_vocab(&self) -> usize {
-        match &self.model { WebRuntime::Dense(m) => m.cfg.n_vocab, WebRuntime::Lfm2(m) => m.cfg.n_vocab }
+        match &self.model {
+            WebRuntime::Dense(m) => m.cfg.n_vocab,
+            WebRuntime::Lfm2(m) => m.cfg.n_vocab,
+            WebRuntime::Gemma4(m) => m.cfg.n_vocab,
+        }
     }
     fn n_layer(&self) -> usize {
-        match &self.model { WebRuntime::Dense(m) => m.cfg.n_layer, WebRuntime::Lfm2(m) => m.cfg.n_layer }
+        match &self.model {
+            WebRuntime::Dense(m) => m.cfg.n_layer,
+            WebRuntime::Lfm2(m) => m.cfg.n_layer,
+            WebRuntime::Gemma4(m) => m.cfg.n_layer,
+        }
     }
     /// The dense config, on the paths that are dense-only (embeddings, grouped-K). Panics on lfm2 by
     /// design: those call sites must refuse earlier with a real message.
     fn dense_cfg(&self) -> &ferric_llama::qwen3::Cfg {
         match &self.model {
             WebRuntime::Dense(m) => &m.cfg,
-            WebRuntime::Lfm2(_) => unreachable!("dense_cfg on lfm2 — the caller must gate first"),
+            _ => unreachable!("dense_cfg on a non-dense runtime — the caller must gate first"),
         }
     }
     /// `run` without JS callback types — the seam that lets the SAME code path be exercised natively.
@@ -661,6 +693,11 @@ impl FerricModel {
     /// does not fail generation, it just runs past the end-of-turn until `steps` expires.
     #[doc(hidden)]
     pub fn eos_ids(&self) -> Vec<u32> { self.eos_set.clone() }
+
+    /// The encoded prompt ids — exposed so the native smoke can hand the IDENTICAL ids to the
+    /// native runtime example and attribute a divergence to the path rather than the tokenizer.
+    #[doc(hidden)]
+    pub fn encode_ids(&self, prompt: &str) -> Vec<u32> { self.encode(prompt) }
 
     #[doc(hidden)]
     pub async fn generate_plain(&self, prompt: &str, steps: usize) -> std::result::Result<String, JsValue> {
@@ -685,6 +722,13 @@ impl FerricModel {
                 }
                 WebCache::Lfm2(ferric_llama::lfm2::Cache::with_kvq(&m.cfg, self.kv_fmt))
             }
+            WebRuntime::Gemma4(m) => {
+                if self.kv_grouped_k {
+                    return Err(JsValue::from_str("grouped K is wired on the dense runtime only today; \
+                                                  call setKvCache(fmt, false) for gemma4"));
+                }
+                WebCache::Gemma4(ferric_llama::gemma4::Cache::with_kvq(&m.cfg, self.kv_fmt))
+            }
         };
         let mut seq = ids.clone();
         let mut emitted = String::new();
@@ -693,6 +737,7 @@ impl FerricModel {
             let logits = match (&self.model, &mut cache) {
                 (WebRuntime::Dense(m), WebCache::Dense(c)) => m.forward_cached(toks, c),
                 (WebRuntime::Lfm2(m), WebCache::Lfm2(c)) => m.forward(toks, c),
+                (WebRuntime::Gemma4(m), WebCache::Gemma4(c)) => m.forward(toks, c),
                 _ => unreachable!("cache kind is constructed from the model kind above"),
             };
             let v = logits.to_vec().await;
