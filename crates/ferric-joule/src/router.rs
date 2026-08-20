@@ -229,6 +229,115 @@ impl<R: ?Sized> Predictor<R> for Uniform {
     }
 }
 
+/// A predictor that **learns from what actually happened**, with no model and no feature engineering.
+///
+/// [`Uniform`] reduces the router to escalation; a residual-stream probe like Switchyard's needs a
+/// trained head and a forward pass you have not paid for yet. This sits between them: bucket requests
+/// by one cheap observable, keep a success count per (bucket, rung), and report the Beta-Binomial
+/// posterior mean.
+///
+/// ## Why Beta-Binomial rather than a raw rate
+///
+/// A raw `successes / attempts` says `p = 1.0` after a single success, and **overconfidence is the
+/// expensive direction here** — it skips a cheap rung that would have worked and pays the dear one for
+/// nothing. [`Calibration::bias`] exists to catch exactly that. The posterior mean
+/// `(s + a) / (n + a + b)` cannot reach 0 or 1 at any finite `n`, so a thin bucket shrinks toward the
+/// prior automatically rather than by a hand-tuned confidence threshold.
+///
+/// ## The cold-start property that makes this safe to deploy
+///
+/// With the default Laplace prior and no observations at all, every rung reports 0.5 — identical to
+/// `Uniform(0.5)`, which the router turns into pure escalation. **A fresh `OnlineRate` therefore cannot
+/// route worse than the escalation baseline**; it can only improve as evidence arrives. That is a
+/// property worth having before a router is allowed near a serving path.
+pub struct OnlineRate<F> {
+    bucket: F,
+    /// `(bucket, rung) -> (successes, attempts)`.
+    counts: std::collections::HashMap<(u32, usize), (u32, u32)>,
+    prior_a: f64,
+    prior_b: f64,
+}
+
+impl<F> OnlineRate<F> {
+    /// `bucket` maps a request to a coarse class. It must be computable **before** running anything —
+    /// a feature that needs the answer is not a router feature.
+    pub fn new(bucket: F) -> OnlineRate<F> {
+        OnlineRate { bucket, counts: std::collections::HashMap::new(), prior_a: 1.0, prior_b: 1.0 }
+    }
+
+    /// Beta(a, b) prior. `(1, 1)` is Laplace and gives the 0.5 cold start; a smaller `a` biases toward
+    /// pessimism, which costs energy more slowly than optimism does.
+    pub fn with_prior(mut self, a: f64, b: f64) -> Self {
+        assert!(a > 0.0 && b > 0.0, "Beta prior needs positive parameters, got ({a}, {b})");
+        self.prior_a = a;
+        self.prior_b = b;
+        self
+    }
+
+    /// Record that `rung` was attempted for a request in `bucket` and whether it resolved it.
+    ///
+    /// Only ATTEMPTED rungs may be recorded. A rung the router skipped has no outcome, and inventing
+    /// one — assuming a skipped cheap rung would have failed — is how a router convinces itself its own
+    /// decisions were right. That failure mode is silent and self-reinforcing.
+    pub fn observe_bucket(&mut self, bucket: u32, rung: usize, succeeded: bool) {
+        let e = self.counts.entry((bucket, rung)).or_insert((0, 0));
+        e.1 += 1;
+        if succeeded { e.0 += 1; }
+    }
+
+    /// Attempts recorded for a `(bucket, rung)` — for a caller deciding whether the estimate is worth
+    /// anything yet.
+    pub fn attempts(&self, bucket: u32, rung: usize) -> u32 {
+        self.counts.get(&(bucket, rung)).map_or(0, |e| e.1)
+    }
+
+    /// Posterior for a single rung, bucketing the request the same way [`Predictor::p_success`] does.
+    ///
+    /// For a caller with a two-outcome decision (speculate or not, cache or not) that does not want a
+    /// whole [`Profile`] just to read one probability.
+    pub fn p_success_at<R: ?Sized>(&self, request: &R, rung: usize) -> f64
+    where F: Fn(&R) -> u32 {
+        self.posterior((self.bucket)(request), rung)
+    }
+
+    fn posterior(&self, bucket: u32, rung: usize) -> f64 {
+        let (s, n) = self.counts.get(&(bucket, rung)).copied().unwrap_or((0, 0));
+        (s as f64 + self.prior_a) / (n as f64 + self.prior_a + self.prior_b)
+    }
+}
+
+impl<F> OnlineRate<F> {
+    /// Record an outcome against the request itself, bucketing it the same way `p_success` does.
+    ///
+    /// `R` is bound per-call rather than on the impl block: the bucket closure fixes the request type,
+    /// so a second `R` on the impl would be unconstrained.
+    pub fn observe<R: ?Sized>(&mut self, request: &R, rung: usize, succeeded: bool)
+    where F: Fn(&R) -> u32 {
+        let b = (self.bucket)(request);
+        self.observe_bucket(b, rung, succeeded);
+    }
+}
+
+impl<R: ?Sized, F: Fn(&R) -> u32> Predictor<R> for OnlineRate<F> {
+    fn p_success(&self, request: &R, profile: &Profile) -> Vec<f64> {
+        let b = (self.bucket)(request);
+        (0..profile.len()).map(|k| self.posterior(b, k)).collect()
+    }
+}
+
+/// Bucket by prompt length, log-spaced: `0` for <=32 tokens, then a bucket per doubling, capped.
+///
+/// Log spacing because the thing that makes a cheap rung fail scales with context, not with a fixed
+/// number of tokens — the difference between 100 and 200 tokens matters far more than between 10,000
+/// and 10,100. Capped so a pathological prompt cannot create an unbounded number of one-observation
+/// buckets, each of which would sit uselessly at the prior.
+pub fn prompt_len_bucket(tokens: usize) -> u32 {
+    let mut b = 0u32;
+    let mut edge = 32usize;
+    while tokens > edge && b < 12 { edge *= 2; b += 1; }
+    b
+}
+
 /// How well the predictor's probabilities match reality.
 ///
 /// A router is only as good as this. Brier score is used rather than accuracy because a router
@@ -577,5 +686,147 @@ mod tests {
         assert!((rp.joules - 3.0).abs() < 1e-9);
         // An empty set does not silently become a free rung.
         assert_eq!(RungProfile::from_readings("m", &[]).attempts, 0);
+    }
+}
+
+#[cfg(test)]
+mod online_rate_tests {
+    use super::*;
+
+    /// Two rungs: a cheap one that only works on short prompts, and a dear one that always works.
+    fn profile() -> Profile {
+        Profile::new(vec![
+            // `attempts` is non-zero on purpose: a profile built from zero measurements is refused,
+            // which is the crate's rule that an unmeasured energy is not an energy.
+            RungProfile { name: "local-4b", joules: 1.0, attempts: 32 },
+            RungProfile { name: "local-30b", joules: 10.0, attempts: 32 },
+        ]).unwrap()
+    }
+
+    /// **The safety property.** A predictor with no evidence must not route worse than escalation.
+    ///
+    /// With the Laplace prior and zero observations every rung reads 0.5, which is exactly
+    /// `Uniform(0.5)` — so the plan a fresh `OnlineRate` produces is the escalation plan, byte for byte.
+    /// Without this a router is a liability on its first request rather than an improvement on its
+    /// hundredth.
+    #[test]
+    fn a_predictor_with_no_evidence_plans_exactly_what_escalation_would() {
+        let pr = profile();
+        let cold = OnlineRate::new(|_: &usize| 0u32);
+        let p_cold = cold.p_success(&0usize, &pr);
+        let p_unif = Uniform(0.5).p_success(&0usize, &pr);
+        assert_eq!(p_cold, p_unif, "a cold OnlineRate must be indistinguishable from Uniform(0.5)");
+        assert_eq!(pr.plan(&p_cold).unwrap().start, pr.plan(&p_unif).unwrap().start,
+                   "and must therefore choose the same starting rung");
+    }
+
+    /// A thin bucket must NOT become certain. One success is not proof.
+    ///
+    /// A raw rate says 1.0 here, which makes the router skip every rung below — the overconfidence
+    /// `Calibration::bias` is built to detect, and the direction that wastes energy.
+    #[test]
+    fn one_observation_does_not_produce_certainty() {
+        let pr = profile();
+        let mut r = OnlineRate::new(|_: &usize| 0u32);
+        r.observe(&0usize, 0, true);
+        let p = r.p_success(&0usize, &pr)[0];
+        assert!(p > 0.5, "one success should move the estimate up, got {p}");
+        assert!(p < 0.8, "one success must NOT approach certainty; a raw rate would say 1.0, got {p}");
+    }
+
+    /// Evidence that a rung fails must actually change the plan.
+    #[test]
+    fn learning_that_the_cheap_rung_fails_makes_the_router_skip_it() {
+        let pr = profile();
+        let mut r = OnlineRate::new(|&n: &usize| prompt_len_bucket(n));
+        let long = 4096usize;
+        assert_eq!(pr.plan(&r.p_success(&long, &pr)).unwrap().start, 0, "cold: start at the cheap rung");
+        for _ in 0..40 { r.observe(&long, 0, false); }
+        let p = r.p_success(&long, &pr);
+        assert!(p[0] < 0.1, "40 failures should drive the estimate down, got {}", p[0]);
+        assert_eq!(pr.plan(&p).unwrap().start, 1, "and the router should now skip straight to the dear rung");
+    }
+
+    /// Buckets are independent: learning about long prompts must not condemn short ones.
+    ///
+    /// This is what the bucket is FOR. A single global rate would let 4k-token failures suppress the
+    /// cheap rung for 20-token requests, which is the opposite of routing.
+    #[test]
+    fn evidence_is_confined_to_its_bucket() {
+        let pr = profile();
+        let mut r = OnlineRate::new(|&n: &usize| prompt_len_bucket(n));
+        for _ in 0..40 { r.observe(&4096usize, 0, false); }
+        let (short, long) = (16usize, 4096usize);
+        assert_ne!(prompt_len_bucket(short), prompt_len_bucket(long), "fixture: the two must differ");
+        assert!(r.p_success(&short, &pr)[0] > 0.4,
+                "short prompts saw no evidence and must stay at the prior");
+        assert!(r.p_success(&long, &pr)[0] < 0.1, "long prompts learned");
+        assert_eq!(pr.plan(&r.p_success(&short, &pr)).unwrap().start, 0, "short still tries cheap first");
+        assert_eq!(pr.plan(&r.p_success(&long, &pr)).unwrap().start, 1, "long skips it");
+    }
+
+    /// Log-spaced buckets, capped so a pathological prompt cannot spawn unbounded thin buckets.
+    #[test]
+    fn prompt_length_buckets_are_log_spaced_and_bounded() {
+        assert_eq!(prompt_len_bucket(1), 0);
+        assert_eq!(prompt_len_bucket(32), 0, "the first edge is inclusive");
+        assert_eq!(prompt_len_bucket(33), 1);
+        assert_eq!(prompt_len_bucket(64), 1);
+        assert_eq!(prompt_len_bucket(65), 2);
+        assert!(prompt_len_bucket(1 << 30) <= 12, "must saturate rather than grow without bound");
+        // Monotone: a longer prompt is never in an earlier bucket.
+        let mut last = 0;
+        for n in [1usize, 40, 100, 1000, 10_000, 100_000, 10_000_000] {
+            let b = prompt_len_bucket(n);
+            assert!(b >= last, "bucket went backwards at {n}");
+            last = b;
+        }
+    }
+
+    /// **The claim that matters: fewer joules per resolved task than escalation.**
+    ///
+    /// A workload where the cheap rung genuinely cannot serve long prompts. Escalation pays 1 J for the
+    /// doomed cheap attempt on every one of them; a router that has learned this skips it. The measure
+    /// is joules, not accuracy — both arms resolve every task, they just pay differently.
+    #[test]
+    fn on_a_workload_with_structure_the_router_spends_fewer_joules_than_escalation() {
+        let pr = profile();
+        // Deterministic pseudo-random workload; no rand dependency and no wall clock.
+        let reqs: Vec<usize> = (0..400).map(|i| if (i * 2654435761usize >> 3) % 2 == 0 { 16 } else { 4096 }).collect();
+        let cheap_works = |n: usize| n <= 32;
+
+        let mut r = OnlineRate::new(|&n: &usize| prompt_len_bucket(n));
+        let (mut routed, mut escalated) = (0.0f64, 0.0f64);
+        for &n in &reqs {
+            let start = pr.plan(&r.p_success(&n, &pr)).unwrap().start;
+            // Routed arm: pay from `start` upward until something resolves.
+            for k in start..pr.len() {
+                routed += pr.joules(k);
+                let ok = if k == 0 { cheap_works(n) } else { true };
+                if k == 0 { r.observe(&n, 0, ok); }   // only ATTEMPTED rungs are recorded
+                if ok { break }
+            }
+            // Escalation arm: always from rung 0.
+            escalated += pr.joules(0);
+            if !cheap_works(n) { escalated += pr.joules(1); }
+        }
+        // Measure against the ORACLE, not an arbitrary percentage. The first version of this test
+        // demanded a "double-digit saving" and failed at 8.0% — but the oracle bound on this workload
+        // is 8.33%, so the threshold was asking for more than physically exists. The router was at
+        // 95.5% of optimal and the assertion was wrong. Absolute percentage is a property of the
+        // SPREAD (the cheap rung is 1/11 of the dear one, so skipping it can never save more than
+        // that); fraction-of-available-saving is a property of the ROUTER, which is what is under test.
+        let oracle: f64 = reqs.iter().map(|&n| if cheap_works(n) { pr.joules(0) } else { pr.joules(1) }).sum();
+        assert!(oracle < escalated, "fixture: escalation must have something to lose");
+        assert!(routed < escalated,
+                "routing spent {routed:.0} J against escalation's {escalated:.0} J — it must be cheaper \
+                 on a workload it can learn, or the predictor is not earning its place");
+        let captured = (escalated - routed) / (escalated - oracle);
+        eprintln!("routed {routed:.0} J · escalation {escalated:.0} J · oracle {oracle:.0} J — \
+                   {:.1}% of the available saving captured ({:.1}% fewer joules absolute)",
+                  captured * 100.0, (1.0 - routed / escalated) * 100.0);
+        assert!(captured > 0.90,
+                "captured only {:.1}% of the {:.0} J that was available to save — the learning is too \
+                 slow or the estimates are miscalibrated", captured * 100.0, escalated - oracle);
     }
 }

@@ -46,7 +46,7 @@ pub use compaction::{Decision, FitError, Policy, StepCost};
 pub use fabric::{Capability, Fabric, Split, Unit};
 pub use ladder::{Ladder, Routed, Trail};
 pub use recursion::{Model as RecursionModel, Shape};
-pub use router::{Calibration, Plan, PlanError, Predictor, Profile, Router, RungProfile, Uniform};
+pub use router::{prompt_len_bucket, Calibration, OnlineRate, Plan, PlanError, Predictor, Profile, Router, RungProfile, Uniform};
 
 use std::time::{Duration, Instant};
 
