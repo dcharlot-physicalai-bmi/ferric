@@ -444,6 +444,10 @@ pub fn k_axis_grouped() -> bool {
     }
 }
 
+/// The K-side store for `fmt` under the current axis choice — shared by every runtime that wires
+/// grouped K, so the env var means one thing everywhere.
+pub fn k_store_from_env(f: KvqFmt) -> KvStore { k_store(f) }
+
 fn k_store(f: KvqFmt) -> KvStore {
     if k_axis_grouped() { KvStore::grouped(f) } else { KvStore::block(f) }
 }

@@ -715,13 +715,8 @@ impl FerricModel {
         // tokens, continuing this cache", so the dispatch lives in one closure-shaped match.
         let mut cache = match &self.model {
             WebRuntime::Dense(_) => WebCache::Dense(Cache::with_kv_config(self.dense_cfg(), self.kv_fmt, self.kv_grouped_k)),
-            WebRuntime::Lfm2(m) => {
-                if self.kv_grouped_k {
-                    return Err(JsValue::from_str("grouped K is wired on the dense runtime only today; \
-                                                  call setKvCache(fmt, false) for lfm2"));
-                }
-                WebCache::Lfm2(ferric_llama::lfm2::Cache::with_kvq(&m.cfg, self.kv_fmt))
-            }
+            WebRuntime::Lfm2(m) => WebCache::Lfm2(
+                ferric_llama::lfm2::Cache::with_kv_config(&m.cfg, self.kv_fmt, self.kv_grouped_k)),
             WebRuntime::Gemma4(m) => {
                 if self.kv_grouped_k {
                     return Err(JsValue::from_str("grouped K is wired on the dense runtime only today; \

@@ -19,7 +19,7 @@
 //! ```
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
-use ferric_tensor::kvquant::{KvqFmt, QKvCache};
+use ferric_tensor::kvquant::{KvStore, KvqFmt};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ pub struct Cache {
     kv: Vec<(KvBuf, KvBuf)>,
     /// Block-quantized twin of `kv`. **Empty unless KV quantization is on**, and when it is on `kv` is
     /// the empty one — holding both would spend the memory the quantization exists to save.
-    q: Vec<(QKvCache, QKvCache)>,
+    q: Vec<(KvStore, KvStore)>,
     fmt: Option<KvqFmt>,
     /// `[l_cache-1, d]` of the PRE-convolution gated signal `B⊙x` — the reference stores the signal,
     /// not the conv output, and storing the wrong one produces plausible drift rather than an error.
@@ -86,11 +86,28 @@ impl Cache {
                 // Sized `n_layer`, not `n_attn`: every index here is a BLOCK index, and a compacted
                 // vector would need an attention-block renumbering that nothing else in this file does.
                 // The conv blocks' slots stay empty and cost nothing until appended to.
-                q: (0..cfg.n_layer).map(|_| (QKvCache::new(f), QKvCache::new(f))).collect(),
+                // K may be token-GROUPED (FERRIC_KVQ_K_AXIS=grouped, via the same predicate the
+                // dense runtime uses so the env var means one thing everywhere); V stays per-block —
+                // the measurement is asymmetric and grouping V buys ~nothing for a staging tail.
+                // Motivation on THIS runtime: block-K q4_0 diverged from f32 at generated token 3.
+                q: (0..cfg.n_layer).map(|_| (crate::qwen3::k_store_from_env(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
                 conv,
             },
         }
+    }
+
+    /// Explicit KV configuration — the constructor a browser must use: `Cache::new`/`with_kvq` read
+    /// the axis from the environment, and a wasm32 tab HAS no environment, so the env path silently
+    /// pins a tab to block-K. Same reasoning as `qwen3::Cache::with_kv_config`.
+    pub fn with_kv_config(cfg: &Cfg, fmt: Option<KvqFmt>, grouped_k: bool) -> Cache {
+        let mut c = Cache::with_kvq(cfg, fmt);
+        if let Some(f) = fmt {
+            if grouped_k {
+                c.q = (0..cfg.n_layer).map(|_| (KvStore::grouped(f), KvStore::block(f))).collect();
+            }
+        }
+        c
     }
 
     /// The KV-cache quantization format in force, or `None` for f32.

@@ -530,3 +530,11 @@ from the document the tab fetched at inference time. Ternary weights + 4.5-bit K
 is ~12x smaller end-to-end than the f16/f32 default, output unchanged, and the quantized rows are
 FASTER because decode at this size is bandwidth-bound. What this deprioritises, deliberately: the V4
 forward graph (a 156 GB MoE is the premise this bets against) and the multi-GB streaming tab loader.
+
+**LFM2 grouped-K (2026-08-20):** the K axis is now shared across runtimes via `KvStore` and one env
+predicate. Measured on LFM2.5-1.2B, 24 greedy tokens vs f32: block-K q4_0 diverges at token **2**,
+grouped-K q4_0 at token **12**, grouped-K q8_0 **never** — the dense ordering, reproduced on the
+edge-native architecture. Batched decode composed untouched (solo-equivalent n=2/3/4/8 under grouped
+q4_0), because the axis lives in the TYPE rather than in per-runtime flags. In-tab receipt:
+`16 layers · lfm2 · BrowserWebGpu · kv q4_0 K:grouped`, identical output, **37.6 tok/s** — the
+fastest LFM2 tab run recorded, quantized KV being less memory traffic on a bandwidth-bound decode.
