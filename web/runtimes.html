@@ -13,9 +13,12 @@ try {
   const bytes = new Uint8Array(await r.arrayBuffer());
   S('loading ' + (bytes.length / 1048576 | 0) + ' MB');
   const m = await FerricModel.load(bytes);
-  document.getElementById('info').textContent = m.info() + ' · kv ' + m.kvCache();
+  // KV config BEFORE the info render: the first version rendered first, so the page said "kv f32"
+  // whatever the run actually used — an observable that could not distinguish the switch working
+  // from the switch being ignored. The driver asserts on this line.
   const kv = q.get('kv');
   if (kv) m.setKvCache(kv, q.get('grouped') === '1');
+  document.getElementById('info').textContent = m.info() + ' · kv ' + m.kvCache();
   S('generating');
   const t0 = performance.now();
   let out = '';
