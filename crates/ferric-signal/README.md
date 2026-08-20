@@ -110,13 +110,33 @@ signal through near-unique codes; an unseen code is an untrained embedding row c
 and the blurry tokenizer's collisions were doing real representation-sharing work that the
 frozen-embedding LM depended on. Training the tokenizer alone makes held-out worse.
 
-What the three curves support together:
+**A fourth measurement tested row 3's own explanation, and refuted it.** The mechanism above —
+sharp codes starve because the frozen embedding cannot learn them — predicts that unfreezing the
+table closes the gap. The crate now has a differentiable lookup (`embed_var`: a one-hot matrix
+times the table, so matmul's existing backward is exactly the scatter-add a trainable embedding
+needs), and the full grid at 16 variants per kind says otherwise:
 
-- **Tokenizer and embeddings must unfreeze together.** The missing primitive is a differentiable
-  row gather in the autograd layer, and the cost of not having it is now a measurement rather than
-  a guess: 60% against 38% at 16 variants per process.
+| held-out at N=16 | frozen embedding | trainable embedding |
+|---|---|---|
+| untrained tokenizer | **60%** | 53% |
+| trained tokenizer | 38% | 31% |
+
+Trainable embeddings lift the sharp tokenizer at small and mid sizes — 12% to 31% at N=4, 38% to
+44% at N=8 — and give it back at N=16, where the two embedding conditions sit one example apart,
+inside noise at these sample sizes. The blurry tokenizer wins every cell. The control in the
+trainable configuration lands at 25% against the 20% chance line, one example above it.
+
+What the whole set of measurements supports:
+
+- **Generalization in this regime flows through shared codes, and a tokenizer sharp enough to
+  eliminate sharing starves the model regardless of what is trainable downstream.** Codebook
+  resolution has to be matched to the coverage the corpus can actually provide — a tokenizer can
+  be too good for its data. This is the small-scale form of a familiar production rule: vocabulary
+  size is chosen to fit the corpus, and the two are grown together.
 - **A tokenizer's training budget must scale with its corpus.** At fixed budget it silently becomes
   the bottleneck, and its degradation masquerades as a data effect with the opposite sign.
+- **Unfreezing the embedding is necessary machinery, not a cure.** It converts coverage into
+  accuracy faster mid-curve, and it does nothing for codes the corpus never visits.
 
 The first version of this experiment reported a higher, non-monotone curve with no split guard at
 all, and it was wrong: held-out examples were token-identical to training examples, and denser

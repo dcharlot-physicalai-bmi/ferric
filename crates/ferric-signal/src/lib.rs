@@ -69,7 +69,7 @@ pub use cost::TokenCost;
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};
 pub use receipt::{agree, agreement, Agreement, TokenReceipt, TokenSpec};
-pub use language::{cross_entropy, lm_forward_var, Example, SensorLm, Sequencer, Span, Task};
+pub use language::{cross_entropy, embed_var, lm_forward_var, Example, SensorLm, Sequencer, Span, Task};
 pub use patch::{PatchError, Patcher, RevIn};
 pub use tower::{decoder_forward_var, forward_var, Block, DecoderWeights, EncoderWeights};
 pub use store::{StoreError, Weights};

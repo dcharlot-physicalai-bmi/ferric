@@ -47,9 +47,9 @@
 
 use ferric_core::Context;
 use ferric_signal::{
-    cross_entropy, decoder_forward_var, forward_var, lm_forward_var, mse, straight_through, synth,
-    DecoderWeights, EncoderConfig, EncoderWeights, Fsq, HybridVocab, Patcher, RevIn, SensorLm,
-    Sequencer, Span, Task,
+    cross_entropy, decoder_forward_var, embed_var, forward_var, lm_forward_var, mse,
+    straight_through, synth, DecoderWeights, EncoderConfig, EncoderWeights, Fsq, HybridVocab,
+    Patcher, RevIn, SensorLm, Sequencer, Span, Task,
 };
 use ferric_tensor::autograd::Var;
 use ferric_tensor::optim::Adam;
@@ -85,6 +85,11 @@ fn main() {
     let steps = num(&args, "--steps", 600);
     let control = args.iter().any(|a| a == "--control");
     let tok_steps = num(&args, "--train-tokenizer", 0);
+    // Unfreeze the embedding table: it joins the optimizer, and lookups go through the
+    // differentiable one-hot path so gradient scatters into exactly the rows each batch used.
+    // This is the cell the isolation sweep priced: a sharp tokenizer under a FROZEN embedding lost
+    // to the untrained one at every corpus size, because an unseen code was an untrained row.
+    let train_embed = args.iter().any(|a| a == "--train-embeddings");
     // The tokenizer's own corpus, in variants per kind. Defaults to the LM's corpus. Setting it
     // larger (e.g. 16 while sweeping --variants) holds tokenizer quality CONSTANT across the sweep,
     // isolating what data buys the LM: with both retrained per size, the x-axis moves two things
@@ -205,12 +210,23 @@ fn main() {
 
     let cfg = EncoderConfig { patch_len: PATCH, d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, latent_dim: 5 };
     let lm = SensorLm::deterministic(&ctx, cfg, rows, 3).unwrap();
-    let mut params = lm.params_flat();
+    let mut params: Vec<Tensor> = if train_embed {
+        std::iter::once(lm.embed.clone()).chain(lm.params_flat()).collect()
+    } else {
+        lm.params_flat()
+    };
     let mut opt = Adam::new(&params, 3e-3);
+    // With the table unfrozen, params[0] is the LIVE table and lm.embed is its stale initial copy;
+    // every lookup below must go through params, or the model would train one table and run
+    // another — the exact two-model drift the tower equivalence tests exist to prevent.
+    let off = if train_embed { 1usize } else { 0usize };
 
     println!("\nSCALING  {} variants/kind = {} examples, {} steps, batch {} (one of each kind per batch){}",
              variants, train.len(), steps, BATCH,
              if control { "  [CONTROL: random labels]" } else { "" });
+    if train_embed {
+        println!("  embedding table UNFROZEN: {} rows train with the LM", rows);
+    }
     println!("  tokenizer fixed and untrained; embedding frozen; LM trains");
     println!("  distinct signal codes in the training set: {}", train_codes.len());
     println!("  distinct token SEQUENCES in the training set: {distinct_seqs} of {}", train.len());
@@ -225,8 +241,12 @@ fn main() {
     let eval_one = |params: &[Tensor], codes: Vec<u32>, want_word: u32| -> bool {
         let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
         let ids = seq.encode(&[Span::Signal(vec![codes])]).unwrap();
-        let emb = Var::leaf(lm.embed_tokens(&ids));
-        let logits = pollster::block_on(lm_forward_var(&ctx, cfg, &vars, &emb).unwrap().value().to_vec());
+        let emb = if train_embed {
+            embed_var(&ctx, &vars[0], &ids).unwrap()
+        } else {
+            Var::leaf(lm.embed_tokens(&ids))
+        };
+        let logits = pollster::block_on(lm_forward_var(&ctx, cfg, &vars[off..], &emb).unwrap().value().to_vec());
         let last = (ids.len() - 1) * rows as usize;
         let row = &logits[last..last + rows as usize];
         let best = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
@@ -289,8 +309,12 @@ fn main() {
         for j in 0..BATCH {
             let (_, _, _, e) = &train[(step * BATCH + j) % train.len()];
             let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
-            let emb = Var::leaf(lm.embed_tokens(&e.tokens));
-            let logits = lm_forward_var(&ctx, cfg, &vars, &emb).unwrap();
+            let emb = if train_embed {
+                embed_var(&ctx, &vars[0], &e.tokens).unwrap()
+            } else {
+                Var::leaf(lm.embed_tokens(&e.tokens))
+            };
+            let logits = lm_forward_var(&ctx, cfg, &vars[off..], &emb).unwrap();
             let loss = cross_entropy(&ctx, &logits, &e.tokens, e.target_from, rows).unwrap();
             loss.backward();
             total += pollster::block_on(loss.value().to_vec())[0];
@@ -312,7 +336,7 @@ fn main() {
     let (tr, tn) = train_acc(&params);
     let h = held_acc(&params);
     let pct = if h.scored > 0 { h.right as f64 / h.scored as f64 * 100.0 } else { f64::NAN };
-    println!("\nRESULT variants={variants} control={control} tok_steps={tok_steps} tok_variants={tok_variants} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
+    println!("\nRESULT variants={variants} control={control} tok_steps={tok_steps} tok_variants={tok_variants} train_embed={train_embed} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
              h.right, h.scored, h.collided, h.overlap_pct, train.len());
     let by_kind: Vec<String> = h.per_kind.iter().enumerate()
         .map(|(k, (r, n))| format!("{}={r}/{n}", synth::name(k)))

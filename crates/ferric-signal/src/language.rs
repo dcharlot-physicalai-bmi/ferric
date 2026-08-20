@@ -574,6 +574,109 @@ pub fn cross_entropy(
     Ok(logp.mul(&mask).sum_all().mul(&scale))
 }
 
+/// Differentiable embedding lookup, from existing primitives only.
+///
+/// `Var` has no row-gather backward, and this crate does not reach into a shared crate to add one
+/// while other work is in flight there. It does not need to: a one-hot matrix `[t, rows]` times
+/// the table `[rows, d]` IS gather in the forward pass, and matmul's existing backward computes
+/// `one_hot^T @ grad` — exactly the scatter-add a trainable embedding needs. The one-hot is
+/// materialized, t x rows floats, which is megabytes at this crate's scales and would want a
+/// native gather in a real deployment; the cost of NOT having a trainable table at all is measured
+/// in the README at 60% against 38% held-out.
+pub fn embed_var(ctx: &Arc<Context>, table: &Var, ids: &[u32]) -> Result<Var, PatchError> {
+    let shape = &table.value().shape;
+    if shape.len() != 2 {
+        return Err(PatchError::Ragged { len: shape.len(), channels: 2 });
+    }
+    let rows = shape[0];
+    if ids.is_empty() {
+        return Err(PatchError::TooShort { len: 0, patch_len: 1 });
+    }
+    if let Some(&bad) = ids.iter().find(|&&i| (i as usize) >= rows) {
+        return Err(PatchError::Ragged { len: bad as usize, channels: rows });
+    }
+    let t = ids.len();
+    let mut oh = vec![0.0f32; t * rows];
+    for (i, &id) in ids.iter().enumerate() {
+        oh[i * rows + id as usize] = 1.0;
+    }
+    Ok(Var::leaf(Tensor::from_vec(ctx, &oh, &[t, rows])).matmul(table))
+}
+
+#[cfg(test)]
+mod embed_var_tests {
+    use super::*;
+    use crate::Fsq;
+
+    fn ctx() -> Option<Arc<Context>> {
+        match pollster::block_on(Context::new()) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                if std::env::var("FERRIC_NO_GPU").is_ok() {
+                    eprintln!("FERRIC_NO_GPU set; skipping deliberately ({e:?})");
+                    None
+                } else {
+                    panic!("no GPU context ({e:?}). Set FERRIC_NO_GPU=1 to waive this on purpose.");
+                }
+            }
+        }
+    }
+
+    /// The differentiable lookup must agree with the frozen one exactly, or the model that trains
+    /// with one and runs with the other is two models.
+    #[test]
+    fn the_one_hot_lookup_equals_gather_rows() {
+        let Some(ctx) = ctx() else { return };
+        let v = HybridVocab::new(50, Fsq::signal_15bit()).unwrap();
+        let lm = SensorLm::deterministic(
+            &ctx,
+            EncoderConfig { patch_len: 8, d_model: 16, n_layers: 1, n_heads: 2, d_ff: 32, latent_dim: 5 },
+            v.total(),
+            7,
+        )
+        .unwrap();
+        let ids = [0u32, 49, 500, v.total() - 1, 3];
+        let a = pollster::block_on(lm.embed_tokens(&ids).to_vec());
+        let b = pollster::block_on(
+            embed_var(&ctx, &Var::leaf(lm.embed.clone()), &ids).unwrap().value().to_vec(),
+        );
+        assert_eq!(a, b, "the two lookups disagree");
+    }
+
+    /// THE PROPERTY THE FROZEN TABLE LACKED: gradient reaches exactly the rows that were used.
+    /// A used row must receive a non-zero gradient and an unused row must receive zero — anything
+    /// else either fails to train the codes that appeared or trains codes that did not.
+    #[test]
+    fn gradient_reaches_used_rows_and_only_used_rows() {
+        let Some(ctx) = ctx() else { return };
+        let rows = 40usize;
+        let d = 8usize;
+        let data: Vec<f32> = (0..rows * d).map(|i| ((i * 37) % 19) as f32 * 0.1 - 0.9).collect();
+        let table = Var::leaf(Tensor::from_vec(&ctx, &data, &[rows, d]));
+        let ids = [3u32, 17, 3, 39];
+        embed_var(&ctx, &table, &ids).unwrap().sum_all().backward();
+        let g = pollster::block_on(table.grad().expect("no gradient reached the table").to_vec());
+        for r in 0..rows {
+            let row_g = &g[r * d..(r + 1) * d];
+            let used = ids.contains(&(r as u32));
+            let nonzero = row_g.iter().any(|x| *x != 0.0);
+            assert_eq!(nonzero, used, "row {r}: used={used} but gradient nonzero={nonzero}");
+        }
+        // Row 3 appeared twice, so its gradient is the SUM: exactly 2.0 per column under sum_all.
+        for c in 0..d {
+            assert_eq!(g[3 * d + c], 2.0, "duplicate id did not accumulate");
+        }
+    }
+
+    #[test]
+    fn out_of_range_and_empty_ids_are_refused() {
+        let Some(ctx) = ctx() else { return };
+        let table = Var::leaf(Tensor::from_vec(&ctx, &vec![0.0; 10 * 4], &[10, 4]));
+        assert!(embed_var(&ctx, &table, &[10]).is_err(), "an id past the table was accepted");
+        assert!(embed_var(&ctx, &table, &[]).is_err(), "an empty id list was accepted");
+    }
+}
+
 #[cfg(test)]
 mod lm_tests {
     use super::*;
