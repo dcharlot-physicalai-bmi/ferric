@@ -1,6 +1,7 @@
 //! Pure-Rust reader for the llama.cpp **GGUF** container + dequantizers for the common block-quant
 //! formats: F32, F16, Q8_0, the legacy Q4_0/Q4_1/Q5_0/Q5_1, the k-quants **Q4_K/Q5_K/Q6_K**, the
-//! non-linear codebook quants **IQ4_NL/IQ4_XS**, and BitNet-style ternary (TQ2_0 + PrismML Q1_0/Q2_0).
+//! non-linear codebook quants **IQ4_NL/IQ4_XS**, OCP microscaling **MXFP4** (GPT-OSS's release
+//! format), and BitNet-style ternary (TQ2_0 + PrismML Q1_0/Q2_0).
 //! GGUF is how the entire llama.cpp / HF
 //! quantized-model corpus ships — including Liquid AI's LFM2 and BitNet — so this is the ingest path
 //! that lets Ferric run those models. Dequant here is CPU-side (I/O layer); a fused on-GPU dequant
@@ -28,6 +29,7 @@ const Q6_K: u32 = 14;
 const IQ4_NL: u32 = 20; // 4-bit non-linear codebook, group-32 (kvalues_iq4nl)
 const IQ4_XS: u32 = 23; // 4-bit non-linear codebook, 256-super-block w/ 6-bit sub-scales
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
+const MXFP4: u32 = 39; // OCP Microscaling FP4: 32×E2M1 elements under one E8M0 shared exponent (GPT-OSS)
 const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
 const Q2_0: u32 = 42; // PrismML ternary: {−1,0,+1}·scale, group-128 (2.125 bpw on disk)
 
@@ -124,7 +126,308 @@ pub fn parse(bytes: Vec<u8>) -> Result<Gguf, String> {
     if !c.ok { return Err("GGUF header truncated or malformed".into()); }
     let align = match metadata.get("general.alignment") { Some(Meta::U(a)) => *a as usize, _ => 32 };
     let data_start = c.p.div_ceil(align) * align;
+    check_declared_strides(&tensors, bytes.len().saturating_sub(data_start), align)?;
+    resolve_ambiguous_types(&mut tensors, bytes.len().saturating_sub(data_start), align)?;
     Ok(Gguf { metadata, tensors, data: bytes, data_start })
+}
+
+/// **FP8 E4M3** (OCP `float8_e4m3fn`) -> f32, as a 256-entry bit-pattern table.
+///
+/// DeepSeek V4 Flash stores its dense weights as `F8_E4M3_B128`: 128 elements of this format under one
+/// shared **E8M0** scale. The scale half already exists here and is bit-exact — it is the same
+/// encoding MXFP4 uses, verified over the full 4096-pair grid. This is the element half.
+///
+/// A table rather than bit arithmetic because E4M3 is small enough to enumerate exhaustively, and
+/// because the `fn` variant's edges are where a hand-rolled decoder goes wrong: there are **no
+/// infinities**, `0x7F` and `0xFF` are the only NaNs, the maximum finite magnitude is **448.0**, and
+/// subnormals run down to 2^-9 (0.001953125). Every entry below is the bit pattern PyTorch's
+/// `float8_e4m3fn` produces for that byte, generated rather than typed.
+///
+/// The `fn` variant is the right reference: the V4 fork's element decoder
+/// (`ggml_f8_e4m3fn_to_fp32`, nisparks/llama.cpp @ `9d36408`, `ggml-quants.c:552-566`) implements
+/// exactly these semantics — `(x & 0x7F) == 0x7F` is NaN, no infinity branch, max finite `0x7E` =
+/// 448 (which its quantizer also uses as the scale target). Element-order/value decode has NOT been
+/// diffed against reference dequantized values from a real file, only against the fork's source.
+pub const E4M3_TO_F32_BITS: [u32; 256] = [
+    0x00000000, 0x3b000000, 0x3b800000, 0x3bc00000, 0x3c000000, 0x3c200000, 0x3c400000, 0x3c600000,
+    0x3c800000, 0x3c900000, 0x3ca00000, 0x3cb00000, 0x3cc00000, 0x3cd00000, 0x3ce00000, 0x3cf00000,
+    0x3d000000, 0x3d100000, 0x3d200000, 0x3d300000, 0x3d400000, 0x3d500000, 0x3d600000, 0x3d700000,
+    0x3d800000, 0x3d900000, 0x3da00000, 0x3db00000, 0x3dc00000, 0x3dd00000, 0x3de00000, 0x3df00000,
+    0x3e000000, 0x3e100000, 0x3e200000, 0x3e300000, 0x3e400000, 0x3e500000, 0x3e600000, 0x3e700000,
+    0x3e800000, 0x3e900000, 0x3ea00000, 0x3eb00000, 0x3ec00000, 0x3ed00000, 0x3ee00000, 0x3ef00000,
+    0x3f000000, 0x3f100000, 0x3f200000, 0x3f300000, 0x3f400000, 0x3f500000, 0x3f600000, 0x3f700000,
+    0x3f800000, 0x3f900000, 0x3fa00000, 0x3fb00000, 0x3fc00000, 0x3fd00000, 0x3fe00000, 0x3ff00000,
+    0x40000000, 0x40100000, 0x40200000, 0x40300000, 0x40400000, 0x40500000, 0x40600000, 0x40700000,
+    0x40800000, 0x40900000, 0x40a00000, 0x40b00000, 0x40c00000, 0x40d00000, 0x40e00000, 0x40f00000,
+    0x41000000, 0x41100000, 0x41200000, 0x41300000, 0x41400000, 0x41500000, 0x41600000, 0x41700000,
+    0x41800000, 0x41900000, 0x41a00000, 0x41b00000, 0x41c00000, 0x41d00000, 0x41e00000, 0x41f00000,
+    0x42000000, 0x42100000, 0x42200000, 0x42300000, 0x42400000, 0x42500000, 0x42600000, 0x42700000,
+    0x42800000, 0x42900000, 0x42a00000, 0x42b00000, 0x42c00000, 0x42d00000, 0x42e00000, 0x42f00000,
+    0x43000000, 0x43100000, 0x43200000, 0x43300000, 0x43400000, 0x43500000, 0x43600000, 0x43700000,
+    0x43800000, 0x43900000, 0x43a00000, 0x43b00000, 0x43c00000, 0x43d00000, 0x43e00000, 0x7ff00000,
+    0x80000000, 0xbb000000, 0xbb800000, 0xbbc00000, 0xbc000000, 0xbc200000, 0xbc400000, 0xbc600000,
+    0xbc800000, 0xbc900000, 0xbca00000, 0xbcb00000, 0xbcc00000, 0xbcd00000, 0xbce00000, 0xbcf00000,
+    0xbd000000, 0xbd100000, 0xbd200000, 0xbd300000, 0xbd400000, 0xbd500000, 0xbd600000, 0xbd700000,
+    0xbd800000, 0xbd900000, 0xbda00000, 0xbdb00000, 0xbdc00000, 0xbdd00000, 0xbde00000, 0xbdf00000,
+    0xbe000000, 0xbe100000, 0xbe200000, 0xbe300000, 0xbe400000, 0xbe500000, 0xbe600000, 0xbe700000,
+    0xbe800000, 0xbe900000, 0xbea00000, 0xbeb00000, 0xbec00000, 0xbed00000, 0xbee00000, 0xbef00000,
+    0xbf000000, 0xbf100000, 0xbf200000, 0xbf300000, 0xbf400000, 0xbf500000, 0xbf600000, 0xbf700000,
+    0xbf800000, 0xbf900000, 0xbfa00000, 0xbfb00000, 0xbfc00000, 0xbfd00000, 0xbfe00000, 0xbff00000,
+    0xc0000000, 0xc0100000, 0xc0200000, 0xc0300000, 0xc0400000, 0xc0500000, 0xc0600000, 0xc0700000,
+    0xc0800000, 0xc0900000, 0xc0a00000, 0xc0b00000, 0xc0c00000, 0xc0d00000, 0xc0e00000, 0xc0f00000,
+    0xc1000000, 0xc1100000, 0xc1200000, 0xc1300000, 0xc1400000, 0xc1500000, 0xc1600000, 0xc1700000,
+    0xc1800000, 0xc1900000, 0xc1a00000, 0xc1b00000, 0xc1c00000, 0xc1d00000, 0xc1e00000, 0xc1f00000,
+    0xc2000000, 0xc2100000, 0xc2200000, 0xc2300000, 0xc2400000, 0xc2500000, 0xc2600000, 0xc2700000,
+    0xc2800000, 0xc2900000, 0xc2a00000, 0xc2b00000, 0xc2c00000, 0xc2d00000, 0xc2e00000, 0xc2f00000,
+    0xc3000000, 0xc3100000, 0xc3200000, 0xc3300000, 0xc3400000, 0xc3500000, 0xc3600000, 0xc3700000,
+    0xc3800000, 0xc3900000, 0xc3a00000, 0xc3b00000, 0xc3c00000, 0xc3d00000, 0xc3e00000, 0xfff00000
+];
+
+/// One E4M3 byte as f32.
+#[inline]
+pub fn e4m3_to_f32(b: u8) -> f32 { f32::from_bits(E4M3_TO_F32_BITS[b as usize]) }
+
+/// **ggml type 42 is claimed by THREE different formats**, distinguishable only by stride.
+///
+/// | claimant | values/block | bytes/block | bytes per 128 values |
+/// |---|---|---|---|
+/// | PrismML `Q2_0` — what this crate has always meant by 42 | 128 | 34 | 34 |
+/// | ggml-org mainline `GGML_TYPE_Q2_0` (`block_q2_0`: f16 d + 16 code bytes) — **not decoded here** | 64 | 18 | 36 |
+/// | `F8_E4M3_B128` — DeepSeek V4 Flash's dense weights | 128 | 129 | 129 |
+///
+/// The collision is **confirmed in the wild, both ways** (2026-08-19): a real V4 file
+/// (`DeepSeek-V4-Flash-FP4-FP8-native.gguf`, 156,148,189,760 bytes, x-repo-commit `0b34e0b6`) carries
+/// 365 tensors of id 42 at exactly 129 bytes per 128 elements, matching the nisparks/llama.cpp WIP
+/// branch (`gguf-py constants.py:4115`, `ggml.h:432` @ `9d36408`: `GGML_TYPE_F8_E4M3_B128 = 42`);
+/// while ggml-org master (`ggml.h:432` @ `b062ba7`) assigns 42 to its own `Q2_0` at 64 values /
+/// 18 bytes. Mainline has NO F8 type at all — it dequantizes FP8 checkpoints at convert time.
+/// Note the two `Q2_0`s ALSO differ from each other (34 vs 36 bytes per 128 values).
+/// And never key on `general.file_type` either: nisparks ftype `MOSTLY_F8_E4M3_MXFP4` = 41 collides
+/// with upstream ftype `MOSTLY_Q2_0` = 41.
+///
+/// A file carries only the id, so the claimants are distinguishable **only by how many bytes the
+/// tensor actually occupies**. That is knowable at parse time: GGUF lays tensors out sequentially, so
+/// the gap to the next tensor bounds each one. This resolves it there rather than letting `deq_raw`
+/// guess.
+///
+/// Reading a V4 file as `Q2_0` would land at ~1/4 the correct stride and return plausible garbage
+/// with no error — which is exactly the failure [`check_declared_strides`] was added to prevent,
+/// written before this collision was known to be real.
+pub fn resolve_type_42(n_elements: usize, declared_bytes: usize) -> Result<u32, String> {
+    // Mainline ggml-org Q2_0 (64 values / 18 bytes) is the third claimant, and one this crate does
+    // NOT decode. Its stride is only 2 bytes per 128 values away from PrismML's, so name it precisely
+    // when it appears instead of folding it into the generic refusal below.
+    if n_elements % 64 == 0 && declared_bytes == n_elements / 64 * 18 {
+        return Err(format!(
+            "ggml type 42 with {declared_bytes} bytes for {n_elements} elements matches mainline \
+             ggml-org Q2_0 (block_q2_0: 64 values / 18 bytes, ggml.h:432 @ b062ba7), which this crate \
+             does not decode. It is NOT PrismML Q2_0 (128 values / 34 bytes) and NOT F8_E4M3_B128 \
+             (128 values / 129 bytes). Refusing rather than mis-decoding."));
+    }
+    if n_elements % 128 != 0 {
+        return Err(format!("ggml type 42 needs a multiple of 128 elements, got {n_elements}"));
+    }
+    let blocks = n_elements / 128;
+    match declared_bytes {
+        b if b == blocks * 34 => Ok(Q2_0),
+        b if b == blocks * F8_E4M3_B128_BYTES => Ok(F8_E4M3_B128),
+        b => Err(format!(
+            "ggml type 42 is ambiguous and this tensor matches none of the three claimants: \
+             {n_elements} elements in {b} bytes is {:.3} bits/value, but PrismML Q2_0 is {} bytes \
+             ({blocks} x 34), mainline ggml-org Q2_0 is {} bytes ({n_elements}/64 x 18, undecoded \
+             here), and F8_E4M3_B128 is {} bytes ({blocks} x {F8_E4M3_B128_BYTES}). Refusing rather \
+             than picking one.",
+            b as f64 * 8.0 / n_elements as f64, blocks * 34, n_elements / 64 * 18,
+            blocks * F8_E4M3_B128_BYTES)),
+    }
+}
+
+/// E8M0 under the **OCP bias of 127**: `2^(e - 127)`, with `0xFF` reserved for NaN.
+///
+/// ⚠ **This is a DIFFERENT bias from [`e8m0_half_to_f32`], and the difference is a factor of two.**
+/// That one returns `2^(e - 128)` because ggml pairs it with a *doubled* E2M1 value table — an
+/// arithmetic choice ggml makes so that `e = 255` yields a representable `2^127` instead of
+/// overflowing. E4M3 values are not doubled, so pairing them with the halved scale would make every
+/// V4 weight exactly half its true magnitude: a uniform scaling that produces fluent, confidently
+/// wrong output rather than an error.
+///
+/// **Bias-127 is what the V4 fork implements — verified at source level, 2026-08-19.**
+/// `dequantize_row_f8_e4m3_b128` in nisparks/llama.cpp @ `9d36408` (`ggml-quants.c:649`) decodes the
+/// scale with `GGML_E8M0_TO_FP32` (`ggml-impl.h:439-473`): `bits = e << 23`, i.e. `2^(e-127)`, with
+/// `e = 0` special-cased to bits `0x00400000` = 2^-127 — exactly this function. The quantizer
+/// round-trips through the same macro (`ggml-quants.c:634`), and upstream master's checkpoint
+/// converter reads the same E8M0 bytes as `torch.exp2(bits - 127.0)` (`conversion/deepseek.py:646`).
+/// The halved convention (`ggml_e8m0_to_fp32_half`) is used ONLY by MXFP4's doubled-table path.
+/// Byte-level evidence cannot discriminate the two conventions (observed V4 scale bytes 115/116 fit
+/// both, one octave apart), so this verdict rests on the fork's source, not on file bytes.
+///
+/// One deliberate divergence: ggml's macro has its `0xFF -> NaN` branch commented out ("we don't
+/// need to handle NaNs"), so `0xFF` yields +Inf there; this function keeps OCP's NaN so a poisoned
+/// scale is caught rather than silently multiplied through. `0xFF` = 2^128 is not producible by a
+/// sane quantizer either way.
+fn e8m0_bias127(e: u8) -> f32 {
+    match e {
+        // 2^-127 is subnormal in f32 (min normal is 2^-126), so it cannot be written as an exponent
+        // field and is built from its mantissa bit instead.
+        0 => f32::from_bits(1 << 22),
+        // OCP reserves the all-ones exponent for NaN. Left as NaN deliberately: a weight that arrives
+        // as NaN should stay NaN and be caught, not be silently clamped to a large finite number.
+        0xFF => f32::NAN,
+        _ => f32::from_bits((e as u32) << 23),
+    }
+}
+
+/// `F8_E4M3_B128`: one E8M0 scale byte, then 128 E4M3 payload bytes — **scale FIRST, ggml-style**.
+///
+/// **The 129-byte container is verified against a real V4 file, 2026-08-19** — no longer a model-card
+/// assumption. In `DeepSeek-V4-Flash-FP4-FP8-native.gguf` (156,148,189,760 bytes, x-repo-commit
+/// `0b34e0b6`), all 365 type-42 tensors measure exactly `n/128 * 129` bytes by header offset
+/// arithmetic (two independent parsers, zero deviants). Scale position was measured from the bytes
+/// themselves: byte 0 of every 129-byte block in two independently probed tensors holds one of two
+/// values (the shared exponent; entropy ~0 at phase 0 of 129) while bytes 1..=128 show full FP8
+/// spread with sign bits near 50% (entropy >= 6.1 at every other phase, method calibrated on the same
+/// file's known scale-first MXFP4 tensor). The fork's struct agrees: `{ uint8_t e; uint8_t qs[128]; }`
+/// with `static_assert sizeof == 129` (nisparks/llama.cpp @ `9d36408`, `ggml-common.h:222-227`), as
+/// does its converter, which writes the scale to byte 0 of each block
+/// (`convert_hf_to_gguf.py:9429-9432`).
+///
+/// ⚠ This crate FIRST SHIPPED the opposite order — 128 payload bytes then the scale LAST — as a
+/// labelled assumption. All three reconciliation sources refuted it; corrected 2026-08-19. The wrong
+/// order read every element one byte early AND took the exponent from the wrong end of the block.
+pub const F8_E4M3_B128_BYTES: usize = 129;
+const F8_E4M3_B128: u32 = 1042; // internal id; the FILE always says 42
+
+/// Dequantize `F8_E4M3_B128`: each block is one E8M0 scale byte, then 128 E4M3 elements.
+pub fn deq_f8_e4m3_b128(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    if n % 128 != 0 { return Err(format!("F8_E4M3_B128 needs a multiple of 128 elements, got {n}")); }
+    let blocks = n / 128;
+    let need = blocks * F8_E4M3_B128_BYTES;
+    if raw.len() < need { return Err(format!("F8_E4M3_B128 needs {need} bytes for {n} elements, got {}", raw.len())); }
+    let mut out = Vec::with_capacity(n);
+    for b in 0..blocks {
+        let base = b * F8_E4M3_B128_BYTES;
+        // Scale FIRST — same byte order as MXFP4. Verified, not assumed: see [`F8_E4M3_B128_BYTES`].
+        let d = e8m0_bias127(raw[base]);
+        for j in 1..=128 { out.push(e4m3_to_f32(raw[base + j]) * d); }
+    }
+    Ok(out)
+}
+
+/// Refuse a file whose tensors do not fit the strides this crate believes their types have.
+///
+/// Every reader here computes a tensor's byte length from [`type_size`] and reads that many bytes at
+/// the declared offset. Nothing else checks it. So if this crate's idea of a type's block layout ever
+/// disagrees with the writer's, the read silently lands at the wrong stride and returns plausible
+/// garbage: no error, no panic, just wrong weights and fluent wrong output.
+///
+/// That is not hypothetical. GGUF type ids in the 40s are contested territory — vendor extensions and
+/// mainline ggml have both claimed ids there, with different block geometry. This crate maps id 42 to
+/// a group-128 / 34-byte ternary layout (2.125 bpw); mainline ggml-org master assigns 42 to its own
+/// `Q2_0` (`block_q2_0`: f16 d + 16 code bytes = 18 B / 64 values = 2.25 bpw, `ggml.h:432` @
+/// `b062ba7`); and the nisparks V4 fork assigns 42 to `F8_E4M3_B128` (129 B / 128 values) — three
+/// layouts, and a file carries only the id. See [`resolve_type_42`].
+///
+/// The check is cheap and general, and deliberately not a special case for one id: GGUF lays tensors
+/// out sequentially, so the gap to the next tensor's offset bounds what a tensor can actually occupy.
+/// If our computed size exceeds that gap, our stride is wrong for this file and the only safe answer
+/// is to refuse. It cannot prove agreement (a type whose stride is too SMALL still fits the gap and
+/// is caught only by the total-size check on the last tensor), so it is a floor, not a proof.
+/// Rewrite ambiguous type ids to their internal resolutions, so every consumer downstream sees an
+/// UNAMBIGUOUS id and none of them re-derives the disambiguation.
+///
+/// [`resolve_type_42`] existed and was tested before anything CALLED it — the same
+/// written-ahead-of-its-wiring gap this tree has produced twice before (`Model::supports_batching`,
+/// the joule router). Until this call, a DeepSeek V4 file was merely REFUSED by the stride guard;
+/// with it, the file's type-42 tensors resolve to F8_E4M3_B128 (internal 1042) and load, while a
+/// PrismML ternary file keeps meaning what it always meant.
+///
+/// Runs AFTER [`check_declared_strides`], so a header-probe prefix (where the last tensor's bound is
+/// unknowable) resolves what it can: the last tensor of a prefix is left as-is when its size cannot
+/// be established, and the full-file parse settles it.
+fn resolve_ambiguous_types(tensors: &mut [TensorInfo], data_len: usize, align: usize) -> Result<(), String> {
+    let mut order: Vec<usize> = (0..tensors.len()).collect();
+    order.sort_by_key(|&i| tensors[i].offset);
+    let have_full = order.last().is_none_or(|&i| data_len >= tensors[i].offset as usize);
+    for w in 0..order.len() {
+        let i = order[w];
+        if tensors[i].ggml_type != 42 { continue }
+        let n: usize = tensors[i].dims.iter().product::<u64>() as usize;
+        let limit = match order.get(w + 1) {
+            Some(&j) => tensors[j].offset as usize,
+            None if have_full => data_len,
+            None => continue, // header probe: the last tensor's bound is unknowable here
+        };
+        let avail = limit.saturating_sub(tensors[i].offset as usize);
+        // `avail` = exact size + alignment padding, so the true size lies in (avail - align, avail].
+        // Collect EVERY claimant whose exact stride lands in that window and demand exactly one —
+        // first-match with a generous window mis-resolves small tensors, where the claimants' sizes
+        // (34 / 36 / 129 bytes per 128 values) sit closer together than a loose slack bound. With the
+        // real bound (align, typically 32) the strides separate at >= 16 blocks for 34-vs-36 and from
+        // the very first block against 129.
+        let matches: Vec<usize> = [34usize, 36, 129].iter()
+            .map(|&bpb| n / 128 * bpb)
+            .filter(|&sz| sz <= avail && avail < sz + align.max(1))
+            .collect();
+        match matches.as_slice() {
+            [sz] => tensors[i].ggml_type = resolve_type_42(n, *sz)?,
+            [] => return Err(format!(
+                "tensor '{}' declares ggml type 42 but its {avail} available bytes for {n} elements \
+                 match no claimant's stride (PrismML Q2_0 34 B, mainline Q2_0 36 B, F8_E4M3_B128 \
+                 129 B per 128 values). Refusing to load rather than guess.", tensors[i].name)),
+            _ => return Err(format!(
+                "tensor '{}' is too small to disambiguate ggml type 42: {avail} bytes for {n} \
+                 elements fits more than one claimant within one {align}-byte alignment. Refusing to \
+                 load rather than pick — a mis-resolved tensor decodes to plausible garbage.",
+                tensors[i].name)),
+        }
+    }
+    Ok(())
+}
+
+fn check_declared_strides(tensors: &[TensorInfo], data_len: usize, align: usize) -> Result<(), String> {
+    let mut by_offset: Vec<&TensorInfo> = tensors.iter().collect();
+    by_offset.sort_by_key(|t| t.offset);
+    // `backed.rs` parses a header out of a PREFIX of the file (`header_probe` starts at 1 MiB and
+    // grows), so `data_len` is then the probe's length and not the data section's. Detect that rather
+    // than reject every probe: if the buffer ends before the last tensor even begins, it is a prefix.
+    // The gap between consecutive tensors is still meaningful in a prefix — only the final tensor's
+    // bound needs the true total, so that one check is what gets skipped.
+    let have_full_data = by_offset.last().is_none_or(|t| data_len >= t.offset as usize);
+    for (i, t) in by_offset.iter().enumerate() {
+        let n: usize = t.dims.iter().product::<u64>() as usize;
+        // An unknown type is a separate, already-loud failure; nothing to compare against here.
+        let Ok(sz) = type_size(t.ggml_type, n) else { continue };
+        // The next tensor's start, or the end of the data section for the last one.
+        let limit = match by_offset.get(i + 1) {
+            Some(next) => next.offset as usize,
+            None if have_full_data => data_len,
+            None => continue,
+        };
+        let avail = limit.saturating_sub(t.offset as usize);
+        if sz > avail {
+            return Err(format!(
+                "tensor '{}' (ggml type {}, {n} elements) needs {sz} bytes by this reader's block \
+                 layout, but the file leaves only {avail} before the next tensor. The type id's \
+                 layout here disagrees with the writer's, so reading it would silently return \
+                 garbage at the wrong stride rather than fail. Refusing to load.\n\
+                 If this is a mainline ggml file using a type id this crate maps to a vendor \
+                 extension, the type table in this crate needs the file's layout, not a wider read.",
+                t.name, t.ggml_type,
+            ));
+        }
+        // Padding between tensors is legal and normal; a gap far larger than alignment means the
+        // stride is too SMALL, which reads short and also corrupts. Only flag it when unmistakable.
+        if i + 1 < by_offset.len() && avail > sz + align.max(64) * 4 && avail > sz * 2 {
+            return Err(format!(
+                "tensor '{}' (ggml type {}, {n} elements) is {sz} bytes by this reader's block \
+                 layout, but the file reserves {avail} for it — more than twice as much, and far \
+                 beyond alignment padding. This reader's stride for that type id is too small, which \
+                 reads a short prefix of every block. Refusing to load.",
+                t.name, t.ggml_type,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Uniform read access over a GGUF, however it's held: the eager in-memory `Gguf` (the browser path
@@ -181,8 +484,11 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         IQ4_NL => n / 32 * 18,
         IQ4_XS => n / 256 * 136,
         TQ2_0 => n / 256 * 66,
+        MXFP4 => n / 32 * 17,
         Q1_0 => n / 128 * 18,
         Q2_0 => n / 128 * 34,
+        // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
+        F8_E4M3_B128 => n / 128 * F8_E4M3_B128_BYTES,
         other => return Err(format!("unsupported ggml type {other}")),
     })
 }
@@ -204,8 +510,11 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         IQ4_NL => deq_iq4_nl(raw, n),
         IQ4_XS => deq_iq4_xs(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
+        MXFP4 => deq_mxfp4(raw, n),
         Q1_0 => deq_q1_0(raw, n),
         Q2_0 => deq_q2_0(raw, n),
+        // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
+        F8_E4M3_B128 => deq_f8_e4m3_b128(raw, n)?,
         other => return Err(format!("unsupported ggml type {other}")),
     })
 }
@@ -533,6 +842,70 @@ fn deq_tq2_0(raw: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// The OCP **E2M1** value table (1 sign bit, 2 exponent bits, 1 mantissa bit), stored **doubled**:
+/// the element's true value is `KVALUES_MXFP4_2X[code] / 2`, i.e. `{±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4,
+/// ±6}`. The same magnitudes appear in HF transformers' `integrations/mxfp4.py::FP4_VALUES`, so the
+/// two independent references agree on the table.
+///
+/// Two details are not free choices, and both were read out of ggml rather than reasoned about:
+///
+/// * **Code 8 is `+0.0`, not `−0.0`.** HF's list writes `-0.0` in slot 8; ggml's table is integral,
+///   so the sign never appears, and a bitwise diff sees the difference that `==` cannot.
+/// * **The doubling is load-bearing at the top of the exponent range.** Pairing this table with the
+///   *half* scale below is ggml's own arithmetic, and it is the reason `e = 255, code = 1` is the
+///   finite `2^127` rather than `inf` — see `e8m0_half_to_f32`.
+const KVALUES_MXFP4_2X: [f32; 16] = [
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+    0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0,
+];
+
+/// The **E8M0** shared scale, with one power of two held back: the block's first byte is a raw f32
+/// exponent field, so the scale is `2^(e − 127)`, and this returns `2^(e − 128)` to be paired with the
+/// doubled value table above.
+///
+/// Holding the factor back is not cosmetic. `2^(e − 127)` at `e = 255` is `2^128`, which **is not
+/// representable in f32** — computing the scale first and multiplying second turns every element of
+/// such a block into `±inf` or `NaN`, where ggml (and `ldexp`, and HF's `torch.ldexp`) return finite
+/// values for the small codes: `(e=255, code=1) → 0x7f000000 = 2^127`. This form never forms the
+/// unrepresentable intermediate, because `2^(e − 128)` tops out at `2^127`, which is finite.
+///
+/// The bottom end needs the bits built by hand too: `e = 0` and `e = 1` give `2^−128` and `2^−127`,
+/// both **subnormal** (f32's smallest normal is `2^−126`), so their exponent field is 0 and the value
+/// lives in the mantissa. Every product with the doubled table stays ≥ `2^−149` and is exact.
+///
+/// **This function is where the first version of this file was wrong**, and no amount of reading the
+/// spec would have said so: a probe of one code (`1.0`) across all 256 exponents agreed with the naive
+/// `2^(e − 127)` everywhere, because `1.0 · 2^128` overflows to `inf` and `inf` is what ggml returns
+/// for *that* code. Only the full 16-code × edge-exponent grid separates the two.
+fn e8m0_half_to_f32(e: u8) -> f32 {
+    match e {
+        0 => f32::from_bits(1 << 21), // 2^−128 = 2^21 · 2^−149 (subnormal)
+        1 => f32::from_bits(1 << 22), // 2^−127 = 2^22 · 2^−149 (subnormal)
+        _ => f32::from_bits((e as u32 - 1) << 23),
+    }
+}
+
+/// **MXFP4** (OCP Microscaling FP4, ggml type 39) — the format GPT-OSS ships in. 17-byte block,
+/// 32 values: `u8 e` (the E8M0 shared exponent) then `qs[16]`, two 4-bit E2M1 codes per byte.
+/// Element `i` takes the **low** nibble of `qs[i]` and element `i+16` the **high** nibble — the same
+/// low-half / high-half split as Q4_0, and *not* the lo/hi *interleave* HF transformers uses in its
+/// own packing (the value table is shared between the two; the byte order is not).
+///
+/// value = `(2·E2M1[code]) · 2^(e − 128)`, which is `E2M1[code] · 2^(e − 127)` wherever that is
+/// representable and correct where it is not.
+fn deq_mxfp4(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(17).take(n / 32).enumerate() {
+        let d = e8m0_half_to_f32(blk[0]);
+        for i in 0..16 {
+            let byte = blk[1 + i];
+            out[bi * 32 + i] = KVALUES_MXFP4_2X[(byte & 0x0F) as usize] * d;
+            out[bi * 32 + i + 16] = KVALUES_MXFP4_2X[(byte >> 4) as usize] * d;
+        }
+    }
+    out
+}
+
 /// **Q1_0** — PrismML "Bonsai" 1-bit (also mainline llama.cpp type 41). 128-value block = `f16 d`
 /// then `qs[16]`; element j → byte j/8, bit j%8 (LSB-first); value = bit ? +d : −d. 1.125 bpw.
 fn deq_q1_0(raw: &[u8], n: usize) -> Vec<f32> {
@@ -702,4 +1075,379 @@ pub fn quant_q5_1(x: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&nibbles);
     }
     out
+}
+
+/// **MXFP4 against llama.cpp's own dequantizer, bit for bit.**
+///
+/// A dequant of a microscaling format is *exact-representable* — every output is a table value times
+/// a power of two — so "close enough" is not the bar here. Every golden below was captured from the
+/// shipped `libggml-base`, through the same `ggml_get_type_traits(GGML_TYPE_MXFP4)->to_float` that
+/// `llama-eval-callback` prints, and is compared on **f32 bit patterns**, not on `==`. Bits matter:
+/// ggml emits `+0.0` for code 8, HF transformers' `FP4_VALUES` writes `-0.0` there, and `==` cannot
+/// tell those apart.
+///
+/// `GG_GRID` pins the value table, the E8M0 bias and both saturating ends of the exponent range.
+/// `REAL_*` pins what the table checks cannot: the intra-block nibble order and the 17-byte stride,
+/// on bytes lifted out of an actual MXFP4 GGUF (`llama-quantize --tensor-type attn_q=mxfp4` over
+/// Qwen2.5-0.5B) rather than a synthetic pattern. The full-tensor version of that same diff —
+/// 11.1 M elements over five tensors — is `examples/mxfp4_ref_diff.rs`, which takes every path from
+/// argv so it can be re-run against GPT-OSS itself when a checkpoint is on hand.
+#[cfg(test)]
+mod mxfp4_tests {
+    use super::*;
+
+    // ---- GOLDEN A: 10 scale bytes x 16 codes, captured from ggml ----
+    const GG_E: [u8; 10] = [0, 1, 2, 64, 126, 127, 128, 200, 254, 255];
+    const GG_GRID: [u32; 160] = [
+        0x00000000, 0x00200000, 0x00400000, 0x00600000, 0x00800000, 0x00c00000, 0x01000000, 0x01400000,
+        0x00000000, 0x80200000, 0x80400000, 0x80600000, 0x80800000, 0x80c00000, 0x81000000, 0x81400000, // e=0
+        0x00000000, 0x00400000, 0x00800000, 0x00c00000, 0x01000000, 0x01400000, 0x01800000, 0x01c00000,
+        0x00000000, 0x80400000, 0x80800000, 0x80c00000, 0x81000000, 0x81400000, 0x81800000, 0x81c00000, // e=1
+        0x00000000, 0x00800000, 0x01000000, 0x01400000, 0x01800000, 0x01c00000, 0x02000000, 0x02400000,
+        0x00000000, 0x80800000, 0x81000000, 0x81400000, 0x81800000, 0x81c00000, 0x82000000, 0x82400000, // e=2
+        0x00000000, 0x1f800000, 0x20000000, 0x20400000, 0x20800000, 0x20c00000, 0x21000000, 0x21400000,
+        0x00000000, 0x9f800000, 0xa0000000, 0xa0400000, 0xa0800000, 0xa0c00000, 0xa1000000, 0xa1400000, // e=64
+        0x00000000, 0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000, 0x3fc00000, 0x40000000, 0x40400000,
+        0x00000000, 0xbe800000, 0xbf000000, 0xbf400000, 0xbf800000, 0xbfc00000, 0xc0000000, 0xc0400000, // e=126
+        0x00000000, 0x3f000000, 0x3f800000, 0x3fc00000, 0x40000000, 0x40400000, 0x40800000, 0x40c00000,
+        0x00000000, 0xbf000000, 0xbf800000, 0xbfc00000, 0xc0000000, 0xc0400000, 0xc0800000, 0xc0c00000, // e=127
+        0x00000000, 0x3f800000, 0x40000000, 0x40400000, 0x40800000, 0x40c00000, 0x41000000, 0x41400000,
+        0x00000000, 0xbf800000, 0xc0000000, 0xc0400000, 0xc0800000, 0xc0c00000, 0xc1000000, 0xc1400000, // e=128
+        0x00000000, 0x63800000, 0x64000000, 0x64400000, 0x64800000, 0x64c00000, 0x65000000, 0x65400000,
+        0x00000000, 0xe3800000, 0xe4000000, 0xe4400000, 0xe4800000, 0xe4c00000, 0xe5000000, 0xe5400000, // e=200
+        0x00000000, 0x7e800000, 0x7f000000, 0x7f400000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000,
+        0x00000000, 0xfe800000, 0xff000000, 0xff400000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, // e=254
+        0x00000000, 0x7f000000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000,
+        0x00000000, 0xff000000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, // e=255
+    ];
+
+    // ---- GOLDEN B: first 8 blocks of blk.0.attn_q.weight in a real MXFP4 gguf ----
+    // Scale bytes are 0x77,0x77,0x77,0x77,0x77,0x78,0x76,0x78 — three distinct exponents, so a block
+    // read at the wrong stride lands on the wrong scale and cannot pass by luck.
+    const REAL_RAW: [u8; 136] = [
+        0x77, 0x99, 0x49, 0xd4, 0x54, 0xd1, 0x0a, 0x02, 0xa0, 0x05, 0xa9, 0x7a, 0x96, 0x33, 0xc0, 0x9c, 0xb0,
+        0x77, 0xb1, 0xd1, 0xd0, 0xcd, 0x41, 0xc1, 0xba, 0xa9, 0x76, 0x27, 0xcd, 0x6a, 0x19, 0xa5, 0x14, 0xa1,
+        0x77, 0x4d, 0x1e, 0x10, 0x05, 0x15, 0x22, 0xa2, 0xb4, 0x24, 0x2f, 0x53, 0x9c, 0xda, 0xa7, 0x9b, 0x09,
+        0x77, 0xd3, 0x12, 0xa6, 0xb0, 0xfd, 0x05, 0xca, 0x2a, 0xa0, 0x44, 0xa7, 0x63, 0x7a, 0x6e, 0x32, 0x90,
+        0x77, 0x2c, 0x6c, 0x74, 0xa3, 0xa6, 0xa3, 0xcc, 0x36, 0x2d, 0xbe, 0xcf, 0xcc, 0x0a, 0xd1, 0xd5, 0x2b,
+        0x78, 0x9c, 0x09, 0x4c, 0x39, 0x23, 0x90, 0xa5, 0x11, 0xc9, 0x01, 0x13, 0xa3, 0x92, 0x99, 0x61, 0x41,
+        0x76, 0x67, 0x5c, 0x73, 0x03, 0x4d, 0xf7, 0x44, 0xea, 0xe5, 0x49, 0x96, 0xdf, 0xcd, 0x79, 0xed, 0x6b,
+        0x78, 0x0b, 0x00, 0x31, 0x90, 0x0a, 0x01, 0xa2, 0x03, 0x99, 0x1a, 0x03, 0x1c, 0xa0, 0x31, 0x41, 0x26,
+    ];
+    const REAL_GGML: [u32; 256] = [
+        0xbb000000, 0xbb000000, 0x3c000000, 0x3c000000, 0x3b000000, 0xbb800000, 0x3b800000, 0x00000000,
+        0x3c400000, 0xbb000000, 0xbb800000, 0x3c800000, 0x3bc00000, 0x00000000, 0xbc000000, 0x00000000,
+        0xbb000000, 0x3c000000, 0xbc400000, 0x3c400000, 0xbc400000, 0x00000000, 0x00000000, 0xbb800000,
+        0x00000000, 0xbb800000, 0x3cc00000, 0xbb000000, 0x3bc00000, 0xbc000000, 0xbb000000, 0xbbc00000,
+        0x3b000000, 0x3b000000, 0x00000000, 0xbc400000, 0x3b000000, 0x3b000000, 0xbb800000, 0xbb000000,
+        0x3c800000, 0x3cc00000, 0xbc400000, 0xbb800000, 0xbb000000, 0x3c400000, 0x3c000000, 0x3b000000,
+        0xbbc00000, 0xbc400000, 0xbc400000, 0xbc000000, 0x3c000000, 0xbc000000, 0xbbc00000, 0xbb800000,
+        0x3cc00000, 0x3b800000, 0xbc000000, 0x3c800000, 0x3b000000, 0xbb800000, 0x3b000000, 0xbb800000,
+        0xbc400000, 0xbc800000, 0x00000000, 0x3c400000, 0x3c400000, 0x3b800000, 0x3b800000, 0x3c000000,
+        0x3c000000, 0xbcc00000, 0x3bc00000, 0xbc000000, 0xbb800000, 0x3cc00000, 0xbbc00000, 0xbb000000,
+        0x3c000000, 0x3b000000, 0x3b000000, 0x00000000, 0x3b000000, 0x3b800000, 0xbb800000, 0xbbc00000,
+        0x3b800000, 0x3b800000, 0x3c400000, 0xbb000000, 0xbc400000, 0xbb800000, 0xbb000000, 0x00000000,
+        0x3bc00000, 0x3b800000, 0x3c800000, 0x00000000, 0xbc400000, 0x3c400000, 0xbb800000, 0xbb800000,
+        0x00000000, 0x3c000000, 0x3cc00000, 0x3bc00000, 0xbb800000, 0xbc800000, 0x3b800000, 0x00000000,
+        0xbc400000, 0x3b000000, 0xbb800000, 0xbbc00000, 0xbcc00000, 0x00000000, 0xbc000000, 0x3b800000,
+        0xbb800000, 0x3c000000, 0xbb800000, 0x3c800000, 0x3cc00000, 0x3c800000, 0x3bc00000, 0xbb000000,
+        0xbc000000, 0xbc000000, 0x3c000000, 0x3bc00000, 0x3c800000, 0x3bc00000, 0xbc000000, 0x3c800000,
+        0xbc400000, 0xbc800000, 0xbcc00000, 0xbc000000, 0xbb800000, 0x3b000000, 0x3c400000, 0xbbc00000,
+        0x3b800000, 0x3c800000, 0x3cc00000, 0xbb800000, 0xbb800000, 0xbb800000, 0xbc000000, 0x3bc00000,
+        0x3b800000, 0xbbc00000, 0xbc000000, 0xbc000000, 0x00000000, 0xbc400000, 0xbc400000, 0x3b800000,
+        0xbc800000, 0xbb800000, 0xbc800000, 0xbb800000, 0x3c400000, 0x00000000, 0x3cc00000, 0x3b800000,
+        0xbb800000, 0x3b800000, 0x3c400000, 0x3c400000, 0x3c000000, 0xbb800000, 0x3b800000, 0x3b800000,
+        0xbb800000, 0x00000000, 0x3c800000, 0x3c400000, 0x3c000000, 0xbb800000, 0xbc000000, 0x3b800000,
+        0xbc800000, 0x00000000, 0x3b800000, 0xbc000000, 0xbb800000, 0xbb800000, 0x3d000000, 0x3c800000,
+        0x3c400000, 0xbb800000, 0x3b400000, 0x3b400000, 0xbbc00000, 0x3c400000, 0x3b800000, 0xbb000000,
+        0x3bc00000, 0xba800000, 0x3c000000, 0xbc400000, 0xbbc00000, 0xba800000, 0xbbc00000, 0xbb400000,
+        0x3c000000, 0x3bc00000, 0x3c400000, 0x00000000, 0x3b800000, 0xbc400000, 0x3b800000, 0xbc000000,
+        0xbc000000, 0x3b800000, 0xba800000, 0xbbc00000, 0xbb800000, 0x3c400000, 0xbc000000, 0x3c000000,
+        0xbc400000, 0x00000000, 0x3b800000, 0x00000000, 0xbc000000, 0x3b800000, 0x3c000000, 0x3c400000,
+        0xbb800000, 0xbc000000, 0x3c400000, 0xbc800000, 0x00000000, 0x3b800000, 0x3b800000, 0x3d000000,
+        0x00000000, 0x00000000, 0x3c400000, 0xbb800000, 0x00000000, 0x00000000, 0xbc000000, 0x00000000,
+        0xbb800000, 0x3b800000, 0x00000000, 0x3b800000, 0xbc000000, 0x3c400000, 0x3c800000, 0x3c000000,
+    ];
+
+    /// The value table and the E8M0 bias, at both saturating ends of the exponent range.
+    ///
+    /// Each code is placed twice — in the low nibble of `qs[0]` (element 0) and in the high nibble of
+    /// `qs[0]` (element 16) — so the two nibble halves are checked against the same golden and a
+    /// half-specific mistake cannot hide.
+    #[test]
+    fn mxfp4_grid_is_bit_identical_to_ggml() {
+        for (ei, &e) in GG_E.iter().enumerate() {
+            for code in 0u8..16 {
+                let want = GG_GRID[ei * 16 + code as usize];
+
+                let mut blk = [0u8; 17];
+                blk[0] = e;
+                blk[1] = code; // low nibble -> element 0
+                let lo = deq_raw(&blk, 32, MXFP4).unwrap();
+                assert_eq!(lo[0].to_bits(), want,
+                    "low nibble: e={e} code={code}: ferric 0x{:08x} ({}) vs ggml 0x{want:08x} ({})",
+                    lo[0].to_bits(), lo[0], f32::from_bits(want));
+
+                let mut blk = [0u8; 17];
+                blk[0] = e;
+                blk[1] = code << 4; // high nibble -> element 16
+                let hi = deq_raw(&blk, 32, MXFP4).unwrap();
+                assert_eq!(hi[16].to_bits(), want,
+                    "high nibble: e={e} code={code}: ferric 0x{:08x} vs ggml 0x{want:08x}",
+                    hi[16].to_bits());
+                // ...and the other half of that byte is code 0, which is +0.0 in ggml's table.
+                assert_eq!(hi[0].to_bits(), 0x0000_0000, "e={e} code={code}: element 0 should be +0.0");
+            }
+        }
+    }
+
+    /// Real bytes out of a real MXFP4 GGUF, against ggml's dequant of the same bytes. This is the
+    /// check that pins the *layout*: element `i` takes the low nibble of `qs[i]` and `i+16` the high
+    /// nibble (not HF's lo/hi interleave), and blocks stride by 17 bytes.
+    #[test]
+    fn mxfp4_real_gguf_blocks_are_bit_identical_to_ggml() {
+        let got = deq_raw(&REAL_RAW, 256, MXFP4).unwrap();
+        assert_eq!(got.len(), 256);
+        let mut ndiff = 0;
+        for i in 0..256 {
+            if got[i].to_bits() != REAL_GGML[i] {
+                ndiff += 1;
+                if ndiff == 1 {
+                    panic!("element {i} (block {}, lane {}): ferric {} (0x{:08x}) vs ggml {} (0x{:08x})",
+                        i / 32, i % 32, got[i], got[i].to_bits(),
+                        f32::from_bits(REAL_GGML[i]), REAL_GGML[i]);
+                }
+            }
+        }
+        assert_eq!(ndiff, 0);
+    }
+
+    /// The on-disk stride. 426_496 is the byte length `llama-gguf` reports for the 896x896
+    /// `blk.0.attn_q.weight` of the requantized file, so this is a measured number, not arithmetic
+    /// restated: 802_816 values / 32 = 25_088 blocks x 17 bytes.
+    /// The two E8M0 biases must stay a factor of two apart, and neither may drift into the other.
+    ///
+    /// `e8m0_half_to_f32` is ggml's `2^(e-128)`, paired with a DOUBLED E2M1 table. `e8m0_bias127` is
+    /// OCP's `2^(e-127)`, paired with undoubled E4M3. Using one where the other belongs scales every
+    /// weight by 2x or 0.5x — uniform, so the model still produces fluent text, and nothing errors.
+    #[test]
+    fn the_two_e8m0_biases_differ_by_exactly_two() {
+        for e in 1..=0xFEu8 {
+            let (ggml, ocp) = (e8m0_half_to_f32(e), e8m0_bias127(e));
+            assert!(ggml.is_finite() && ocp.is_finite(), "e={e}: both must be finite in range");
+            assert_eq!(ocp, ggml * 2.0, "e={e}: OCP must be exactly twice ggml's");
+        }
+        // Landmarks that pin the absolute scale, not just the ratio.
+        assert_eq!(e8m0_bias127(127), 1.0, "bias 127 means e=127 is unity");
+        assert_eq!(e8m0_bias127(128), 2.0);
+        assert_eq!(e8m0_bias127(126), 0.5);
+        // Deliberate divergence from the V4 fork, documented on `e8m0_bias127`: ggml's macro has its
+        // NaN branch commented out so 0xFF decodes to +Inf there; we keep OCP's NaN so a poisoned
+        // scale is caught instead of multiplied through.
+        assert!(e8m0_bias127(0xFF).is_nan(), "OCP reserves all-ones for NaN");
+    }
+
+    /// The block decode: one E8M0 scale byte, THEN 128 E4M3 elements — scale FIRST.
+    ///
+    /// This layout is verified against a real V4 file (byte-level phase statistics of two tensors of
+    /// `DeepSeek-V4-Flash-FP4-FP8-native.gguf`, two independent probes) and the fork's block struct
+    /// (`{ uint8_t e; uint8_t qs[128]; }`). The crate originally shipped the OPPOSITE order as a
+    /// labelled assumption; the fixture below is deliberately asymmetric so a payload-first decoder
+    /// cannot pass it: read back-to-front, block 0's "scale" would be its last payload byte (0x40,
+    /// not an exponent of 1) and its first element the byte 127 (= E4M3 NaN).
+    #[test]
+    fn f8_e4m3_b128_decodes_a_block_under_its_shared_scale() {
+        let mut raw = vec![0u8; F8_E4M3_B128_BYTES * 2];
+        // Block 0: scale byte FIRST (127 -> 2^0), then values 1.0 (0x38) and 2.0 (0x40).
+        raw[0] = 127; raw[1] = 0x38; raw[2] = 0x40;
+        // ...and a nonzero LAST payload byte, where the old layout looked for the scale.
+        raw[128] = 0x40;
+        // Block 1: the same leading payload bytes at scale 2^1, so every value doubles.
+        raw[F8_E4M3_B128_BYTES] = 128;
+        raw[F8_E4M3_B128_BYTES + 1] = 0x38; raw[F8_E4M3_B128_BYTES + 2] = 0x40;
+        let v = deq_f8_e4m3_b128(&raw, 256).expect("two whole blocks");
+        assert_eq!(v.len(), 256);
+        assert_eq!((e4m3_to_f32(0x38), e4m3_to_f32(0x40)), (1.0, 2.0), "fixture: the chosen bytes");
+        assert_eq!((v[0], v[1]), (1.0, 2.0), "block 0 at 2^0, elements from bytes 1..=128");
+        assert_eq!(v[127], 2.0, "byte 128 is the LAST ELEMENT of block 0, not its scale");
+        assert_eq!((v[128], v[129]), (2.0, 4.0), "block 1 at 2^1 — the scale is PER BLOCK");
+        assert_eq!(v[3], 0.0, "0x00 is zero whatever the scale");
+
+        // Refusals, not silent truncation.
+        assert!(deq_f8_e4m3_b128(&raw, 100).is_err(), "a partial block must be refused");
+        assert!(deq_f8_e4m3_b128(&raw[..10], 256).is_err(), "short input must be refused");
+    }
+
+    /// Type 42 is claimed three ways and must be resolved by STRIDE, never by preference.
+    /// The parse path itself must resolve type 42 — a tested resolver nothing calls is the
+    /// written-ahead-of-its-wiring gap this tree has now produced three times.
+    ///
+    /// Built as a REAL in-memory GGUF (header, tensor table, data), not a mocked call: the claim is
+    /// about what `parse` hands downstream, so the parser is the subject.
+    #[test]
+    fn parsing_a_file_resolves_type_42_by_stride_and_refuses_tiny_ambiguity() {
+        fn gguf_with_type42(n_elems: u64, data_bytes: usize) -> Vec<u8> {
+            let mut b: Vec<u8> = Vec::new();
+            b.extend(b"GGUF");
+            b.extend(3u32.to_le_bytes());
+            b.extend(1u64.to_le_bytes());               // one tensor
+            b.extend(0u64.to_le_bytes());               // no kv
+            let name = b"t";
+            b.extend((name.len() as u64).to_le_bytes());
+            b.extend(name);
+            b.extend(1u32.to_le_bytes());               // n_dims
+            b.extend(n_elems.to_le_bytes());
+            b.extend(42u32.to_le_bytes());              // the contested id
+            b.extend(0u64.to_le_bytes());               // offset
+            while b.len() % 32 != 0 { b.push(0); }      // default alignment
+            b.extend(std::iter::repeat(0u8).take(data_bytes));
+            b
+        }
+        // 128 blocks at 129 B: unambiguous within one 32-byte alignment -> resolves to F8 (1042).
+        let f8 = parse(gguf_with_type42(128 * 128, 128 * 129)).expect("F8 stride must load");
+        assert_eq!(f8.tensors[0].ggml_type, 1042,
+                   "the PARSER must hand downstream the resolved id, not the contested 42");
+        // Same element count at 34 B/block: PrismML ternary keeps meaning what it always meant.
+        let q2 = parse(gguf_with_type42(128 * 128, 128 * 34)).expect("Q2_0 stride must load");
+        assert_eq!(q2.tensors[0].ggml_type, 42);
+        // Mainline ggml-org Q2_0 (18 B / 64 values = 36 B / 128): refused BY NAME, no decoder exists.
+        let e = match parse(gguf_with_type42(128 * 128, 128 * 36)) {
+            Err(e) => e, Ok(_) => panic!("a mainline-Q2_0 stride must refuse, not load"),
+        };
+        assert!(e.contains("64 values / 18 bytes") || e.contains("mainline"),
+                "mainline must be refused by name, got: {e}");
+        // ONE block: 34 vs 36 differ by 2 bytes — inside one alignment, so it must REFUSE as
+        // ambiguous rather than first-match to PrismML. This is the case a slack-window resolver
+        // silently gets wrong.
+        let e = match parse(gguf_with_type42(128, 36)) {
+            Err(e) => e, Ok(_) => panic!("a one-block ambiguous tensor must refuse, not first-match"),
+        };
+        assert!(e.contains("too small to disambiguate"), "got: {e}");
+    }
+    #[test]
+    fn type_42_resolves_by_stride_and_refuses_when_it_matches_neither() {
+        let n = 1024usize;                 // 8 blocks of 128
+        assert_eq!(resolve_type_42(n, 8 * 34).unwrap(), 42, "34 bytes/block is PrismML Q2_0");
+        assert_eq!(resolve_type_42(n, 8 * F8_E4M3_B128_BYTES).unwrap(), 1042, "129 is F8_E4M3_B128");
+        // Mainline ggml-org master ALSO assigns 42 (its own Q2_0: 64 values / 18 bytes = 36 bytes
+        // per 128). This crate cannot decode that layout — the refusal must NAME it, because 36 is
+        // only 2 bytes per 128 values away from PrismML's 34 and a generic message would send the
+        // reader hunting the wrong format.
+        let e = resolve_type_42(n, n / 64 * 18).unwrap_err();
+        assert!(e.contains("mainline") && e.contains("64 values / 18 bytes"), "unexpected: {e}");
+        // Anything else is a format this crate does not know, and guessing would mis-decode silently.
+        let e = resolve_type_42(n, 8 * 64).unwrap_err();
+        assert!(e.contains("none of the three"), "unexpected: {e}");
+        assert!(resolve_type_42(100, 3400).is_err(), "not a multiple of 128 elements");
+    }
+
+    /// The internal id `resolve_type_42` hands back must be usable end-to-end: `type_size` computes
+    /// the 129-byte stride and `deq_raw` routes to the F8 decoder. Fixture chosen so a scale/payload
+    /// swap cannot pass: both blocks decode element 0 to 2.0 via DIFFERENT (scale, element) pairs.
+    #[test]
+    fn f8_internal_id_dispatches_through_type_size_and_deq_raw() {
+        assert_eq!(type_size(F8_E4M3_B128, 256).unwrap(), 2 * F8_E4M3_B128_BYTES);
+        let mut raw = vec![0u8; 2 * F8_E4M3_B128_BYTES];
+        raw[0] = 128; raw[1] = 0x38;                                       // 2^1 x 1.0
+        raw[F8_E4M3_B128_BYTES] = 127; raw[F8_E4M3_B128_BYTES + 1] = 0x40; // 2^0 x 2.0
+        let v = deq_raw(&raw, 256, F8_E4M3_B128).expect("routed to deq_f8_e4m3_b128");
+        assert_eq!((v[0], v[128]), (2.0, 2.0));
+        assert_eq!(v.len(), 256);
+    }
+
+    #[test]
+    fn mxfp4_type_size_matches_the_file() {
+        assert_eq!(type_size(MXFP4, 32).unwrap(), 17);
+        assert_eq!(type_size(MXFP4, 802_816).unwrap(), 426_496);
+        // 0.53125 bytes/elem = 4.25 bits/weight: 4 bits of E2M1 plus 8 shared exponent bits per 32.
+        assert_eq!(type_size(MXFP4, 32).unwrap() as f64 * 8.0 / 32.0, 4.25);
+    }
+
+    /// `deq_raw` must consume the block stride, not the element count: 8 blocks of input yield 256
+    /// values and the last block's distinct scale (0x78) has to reach the last lane.
+    /// E4M3 must match PyTorch's `float8_e4m3fn` **exactly, for all 256 bytes**.
+    ///
+    /// The table is generated, so this test is not checking arithmetic — it is checking that the
+    /// generated values are the ones the format actually defines, and pinning the edges a hand-rolled
+    /// decoder gets wrong. MXFP4 shipped with an off-by-one in exactly this kind of edge (2^(e-127) at
+    /// e=255 overflows where ggml returns finite) and only an exhaustive comparison found it.
+    #[test]
+    fn e4m3_matches_the_reference_over_every_byte() {
+        // Landmarks, taken from torch and asserted here so a regenerated table cannot drift silently.
+        assert_eq!(e4m3_to_f32(0x00), 0.0, "zero");
+        assert!(e4m3_to_f32(0x80).is_sign_negative() && e4m3_to_f32(0x80) == 0.0, "negative zero");
+        assert_eq!(e4m3_to_f32(0x01), 0.001953125f32, "smallest subnormal");
+        assert_eq!(e4m3_to_f32(0x7E), 448.0, "max finite magnitude is 448, not 240 or 480");
+        assert_eq!(e4m3_to_f32(0xFE), -448.0, "and symmetric");
+        assert!(e4m3_to_f32(0x7F).is_nan() && e4m3_to_f32(0xFF).is_nan(), "the two NaN encodings");
+
+        // The `fn` variant has NO infinities. A decoder that reuses IEEE binary8 logic produces them,
+        // and an inf weight silently poisons every product it touches.
+        let infs = (0..=255u8).filter(|&b| e4m3_to_f32(b).is_infinite()).count();
+        assert_eq!(infs, 0, "float8_e4m3fn defines no infinities; found {infs}");
+
+        // Exactly two NaNs, and every other byte finite.
+        let nans = (0..=255u8).filter(|&b| e4m3_to_f32(b).is_nan()).count();
+        assert_eq!(nans, 2, "0x7F and 0xFF only");
+        assert_eq!((0..=255u8).filter(|&b| e4m3_to_f32(b).is_finite()).count(), 254);
+
+        // Monotone over the positive range: byte order is value order for a sign-magnitude float, and
+        // a table with a transposed pair would still pass every landmark above.
+        // Stops at 0x7E: 0x7F is NaN, and NaN compares false against everything, so including it
+        // would fail here for the right reason and the wrong one.
+        for b in 1..0x7Eu8 {
+            assert!(e4m3_to_f32(b) < e4m3_to_f32(b + 1),
+                    "0x{b:02x} -> {} must be < 0x{:02x} -> {}", e4m3_to_f32(b), b + 1, e4m3_to_f32(b + 1));
+        }
+    }
+
+    #[test]
+    fn mxfp4_last_block_uses_its_own_scale() {
+        let got = deq_raw(&REAL_RAW, 256, MXFP4).unwrap();
+        // block 7's scale byte is 0x78 -> 2^(120-127) = 2^-7; its qs[15] high nibble is 0x2 -> +1.0.
+        assert_eq!(REAL_RAW[7 * 17], 0x78);
+        assert_eq!(REAL_RAW[7 * 17 + 16] >> 4, 0x2);
+        assert_eq!(got[7 * 32 + 31].to_bits(), (1.0f32 * 2f32.powi(-7)).to_bits());
+        assert_eq!(got[7 * 32 + 31].to_bits(), REAL_GGML[255]);
+    }
+
+    /// A type id whose block layout this crate gets wrong must REFUSE, not read at the wrong stride.
+    ///
+    /// The concrete risk this guards: GGUF type ids in the 40s are contested. This crate maps id 42 to
+    /// a group-128 / 34-byte ternary layout (2.125 bpw); mainline `llama-quantize` advertises its own
+    /// `Q2_0` as "2.25 bpw quantization (group 64)". A file carries only the id, and every reader here
+    /// computes the byte length from `type_size` and reads that many bytes at the declared offset with
+    /// no other check. Wrong stride in, plausible garbage out, no error.
+    ///
+    /// Both directions matter and they fail differently: too LARGE overruns into the next tensor, too
+    /// SMALL reads a short prefix of every block while leaving an implausible hole.
+    #[test]
+    fn a_stride_that_disagrees_with_the_file_is_refused_in_both_directions() {
+        // Two 1024-element Q8_0 tensors laid out back to back: 1024/32*34 = 1088 bytes each.
+        let t = |name: &str, off: u64| TensorInfo {
+            name: name.into(), dims: vec![1024], ggml_type: Q8_0, offset: off,
+        };
+        let tensors = vec![t("a", 0), t("b", 1088)];
+        let total = 2176;
+
+        check_declared_strides(&tensors, total, 32)
+            .expect("the honest layout must load: 1088 bytes each, exactly back to back");
+
+        // Too large: 'a' would need more than the 1088 the file leaves before 'b'.
+        let overrun = vec![t("a", 0), t("b", 700)];
+        let e = check_declared_strides(&overrun, total, 32).expect_err("must refuse an overrun");
+        assert!(e.contains("needs 1088 bytes") && e.contains("only 700"), "unexpected message: {e}");
+
+        // Too small: the file reserves far more for 'a' than this reader thinks it occupies.
+        let underrun = vec![t("a", 0), t("b", 40_000)];
+        let e = check_declared_strides(&underrun, 41_088, 32).expect_err("must refuse an underrun");
+        assert!(e.contains("is 1088 bytes") && e.contains("reserves 40000"), "unexpected message: {e}");
+
+        // A header PROBE holds only a prefix of the file, so the last tensor's bound is unknowable and
+        // must not be enforced — `backed.rs` parses exactly this way and every probe would otherwise
+        // be rejected. The inter-tensor gaps are still checked, which is what the overrun case above
+        // relies on.
+        check_declared_strides(&tensors, 16, 32)
+            .expect("a header probe must still parse: its buffer ends before the tensors begin");
+    }
 }
