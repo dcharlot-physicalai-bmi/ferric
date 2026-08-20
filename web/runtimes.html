@@ -30,15 +30,46 @@ try {
   // receipt so the driver can assert retrieval picked the RIGHT knowledge, not just any knowledge.
   const corpusUrl = q.get('corpus');
   if (corpusUrl) {
-    S('embedding corpus');
     const chunks = (await (await fetch(corpusUrl)).text()).split(/\n\s*\n/).map(c => c.trim()).filter(c => c);
+    // ?vecs=<url>: PRECOMPUTED corpus vectors. Corpus embeddings are a function of (corpus, model)
+    // and change only when one does — computing them per query scales O(corpus) in model forwards,
+    // shipping them scales the tab's per-query work to ONE embed plus dot products. The header's
+    // fingerprint (the model's own embedding of a fixed probe, hashed) is the receipt that this
+    // file's model and the tab's model AGREE — mixed vectors rank garbage silently.
+    const vecsUrl = q.get('vecs');
+    let corpusVecs = null;
+    if (vecsUrl) {
+      S('loading corpus vectors');
+      const buf = await (await fetch(vecsUrl)).arrayBuffer();
+      const dv = new DataView(buf);
+      if (dv.getUint32(0, true) !== 0x43455646) throw new Error('not an FVEC file'); // "FVEC" LE
+      if (dv.getUint32(4, true) !== 2) throw new Error('FVEC v' + dv.getUint32(4, true) + '; this page reads v2');
+      const nEmbd = dv.getUint32(8, true), nChunks = dv.getUint32(12, true);
+      if (nChunks !== chunks.length) throw new Error(`vecs cover ${nChunks} chunks, corpus has ${chunks.length}`);
+      // Model identity by COSINE against the shipped probe vector, not by bit-hash: fabrics select
+      // different kernel variants (subgroup reduce on Metal, plain on Dawn), so the same model's
+      // embeddings differ at ulp order across stacks by construction. 0.999 tolerates that noise; a
+      // different model's probe lands nowhere near it. The measured cross-fabric cosine is rendered
+      // so the run leaves a record of HOW far apart the stacks actually were.
+      const fileProbe = new Float32Array(buf, 16, nEmbd);
+      const probe = await m.embed('ferric model fingerprint probe');
+      let dotP = 0; for (let k = 0; k < nEmbd; k++) dotP += probe[k] * fileProbe[k];
+      document.getElementById('info').textContent += ' · probe-cos ' + dotP.toFixed(6);
+      if (!(dotP > 0.999)) throw new Error('corpus vectors were made by a DIFFERENT model (probe cosine ' + dotP.toFixed(4) + ')');
+      const base = 16 + nEmbd * 4;
+      corpusVecs = [];
+      for (let i = 0; i < nChunks; i++) corpusVecs.push(new Float32Array(buf, base + i * nEmbd * 4, nEmbd));
+    }
+    S(vecsUrl ? 'embedding question' : 'embedding corpus');
+    const t0r = performance.now();
     const qv = await m.embed(prompt);
     const scored = [];
     for (let i = 0; i < chunks.length; i++) {
-      const cv = await m.embed(chunks[i]);
+      const cv = corpusVecs ? corpusVecs[i] : await m.embed(chunks[i]);
       let dot = 0; for (let k = 0; k < qv.length; k++) dot += qv[k] * cv[k];
       scored.push([dot, i]);
     }
+    document.getElementById('stats').textContent = 'retrieval ' + ((performance.now() - t0r) | 0) + ' ms · ';
     scored.sort((x, y) => y[0] - x[0]);
     const top = scored.slice(0, 2);
     document.getElementById('info').textContent += ' · retrieved ' + top.map(([s,i]) => i + ':' + s.toFixed(3)).join(' ');

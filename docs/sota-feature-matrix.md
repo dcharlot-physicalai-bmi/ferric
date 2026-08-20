@@ -559,3 +559,17 @@ local, only the corpus remote, with an auditable record of which knowledge groun
 two assertions are separate BY DESIGN: a wrong ranking is caught even when generation gets lucky,
 and a generation failure is isolated from retrieval — the subject-vs-claim discipline applied to the
 demo itself.
+
+**At scale, with precomputed vectors (2026-08-20):** corpus embeddings are a function of (corpus,
+model), so `embed_corpus` computes them ONCE natively and ships them as a ~1 MB `.fvec` beside the
+corpus; the tab pays ONE question-embed plus dot products per query, independent of corpus size. On a
+120-chunk corpus the correct chunk still ranked FIRST at the same cosine and margin as the 8-chunk
+run (19:0.819 vs 0.772) and the answer held.
+
+The file's model-identity check REFUTED its own first design and produced a finding: a bit-hash of a
+probe embedding MISMATCHES across fabrics for the SAME model, because kernel selection is
+capability-dependent (subgroup reduce on native Metal, plain on Chrome/Dawn) — the same dispatch takes
+a different reduction order by construction, and 28 layers accumulate it to ulp order. v2 ships the
+probe VECTOR and checks cosine > 0.999; the measured cross-fabric agreement renders on every run
+(probe-cos 1.000000 — real at the bit level, invisible at six decimals). Rule: across fabrics, model
+identity is a TOLERANCE check, never a bit-hash.
