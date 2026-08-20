@@ -36,14 +36,20 @@
 //!   guarded by the code-sequence exclusion above, not by the control. The realized agreement
 //!   between random and true labels is printed, because with 5 kinds it varies by draw and the
 //!   null is only readable next to it.
+//! - `--train-tokenizer <steps>` first trains the encoder+decoder through the FSQ bottleneck on
+//!   the TRAINING variants' signals only — the tokenizer is part of the model, so it never sees a
+//!   held-out variant — and then tokenizes both splits with the trained encoder. The untrained
+//!   tokenizer collapsed the entire thermal family to shared token sequences; this flag exists to
+//!   measure what training the tokenizer buys back.
 //! - "Chance" is 1-in-5: the score demands the argmax over all 32,777 rows land on the one true
 //!   word among 5, so 20% is what guessing uniformly among the five words would earn, and the
 //!   model can do worse by preferring a signal token.
 
 use ferric_core::Context;
 use ferric_signal::{
-    cross_entropy, lm_forward_var, synth, EncoderConfig, EncoderWeights, Fsq, HybridVocab, Patcher,
-    RevIn, SensorLm, Sequencer, Span, Task,
+    cross_entropy, decoder_forward_var, forward_var, lm_forward_var, mse, straight_through, synth,
+    DecoderWeights, EncoderConfig, EncoderWeights, Fsq, HybridVocab, Patcher, RevIn, SensorLm,
+    Sequencer, Span, Task,
 };
 use ferric_tensor::autograd::Var;
 use ferric_tensor::optim::Adam;
@@ -78,6 +84,18 @@ fn main() {
     let variants = num(&args, "--variants", 4);
     let steps = num(&args, "--steps", 600);
     let control = args.iter().any(|a| a == "--control");
+    let tok_steps = num(&args, "--train-tokenizer", 0);
+    // The tokenizer's own corpus, in variants per kind. Defaults to the LM's corpus. Setting it
+    // larger (e.g. 16 while sweeping --variants) holds tokenizer quality CONSTANT across the sweep,
+    // isolating what data buys the LM: with both retrained per size, the x-axis moves two things
+    // at once — at fixed steps the tokenizer undertrains as its corpus grows, and its degradation
+    // masquerades as an LM data effect. Every tokenizer-corpus variant stays in 0..100, so the
+    // held-out set is unseen by the WHOLE model either way.
+    let tok_variants = num(&args, "--tokenizer-variants", variants);
+    if tok_variants < variants || tok_variants > HELD_BASE {
+        eprintln!("--tokenizer-variants must be in {variants}..={HELD_BASE}");
+        std::process::exit(2);
+    }
 
     if variants < 1 || variants > HELD_BASE {
         eprintln!("--variants must be in 1..={HELD_BASE}: train variants are 0..N and held-out \
@@ -102,14 +120,62 @@ fn main() {
     let patcher = Patcher::contiguous(PATCH).unwrap();
     let ld = enc_cfg.latent_dim;
 
+    // With --train-tokenizer, the encoder is trained as an autoencoder through the FSQ bottleneck
+    // on the TRAINING variants' signals only, each normalized exactly as codes_for will normalize
+    // it. The tokenizer is part of the model; letting it see a held-out signal would move the
+    // split guard's job into the tokenizer and hide it there.
+    let trained_enc: Option<Vec<Tensor>> = if tok_steps > 0 {
+        let mut all_patches: Vec<f32> = Vec::new();
+        for kind in 0..synth::KINDS {
+            for v in 0..tok_variants {
+                let raw = synth::signal(kind, v, PATCH * PATCHES);
+                let rev = RevIn::fit(&raw, 1).unwrap();
+                all_patches.extend(patcher.patchify(&rev.apply(&raw).unwrap()).unwrap());
+            }
+        }
+        let t_all = all_patches.len() / PATCH;
+        let x = Tensor::from_vec(&ctx, &all_patches, &[t_all, PATCH]);
+        let e0 = EncoderWeights::deterministic(&ctx, enc_cfg, 1).unwrap();
+        let d0 = DecoderWeights::deterministic(&ctx, enc_cfg, 2).unwrap();
+        let n_enc = e0.params_flat().len();
+        let mut all: Vec<Tensor> = e0.params_flat().into_iter().chain(d0.params_flat()).collect();
+        let mut topt = Adam::new(&all, 2e-3);
+        let mut last = f32::NAN;
+        for _ in 0..=tok_steps {
+            let vars: Vec<Var> = all.iter().cloned().map(Var::leaf).collect();
+            let xv = Var::leaf(x.clone());
+            let z = forward_var(&ctx, enc_cfg, &vars[..n_enc], &xv).unwrap();
+            let zq = straight_through(&ctx, &z, &q);
+            let recon = decoder_forward_var(&ctx, enc_cfg, &vars[n_enc..], &zq).unwrap();
+            let loss = mse(&recon, &xv);
+            loss.backward();
+            last = pollster::block_on(loss.value().to_vec())[0];
+            let grads: Vec<Tensor> = vars.iter().map(|v| v.grad().expect("no gradient")).collect();
+            topt.step(&mut all, &grads);
+        }
+        println!("  tokenizer: trained {tok_steps} steps on {t_all} patches from {tok_variants} training variants/kind (held-out never seen); final recon MSE {last:.5}");
+        Some(all[..n_enc].to_vec())
+    } else {
+        None
+    };
+
     let codes_for = |kind: usize, variant: usize| -> Vec<u32> {
         let raw = synth::signal(kind, variant, PATCH * PATCHES);
         let rev = RevIn::fit(&raw, 1).unwrap();
         let patches = patcher.patchify(&rev.apply(&raw).unwrap()).unwrap();
         let t = patches.len() / PATCH;
-        let lat = pollster::block_on(
-            enc.forward(&ctx, &Tensor::from_vec(&ctx, &patches, &[t, PATCH])).unwrap().to_vec(),
-        );
+        let x = Tensor::from_vec(&ctx, &patches, &[t, PATCH]);
+        // `quantize` applies the same bound-then-round the straight-through estimator trained
+        // through, so inference and training see one quantizer.
+        let lat = match &trained_enc {
+            Some(p) => {
+                let vars: Vec<Var> = p.iter().cloned().map(Var::leaf).collect();
+                pollster::block_on(
+                    forward_var(&ctx, enc_cfg, &vars, &Var::leaf(x)).unwrap().value().to_vec(),
+                )
+            }
+            None => pollster::block_on(enc.forward(&ctx, &x).unwrap().to_vec()),
+        };
         (0..t)
             .map(|i| q.to_index(&q.quantize(&lat[i * ld..(i + 1) * ld]).unwrap()).unwrap())
             .collect()
@@ -135,6 +201,7 @@ fn main() {
         }
     }
     let agree = train.iter().filter(|(k, _, l, _)| *l == (*k + 1) as u32).count();
+    let distinct_seqs = train_seqs.len();
 
     let cfg = EncoderConfig { patch_len: PATCH, d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, latent_dim: 5 };
     let lm = SensorLm::deterministic(&ctx, cfg, rows, 3).unwrap();
@@ -146,6 +213,7 @@ fn main() {
              if control { "  [CONTROL: random labels]" } else { "" });
     println!("  tokenizer fixed and untrained; embedding frozen; LM trains");
     println!("  distinct signal codes in the training set: {}", train_codes.len());
+    println!("  distinct token SEQUENCES in the training set: {distinct_seqs} of {}", train.len());
     if control {
         println!("  realized agreement of random labels with truth: {agree} of {} ({:.0}%)",
                  train.len(), agree as f64 / train.len() as f64 * 100.0);
@@ -244,7 +312,7 @@ fn main() {
     let (tr, tn) = train_acc(&params);
     let h = held_acc(&params);
     let pct = if h.scored > 0 { h.right as f64 / h.scored as f64 * 100.0 } else { f64::NAN };
-    println!("\nRESULT variants={variants} control={control} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
+    println!("\nRESULT variants={variants} control={control} tok_steps={tok_steps} tok_variants={tok_variants} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
              h.right, h.scored, h.collided, h.overlap_pct, train.len());
     let by_kind: Vec<String> = h.per_kind.iter().enumerate()
         .map(|(k, (r, n))| format!("{}={r}/{n}", synth::name(k)))

@@ -70,7 +70,7 @@ different parameters — a faster decay, a wider duty cycle, a different chirp s
 20% chance is the memorisation signature: the architecture learns the mapping, and has nothing to
 generalise from. **That gap is what a real corpus would close.**
 
-### Scaling the synthetic corpus
+### Scaling the synthetic corpus: three curves, two of them instructively wrong
 
 Train on N variants per process (bounded parameter families from `synth`), hold out a disjoint set,
 and guard the split **where the model looks**: any held-out example whose token sequence also
@@ -78,31 +78,51 @@ appears in training is excluded and counted, because per-example normalization c
 family's affine parameters and raw-signal distinctness proves nothing downstream of a lossy
 front end.
 
-| variants/kind | train acc | held-out (guarded) | excluded as token-identical |
-|---|---|---|---|
-| 1 | 5/5 | 6/16 (38%) | 4 of 20 |
-| 2 | 10/10 | 7/16 (44%) | 4 of 20 |
-| 4 | 20/20 | 8/16 (50%) | 4 of 20 |
-| 8 | 40/40 | 8/15 (53%) | 5 of 20 |
-| 16 | 80/80 | 9/15 (60%) | 5 of 20 |
+| held-out accuracy at N variants/kind | 1 | 2 | 4 | 8 | 16 | control |
+|---|---|---|---|---|---|---|
+| untrained tokenizer | 38% | 44% | 50% | 53% | **60%** | 20% |
+| tokenizer retrained per size, fixed 400 steps | 47% | 50% | 47% | 38% | 19% | 19% |
+| one tokenizer, trained once on the full pool, 1200 steps | 32% | 21% | 12% | 38% | 38% | 19% |
 
-Chance is 20%. Tripling the training steps at 8 and 16 variants moves nothing (60% both), and the
-random-label control lands exactly at chance (3/15), printed next to its realized label agreement so
-the null is readable. With 15–16 scored examples a single step of the curve is within noise; the
-evidence is the monotone climb across five sizes. Three readings:
+Chance is 20%, every control lands on it, and each control prints its realized label agreement so
+the null is readable. Held-out n is 15–19 per point, so a single step is within noise; the shapes
+across five sizes are the evidence. The tokenizer never sees a held-out variant in any row — the
+split holds across the whole model, not just the LM.
 
-- **Data, not compute, is still the binding constraint at 16 variants per process.** The curve is
-  climbing when it stops being measured, and 3x compute does not move it.
-- **The untrained tokenizer is a ceiling, and the split guard is what exposes it.** Every thermal
-  example — train or held-out — collapses to shared token sequences: an untrained encoder cannot
-  separate smooth decay rates at all, so that family contributes nothing to either side of the
-  split. The next lever is training the tokenizer (`train_tower` shows it trains), not scaling
-  the LM.
-- The first version of this experiment reported a higher, non-monotone curve, and it was wrong:
-  held-out examples were token-identical to training examples, and denser sampling made that more
-  likely — a curve partly manufactured by its own x-axis. The split guard, the control calibration
-  and the per-batch class balance all came out of an adversarial review of the protocol; the
-  numbers above are the sound ones.
+**Row 1, the best curve, is borrowing.** It climbs monotonically and is still climbing at 16
+variants, but the untrained tokenizer collapses the entire thermal family to shared token sequences
+— every thermal example is excluded as token-identical — and part of its generalization rides on
+exactly that blurriness: codes shared between train and held-out act as smoothing.
+
+**Row 2 is a confound inverting a conclusion.** Retraining the tokenizer per corpus size at a fixed
+step budget makes tokenizer quality a hidden variable of the x-axis: reconstruction error scales
+almost linearly with corpus size (0.003 to 0.020), the thermal family re-collapses, and at 16
+variants even train accuracy breaks. A reader shown only this curve would conclude that data hurts.
+Any scaling study that retrains a preprocessing component per corpus size at fixed budget carries
+this exact risk.
+
+**Row 3 revises this crate's own previous conclusion, and the revision is the finding.** An earlier
+commit concluded "the next lever is training the tokenizer, not scaling the LM." Measured, that is
+incomplete: one well-trained tokenizer — reconstruction 0.007, the thermal family separated, the
+split guard nearly quiet at small sizes — held fixed across the sweep is worse than the untrained
+one at every corpus size. The mechanism is the frozen embedding. A sharp tokenizer routes each
+signal through near-unique codes; an unseen code is an untrained embedding row carrying nothing;
+and the blurry tokenizer's collisions were doing real representation-sharing work that the
+frozen-embedding LM depended on. Training the tokenizer alone makes held-out worse.
+
+What the three curves support together:
+
+- **Tokenizer and embeddings must unfreeze together.** The missing primitive is a differentiable
+  row gather in the autograd layer, and the cost of not having it is now a measurement rather than
+  a guess: 60% against 38% at 16 variants per process.
+- **A tokenizer's training budget must scale with its corpus.** At fixed budget it silently becomes
+  the bottleneck, and its degradation masquerades as a data effect with the opposite sign.
+
+The first version of this experiment reported a higher, non-monotone curve with no split guard at
+all, and it was wrong: held-out examples were token-identical to training examples, and denser
+sampling made that more likely — a curve partly manufactured by its own x-axis. The guard, the
+control calibration and the per-batch class balance all came out of an adversarial review of the
+protocol; every number above postdates it.
 
 ## What is NOT here
 
