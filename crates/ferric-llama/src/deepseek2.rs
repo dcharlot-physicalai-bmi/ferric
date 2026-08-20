@@ -50,6 +50,7 @@
 //! own conversion script applied — so the value in the file is not the value in the formula.
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
+use ferric_tensor::kvquant::{KvqFmt, QKvCache};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -239,14 +240,92 @@ struct Block {
     ffn: Ffn,
 }
 
+/// Where each row's RoPE angle takes its absolute position from.
+///
+/// One sequence's rows are consecutive (`offset + i`); N *independent* sequences batched one token
+/// each are not — row `i` sits wherever sequence `i`'s own history reached. Making that an enum
+/// threaded through one shared projection helper, rather than writing the projections twice, is
+/// deliberate: the batched and solo paths must differ in EXACTLY this one place. A batched copy that
+/// drifted anywhere else — a dropped YaRN table, NEOX pairing, a shared position — still emits fluent
+/// text with finite logits and raises nothing at all.
+enum Pos<'a> {
+    /// One sequence: `t` consecutive rows starting at this absolute position.
+    Run(usize),
+    /// One row per sequence, each at its own absolute position.
+    Rows(&'a [u32]),
+}
+
 pub struct Cache {
     pub pos: usize,
     kv: Vec<(KvBuf, KvBuf)>,
+    /// Block-quantized twin of `kv`. **Empty unless KV quantization is on**, and when it is on `kv` is
+    /// the empty one — holding both would spend the memory the quantization exists to save.
+    q: Vec<(QKvCache, QKvCache)>,
+    fmt: Option<KvqFmt>,
 }
 
 impl Cache {
-    pub fn new(cfg: &Cfg) -> Cache {
-        Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() }
+    /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise. See [`Cache::with_kvq`].
+    pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, crate::qwen3::kvq_from_env()) }
+
+    /// A cache whose K/V rows are stored as `fmt` quantization blocks — `None` for today's f32.
+    ///
+    /// **Opt-in, and it must stay opt-in**: this trades accuracy for memory, so it is the caller's
+    /// choice and never a silent change to an existing run.
+    ///
+    /// ⚠ **This runtime caches DECOMPRESSED K/V, not the latent.** MLA's selling point is that one
+    /// `kv_lora_rank`-wide vector per position is enough, but that is the *absorbed* path, which
+    /// [`DeepSeek2::load`] refuses. The legacy `attn_kv_b` path decompresses to `n_head * qk_dim` keys
+    /// and `n_head * v_head` values and caches those — far larger than the latent. So KV quantization
+    /// buys MORE here than on a model whose cache is already small, not less, and the two are
+    /// complementary rather than redundant: the absorbed path would shrink the row count's width, this
+    /// shrinks each element.
+    ///
+    /// K and V have DIFFERENT widths here (qk_dim vs v_head per head), which each `QKvCache` learns on
+    /// its own first append — they are separate caches, so nothing forces them to agree.
+    pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
+        match fmt {
+            None => Cache {
+                pos: 0,
+                kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(),
+                q: Vec::new(),
+                fmt: None,
+            },
+            Some(f) => Cache {
+                pos: 0,
+                kv: Vec::new(),
+                q: (0..cfg.n_layer).map(|_| (QKvCache::new(f), QKvCache::new(f))).collect(),
+                fmt: Some(f),
+            },
+        }
+    }
+
+    /// The KV-cache quantization format in force, or `None` for f32.
+    pub fn kvq_fmt(&self) -> Option<KvqFmt> { self.fmt }
+
+    /// **Device bytes the K/V caches actually occupy right now.**
+    pub fn kv_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv.iter().map(|(k, v)| (k.len() * k.width() + v.len() * v.width()) * 4).sum(),
+            Some(_) => self.q.iter().map(|(k, v)| k.bytes() + v.bytes()).sum(),
+        }
+    }
+
+    /// Live K/V bytes, ignoring allocated slack — what the FORMAT buys. See
+    /// [`ferric_tensor::kvquant::QKvCache::live_bytes`] for why this differs from `kv_bytes()`.
+    pub fn kv_live_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.live_bytes() + v.live_bytes()).sum(),
+        }
+    }
+
+    /// What the same live rows would cost as f32 — `kv_live_bytes()`'s denominator.
+    pub fn kv_f32_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.f32_bytes() + v.f32_bytes()).sum(),
+        }
     }
 }
 
@@ -363,21 +442,96 @@ impl DeepSeek2 {
     ///
     /// The scale lands on the rope lanes only, never the nope lanes, so it cannot be folded into the
     /// attention scale the way `mscale²` can.
-    fn rope_pe(&self, x: &Tensor, heads: usize, pos: usize) -> Tensor {
+    fn rope_pe(&self, x: &Tensor, heads: usize, pos: &Pos) -> Tensor {
         let cfg = &self.cfg;
         // ⚠ INTERLEAVED. llama.cpp lists deepseek2 under "normal RoPE, operating on pairs of
         // consecutive head values" (ROPE_TYPE_NORM), not the split-half NEOX pairing every Qwen-family
         // model here uses. Rotating the wrong partners produces finite logits and wrong text.
         // A/B via FERRIC_ROPE_NEOX to settle the pairing empirically rather than by reading alone.
         let neox = std::env::var("FERRIC_ROPE_NEOX").is_ok();
-        let r = match (&self.yarn, neox) {
-            (Some(fs), false) => x.rope_scaled_interleaved(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
-            (Some(fs), true) => x.rope_scaled(fs, heads, cfg.qk_rope, cfg.rope_base, pos),
-            (None, false) => x.rope_interleaved(heads, cfg.qk_rope, cfg.rope_base, pos),
-            (None, true) => x.rope(heads, cfg.qk_rope, cfg.rope_base, pos),
+        let r = match pos {
+            Pos::Run(off) => match (&self.yarn, neox) {
+                (Some(fs), false) => x.rope_scaled_interleaved(fs, heads, cfg.qk_rope, cfg.rope_base, *off),
+                (Some(fs), true) => x.rope_scaled(fs, heads, cfg.qk_rope, cfg.rope_base, *off),
+                (None, false) => x.rope_interleaved(heads, cfg.qk_rope, cfg.rope_base, *off),
+                (None, true) => x.rope(heads, cfg.qk_rope, cfg.rope_base, *off),
+            },
+            // The SAME two kernels, with each row's position read from a list instead of derived from
+            // one offset: `Some(fs)` selects ROPE_SCALED_WGSL exactly as `rope_scaled*` does, and
+            // `interleaved` is the same __PAIRLO__/__PAIRHI__ substitution. Both arguments must be
+            // threaded through, not defaulted — `rope_at` (the unscaled NEOX-only version) is what
+            // silently turned the dense runtime's batched decode into a different model: no YaRN
+            // stretch and the wrong rotation partners, fluent output, no error. Here that would also
+            // drop `mscale`'s sibling on the rope lanes and rotate DeepSeek's NORM pairs as NEOX.
+            Pos::Rows(p) => x.rope_at_ex(heads, cfg.qk_rope, cfg.rope_base, p, self.yarn.as_ref(), !neox),
         };
         let af = cfg.attn_factor();
         if (af - 1.0).abs() < 1e-9 { r } else { r.mul(&r.scalar(af)) }
+    }
+
+    /// Everything in MLA up to the attention itself: Q split into `[nope | rope]`, the compressed KV
+    /// decompressed to per-head K-nope and V, the SHARED rope vector broadcast across heads, and the
+    /// `mscale²` prescale on Q. Returns `(q_full [t, nh*qk], k [t, nh*qk], v [t, nh*vh])`.
+    ///
+    /// Solo decode and batched decode share this verbatim so they CANNOT drift. Every op here is
+    /// row-wise, so a row's projections do not depend on which rows travel with it; the one thing that
+    /// does depend on the row is the RoPE position, which is why `pos` is the only parameter that
+    /// differs between the two callers. Keeping that difference down to one enum is the whole defence
+    /// against the failure this path has no symptom for.
+    fn attn_proj(&self, h: &Tensor, blk: &Block, il: usize, pos: &Pos) -> (Tensor, Tensor, Tensor) {
+        let cfg = &self.cfg;
+        let (eps, t) = (cfg.eps, h.shape[0]);
+        let (nh, nope, rope, vh, r) = (cfg.n_head, cfg.qk_nope, cfg.qk_rope, cfg.v_head, cfg.kv_lora_rank);
+        let qk = cfg.qk_head();
+
+        // Q: [t, nh*qk] -> split each head into its nope and rope lanes.
+        let q = h.matmul_q(&blk.q).reshape(&[t, nh, qk]);
+        let q_nope = q.narrow(2, 0, nope).contiguous();
+        let q_pe = self.rope_pe(&q.narrow(2, nope, rope).contiguous().reshape(&[t, nh * rope]), nh, pos)
+            .reshape(&[t, nh, rope]);
+
+        // The compressed KV plus the SHARED rope vector: [t, r + rope].
+        dump("q", il, &q.reshape(&[t, nh * qk]));
+        let kvp = h.matmul_q(&blk.kv_a_mqa);
+        let kv_cmpr = kvp.narrow(1, 0, r).contiguous().rmsnorm(&blk.kv_a_norm, eps);
+        let k_pe = self.rope_pe(&kvp.narrow(1, r, rope).contiguous(), 1, pos);
+
+        // Decompress to per-head K-nope and V: [t, nh*(nope+vh)].
+        dump("kv_cmpr", il, &kv_cmpr);
+        dump("k_pe", il, &k_pe);
+        let kv = kv_cmpr.matmul_q(&blk.kv_b).reshape(&[t, nh, nope + vh]);
+        dump("kv", il, &kv.reshape(&[t, nh * (nope + vh)]));
+        let k_nope = kv.narrow(2, 0, nope).contiguous();
+        let v = kv.narrow(2, nope, vh).contiguous().reshape(&[t, nh * vh]);
+
+        // K is [nope | shared rope], so the one rope vector is broadcast to every head.
+        let k_pe_all = k_pe.reshape(&[t, 1, rope]).broadcast_to(&[t, nh, rope]).contiguous();
+        let k = k_nope.cat(&k_pe_all, 2).reshape(&[t, nh * qk]);
+        let q_full = q_nope.cat(&q_pe, 2).reshape(&[t, nh * qk]);
+        // The kernels bake in 1/sqrt(qk); DeepSeek wants mscale²/sqrt(qk).
+        let q_full = q_full.mul(&q_full.scalar(cfg.q_prescale()));
+        (q_full, k, v)
+    }
+
+    /// DeepSeekMoE (or the dense SwiGLU on the leading blocks), on `t` already-normed rows.
+    ///
+    /// Row-wise throughout — the router picks each row's own top-k and the indexed expert kernels take
+    /// a `[t, k, ff]` mid — so this is the same function for one token, a prefill block, or N batched
+    /// sequences. Extracted rather than duplicated for the batched path precisely because a second copy
+    /// could pick up a different `expert_norm`/`routed_scale` and nothing would ever say so.
+    fn ffn(&self, f: &Tensor, blk: &Block) -> Tensor {
+        let cfg = &self.cfg;
+        match &blk.ffn {
+            Ffn::Dense { gate, up, down } => f.matmul_q(gate).silu().mul(&f.matmul_q(up)).matmul_q(down),
+            Ffn::Moe { router, bias, gate_up, down, sh_gate, sh_up, sh_down } => {
+                let selw = f.matmul_q(router).moe_topk_ex(
+                    bias.as_ref(), cfg.n_expert_used, cfg.sigmoid_gate, cfg.routed_scale, cfg.expert_norm);
+                let mid = f.matmul_q4_k_swiglu_id(gate_up, &selw, cfg.n_expert_used, cfg.expert_ff);
+                let routed = down.wsum(&mid, &selw, cfg.d);
+                let shared = f.matmul_q(sh_gate).silu().mul(&f.matmul_q(sh_up)).matmul_q(sh_down);
+                routed.add(&shared)
+            }
+        }
     }
 
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
@@ -386,8 +540,8 @@ impl DeepSeek2 {
 
     pub fn forward_hidden_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         let cfg = &self.cfg;
-        let (d, eps, t, pos) = (cfg.d, cfg.eps, tokens.len(), cache.pos);
-        let (nh, nope, rope, vh, r) = (cfg.n_head, cfg.qk_nope, cfg.qk_rope, cfg.v_head, cfg.kv_lora_rank);
+        let (eps, t, pos) = (cfg.eps, tokens.len(), cache.pos);
+        let (nh, vh) = (cfg.n_head, cfg.v_head);
         let qk = cfg.qk_head();
         let mut x = self.embed(tokens);
 
@@ -395,34 +549,18 @@ impl DeepSeek2 {
             let h = x.rmsnorm(&blk.attn_norm, eps);
             dump("attn_norm", il, &h);
 
-            // Q: [t, nh*qk] -> split each head into its nope and rope lanes.
-            let q = h.matmul_q(&blk.q).reshape(&[t, nh, qk]);
-            let q_nope = q.narrow(2, 0, nope).contiguous();
-            let q_pe = self.rope_pe(&q.narrow(2, nope, rope).contiguous().reshape(&[t, nh * rope]), nh, pos)
-                .reshape(&[t, nh, rope]);
+            // One sequence: its `t` rows are consecutive from the cache's position.
+            let (q_full, k, v) = self.attn_proj(&h, blk, il, &Pos::Run(pos));
 
-            // The compressed KV plus the SHARED rope vector: [t, r + rope].
-            dump("q", il, &q.reshape(&[t, nh * qk]));
-            let kvp = h.matmul_q(&blk.kv_a_mqa);
-            let kv_cmpr = kvp.narrow(1, 0, r).contiguous().rmsnorm(&blk.kv_a_norm, eps);
-            let k_pe = self.rope_pe(&kvp.narrow(1, r, rope).contiguous(), 1, pos);
-
-            // Decompress to per-head K-nope and V: [t, nh*(nope+vh)].
-            dump("kv_cmpr", il, &kv_cmpr);
-            dump("k_pe", il, &k_pe);
-            let kv = kv_cmpr.matmul_q(&blk.kv_b).reshape(&[t, nh, nope + vh]);
-            dump("kv", il, &kv.reshape(&[t, nh * (nope + vh)]));
-            let k_nope = kv.narrow(2, 0, nope).contiguous();
-            let v = kv.narrow(2, nope, vh).contiguous().reshape(&[t, nh * vh]);
-
-            // K is [nope | shared rope], so the one rope vector is broadcast to every head.
-            let k_pe_all = k_pe.reshape(&[t, 1, rope]).broadcast_to(&[t, nh, rope]).contiguous();
-            let k = k_nope.cat(&k_pe_all, 2).reshape(&[t, nh * qk]);
-            let q_full = q_nope.cat(&q_pe, 2).reshape(&[t, nh * qk]);
-            // The kernels bake in 1/sqrt(qk); DeepSeek wants mscale²/sqrt(qk).
-            let q_full = q_full.mul(&q_full.scalar(cfg.q_prescale()));
-
-            let (kc, vc) = { let e = &mut cache.kv[il]; append2(&self.ctx, &mut e.0, &k, &mut e.1, &v) };
+            let (kc, vc) = match cache.fmt {
+                None => { let e = &mut cache.kv[il]; append2(&self.ctx, &mut e.0, &k, &mut e.1, &v) }
+                Some(_) => {
+                    let e = &mut cache.q[il];
+                    e.0.append(&self.ctx, &k);
+                    e.1.append(&self.ctx, &v);
+                    (e.0.dequantize(&self.ctx), e.1.dequantize(&self.ctx))
+                }
+            };
 
             // V is narrower than K here, so the attention helper cannot infer the value width from
             // the key width. Heads are 1:1 (no GQA) after decompression.
@@ -433,23 +571,104 @@ impl DeepSeek2 {
             x = x.add(&ao);
 
             let f = x.rmsnorm(&blk.ffn_norm, eps);
-            let out = match &blk.ffn {
-                Ffn::Dense { gate, up, down } => f.matmul_q(gate).silu().mul(&f.matmul_q(up)).matmul_q(down),
-                Ffn::Moe { router, bias, gate_up, down, sh_gate, sh_up, sh_down } => {
-                    let selw = f.matmul_q(router).moe_topk_ex(
-                        bias.as_ref(), cfg.n_expert_used, cfg.sigmoid_gate, cfg.routed_scale, cfg.expert_norm);
-                    let mid = f.matmul_q4_k_swiglu_id(gate_up, &selw, cfg.n_expert_used, cfg.expert_ff);
-                    let routed = down.wsum(&mid, &selw, d);
-                    let shared = f.matmul_q(sh_gate).silu().mul(&f.matmul_q(sh_up)).matmul_q(sh_down);
-                    routed.add(&shared)
-                }
-            };
+            let out = self.ffn(&f, blk);
             dump("ffn_out", il, &out);
             x = x.add(&out);
             dump("l_out", il, &x);
         }
 
         cache.pos += t;
+        x.rmsnorm(&self.out_norm, eps)
+    }
+
+    /// MLA for **N independent sequences**, one token each.
+    ///
+    /// The win is `attn_proj`: `attn_q` (2048×3072), `attn_kv_a_mqa`, `attn_kv_b` and `attn_output` are
+    /// read ONCE for N rows instead of once per row. Decode is weight-bound, so that amortisation is
+    /// the entire point of batching — and on this architecture the FFN amortises too, since the shared
+    /// expert and the router are dense over all rows.
+    ///
+    /// Attention itself stays a loop, and has to: sequence `i` attends *its own* latent KV
+    /// history, which is a different length from its neighbours'. `causal_attention_split` builds one
+    /// `[t, s]` mask per call, and `s` differs per sequence. Folding that loop away is what paged
+    /// attention buys; it is not something batching can do on its own.
+    fn attn_batch(&self, h: &Tensor, blk: &Block, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        let cfg = &self.cfg;
+        let (nh, vh) = (cfg.n_head, cfg.v_head);
+        let qk = cfg.qk_head();
+        let n = h.shape[0];
+        debug_assert_eq!(n, caches.len(), "one row per sequence");
+
+        // Row `i` sits wherever sequence `i`'s own history reached — NOT at a shared offset. The rope
+        // lanes are the only place the position enters the projections, so this vector is the entire
+        // difference between the batched and solo paths. Read from `c.pos` BEFORE any cache is
+        // advanced, which is why `forward_hidden_batch` bumps `pos` only after the last block.
+        let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
+        let (q_full, k, v) = self.attn_proj(h, blk, il, &Pos::Rows(&positions));
+
+        let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+        for (i, c) in caches.iter_mut().enumerate() {
+            // Row `i` of the batch goes into cache `i` and is attended against cache `i` only. A
+            // narrow onto the wrong row here is the archetypal silent failure: shapes still match,
+            // logits stay finite, and the model writes fluent text from another sequence's history.
+            let (ki, vi) = (k.narrow(0, i, 1), v.narrow(0, i, 1));
+            // Both stores index by SEQUENCE then layer, so batching needs no fork: row `i` appends
+            // to cache `i` exactly as the solo path does.
+            let (kc, vc) = match c.fmt {
+                None => { let e = &mut c.kv[il]; append2(&self.ctx, &mut e.0, &ki, &mut e.1, &vi) }
+                Some(_) => {
+                    let e = &mut c.q[il];
+                    e.0.append(&self.ctx, &ki);
+                    e.1.append(&self.ctx, &vi);
+                    (e.0.dequantize(&self.ctx), e.1.dequantize(&self.ctx))
+                }
+            };
+            let qi = q_full.narrow(0, i, 1).contiguous();
+            outs.push(nn::causal_attention_split(&qi, &kc, &vc, nh, qk, vh, 0.0));
+        }
+        let att = outs.iter().skip(1).fold(outs[0].clone(), |acc, t| acc.cat(t, 0));
+        dump("attn", il, &att);
+        att.matmul_q(&blk.o)
+    }
+
+    /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
+    ///
+    /// `tokens[i]` is the next token for `caches[i]`. Returns `[N, n_vocab]` logits — row `i` belongs
+    /// to sequence `i`.
+    ///
+    /// Every sequence's logits are **identical** to calling [`Self::forward`] on it alone; batching
+    /// changes only how the work is scheduled. `examples/batched_decode_deepseek2.rs` asserts exactly
+    /// that on token ids, because there is no other way to see it: a batched path that crossed
+    /// sequences produces fluent text and finite logits with nothing to catch it.
+    pub fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        self.forward_hidden_batch(tokens, caches).matmul_q(&self.head)
+    }
+
+    /// [`Self::forward_batch`] without the LM head: `[N, d]` final hidden states.
+    pub fn forward_hidden_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        assert_eq!(tokens.len(), caches.len(), "one token per sequence");
+        assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
+        let eps = self.cfg.eps;
+        let mut x = self.embed(tokens);
+
+        for (il, blk) in self.blocks.iter().enumerate() {
+            let h = x.rmsnorm(&blk.attn_norm, eps);
+            dump("attn_norm", il, &h);
+            let ao = self.attn_batch(&h, blk, caches, il);
+            dump("attn_out", il, &ao);
+            x = x.add(&ao);
+
+            let f = x.rmsnorm(&blk.ffn_norm, eps);
+            let out = self.ffn(&f, blk);
+            dump("ffn_out", il, &out);
+            x = x.add(&out);
+            dump("l_out", il, &x);
+        }
+
+        // AFTER every block, not inside the loop: each block reads `c.pos` to build its rope positions,
+        // so bumping it early would rope block 1 one step ahead of block 0 — a per-layer position skew
+        // that is invisible in the output shape and produces perfectly fluent, wrong text.
+        for c in caches.iter_mut() { c.pos += 1; }
         x.rmsnorm(&self.out_norm, eps)
     }
 }
@@ -533,5 +752,53 @@ mod tests {
         assert!(!c.is_moe(0), "block 0 is dense on Coder-V2-Lite");
         assert!(c.is_moe(1));
         assert!(c.is_moe(26));
+    }
+}
+
+#[cfg(test)]
+mod kvq_tests {
+    use super::*;
+
+    fn cfg(n_layer: usize) -> Cfg {
+        // Coder-V2-Lite's shape. Only the widths matter here; the MoE fields are along for the ride.
+        Cfg {
+            n_layer, d: 2048, n_head: 16, n_vocab: 102400, eps: 1e-6,
+            qk_nope: 128, qk_rope: 64, v_head: 128, kv_lora_rank: 512,
+            dense_lead: 1, n_expert: 64, n_expert_used: 6, n_expert_shared: 2,
+            expert_ff: 1408, n_ff: 10944, routed_scale: 1.0, expert_norm: false,
+            sigmoid_gate: false, rope_base: 10000.0, yarn_factor: 40.0,
+            yarn_orig_ctx: 4096, yarn_log_mul: 0.0,
+        }
+    }
+
+    /// The two stores are never both populated, in either direction.
+    ///
+    /// Worth pinning on this runtime specifically because its K and V have DIFFERENT widths — 
+    /// `n_head * (qk_nope + qk_rope)` against `n_head * v_head` — so the two `QKvCache`s in a pair
+    /// learn different widths on their first append. Nothing forces them to agree, and nothing should.
+    #[test]
+    fn a_quantized_cache_holds_no_f32_rows_and_pairs_may_differ_in_width() {
+        let c = cfg(4);
+        let f = Cache::with_kvq(&c, None);
+        assert!(f.kvq_fmt().is_none());
+        assert_eq!(f.kv.len(), c.n_layer);
+        assert!(f.q.is_empty(), "an f32 cache must not allocate the quantized twin");
+
+        for fmt in KvqFmt::ALL {
+            let q = Cache::with_kvq(&c, Some(fmt));
+            assert_eq!(q.kvq_fmt(), Some(fmt));
+            assert!(q.kv.is_empty(), "{}: the f32 vector must be EMPTY, not merely unused", fmt.name());
+            assert_eq!(q.q.len(), c.n_layer, "{}: one slot per layer", fmt.name());
+            assert_eq!(q.kv_bytes(), 0, "{}: an untouched cache costs nothing", fmt.name());
+            // Both start width-less; each learns its own on first append.
+            assert!(q.q.iter().all(|(k, v)| k.width() == 0 && v.width() == 0),
+                    "{}: widths are learned per cache, not fixed at construction", fmt.name());
+        }
+
+        // The widths this runtime will actually use are both block-aligned, which QKvCache requires.
+        let (kw, vw) = (c.n_head * (c.qk_nope + c.qk_rope), c.n_head * c.v_head);
+        assert_eq!((kw % 32, vw % 32), (0, 0),
+                   "MLA K width {kw} and V width {vw} must be multiples of the 32-value block");
+        assert_ne!(kw, vw, "this runtime's K and V widths differ — that is the case being pinned");
     }
 }

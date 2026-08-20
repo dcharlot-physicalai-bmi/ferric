@@ -26,6 +26,7 @@ use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::dtype::{Q2_0Weights, Q4_KWeights, Q6_KWeights, Q8_0Weights};
 use ferric_tensor::QMatrix;
 use crate::qwen3::Proj; // Fused-or-Split projection: real Q4_K_M models mix quants within a fused qkv/gate
+use ferric_tensor::kvquant::{KvqFmt, QKvCache};
 use ferric_tensor::{nn, Tensor};
 use std::sync::Arc;
 
@@ -190,6 +191,10 @@ pub enum Mixer { Attn(AttnW), Gdn(GdnW), Lag(LagAttnW) }
 #[derive(Clone)]
 pub(crate) enum LayerCache {
     Attn { k: Tensor, v: Tensor },   // [S, n_kv·head_dim]
+    /// Block-quantized attention history, when `FERRIC_KVQ` is on. A separate variant rather than a
+    /// field on `Attn` because the two are never both present, and a `match` arm is harder to forget
+    /// than an `Option` — reading the wrong one yields an empty history, which is finite and fluent.
+    AttnQ { k: QKvCache, v: QKvCache },
     Gdn { state: Tensor, conv: Tensor }, // state [n_v_heads, dv, dk]; conv [conv_kernel-1, conv_dim]
 }
 
@@ -197,10 +202,28 @@ pub(crate) enum LayerCache {
 pub struct Cache {
     pub pos: usize,
     layers: Vec<Option<LayerCache>>,
+    /// KV block format for the ATTENTION layers, or `None` for f32. The GDN layers are unaffected:
+    /// their state is `[n_v_heads, dv, dk]`, fixed by the architecture rather than growing with
+    /// context, so quantizing it would trade accuracy for nothing.
+    fmt: Option<KvqFmt>,
 }
 
 impl Cache {
-    pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, layers: (0..cfg.n_layer).map(|_| None).collect() } }
+    /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise.
+    pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, crate::qwen3::kvq_from_env()) }
+
+    /// A cache whose attention K/V rows are stored as `fmt` quantization blocks.
+    ///
+    /// `Clone` stays derivable — and `snapshot` stays correct — because `QKvCache`'s own `Clone` is a
+    /// real device copy, not a handle share. That was not true until `deep_clone` shipped, and a
+    /// derived clone of an in-place-append store is exactly the aliasing bug this file already carried
+    /// once in the gated-delta-net state.
+    pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
+        Cache { pos: 0, layers: (0..cfg.n_layer).map(|_| None).collect(), fmt }
+    }
+
+    /// The KV-cache quantization format in force, or `None` for f32.
+    pub fn kvq_fmt(&self) -> Option<KvqFmt> { self.fmt }
     /// O(1) snapshot for speculative-decoding rollback: tensors are immutable Arc-shared buffers, so
     /// cloning the cache clones handles, never GPU data. Restoring = assigning the snapshot back.
     pub fn snapshot(&self) -> Cache { self.clone() }
@@ -639,7 +662,7 @@ impl Qwen35 {
         rot.cat(&x3.narrow(2, n_rot, hd - n_rot), 2).reshape(&[t, n_heads * hd])
     }
 
-    fn attn(&self, h: &Tensor, w: &AttnW, cache: &mut Option<LayerCache>, offset: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, w: &AttnW, cache: &mut Option<LayerCache>, offset: usize, fmt: Option<KvqFmt>) -> Tensor {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
         let nkv = self.cfg.n_head_kv;
         // One fused matmul emits [q_and_gate | k | v]; split it back out.
@@ -655,8 +678,28 @@ impl Qwen35 {
         let k = self.rope_partial(&k, nkv, offset);
 
         // Append this step's K/V to the history, then attend over all of it.
+        // `store_q` carries the quantized caches back out of the match so they can be put back below;
+        // the f32 arm keeps the old behaviour of storing the concatenated tensors.
+        let mut store_q: Option<(QKvCache, QKvCache)> = None;
         let (kc, vc) = match cache.take() {
             Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&k, 0), pv.cat(&v, 0)),
+            Some(LayerCache::AttnQ { k: mut qk, v: mut qv }) => {
+                qk.append(&self.ctx, &k);
+                qv.append(&self.ctx, &v);
+                let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                store_q = Some((qk, qv));
+                d
+            }
+            // First token of a quantized run: build the store, then take the same path.
+            None if fmt.is_some() => {
+                let f = fmt.expect("checked");
+                let (mut qk, mut qv) = (QKvCache::new(f), QKvCache::new(f));
+                qk.append(&self.ctx, &k);
+                qv.append(&self.ctx, &v);
+                let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                store_q = Some((qk, qv));
+                d
+            }
             _ => (k, v),
         };
         let s = kc.shape[0];
@@ -673,7 +716,10 @@ impl Qwen35 {
             // t new queries against a longer cache — the speculative-verify shape.
             nn::causal_attention_kv(&q, &kc, &vc, nh, nkv, 0.0)
         };
-        *cache = Some(LayerCache::Attn { k: kc, v: vc });
+        *cache = match store_q {
+            Some((qk, qv)) => Some(LayerCache::AttnQ { k: qk, v: qv }),
+            None => Some(LayerCache::Attn { k: kc, v: vc }),
+        };
         o.mul(&gate.sigmoid()).matmul_q(&w.wo)
     }
 
@@ -713,7 +759,7 @@ impl Qwen35 {
 
     /// Laguna attention: GQA with QK-norm, per-layer rope (plain or YaRN-scaled, partial rotary), a
     /// sliding-window mask on 3 of every 4 layers, and a per-head softplus gate on the output.
-    fn lag_attn(&self, h: &Tensor, w: &LagAttnW, cache: &mut Option<LayerCache>, offset: usize) -> Tensor {
+    fn lag_attn(&self, h: &Tensor, w: &LagAttnW, cache: &mut Option<LayerCache>, offset: usize, fmt: Option<KvqFmt>) -> Tensor {
         let (t, hd) = (h.shape[0], self.cfg.head_dim);
         let (nh, nkv) = (w.n_head, self.cfg.n_head_kv);
         let q = h.matmul_q(&w.q).reshape(&[t, nh, hd]).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
@@ -721,8 +767,28 @@ impl Qwen35 {
         let v = h.matmul_q(&w.v).contiguous();
         let q = self.lag_rope(&q, nh, offset, w);
         let k = self.lag_rope(&k, nkv, offset, w);
+        // `store_q` carries the quantized caches back out of the match so they can be put back below;
+        // the f32 arm keeps the old behaviour of storing the concatenated tensors.
+        let mut store_q: Option<(QKvCache, QKvCache)> = None;
         let (kc, vc) = match cache.take() {
             Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&k, 0), pv.cat(&v, 0)),
+            Some(LayerCache::AttnQ { k: mut qk, v: mut qv }) => {
+                qk.append(&self.ctx, &k);
+                qv.append(&self.ctx, &v);
+                let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                store_q = Some((qk, qv));
+                d
+            }
+            // First token of a quantized run: build the store, then take the same path.
+            None if fmt.is_some() => {
+                let f = fmt.expect("checked");
+                let (mut qk, mut qv) = (QKvCache::new(f), QKvCache::new(f));
+                qk.append(&self.ctx, &k);
+                qv.append(&self.ctx, &v);
+                let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                store_q = Some((qk, qv));
+                d
+            }
             _ => (k, v),
         };
         let s = kc.shape[0];
@@ -736,7 +802,10 @@ impl Qwen35 {
         } else {
             nn::causal_attention(&q, &kc, &vc, nh, nkv, 0.0)
         };
-        *cache = Some(LayerCache::Attn { k: kc, v: vc });
+        *cache = match store_q {
+            Some((qk, qv)) => Some(LayerCache::AttnQ { k: qk, v: qv }),
+            None => Some(LayerCache::Attn { k: kc, v: vc }),
+        };
         // per-head softplus output gate, broadcast over head_dim
         let gate = h.matmul_q(&w.gate).softplus();  // [t, nh]
         let o = o.reshape(&[t, nh, hd]).mul(&gate.reshape(&[t, nh, 1]).broadcast_to(&[t, nh, hd])).reshape(&[t, nh * hd]);
@@ -895,6 +964,8 @@ impl Qwen35 {
         // attribute time (mixer vs ffn); otherwise the whole layer is one batch (fewer submits).
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         for (il, l) in self.layers.iter().enumerate().take(n) {
+            // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
+            let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
             let xin = &x;
             if profiling {
@@ -904,7 +975,7 @@ impl Qwen35 {
                 let is_attn = matches!(l.mixer, Mixer::Attn(_));
                 let y = batch(&self.ctx, || {
                     let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
-                    match &l.mixer { Mixer::Attn(w) => self.attn(&h, w, lc, pos), Mixer::Gdn(w) => self.gdn(&h, w, lc), Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos) }
+                    match &l.mixer { Mixer::Attn(w) => self.attn(&h, w, lc, pos, fmt), Mixer::Gdn(w) => self.gdn(&h, w, lc), Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, fmt) }
                 });
                 prof(&self.ctx, if is_attn { "attn" } else { "gdn" });
                 let xy = xin.add(&y);
@@ -914,9 +985,9 @@ impl Qwen35 {
                 x = batch(&self.ctx, || {
                     let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
                     let y = match &l.mixer {
-                        Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                        Mixer::Attn(w) => self.attn(&h, w, lc, pos, fmt),
                         Mixer::Gdn(w) => self.gdn(&h, w, lc),
-                        Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
+                        Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, fmt),
                     };
                     // Fuse the post-mixer residual add with the pre-FFN norm (one dispatch, two
                     // outputs: the residual `xy` and its norm) — saves a dispatch every layer.
@@ -949,14 +1020,16 @@ impl Qwen35 {
         let mut x = self.embed(tokens);
         let pos = cache.pos;
         for (il, l) in self.layers.iter().enumerate().take(n) {
+            // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
+            let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
             let xin = &x;
             x = batch(&self.ctx, || {
                 let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
                 let y = match &l.mixer {
-                    Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                    Mixer::Attn(w) => self.attn(&h, w, lc, pos, fmt),
                     Mixer::Gdn(w) => self.gdn(&h, w, lc),
-                    Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
+                    Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, fmt),
                 };
                 let (xy, ffn_in) = xin.add_rmsnorm(&y, &l.post_norm, self.cfg.eps);
                 self.ffn(&ffn_in, l).add(&xy)
@@ -983,13 +1056,15 @@ impl Qwen35 {
         let pos = cache.pos;
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         for (il, l) in self.layers.iter().enumerate().take(n) {
+            // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
+            let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
             let xin = &x;
             if profiling {
                 let is_attn = matches!(l.mixer, Mixer::Attn(_));
                 let y = batch(&self.ctx, || {
                     let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
-                    match &l.mixer { Mixer::Attn(w) => self.attn(&h, w, lc, pos), Mixer::Gdn(w) => self.gdn(&h, w, lc), Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos) }
+                    match &l.mixer { Mixer::Attn(w) => self.attn(&h, w, lc, pos, fmt), Mixer::Gdn(w) => self.gdn(&h, w, lc), Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, fmt) }
                 });
                 prof(&self.ctx, if is_attn { "attn" } else { "gdn" });
                 let xy = xin.add(&y);
@@ -999,9 +1074,9 @@ impl Qwen35 {
                 x = batch(&self.ctx, || {
                     let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
                     let y = match &l.mixer {
-                        Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                        Mixer::Attn(w) => self.attn(&h, w, lc, pos, fmt),
                         Mixer::Gdn(w) => self.gdn(&h, w, lc),
-                        Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
+                        Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, fmt),
                     };
                     // Fuse the post-mixer residual add with the pre-FFN norm (one dispatch, two
                     // outputs: the residual `xy` and its norm) — saves a dispatch every layer.
@@ -1061,10 +1136,14 @@ impl Qwen35 {
         let (logits, hid) = batch(&self.ctx, || {
             let x = emb.rmsnorm(&m.enorm, eps).cat(&hiddens.rmsnorm(&m.hnorm, eps), 1).matmul_q(&m.eh_proj);
             let h = x.rmsnorm(&l.attn_norm, eps);
+            // The MTP draft block keeps an f32 cache regardless of `FERRIC_KVQ`. It is ONE layer whose
+            // history is discarded every verify round, so quantizing it would add a lossy step to the
+            // path whose whole job is proposing tokens the main model then checks — spending accuracy
+            // where there is almost no memory to save.
             let y = match &l.mixer {
-                Mixer::Attn(w) => self.attn(&h, w, lc, pos),
+                Mixer::Attn(w) => self.attn(&h, w, lc, pos, None),
                 Mixer::Gdn(w) => self.gdn(&h, w, lc),
-                Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos),
+                Mixer::Lag(w) => self.lag_attn(&h, w, lc, pos, None),
             };
             let xy = x.add(&y);
             let x = self.ffn(&xy.rmsnorm(&l.post_norm, eps), l).add(&xy);
@@ -1075,5 +1154,374 @@ impl Qwen35 {
         });
         mc.pos += tokens.len();
         (logits, hid)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Batched decode: N independent sequences, one token each, one forward pass.
+    //
+    // Decode is weight-streaming-bound: one token drags the whole layer stack through memory. Running
+    // N sequences as N forwards reads those weights N times. Stacking the N rows into `[N, d]` reads
+    // them ONCE — that is the entire win, and it lives in the projections (in_proj/qkv/q/k/v/o/ffn/
+    // lm_head), which are plain `[N, d] × [d, out]` matmuls.
+    //
+    // What does NOT batch is every part that carries per-sequence state, and on this hybrid that is
+    // three separate things, not one:
+    //   • the KV cache on the full-attention layers  — each sequence's history is a different length;
+    //   • the gated-delta-net RECURRENT STATE `[nv, dv, dk]` — one per sequence, per layer;
+    //   • the GDN short conv's carried tail `[K-1, cd]` — likewise per sequence.
+    // Those stay per-row loops. Sharing any of them across rows is the failure this file is written
+    // to prevent: it produces fluent, plausible text with finite logits and no error at all.
+    // ---------------------------------------------------------------------------------------------
+
+    /// [`Self::rope_partial`] with each row at its **own** absolute position.
+    ///
+    /// Identical to the solo path in every other respect — same NORM/ggml-NEOX pairing (`interleaved:
+    /// false`, matching `Tensor::rope`), same `n_rot`, same θ, same untouched tail. Only where the
+    /// angle's position comes from differs: `rope` walks `offset + i` down the rows, which is right for
+    /// one sequence and wrong for N, because row `i` here is a *different stream* at whatever position
+    /// its own history reached. Getting that wrong is invisible — every row still rotates by *a* valid
+    /// angle, so the output stays fluent and only the sequence identity is scrambled.
+    fn rope_partial_at(&self, x: &Tensor, n_heads: usize, positions: &[u32]) -> Tensor {
+        let (t, hd, n_rot) = (x.shape[0], self.cfg.head_dim, self.cfg.n_rot);
+        let x3 = x.reshape(&[t, n_heads, hd]);
+        let rot = x3.narrow(2, 0, n_rot).contiguous().reshape(&[t, n_heads * n_rot])
+            .rope_at_ex(n_heads, n_rot, self.cfg.rope_base, positions, None, false)
+            .reshape(&[t, n_heads, n_rot]);
+        rot.cat(&x3.narrow(2, n_rot, hd - n_rot), 2).reshape(&[t, n_heads * hd])
+    }
+
+    /// [`Self::lag_rope`] with each row at its own absolute position.
+    ///
+    /// ⚠ The YaRN branch must stay: laguna's full-attention layers carry a per-dimension inverse-frequency
+    /// scale AND an `mscale` on cos/sin, and the sliding layers carry neither. Dropping the scale here
+    /// while `lag_rope` keeps it is precisely how the dense runtime's batched path diverged — an unscaled
+    /// rope against a scaled one, no error, fluent output. `rope_at_ex` takes `freq_scale` for exactly
+    /// this reason and runs the same `rope_scaled` kernel `rope_scaled` does, so the two agree by
+    /// construction rather than by hope.
+    fn lag_rope_at(&self, x: &Tensor, n_heads: usize, positions: &[u32], w: &LagAttnW) -> Tensor {
+        let (t, hd, n_rot) = (x.shape[0], self.cfg.head_dim, w.n_rot);
+        let rope1 = |r: &Tensor| -> Tensor {
+            match &w.yarn {
+                Some((fs, ms)) => {
+                    let rot = r.rope_at_ex(n_heads, n_rot, w.base, positions, Some(fs), false);
+                    rot.mul(&Tensor::from_vec(&self.ctx, &[*ms], &[1, 1]).broadcast_to(&[t, n_heads * n_rot]))
+                }
+                None => r.rope_at_ex(n_heads, n_rot, w.base, positions, None, false),
+            }
+        };
+        if n_rot == hd { return rope1(x); }
+        let x3 = x.reshape(&[t, n_heads, hd]);
+        let rot = rope1(&x3.narrow(2, 0, n_rot).contiguous().reshape(&[t, n_heads * n_rot])).reshape(&[t, n_heads, n_rot]);
+        rot.cat(&x3.narrow(2, n_rot, hd - n_rot), 2).reshape(&[t, n_heads * hd])
+    }
+
+    /// Stack N single-row `[1, w]` tensors into one `[N, w]`. Rank-2 only, so a rank-3 result is
+    /// flattened by the caller and reshaped back — `cat` on the row axis is the only join needed.
+    fn stack_rows(rows: Vec<Tensor>) -> Tensor {
+        let mut it = rows.into_iter();
+        let first = it.next().expect("stack_rows: at least one sequence");
+        it.fold(first, |acc, r| acc.cat(&r, 0))
+    }
+
+    /// Full gated GQA attention (the 1-in-4 non-recurrent qwen35 layer) for N sequences, one token each.
+    ///
+    /// `wqkv` and `wo` run once over `[N, d]` — that is the win. The attention between them is a loop
+    /// because sequence `i` attends *its own* K/V history at *its own* position and those histories have
+    /// different lengths; nothing about that is expressible as one dense op without paged attention.
+    fn attn_batch(&self, h: &Tensor, w: &AttnW, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        let (n, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
+        let nkv = self.cfg.n_head_kv;
+        debug_assert_eq!(n, caches.len(), "one row per sequence");
+
+        let qkv = w.wqkv.matmul(h);                                   // <-- batched: the win
+        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[n, nh, hd * 2]);
+        let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[n, nh * hd]);
+        let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[n, nh * hd]);
+        let k = qkv.narrow(1, w.q_out, w.kv_out).reshape(&[n, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[n, nkv * hd]);
+        let v = qkv.narrow(1, w.q_out + w.kv_out, w.kv_out).contiguous();
+
+        // `caches[i].pos` is sequence i's own stream position — read it BEFORE the caller bumps it.
+        let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
+        let q = self.rope_partial_at(&q, nh, &positions);
+        let k = self.rope_partial_at(&k, nkv, &positions);
+
+        let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+        for (i, c) in caches.iter_mut().enumerate() {
+            // Row i's K/V goes into cache i and NOWHERE else. `.contiguous()` because these rows are
+            // views into the batched projection and the cache outlives this call.
+            let (ki, vi) = (k.narrow(0, i, 1).contiguous(), v.narrow(0, i, 1).contiguous());
+            let fmt = c.fmt;
+            let lc = &mut c.layers[il];
+            // ⚠ The quantized arm MUST be here as well as in the solo path. Without it a cache
+            // holding `AttnQ` falls to `_ => (ki, vi)` — i.e. this token attends to ITSELF ALONE, as
+            // if the sequence had no history — and the output stays finite and fluent. That is not
+            // hypothetical: it is what this file did on its first pass, and the batched-vs-solo
+            // equivalence example is what caught it.
+            let mut store_q: Option<(QKvCache, QKvCache)> = None;
+            let (kc, vc) = match lc.take() {
+                Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&ki, 0), pv.cat(&vi, 0)),
+                Some(LayerCache::AttnQ { k: mut qk, v: mut qv }) => {
+                    qk.append(&self.ctx, &ki);
+                    qv.append(&self.ctx, &vi);
+                    let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                    store_q = Some((qk, qv));
+                    d
+                }
+                None if fmt.is_some() => {
+                    let f = fmt.expect("checked");
+                    let (mut qk, mut qv) = (QKvCache::new(f), QKvCache::new(f));
+                    qk.append(&self.ctx, &ki);
+                    qv.append(&self.ctx, &vi);
+                    let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                    store_q = Some((qk, qv));
+                    d
+                }
+                _ => (ki, vi),
+            };
+            let qi = q.narrow(0, i, 1).contiguous();
+            // t == 1 per row, so this is the same `decode_attention` branch the solo path takes.
+            outs.push(nn::decode_attention(&qi, &kc, &vc, nh, nkv, 0.0));
+            *lc = match store_q {
+                Some((qk, qv)) => Some(LayerCache::AttnQ { k: qk, v: qv }),
+                None => Some(LayerCache::Attn { k: kc, v: vc }),
+            };
+        }
+        let o = Self::stack_rows(outs);
+        o.mul(&gate.sigmoid()).matmul_q(&w.wo)                        // <-- batched again
+    }
+
+    /// Laguna attention (sliding-window or YaRN full) for N sequences, one token each.
+    fn lag_attn_batch(&self, h: &Tensor, w: &LagAttnW, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        let (n, hd) = (h.shape[0], self.cfg.head_dim);
+        let (nh, nkv) = (w.n_head, self.cfg.n_head_kv);
+        debug_assert_eq!(n, caches.len(), "one row per sequence");
+
+        let q = h.matmul_q(&w.q).reshape(&[n, nh, hd]).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[n, nh * hd]);
+        let k = h.matmul_q(&w.k).reshape(&[n, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[n, nkv * hd]);
+        let v = h.matmul_q(&w.v).contiguous();                        // <-- all three batched: the win
+        let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
+        let q = self.lag_rope_at(&q, nh, &positions, w);
+        let k = self.lag_rope_at(&k, nkv, &positions, w);
+
+        let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+        for (i, c) in caches.iter_mut().enumerate() {
+            let (ki, vi) = (k.narrow(0, i, 1).contiguous(), v.narrow(0, i, 1).contiguous());
+            let fmt = c.fmt;
+            let lc = &mut c.layers[il];
+            // ⚠ The quantized arm MUST be here as well as in the solo path. Without it a cache
+            // holding `AttnQ` falls to `_ => (ki, vi)` — i.e. this token attends to ITSELF ALONE, as
+            // if the sequence had no history — and the output stays finite and fluent. That is not
+            // hypothetical: it is what this file did on its first pass, and the batched-vs-solo
+            // equivalence example is what caught it.
+            let mut store_q: Option<(QKvCache, QKvCache)> = None;
+            let (kc, vc) = match lc.take() {
+                Some(LayerCache::Attn { k: pk, v: pv }) => (pk.cat(&ki, 0), pv.cat(&vi, 0)),
+                Some(LayerCache::AttnQ { k: mut qk, v: mut qv }) => {
+                    qk.append(&self.ctx, &ki);
+                    qv.append(&self.ctx, &vi);
+                    let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                    store_q = Some((qk, qv));
+                    d
+                }
+                None if fmt.is_some() => {
+                    let f = fmt.expect("checked");
+                    let (mut qk, mut qv) = (QKvCache::new(f), QKvCache::new(f));
+                    qk.append(&self.ctx, &ki);
+                    qv.append(&self.ctx, &vi);
+                    let d = (qk.dequantize(&self.ctx), qv.dequantize(&self.ctx));
+                    store_q = Some((qk, qv));
+                    d
+                }
+                _ => (ki, vi),
+            };
+            let qi = q.narrow(0, i, 1).contiguous();
+            // The window is measured against THIS sequence's own cache length, which is why the
+            // window branch has to be inside the loop too — rows at different positions keep
+            // different key spans alive.
+            outs.push(if w.window > 0 { nn::decode_attention_win(&qi, &kc, &vc, nh, nkv, w.window, 0.0) }
+                      else { nn::decode_attention(&qi, &kc, &vc, nh, nkv, 0.0) });
+            *lc = match store_q {
+                Some((qk, qv)) => Some(LayerCache::AttnQ { k: qk, v: qv }),
+                None => Some(LayerCache::Attn { k: kc, v: vc }),
+            };
+        }
+        let o = Self::stack_rows(outs);
+        let gate = h.matmul_q(&w.gate).softplus();                    // [N, nh] — batched
+        let o = o.reshape(&[n, nh, hd]).mul(&gate.reshape(&[n, nh, 1]).broadcast_to(&[n, nh, hd])).reshape(&[n, nh * hd]);
+        o.matmul_q(&w.o)                                              // <-- batched again
+    }
+
+    /// Gated delta net (the 3-in-4 recurrent qwen35 layer) for N sequences, one token each.
+    ///
+    /// The hard one. `in_proj` and `ssm_out` batch — those are the weight-bound ends and the whole
+    /// reason to be here. Between them sit TWO pieces of per-sequence carried state:
+    ///
+    ///   • the short conv's tail `[K-1, cd]` — the last `conv_kernel-1` inputs of *that stream*;
+    ///   • the delta-rule state `S [nv, dv, dk]` — that stream's entire compressed history.
+    ///
+    /// Both are looped per row and read/written only through `caches[i]`. Handing `gdn_conv` or
+    /// `gated_delta_rule_stateful` a stacked `[N, …]` input would make them treat the N rows as N
+    /// CONSECUTIVE TIMESTEPS of one sequence: the conv would convolve row 0 into row 1 and the
+    /// recurrence would thread one state through all of them. Nothing would fault — the shapes are
+    /// identical and the output is finite and fluent. It would simply be a different model.
+    ///
+    /// Everything with no carried state is per-row arithmetic and does batch, exactly:
+    /// `gdn_gate` (row-major `proj[row·pw + …]`), `gdn_qk` (per-row, per-head L2 norm) and `gdn_post`
+    /// (per-row gated RMSNorm, reading z at `(r/nv)·pw`). Those are folded back to one dispatch each.
+    fn gdn_batch(&self, h: &Tensor, w: &GdnW, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        let c = &self.cfg;
+        let (n, nk, nv) = (h.shape[0], c.n_k_heads, c.n_v_heads);
+        let (dk, dv, kd) = (c.head_k_dim, c.head_v_dim(), c.key_dim());
+        debug_assert_eq!(n, caches.len(), "one row per sequence");
+
+        let proj = w.in_proj.matmul(h);                               // <-- batched: the win
+        let (qo, zo) = (w.qkv_out, w.z_out);
+        let pad = c.conv_kernel - 1;
+
+        // Stateless: pure per-(row, v-head) arithmetic on the projection's alpha/beta columns.
+        let gb = nn::gdn_gate(&proj, &w.dt_bias, &w.a, nv, qo + zo);   // [N, nv, 2]
+
+        // Per-sequence: each row's conv sees only its OWN carried tail (zeros at the start of a
+        // sequence — the standalone conv's causal zero-padding), never the neighbouring row.
+        let mut conv_rows: Vec<Tensor> = Vec::with_capacity(n);
+        let mut v_rows: Vec<Tensor> = Vec::with_capacity(n);
+        let mut tails: Vec<Tensor> = Vec::with_capacity(n);
+        let mut prev_states: Vec<Option<Tensor>> = Vec::with_capacity(n);
+        for (i, cc) in caches.iter_mut().enumerate() {
+            let (prev_conv, prev_state) = match cc.layers[il].take() {
+                Some(LayerCache::Gdn { state, conv }) => (conv, Some(state)),
+                _ => (Tensor::zeros(&self.ctx, &[pad, qo]), None),
+            };
+            let pi = proj.narrow(0, i, 1); // [1, pw] — gdn_conv packs it and keeps `pw` from shape[1]
+            let (cv, tail, vv) = nn::gdn_conv(&pi, &prev_conv, &w.conv1d, qo, c.conv_kernel, c.d_inner, 2 * kd);
+            conv_rows.push(cv);
+            v_rows.push(vv);
+            tails.push(tail);
+            prev_states.push(prev_state);
+        }
+
+        // Back to one dispatch: gdn_qk is per-row (`base = r·cd + …`), so stacking is exact.
+        let conv = Self::stack_rows(conv_rows);                        // [N, qo]
+        let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, 1.0 / (dv as f32).sqrt(), c.eps);
+        let v = Self::stack_rows(v_rows).reshape(&[n, nv, dv]);        // [N, nv, dv]
+
+        // Per-sequence again: one recurrent state per row, advanced by exactly one step.
+        let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+        let mut states: Vec<Tensor> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (qi, ki, vi) = (q.narrow(0, i, 1), k.narrow(0, i, 1), v.narrow(0, i, 1));
+            let gbi = gb.narrow(0, i, 1);
+            let (o, st) = qi.gated_delta_rule_stateful(&ki, &vi, &gbi, nv, dk, dv, prev_states[i].as_ref());
+            outs.push(o.reshape(&[1, nv * dv])); // flatten so the join is a rank-2 row cat
+            states.push(st);
+        }
+        for (i, cc) in caches.iter_mut().enumerate() {
+            cc.layers[il] = Some(LayerCache::Gdn { state: states[i].clone(), conv: tails[i].clone() });
+        }
+
+        let o = Self::stack_rows(outs).reshape(&[n, nv, dv]);
+        // gdn_post reads each row's z gate at `(r/nv)·pw + z_off`, so the batched proj lines up row-wise.
+        nn::gdn_post(&o, &proj, &w.norm, qo, c.eps).matmul_q(&w.out)   // <-- batched again
+    }
+
+    /// One block for N sequences. Same structure as the non-profiling arm of `forward_cached`; only
+    /// the mixer differs, and the FFN (dense or MoE) is reused unchanged because every one of its
+    /// kernels already routes and computes per token.
+    fn apply_layer_batch(&self, x: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize) -> Tensor {
+        use ferric_tensor::batch;
+        let xin = x;
+        batch(&self.ctx, || {
+            let h = xin.rmsnorm(&l.attn_norm, self.cfg.eps);
+            let y = match &l.mixer {
+                Mixer::Attn(w) => self.attn_batch(&h, w, caches, il),
+                Mixer::Gdn(w) => self.gdn_batch(&h, w, caches, il),
+                Mixer::Lag(w) => self.lag_attn_batch(&h, w, caches, il),
+            };
+            let (xy, ffn_in) = xin.add_rmsnorm(&y, &l.post_norm, self.cfg.eps);
+            self.ffn(&ffn_in, l).add(&xy)
+        })
+    }
+
+    /// Whether [`Self::forward_batch`] is solo-equivalent for this model.
+    ///
+    /// True for every checkpoint this runtime loads: the batched rope goes through `rope_at_ex`, which
+    /// covers both conventions qwen35/laguna use (NORM-paired partial rope, with or without YaRN's
+    /// per-dimension scale), so there is no branch the batched path silently drops. Kept as an explicit
+    /// predicate anyway, because the dense runtime's version of this question was answered "obviously
+    /// yes" and was wrong for every rope-scaled model — a scheduler should ask rather than assume.
+    pub fn batching_supported(&self) -> bool { true }
+
+    /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
+    ///
+    /// `tokens[i]` is the next token for `caches[i]`. Returns `[N, n_vocab]` logits — row `i` belongs to
+    /// sequence `i`. Every sequence must have been prefilled (via `forward_cached`) into its own cache.
+    ///
+    /// Every sequence's logits are **identical** to advancing it alone with `forward_cached`; batching
+    /// changes only how the work is scheduled. `examples/batched_decode_qwen35.rs` asserts that on token
+    /// ids, because a batched path that crossed sequences — a shared RoPE position, a delta-rule state
+    /// threaded through the wrong row — would still emit fluent text with finite logits and no error.
+    pub fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        use ferric_tensor::batch;
+        assert!(self.batching_supported(), "forward_batch is not solo-equivalent on this model");
+        assert_eq!(tokens.len(), caches.len(), "one token per sequence");
+        assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
+        let mut x = self.embed(tokens);
+        for (il, l) in self.layers.iter().enumerate() {
+            x = self.apply_layer_batch(&x, l, caches, il);
+        }
+        // AFTER the layers: `attn_batch`/`lag_attn_batch` read `c.pos` as this token's own absolute
+        // position. Bumping first would rope every row one step into the future.
+        for c in caches.iter_mut() { c.pos += 1; }
+        batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head))
+    }
+}
+
+#[cfg(test)]
+mod kvq_tests {
+    use super::*;
+
+    /// A quantized qwen35 cache must still be `Clone`, and that clone must be a real copy.
+    ///
+    /// This runtime is the one where the aliasing hazard is not hypothetical: `Cache::snapshot` is
+    /// `self.clone()` and `ferric-serve`'s speculative-decode rollback restores it. The GDN state was
+    /// already caught doing exactly this — a snapshot that moved with the thing it was taken from —
+    /// so a KV store that appends IN PLACE inside a `#[derive(Clone)]` struct is the same bug waiting
+    /// to happen. It is safe only because `QKvCache::clone` routes through `deep_clone`.
+    ///
+    /// No GPU needed: an untouched cache has no device and no buffers, which is exactly the state
+    /// this asserts is clonable.
+    #[test]
+    fn a_quantized_cache_is_still_clonable_for_speculative_rollback() {
+        let mut c = Cache::default();
+        c.fmt = Some(KvqFmt::Q8_0);
+        c.layers = vec![None, None];
+        c.pos = 7;
+
+        let snap = c.snapshot();
+        assert_eq!(snap.pos, 7, "snapshot carries the position");
+        assert_eq!(snap.kvq_fmt(), Some(KvqFmt::Q8_0), "and the format, or the restored cache would \
+                                                        append a different layout than it holds");
+
+        // Advancing the original must not move the snapshot. `pos` is the cheap half of that; the
+        // buffer half is proven in ferric-tensor's `the_clone_impl_is_the_deep_copy_and_not_a_handle_share`.
+        c.pos = 99;
+        assert_eq!(snap.pos, 7, "the snapshot tracked the live cache's position");
+    }
+
+    /// The MTP draft block is f32 whatever `FERRIC_KVQ` says.
+    ///
+    /// Pinned because it is a deliberate asymmetry that looks like an oversight: one layer, history
+    /// discarded every verify round, so quantizing it spends accuracy on the path whose job is
+    /// proposing tokens the main model checks, for almost no memory.
+    #[test]
+    fn the_mtp_draft_cache_has_no_quantized_variant() {
+        let mc = MtpCache::default();
+        assert!(mc.layer.is_none(), "a fresh draft cache is empty");
+        // The MTP call sites pass `None` literally; if that ever becomes `mc.fmt` this test should be
+        // replaced by one that exercises it rather than deleted.
+        let src = include_str!("qwen35.rs");
+        assert!(src.contains("self.attn(&h, w, lc, pos, None)"),
+                "the MTP draft path stopped passing None — it now quantizes a cache whose history is \
+                 thrown away every round; that needs its own justification and its own test");
     }
 }

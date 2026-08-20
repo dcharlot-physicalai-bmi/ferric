@@ -33,6 +33,7 @@
 //! experts and running a much smaller model than the file describes.
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
+use ferric_tensor::kvquant::{KvqFmt, QKvCache};
 use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -156,11 +157,76 @@ struct Block {
 pub struct Cache {
     pub pos: usize,
     kv: Vec<(KvBuf, KvBuf)>,
+    /// Block-quantized twin of `kv`. **Empty unless KV quantization is on**, and when it is on `kv` is
+    /// the empty one — holding both would spend the memory the quantization exists to save.
+    ///
+    /// Sized `n_layer` like `kv` even though only the first `kv_from_start` entries are ever written:
+    /// [`Cfg::kv_src`] indexes this by block, and a shorter vector would make every shared block's
+    /// read an index computation instead of a lookup.
+    q: Vec<(QKvCache, QKvCache)>,
+    fmt: Option<KvqFmt>,
 }
 
 impl Cache {
-    pub fn new(cfg: &Cfg) -> Cache {
-        Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() }
+    /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise. See [`Cache::with_kvq`].
+    pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, crate::qwen3::kvq_from_env()) }
+
+    /// A cache whose K/V rows are stored as `fmt` quantization blocks — `None` for today's f32.
+    ///
+    /// **Opt-in, and it must stay opt-in**: this trades accuracy for memory, so it is the caller's
+    /// choice and never a silent change to an existing run. The format is read once, here, rather than
+    /// per layer per step — it cannot change mid-sequence, and re-reading it in the decode loop would
+    /// be a way for a half-quantized cache to exist.
+    pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
+        match fmt {
+            None => Cache {
+                pos: 0,
+                kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(),
+                q: Vec::new(),
+                fmt: None,
+            },
+            Some(f) => Cache {
+                pos: 0,
+                kv: Vec::new(),
+                q: (0..cfg.n_layer).map(|_| (QKvCache::new(f), QKvCache::new(f))).collect(),
+                fmt: Some(f),
+            },
+        }
+    }
+
+    /// The KV-cache quantization format in force, or `None` for f32.
+    pub fn kvq_fmt(&self) -> Option<KvqFmt> { self.fmt }
+
+    /// **Device bytes the K/V caches actually occupy right now**, summed over the blocks that own KV.
+    ///
+    /// Gemma 4 shares KV: only the first `kv_from_start` blocks hold any, and the rest read theirs. So
+    /// this is already far below `n_layer × per-block`, and the quantization ratio applies on top of
+    /// that saving rather than instead of it. For an f32 cache `KvBuf` exposes no capacity, so the f32
+    /// side undercounts its own slack — which pushes the reported ratio DOWN, making it a floor.
+    pub fn kv_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv.iter().map(|(k, v)| (k.len() * k.width() + v.len() * v.width()) * 4).sum(),
+            Some(_) => self.q.iter().map(|(k, v)| k.bytes() + v.bytes()).sum(),
+        }
+    }
+
+    /// Live K/V bytes, ignoring allocated slack — what the FORMAT buys, as opposed to what the device
+    /// is holding. `kv_bytes()` counts allocated capacity and both stores grow by doubling, so
+    /// `kv_bytes() / kv_f32_bytes()` understates the format ratio by up to 2x. See
+    /// [`ferric_tensor::kvquant::QKvCache::live_bytes`].
+    pub fn kv_live_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.live_bytes() + v.live_bytes()).sum(),
+        }
+    }
+
+    /// What the same live rows would cost as f32 — `kv_bytes()`'s denominator, on either kind of cache.
+    pub fn kv_f32_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.f32_bytes() + v.f32_bytes()).sum(),
+        }
     }
 }
 
@@ -262,6 +328,14 @@ impl Gemma4 {
         })
     }
 
+    /// Whether the GLOBAL blocks carry proportional-RoPE factors.
+    ///
+    /// Exposed so the batched-decode equivalence example can state which rope variant it actually
+    /// exercised. "Scaled versus unscaled rope" is the exact axis on which the dense runtime's batched
+    /// path silently diverged from its solo path, and a run that cannot say which one it used is not
+    /// evidence about the other.
+    pub fn has_rope_freqs(&self) -> bool { self.rope_freqs.is_some() }
+
     /// Gather rows from a raw quantised table.
     fn gather(&self, raw: &[u8], ty: u32, width: usize, tokens: &[u32]) -> Tensor {
         let row = ferric_gguf::type_size(ty, width).expect("row size");
@@ -358,14 +432,35 @@ impl Gemma4 {
                     .reshape(&[t * cfg.n_kv, hd])
                     .rmsnorm_weightless(eps)
                     .reshape(&[t, cfg.n_kv * hd]);
-                let e = &mut cache.kv[il];
-                append2(&self.ctx, &mut e.0, &k, &mut e.1, &v);
+                match cache.fmt {
+                    None => { let e = &mut cache.kv[il]; append2(&self.ctx, &mut e.0, &k, &mut e.1, &v); }
+                    // `QKvCache::append` quantizes exactly the rows handed to it and writes them at
+                    // their flat block offset, so a one-token step touches `width/32` blocks and
+                    // re-reads nothing. That property is what makes a per-block scale the only
+                    // granularity that can append at all: a per-tensor or per-channel scale is
+                    // invalidated by any new token that moves a max, which is an O(len·width)
+                    // requantize per token. See `kvquant::append_cost`.
+                    Some(_) => { let e = &mut cache.q[il]; e.0.append(&self.ctx, &k); e.1.append(&self.ctx, &v); }
+                }
             }
 
             // Shared blocks read an earlier block's cache, which this same pass has already filled
             // (kv_src(il) < kv_from_start <= il).
             let src = cfg.kv_src(il);
-            let (kc, vc) = (cache.kv[src].0.view(&self.ctx), cache.kv[src].1.view(&self.ctx));
+            // The quantized arm materialises the window: the whole history for THIS block expands back
+            // to a transient `[len, width]` f32 tensor that attention reads and the layer then drops.
+            // So the persistent cache shrinks by the format's ratio while the transient cost is one
+            // block's K and V rather than all `n_layer` of them. Dequantizing inside the attention
+            // kernel instead — which the block layout was chosen to allow — needs new kernels in
+            // `ferric-tensor`, which this does not own.
+            //
+            // ⚠ `src`, not `il`. A shared block dequantizes the cache it READS. Using `il` here would
+            // hand blocks ≥ kv_from_start an empty cache, and empty attention output is fluent, not
+            // an error.
+            let (kc, vc) = match cache.fmt {
+                None => (cache.kv[src].0.view(&self.ctx), cache.kv[src].1.view(&self.ctx)),
+                Some(_) => (cache.q[src].0.dequantize(&self.ctx), cache.q[src].1.dequantize(&self.ctx)),
+            };
 
             let window = if is_swa { cfg.window } else { 0 };
             let att = if t == 1 {
@@ -394,6 +489,170 @@ impl Gemma4 {
         }
 
         cache.pos += t;
+        x.rmsnorm(&self.out_norm, eps)
+    }
+
+    /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
+    ///
+    /// `tokens[i]` is the next token for `caches[i]`; the returned `[N, n_vocab]` logits have row `i`
+    /// belonging to sequence `i`. Every row is **identical** to calling [`Self::forward`] on that
+    /// sequence alone — batching changes only how the work is scheduled, never the result.
+    ///
+    /// The win is that the weights stream **once for N tokens** instead of N times: every projection
+    /// (q/k/v/o, gate/up/down, the per-layer gate and proj, the per-layer model proj, and the
+    /// 262144-wide head) becomes one matmul over an `[N, d]` tensor. Decode is a weight-streaming
+    /// problem, and that amortisation is the entire point.
+    ///
+    /// Attention itself is NOT batched and must not be: sequence `i` attends its own KV history at its
+    /// own position, and those histories differ in length. Collapsing that loop is what paged attention
+    /// would buy; faking it here would mean reading another sequence's keys, which produces fluent,
+    /// confident, wrong text and no error.
+    ///
+    /// Unlike the Qwen runtime this needs no `batching_supported` refusal. Gemma 4 is NEOX-paired on
+    /// every block, and [`Tensor::rope_at_ex`] covers both of the rope variants this model uses — the
+    /// proportional-scaled one on global blocks and the plain one on sliding blocks — so the batched
+    /// rope is the same kernel with the same arguments as the solo path, differing only in where each
+    /// row's position comes from.
+    pub fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        let h = self.forward_hidden_batch(tokens, caches);
+        let logits = h.matmul_q(&self.head);
+        if self.cfg.final_softcap > 0.0 { logits.softcap(self.cfg.final_softcap) } else { logits }
+    }
+
+    /// Final normed hidden state for N sequences, one token each — `[N, d]`.
+    ///
+    /// Mirrors [`Self::forward_hidden_cached`] step for step. Read them side by side: any line that
+    /// drifts apart is a silent divergence, because nothing here can fail loudly.
+    pub fn forward_hidden_batch(&self, tokens: &[u32], caches: &mut [&mut Cache]) -> Tensor {
+        let cfg = &self.cfg;
+        let (d, eps, n) = (cfg.d, cfg.eps, tokens.len());
+        assert_eq!(n, caches.len(), "forward_batch needs exactly one token per sequence");
+        assert!(n > 0, "forward_batch needs at least one sequence");
+        // Every cache in a batch must agree on representation: the loop below branches on `c.fmt` per
+        // sequence, so a mixed batch is not wrong, but it means the caller built them from different
+        // configs and any memory accounting over the batch would be meaningless.
+        assert!(caches.windows(2).all(|w| w[0].fmt == w[1].fmt),
+                "forward_batch got a mix of quantized and f32 caches in one batch: {:?}",
+                caches.iter().map(|c| c.fmt).collect::<Vec<_>>());
+
+        // Every row sits at a DIFFERENT absolute position. Captured once, before the pass bumps `pos`.
+        // A batched rope that shared one position — sequence 0's, say — still returns finite logits and
+        // still writes fluent text; there is no symptom to notice. This vector is the only thing
+        // standing between that and correctness, which is why it is read here and nowhere else.
+        let positions: Vec<u32> = caches.iter().map(|c| c.pos as u32).collect();
+
+        // Same sqrt(d) scaling as the solo path, and the per-layer projection reads the SCALED value.
+        let e = self.gather(&self.embd_raw, self.embd_ty, d, tokens);
+        let mut x = e.mul(&e.scalar((d as f32).sqrt()));
+        // [N, n_layer, ple] — one row per sequence, so this batches with no change at all.
+        let per_layer = (cfg.ple > 0).then(|| self.per_layer_inputs(tokens, &x));
+
+        for (il, blk) in self.blocks.iter().enumerate() {
+            let hd = cfg.head_dim_at(il);
+            let is_swa = cfg.swa[il];
+            let base = if is_swa { cfg.rope_base_swa } else { cfg.rope_base };
+            let h = x.rmsnorm(&blk.attn_norm, eps);
+
+            // `rope_at_ex` is `rope_scaled` / `rope` with each row's position read from a table instead
+            // of `offset + i`. The arms MUST stay in lock-step with the solo `rope` closure above:
+            // proportional scaling on the global blocks only, NEOX pairing on both. Getting either
+            // wrong is exactly how the dense runtime's batched path diverged — an unscaled rope on the
+            // batched side against a scaled one on the solo side, silently, on rope-scaled models.
+            let rope = |v: Tensor, heads: usize| -> Tensor {
+                match (&self.rope_freqs, is_swa) {
+                    (Some(f), false) => v.rope_at_ex(heads, hd, base, &positions, Some(f), false),
+                    _ => v.rope_at_ex(heads, hd, base, &positions, None, false),
+                }
+            };
+
+            // Q is projected on every block, KV-owning or not — one matmul for all N rows.
+            let q = rope(
+                h.matmul_q(&blk.q)
+                    .reshape(&[n * cfg.n_head, hd])
+                    .rmsnorm(&blk.q_norm, eps)
+                    .reshape(&[n, cfg.n_head * hd]),
+                cfg.n_head,
+            );
+            // f_attention_scale = 1.0, as in the solo path: pre-multiplying by sqrt(hd) cancels the
+            // 1/sqrt(head_dim) the shared attention kernels bake in.
+            let q = q.mul(&q.scalar((hd as f32).sqrt()));
+
+            // K/V for all N rows at once when this block owns a cache; the rows are split apart below,
+            // because each one belongs to a different sequence's buffer.
+            let kv = cfg.has_kv(il).then(|| {
+                let k = rope(
+                    h.matmul_q(blk.k.as_ref().expect("kv block has k"))
+                        .reshape(&[n * cfg.n_kv, hd])
+                        .rmsnorm(blk.k_norm.as_ref().expect("kv block has k_norm"), eps)
+                        .reshape(&[n, cfg.n_kv * hd]),
+                    cfg.n_kv,
+                );
+                // The weightless V norm, same as solo. Dropping it here and keeping it there would
+                // change every value on the batched path with nothing to raise.
+                let v = h
+                    .matmul_q(blk.v.as_ref().expect("kv block has v"))
+                    .reshape(&[n * cfg.n_kv, hd])
+                    .rmsnorm_weightless(eps)
+                    .reshape(&[n, cfg.n_kv * hd]);
+                (k, v)
+            });
+
+            let src = cfg.kv_src(il);
+            let window = if is_swa { cfg.window } else { 0 };
+            // The per-sequence part. Note `c.kv[..]` throughout: the shared-KV indirection is resolved
+            // INSIDE this sequence's own cache. Hoisting the view out of the loop — reading
+            // `caches[0].kv[src]` for every row — is the shape of mistake that batching invites, and it
+            // would hand sequence 3 sequence 0's history with no error and plausible text.
+            let mut outs: Vec<Tensor> = Vec::with_capacity(n);
+            for (i, c) in caches.iter_mut().enumerate() {
+                if let Some((k, v)) = &kv {
+                    // Both stores index by SEQUENCE then block, so batching needs no fork: row `i`
+                    // appends to cache `i` exactly as the solo path does.
+                    match c.fmt {
+                        None => {
+                            let e = &mut c.kv[il];
+                            append2(&self.ctx, &mut e.0, &k.narrow(0, i, 1), &mut e.1, &v.narrow(0, i, 1));
+                        }
+                        Some(_) => {
+                            let e = &mut c.q[il];
+                            e.0.append(&self.ctx, &k.narrow(0, i, 1));
+                            e.1.append(&self.ctx, &v.narrow(0, i, 1));
+                        }
+                    }
+                }
+                // `src` is filled before it is read: kv_src(il) <= il, and this same pass has already
+                // walked block `src` for this token.
+                // `src`, not `il` — a shared block reads the cache it was pointed at, inside THIS
+                // sequence's own cache. Both halves of that matter and neither errors when wrong.
+                let (kc, vc) = match c.fmt {
+                    None => (c.kv[src].0.view(&self.ctx), c.kv[src].1.view(&self.ctx)),
+                    Some(_) => (c.q[src].0.dequantize(&self.ctx), c.q[src].1.dequantize(&self.ctx)),
+                };
+                let qi = q.narrow(0, i, 1).contiguous();
+                outs.push(nn::decode_attention_win(&qi, &kc, &vc, cfg.n_head, cfg.n_kv, window, 0.0));
+            }
+            let att = outs[1..].iter().fold(outs[0].clone(), |a, t| a.cat(t, 0));
+
+            // Everything from here is row-independent, so it is the plain solo code at N rows.
+            let attn_out = x.add(&att.matmul_q(&blk.o).rmsnorm(&blk.attn_post_norm, eps));
+
+            let f = attn_out.rmsnorm(&blk.ffn_norm, eps);
+            let ffn = f.matmul_q(&blk.gate).gelu().mul(&f.matmul_q(&blk.up)).matmul_q(&blk.down);
+            x = attn_out.add(&ffn.rmsnorm(&blk.ffn_post_norm, eps));
+
+            if let Some(pl) = &per_layer {
+                let slice = pl.narrow(1, il, 1).contiguous().reshape(&[n, cfg.ple]);
+                let gated = x.matmul_q(&blk.inp_gate).gelu().mul(&slice);
+                x = x.add(&gated.matmul_q(&blk.proj).rmsnorm(&blk.ple_post_norm, eps));
+            }
+
+            if let Some(s) = &blk.out_scale {
+                x = x.mul(&s.broadcast_to(&[n, d]));
+            }
+        }
+
+        // One token each, so each sequence advances by exactly one — not by N.
+        for c in caches.iter_mut() { c.pos += 1; }
         x.rmsnorm(&self.out_norm, eps)
     }
 }
@@ -490,5 +749,56 @@ mod tests {
         assert_eq!(c.n_ff[14], 6144);
         assert_eq!(c.n_ff[15], 12288);
         assert_ne!(c.n_ff[0], c.n_ff[34], "the widths differ; a uniform read would hide it");
+    }
+
+    /// A KV-quantized cache must never expose the EMPTY f32 vector as if it were history.
+    ///
+    /// This is the whole failure mode of the wiring, and it has no symptom: an empty cache makes
+    /// attention output finite and the text fluent, so nothing downstream raises. There is no test in
+    /// CI that exercises the quantized path end to end — that needs a real checkpoint on argv — so
+    /// these are the invariants that CAN be checked without weights, and they are the ones that make
+    /// the difference between "refuses" and "silently wrong".
+    #[test]
+    fn a_quantized_cache_never_hands_out_the_empty_f32_buffers() {
+        let c = e2b();
+
+        let f32_cache = Cache::with_kvq(&c, None);
+        assert!(f32_cache.kvq_fmt().is_none());
+        assert_eq!(f32_cache.kv.len(), c.n_layer, "the f32 cache holds the real buffers");
+        assert!(f32_cache.q.is_empty(), "and allocates no quantized twin");
+
+        for fmt in KvqFmt::ALL {
+            let q = Cache::with_kvq(&c, Some(fmt));
+            assert_eq!(q.kvq_fmt(), Some(fmt));
+            // The two stores are never both populated: holding f32 rows as well would spend exactly
+            // the memory the quantization exists to save.
+            assert!(q.kv.is_empty(), "{}: the f32 vector must be EMPTY, not merely unused — anything \
+                                      that reads it gets zero rows and no error", fmt.name());
+            assert_eq!(q.q.len(), c.n_layer,
+                       "{}: sized by block, because Cfg::kv_src indexes this by block and a shorter \
+                        vector turns every shared block's read into an index computation", fmt.name());
+        }
+    }
+
+    /// `kv_src` is the gemma4-specific hazard: a shared block must dequantize the cache it READS.
+    ///
+    /// Pinned here because the consequence of using `il` instead is silent. Blocks at or past
+    /// `kv_from_start` own no cache, so `q[il]` is an untouched `QKvCache` — zero rows, finite
+    /// attention, fluent text. The solo path's read is `q[cfg.kv_src(il)]`.
+    #[test]
+    fn every_shared_block_reads_a_quantized_slot_that_an_owning_block_actually_filled() {
+        let c = e2b();
+        let q = Cache::with_kvq(&c, Some(KvqFmt::Q8_0));
+        for il in 0..c.n_layer {
+            let src = c.kv_src(il);
+            assert!(src < c.kv_from_start,
+                    "block {il} reads slot {src}, which no block owns — that slot is never appended \
+                     to, so it stays empty and attention silently sees nothing");
+            assert!(c.has_kv(src), "the slot block {il} reads must itself be an owning block");
+            assert!(src < q.q.len(), "slot {src} is out of range of the quantized store");
+            // Same attention type: the two kinds do not even share a head width, so a cross-type
+            // read would be a shape error at best and wrong history at worst.
+            assert_eq!(c.swa[src], c.swa[il], "block {il} and its source {src} must agree on type");
+        }
     }
 }

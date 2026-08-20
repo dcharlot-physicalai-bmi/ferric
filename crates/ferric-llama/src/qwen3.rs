@@ -13,6 +13,7 @@
 use crate::qwen35::{f32t, qm, qm_cat};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufSource, Meta};
+use ferric_tensor::kvquant::{KvStore, KvqFmt};
 use ferric_tensor::{nn, KvBuf, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -257,18 +258,207 @@ pub struct Layer {
 pub struct Cache {
     pub pos: usize,
     kv: Vec<(KvBuf, KvBuf)>,
+    /// Block-quantized twin of `kv`. **Empty unless KV quantization is on**, and when it is on `kv`
+    /// is the empty one — the two are never both populated, because holding the f32 rows as well
+    /// would spend the memory the quantization exists to save.
+    q: Vec<(KvStore, KvStore)>,
+    fmt: Option<KvqFmt>,
 }
 impl Cache {
-    pub fn new(cfg: &Cfg) -> Cache { Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect() } }
+    /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise. See [`Cache::with_kvq`].
+    pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, kvq_from_env()) }
+
+    /// A cache whose K/V rows are stored as `fmt` quantization blocks — `None` for today's f32.
+    ///
+    /// **Opt-in, and it must stay opt-in**: this trades accuracy for memory, so it is the caller's
+    /// choice and never a silent change to an existing run. `Cache::new` reads `FERRIC_KVQ`
+    /// (`q8_0` | `q4_0` | `q4_1`; unset or `off`/`f32` = off) once, here, rather than per layer per
+    /// step — the format cannot change mid-sequence, so re-reading it in the decode loop would be
+    /// both slower and a way for a half-quantized cache to exist.
+    /// Explicit KV cache configuration — **the constructor a browser must use.**
+    ///
+    /// [`Cache::new`] and [`Cache::with_kvq`] read `FERRIC_KVQ` / `FERRIC_KVQ_K_AXIS` through
+    /// `std::env::var`, and on `wasm32-unknown-unknown` there IS no environment: `var` always errs, so
+    /// those paths silently pin the browser to an f32 cache. That is precisely backwards — memory is
+    /// the binding constraint in a tab, not on a workstation — so the knob has to be passable as an
+    /// argument, not only as an env var.
+    ///
+    /// `grouped_k` picks the token-grouped layout for K. See §M of `docs/sota-feature-matrix.md`: on
+    /// qwen2.5-0.5b it takes q4_0 from perplexity 106.6 to 32.2 against an f32 cache's 31.2, at 7.11x
+    /// the context per GB.
+    pub fn with_kv_config(cfg: &Cfg, fmt: Option<KvqFmt>, grouped_k: bool) -> Cache {
+        match fmt {
+            None => Cache::with_kvq(cfg, None),
+            Some(f) => Cache {
+                pos: 0,
+                kv: Vec::new(),
+                q: (0..cfg.n_layer)
+                    .map(|_| (if grouped_k { KvStore::grouped(f) } else { KvStore::block(f) }, KvStore::block(f)))
+                    .collect(),
+                fmt: Some(f),
+            },
+        }
+    }
+
+    pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
+        match fmt {
+            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None },
+            Some(f) => Cache {
+                pos: 0,
+                kv: Vec::new(),
+                // K and V are configured SEPARATELY, because the measurement is asymmetric: at 4
+                // bits on real captured K/V, grouping along tokens takes K from 0.09591 to 0.03495
+                // relative RMSE and V from 0.08660 to only 0.07010. K has outlier channels; V does
+                // not. Grouping V would buy ~nothing and cost it a staging tail and a permute per read.
+                //
+                // Default is block/block — today's behaviour, byte for byte. `FERRIC_KVQ_K_AXIS=grouped`
+                // opts K into the token-grouped layout. Opt-in rather than inferred from the bit width,
+                // because a flag that silently changes layout below some threshold is the kind of magic
+                // that makes a regression impossible to attribute.
+                q: (0..cfg.n_layer).map(|_| (k_store(f), KvStore::block(f))).collect(),
+                fmt: Some(f),
+            },
+        }
+    }
+
+    /// The KV-cache quantization format in force, or `None` for f32.
+    pub fn kvq_fmt(&self) -> Option<KvqFmt> { self.fmt }
+
+    /// **Device bytes the K/V caches actually occupy right now**, summed over layers.
+    ///
+    /// This is the number the memory claim is made on. For a quantized cache it is `QKvCache::bytes()`
+    /// — allocated code+scale words, so it counts the slack from capacity doubling. For an f32 cache
+    /// `KvBuf` exposes no capacity, so this reports `len × width × 4`, which **under**counts the same
+    /// slack. Both errors push the ratio down, so the reported saving is a floor, not a best case.
+    pub fn kv_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv.iter().map(|(k, v)| (k.len() * k.width() + v.len() * v.width()) * 4).sum(),
+            Some(_) => self.q.iter().map(|(k, v)| k.bytes() + v.bytes()).sum(),
+        }
+    }
+
+    /// Live K/V bytes, ignoring allocated slack — what the FORMAT buys, as opposed to what the device
+    /// is holding. `kv_bytes()` counts allocated capacity and both stores grow by doubling, so
+    /// `kv_bytes() / kv_f32_bytes()` understates the format ratio by up to 2x. See
+    /// [`ferric_tensor::kvquant::QKvCache::live_bytes`].
+    pub fn kv_live_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.live_bytes() + v.live_bytes()).sum(),
+        }
+    }
+
+    /// What the same live rows would cost as f32 — `kv_bytes()`'s denominator, on either kind of cache.
+    pub fn kv_f32_bytes(&self) -> usize {
+        match self.fmt {
+            None => self.kv_bytes(),
+            Some(_) => self.q.iter().map(|(k, v)| k.f32_bytes() + v.f32_bytes()).sum(),
+        }
+    }
+
     /// Per-layer (K, V) buffers — for a prefix cache that copies them.
-    pub fn layers(&self) -> &[(KvBuf, KvBuf)] { &self.kv }
+    ///
+    /// **Refuses on a quantized cache** rather than returning the empty `kv` vec. Silently handing back
+    /// zero-row buffers would make `PrefixCache::insert` store an empty prefix and `seed` install one,
+    /// i.e. a cache that is quietly not a cache — the class of failure this file already carries two
+    /// panics for. Quantized prefix reuse needs `QKvCache::clone_prefix`, which does not exist.
+    pub fn layers(&self) -> &[(KvBuf, KvBuf)] {
+        assert!(self.fmt.is_none(), "Cache::layers() on a KV-quantized cache: the f32 buffers are empty. \
+                                     Use Cache::layers_q().");
+        &self.kv
+    }
     /// Mutable access to layer `il`'s (K, V) — used by batched decode, which walks N caches per layer.
-    pub fn kv_mut(&mut self, il: usize) -> &mut (KvBuf, KvBuf) { &mut self.kv[il] }
+    pub fn kv_mut(&mut self, il: usize) -> &mut (KvBuf, KvBuf) {
+        assert!(self.fmt.is_none(), "Cache::kv_mut() on a KV-quantized cache; use Cache::layer_kv()");
+        &mut self.kv[il]
+    }
+    /// Layer `il`'s K/V store, whichever kind this cache holds. The one place the two differ.
+    fn layer_kv(&mut self, il: usize) -> LayerKv<'_> {
+        match self.fmt {
+            None => LayerKv::F32(&mut self.kv[il]),
+            Some(_) => LayerKv::Quant(&mut self.q[il]),
+        }
+    }
+    /// Per-layer quantized (K, V) — the quantized twin of [`Cache::layers`], for a prefix cache that
+    /// copies them with [`ferric_tensor::kvquant::QKvCache::clone_prefix`].
+    ///
+    /// Refuses on an f32 cache for the same reason `layers` refuses on a quantized one: the vector is
+    /// EMPTY there, and a prefix cache that stored zero rows would be a cache that is quietly not a
+    /// cache.
+    pub fn layers_q(&self) -> &[(KvStore, KvStore)] {
+        assert!(self.fmt.is_some(), "Cache::layers_q() on an f32 cache: the quantized vector is empty. \
+                                     Use Cache::layers().");
+        &self.q
+    }
+
+    /// Install pre-computed quantized KV. The caller must set [`Cache::pos`] to match.
+    ///
+    /// The format must be the one this cache was built with. Seeding q4_0 rows into a cache that will
+    /// append q8_0 blocks would put two layouts in one buffer, and the reconstruction of the older
+    /// rows would be wrong in a way that reads as fluent drift.
+    pub fn set_layers_q(&mut self, kv: Vec<(KvStore, KvStore)>) {
+        let Some(f) = self.fmt else {
+            panic!("Cache::set_layers_q() on an f32 cache would install rows the attention path will \
+                    not read. Use Cache::set_layers().");
+        };
+        assert!(kv.iter().all(|(k, v)| k.fmt() == f && v.fmt() == f),
+                "seeding {:?} rows into a {:?} cache: one buffer cannot hold two block layouts, and \
+                 the older rows would reconstruct wrong with no error",
+                kv.first().map(|(k, _)| k.fmt()), f);
+        self.q = kv;
+    }
+
     /// Install pre-computed KV, e.g. a prefix copied from an earlier request.
     ///
     /// The caller must set [`Cache::pos`] to match; `crate::prefix::PrefixCache::seed` does both, and
     /// getting them out of step means the model ropes the next token at the wrong position.
-    pub fn set_layers(&mut self, kv: Vec<(KvBuf, KvBuf)>) { self.kv = kv; }
+    pub fn set_layers(&mut self, kv: Vec<(KvBuf, KvBuf)>) {
+        assert!(self.fmt.is_none(), "Cache::set_layers() on a KV-quantized cache would install f32 rows \
+                                     the attention path will not read. Use Cache::set_layers_q().");
+        self.kv = kv;
+    }
+}
+
+/// Where a layer's K/V history lives. `F32` is today's `KvBuf` pair and is what a default `Cache` holds.
+enum LayerKv<'a> {
+    F32(&'a mut (KvBuf, KvBuf)),
+    Quant(&'a mut (KvStore, KvStore)),
+}
+
+/// `FERRIC_KVQ` → a KV block format. Unset, empty, `off`, `0`, `f32` and `none` all mean f32.
+///
+/// An unrecognised value **panics** instead of falling back to f32: `FERRIC_KVQ=q8` (a real typo — the
+/// ggml name is `q8_0`) would otherwise run the full-precision path while the operator believed the
+/// cache was a quarter the size, and the only symptom would be memory that failed to drop.
+/// The K side's layout. `FERRIC_KVQ_K_AXIS=grouped` picks per-channel-across-32-tokens; anything else,
+/// including unset, keeps the shipped per-block layout.
+///
+/// Unrecognised values PANIC rather than falling back, for the same reason `kvq_from_env` does: a
+/// typo would quietly run the layout the operator thought they had replaced, and the only symptom
+/// would be an accuracy number that failed to improve.
+pub fn k_axis_grouped() -> bool {
+    match std::env::var("FERRIC_KVQ_K_AXIS").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "" | "block" | "per_block" => false,
+        "grouped" | "group" | "token" => true,
+        other => panic!("FERRIC_KVQ_K_AXIS={other:?} is not a KV axis. Use \"grouped\" or \"block\"."),
+    }
+}
+
+fn k_store(f: KvqFmt) -> KvStore {
+    if k_axis_grouped() { KvStore::grouped(f) } else { KvStore::block(f) }
+}
+
+pub fn kvq_from_env() -> Option<KvqFmt> {
+    let raw = std::env::var("FERRIC_KVQ").unwrap_or_default();
+    let s = raw.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "off" | "0" | "f32" | "none" => None,
+        "q8_0" => Some(KvqFmt::Q8_0),
+        "q4_0" => Some(KvqFmt::Q4_0),
+        "q4_1" => Some(KvqFmt::Q4_1),
+        other => panic!("FERRIC_KVQ={other:?} is not a KV cache format. Use one of {:?}, or unset it for f32.",
+                        KvqFmt::ALL.map(|f| f.name())),
+    }
 }
 
 /// Where the token-embedding rows come from.
@@ -614,7 +804,7 @@ impl Qwen3 {
         if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
     }
 
-    fn attn(&self, h: &Tensor, l: &Layer, cache: &mut (KvBuf, KvBuf), offset: usize, il: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         self.grab(format!("l{il}.qkv"), h); // GPTQ calibration: capture wqkv input
         // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
@@ -689,7 +879,30 @@ impl Qwen3 {
         // and in ONE dispatch rather than two, since K and V land at the same point in every layer.
         // Verified byte-identical to two separate appends across GQA widths, strided source windows and
         // cache growth in `ferric-tensor/examples/kv_append2.rs`.
-        let (kc, vc) = ferric_tensor::append2(&self.ctx, &mut cache.0, &k, &mut cache.1, &v);
+        //
+        // The quantized arm is the same contract with a different store, and the shape of it is forced
+        // by decode: `QKvCache::append` quantizes **exactly the rows handed to it** and writes them at
+        // their flat block offset, so a one-token step touches `width/32` blocks and re-reads nothing.
+        // A scheme with a per-tensor or per-channel scale could not do that — a new token that moves a
+        // max invalidates every code already stored, which is an O(len·width) requantize per token.
+        // (`kvquant::append_cost` states that mechanically; §L of docs/sota-feature-matrix.md has the
+        // measured error of each granularity on captured K/V.)
+        //
+        // Then it **materialises the window**: `dequantize()` expands the whole history back to a
+        // transient `[len, width]` f32 tensor for attention to read, and that tensor is dropped at the
+        // end of the layer. The alternative — dequantizing inside the attention kernel, which the
+        // block layout was deliberately chosen to allow — needs new kernels in `ferric-tensor`, which
+        // this change does not own. So the persistent cost drops by the format's ratio while the
+        // transient cost is ONE layer's K and V rather than all `n_layer` of them, and the extra
+        // bandwidth is a dequantize pass over the same bytes attention was about to read anyway.
+        let (kc, vc) = match cache {
+            LayerKv::F32(e) => ferric_tensor::append2(&self.ctx, &mut e.0, &k, &mut e.1, &v),
+            LayerKv::Quant(e) => {
+                e.0.append(&self.ctx, &k);
+                e.1.append(&self.ctx, &v);
+                (e.0.dequantize(&self.ctx), e.1.dequantize(&self.ctx))
+            }
+        };
         // decode: fused single-query; prefill: flash (O(T) memory, no [nh,T,T] matrix) up to its
         // shared-memory limit, else the composed causal path. All three are the same math.
         let s = kc.shape[0];
@@ -759,7 +972,7 @@ impl Qwen3 {
     /// Pulling it out is what makes a **stepping** forward possible: a caller that must await something
     /// between layers — a browser fetching the next layer's weights — cannot use a loop that runs to
     /// completion. See [`Qwen3::step_layer`].
-    fn apply_layer(&self, x: &Tensor, l: &Layer, lc: &mut (KvBuf, KvBuf), pos: usize, il: usize) -> Tensor {
+    fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize) -> Tensor {
         use ferric_tensor::{batch, prof};
         dump("inpL", il, x);
         dump("attn_norm", il, &x.rmsnorm(&l.attn_norm, self.cfg.eps));
@@ -860,8 +1073,15 @@ impl Qwen3 {
         let mut outs: Vec<Tensor> = Vec::with_capacity(n);
         for (i, c) in caches.iter_mut().enumerate() {
             let (ki, vi) = (k.narrow(0, i, 1), v.narrow(0, i, 1));
-            let lc = c.kv_mut(il);
-            let (kc, vc) = ferric_tensor::append2(&self.ctx, &mut lc.0, &ki, &mut lc.1, &vi);
+            // Same two arms as the solo path, for the same reason; see `attn`.
+            let (kc, vc) = match c.layer_kv(il) {
+                LayerKv::F32(e) => ferric_tensor::append2(&self.ctx, &mut e.0, &ki, &mut e.1, &vi),
+                LayerKv::Quant(e) => {
+                    e.0.append(&self.ctx, &ki);
+                    e.1.append(&self.ctx, &vi);
+                    (e.0.dequantize(&self.ctx), e.1.dequantize(&self.ctx))
+                }
+            };
             let qi = q.narrow(0, i, 1).contiguous();
             outs.push(if win > 0 { nn::decode_attention_win(&qi, &kc, &vc, nh, nkv, win, sc) }
                       else { nn::decode_attention(&qi, &kc, &vc, nh, nkv, sc) });
@@ -893,9 +1113,14 @@ impl Qwen3 {
 
     /// Whether [`Self::forward_batch`] is solo-equivalent for this model.
     ///
-    /// False when the model needs scaled (`rope_freqs`/YaRN) or NORM-interleaved RoPE, because
-    /// `rope_at` — the per-row-position kernel the batched path uses — implements neither. Callers
-    /// should fall back to per-sequence `forward_cached` rather than batching a model this refuses.
+    /// True for every checkpoint this runtime loads. It was **not** always: the batched path used
+    /// `rope_at`, which implemented neither scaled (`rope_freqs`/YaRN) nor NORM-interleaved RoPE, so
+    /// batching such a model diverged from solo decode with no error and fluent output. It now routes
+    /// through `rope_at_ex`, which takes both the frequency table and the pairing convention, so the
+    /// batched and solo paths reach the same kernel with the same arguments.
+    ///
+    /// Kept as an explicit predicate rather than deleted, because this exact question was once
+    /// answered "obviously yes" and was wrong — a scheduler should ask rather than assume.
     pub fn batching_supported(&self) -> bool { true }
 
     /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
@@ -962,7 +1187,7 @@ impl Qwen3 {
     pub fn step_layer(&self, step: &mut Step, cache: &mut Cache) -> bool {
         let Some(il) = step.next_layer() else { return true };
         let l = self.layer_ref(il);
-        step.x = self.apply_layer(&step.x, &l, &mut cache.kv[il], step.pos, il);
+        step.x = self.apply_layer(&step.x, &l, cache.layer_kv(il), step.pos, il);
         step.il += 1;
         step.il >= step.n_layer
     }
@@ -983,7 +1208,7 @@ impl Qwen3 {
         for il in 0..self.cfg.n_layer {
             // A streamed layer is dropped at the end of the iteration — that drop IS the eviction.
             let l = self.layer_ref(il);
-            x = self.apply_layer(&x, &l, &mut cache.kv[il], pos, il);
+            x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il);
         }
         cache.pos += tokens.len();
         x
@@ -1009,7 +1234,7 @@ impl Qwen3 {
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            h = self.apply_layer(&h, &l, &mut cache.kv[il], pos, il);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il);
         }
         cache.pos += t;
         batch(&self.ctx, || self.head(&h))
@@ -1061,7 +1286,7 @@ impl Qwen3 {
         let mut x = self.embed(tokens);
         let pos = cache.pos;
         for (il, l) in self.layers.iter().enumerate().take(first) {
-            let lc = &mut cache.kv[il];
+            let lc = cache.layer_kv(il);
             let xin = &x;
             x = batch(&self.ctx, || {
                 let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
@@ -1088,7 +1313,7 @@ impl Qwen3 {
         let pos = cache.pos;
         let last = self.layers.len() - 1;
         for (il, l) in self.layers.iter().enumerate() {
-            let lc = &mut cache.kv[il];
+            let lc = cache.layer_kv(il);
             let xin = &x;
             if il == last {
                 return batch(&self.ctx, || {
@@ -1146,5 +1371,96 @@ mod rope_type_tests {
                         "{} is served by the dense loader but its rope type was never audited", e.name);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod kvq_cache_tests {
+    use super::*;
+
+    /// Minimal Cfg — only the fields `Cache::with_kvq` reads matter here.
+    fn cfg(n_layer: usize) -> Cfg {
+        Cfg {
+            n_embd: 896, n_layer, n_head: 14, n_head_kv: 2, head_dim: 64, n_ff: 4864,
+            n_vocab: 151936, eps: 1e-6, rope_base: 1e6, has_qk_norm: true, qkv_bias: false,
+            is_gemma: false, embd_scale: 1.0, sliding_window: 0, sliding_pattern: 0,
+            gemma2: false, attn_softcap: 0.0, final_softcap: 0.0,
+            swa: vec![false; n_layer], logit_scale: 1.0, post_norms: false, nope_global: false,
+            rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
+            yarn_factor: 1.0, yarn_orig_ctx: 0,
+        }
+    }
+
+    /// The two stores are never both populated, in either direction.
+    ///
+    /// There is no CI test that runs the quantized path end to end — that needs a checkpoint on argv —
+    /// so these are the invariants checkable without weights, and they are the ones separating
+    /// "refuses" from "silently wrong": an empty cache yields finite attention and fluent text.
+    #[test]
+    fn a_quantized_cache_holds_no_f32_rows_and_an_f32_cache_holds_no_quantized_ones() {
+        let c = cfg(24);
+        let f = Cache::with_kvq(&c, None);
+        assert!(f.kvq_fmt().is_none());
+        assert_eq!(f.kv.len(), c.n_layer);
+        assert!(f.q.is_empty(), "an f32 cache must not allocate the quantized twin");
+        for fmt in KvqFmt::ALL {
+            let q = Cache::with_kvq(&c, Some(fmt));
+            assert_eq!(q.kvq_fmt(), Some(fmt));
+            assert!(q.kv.is_empty(), "{}: the f32 vector must be EMPTY, not merely unused", fmt.name());
+            assert_eq!(q.q.len(), c.n_layer, "{}: one quantized slot per layer", fmt.name());
+        }
+    }
+
+    /// Everything `FERRIC_KVQ` parsing owes us, in ONE test on purpose.
+    ///
+    /// `kvq_from_env` reads a process-global, and `cargo test` runs tests as parallel THREADS of one
+    /// process. Two tests each setting `FERRIC_KVQ` would race and fail intermittently — the kind of
+    /// flake that gets "fixed" by rerunning. Keeping every mutation of that variable inside a single
+    /// test body makes the ordering total. No other test here calls `kvq_from_env`; they build caches
+    /// through `with_kvq` directly, which takes the format as an argument.
+    #[test]
+    fn kvq_from_env_parses_every_spelling_and_refuses_typos() {
+        let restore = std::env::var("FERRIC_KVQ").ok();
+
+        for v in ["", "off", "0", "f32", "none", "  OFF  "] {
+            std::env::set_var("FERRIC_KVQ", v);
+            assert!(kvq_from_env().is_none(), "FERRIC_KVQ={v:?} must mean f32");
+        }
+        for (v, want) in [("q8_0", KvqFmt::Q8_0), ("q4_0", KvqFmt::Q4_0), ("q4_1", KvqFmt::Q4_1)] {
+            std::env::set_var("FERRIC_KVQ", v);
+            assert_eq!(kvq_from_env(), Some(want), "FERRIC_KVQ={v:?}");
+        }
+
+        // A typo must be LOUD. `q8` is a real one — the ggml name is `q8_0` — and falling back to f32
+        // would run full precision while the operator believed the cache was a quarter the size, with
+        // no symptom but memory that failed to drop.
+        std::env::set_var("FERRIC_KVQ", "q8");
+        let e = std::panic::catch_unwind(kvq_from_env)
+            .expect_err("FERRIC_KVQ=q8 must panic, not silently mean f32");
+        let msg = e.downcast_ref::<String>().map(String::as_str).unwrap_or("");
+        assert!(msg.contains("is not a KV cache format"), "unexpected panic message: {msg:?}");
+
+        match restore { Some(v) => std::env::set_var("FERRIC_KVQ", v), None => std::env::remove_var("FERRIC_KVQ") }
+    }
+
+    /// Using the wrong accessor would store an empty prefix and seed one — a cache that is quietly not
+    /// a cache. Both representations are supported now (`QKvCache::clone_prefix` shipped 2026-08-16);
+    /// what is refused is reaching for the store this cache does not have.
+    #[test]
+    #[should_panic(expected = "Use Cache::layers_q()")]
+    fn layers_refuses_on_a_quantized_cache_instead_of_returning_the_empty_vec() {
+        let _ = Cache::with_kvq(&cfg(4), Some(KvqFmt::Q8_0)).layers();
+    }
+
+    #[test]
+    #[should_panic(expected = "use Cache::layer_kv")]
+    fn kv_mut_refuses_on_a_quantized_cache() {
+        let _ = Cache::with_kvq(&cfg(4), Some(KvqFmt::Q8_0)).kv_mut(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "would install f32 rows")]
+    fn set_layers_refuses_on_a_quantized_cache() {
+        Cache::with_kvq(&cfg(4), Some(KvqFmt::Q8_0)).set_layers(Vec::new());
     }
 }
