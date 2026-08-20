@@ -508,3 +508,25 @@ ceiling is a STREAMING load — read the response body in chunks into wasm, uplo
 arrive, never hold the file twice — and `ferric-gguf`'s `Backing`/`GgufBacked`/`header_probe` were
 built for exactly that access pattern. Until then the honest browser matrix is: dense family + LFM2
 proven in-tab; gemma4 wired and native-proven but tab-blocked on load shape, not on capability.
+
+### §O addendum: the small-model thesis, receipted in one tab (2026-08-20)
+
+The strategic claim under test: parameters do not need to store the world when the runtime lives
+inside it — a tab has native fetch into all data, so weights supply COMPETENCE and retrieval supplies
+KNOWLEDGE, which is why ternary-compressed small models are sufficient rather than a compromise.
+
+Every row is a real headless-Chrome run with the KV receipt asserted in force on the page:
+
+| stack (PrismML ternary bonsai-1.7B, 2.125 bpw, ~450 MB) | verdict | tok/s |
+|---|---|---|
+| f32 KV | ✅ correct | 10.7 |
+| q8_0 grouped-K KV | ✅ token-identical | 14.6 |
+| **q4_0 grouped-K KV** | ✅ token-identical | 15.1 |
+| q4_0 grouped-K + **retrieval-grounded QA** (`?ctx=`) | ✅ answered "0.95" | 7.8 |
+
+The last row is the decisive one: the question asks for a fact that POSTDATES any possible training
+data (this month's wasm bundle size), so no parameters anywhere could contain it — the answer came
+from the document the tab fetched at inference time. Ternary weights + 4.5-bit KV + a 0.95 MB runtime
+is ~12x smaller end-to-end than the f16/f32 default, output unchanged, and the quantized rows are
+FASTER because decode at this size is bandwidth-bound. What this deprioritises, deliberately: the V4
+forward graph (a 156 GB MoE is the premise this bets against) and the multi-GB streaming tab loader.

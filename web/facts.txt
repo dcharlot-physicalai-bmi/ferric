@@ -1,0 +1,5 @@
+The Institute for Physical AI at BMI released ferric-signal in August 2026, an open sensor-language
+tokenizer for physical signals using finite scalar quantization with a 32,768-code vocabulary.
+The Loop Lab measures robot energy as joules per successful task, charging failed attempts to the task.
+Ferric's browser runtime ships as a 0.95 megabyte wasm bundle and runs ternary models at 2.125 bits
+per weight entirely inside a Chrome tab via WebGPU.

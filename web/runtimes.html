@@ -19,10 +19,21 @@ try {
   const kv = q.get('kv');
   if (kv) m.setKvCache(kv, q.get('grouped') === '1');
   document.getElementById('info').textContent = m.info() + ' · kv ' + m.kvCache();
+  // "The weights can be on the outside": knowledge is FETCHED at inference time rather than stored
+  // in parameters. ?ctx=<url> pulls a document over the tab's native network access and grounds the
+  // prompt in it — the in-tab model supplies language competence, the web supplies the facts. This is
+  // the architectural reason a 450 MB ternary model in a browser is not a compromise.
+  let prompt = q.get('prompt') || 'The capital of France is';
+  const ctxUrl = q.get('ctx');
+  if (ctxUrl) {
+    S('fetching context');
+    const doc = await (await fetch(ctxUrl)).text();
+    prompt = 'Context:\n' + doc.trim() + '\n\nQuestion: ' + prompt + '\nAnswer:';
+  }
   S('generating');
   const t0 = performance.now();
   let out = '';
-  const text = await m.generate(q.get('prompt') || 'The capital of France is', parseInt(q.get('steps') || '12'),
+  const text = await m.generate(prompt, parseInt(q.get('steps') || '12'),
     (tok) => { out += tok; document.getElementById('gen').textContent = out; });
   const dt = (performance.now() - t0) / 1000;
   document.getElementById('gen').textContent = text;
