@@ -20,8 +20,16 @@
 //! magnitude-bounded yet, so a small model can loop digits until `max_tokens` — use an `integer` with
 //! bounds where possible, set `maxLength`/`maxItems`, or use adequate `max_tokens`.
 //!
-//! One request at a time (the GPU serializes anyway); continuous batching is the P1 follow-up.
+//! **Continuous batching.** Concurrent requests share one decode step: `forward_batch` advances every
+//! in-flight sequence by one token in a single forward, so the weight set is read once for the whole
+//! batch instead of once per request. Arrivals join mid-flight and a finished sequence's slot is
+//! refilled on the very next step (`ferric_llama::sched::Scheduler` is the policy; `batch.rs` is the
+//! transport). `--max-batch N` (default 8), `--no-batch` to force serial. A model whose runtime has no
+//! solo-equivalent batched forward — `Model::supports_batching` — falls back to serial automatically,
+//! as do guided-decoding and tool-calling requests, which keep the untouched single-request path.
 mod mcp;
+mod batch;
+mod specgate;
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::{qwen3, qwen35};
@@ -57,18 +65,22 @@ impl Model {
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
-    /// Whether this runtime can advance N independent sequences in one forward.
+    /// Whether this runtime has a `forward_batch` that is **proven** solo-equivalent — i.e. whether a
+    /// batching scheduler is allowed to put it in a batch at all.
     ///
-    /// Only the dense path implements `forward_batch` today. The other four runtimes each carry a
-    /// **different** per-sequence state — gated-delta-net recurrence (qwen35), short-conv state
-    /// (lfm2), shared KV where later blocks read an earlier block's cache (gemma4), MLA latent KV with
-    /// asymmetric head widths (deepseek2) — so each needs its own batched forward and its own proof
-    /// that batching did not cross sequences.
+    /// Each runtime carries a **different** per-sequence state — gated-delta-net recurrence (qwen35),
+    /// short-conv rolling window (lfm2), shared KV where later blocks read an earlier block's cache
+    /// (gemma4), MLA latent KV with asymmetric head widths (deepseek2) — so each needs its own batched
+    /// forward *and* its own proof that batching did not cross sequences. `true` here means that proof
+    /// exists and is checked in, not that the method compiles.
     ///
-    /// This exists so a server that gains continuous batching **falls back to serial** on the
-    /// runtimes that cannot support it, rather than silently mis-batching one. That failure would not
-    /// error: a batched path that leaked across sequences still emits fluent text, which is the whole
-    /// reason `examples/continuous_batching` re-runs every sequence solo and compares.
+    /// ⚠ **This is a claim about the runtime, not about the server.** `ferric-serve` still has no
+    /// batched dispatch path: the batched decode loop lives in
+    /// `ferric-llama/examples/continuous_batching.rs` and the TCP wiring is unbuilt. Nothing reads this
+    /// yet. It is written ahead of that wiring so the wiring cannot be built without confronting which
+    /// runtimes are safe to batch, and so `false` here forces **serial fallback** rather than silent
+    /// mis-batching. Mis-batching does not error: a batched path that leaked across sequences still
+    /// emits fluent text, which is why every port re-runs each sequence solo and compares token ids.
     ///
     /// Written as an exhaustive `match` on purpose — adding a runtime forces a decision here instead
     /// of inheriting a default.
@@ -77,7 +89,36 @@ impl Model {
             // Dense supports it only when the model does not need scaled or NORM-interleaved rope —
             // rope_at implements neither, so batching such a model silently diverges from solo decode.
             Model::Dense(m) => m.batching_supported(),
-            Model::Hybrid(_) | Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => false,
+            // Routed through the runtime's own predicate for the same reason as Dense: the runtime,
+            // not the server, knows which of its checkpoints have a batched path that covers every
+            // branch the solo path takes.
+            Model::Hybrid(m) => m.batching_supported(),
+            // Ported AND adversarially verified token-identical to solo decode: lfm2 at n=2/3/4/8,
+            // gemma4 at n=2/3/4 including prompts past the 512 sliding window, deepseek2 at n=2/4 with
+            // MLA, DeepSeekMoE routing and YaRN. None of these three has a checkpoint-dependent branch
+            // in its batched path, so there is no predicate for them to consult.
+            Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => true,
+        }
+    }
+
+    /// Batched decode for N sequences, dispatched on the runtime. See `batch::ServeModel::decode`,
+    /// which is the only caller; the kind check is `unreachable!` because `ModelCache` is only ever
+    /// produced by `new_cache` on this same `Model`.
+    fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut ModelCache]) -> Tensor {
+        macro_rules! b {
+            ($m:expr, $variant:path) => {{
+                let mut cs: Vec<_> = caches.iter_mut()
+                    .map(|c| match &mut **c { $variant(x) => x, _ => unreachable!("model/cache kind mismatch") })
+                    .collect();
+                $m.forward_batch(tokens, &mut cs)
+            }};
+        }
+        match self {
+            Model::Dense(m) => b!(m, ModelCache::Dense),
+            Model::Hybrid(m) => b!(m, ModelCache::Hybrid),
+            Model::Lfm2(m) => b!(m, ModelCache::Lfm2),
+            Model::Gemma4(m) => b!(m, ModelCache::Gemma4),
+            Model::DeepSeek2(m) => b!(m, ModelCache::DeepSeek2),
         }
     }
 
@@ -127,6 +168,11 @@ fn byte_decoder() -> HashMap<char, u8> {
 pub(crate) struct Engine {
     ctx: Arc<Context>,
     model: Model,
+    /// Whether speculative decoding pays for itself on this request, learned from observed draft
+    /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
+    /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
+    /// a small map, and rather than a per-request copy because the whole point is to accumulate.
+    spec_gate: std::sync::Mutex<specgate::SpecGate>,
     bpe: Bpe,
     /// Present for SentencePiece models (`tokenizer.ggml.model == "llama"`: Phi-3 / Mistral / Llama-2 /
     /// Gemma). When set, all text tokenization goes through it instead of the byte-level `bpe`.
@@ -258,7 +304,10 @@ impl Engine {
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
         let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None) }
+        // The break-even is `E_draft / E_main`, estimated from shape: one MTP block against the main
+        // model's `n_layer`. A structural estimate, not a measurement — see `specgate`.
+        let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -363,6 +412,28 @@ impl Engine {
         last.iter().map(|x| x / norm).collect()
     }
 
+    /// Whether **this server** may put this engine's requests in a shared decode batch.
+    ///
+    /// Two conditions, and the second is not the runtime's business:
+    ///
+    /// 1. `Model::supports_batching()` — the runtime's own claim that its `forward_batch` is proven
+    ///    solo-equivalent for the loaded checkpoint. This is that gate's only consumer.
+    /// 2. The serial path for this engine must be the plain decode loop. A hybrid shipping its own
+    ///    MTP draft block takes `generate_spec` instead, and the batched forward does no drafting —
+    ///    so batching it would be comparing against a *different* reference, and "a batched response
+    ///    equals a serial one" would stop being a checkable statement. Refuse rather than blur it.
+    ///    (`FERRIC_NOSPEC=1` disables drafting, and then this model batches.)
+    ///
+    /// `FERRIC_NOBATCH=1` forces serial for everything — the A/B escape hatch.
+    pub(crate) fn batchable(&self) -> bool {
+        if std::env::var("FERRIC_NOBATCH").is_ok() { return false; }
+        if !self.model.supports_batching() { return false; }
+        if let Model::Hybrid(m) = &self.model {
+            if m.mtp.is_some() && std::env::var("FERRIC_NOSPEC").is_err() { return false; }
+        }
+        true
+    }
+
     fn chat_ids(&self, messages: &[Value]) -> Vec<u32> {
         if !self.has_chat_family() {
             // No recognized chat family in the vocab → a base model — plain concatenation.
@@ -394,8 +465,34 @@ impl Engine {
         if std::env::var("FERRIC_DUMP_IDS").is_ok() { eprintln!("prompt ids ({}): {:?}", prompt.len(), prompt); }
         if let Model::Hybrid(m) = &self.model {
             // FERRIC_NOSPEC=1 forces the plain loop (A/B + regression escape hatch).
+            //
+            // Beyond that, `SpecGate` decides. Self-drafting is not free — every step pays the draft
+            // forward AND the main forward — so below an acceptance rate of `E_draft / E_main` it
+            // spends MORE joules per token than the plain loop. The gate holds a learned acceptance
+            // estimate per prompt-length bucket and declines when the request sits below break-even.
+            // With no evidence it speculates, which is exactly today's behaviour.
             if m.mtp.is_some() && std::env::var("FERRIC_NOSPEC").is_err() {
-                return self.generate_spec(m, prompt, max_tokens, temperature, guide, on_delta);
+                let speculate = {
+                    let g = self.spec_gate.lock().expect("spec gate poisoned");
+                    let take = g.should_speculate(prompt.len());
+                    if std::env::var("FERRIC_SPEC_TRACE").is_ok() {
+                        eprintln!("spec gate: prompt {} tok · p(accept)~{:.3} vs break-even {:.3} -> {}",
+                                  prompt.len(), g.expected_acceptance(prompt.len()), g.break_even(),
+                                  if take { "speculate" } else { "plain" });
+                    }
+                    take
+                };
+                if speculate {
+                    let (text, p, n, drafted, accepted) =
+                        self.generate_spec(m, prompt, max_tokens, temperature, guide, on_delta);
+                    // Only ATTEMPTED drafts are recorded. A step that did not draft has no outcome, and
+                    // inventing one would let the gate confirm its own decisions.
+                    if drafted > 0 {
+                        let mut g = self.spec_gate.lock().expect("spec gate poisoned");
+                        for i in 0..drafted { g.observe(prompt.len(), i < accepted); }
+                    }
+                    return (text, p, n);
+                }
             }
         }
         let mut cache = self.model.new_cache();
@@ -453,7 +550,11 @@ impl Engine {
     /// class of shift as any kernel-fusion change. The draft only decides how many tokens each
     /// main forward yields (~80% acceptance ⇒ ~2 per forward). Rollback on rejection is O(1):
     /// caches are Arc-handle snapshots, never GPU copies.
-    fn generate_spec(&self, m: &Qwen35, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    fn generate_spec(&self, m: &Qwen35, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize, u32, u32) {
+        // Draft accounting, returned so the caller can feed `SpecGate`. The doc above this function
+        // asserts "~80% acceptance"; nothing measured it until now, and a gate that decides on an
+        // assumed rate is a heuristic wearing a derivation's clothes.
+        let (mut drafted, mut accepted) = (0u32, 0u32);
         let n_vocab = self.model.n_vocab();
         let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
         let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
@@ -493,7 +594,7 @@ impl Engine {
         fed.extend_from_slice(&suffix);
         let v = pollster::block_on(lg.to_vec());
         let first = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng);
-        let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else { save_slot!(); return (emitted, prompt.len(), 0) };
+        let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else { save_slot!(); return (emitted, prompt.len(), 0, drafted, accepted) };
         commit!(pend0);
         let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
         // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
@@ -526,6 +627,10 @@ impl Engine {
                 let t1 = self.select_token(&v[0..n_vocab], &guide, temperature, &mut rng);
                 let Some(t1) = t1.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
                 commit!(t1);
+                // Two drafts were proposed this step; each is one observation for the gate. Counted
+                // where the decision is ALREADY made rather than re-derived, so the tally cannot drift
+                // from the branch it describes.
+                drafted += 2;
                 if t1 != d1 || gen.len() >= max_tokens {
                     // Reject both (or stop): discard the forward, re-feed t1 next iter.
                     cache = snap;
@@ -538,6 +643,7 @@ impl Engine {
                 let t2 = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
                 let Some(t2) = t2.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
                 commit!(t2);
+                accepted += 1;   // d1 matched
                 if t2 != d2 || gen.len() >= max_tokens {
                     // Accept d1 only: d2's cache entry is wrong → discard forward, re-feed [d1, t2].
                     cache = snap;
@@ -546,6 +652,7 @@ impl Engine {
                     phid = hid2.narrow(0, k - 1, 2).contiguous();
                     continue;
                 }
+                accepted += 1;   // d2 matched too
                 // Accept both: the cache validly holds [unfed…, d1, d2]; emit pend from row 2.
                 fed.extend_from_slice(&toks);
                 let pend = self.select_token(&v[2 * n_vocab..3 * n_vocab], &guide, temperature, &mut rng);
@@ -596,7 +703,7 @@ impl Engine {
             }
         }
         save_slot!();
-        (emitted, prompt.len(), gen.len())
+        (emitted, prompt.len(), gen.len(), drafted, accepted)
     }
 }
 
@@ -660,11 +767,16 @@ pub fn run() {
     let mut port = 8080u16;
     let mut name = "ferric".to_string();
     let mut mcp_cmds: Vec<(String, String)> = Vec::new();
+    // How many sequences may share one decode step. 8 is a starting point, not a measured optimum:
+    // occupancy is what decides the payoff and only the deployment knows its arrival rate.
+    let mut max_batch = std::env::var("FERRIC_MAX_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(8usize);
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
+            "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
+            "--no-batch" => { std::env::set_var("FERRIC_NOBATCH", "1"); i += 1; }
             "--mcp" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("stdio".to_string(), c.clone())); } i += 2; }
             "--mcp-http" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("http".to_string(), c.clone())); } i += 2; }
             _ => i += 1,
@@ -705,31 +817,42 @@ pub fn run() {
         return;
     }
     let mcps = std::cell::RefCell::new(mcps);
+    let any_mcp_tools = !mcps.borrow().openai_tools().is_empty();
+    let batching = eng.batchable();
     eprintln!("ferric-serve: {} ({} layers, vocab {}) on {:?}{} — http://127.0.0.1:{port}/v1",
         name, eng.model.n_layer(), eng.model.n_vocab(), eng.ctx.backend,
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
+    eprintln!("ferric-serve: continuous batching {}",
+        if batching { format!("ON, max_batch {max_batch}") } else { "OFF (serial) — this model has no solo-equivalent batched decode, or it was disabled".to_string() });
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("bind :{port}: {e}"));
-    for stream in listener.incoming() {
-        if let Ok(s) = stream {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&eng, &mcps, s)));
-            if r.is_err() { eprintln!("ferric-serve: handler panicked (recovered)"); }
-        }
-    }
+    // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
+    // loop, embeddings, unknown paths) goes to the untouched serial handler below.
+    batch::serve_loop(eng, listener, batch::ServeOpts { max_batch, any_mcp_tools },
+        |eng, method, path, body, s| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(eng, &mcps, method, path, body, s)));
+            match r {
+                Ok(handled) => handled,
+                Err(_) => { eprintln!("ferric-serve: handler panicked (recovered)"); true }
+            }
+        });
 }
 
-fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, mut stream: TcpStream) {
-    let (method, path, body) = match read_request(&mut stream) { Some(r) => r, None => return };
-    match (method.as_str(), path.as_str()) {
-        ("GET", "/health") => write_json(&mut stream, 200, &json!({"status": "ok"})),
-        ("GET", "/v1/models") => write_json(&mut stream, 200, &json!({
+/// The serial handler: every endpoint the batch loop does not own. Returns whether it recognised the
+/// request (`false` → the caller writes a 404).
+fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8], stream: &mut TcpStream) -> bool {
+    match (method, path) {
+        ("GET", "/health") => write_json(stream, 200, &json!({"status": "ok"})),
+        ("GET", "/v1/models") => write_json(stream, 200, &json!({
             "object": "list",
             "data": [{"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"}]
         })),
-        ("POST", "/v1/chat/completions") => chat(eng, mcps, &mut stream, &body),
-        ("POST", "/v1/completions") => completions(eng, &mut stream, &body),
-        ("POST", "/v1/embeddings") => embeddings(eng, &mut stream, &body),
-        _ => write_json(&mut stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}})),
+        ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
+        ("POST", "/v1/completions") => completions(eng, stream, body),
+        ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
+        // Unrecognised: let the caller answer, so there is exactly one 404 writer.
+        _ => return false,
     }
+    true
 }
 
 /// OpenAI-compatible `/v1/embeddings`: `input` is a string or array of strings → L2-normalized vectors.
@@ -938,28 +1061,85 @@ mod tests {
 
 #[cfg(test)]
 mod batching_support {
-    /// Pins which runtimes implement batched decode, against the source rather than against a belief.
+    /// Pins, against the source rather than against a belief, that every runtime the server is willing
+    /// to batch actually implements batched decode — and that every runtime it is NOT willing to batch
+    /// is refused **deliberately** rather than by omission.
     ///
-    /// An earlier version of this test looped over the other runtimes and asserted nothing — a dead
-    /// loop that read like coverage. That is the same vacuous-guard failure caught in the rope-type
-    /// audit, so this one asserts both directions explicitly.
+    /// This guard has now failed twice in its intended way and been rewritten each time, which is the
+    /// point of it:
+    ///   1. It first looped over the runtimes and asserted nothing — a dead loop that read like
+    ///      coverage, the same vacuous-guard failure caught in the rope-type audit.
+    ///   2. It then asserted "no runtime but Dense contains forward_batch", which fired correctly the
+    ///      moment four ports landed. But that phrasing had a shelf life: once every runtime has the
+    ///      method, source text alone can no longer distinguish ported from served, and the assertion
+    ///      would have had to be deleted rather than tightened.
+    ///
+    /// So the invariant is now the *correspondence* between the two lists, which does not expire: a
+    /// runtime claimed batchable must have the method, and a runtime that has the method but is not
+    /// claimed must appear literally in the refusing arm. The gap between "ported" and "served" is
+    /// exactly where a verified port quietly becomes dead code.
     #[test]
-    fn only_the_dense_runtime_implements_batched_decode() {
-        const NEEDLE: &str = "pub fn forward_batch";
-        assert!(include_str!("../../ferric-llama/src/qwen3.rs").contains(NEEDLE),
-                "the dense runtime must implement forward_batch — Model::supports_batching claims it does");
-        for (name, src) in [
-            ("qwen35",    include_str!("../../ferric-llama/src/qwen35.rs")),
-            ("lfm2",      include_str!("../../ferric-llama/src/lfm2.rs")),
-            ("gemma4",    include_str!("../../ferric-llama/src/gemma4.rs")),
-            ("deepseek2", include_str!("../../ferric-llama/src/deepseek2.rs")),
+    fn every_ported_runtime_has_an_explicit_serving_decision() {
+        // ⚠ THE TRAILING `(` IS LOAD-BEARING. Without it the needle is a PREFIX of any renamed
+        // method, so `forward_batch_RENAMED` still "contains" it and the check silently passes. That
+        // exact mutation defeated the first version of this test.
+        const NEEDLE: &str = "pub fn forward_batch(";
+
+        // ⚠ Read ONLY the body of `supports_batching`, never the whole file. The first version of this
+        // test searched all of `lib.rs` for arm literals it also declared as `const` two lines above —
+        // so `SELF_SRC.contains(ARM)` was satisfied by the test's own source and was true no matter
+        // what the function said. Both mutations passed. That is the same failure as the rope-type
+        // audit, where the test kept a copy of the predicate it was supposed to be checking.
+        let self_src: &str = include_str!("lib.rs");
+        let body = {
+            let start = self_src.find("fn supports_batching(&self) -> bool {")
+                .expect("supports_batching was renamed; this guard reads its body by name");
+            let rest = &self_src[start..];
+            let end = rest.find("\n    }").expect("unterminated supports_batching body");
+            &rest[..end]
+        };
+        // Proof the slice is the function and not the whole file: the consts below live outside it.
+        assert!(!body.contains("const NEEDLE"), "the extracted body swallowed this test's own source");
+
+        // Every runtime is now batchable, so the refusing arm is empty and the interesting invariant
+        // is different from what it was an hour ago: it is no longer "which list is it in" but "does
+        // every variant appear in SOME arm, and does each one back its claim with a real method".
+        const BLANKET_ARM: &str = "Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => true";
+        assert!(body.contains(BLANKET_ARM),
+                "Model::supports_batching's arms changed shape; this guard reads them literally, so \
+                 update both together rather than letting the guard go quiet.\nbody was:\n{body}");
+
+        // (runtime source, its Model variant, does it consult its OWN batching_supported predicate)
+        for (name, src, variant, asks_runtime) in [
+            ("qwen3",     include_str!("../../ferric-llama/src/qwen3.rs"),     "Model::Dense",     true),
+            ("qwen35",    include_str!("../../ferric-llama/src/qwen35.rs"),    "Model::Hybrid",    true),
+            ("lfm2",      include_str!("../../ferric-llama/src/lfm2.rs"),      "Model::Lfm2",      false),
+            ("gemma4",    include_str!("../../ferric-llama/src/gemma4.rs"),    "Model::Gemma4",    false),
+            ("deepseek2", include_str!("../../ferric-llama/src/deepseek2.rs"), "Model::DeepSeek2", false),
         ] {
-            assert!(!src.contains(NEEDLE),
-                    "{name} now implements forward_batch — update Model::supports_batching, or the \
-                     server will keep serialising a runtime that could be batched");
+            assert!(src.contains(NEEDLE),
+                    "{name} is claimed batchable by Model::supports_batching but has no {NEEDLE} — \
+                     either the method was removed or the claim is wrong");
+            assert!(body.contains(variant),
+                    "{variant} appears in no arm of Model::supports_batching — a runtime must never \
+                     fall out of the match entirely");
+            if asks_runtime {
+                // Its batched path has a checkpoint-dependent branch, so the server must ask the
+                // runtime rather than answer for it.
+                assert!(body.contains(&format!("{variant}(m) => m.batching_supported()")),
+                        "{variant} has a per-checkpoint predicate that supports_batching stopped \
+                         consulting; a blanket `true` here would batch a checkpoint the runtime knows \
+                         it cannot batch");
+                // ⚠ HONEST LABEL: this one is subsumed by the compiler, not independent coverage.
+                // Removing the method from the runtime makes `m.batching_supported()` above fail to
+                // build, so the mutation never reaches this assertion — verified by running it
+                // (`error[E0599]: no method named batching_supported`). Kept only to name the coupling
+                // at the point where it matters; the assertion above it is the one that bites.
+                assert!(src.contains("pub fn batching_supported(&self) -> bool"),
+                        "{name} lost the predicate supports_batching calls");
+            }
         }
-        // The reverse direction — a runtime losing forward_batch while still claimed — is caught by
-        // the first assertion, and a NEW runtime cannot default to `true` because
-        // Model::supports_batching is an exhaustive match the compiler forces you to extend.
+        // A brand-new runtime cannot slip past either list: Model::supports_batching is an exhaustive
+        // match, so the compiler forces a decision before this test ever runs.
     }
 }
