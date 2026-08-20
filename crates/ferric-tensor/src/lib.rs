@@ -1505,7 +1505,7 @@ fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
 // without an A/B like the one above.
 
 fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
-    let _t = std::time::Instant::now();
+    let _t = profclock::now();
     let _g = scopeguard_ns(_t, 3);
     ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("info"), contents: bytemuck::cast_slice(data),
@@ -1532,7 +1532,7 @@ thread_local! {
 }
 
 pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
-    let _t = std::time::Instant::now();
+    let _t = profclock::now();
     let _g = scopeguard_ns(_t, 3);
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1561,10 +1561,36 @@ pub(crate) fn unibuf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
         }).clone()
     })
 }
+/// The profiling clock, made a no-op on wasm32 in ONE place so every call site stays identical.
+///
+/// `std::time::Instant` LINKS on wasm32-unknown-unknown and only PANICS at runtime ("time not
+/// implemented on this platform") — which is why the wasm build stayed green while the first kernel
+/// dispatch in a real Chrome tab died: `u32buf`/`unibuf` run on every dispatch, and their `_t`/`_g`
+/// profiling pair reached this clock before any output existed. Found by the in-browser test, not by
+/// any compile: a portability break that only exists at runtime can only be caught by running.
+mod profclock {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub type T = std::time::Instant;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn now() -> T { std::time::Instant::now() }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn elapsed_ns(t: &T) -> u64 { t.elapsed().as_nanos() as u64 }
+
+    /// In a tab the host-time ledger reads zero rather than crashing the model: HOST_NS is a native
+    /// instrument, and the browser's own devtools own that job there.
+    #[cfg(target_arch = "wasm32")]
+    #[derive(Clone, Copy)]
+    pub struct T;
+    #[cfg(target_arch = "wasm32")]
+    pub fn now() -> T { T }
+    #[cfg(target_arch = "wasm32")]
+    pub fn elapsed_ns(_t: &T) -> u64 { 0 }
+}
+
 /// Charge the elapsed time of the enclosing scope to a HOST_NS slot on drop.
-struct NsGuard(std::time::Instant, usize);
-impl Drop for NsGuard { fn drop(&mut self) { add_ns(self.1, self.0.elapsed().as_nanos() as u64); } }
-fn scopeguard_ns(t: std::time::Instant, slot: usize) -> NsGuard { NsGuard(t, slot) }
+struct NsGuard(profclock::T, usize);
+impl Drop for NsGuard { fn drop(&mut self) { add_ns(self.1, profclock::elapsed_ns(&self.0)); } }
+fn scopeguard_ns(t: profclock::T, slot: usize) -> NsGuard { NsGuard(t, slot) }
 
 /// How many KV partitions to split a decode attention across.
 ///
@@ -1692,16 +1718,16 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
          into the y dimension and linearise in the shader via num_workgroups.",
         g
     );
-    let _t = std::time::Instant::now();
+    let _t = profclock::now();
     let pipe = pipeline_for(ctx, wgsl, label);
-    add_ns(0, _t.elapsed().as_nanos() as u64);
-    let _t = std::time::Instant::now();
+    add_ns(0, profclock::elapsed_ns(&_t));
+    let _t = profclock::now();
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
     });
-    add_ns(1, _t.elapsed().as_nanos() as u64);
+    add_ns(1, profclock::elapsed_ns(&_t));
     DISPATCHES.with(|c| c.set(c.get() + 1));
     // Kernel-name tracing, cached: this sits on the hot path (hundreds of dispatches per token), so the
     // env lookup happens once rather than per dispatch. Worth keeping — tracing labels is what showed the
@@ -1711,13 +1737,13 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         eprintln!("KERNEL\t{label}");
     }
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
-        let _t = std::time::Instant::now();
+        let _t = profclock::now();
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
         drop(pass);
-        add_ns(2, _t.elapsed().as_nanos() as u64);
+        add_ns(2, profclock::elapsed_ns(&_t));
     };
     // If a batch is open, append to its current (or a fresh) Wgsl segment and defer the submit;
     // otherwise submit this op alone. `bg` comes back out when unbatched.

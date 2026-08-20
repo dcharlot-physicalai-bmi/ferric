@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>ferric runtimes</title>
+<body style="font:14px monospace">
+<div id="status">boot</div><div id="info"></div><pre id="gen"></pre><div id="stats"></div>
+<script type="module">
+import init, { FerricModel } from './pkg/ferric_web.js';
+const q = new URLSearchParams(location.search);
+const S = (m) => document.getElementById('status').textContent = m;
+try {
+  await init();
+  S('fetching model');
+  const r = await fetch(q.get('model'));
+  if (!r.ok) throw new Error('fetch ' + r.status);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  S('loading ' + (bytes.length / 1048576 | 0) + ' MB');
+  const m = await FerricModel.load(bytes);
+  document.getElementById('info').textContent = m.info() + ' · kv ' + m.kvCache();
+  const kv = q.get('kv');
+  if (kv) m.setKvCache(kv, q.get('grouped') === '1');
+  S('generating');
+  const t0 = performance.now();
+  let out = '';
+  const text = await m.generate(q.get('prompt') || 'The capital of France is', parseInt(q.get('steps') || '12'),
+    (tok) => { out += tok; document.getElementById('gen').textContent = out; });
+  const dt = (performance.now() - t0) / 1000;
+  document.getElementById('gen').textContent = text;
+  document.getElementById('stats').textContent = (text.length ? (parseInt(q.get('steps') || '12') / dt).toFixed(1) : '0') + ' tok/s';
+  S('done');
+} catch (e) { S('ERROR: ' + e); }
+</script>
