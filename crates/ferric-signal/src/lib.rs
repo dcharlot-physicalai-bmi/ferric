@@ -65,7 +65,7 @@ pub mod tower;
 pub mod train;
 pub mod vocab;
 
-pub use cost::TokenCost;
+pub use cost::{vocab_cost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};
 pub use receipt::{agree, agreement, Agreement, TokenReceipt, TokenSpec};

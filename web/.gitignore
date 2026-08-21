@@ -1,3 +1,6 @@
 pkg/
 model.gguf
 autorun.html
+bonsai.gguf
+retriever.gguf
+*.gguf

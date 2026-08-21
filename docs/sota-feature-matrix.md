@@ -647,33 +647,51 @@ data by construction.
 ### The other half: facts no model can have memorised
 
 The bench above is the case *most favourable to weights-inside*, because every fact in it is in the
-baseline's training data by construction. The regime the thesis is actually about is knowledge a
-model cannot have — post-cutoff, private, local, specific. So the same harness was run against 22
-invented instruments with invented parameters (`web/qa_novel.tsv`, `web/qa_novel_corpus.txt`), each
-answer flanked by two siblings carrying **different** values, every number in the corpus globally
-unique so no answer can be matched by a word-boundary hit on another instrument's figure, and the
-whole set generated from a fixed seed so it reproduces from the file alone.
+baseline's training data by construction. The regime the thesis is actually about is knowledge a model
+cannot have — post-cutoff, private, local, specific. So the same harness runs against 22 invented
+instruments with invented parameters (`web/qa_novel.tsv`, `web/qa_novel_corpus.txt`), each answer
+flanked by two siblings carrying **different** values, every number in the corpus globally unique so
+no answer can be matched by a word-boundary hit on another instrument's figure, and generated from a
+fixed seed so it reproduces from the file alone.
 
-| arm | bytes | memorised world facts | facts nothing could memorise |
+**No positional shortcut can pass it.** Every passage carries three numbers (value, revision,
+catalogue) and only half lead with the answer, so `copy-the-first-number` scores 11/22,
+`copy-the-last` 11/22, `copy-the-middle` 0/22. Anything above 11 required reading the question. The
+first version of this corpus put the answer first every time, where a pure copying heuristic would
+have scored 22/22 — indistinguishable from the result the best arm actually got.
+
+## R. The full matrix (2026-08-21)
+
+| system | total bytes | memorised world facts | facts nothing could memorise |
 |---|---|---|---|
-| weights INSIDE — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** | **0/22 (0%)** |
-| CONTROL — qwen3-0.6b, closed book | 397 MB | 14/22 (64%) | **0/22 (0%)** |
-| weights OUTSIDE — qwen3-0.6b + trained retriever + corpus | 1036 MB | 18/22 (82%) | **20/22 (91%)** |
+| **weights INSIDE** — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** | **0/22 (0%)** |
+| **weights OUTSIDE** — Bonsai-1.7B **ternary** + qwen3-embed + corpus | **1102 MB** | **20/22 (91%)** | **22/22 (100%)** |
+| weights OUTSIDE — qwen3-0.6b + qwen3-embed + corpus | 1036 MB | 18/22 (82%) | 19/22 (86%) |
+| *control* — Bonsai-1.7B ternary, closed book | 463 MB | 17/22 | 0/22 |
+| *control* — qwen3-0.6b, closed book | 397 MB | 14/22 | 0/22 |
 
-retrieval@1 was **22/22**, mean top1–top2 margin 0.1835, all 22 passages distinct, net contribution
-**+20**. Both lookup failures were handed the right passage and did not use it — extraction, not
-search, which is the ceiling the registered prediction named.
+**At 1.3% fewer bytes, the ternary system ties the memoriser on the memoriser's home turf and beats
+it 22 to 0 everywhere else.** On the invented corpus it made zero errors: retrieval@1 22/22, mean
+top1–top2 margin 0.1826, all 22 passages distinct, net contribution +22.
 
-**The precise statement the two benches support together:**
+### What the three rows say that one row cannot
 
-1. Where the model already knows the answer, memorising **wins narrowly** — 20 to 18, at equal bytes.
-   Shipping a corpus does not beat shipping parameters on their home turf.
-2. Where the model cannot know the answer, lookup is **the only arm that works at all** — 20 to 0,
-   and the 397 MB generator scores the *same 91%* the 2.8x larger model scores on facts it memorised.
-3. So the case for weights-outside is not that it beats memorisation. It is that **memorisation has a
-   hard zero** outside its training data, and no parameter count moves it. A model that ships with
-   the corpus outside covers both regimes; a model that ships with everything inside covers one.
+1. **Memorisation has a hard zero.** Outside its training data the 1117 MB model scores 0/22, and no
+   parameter count moves that. This is the whole asymmetry: one architecture degrades, the other
+   stops.
+2. **Ternary buys the tie.** The 0.6B dense generator loses the world-facts arm 18–20; the 1.7B
+   ternary generator draws it 20–20 in **1.2x the bytes of the 0.6B**. Ternary compression is what
+   makes "small enough to ship" and "good enough to tie" the same model.
+3. **The retriever is the new bottleneck, and it is the wrong size.** `qwen3-embed-0.6b` is 639 MB
+   against the ternary generator's 463 MB — in a weights-outside system the *retriever* is the larger
+   half. It is also the half the field already ships at 20–100 MB (MiniLM, bge-small, gte-small), so
+   the concrete engineering path is a small trained retriever beside a ternary generator, and the
+   1102 MB measured here is an upper bound, not the target.
+4. **Retrieval quality is a capability, not a given.** Pooling a generator's hidden state retrieves
+   8/22; a checkpoint trained to embed retrieves 22/22. The failure mode of the first is not an
+   error — it is ordinary-looking cosine scores that rank near-arbitrarily, which a single-question
+   demo cannot detect. §Q is the record of this project shipping exactly that demo.
 
-This is the measurable form of the browser-native thesis: a tab has the network, so the corpus is
-free to be current, private, and arbitrarily large, and the only thing that must fit in memory is the
-part that reads it.
+This is the measurable form of the browser-native thesis: a tab has the network, so the corpus is free
+to be current, private, and arbitrarily large, and the only thing that must fit in memory is the part
+that reads it.

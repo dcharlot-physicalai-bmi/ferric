@@ -86,9 +86,102 @@ impl EncoderConfig {
     }
 }
 
+/// What a vocabulary costs to carry, per token generated.
+///
+/// A decoder over a hybrid vocabulary touches its embedding table twice per position: once to look
+/// a token up, and once at the output head to score every row. The lookup is one row; **the head is
+/// the whole table**, and that is the term that grows with codebook size. At the edge this is not a
+/// rounding error — the crate's own arithmetic-intensity measurement puts a small tokenizer at
+/// ~8 FLOP per weight byte, far under the ~100–300 a modern part needs to be compute-bound, so
+/// **bytes moved, not operations, set the bill**.
+///
+/// This exists because the resolution sweep in the README measured 243 codes and 32,768 codes
+/// scoring identically on held-out accuracy at one corpus scale. Identical accuracy at 135x fewer
+/// codes is an energy claim as much as a modelling one, and this makes it exact rather than
+/// rhetorical.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VocabCost {
+    pub rows: u64,
+    pub d_model: u64,
+    /// Bytes in the embedding table at 4 bytes per parameter.
+    pub embed_bytes: u64,
+    /// Bytes in the untied output head, which is the same shape.
+    pub head_bytes: u64,
+    /// Multiply-accumulates to score every row at one position.
+    pub head_macs_per_token: u64,
+}
+
+impl VocabCost {
+    /// Weight bytes that must be read to emit ONE token: the head in full, plus one embedding row.
+    ///
+    /// The head dominates by a factor of `rows`, which is exactly why codebook size is an energy
+    /// decision.
+    pub fn bytes_per_token(&self) -> u64 {
+        self.head_bytes + self.d_model * 4
+    }
+
+    /// Ratio of this vocabulary's per-token traffic to another's. `> 1` means self is costlier.
+    pub fn traffic_vs(&self, other: &VocabCost) -> f64 {
+        self.bytes_per_token() as f64 / other.bytes_per_token().max(1) as f64
+    }
+}
+
+/// Cost of carrying a vocabulary of `rows` rows at width `d_model`.
+pub fn vocab_cost(rows: u32, d_model: usize) -> VocabCost {
+    let (r, d) = (rows as u64, d_model as u64);
+    VocabCost {
+        rows: r,
+        d_model: d,
+        embed_bytes: r * d * 4,
+        head_bytes: r * d * 4,
+        head_macs_per_token: r * d,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE ENERGY FORM OF THE RESOLUTION FINDING. The README measures 243 codes and 32,768 codes
+    /// scoring the same on held-out accuracy at one corpus scale. If accuracy is equal, the cost
+    /// difference is the whole argument, and it is large.
+    #[test]
+    fn the_small_codebook_moves_far_fewer_bytes_per_token() {
+        let words = 6u32;
+        let markers = 3u32;
+        let d = 64usize;
+        let small = vocab_cost(words + 243 + markers, d);
+        let large = vocab_cost(words + 32_768 + markers, d);
+        assert!(small.bytes_per_token() < large.bytes_per_token());
+        let ratio = large.traffic_vs(&small);
+        assert!(
+            ratio > 100.0,
+            "expected the 32,768-code vocabulary to move over 100x the bytes per token, got {ratio:.0}x"
+        );
+    }
+
+    #[test]
+    fn the_head_dominates_a_single_row_lookup() {
+        let v = vocab_cost(32_777, 64);
+        // The lookup is one row; the head is every row. The ratio IS the vocabulary size.
+        assert!(v.head_bytes / (v.d_model * 4) > 30_000);
+        assert_eq!(v.bytes_per_token(), v.head_bytes + v.d_model * 4);
+    }
+
+    #[test]
+    fn vocab_cost_arithmetic_is_hand_checkable() {
+        let v = vocab_cost(10, 8);
+        assert_eq!(v.embed_bytes, 10 * 8 * 4);
+        assert_eq!(v.head_bytes, 10 * 8 * 4);
+        assert_eq!(v.head_macs_per_token, 80);
+        assert_eq!(v.bytes_per_token(), 320 + 32);
+    }
+
+    #[test]
+    fn a_vocabulary_costs_the_same_as_itself() {
+        let v = vocab_cost(1000, 64);
+        assert_eq!(v.traffic_vs(&v), 1.0);
+    }
 
     #[test]
     fn linear_terms_scale_linearly_and_attention_scales_quadratically() {
