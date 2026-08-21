@@ -14,6 +14,11 @@
 //!   the right one of three near neighbours, so it can genuinely fail, and it does.
 //! - **Passages are phrased away from the questions.** The corpus says "suffered a catastrophic power
 //!   excursion during a late-night safety test on 26 April 1986"; the question asks "in which year".
+//! - **No positional shortcut can pass.** In the invented-facts corpus every passage carries three
+//!   numbers (the value, a revision, a catalogue entry) and only half lead with the answer, so
+//!   "emit the first number you see" scores 11/22, as does "emit the last". Before that fix the
+//!   answer was always the leading number and a pure copying heuristic would have scored 22/22 —
+//!   the bench would have measured copying and reported it as comprehension.
 //! - **Both arms are graded by the same word-boundary matcher** against the same answer key, and the
 //!   per-task outcomes are printed, so any reader can check the grader rather than trust the tally.
 //!
