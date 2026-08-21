@@ -24,6 +24,30 @@ try {
   // prompt in it — the in-tab model supplies language competence, the web supplies the facts. This is
   // the architectural reason a 450 MB ternary model in a browser is not a compromise.
   let prompt = q.get('prompt') || 'The capital of France is';
+  // ?retriever=<url>: a SEPARATE checkpoint for embedding, and the honest answer to a claim this
+  // page used to make. Using the generator as its own retriever — pooling a hidden state from weights
+  // never trained to embed — retrieves the right passage 8 times in 22 on the graded bench in
+  // docs/sota-feature-matrix.md §Q, with top1-top2 margins around 0.01 and one chunk winning for
+  // unrelated questions. A single-question demo cannot detect that: it looks identical to retrieval
+  // working. A checkpoint trained to embed takes the same bench to 19/22 at 11x the margin, so the
+  // two roles get two models, and the page says which model did which.
+  let rm = null;
+  const retrUrl = q.get('retriever');
+  if (retrUrl) {
+    S('fetching retriever');
+    const rr = await fetch(retrUrl);
+    if (!rr.ok) throw new Error('retriever fetch ' + rr.status);
+    const rb = new Uint8Array(await rr.arrayBuffer());
+    S('loading retriever ' + (rb.length / 1048576 | 0) + ' MB');
+    rm = await FerricModel.load(rb);
+    document.getElementById('info').textContent += ' · retriever ' + (rb.length / 1048576 | 0) + ' MB';
+  } else {
+    document.getElementById('info').textContent += ' · retriever=self';
+  }
+  // Everything that embeds goes through this, so the probe, the corpus and the question can never be
+  // computed by different models — which would rank garbage while every cosine still looked ordinary.
+  const embedder = rm || m;
+
   // Corpus-scale "weights on the outside": ?corpus=<url> fetches a document set, EMBEDS every chunk
   // and the question IN-TAB, ranks by cosine, and grounds generation in the winners. Retrieval and
   // generation are both local; only the corpus is remote. The chosen chunk index is rendered as a
@@ -52,7 +76,7 @@ try {
       // different model's probe lands nowhere near it. The measured cross-fabric cosine is rendered
       // so the run leaves a record of HOW far apart the stacks actually were.
       const fileProbe = new Float32Array(buf, 16, nEmbd);
-      const probe = await m.embed('ferric model fingerprint probe');
+      const probe = await embedder.embed('ferric model fingerprint probe');
       let dotP = 0; for (let k = 0; k < nEmbd; k++) dotP += probe[k] * fileProbe[k];
       document.getElementById('info').textContent += ' · probe-cos ' + dotP.toFixed(6);
       if (!(dotP > 0.999)) throw new Error('corpus vectors were made by a DIFFERENT model (probe cosine ' + dotP.toFixed(4) + ')');
@@ -62,10 +86,10 @@ try {
     }
     S(vecsUrl ? 'embedding question' : 'embedding corpus');
     const t0r = performance.now();
-    const qv = await m.embed(prompt);
+    const qv = await embedder.embed(prompt);
     const scored = [];
     for (let i = 0; i < chunks.length; i++) {
-      const cv = corpusVecs ? corpusVecs[i] : await m.embed(chunks[i]);
+      const cv = corpusVecs ? corpusVecs[i] : await embedder.embed(chunks[i]);
       let dot = 0; for (let k = 0; k < qv.length; k++) dot += qv[k] * cv[k];
       scored.push([dot, i]);
     }
