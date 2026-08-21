@@ -695,3 +695,48 @@ top1–top2 margin 0.1826, all 22 passages distinct, net contribution +22.
 This is the measurable form of the browser-native thesis: a tab has the network, so the corpus is free
 to be current, private, and arbitrarily large, and the only thing that must fit in memory is the part
 that reads it.
+
+## S. The retrieval decay curve, and what a small retriever costs (2026-08-21)
+
+§R asserted that a browser tab's corpus "is free to be current, private, and arbitrarily large". That
+sentence rode on a single 66-chunk measurement. `crates/ferric-web/examples/retrieval_scale.rs`
+measures it: one embedding pass over 1000 chunks, then arithmetic over nested subsets that all share
+the same 22 answer-bearing passages, so the only variable is how many distractors the right answer
+must outrank.
+
+| chunks | retrieval@1 | margin (top1−top2) | top1 | second place | distinct passages |
+|---|---|---|---|---|---|
+| 22 | **22/22** | 0.4016 | 0.8299 | 0.4283 | 22 |
+| 50 | **22/22** | 0.2809 | 0.8299 | 0.5490 | 22 |
+| 100 | **22/22** | 0.2324 | 0.8299 | 0.5975 | 22 |
+| 200 | **22/22** | 0.2121 | 0.8299 | 0.6178 | 22 |
+| 400 | **22/22** | 0.1947 | 0.8299 | 0.6352 | 22 |
+| 700 | **22/22** | 0.1760 | 0.8299 | 0.6539 | 22 |
+| 1000 | **22/22** | 0.1610 | 0.8299 | 0.6689 | 22 |
+
+**retrieval@1 is perfect across a 45x range, and no question ever collapses onto another's passage.**
+
+**`top1` never moves.** It cannot — the question and its passage are unchanged at every size. The
+entire effect is the *runner-up* climbing, 0.4283 → 0.6689, as more distractors get more chances to
+look relevant. Stating the result as "retrieval degrades with corpus size" would be wrong in a way
+this column makes obvious: nothing about the right answer degrades, the field behind it crowds.
+
+**Decay is steep then flat.** The first few distractors cost the most (−0.1023 per doubling from 22
+to 50); by 200 chunks it settles to **−0.0225 per doubling** averaged over the last four steps.
+Extrapolating that rate, the margin would reach zero near **140,000 chunks** — an *extrapolation*
+from seven points that assumes the settled rate holds, not a measurement, and the practical ceiling
+sits well below it since ranking becomes a coin flip as the margin approaches zero. What is measured
+is that 1000 chunks is nowhere near the limit.
+
+### The retriever quantizes for free
+
+| retriever | size | retrieval@1 | margin @66 | end-to-end |
+|---|---|---|---|---|
+| Q8_0 | 639 MB | 22/22 | 0.1826 | 22/22 |
+| **Q4_K_M** | **396 MB** | 22/22 | 0.2132 | **22/22** |
+
+The margin difference runs in the candidate's favour, which on 22 questions is sampling noise: the
+claim is **no degradation**, never improvement. What matters is the size. With a 4-bit retriever the
+weights-outside system ships **860 MB against the memoriser's 1117 MB** — so the headline moves from
+"ties at equal bytes" to **wins at 1.3x smaller**, still 22/22 against 0/22 on facts nothing could
+have memorised.
