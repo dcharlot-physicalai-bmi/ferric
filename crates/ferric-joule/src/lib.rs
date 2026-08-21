@@ -11,9 +11,16 @@
 //! 1. **A [`Reading`] carries its measurement class.** A joule figure that came from a power sensor and
 //!    one that came from multiplying a nameplate TDP by a utilisation guess are different kinds of
 //!    object, and they do not silently mix. See [`Class`].
-//! 2. **A [`Saving`] cannot be constructed by hand.** The only way to obtain one is [`compare`], which
-//!    takes two closures, runs both, and keeps both readings. There is no `Saving::new`. If you have a
-//!    saving, you have the baseline, because the type system would not let you have it otherwise.
+//! 2. **A [`Saving`] cannot be constructed by hand.** The only ways to obtain one are [`compare`] and
+//!    [`compare_tasks`], which take two closures, run both, and keep both readings. There is no
+//!    `Saving::new`. If you have a saving, you have the baseline, because the type system would not
+//!    let you have it otherwise — enforced by `#[non_exhaustive]` and a `compile_fail` doc-test on
+//!    [`Saving`], which is an external crate at test time and so is the only place this is checkable.
+//!    Until 2026-08-21 this paragraph was prose and every field was `pub`; the property it asserted
+//!    was simply absent.
+//! 4. **A success count is observed, not accepted.** [`compare_tasks`] grades each task itself and
+//!    tallies per arm, because joules-per-completed-task turns entirely on that denominator and a
+//!    denominator supplied by the claimant is the failure mode in the paragraph above this list.
 //! 3. **An unavailable meter is an error, not a zero.** When no sensor can be read, [`Meter::read`]
 //!    returns `None` and every downstream figure is `None`. It never falls back to an estimate wearing
 //!    a measurement's clothes.
@@ -191,20 +198,47 @@ pub fn measure<M: Meter, T>(meter: &M, f: impl FnOnce() -> T) -> (T, Option<Read
 /// There is deliberately no constructor. `Saving` is produced solely by [`compare`], so possessing one
 /// is proof that both arms were actually run, on the same meter, in the same process. A percentage
 /// pulled from a slide cannot be turned into this type.
+/// Constructing one outside this crate is a compile error, and that is load-bearing rather than
+/// stylistic:
+///
+/// ```compile_fail
+/// use ferric_joule::{Saving, Reading, Class, Boundary};
+/// let r = Reading { joules: 1.0, seconds: 1.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+/// // `Saving` is #[non_exhaustive]: no struct literal, so no saving without two measured arms.
+/// let _ = Saving { baseline: r, candidate: r, tasks: 1, successes: (1, 1) };
+/// ```
+///
+/// That doc-test is the enforcement. The module header claimed this property from the beginning and
+/// the type did not have it until 2026-08-21 — every field was `pub`, so any crate could write the
+/// literal and hand-assemble a "saving" with no baseline behind it. A contract stated in prose and
+/// not in the type is a comment. Note the remaining gap, stated rather than hidden: [`Reading`] IS
+/// still constructible by hand, so a fabricated *reading* is possible; what is not possible is
+/// assembling two of them into the object that backs a claim.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Saving {
     pub baseline: Reading,
     pub candidate: Reading,
     /// Tasks ATTEMPTED by each arm.
     pub tasks: u64,
-    /// Tasks that SUCCEEDED. This is the denominator that matters, and it is separate from `tasks`
-    /// because unattended automation pays full price for its failures.
+    /// Tasks that SUCCEEDED, **per arm**. This is the denominator that matters, and it is separate
+    /// from `tasks` because unattended automation pays full price for its failures.
+    ///
+    /// It is a PAIR, and that is the whole point. This field was a single `u64` shared by both arms
+    /// until 2026-08-21, which quietly made it decorative: dividing both arms by the same number
+    /// changes the absolute figures and leaves every ratio — [`Saving::fraction`], [`Saving::percent`],
+    /// the ranking — bit-identical to [`Saving::per_attempt`]. A field that cannot change any
+    /// comparison cannot correct one, so the crate's central argument was unstatable in the crate's own
+    /// type. Two arms that succeed at the same rate is a *measurement*, never an assumption.
     ///
     /// Measured: in one agentic run, 2,256 J of 3,614 J (62.4%) went to a failed attempt before the
     /// successful retry (arXiv:2605.22883). On GAIA, the model burning 7.31 kJ per query scored 16.4%
     /// and the one burning 1.18 kJ scored 5.5% (arXiv:2511.07885) — per *successful* goal that is
-    /// 44.6 kJ against 21.5 kJ, which reverses the ranking energy-per-query gives you.
-    pub successes: u64,
+    /// 44.6 kJ against 21.5 kJ. Those numbers **narrow** the gap from 6.19x to 2.08x; they do not
+    /// reverse it, and this doc said "reverses" until the arithmetic was checked. The reversal is
+    /// real but needs a wider success gap than GAIA's, and `energy_per_success_can_reverse_the_ranking`
+    /// constructs the smallest one that does it.
+    pub successes: (u64, u64),
 }
 
 impl Saving {
@@ -224,12 +258,32 @@ impl Saving {
         self.baseline.seconds / self.candidate.seconds
     }
 
-    /// Joules per SUCCESSFUL task, both arms. The metric that actually matters.
+    /// Joules per SUCCESSFUL task, **each arm against its own success count**. The metric that
+    /// actually matters.
     ///
     /// Energy per query flatters anything that fails cheaply; energy per token flatters anything
     /// terse. Neither is a unit of useful work.
     pub fn per_success(&self) -> (f64, f64) {
-        (self.baseline.per_task(self.successes), self.candidate.per_task(self.successes))
+        (self.baseline.per_task(self.successes.0), self.candidate.per_task(self.successes.1))
+    }
+
+    /// The saving computed on the unit that matters, which can differ in SIGN from [`percent`].
+    ///
+    /// [`percent`] compares total energy, so an arm that fails more looks cheaper for failing. This
+    /// charges each arm for the work it actually completed. When the two disagree, this one is the
+    /// answer and the other is the artefact.
+    ///
+    /// [`percent`]: Saving::percent
+    pub fn percent_per_success(&self) -> f64 {
+        let (b, c) = self.per_success();
+        if !(b > 0.0) { return f64::NAN; }
+        (b - c) / b * 100.0
+    }
+
+    /// Fraction of attempts each arm completed, `(baseline, candidate)`.
+    pub fn success_rate(&self) -> (f64, f64) {
+        if self.tasks == 0 { return (f64::NAN, f64::NAN); }
+        (self.successes.0 as f64 / self.tasks as f64, self.successes.1 as f64 / self.tasks as f64)
     }
 
     /// Joules per attempt, which is what most published figures actually report.
@@ -259,8 +313,11 @@ impl Saving {
         if self.tasks == 0 {
             return Err("no task count was recorded, so joules-per-task is undefined");
         }
-        if self.successes == 0 {
-            return Err("no successes recorded: energy per successful task is the unit, and zero successes at any energy is not an efficiency result");
+        if self.successes.0 == 0 || self.successes.1 == 0 {
+            return Err("an arm recorded no successes: energy per successful task is the unit, and zero successes at any energy is not an efficiency result");
+        }
+        if self.successes.0 > self.tasks || self.successes.1 > self.tasks {
+            return Err("an arm recorded more successes than attempts, so the accounting is wrong before the energy is");
         }
         if self.baseline.seconds < 1.0 || self.candidate.seconds < 1.0 {
             return Err("an arm ran for under a second, which is inside the noise of every sensor listed in this crate");
@@ -272,9 +329,17 @@ impl Saving {
 impl std::fmt::Display for Saving {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (b, c) = self.per_success();
+        let (rb, rc) = self.success_rate();
         writeln!(f, "  baseline   {}", self.baseline)?;
         writeln!(f, "  candidate  {}", self.candidate)?;
-        writeln!(f, "  per success {b:.4} J -> {c:.4} J  ({}/{} succeeded)", self.successes, self.tasks)?;
+        writeln!(f, "  per success {b:.4} J -> {c:.4} J  ({}/{} vs {}/{} succeeded, {:.0}% vs {:.0}%)",
+                 self.successes.0, self.tasks, self.successes.1, self.tasks, rb * 100.0, rc * 100.0)?;
+        // Both percentages, always. Printing only the first is how an arm that fails more gets
+        // reported as an efficiency win for failing more cheaply.
+        writeln!(f, "  per success saving {:.1}%{}", self.percent_per_success(),
+                 if self.percent_per_success() * self.percent() < 0.0 {
+                     "  ⚠ OPPOSITE SIGN to the energy saving below: the arms did not do equal work"
+                 } else { "" })?;
         write!(f, "  saving     {:.1}% energy, {:.2}x speed [{}]  {}",
                self.percent(), self.speedup(), self.class().label(),
                match self.claimable() {
@@ -297,7 +362,7 @@ impl std::fmt::Display for Saving {
 pub fn compare<M: Meter>(
     meter: &M,
     tasks: u64,
-    successes: u64,
+    successes: (u64, u64),
     reps: usize,
     mut baseline: impl FnMut(),
     mut candidate: impl FnMut(),
@@ -328,6 +393,84 @@ pub fn compare<M: Meter>(
         tasks,
         successes,
     })
+}
+
+/// Measure two arms over a **graded task set**, counting each arm's successes rather than believing them.
+///
+/// [`compare`] takes the success counts as arguments, which means the number that decides the whole
+/// result — joules per completed task — arrives from outside the measurement, exactly like the
+/// baselines this crate exists to distrust. Here the closures return `bool` per task and the crate
+/// tallies them, so a `Saving` from this path cannot report a success rate no arm demonstrated.
+///
+/// Both arms see the SAME task slice in the same order. Energy is measured around the whole arm, not
+/// per task, because every sensor listed in this crate is far too coarse for a single short task; the
+/// per-task figure is division afterwards, and [`Saving::claimable`] refuses arms under a second.
+///
+/// Reps alternate which arm runs first, so thermal drift is not attributed to whichever went second.
+pub fn compare_tasks<M: Meter, T>(
+    meter: &M,
+    tasks: &[T],
+    reps: usize,
+    mut baseline: impl FnMut(&T) -> bool,
+    mut candidate: impl FnMut(&T) -> bool,
+) -> Option<(Saving, Vec<bool>, Vec<bool>)> {
+    if !meter.available() { return None; }
+    if tasks.is_empty() { return None; }
+    let reps = reps.max(1);
+    let (mut bj, mut bs, mut cj, mut cs) = (0.0, 0.0, 0.0, 0.0);
+    let (mut bok, mut cok) = (vec![false; tasks.len()], vec![false; tasks.len()]);
+
+    for i in 0..reps {
+        let mut run_b = |bok: &mut Vec<bool>| measure(meter, || {
+            for (n, t) in tasks.iter().enumerate() { bok[n] = baseline(t); }
+        });
+        let mut run_c = |cok: &mut Vec<bool>| measure(meter, || {
+            for (n, t) in tasks.iter().enumerate() { cok[n] = candidate(t); }
+        });
+        let (b, c) = if i % 2 == 0 {
+            let (_, b) = run_b(&mut bok);
+            let (_, c) = run_c(&mut cok);
+            (b?, c?)
+        } else {
+            let (_, c) = run_c(&mut cok);
+            let (_, b) = run_b(&mut bok);
+            (b?, c?)
+        };
+        bj += b.joules; bs += b.seconds; cj += c.joules; cs += c.seconds;
+    }
+
+    let n = reps as f64;
+    let mk = |j: f64, sec: f64| Reading {
+        joules: j / n, seconds: sec / n, class: meter.class(), source: meter.source(), boundary: meter.boundary(),
+    };
+    let saving = Saving {
+        baseline: mk(bj, bs),
+        candidate: mk(cj, cs),
+        tasks: tasks.len() as u64,
+        successes: (bok.iter().filter(|x| **x).count() as u64,
+                    cok.iter().filter(|x| **x).count() as u64),
+    };
+    Some((saving, bok, cok))
+}
+
+/// The task-set half of [`compare_tasks`] when no meter is available.
+///
+/// On a laptop on AC power there is no readable energy sensor, and this crate refuses to invent one.
+/// That must not also mean the *success* half of the comparison cannot be measured — success rates
+/// are what the energy figure would be divided BY, and they are measurable on any machine. This runs
+/// both arms and returns the graded outcomes with wall-clock, and deliberately returns no [`Saving`],
+/// because a saving without a meter is the thing this crate was written to prevent.
+pub fn grade_tasks<T>(
+    tasks: &[T],
+    mut baseline: impl FnMut(&T) -> bool,
+    mut candidate: impl FnMut(&T) -> bool,
+) -> (Vec<bool>, Vec<bool>, (f64, f64)) {
+    let t0 = Instant::now();
+    let bok: Vec<bool> = tasks.iter().map(&mut baseline).collect();
+    let bsec = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    let cok: Vec<bool> = tasks.iter().map(&mut candidate).collect();
+    (bok, cok, (bsec, t1.elapsed().as_secs_f64()))
 }
 
 // ---- meters ----
@@ -564,7 +707,7 @@ mod tests {
         // efficient run, so a broken sensor must not be able to look like a win.
         let (_, r) = measure(&Dead, || std::hint::black_box(1 + 1));
         assert!(r.is_none(), "a dead meter produced a reading");
-        assert!(compare(&Dead, 1, 1, 1, || {}, || {}).is_none(), "a dead meter produced a saving");
+        assert!(compare(&Dead, 1, (1, 1), 1, || {}, || {}).is_none(), "a dead meter produced a saving");
     }
 
     #[test]
@@ -572,9 +715,9 @@ mod tests {
         // Enforced by there being no constructor. This test documents the intent so that adding one
         // later is a visible decision rather than a convenience someone slipped in.
         let m = Fake::new(1.0, Class::Measured);
-        let s = compare(&m, 10, 10, 1, || {}, || {}).expect("meter is available");
+        let s = compare(&m, 10, (10, 9), 1, || {}, || {}).expect("meter is available");
         assert_eq!(s.tasks, 10);
-        assert_eq!(s.successes, 10);
+        assert_eq!(s.successes, (10, 9));
         // The only public path to Saving is compare(); the struct's fields are readable but there is no
         // way to fabricate the readings without a Meter having produced them.
         let _ = s.baseline;
@@ -584,7 +727,7 @@ mod tests {
     fn an_estimate_may_not_back_a_claim() {
         let est = Nameplate::new(50.0);
         std::thread::sleep(Duration::from_millis(1100));
-        let s = compare(&est, 100, 100, 1, || std::thread::sleep(Duration::from_millis(1100)),
+        let s = compare(&est, 100, (100, 100), 1, || std::thread::sleep(Duration::from_millis(1100)),
                                        || std::thread::sleep(Duration::from_millis(1100)))
             .expect("nameplate is always available");
         assert_eq!(s.class(), Class::Estimated);
@@ -594,7 +737,7 @@ mod tests {
     #[test]
     fn a_sub_second_arm_is_refused_because_it_is_inside_sensor_noise() {
         let m = Fake::new(1.0, Class::Measured);
-        let s = compare(&m, 5, 5, 1, || {}, || {}).unwrap();
+        let s = compare(&m, 5, (5, 5), 1, || {}, || {}).unwrap();
         assert!(s.claimable().is_err(), "a run of microseconds was accepted as claimable");
     }
 
@@ -616,7 +759,7 @@ mod tests {
         let r = Ramp { n: std::cell::Cell::new(0) };
         let (_, b) = measure(&r, || {});
         let (_, c) = measure(&r, || {});
-        let s = Saving { baseline: b.unwrap(), candidate: c.unwrap(), tasks: 1, successes: 1 };
+        let s = Saving { baseline: b.unwrap(), candidate: c.unwrap(), tasks: 1, successes: (1, 1) };
         assert!(s.fraction() < 0.0, "a worse candidate was not reported as negative");
         assert!((s.percent() + 200.0).abs() < 1e-6, "expected -200%, got {}", s.percent());
     }
@@ -625,7 +768,7 @@ mod tests {
     fn the_weaker_class_wins_a_comparison() {
         let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "x", boundary: Boundary::DEVICE };
         let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Estimated, source: "x", boundary: Boundary::DEVICE };
-        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: 1 };
+        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: (1, 1) };
         assert_eq!(s.class(), Class::Estimated, "a comparison claimed to be stronger than its weaker arm");
     }
 
@@ -633,7 +776,7 @@ mod tests {
     fn mismatched_meters_are_not_comparable() {
         let a = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "rapl:package", boundary: Boundary::DEVICE };
         let b = Reading { joules: 5.0, seconds: 2.0, class: Class::Measured, source: "nvidia-smi:board", boundary: Boundary::DEVICE };
-        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: 1 };
+        let s = Saving { baseline: a, candidate: b, tasks: 1, successes: (1, 1) };
         assert!(s.claimable().is_err(), "energy from two different sensors was accepted as a difference");
     }
 
@@ -671,7 +814,7 @@ mod boundary_tests {
         // Comparing across that boundary attributes an accounting choice to a method.
         let dev = Reading { joules: 100.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
         let sys = Reading { joules: 42.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::SYSTEM };
-        let s = Saving { baseline: sys, candidate: dev, tasks: 10, successes: 10 };
+        let s = Saving { baseline: sys, candidate: dev, tasks: 10, successes: (10, 10) };
         assert!(s.claimable().is_err(), "a cross-boundary comparison was accepted");
         assert!(s.claimable().unwrap_err().contains("enclose different things"));
     }
@@ -682,22 +825,94 @@ mod boundary_tests {
         // Per query the cheap one wins; per SUCCESS it is 21.5 kJ against 44.6 kJ and the ranking holds
         // only because both succeeded sometimes. At zero successes there is no efficiency at any energy.
         let r = Reading { joules: 10.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
-        let s = Saving { baseline: r, candidate: r, tasks: 100, successes: 0 };
+        let s = Saving { baseline: r, candidate: r, tasks: 100, successes: (100, 0) };
         assert!(s.claimable().unwrap_err().contains("no successes"));
     }
 
     #[test]
-    fn energy_per_success_can_reverse_energy_per_attempt() {
-        // The whole reason `successes` is a separate field.
-        let cheap = Reading { joules: 1180.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
-        let dear  = Reading { joules: 7310.0, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
-        // 1000 attempts each; the expensive arm succeeds 3x as often.
-        let s = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: 164 };
-        let t = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: 55 };
-        // Per attempt the cheap arm always looks better; per success depends on which denominator is real.
-        let (_, cheap_per_attempt) = s.per_attempt();
-        assert!(cheap_per_attempt < 7.31, "per-attempt arithmetic broke");
-        assert!(s.per_success().1 < t.per_success().1, "more successes must lower joules per success");
+    fn energy_per_success_can_reverse_the_ranking() {
+        // The previous version of this test was VACUOUS, and it is worth saying how, because the
+        // mechanism is new: it compared `s.per_success().1 < t.per_success().1` across two DIFFERENT
+        // `Saving`s that shared a Reading, which reduces to 1180/164 < 1180/55 — the monotonicity of
+        // division, true for every input, including inputs where the ranking does not reverse at all.
+        // The name claimed a property BETWEEN THE TWO ARMS; the assertion tested arithmetic inside one
+        // accessor. It could not have failed.
+        let r = |j: f64| Reading { joules: j, seconds: 2.0, class: Class::Measured, source: "m", boundary: Boundary::DEVICE };
+        let (dear, cheap) = (r(7310.0), r(1180.0));
+
+        // 1. The real GAIA figures NARROW the gap; they do not reverse it. This is the case the field
+        //    quotes, and the honest reading of it is 6.19x -> 2.08x, still in the cheap arm's favour.
+        let gaia = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: (164, 55) };
+        let (b, c) = gaia.per_attempt();
+        assert!((b / c - 6.19).abs() < 0.01, "per attempt the dear arm costs 6.19x, got {:.3}x", b / c);
+        let (b, c) = gaia.per_success();
+        assert!((b / c - 2.08).abs() < 0.01, "per success that falls to 2.08x, got {:.3}x", b / c);
+        assert!(gaia.percent() > 0.0 && gaia.percent_per_success() > 0.0,
+                "GAIA narrows the gap without crossing zero, so both savings stay positive");
+
+        // 2. A reversal needs a wider success gap, and then BOTH SIGNS FLIP — which is the property
+        //    the old assertion could not express, because a shared denominator cancels out of every
+        //    ratio this type computes.
+        let rev = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: (500, 55) };
+        assert!(rev.percent() > 0.0, "the cheap arm still burns less total energy: {:.1}%", rev.percent());
+        assert!(rev.percent_per_success() < 0.0,
+                "and yet it costs MORE per completed task; that reversal is the whole point of the \
+                 field, and it must show up as a sign disagreement: {:.1}% vs {:.1}%",
+                rev.percent(), rev.percent_per_success());
+
+        // 3. THE REGRESSION GUARD for the defect this replaced: with the denominators shared, no
+        //    reversal is representable, because per_success and per_attempt differ by a constant
+        //    factor that divides out. Equal success counts must therefore agree in sign with
+        //    per_attempt for every possible pair of readings.
+        let equal = Saving { baseline: dear, candidate: cheap, tasks: 1000, successes: (164, 164) };
+        assert!((equal.percent() - equal.percent_per_success()).abs() < 1e-9,
+                "with equal successes the two savings are the SAME number — if they ever differ, the \
+                 per-arm denominators stopped being applied per arm");
+    }
+
+    #[test]
+    fn compare_tasks_counts_successes_instead_of_believing_them() {
+        // The point of this path: the success counts are OBSERVED from the closures, so a caller
+        // cannot report a rate no arm demonstrated. Here the baseline solves the even tasks and the
+        // candidate solves the first three — chosen so the two counts differ AND neither equals the
+        // task count, which is what makes a wrong denominator visible.
+        let m = Nameplate::new(10.0);
+        let tasks: Vec<u32> = (0..10).collect();
+        let (s, bok, cok) = compare_tasks(&m, &tasks, 1,
+            |t| t % 2 == 0,
+            |t| *t < 3,
+        ).expect("nameplate is always available");
+        assert_eq!(s.successes, (5, 3), "counted from the closures, not from an argument");
+        assert_eq!(bok.iter().filter(|x| **x).count(), 5);
+        assert_eq!(cok.iter().filter(|x| **x).count(), 3);
+        assert_eq!(s.tasks, 10);
+        // And the graded outcomes come back per task, so a caller can show WHICH tasks each arm lost
+        // rather than only how many. A bench that reports 5/10 without saying which five cannot be
+        // audited by anyone, including its author.
+        assert!(bok[0] && !bok[1], "per-task outcomes must survive, not just the tally");
+        assert!(cok[2] && !cok[3]);
+    }
+
+    #[test]
+    fn compare_tasks_refuses_an_empty_task_set() {
+        // Zero tasks is not a comparison of zero cost; it is an absent comparison. Returning a Saving
+        // with tasks: 0 would put a NaN into every downstream figure and let `claimable` be the only
+        // thing standing between that and a published number.
+        let m = Nameplate::new(10.0);
+        let empty: [u32; 0] = [];
+        assert!(compare_tasks(&m, &empty, 1, |_| true, |_| true).is_none());
+    }
+
+    #[test]
+    fn grade_tasks_measures_the_denominator_when_no_meter_exists() {
+        // The case this machine is actually in: on AC power there is no readable sensor, and the
+        // success halves of the comparison are still measurable. This path returns no Saving BY
+        // CONSTRUCTION — there is no meter, so there is no energy claim to be made — while still
+        // producing the per-task outcomes that any later energy figure would be divided by.
+        let tasks: Vec<u32> = (0..8).collect();
+        let (bok, cok, (bs, cs)) = grade_tasks(&tasks, |t| t % 4 == 0, |t| *t < 6);
+        assert_eq!((bok.iter().filter(|x| **x).count(), cok.iter().filter(|x| **x).count()), (2, 6));
+        assert!(bs >= 0.0 && cs >= 0.0, "wall-clock is reported even when joules are not");
     }
 
     #[test]

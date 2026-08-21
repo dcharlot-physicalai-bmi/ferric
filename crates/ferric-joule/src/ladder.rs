@@ -189,11 +189,17 @@ impl Routed {
     /// The resulting [`Saving`] then carries both arms and everything [`Saving::claimable`] checks.
     pub fn against(&self, top_only: &Routed, class: Class, source: &'static str,
                    boundary: crate::Boundary, seconds: (f64, f64)) -> Saving {
+        // Each arm's OWN success count. This read `successes: self.succeeded()` — the ladder's own
+        // number, applied to both arms — until 2026-08-21, which is precisely the error a ladder
+        // exists to expose: routing buys its energy saving by resolving more work on weaker rungs,
+        // so the arm that saves energy is exactly the arm whose success count is most likely to
+        // differ. Charging the top-rung baseline the ladder's success count made the saving read as
+        // free.
         Saving {
             baseline: Reading { joules: top_only.joules(), seconds: seconds.0, class, source, boundary },
             candidate: Reading { joules: self.joules(), seconds: seconds.1, class, source, boundary },
             tasks: self.attempted(),
-            successes: self.succeeded(),
+            successes: (top_only.succeeded(), self.succeeded()),
         }
     }
 }
@@ -305,8 +311,34 @@ mod tests {
         let b = Routed { trails: vec![Trail { attempts: vec![("x", Reading { joules: 40.0, seconds: 1.0, class: Class::Measured, source: "s", boundary: Boundary::DEVICE })], resolved_by: Some("x") }] };
         let s = a.against(&b, Class::Measured, "s", Boundary::DEVICE, (4.0, 1.0));
         assert!((s.percent() - 75.0).abs() < 1e-9, "expected 75%, got {}", s.percent());
-        assert_eq!(s.successes, 1);
+        assert_eq!(s.successes, (1, 1), "both arms resolved their one task here");
         assert!(s.claimable().is_ok(), "{:?}", s.claimable());
+    }
+
+    #[test]
+    fn a_ladder_that_saves_energy_by_resolving_less_does_not_read_as_a_free_win() {
+        // `against` charged BOTH arms the ladder's own success count until 2026-08-21. That is the
+        // one place the error is guaranteed to matter: a ladder buys its saving by resolving work on
+        // weaker rungs, so the arm that saves the energy is the arm whose success count differs.
+        let rd = |j: f64| Reading { joules: j, seconds: 1.0, class: Class::Measured, source: "s", boundary: Boundary::DEVICE };
+        let trail = |j: f64, ok: bool| Trail { attempts: vec![("r", rd(j))], resolved_by: if ok { Some("r") } else { None } };
+
+        // Ladder: 4 tasks at 10 J, 2 resolved. Top-rung-only: 4 tasks at 40 J, all 4 resolved.
+        let ladder = Routed { trails: (0..4).map(|i| trail(10.0, i < 2)).collect() };
+        let top = Routed { trails: (0..4).map(|_| trail(40.0, true)).collect() };
+        let s = ladder.against(&top, Class::Measured, "s", Boundary::DEVICE, (4.0, 4.0));
+
+        assert_eq!(s.successes, (4, 2), "each arm must carry its OWN success count");
+        assert!((s.percent() - 75.0).abs() < 1e-9, "total energy still falls 75%: {:.1}%", s.percent());
+        // 160 J / 4 = 40 J per resolved task; 40 J / 2 = 20 J per resolved task. Still a win, but 50%
+        // rather than 75% — the routing gave back a third of the saving in unresolved work, and the
+        // old code could not have shown that because both arms divided by 2.
+        let (b, c) = s.per_success();
+        assert!((b - 40.0).abs() < 1e-9 && (c - 20.0).abs() < 1e-9, "per success {b} -> {c}");
+        assert!((s.percent_per_success() - 50.0).abs() < 1e-9,
+                "the saving on the unit that matters is 50%, not 75%: {:.1}%", s.percent_per_success());
+        assert!(s.percent_per_success() < s.percent(),
+                "a ladder that resolves less MUST look worse per success than per joule");
     }
 
     #[test]

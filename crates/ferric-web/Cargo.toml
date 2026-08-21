@@ -28,3 +28,4 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 pollster = "0.4"
+ferric-joule = { path = "../ferric-joule", version = "0.3" }
