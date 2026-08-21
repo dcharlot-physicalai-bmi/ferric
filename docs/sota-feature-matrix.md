@@ -598,3 +598,48 @@ needs — `compare_tasks()`, which grades the closures and **tallies** successes
 cannot report a rate no arm demonstrated, and `grade_tasks()` for machines with no readable sensor.
 
 All four fixes are mutation-proven: reinstating each defect turns the suite red.
+
+## Q. "Weights on the outside", graded — and what the control arm did to it (2026-08-21)
+
+`crates/ferric-web/examples/lookup_vs_weights.rs`. The thesis under test: *a model small enough to
+ship to a tab, with the corpus outside its weights, answers more questions correctly than a model
+several times larger answering from memory.* 22 real, checkable facts; 66 corpus chunks with **every
+answer flanked by two topically adjacent distractors** (Chernobyl beside Three Mile Island and
+Fukushima; gold beside silver and platinum); both arms graded by the same word-boundary matcher.
+
+**The prediction was registered in the source before the first run, and it was refuted.**
+
+| arm | bytes | score |
+|---|---|---|
+| weights INSIDE — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** |
+| CONTROL — qwen3-0.6b, closed book | 397 MB | 14/22 (64%) |
+| weights OUTSIDE — qwen3-0.6b + 66 chunks, generator as its own retriever | 397 MB | 14/22 (64%) |
+
+**The control is the whole bench.** Retrieval's net contribution was **+0**: two questions answered
+only *with* the passage, two *lost* by having it. The 64% was entirely what the small model already
+knew, and on two questions an irrelevant passage displaced an answer the model would have given
+unaided. Without the control this reads as "small + retrieval scores 64%" and credits the corpus with
+work the corpus did not do.
+
+### The cause was a retriever the code had already warned about
+
+`FerricModel::embed` pools the last hidden state, and its own doc says doing that on a checkpoint not
+trained for embedding "hands back plausible cosine scores that mean nothing". **Its guard checks the
+runtime kind (`Dense`), not whether the weights were trained for the task**, so a generative model
+passes it silently. Swapping in a checkpoint actually trained to embed:
+
+| | generator as retriever | trained retriever |
+|---|---|---|
+| retrieval@1 | 8/22 | **19/22** |
+| mean top1–top2 margin | 0.0108 | **0.1188** (11x) |
+| distinct passages for 22 questions | 14 | **22** (no collapse) |
+| lookup arm score | 14/22 | **18/22** |
+| retrieval's net contribution | **+0** (+2 / −2) | **+4** (+4 / −0) |
+
+**But a working retriever is not free.** `qwen3-embed-0.6b` is 639 MB, so the candidate ships 1036 MB
+against the baseline's 1117 MB — the size ratio the thesis rests on falls from **2.8x to 1.08x**.
+Pricing only the generator would be the same class of error as a baseline measured at 3.4% MFU.
+
+**Standing result on memorised world facts: at equal bytes, memorising beat looking up, 20 to 18.**
+That is the case most favourable to weights-inside, since every fact is in the baseline's training
+data by construction.
