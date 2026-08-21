@@ -662,17 +662,23 @@ have scored 22/22 — indistinguishable from the result the best arm actually go
 
 ## R. The full matrix (2026-08-21)
 
-| system | total bytes | memorised world facts | facts nothing could memorise |
-|---|---|---|---|
-| **weights INSIDE** — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** | **0/22 (0%)** |
-| **weights OUTSIDE** — Bonsai-1.7B **ternary** + qwen3-embed + corpus | **1102 MB** | **20/22 (91%)** | **22/22 (100%)** |
-| weights OUTSIDE — qwen3-0.6b + qwen3-embed + corpus | 1036 MB | 18/22 (82%) | 19/22 (86%) |
-| *control* — Bonsai-1.7B ternary, closed book | 463 MB | 17/22 | 0/22 |
-| *control* — qwen3-0.6b, closed book | 397 MB | 14/22 | 0/22 |
+| system | total bytes | memorised world facts | invented facts (66) | invented facts (1000) |
+|---|---|---|---|---|
+| **weights INSIDE** — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** | **0/22** | **0/22** |
+| **weights OUTSIDE** — Bonsai-1.7B **ternary** + **Q4_K_M** retriever | **860 MB** | **20/22 (91%)** | **22/22** | **22/22** |
+| weights OUTSIDE — Bonsai-1.7B ternary + Q8_0 retriever | 1102 MB | 20/22 (91%) | 22/22 | 22/22 |
+| weights OUTSIDE — qwen3-0.6b + Q8_0 retriever | 1036 MB | 18/22 (82%) | 19/22 | — |
+| *control* — Bonsai-1.7B ternary, closed book | 463 MB | 17/22 | 0/22 | 0/22 |
+| *control* — qwen3-0.6b, closed book | 397 MB | 14/22 | 0/22 | — |
 
-**At 1.3% fewer bytes, the ternary system ties the memoriser on the memoriser's home turf and beats
-it 22 to 0 everywhere else.** On the invented corpus it made zero errors: retrieval@1 22/22, mean
-top1–top2 margin 0.1826, all 22 passages distinct, net contribution +22.
+**At 77% of the memoriser's bytes, the ternary + corpus system ties it on the facts it memorised and
+beats it 22–0 on the facts it could not — and holds that across a 45x range of corpus sizes.**
+
+On the invented corpus the ternary arm made zero errors at either corpus size: retrieval@1 22/22,
+all 22 passages distinct, net contribution +22. On world facts it retrieves 20/22 with the 4-bit
+retriever against 19/22 with the 8-bit one, so quantisation costs nothing on the *harder* retrieval
+problem either — paraphrased questions against topically adjacent distractors, where the margin sits
+at 0.1207 rather than the invented corpus's 0.16–0.21.
 
 ### What the three rows say that one row cannot
 
