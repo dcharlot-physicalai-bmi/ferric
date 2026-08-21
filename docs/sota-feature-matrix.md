@@ -643,3 +643,37 @@ Pricing only the generator would be the same class of error as a baseline measur
 **Standing result on memorised world facts: at equal bytes, memorising beat looking up, 20 to 18.**
 That is the case most favourable to weights-inside, since every fact is in the baseline's training
 data by construction.
+
+### The other half: facts no model can have memorised
+
+The bench above is the case *most favourable to weights-inside*, because every fact in it is in the
+baseline's training data by construction. The regime the thesis is actually about is knowledge a
+model cannot have — post-cutoff, private, local, specific. So the same harness was run against 22
+invented instruments with invented parameters (`web/qa_novel.tsv`, `web/qa_novel_corpus.txt`), each
+answer flanked by two siblings carrying **different** values, every number in the corpus globally
+unique so no answer can be matched by a word-boundary hit on another instrument's figure, and the
+whole set generated from a fixed seed so it reproduces from the file alone.
+
+| arm | bytes | memorised world facts | facts nothing could memorise |
+|---|---|---|---|
+| weights INSIDE — qwen1.5b, closed book | 1117 MB | **20/22 (91%)** | **0/22 (0%)** |
+| CONTROL — qwen3-0.6b, closed book | 397 MB | 14/22 (64%) | **0/22 (0%)** |
+| weights OUTSIDE — qwen3-0.6b + trained retriever + corpus | 1036 MB | 18/22 (82%) | **20/22 (91%)** |
+
+retrieval@1 was **22/22**, mean top1–top2 margin 0.1835, all 22 passages distinct, net contribution
+**+20**. Both lookup failures were handed the right passage and did not use it — extraction, not
+search, which is the ceiling the registered prediction named.
+
+**The precise statement the two benches support together:**
+
+1. Where the model already knows the answer, memorising **wins narrowly** — 20 to 18, at equal bytes.
+   Shipping a corpus does not beat shipping parameters on their home turf.
+2. Where the model cannot know the answer, lookup is **the only arm that works at all** — 20 to 0,
+   and the 397 MB generator scores the *same 91%* the 2.8x larger model scores on facts it memorised.
+3. So the case for weights-outside is not that it beats memorisation. It is that **memorisation has a
+   hard zero** outside its training data, and no parameter count moves it. A model that ships with
+   the corpus outside covers both regimes; a model that ships with everything inside covers one.
+
+This is the measurable form of the browser-native thesis: a tab has the network, so the corpus is
+free to be current, private, and arbitrarily large, and the only thing that must fit in memory is the
+part that reads it.
