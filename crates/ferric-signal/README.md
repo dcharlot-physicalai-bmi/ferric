@@ -163,6 +163,44 @@ Two things follow, and the second is the more useful:
   trained on 23 billion tokens; at 80 training examples it buys nothing over 243 codes. A codebook
   is sized for a corpus, and a reproduction inherits the number without inheriting the corpus.
 
+### Does the safe interval move with corpus size? No, over this range.
+
+If resolution has to be matched to coverage, coarse and fine codebooks should trade places as the
+corpus grows. Measured across a 135x codebook span and a 16x corpus span, they do not:
+
+| corpus (variants/kind) | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| 243 codes | 30% | 27% | 48% | 37% | **62%** |
+| 32,768 codes | 26% | 45% | 35% | 43% | **62%** |
+
+The two rows track each other inside noise at every point (n is 26–31 after exclusions, so one
+example is 3–4%), and both land on the same figure at the largest corpus. **This is a null result
+and is reported as one.** What it narrows is the shape of the earlier claim: resolution does not
+trade against corpus size here, it simply has a wide safe interval whose two ends fail hard —
+total sequence collapse below it, unvisited codes above it.
+
+### Which makes the codebook an energy decision, not an accuracy one
+
+A decoder touches its vocabulary twice per position: one row on the way in, and **every row** at the
+output head on the way out. The head is the term that grows with codebook size, and at 64-wide
+embeddings it is the dominant traffic per token generated:
+
+| codes | rows | output head | read per token |
+|---|---|---|---|
+| 243 | 252 | 0.06 MB | **63 KiB** |
+| 1,024 | 1,033 | 0.26 MB | 259 KiB |
+| 32,768 | 32,777 | 8.39 MB | **8,195 KiB** |
+| 248,832 | 248,841 | 63.70 MB | 62,211 KiB |
+
+**130x the bytes per token, for held-out accuracy measured equal.** This crate's own arithmetic
+intensity is about 8 FLOP per weight byte against the 100–300 a modern part needs to be
+compute-bound, so bytes moved — not operations — set the bill at the edge. `vocab_cost` computes
+this exactly, and the accounting is tested, including the check that the head dominates a
+single-row lookup by exactly the vocabulary size.
+
+If accuracy is flat across the plateau, the choice is free on accuracy and expensive on energy, and
+only one of those shows up in a benchmark table.
+
 What the whole set of measurements supports:
 
 - **Generalization in this regime flows through shared codes, and a tokenizer sharp enough to
