@@ -124,3 +124,36 @@ async fn run() {
               chunks, so the sweep measures crowding alone. It does NOT re-measure extraction —\n  \
               whether the generator uses the passage it is handed is lookup_vs_weights' question.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hit;
+
+    /// `hit` is duplicated from `lookup_vs_weights.rs` — examples cannot share a module without a
+    /// lib target, so the two copies can drift, and if they do the two benches silently grade by
+    /// different rules while reporting into the same table. These are the SAME cases that file
+    /// asserts, so a divergence in either copy turns one of the two suites red.
+    #[test]
+    fn the_grader_matches_the_one_lookup_vs_weights_uses() {
+        assert!(!hit("The disaster occurred in 1986.", "2"));
+        assert!(!hit("Water boils at 212 degrees.", "2"));
+        assert!(!hit("The iPhone launched in 2007.", "2"));
+        assert!(hit("The smallest prime number is 2.", "2"));
+        assert!(hit("2 is prime", "2"));
+        assert!(hit("the answer is 2", "2"));
+        assert!(hit("It is the Amazon.", "amazon"));
+        assert!(!hit("a golden age of chemistry", "gold"));
+        assert!(!hit("Winds swept the plain", "W"));
+        assert!(hit("The symbol is W.", "W"));
+    }
+
+    #[test]
+    fn a_five_digit_filler_value_cannot_be_read_as_a_four_digit_answer() {
+        // The 1000-chunk corpus draws filler from 10000..99999 and answers from 1000..9999 precisely
+        // so no distractor can collide. That disjointness is only worth anything if the grader
+        // respects digit boundaries, which is this assertion.
+        assert!(!hit("last amended at revision 22650", "2265"));
+        assert!(!hit("catalogue number 12265", "2265"));
+        assert!(hit("stabilises at 2265 millikelvin", "2265"));
+    }
+}
