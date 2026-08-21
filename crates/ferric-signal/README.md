@@ -126,6 +126,43 @@ Trainable embeddings lift the sharp tokenizer at small and mid sizes — 12% to 
 inside noise at these sample sizes. The blurry tokenizer wins every cell. The control in the
 trainable configuration lands at 25% against the 20% chance line, one example above it.
 
+### The direct test: sweeping codebook resolution at fixed corpus
+
+The conclusions above say resolution must be matched to coverage. That is testable in one
+parameter, so it was tested: hold the corpus at 16 variants per kind and sweep the quantizer from
+2 to 12 levels per latent dimension.
+
+| levels/dim | codes | distinct sequences | held-out | excluded | code overlap |
+|---|---|---|---|---|---|
+| 2 | 32 | **1 of 80** | undefined | 40 of 40 | 100% |
+| 3 | 243 | 62 of 80 | **62%** | 14 | 99% |
+| 4 | 1,024 | 60 of 80 | 57% | 12 | 96% |
+| 6 | 7,776 | 65 of 80 | 58% | 9 | 91% |
+| 8 | 32,768 | 66 of 80 | **62%** | 11 | 76% |
+| 12 | 248,832 | 65 of 80 | 48% | 9 | 56% |
+
+**A plateau bounded by two failure modes, not a peak.** At 32 codes the tokenizer emits ONE
+sequence for all eighty training examples — damped, thermal, square, chirp and noise become the
+same token stream, train accuracy falls to guessing, and every held-out example is excluded as
+token-identical. Held-out accuracy is reported as undefined rather than as a number, because with
+no distinct sequences there is nothing to score. At 248,832 codes the opposite failure begins:
+overlap falls to 56%, held-out signals land on codes the corpus never visited, and accuracy drops
+to 48%.
+
+Between those walls, across a **135x span of codebook size**, held-out sits at 57–62% — flat within
+noise at these sample sizes (n is 26–31 after exclusions, so one example is 3–4%). 243 codes and
+32,768 codes perform the same.
+
+Two things follow, and the second is the more useful:
+
+- **Resolution is the causal variable; training the tokenizer was a proxy for it.** The earlier
+  rows are re-read by this sweep: the untrained tokenizer won not because it was untrained but
+  because it was COARSE, and coarse in the useful range. Training sharpened it past the plateau.
+- **At this corpus scale the codebook can be two orders of magnitude smaller for the same
+  accuracy.** The 32,768-code default is inherited from the published description of a model
+  trained on 23 billion tokens; at 80 training examples it buys nothing over 243 codes. A codebook
+  is sized for a corpus, and a reproduction inherits the number without inheriting the corpus.
+
 What the whole set of measurements supports:
 
 - **Generalization in this regime flows through shared codes, and a tokenizer sharp enough to

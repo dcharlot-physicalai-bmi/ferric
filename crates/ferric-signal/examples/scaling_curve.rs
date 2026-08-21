@@ -41,6 +41,11 @@
 //!   held-out variant — and then tokenizes both splits with the trained encoder. The untrained
 //!   tokenizer collapsed the entire thermal family to shared token sequences; this flag exists to
 //!   measure what training the tokenizer buys back.
+//! - `--fsq-levels L` sets the quantizer to L levels per latent dimension, so the codebook is
+//!   L^5 codes. This is the direct test of the series' own conclusion — that codebook resolution
+//!   must be matched to corpus coverage. If that is right, holding the corpus fixed and sweeping L
+//!   should show an INTERIOR optimum: too coarse and distinct processes collide, too fine and
+//!   held-out signals land on codes the corpus never visited.
 //! - "Chance" is 1-in-5: the score demands the argmax over all 32,777 rows land on the one true
 //!   word among 5, so 20% is what guessing uniformly among the five words would earn, and the
 //!   model can do worse by preferring a signal token.
@@ -62,7 +67,10 @@ const PATCH: usize = 16;
 const PATCHES: usize = 6;
 const BATCH: usize = 5;
 const HELD_BASE: usize = 100;
-const HELD_PER_KIND: usize = 4;
+// Eight held-out variants per kind gives n=40 before exclusions, so one example is 2.5% rather
+// than 6%. The adversarial review flagged the original n=20 as too coarse to carry a
+// curve-slope decision, and eval is cheap next to training.
+const HELD_PER_KIND: usize = 8;
 
 fn num(args: &[String], name: &str, default: usize) -> usize {
     args.iter()
@@ -90,6 +98,11 @@ fn main() {
     // This is the cell the isolation sweep priced: a sharp tokenizer under a FROZEN embedding lost
     // to the untrained one at every corpus size, because an unseen code was an untrained row.
     let train_embed = args.iter().any(|a| a == "--train-embeddings");
+    let fsq_levels = num(&args, "--fsq-levels", 8);
+    if !(2..=16).contains(&fsq_levels) {
+        eprintln!("--fsq-levels must be in 2..=16 (codebook is L^5)");
+        std::process::exit(2);
+    }
     // The tokenizer's own corpus, in variants per kind. Defaults to the LM's corpus. Setting it
     // larger (e.g. 16 while sweeping --variants) holds tokenizer quality CONSTANT across the sweep,
     // isolating what data buys the LM: with both retrained per size, the x-axis moves two things
@@ -115,7 +128,7 @@ fn main() {
     };
     let ctx = Arc::new(ctx);
 
-    let q = Fsq::signal_15bit();
+    let q = Fsq::new(vec![fsq_levels as u32; 5]).expect("levels validated above");
     let seq = Sequencer::new(HybridVocab::new(WORDS.len() as u32, q.clone()).unwrap());
     let rows = seq.embedding_rows();
 
@@ -228,6 +241,8 @@ fn main() {
         println!("  embedding table UNFROZEN: {} rows train with the LM", rows);
     }
     println!("  tokenizer fixed and untrained; embedding frozen; LM trains");
+    println!("  codebook: {} levels/dim = {} codes; embedding table {} rows",
+             fsq_levels, q.codebook_size(), rows);
     println!("  distinct signal codes in the training set: {}", train_codes.len());
     println!("  distinct token SEQUENCES in the training set: {distinct_seqs} of {}", train.len());
     if control {
@@ -336,8 +351,8 @@ fn main() {
     let (tr, tn) = train_acc(&params);
     let h = held_acc(&params);
     let pct = if h.scored > 0 { h.right as f64 / h.scored as f64 * 100.0 } else { f64::NAN };
-    println!("\nRESULT variants={variants} control={control} tok_steps={tok_steps} tok_variants={tok_variants} train_embed={train_embed} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
-             h.right, h.scored, h.collided, h.overlap_pct, train.len());
+    println!("\nRESULT variants={variants} levels={fsq_levels} codes={} control={control} tok_steps={tok_steps} tok_variants={tok_variants} train_embed={train_embed} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
+             q.codebook_size(), h.right, h.scored, h.collided, h.overlap_pct, train.len());
     let by_kind: Vec<String> = h.per_kind.iter().enumerate()
         .map(|(k, (r, n))| format!("{}={r}/{n}", synth::name(k)))
         .collect();
