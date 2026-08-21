@@ -82,6 +82,14 @@ async fn run() {
     let qa_p = a.get(3).expect("qa.tsv");
     let corpus_p = a.get(4).expect("corpus.txt");
     let n_gen: usize = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(28);
+    // Optional SEPARATE retriever checkpoint. When absent the generator embeds its own corpus, which
+    // is what the first run of this bench did and is why the retriever collapsed: `FerricModel::embed`
+    // pools the last hidden state, and its own doc warns that doing so on a checkpoint not TRAINED
+    // for embedding "hands back plausible cosine scores that mean nothing". The guard in that method
+    // checks the runtime kind (Dense), not whether the weights were trained for the task, so a
+    // generative model passes it silently. Measured on the first run: mean top1-top2 margin 0.0107,
+    // 13 distinct passages chosen for 22 questions.
+    let retr_p = a.get(6).map(String::as_str);
 
     let qa_text = std::fs::read_to_string(qa_p).expect("read qa");
     let qs: Vec<Q> = qa_text.lines().filter(|l| !l.trim().is_empty()).map(|l| {
@@ -99,15 +107,30 @@ async fn run() {
     println!("lookup vs weights — {} questions, {} corpus chunks", qs.len(), chunks.len());
     println!("  candidate (weights OUTSIDE): {small_p}  {:.0} MB + corpus", sm_bytes as f64 / 1e6);
     println!("  baseline  (weights INSIDE):  {big_p}  {:.0} MB, closed book", bg_bytes as f64 / 1e6);
-    println!("  ratio: the baseline ships {:.1}x the bytes\n", bg_bytes as f64 / sm_bytes as f64);
+    let retr_bytes = retr_p.map(|r| std::fs::metadata(r).unwrap().len()).unwrap_or(0);
+    // The candidate must be charged for EVERY byte it ships. A separate retriever is a second model
+    // in the tab, and quietly comparing only the generator against the baseline would be the same
+    // class of error as a baseline measured at 3.4% utilisation.
+    println!("  ratio: the baseline ships {:.1}x the candidate's total bytes ({:.0} MB incl. retriever)\n",
+             bg_bytes as f64 / (sm_bytes + retr_bytes) as f64, (sm_bytes + retr_bytes) as f64 / 1e6);
 
     // ---- candidate arm: one small model as BOTH retriever and generator ----
     let small = ferric_web::FerricModel::load(std::fs::read(small_p).expect("read small")).await.expect("load small");
-    eprintln!("embedding {} chunks with the small model...", chunks.len());
+    let retriever = match retr_p {
+        Some(rp) => Some(ferric_web::FerricModel::load(std::fs::read(rp).expect("read retriever")).await.expect("load retriever")),
+        None => None,
+    };
+    let embed_with = retriever.as_ref().unwrap_or(&small);
+    match retr_p {
+        Some(rp) => println!("  retriever: {rp}  {:.0} MB (separate, trained for embedding)",
+                             std::fs::metadata(rp).unwrap().len() as f64 / 1e6),
+        None => println!("  retriever: the generator itself, pooling its own last hidden state"),
+    }
+    eprintln!("embedding {} chunks...", chunks.len());
     let t_embed = std::time::Instant::now();
     let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for (i, c) in chunks.iter().enumerate() {
-        vecs.push(small.embed(c.clone()).await.expect("embed chunk"));
+        vecs.push(embed_with.embed(c.clone()).await.expect("embed chunk"));
         if i % 20 == 0 { eprintln!("  {i}/{}", chunks.len()); }
     }
     // Charged separately and honestly: this is a ONE-TIME cost per (corpus, model), paid here and
@@ -120,56 +143,93 @@ async fn run() {
     let mut retrieved: Vec<usize> = Vec::with_capacity(qs.len());
     let mut margins: Vec<f32> = Vec::with_capacity(qs.len());
     for q in &qs {
-        let qv = small.embed(q.ask.clone()).await.expect("embed question");
+        let qv = embed_with.embed(q.ask.clone()).await.expect("embed question");
         let mut scored: Vec<(usize, f32)> = vecs.iter().enumerate().map(|(i, v)| (i, cosine(&qv, v))).collect();
         scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
         retrieved.push(scored[0].0);
         margins.push(scored[0].1 - scored[1].1);
     }
 
+    let t_cand = std::time::Instant::now();
     let mut cand_out: Vec<String> = Vec::with_capacity(qs.len());
     for (i, q) in qs.iter().enumerate() {
         let p = format!("{}\n\nQuestion: {}\nAnswer:", chunks[retrieved[i]], q.ask);
         cand_out.push(small.generate_plain(&p, n_gen).await.unwrap_or_default());
     }
+
+    let cand_secs = t_cand.elapsed().as_secs_f64();
+
+    // ---- CONTROL: the same small model, same prompt shape, NO passage ----
+    // Without this the bench cannot support its own conclusion. A high retrieval score is equally
+    // consistent with "the passage did the work" and with "this small model already knew these
+    // facts", and those imply opposite things about whether knowledge can live outside the weights.
+    // The control separates them, and it is the arm most likely to embarrass the thesis.
+    let mut ctrl_out: Vec<String> = Vec::with_capacity(qs.len());
+    for q in qs.iter() {
+        let p = format!("Question: {}\nAnswer:", q.ask);
+        ctrl_out.push(small.generate_plain(&p, n_gen).await.unwrap_or_default());
+    }
+    drop(retriever);
     drop(small);
 
     // ---- baseline arm: the larger model, from weights alone ----
     let big = ferric_web::FerricModel::load(std::fs::read(big_p).expect("read big")).await.expect("load big");
+    let t_base = std::time::Instant::now();
     let mut base_out: Vec<String> = Vec::with_capacity(qs.len());
     for q in qs.iter() {
         let p = format!("Question: {}\nAnswer:", q.ask);
         base_out.push(big.generate_plain(&p, n_gen).await.unwrap_or_default());
     }
+    let base_secs = t_base.elapsed().as_secs_f64();
     drop(big);
 
     // Grading goes through ferric-joule so the success counts are TALLIED from the graded outcomes
     // rather than asserted. No meter is available on AC power, so this path deliberately yields no
     // `Saving` at all — see the note where the energy verdict is printed.
     let idx: Vec<usize> = (0..qs.len()).collect();
-    let (bok, cok, (bsec, csec)) = grade_tasks(&idx,
+    let (bok, cok, (_gb, _gc)) = grade_tasks(&idx,
         |i| graded(&base_out[*i], &qs[*i]),
         |i| graded(&cand_out[*i], &qs[*i]));
+    let (ctrl, _, _) = grade_tasks(&idx, |i| graded(&ctrl_out[*i], &qs[*i]), |_| false);
 
-    println!("{:<62} {:^9} {:^9}", "question", "weights", "lookup");
+    println!("{:<58} {:^7} {:^7} {:^7}", "question", "big", "small", "lookup");
     for (i, q) in qs.iter().enumerate() {
-        let short: String = q.ask.chars().take(60).collect();
-        println!("{:<62} {:^9} {:^9}  [c{} m{:.3}]",
-                 short, if bok[i] { "ok" } else { "-" }, if cok[i] { "ok" } else { "-" },
-                 retrieved[i], margins[i]);
+        let short: String = q.ask.chars().take(56).collect();
+        let m = |b: bool| if b { "ok" } else { "-" };
+        println!("{:<58} {:^7} {:^7} {:^7}  [c{} m{:.3}]",
+                 short, m(bok[i]), m(ctrl[i]), m(cok[i]), retrieved[i], margins[i]);
     }
 
     let (nb, nc) = (bok.iter().filter(|x| **x).count(), cok.iter().filter(|x| **x).count());
+    let nctl = ctrl.iter().filter(|x| **x).count();
     let n = qs.len();
-    println!("\n  weights inside ({:.0} MB): {nb}/{n} correct  ({:.0}%)  in {bsec:.1}s",
+    println!("\n  weights inside ({:.0} MB): {nb}/{n} correct  ({:.0}%)  in {base_secs:.1}s generating",
              bg_bytes as f64 / 1e6, nb as f64 / n as f64 * 100.0);
-    println!("  weights outside ({:.0} MB + {} chunks): {nc}/{n} correct  ({:.0}%)  in {csec:.1}s",
+    println!("  CONTROL, small model closed book ({:.0} MB): {nctl}/{n} correct  ({:.0}%)",
+             sm_bytes as f64 / 1e6, nctl as f64 / n as f64 * 100.0);
+    println!("  weights outside ({:.0} MB + {} chunks): {nc}/{n} correct  ({:.0}%)  in {cand_secs:.1}s generating",
              sm_bytes as f64 / 1e6, chunks.len(), nc as f64 / n as f64 * 100.0);
     println!("  corpus embedding, one time per (corpus, model): {embed_secs:.1}s, amortised over every query after the first");
 
     // Where the candidate lost, say WHICH failure it was. Retrieval finding the wrong passage and the
     // model failing to read the right one are different defects with different fixes, and a single
     // accuracy number cannot tell them apart. This is the registered prediction's actual test.
+    // Retrieval quality measured over ALL questions, not only the failures. The failure-only view is
+    // the trap: a question can retrieve a useless passage and still be scored correct because the
+    // small model knew the answer, which inflates apparent retrieval quality by exactly the amount
+    // the control arm is there to detect.
+    let hits_at_1 = (0..n).filter(|&i| qs[i].accept.iter().any(|acc| hit(&chunks[retrieved[i]], acc))).count();
+    let mean_margin: f32 = margins.iter().sum::<f32>() / margins.len() as f32;
+    let distinct: std::collections::BTreeSet<usize> = retrieved.iter().copied().collect();
+    println!("  retrieval@1: {hits_at_1}/{n} questions retrieved a passage that CONTAINS the answer \
+              (mean top1-top2 margin {mean_margin:.4}, {} distinct chunks chosen for {n} questions)",
+             distinct.len());
+    if distinct.len() * 2 < n {
+        println!("    ⚠ the retriever is COLLAPSING: fewer than half as many distinct passages as \
+                  questions means one chunk is winning for unrelated queries, and a mean margin near \
+                  zero means top-1 and top-2 are effectively tied. Ranking is near-arbitrary.");
+    }
+
     let mut retrieval_miss = 0usize;
     let mut extraction_miss = 0usize;
     for i in 0..n {
@@ -180,6 +240,17 @@ async fn run() {
     }
     println!("  of {} lookup failures: {retrieval_miss} retrieved the wrong passage, {extraction_miss} were handed \
               the answer and did not use it", n - nc);
+
+    // The only number that isolates what the CORPUS contributed, as opposed to what the small model
+    // already carried. If this is not clearly positive, the passage is decoration and the thesis
+    // fails on its own bench regardless of how the two headline arms compare.
+    let gained: Vec<usize> = (0..n).filter(|&i| cok[i] && !ctrl[i]).collect();
+    let lost: Vec<usize> = (0..n).filter(|&i| !cok[i] && ctrl[i]).collect();
+    println!("  retrieval's own contribution: +{} answered only WITH the passage, -{} lost by having it \
+              (net {:+})", gained.len(), lost.len(), gained.len() as i64 - lost.len() as i64);
+    if !lost.is_empty() {
+        println!("    a passage that made the model WORSE is the interesting failure; questions: {lost:?}");
+    }
 
     // The energy verdict, and the reason there isn't one.
     match ferric_joule::MacBattery::new().filter(|m| m.available()) {

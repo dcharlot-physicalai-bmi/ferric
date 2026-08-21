@@ -412,6 +412,15 @@ pub struct FerricModel {
     /// must append it to match the reference / native build.
     add_eos: bool,
     eos_id: Option<u32>,
+    /// GGUF `<arch>.pooling_type`, as llama.cpp writes it: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK.
+    ///
+    /// This key was read NOWHERE in the tree until 2026-08-21 and every embed path hardcoded LAST.
+    /// That is correct for Qwen3-Embedding (which declares 3) and silently WRONG for the MEAN-pooling
+    /// family — BGE, E5, GTE and most sentence-transformer exports — where pooling the final position
+    /// of a bidirectionally-trained encoder returns a vector with no trained meaning. The symptom is
+    /// not an error: it is cosine scores that look ordinary and rank near-arbitrarily, which is the
+    /// failure this very method's doc warns about, one level deeper than the warning reached.
+    pooling: Option<u32>,
     /// Control tokens (`<|im_start|>`, `<end_of_turn>`, …) → id, longest-first — so a chat-templated
     /// prompt tokenizes them to their special ids instead of BPE-ing the literal text (essential for
     /// ChatML/Gemma chat + tool-calling to behave as the model was trained).
@@ -482,6 +491,10 @@ impl FerricModel {
         let add_bos = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let eos_id = match g.metadata().get("tokenizer.ggml.eos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_eos = matches!(g.metadata().get("tokenizer.ggml.add_eos_token"), Some(Meta::Bool(true)));
+        // Architecture-prefixed, so it is looked up by suffix rather than by guessing the arch name.
+        let pooling = g.metadata().iter()
+            .find(|(k, _)| k.ends_with(".pooling_type"))
+            .and_then(|(_, v)| match v { Meta::U(n) => Some(*n as u32), Meta::I(n) => Some(*n as u32), _ => None });
         // Control tokens are read from `tokenizer.ggml.token_type` (3 = CONTROL) FIRST, with the old
         // surface heuristic kept only as a fallback for files that omit the array. The heuristic alone
         // is a trap that has now bitten twice in one day: Gemma 4 renamed its chat markers to
@@ -529,7 +542,7 @@ impl FerricModel {
         };
         // Default OFF, exactly as native: quantizing the KV cache trades accuracy for memory and that
         // is the caller's decision. `set_kv_cache` opts in.
-        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, specials, eos_set,
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, pooling, specials, eos_set,
                          kv_fmt: None, kv_grouped_k: false })
     }
 
@@ -612,9 +625,65 @@ impl FerricModel {
         if ids.is_empty() { return Ok(vec![0.0; n]); }
         let v = m.forward_hidden(&ids).to_vec().await; // [T·n_embd]
         let t = (v.len() / n).max(1);
-        let last = &v[(t - 1) * n..t * n]; // last-token pool (the appended EOS when present)
-        let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        Ok(last.iter().map(|x| x / norm).collect())
+        // Pool where the CHECKPOINT says to, not where this method used to assume. See `pooling`.
+        let pooled = pool(&v, t, n, self.pooling.unwrap_or(3)).map_err(|e| JsValue::from_str(&e))?;
+        let norm = pooled.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        Ok(pooled.iter().map(|x| x / norm).collect())
+    }
+}
+
+/// Pool a `[t, n]` hidden-state buffer into one `n`-vector, the way the CHECKPOINT declares.
+///
+/// llama.cpp's `pooling_type`: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK. Extracted as a free function
+/// because the arithmetic is the part that can be wrong quietly — a MEAN that strides rows instead of
+/// columns produces a vector of exactly the right length, exactly the right magnitude, and no
+/// meaning, and no caller can tell.
+pub(crate) fn pool(v: &[f32], t: usize, n: usize, kind: u32) -> Result<Vec<f32>, String> {
+    if n == 0 || t == 0 || v.len() < t * n {
+        return Err(format!("hidden state is {} floats, too short for {t}x{n}", v.len()));
+    }
+    match kind {
+        1 => Ok((0..n).map(|c| (0..t).map(|r| v[r * n + c]).sum::<f32>() / t as f32).collect()),
+        2 => Ok(v[0..n].to_vec()),
+        3 => Ok(v[(t - 1) * n..t * n].to_vec()),
+        other => Err(format!(
+            "this checkpoint declares pooling_type {other}, which embed() does not implement. \
+             Refusing rather than pooling the wrong position and returning cosine scores that look \
+             ordinary and rank arbitrarily (0 = NONE, 4 = RANK need a reranker head).")),
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool;
+
+    #[test]
+    fn mean_pooling_averages_down_COLUMNS_not_along_rows() {
+        // Rows are tokens, columns are channels. The transposed version of this loop returns a vector
+        // of the right length and the right magnitude and no meaning — which is why it is worth a
+        // test with an asymmetric shape, where the two readings cannot coincide.
+        let v = vec![1.0, 2.0, 3.0,
+                     5.0, 6.0, 7.0];              // t = 2, n = 3
+        assert_eq!(pool(&v, 2, 3, 1).unwrap(), vec![3.0, 4.0, 5.0]);
+        assert_eq!(pool(&v, 2, 3, 2).unwrap(), vec![1.0, 2.0, 3.0], "CLS is the FIRST token");
+        assert_eq!(pool(&v, 2, 3, 3).unwrap(), vec![5.0, 6.0, 7.0], "LAST is the final token");
+    }
+
+    #[test]
+    fn a_pooling_type_we_cannot_honour_is_an_error_not_a_guess() {
+        // The whole point. Falling back to LAST for a MEAN checkpoint is precisely the defect this
+        // change exists to remove, so an unknown type must refuse rather than default.
+        for bad in [0u32, 4, 9] {
+            let e = pool(&[1.0, 2.0], 1, 2, bad).unwrap_err();
+            assert!(e.contains(&bad.to_string()), "the error must name the type it refused: {e}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_state_too_short_for_its_shape_is_refused_before_it_panics() {
+        assert!(pool(&[1.0, 2.0], 4, 3, 3).is_err(), "would slice out of bounds");
+        assert!(pool(&[], 1, 1, 3).is_err());
+        assert!(pool(&[1.0], 0, 1, 3).is_err(), "zero tokens has no last token to pool");
     }
 }
 

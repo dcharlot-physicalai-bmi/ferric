@@ -573,3 +573,28 @@ a different reduction order by construction, and 28 layers accumulate it to ulp 
 probe VECTOR and checks cosine > 0.999; the measured cross-fabric agreement renders on every run
 (probe-cos 1.000000 — real at the bit level, invisible at six decimals). Rule: across fabrics, model
 identity is a TOLERANCE check, never a bit-hash.
+
+## P. The measurement instrument was broken where it mattered most (2026-08-21)
+
+`ferric-joule` gates every energy claim this project makes, so its own soundness is upstream of all
+of them. Preparing to *use* it for the first time surfaced four defects, three of which silently
+neutralised the crate's central argument.
+
+| # | defect | why it mattered |
+|---|---|---|
+| 1 | `Saving.successes` was ONE `u64` shared by both arms | `per_success()` divided both arms by the same number, so `fraction()`, `percent()` and the ranking came out bit-identical to `per_attempt()`. **A field that cannot change any comparison cannot correct one** — joules-per-completed-task was decorative |
+| 2 | `Routed::against` charged both arms the ladder's own success count | the worst possible site: routing buys its saving by resolving work on weaker rungs, so the arm that saves the energy is exactly the arm whose success count differs. Savings read as free |
+| 3 | the reversal test could not fail | it compared two *different* `Saving`s and reduced to `1180/164 < 1180/55` — the monotonicity of division, true for every input |
+| 4 | "a `Saving` cannot be constructed by hand" was prose | every field was `pub`. Now `#[non_exhaustive]` + a `compile_fail` doc-test, the only place this is checkable, since doc-tests compile as an external crate |
+
+**And the crate's own citation was overstated.** It read "44.6 kJ against 21.5 kJ, which *reverses*
+the ranking energy-per-query gives you". The arithmetic says otherwise: 6.19x → 2.08x is a
+**narrowing**, same winner. A real reversal needs a wider success gap, and now shows up as the two
+savings **disagreeing in sign**, which `Display` warns about explicitly.
+
+**Why it survived 82 tests:** `Saving` had *no consumer anywhere outside its own tests*. Nothing
+exercised the type, so nothing could expose it. The fix therefore includes the paths a real consumer
+needs — `compare_tasks()`, which grades the closures and **tallies** successes per arm so a caller
+cannot report a rate no arm demonstrated, and `grade_tasks()` for machines with no readable sensor.
+
+All four fixes are mutation-proven: reinstating each defect turns the suite red.
