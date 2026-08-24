@@ -43,14 +43,20 @@
 //!
 //! ## What is not
 //!
-//! **There are no published weights.** The towers run, are the right size, train end to end through
-//! the bottleneck, and reach 25.5 dB on synthetic physics — but nothing here has been trained on
-//! real sensor data, and nothing has been compared against a reference implementation's outputs,
-//! because no reference weights were located. Training the language half additionally needs
-//! sensor-text PAIRS, which is a data question rather than an engineering one.
+//! **There are no published weights.** The towers run, are the right size, and train end to end
+//! through the bottleneck — 25.5 dB on synthetic physics in a single run — but nothing here has
+//! been trained on real sensor data, and nothing has been compared against a reference
+//! implementation's outputs, because no reference weights were located. Training the language half
+//! additionally needs sensor-text PAIRS, which is a data question rather than an engineering one.
 //!
-//! Reconstruction quality is therefore asserted nowhere in the test suite. A threshold over
-//! untrained weights would either be vacuous or would quietly become a quality claim.
+//! **Figures in this crate's documentation and examples are single runs unless a seed count is
+//! given.** Held-out accuracy at these sample sizes carries a standard deviation of roughly six
+//! points across seeds, so a difference smaller than that is not a measurement. The README reports
+//! the one comparison that was run with five seeds; treat everything else as unresolved at that
+//! level.
+//!
+//! Reconstruction quality is asserted nowhere in the test suite. A threshold over untrained
+//! weights would either be vacuous or would quietly become a quality claim.
 
 pub mod cost;
 pub mod encoder;

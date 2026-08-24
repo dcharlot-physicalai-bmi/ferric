@@ -266,10 +266,10 @@ mod tests {
 
     /// THE CONCATENATION AMBIGUITY, tested where it can actually bite.
     ///
-    /// This is the classic way a digest silently collides, and my first version of this test could
-    /// not have caught it: I varied two fields that are not adjacent in `digest()`, and with ASCII
-    /// bodies the TAG BYTE already separates them (`01 61 62 01 63` vs `01 61 01 62 63`). Removing
-    /// the length prefix broke nothing, which is how I learned the test was decorative.
+    /// This is the classic way a digest silently collides, and the obvious test for it does not
+    /// work: varying two fields that are not adjacent in `digest()` proves nothing, because with
+    /// ASCII bodies the TAG BYTE already separates them (`01 61 62 01 63` vs `01 61 01 62 63`).
+    /// Such a test passes with the length prefix removed, which makes it decorative.
     ///
     /// The prefix earns its place when a body CONTAINS the tag byte. Then
     /// `("\x01", "x")` and `("", "\x01x")` both feed `01 01 01 78` and collide exactly.

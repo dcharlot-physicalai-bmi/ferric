@@ -462,7 +462,7 @@ mod tests {
     }
 
     /// The two towers ARE the same size, and the reason is worth pinning down because the
-    /// plausible-sounding opposite is what I assumed first.
+    /// plausible-sounding opposite is easy to reach for.
     ///
     /// Each tower holds BOTH end matrices — the encoder embeds a patch and emits a latent, the
     /// decoder lifts a latent and emits a patch — so the same two shapes appear in both, transposed.

@@ -88,9 +88,9 @@ impl EncoderConfig {
 
     /// Parameter count of the DECODER tower, which is **exactly the encoder's**.
     ///
-    /// I got this wrong first and the test caught it. The intuition — "the encoder's head maps
-    /// `d_model -> latent` and the decoder's maps `d_model -> patch_len`, so the towers differ by
-    /// that swap" — is false, because **each tower contains BOTH end matrices**. The encoder has
+    /// The plausible-sounding opposite — "the encoder's head maps `d_model -> latent` and the
+    /// decoder's maps `d_model -> patch_len`, so the towers differ by that swap" — is false,
+    /// because **each tower contains BOTH end matrices**. The encoder has
     /// `patch_embed [d, P]` on the way in and `latent_head [latent, d]` on the way out; the decoder
     /// has `latent_up [d, latent]` in and `patch_head [P, d]` out. Same two shapes, transposed, so
     /// the totals are identical for every configuration — not by coincidence, by construction.

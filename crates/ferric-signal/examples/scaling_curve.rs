@@ -42,9 +42,8 @@
 //!   tokenizer collapsed the entire thermal family to shared token sequences; this flag exists to
 //!   measure what training the tokenizer buys back.
 //! - `--fsq-levels L` sets the quantizer to L levels per latent dimension, so the codebook is
-//!   L^5 codes. This is the direct test of the series' own conclusion — that codebook resolution
-//!   must be matched to corpus coverage. If that is right, holding the corpus fixed and sweeping L
-//!   should show an INTERIOR optimum: too coarse and distinct processes collide, too fine and
+//!   L^5 codes. Holding the corpus fixed and sweeping L tests whether resolution has to be matched
+//!   to coverage: too coarse and distinct processes collide into one token sequence, too fine and
 //!   held-out signals land on codes the corpus never visited.
 //! - `--seed S` varies the LM's initialization. **Every number this example prints is one run at
 //!   n around 30, and a single run cannot distinguish a 5-point difference from initialization
