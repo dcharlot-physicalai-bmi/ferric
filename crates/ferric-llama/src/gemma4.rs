@@ -88,6 +88,23 @@ impl Cfg {
         let n_layer = u("block_count")?;
         let d = u("embedding_length")?;
 
+        // REFUSE an asymmetry this loader cannot represent, rather than loading it wrong. `attn_dim`
+        // returns ONE width per layer class and it is used for both K and V, which is right for every
+        // checkpoint seen (gemma-4-E2B: 512/512 global, 256/256 sliding) and is an assumption the
+        // format does not guarantee. `value_length_swa` would otherwise be read nowhere at all — the
+        // fourth GGUF key found unread in one sweep, after pooling_type, tokenizer.ggml.pre and the
+        // chat template. A wrong V width does not fail: it generates fluently and wrongly.
+        for (kl, vl, what) in [("attention.key_length", "attention.value_length", "global"),
+                               ("attention.key_length_swa", "attention.value_length_swa", "sliding")] {
+            if let (Ok(k), Ok(v)) = (u(kl), u(vl)) {
+                if k != v {
+                    return Err(format!(
+                        "gemma4 {what} blocks declare key_length {k} and value_length {v}; this loader \
+                         carries one head width per layer class and would silently use {k} for both"));
+                }
+            }
+        }
+
         // Both of these are ARRAYS. A scalar accessor returns Err on an array and would fall back to a
         // default, which is how a per-block schedule silently collapses into a uniform one.
         let swa: Vec<bool> = match md.get("gemma4.attention.sliding_window_pattern") {
@@ -119,6 +136,12 @@ impl Cfg {
             eps: f("attention.layer_norm_rms_epsilon")?,
             head_dim: u("attention.key_length")?,
             head_dim_swa: u("attention.key_length_swa").unwrap_or_else(|_| u("attention.key_length").unwrap_or(0)),
+            // K and V widths are read as ONE number per layer class (`head_dim` / `head_dim_swa`,
+            // both from `key_length*`), because every checkpoint seen declares them equal — gemma-4-E2B
+            // is 512/512 global and 256/256 sliding. `attention.value_length_swa` is therefore never
+            // read, and that is an ASSUMPTION rather than a fact about the format. A model that
+            // separates them would be loaded with the wrong V width and would generate fluently and
+            // wrongly, so it is checked below rather than trusted.
             swa, n_ff,
             window: u("attention.sliding_window")?,
             kv_from_start,
@@ -812,6 +835,76 @@ mod tests {
             // Same attention type: the two kinds do not even share a head width, so a cross-type
             // read would be a shape error at best and wrong history at worst.
             assert_eq!(c.swa[src], c.swa[il], "block {il} and its source {src} must agree on type");
+        }
+    }
+}
+
+#[cfg(test)]
+mod kv_width_tests {
+    use super::Cfg;
+    use ferric_gguf::{GgufSource, Meta, TensorInfo};
+    use std::collections::HashMap;
+
+    /// Metadata-only source: `Cfg::from_gguf` reads no tensors, so the rest can refuse.
+    struct Md(HashMap<String, Meta>);
+    impl GgufSource for Md {
+        fn metadata(&self) -> &HashMap<String, Meta> { &self.0 }
+        fn tensor(&self, _: &str) -> Option<&TensorInfo> { None }
+        fn raw(&self, _: &str) -> Result<Vec<u8>, String> { Err("no tensors in this fixture".into()) }
+        fn dequant(&self, _: &str) -> Result<Vec<f32>, String> { Err("no tensors in this fixture".into()) }
+    }
+
+    /// The real gemma-4-E2B numbers, so the fixture is the shipped shape rather than an invention.
+    fn base() -> HashMap<String, Meta> {
+        let mut m = HashMap::new();
+        for (k, v) in [("block_count", 30u64), ("embedding_length", 2048), ("attention.head_count", 8),
+                       ("attention.head_count_kv", 4), ("attention.key_length", 512),
+                       ("attention.value_length", 512), ("attention.key_length_swa", 256),
+                       ("attention.value_length_swa", 256), ("attention.sliding_window", 512),
+                       ("feed_forward_length", 8192), ("vocab_size", 262144),
+                       ("attention.shared_kv_layers", 20)] {
+            m.insert(format!("gemma4.{k}"), Meta::U(v));
+        }
+        for (k, v) in [("attention.layer_norm_rms_epsilon", 1e-6f32), ("rope.freq_base", 1_000_000.0),
+                       ("rope.freq_base_swa", 10_000.0)] {
+            m.insert(format!("gemma4.{k}"), Meta::F(v as f64));
+        }
+        // Both of these are per-block ARRAYS and the loader refuses a scalar, which is the guard that
+        // stops a per-block schedule collapsing into a uniform one. gemma-4-E2B alternates 5 sliding
+        // blocks to 1 global.
+        m.insert("gemma4.attention.sliding_window_pattern".into(),
+                 Meta::Arr((0..30).map(|i| Meta::U(if (i + 1) % 6 == 0 { 0 } else { 1 })).collect()));
+        m.insert("gemma4.feed_forward_length".into(), Meta::Arr(vec![Meta::U(8192); 30]));
+        m
+    }
+
+    #[test]
+    fn the_shipped_widths_pass_the_guard() {
+        // The guard must not reject the checkpoint it was written beside — an over-eager refusal is
+        // the same defect as a missing one, pointed the other way. This fixture carries metadata only,
+        // so `from_gguf` still fails later at the first TENSOR it needs; what matters is that it gets
+        // that far, i.e. the K/V check let it through.
+        let e = match Cfg::from_gguf(&Md(base())) { Err(e) => e, Ok(_) => String::new() };
+        assert!(!e.contains("value_length"),
+                "gemma-4-E2B's own widths (512/512, 256/256) must pass the guard, got: {e}");
+        assert!(e.contains("token_embd"), "expected to reach the tensor stage, got: {e:?}");
+    }
+
+    #[test]
+    fn a_v_width_that_differs_from_k_is_REFUSED_rather_than_silently_halved() {
+        // This loader carries ONE head width per layer class and uses it for K and V both. Every
+        // checkpoint seen declares them equal, so the assumption is invisible — and a model that
+        // separated them would not fail, it would attend over the wrong V width and generate
+        // fluently and wrongly. `value_length_swa` was read NOWHERE before this guard existed.
+        for key in ["gemma4.attention.value_length", "gemma4.attention.value_length_swa"] {
+            let mut m = base();
+            m.insert(key.into(), Meta::U(128)); // neither 512 nor 256
+            let e = match Cfg::from_gguf(&Md(m)) {
+                Err(e) => e,
+                Ok(_) => panic!("{key} = 128 must be refused, not loaded with the K width"),
+            };
+            assert!(e.contains("128") && e.contains("value_length"),
+                    "the refusal must name the offending number and key, got: {e}");
         }
     }
 }

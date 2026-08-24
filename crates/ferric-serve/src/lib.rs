@@ -310,7 +310,16 @@ impl Engine {
             if is_ctrl && !t.is_empty() { Some((t.clone(), i as u32)) } else { None }
         }).collect();
         specials.sort_by_key(|(s, _)| std::cmp::Reverse(s.len())); // longest-match first
-        let template = match g.metadata.get("tokenizer.ggml.chat_template") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        // TWO spellings, and the one this looked for is not the one modern GGUFs use. Converters
+        // write `tokenizer.chat_template`; `tokenizer.ggml.chat_template` was the older form. Checked
+        // across the checkpoints on this machine: gemma-4-E2B and qwen1.5b both carry ONLY the former,
+        // so this lookup found nothing every time and `template` was always empty — the vocab-based
+        // family detection below carried the whole feature and its "robust even when the GGUF omits
+        // the key" comment described the permanent state rather than a fallback.
+        let template = match g.metadata.get("tokenizer.chat_template")
+            .or_else(|| g.metadata.get("tokenizer.ggml.chat_template")) {
+            Some(Meta::Str(s)) => s.clone(), _ => String::new(),
+        };
         // The break-even is `E_draft / E_main`, estimated from shape: one MTP block against the main
         // model's `n_layer`. A structural estimate, not a measurement — see `specgate`.
         let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
