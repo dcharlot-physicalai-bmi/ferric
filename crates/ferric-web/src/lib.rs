@@ -495,7 +495,12 @@ impl FerricModel {
                 Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),
                 _ => return Err(err("no merges".into())),
             };
-            (Bpe::new(vocab, &merges), None)
+            // `tokenizer.ggml.pre` names the pre-tokenizer REGEX, and it is not the same question as
+            // `tokenizer.ggml.model`. Every Qwen checkpoint declares model=gpt2 AND pre=qwen2; reading
+            // only the first gave the whole family GPT-2's rule, which splits `-Reyes` into `-` + `Reyes`
+            // and makes the merge `- Re` unreachable. Diffed against llama.cpp: token 67960 vs 12,693.
+            (Bpe::new_with_pre(vocab, &merges, ferric_tokenizer::Pre::from_gguf(
+                match g.metadata().get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None })), None)
         };
         let add_space_prefix = !matches!(g.metadata().get("tokenizer.ggml.add_space_prefix"), Some(Meta::Bool(false)));
         let u2b = gpt2_byte_decoder();

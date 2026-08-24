@@ -227,7 +227,14 @@ impl Engine {
             } else { None }).collect(),
             _ => Vec::new(),
         };
-        let bpe = Bpe::new(vocab.clone(), &merges);
+        // `tokenizer.ggml.pre` names the pre-tokenizer regex and is a SEPARATE question from
+        // `tokenizer.ggml.model`. Every Qwen checkpoint declares model=gpt2 and pre=qwen2; reading
+        // only the first gave the whole family GPT-2's rule, under which `-Reyes` splits into `-` +
+        // `Reyes` and the merge `- Re` becomes unreachable. Diffed against llama.cpp: it emits token
+        // 67960 where this emitted 12 then 693. The server serves the same checkpoints as the browser,
+        // so it needs the same fix or generation here diverges from generation there.
+        let bpe = Bpe::new_with_pre(vocab.clone(), &merges, ferric_tokenizer::Pre::from_gguf(
+            match g.metadata.get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None }));
         // SentencePiece models carry a per-token score array and no merges — detect and build an Spm.
         let spm = match g.metadata.get("tokenizer.ggml.model") {
             Some(Meta::Str(s)) if s == "llama" => {

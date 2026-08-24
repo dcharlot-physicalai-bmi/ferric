@@ -36,7 +36,40 @@ pub fn base_byte_vocab() -> HashMap<String, u32> {
     byte_to_unicode().iter().enumerate().map(|(i, &c)| (c.to_string(), i as u32)).collect()
 }
 
+/// Which pre-tokenizer regex a checkpoint declares, from GGUF `tokenizer.ggml.pre`.
+///
+/// This key was read NOWHERE in the tree until 2026-08-21, so every `tokenizer.ggml.model == "gpt2"`
+/// file got the GPT-2 ByteLevel scheme — including the entire Qwen family, which declares `qwen2`.
+/// The two differ in one rule that matters, and it is measurable against llama.cpp:
+///
+/// GPT-2 lets only a SPACE lead a word (` ?\p{L}+`). Qwen2 lets **any single non-letter, non-digit,
+/// non-newline** character lead it (`[^\r\n\p{L}\p{N}]?\p{L}+`). So `Halvorsen-Reyes` is
+/// `Halvorsen` + `-Reyes` under Qwen2 and `Halvorsen` + `-` + `Reyes` under GPT-2 — and the merge
+/// `- Re` → `-Re`, rank 67704 in Qwen3's own table, is unreachable in the second case because merges
+/// only run WITHIN a chunk. Measured: llama.cpp emits token 67960, Ferric emitted 12 then 693.
+///
+/// Punctuation that IS preceded by a space is unaffected — the space-punctuation rule claims it
+/// first in both schemes — so `the (Reyes) buffer` tokenises identically. The divergence is exactly
+/// mid-word punctuation: hyphenated names, apostrophes inside words, dotted identifiers, paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pre {
+    /// HF SmolLM/GPT-2 ByteLevel.
+    #[default]
+    Gpt2,
+    /// Qwen2/Qwen3, and anything else declaring `qwen2`.
+    Qwen2,
+}
+
+impl Pre {
+    /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
+    /// tree did unconditionally before this existed.
+    pub fn from_gguf(pre: Option<&str>) -> Pre {
+        match pre { Some("qwen2") => Pre::Qwen2, _ => Pre::Gpt2 }
+    }
+}
+
 pub struct Bpe {
+    pre: Pre,
     encoder: HashMap<String, u32>,      // token string → id
     decoder: HashMap<u32, String>,      // id → token string
     ranks: HashMap<(String, String), u32>, // merge pair → rank (lower = merged first)
@@ -47,11 +80,16 @@ pub struct Bpe {
 impl Bpe {
     /// Build from an in-memory vocab (token→id) and an ordered merges list ("a b" per line).
     pub fn new(vocab: HashMap<String, u32>, merges: &[(String, String)]) -> Bpe {
+        Bpe::new_with_pre(vocab, merges, Pre::Gpt2)
+    }
+
+    /// Build with an explicit pre-tokenizer. See [`Pre`] for why the choice is load-bearing.
+    pub fn new_with_pre(vocab: HashMap<String, u32>, merges: &[(String, String)], pre: Pre) -> Bpe {
         let b2u = byte_to_unicode();
         let u2b = b2u.iter().enumerate().map(|(i, &c)| (c, i as u8)).collect();
         let decoder = vocab.iter().map(|(k, &v)| (v, k.clone())).collect();
         let ranks = merges.iter().enumerate().map(|(i, (a, b))| ((a.clone(), b.clone()), i as u32)).collect();
-        Bpe { encoder: vocab, decoder, ranks, b2u, u2b }
+        Bpe { pre, encoder: vocab, decoder, ranks, b2u, u2b }
     }
 
     /// Load the standard HF/GPT-2 `vocab.json` + `merges.txt`.
@@ -102,7 +140,7 @@ impl Bpe {
     /// Encode text → token ids (lossless byte-level).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        for word in pretokenize(text) {
+        for word in pretokenize_with(text, self.pre) {
             let symbols: Vec<String> = word.bytes().map(|b| self.b2u[b as usize].to_string()).collect();
             for tok in self.bpe(symbols) {
                 // any merged token is in the vocab; base byte-symbols always are
@@ -198,7 +236,9 @@ impl Spm {
 /// the ByteLevel GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
 /// Hand-rolled to match `tokenizers` token-for-token — contractions, leading-space attach, multi-space
 /// runs (last space joins the next word), punctuation runs, digits individual.
-fn pretokenize(text: &str) -> Vec<String> {
+fn pretokenize(text: &str) -> Vec<String> { pretokenize_with(text, Pre::Gpt2) }
+
+fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
     // Digits step: isolate each digit; group consecutive non-digits.
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
@@ -227,6 +267,22 @@ fn pretokenize(text: &str) -> Vec<String> {
                 if two.starts_with("re") || two.starts_with("ve") || two.starts_with("ll") { out.push(f[i..i + 3].iter().collect()); i += 3; continue; }
                 if matches!(f[i + 1], 's' | 't' | 'm' | 'd') { out.push(f[i..i + 2].iter().collect()); i += 2; continue; }
             }
+            // Qwen2 alternative 2: `[^\r\n\p{L}\p{N}]?\p{L}+` — ONE non-letter, non-digit,
+            // non-newline character may lead a letter run, where GPT-2 admits only a space. Tried
+            // before the punctuation-run rule because the regex lists it first, and that ordering is
+            // the whole behaviour: `-Reyes` becomes one chunk here and two under GPT-2, which decides
+            // whether the merge `- Re` (rank 67704 in Qwen3's table) is reachable at all.
+            //
+            // A space still falls through to the branch below when what follows is NOT a letter, so
+            // ` (Reyes` keeps its ` (` punctuation chunk and tokenises identically under both schemes.
+            if pre == Pre::Qwen2 && !is_l(c) && !is_n(c) && c != '\r' && c != '\n'
+                && i + 1 < n && is_l(f[i + 1]) {
+                let mut e = i + 1;
+                while e < n && is_l(f[e]) { e += 1; }
+                out.push(f[i..e].iter().collect());
+                i = e;
+                continue;
+            }
             let sp = c == ' ';
             let j = i + sp as usize;
             let cls = |p: &dyn Fn(char) -> bool| j < n && p(f[j]);
@@ -251,4 +307,49 @@ fn pretokenize(text: &str) -> Vec<String> {
     }
     if out.is_empty() { out.push(String::new()); }
     out
+}
+
+#[cfg(test)]
+mod pre_tests {
+    use super::{pretokenize_with, Pre};
+
+    /// The one rule that differs, and the exact string that exposed it.
+    ///
+    /// Found by diffing against llama.cpp: `Halvorsen-Reyes` produced token 67960 there and 12 then
+    /// 693 here, because merges only run WITHIN a pre-token chunk and GPT-2's rule puts the hyphen in
+    /// its own chunk — making the merge `- Re` (rank 67704 in Qwen3's own table) unreachable.
+    #[test]
+    fn qwen2_attaches_one_leading_punctuation_to_a_word_and_gpt2_does_not() {
+        assert_eq!(pretokenize_with("Halvorsen-Reyes", Pre::Qwen2), vec!["Halvorsen", "-Reyes"]);
+        assert_eq!(pretokenize_with("Halvorsen-Reyes", Pre::Gpt2), vec!["Halvorsen", "-", "Reyes"]);
+    }
+
+    /// The control that localised the bug. Punctuation PRECEDED BY A SPACE is claimed by the
+    /// space-punctuation rule first in both schemes, so these must stay identical — a "fix" that
+    /// changed them would be over-applying the new rule.
+    #[test]
+    fn punctuation_after_a_space_is_unchanged_by_the_scheme() {
+        for t in ["the (Reyes) buffer", "a - b", "end. Next"] {
+            assert_eq!(pretokenize_with(t, Pre::Qwen2), pretokenize_with(t, Pre::Gpt2),
+                       "space-led punctuation must tokenise identically under both schemes: {t:?}");
+        }
+    }
+
+    /// Only ONE character may lead, and only when a letter follows it.
+    #[test]
+    fn the_lead_is_a_single_char_and_needs_a_letter_after_it() {
+        // Two punctuation chars: the run rule takes them, no attach.
+        assert_eq!(pretokenize_with("a--b", Pre::Qwen2), vec!["a", "--", "b"]);
+        // Punctuation with no following letter stays a run.
+        assert_eq!(pretokenize_with("a-1", Pre::Qwen2), vec!["a", "-", "1"]);
+        // Newlines are excluded by `[^\r\n\p{L}\p{N}]`, so they never attach.
+        assert_eq!(pretokenize_with("a\nb", Pre::Qwen2), vec!["a", "\n", "b"]);
+    }
+
+    #[test]
+    fn the_gguf_key_maps_and_defaults_to_gpt2() {
+        assert_eq!(Pre::from_gguf(Some("qwen2")), Pre::Qwen2);
+        assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "unknown values keep the old behaviour");
+        assert_eq!(Pre::from_gguf(None), Pre::Gpt2, "a file with no key is what the tree assumed for all");
+    }
 }
