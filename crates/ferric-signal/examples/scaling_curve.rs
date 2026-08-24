@@ -46,6 +46,10 @@
 //!   must be matched to corpus coverage. If that is right, holding the corpus fixed and sweeping L
 //!   should show an INTERIOR optimum: too coarse and distinct processes collide, too fine and
 //!   held-out signals land on codes the corpus never visited.
+//! - `--seed S` varies the LM's initialization. **Every number this example prints is one run at
+//!   n around 30, and a single run cannot distinguish a 5-point difference from initialization
+//!   noise.** Sweep the seed and report the spread before believing any gap. A mean without its
+//!   dispersion cannot know whether it measured anything.
 //! - "Chance" is 1-in-5: the score demands the argmax over all 32,777 rows land on the one true
 //!   word among 5, so 20% is what guessing uniformly among the five words would earn, and the
 //!   model can do worse by preferring a signal token.
@@ -99,6 +103,7 @@ fn main() {
     // to the untrained one at every corpus size, because an unseen code was an untrained row.
     let train_embed = args.iter().any(|a| a == "--train-embeddings");
     let fsq_levels = num(&args, "--fsq-levels", 8);
+    let seed = num(&args, "--seed", 3) as u64;
     if !(2..=16).contains(&fsq_levels) {
         eprintln!("--fsq-levels must be in 2..=16 (codebook is L^5)");
         std::process::exit(2);
@@ -222,7 +227,7 @@ fn main() {
     let distinct_seqs = train_seqs.len();
 
     let cfg = EncoderConfig { patch_len: PATCH, d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, latent_dim: 5 };
-    let lm = SensorLm::deterministic(&ctx, cfg, rows, 3).unwrap();
+    let lm = SensorLm::deterministic(&ctx, cfg, rows, seed).unwrap();
     let mut params: Vec<Tensor> = if train_embed {
         std::iter::once(lm.embed.clone()).chain(lm.params_flat()).collect()
     } else {
@@ -351,7 +356,7 @@ fn main() {
     let (tr, tn) = train_acc(&params);
     let h = held_acc(&params);
     let pct = if h.scored > 0 { h.right as f64 / h.scored as f64 * 100.0 } else { f64::NAN };
-    println!("\nRESULT variants={variants} levels={fsq_levels} codes={} control={control} tok_steps={tok_steps} tok_variants={tok_variants} train_embed={train_embed} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
+    println!("\nRESULT seed={seed} variants={variants} levels={fsq_levels} codes={} control={control} tok_steps={tok_steps} tok_variants={tok_variants} train_embed={train_embed} distinct_seqs={distinct_seqs}/{tn} train={tr}/{tn} held={}/{} ({pct:.0}%) collided_excluded={} code_overlap={:.0}% label_agreement={agree}/{} chance=20%",
              q.codebook_size(), h.right, h.scored, h.collided, h.overlap_pct, train.len());
     let by_kind: Vec<String> = h.per_kind.iter().enumerate()
         .map(|(k, (r, n))| format!("{}={r}/{n}", synth::name(k)))

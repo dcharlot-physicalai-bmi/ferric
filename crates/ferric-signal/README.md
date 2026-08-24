@@ -163,6 +163,36 @@ Two things follow, and the second is the more useful:
   trained on 23 billion tokens; at 80 training examples it buys nothing over 243 codes. A codebook
   is sized for a corpus, and a reproduction inherits the number without inheriting the corpus.
 
+### Seed dispersion, and a correction to everything above
+
+**Every table in this section except this one is a single run at n around 30, and a single run
+cannot separate a five-point difference from initialization noise.** Five seeds at each of the two
+codebook sizes that the resolution sweep reported as equal:
+
+| codebook | five seeds | mean | sd | range |
+|---|---|---|---|---|
+| 243 codes | 62, 54, 65, 69, 54 | **60.8%** | 6.2 | 54–69 |
+| 32,768 codes | 62, 48, 45, 52, 55 | **52.4%** | 5.9 | 45–62 |
+
+Two corrections follow, and they run in opposite directions.
+
+**The "identical accuracy" claim was two lucky draws.** Both configurations happened to return 62%
+on the seed that was run first. The 32,768-code configuration's own seeds span 45 to 62, so that
+agreement carried no information. Any single-seed gap of five points or less in the tables above —
+which is most of them — is inside this noise and should be read as unresolved, not as a measurement.
+
+**And the small codebook is not merely equal; the measured direction favours it by about 8 points,
+roughly one pooled standard deviation.** At five seeds with overlapping ranges that is suggestive
+rather than established, and it is stated that way. It does not overturn the recommendation; it
+makes the recommendation cheaper to justify, because the configuration that costs 130 times less
+memory traffic is also the one that scored higher here.
+
+What survives unchanged is the part that was never a sample: the energy accounting is exact
+arithmetic over the vocabulary, not a measurement with a spread. If accuracy differences at this
+scale are below what roughly thirty held-out examples and five seeds can resolve, and traffic
+differs by two orders of magnitude, then **the codebook is decided on the axis that can actually
+distinguish the options** — which is the argument this crate started from.
+
 ### Does the safe interval move with corpus size? No, over this range.
 
 If resolution has to be matched to coverage, coarse and fine codebooks should trade places as the
