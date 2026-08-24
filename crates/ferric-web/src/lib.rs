@@ -15,6 +15,27 @@ use wasm_bindgen::prelude::*;
 /// Scheduler worker entrypoint: the native fabric sends an op frame (op · dims · A · B, same format
 /// as Device::Remote) over a WebSocket; this executes it on the tab's WebGPU and returns the result
 /// bytes. That makes this browser tab a device in the heterogeneous fabric (Device::BrowserWorker).
+/// Build the error value this crate's public API returns, **without aborting on native**.
+///
+/// `JsValue::from_str` cannot be called off wasm32. Every wasm-bindgen extern is a `panic!` inside an
+/// `unsafe extern "C" fn`, which is a NON-UNWINDING context, so constructing a `JsValue` on a native
+/// build does not return an error and does not even panic recoverably — it **aborts the process**,
+/// printing `function not implemented on non-wasm32 targets` and discarding the real message.
+///
+/// That made every one of this crate's ~43 error paths unusable from the native examples: a refusal
+/// the browser reports cleanly killed the process here with a diagnostic about the wrong thing.
+/// Found by pointing `retrieval_scale` at a Q3_K_M checkpoint — a quantisation this runtime genuinely
+/// does not implement (ferric-tensor covers Q4_K/Q5_K/Q6_K, not Q3_K type 11 or Q2_K type 10), so the
+/// refusal was CORRECT and only its delivery was broken.
+///
+/// Native builds therefore panic with the actual message. A panic is still not a returned error — see
+/// [`FerricModel::load_native`] and [`FerricModel::embed_native`] for the seams that do return one —
+/// but it unwinds, it says what went wrong, and `catch_unwind` can contain it.
+fn jserr(msg: impl AsRef<str>) -> JsValue {
+    #[cfg(target_arch = "wasm32")] { JsValue::from_str(msg.as_ref()) }
+    #[cfg(not(target_arch = "wasm32"))] { panic!("ferric-web: {}", msg.as_ref()) }
+}
+
 #[wasm_bindgen]
 pub async fn ferric_worker_exec(input: Vec<u8>) -> Vec<u8> {
     console_error_panic_hook::set_once();
@@ -51,9 +72,9 @@ fn gen(m: u32, k: u32, n: u32) -> (Vec<f32>, Vec<f32>) {
 #[wasm_bindgen]
 pub async fn ferric_matmul_demo(m: u32, k: u32, n: u32) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let (a, b) = gen(m, k, n);
-    let gpu = ctx.matmul(&a, &b, m, k, n).await.map_err(|e| JsValue::from_str(&e))?;
+    let gpu = ctx.matmul(&a, &b, m, k, n).await.map_err(|e| jserr(&e))?;
     let cpu = matmul_cpu(&a, &b, m as usize, k as usize, n as usize);
     let diff = max_abs_diff(&gpu, &cpu);
     Ok(format!("{:?}|{:.3e}|{:?}", ctx.backend, diff, &gpu[..6.min(gpu.len())]))
@@ -73,7 +94,7 @@ impl FerricFabric {
     /// Create the fabric on the browser's best WebGPU adapter (kept resident).
     pub async fn new() -> std::result::Result<FerricFabric, JsValue> {
         console_error_panic_hook::set_once();
-        let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+        let ctx = Context::new().await.map_err(|e| jserr(&e))?;
         Ok(FerricFabric { ctx: Arc::new(ctx) })
     }
 
@@ -119,14 +140,14 @@ pub async fn ferric_lm_demo(prompt: String, steps: usize) -> std::result::Result
     console_error_panic_hook::set_once();
     let ids: Vec<u32> = prompt.split(',').filter_map(|s| s.trim().parse().ok()).map(|v: u32| v % demo::VOCAB as u32).collect();
     if ids.is_empty() {
-        return Err(JsValue::from_str("no valid token ids in prompt"));
+        return Err(jserr("no valid token ids in prompt"));
     }
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let t0 = js_sys::Date::now();
-    let generated = demo::generate(&ctx, &ids, steps).await.map_err(|e| JsValue::from_str(&e))?;
+    let generated = demo::generate(&ctx, &ids, steps).await.map_err(|e| jserr(&e))?;
     let ms = js_sys::Date::now() - t0;
     // correctness, in the browser: GPU prefill logits vs the CPU reference (same math, wasm CPU)
-    let gpu = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
+    let gpu = demo::logits(&ctx, &ids).await.map_err(|e| jserr(&e))?;
     let diff = max_abs_diff(&gpu, &demo::logits_cpu(&ids));
     let js = |v: &[u32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
     Ok(format!(
@@ -142,7 +163,7 @@ pub async fn ferric_lm_demo(prompt: String, steps: usize) -> std::result::Result
 #[wasm_bindgen]
 pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
-    let err = |e: String| JsValue::from_str(&e);
+    let err = |e: String| jserr(&e);
 
     let t_load = js_sys::Date::now();
     let g = parse(model).map_err(err)?;
@@ -190,8 +211,8 @@ pub async fn bonsai_generate(model: Vec<u8>, prompt: String, steps: usize) -> st
 #[wasm_bindgen]
 pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
-    let err = |e: String| JsValue::from_str(&e);
-    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(kind), &JsValue::from_str(payload)); };
+    let err = |e: String| jserr(&e);
+    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &jserr(kind), &jserr(payload)); };
 
     emit("status", "parsing model…");
     let t_load = js_sys::Date::now();
@@ -252,8 +273,8 @@ pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_toke
 #[wasm_bindgen]
 pub async fn bonsai_generate_json(model: Vec<u8>, prompt: String, steps: usize, schema: String, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
-    let err = |e: String| JsValue::from_str(&e);
-    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(kind), &JsValue::from_str(payload)); };
+    let err = |e: String| jserr(&e);
+    let emit = |kind: &str, payload: &str| { let _ = on_token.call2(&JsValue::NULL, &jserr(kind), &jserr(payload)); };
     emit("status", "parsing model…");
     let g = parse(model).map_err(err)?;
     let (bpe, toks) = build_bpe(&g)?;
@@ -317,7 +338,7 @@ pub async fn bonsai_generate_json(model: Vec<u8>, prompt: String, steps: usize, 
 #[wasm_bindgen]
 pub async fn bonsai_logits(model: Vec<u8>, prompt: String) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
-    let err = |e: String| JsValue::from_str(&e);
+    let err = |e: String| jserr(&e);
     let g = parse(model).map_err(err)?;
     let (bpe, _toks) = build_bpe(&g)?;
     let ctx = Arc::new(Context::new().await.map_err(err)?);
@@ -338,7 +359,7 @@ pub async fn bonsai_logits(model: Vec<u8>, prompt: String) -> std::result::Resul
 
 /// Build the exact BPE (+ the raw token strings for detok) from a GGUF's embedded tokenizer.
 fn build_bpe(g: &impl GgufSource) -> std::result::Result<(Bpe, Vec<String>), JsValue> {
-    let err = |e: &str| JsValue::from_str(e);
+    let err = |e: &str| jserr(e);
     let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
         Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
         _ => return Err(err("no tokens")),
@@ -446,7 +467,7 @@ impl FerricModel {
     /// Load a GGUF and upload weights to the GPU once. Reuse the returned handle for every generation.
     pub async fn load(model: Vec<u8>) -> std::result::Result<FerricModel, JsValue> {
         console_error_panic_hook::set_once();
-        let err = |e: String| JsValue::from_str(&e);
+        let err = |e: String| jserr(&e);
         let g = parse(model).map_err(err)?;
         let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
             Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
@@ -593,7 +614,7 @@ impl FerricModel {
 
     /// Guided generation: `schema` (a JSON-Schema string) → schema-conformant, else json_object.
     pub async fn generate_json(&self, prompt: String, steps: usize, schema: String, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
-        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(k), &JsValue::from_str(p)); };
+        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &jserr(k), &jserr(p)); };
         let sch = ferric_agent::guide::compile_str(&schema);
         let mut guide = match &sch {
             Some(p) => ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(p)),
@@ -604,7 +625,7 @@ impl FerricModel {
 
     /// Free-form generation (greedy).
     pub async fn generate(&self, prompt: String, steps: usize, on_token: js_sys::Function) -> std::result::Result<String, JsValue> {
-        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &JsValue::from_str(k), &JsValue::from_str(p)); };
+        let emit = |k: &str, p: &str| { let _ = on_token.call2(&JsValue::NULL, &jserr(k), &jserr(p)); };
         self.run(&prompt, steps, None, &emit).await
     }
 
@@ -615,7 +636,7 @@ impl FerricModel {
         // LAST-pooling embedding reference to compare against. Refuse with a message rather than pool
         // an arbitrary hidden state and hand back plausible cosine scores that mean nothing.
         let WebRuntime::Dense(m) = &self.model else {
-            return Err(JsValue::from_str("embed() is available on dense embedding models only"));
+            return Err(jserr("embed() is available on dense embedding models only"));
         };
         let n = m.cfg.n_embd;
         // Raw piece tokenization (like native Engine::embed) — embeddings embed literal text, so DON'T
@@ -626,7 +647,7 @@ impl FerricModel {
         let v = m.forward_hidden(&ids).to_vec().await; // [T·n_embd]
         let t = (v.len() / n).max(1);
         // Pool where the CHECKPOINT says to, not where this method used to assume. See `pooling`.
-        let pooled = pool(&v, t, n, self.pooling.unwrap_or(3)).map_err(|e| JsValue::from_str(&e))?;
+        let pooled = pool(&v, t, n, self.pooling.unwrap_or(3)).map_err(|e| jserr(&e))?;
         let norm = pooled.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
         Ok(pooled.iter().map(|x| x / norm).collect())
     }
@@ -650,6 +671,35 @@ pub(crate) fn pool(v: &[f32], t: usize, n: usize, kind: u32) -> Result<Vec<f32>,
             "this checkpoint declares pooling_type {other}, which embed() does not implement. \
              Refusing rather than pooling the wrong position and returning cosine scores that look \
              ordinary and rank arbitrarily (0 = NONE, 4 = RANK need a reranker head).")),
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use ferric_tensor::QMatrix;
+
+    #[test]
+    fn the_k_quants_this_runtime_implements_are_exactly_Q4_Q5_Q6() {
+        // `unsupported_tensors` is a filter over this predicate, so the predicate is the thing worth
+        // pinning. These four numbers are why a Q3_K_M file aborted the native benches: llama-quantize
+        // produces types 10 and 11 happily, ferric-tensor has a matmul for neither, and until the
+        // preflight existed that refusal arrived as `function not implemented on non-wasm32 targets`.
+        assert!(QMatrix::block_bytes(10).is_none(), "Q2_K (10) has no native matmul");
+        assert!(QMatrix::block_bytes(11).is_none(), "Q3_K (11) has no native matmul");
+        assert!(QMatrix::block_bytes(12).is_some(), "Q4_K (12) does");
+        assert!(QMatrix::block_bytes(13).is_some(), "Q5_K (13) does");
+        assert!(QMatrix::block_bytes(14).is_some(), "Q6_K (14) does");
+        // If any of the first two ever gains a kernel, this test is the reminder to delete the
+        // corresponding line rather than to relax the assertion.
+    }
+
+    #[test]
+    fn the_block_geometry_is_the_ggml_one_not_a_guess() {
+        // A wrong (values, bytes) pair does not fail to load — it reads the next tensor's bytes as
+        // this one's and produces fluent garbage, so the numbers themselves are worth asserting.
+        assert_eq!(QMatrix::block_bytes(12), Some((256, 144)), "Q4_K super-block");
+        assert_eq!(QMatrix::block_bytes(14), Some((256, 210)), "Q6_K super-block");
+        assert_eq!(QMatrix::block_bytes(8), Some((32, 34)), "Q8_0");
     }
 }
 
@@ -706,7 +756,7 @@ impl FerricModel {
             "q8_0" => Some(KvqFmt::Q8_0),
             "q4_0" => Some(KvqFmt::Q4_0),
             "q4_1" => Some(KvqFmt::Q4_1),
-            other => return Err(JsValue::from_str(&format!(
+            other => return Err(jserr(&format!(
                 "setKvCache: {other:?} is not a KV cache format. Use \"off\", \"q8_0\", \"q4_0\" or \"q4_1\"."))),
         };
         self.kv_grouped_k = grouped_k;
@@ -773,10 +823,34 @@ impl FerricModel {
         self.run(prompt, steps, None, &|_, _| {}).await
     }
 
+    /// **Name every tensor this runtime cannot load, BEFORE trying to load it.**
+    ///
+    /// The loader's refusal is correct and its delivery is not: `load` reports through `JsValue`,
+    /// which cannot be constructed off wasm32 (see [`jserr`]), so on native an unsupported checkpoint
+    /// **aborted the process** with `function not implemented on non-wasm32 targets` — a message
+    /// about wasm-bindgen, for a problem that is entirely about a tensor type.
+    ///
+    /// Measured: `llama-quantize` will happily produce Q3_K_M and Q2_K of a checkpoint this runtime
+    /// otherwise runs, and `ferric-tensor` implements Q4_K, Q5_K and Q6_K but not Q3_K (ggml type 11)
+    /// or Q2_K (type 10). Pointing a bench at one of those files looked like a crash and was in fact
+    /// a correct refusal with no voice.
+    ///
+    /// This returns the offending `(tensor name, ggml type)` pairs and touches no GPU and no
+    /// wasm-bindgen, so it works identically on both targets and can be called before any allocation.
+    /// An empty vector means every tensor has a native matmul; it is NOT a promise the model runs,
+    /// because architecture support is a separate question that [`crate::arch`] answers.
+    pub fn unsupported_tensors(model: &[u8]) -> std::result::Result<Vec<(String, u32)>, String> {
+        let g = parse(model.to_vec())?;
+        Ok(g.tensors.iter()
+            .filter(|t| ferric_tensor::QMatrix::block_bytes(t.ggml_type).is_none() && t.ggml_type != 0 && t.ggml_type != 1)
+            .map(|t| (t.name.clone(), t.ggml_type))
+            .collect())
+    }
+
     async fn run(&self, prompt: &str, steps: usize, mut guide: Option<&mut ferric_agent::guide::Guide<'_>>, emit: &dyn Fn(&str, &str)) -> std::result::Result<String, JsValue> {
         let n_vocab = self.n_vocab();
         let ids = self.encode(prompt);
-        if ids.is_empty() { return Err(JsValue::from_str("prompt encoded to zero tokens")); }
+        if ids.is_empty() { return Err(jserr("prompt encoded to zero tokens")); }
         // From the model's own metadata — the hardcoded Qwen pair generated past every other family's
         // end-of-turn. Empty set means "no known stop", which runs to `steps` and says so honestly.
         let eos = |t: u32| self.eos_set.contains(&t);
@@ -852,7 +926,7 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
         }
         h
     }
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     const T: usize = 12;
     const D: usize = 64;
     const H: u32 = 4;
@@ -866,48 +940,48 @@ pub async fn ferric_fabric_probe() -> std::result::Result<String, JsValue> {
     let wnt = ctx.tensor(&wn, &[D]);
     let mut rows = vec![format!("fabric: {:?} ({})", ctx.backend, ctx.adapter_name)];
     let mm = ctx.mm(&xt, &wt, t, d, d);
-    rows.push(format!("mm        {:016x}", fnv(&ctx.to_vec(&mm).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("mm        {:016x}", fnv(&ctx.to_vec(&mm).await.map_err(|e| jserr(&e))?)));
     let rms = ctx.rmsnorm_t(&xt, &wnt, t, d, 1e-5);
-    rows.push(format!("rmsnorm   {:016x}", fnv(&ctx.to_vec(&rms).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("rmsnorm   {:016x}", fnv(&ctx.to_vec(&rms).await.map_err(|e| jserr(&e))?)));
     let x_pos: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
     let xpt = ctx.tensor(&x_pos, &[T, D]);
     let sq = ctx.sqrt_t(&xpt);
-    rows.push(format!("sqrt      {:016x}", fnv(&ctx.to_vec(&sq).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("sqrt      {:016x}", fnv(&ctx.to_vec(&sq).await.map_err(|e| jserr(&e))?)));
     let rope = ctx.rope_t(&mm, t, H, DH, 10000.0);
-    rows.push(format!("rope      {:016x}", fnv(&ctx.to_vec(&rope).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("rope      {:016x}", fnv(&ctx.to_vec(&rope).await.map_err(|e| jserr(&e))?)));
     let q = ctx.mm(&xt, &wt, t, d, d);
     let k = ctx.mm(&rms, &wt, t, d, d);
     let v = ctx.mm(&xt, &wt, t, d, d);
     let mha = ctx.mha_causal_t(&q, &k, &v, t, H, H, DH);
-    rows.push(format!("mha       {:016x}", fnv(&ctx.to_vec(&mha).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("mha       {:016x}", fnv(&ctx.to_vec(&mha).await.map_err(|e| jserr(&e))?)));
     let sg = ctx.sigmoid_t(&xt);
-    rows.push(format!("sigmoid   {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("sigmoid   {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| jserr(&e))?)));
     let bias = det(D, 4);
     let bt = ctx.tensor(&bias, &[D]);
     let ln = ctx.layernorm_t(&xt, &wnt, &bt, t, d, 1e-5);
-    rows.push(format!("layernorm {:016x}", fnv(&ctx.to_vec(&ln).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("layernorm {:016x}", fnv(&ctx.to_vec(&ln).await.map_err(|e| jserr(&e))?)));
     let sm = ctx.softmax_t(&xt, t, d);
-    rows.push(format!("softmax   {:016x}", fnv(&ctx.to_vec(&sm).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("softmax   {:016x}", fnv(&ctx.to_vec(&sm).await.map_err(|e| jserr(&e))?)));
     let rt = ctx.rmsnorm_tree_t(&xt, &wnt, t, d, 1e-5);
-    rows.push(format!("rms-tree  {:016x}", fnv(&ctx.to_vec(&rt).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("rms-tree  {:016x}", fnv(&ctx.to_vec(&rt).await.map_err(|e| jserr(&e))?)));
     let rc = ferric_core::rmsnorm_tree_cpu(&x, &wn, T, D, 1e-5);
     rows.push(format!("rms-tcpu  {:016x}", fnv(&rc)));
     let lt = ctx.layernorm_tree_t(&xt, &wnt, &bt, t, d, 1e-5);
-    rows.push(format!("ln-tree   {:016x}", fnv(&ctx.to_vec(&lt).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("ln-tree   {:016x}", fnv(&ctx.to_vec(&lt).await.map_err(|e| jserr(&e))?)));
     let lc = ferric_core::layernorm_tree_cpu(&x, &wn, &bias, T, D, 1e-5);
     rows.push(format!("ln-tcpu   {:016x}", fnv(&lc)));
     let st = ctx.softmax_tree_t(&xt, t, d);
-    rows.push(format!("sm-tree   {:016x}", fnv(&ctx.to_vec(&st).await.map_err(|e| JsValue::from_str(&e))?)));
+    rows.push(format!("sm-tree   {:016x}", fnv(&ctx.to_vec(&st).await.map_err(|e| jserr(&e))?)));
     let sc = ferric_core::softmax_tree_cpu(&x, T, D);
     rows.push(format!("sm-tcpu   {:016x}", fnv(&sc)));
     if let Some(sg) = ctx.rmsnorm_sg_t(&xt, &wnt, t, d, 1e-5) {
-        rows.push(format!("rms-sg    {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| JsValue::from_str(&e))?)));
+        rows.push(format!("rms-sg    {:016x}", fnv(&ctx.to_vec(&sg).await.map_err(|e| jserr(&e))?)));
     }
     // the lane-simulation twin is substrate-independent — always present
     let sgc = ferric_core::rmsnorm_sg_cpu(&x, &wn, T, D, 1e-5);
     rows.push(format!("rms-sgc   {:016x}", fnv(&sgc)));
     let ids: Vec<u32> = (0..T as u32).map(|i| (i * 7 + 1) % 32).collect();
-    let lg = demo::logits(&ctx, &ids).await.map_err(|e| JsValue::from_str(&e))?;
+    let lg = demo::logits(&ctx, &ids).await.map_err(|e| jserr(&e))?;
     rows.push(format!("demo-lm   {:016x}", fnv(&lg)));
     Ok(rows.join("\n"))
 }
@@ -943,12 +1017,12 @@ pub async fn ferric_sqrt_forensic() -> std::result::Result<String, JsValue> {
         }
         y * x
     }
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let x = det(12 * 64, 1);
     let x_pos: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
     let xpt = ctx.tensor(&x_pos, &[12, 64]);
     let sq = ctx.sqrt_t(&xpt);
-    let gpu = ctx.to_vec(&sq).await.map_err(|e| JsValue::from_str(&e))?;
+    let gpu = ctx.to_vec(&sq).await.map_err(|e| jserr(&e))?;
     let mut bad = 0usize;
     let mut first = String::new();
     for (i, (&y, &g)) in x_pos.iter().zip(&gpu).enumerate() {
@@ -1006,13 +1080,13 @@ pub async fn ferric_rsqrt_stages() -> std::result::Result<String, JsValue> {
         out[13] = y * x;
         out
     }
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let x = det(12 * 64, 1);
     let y: Vec<f32> = x.iter().map(|v| v * v + 0.25).collect();
     let cpu: Vec<[f32; 14]> = y.iter().map(|&v| cpu_stages(v)).collect();
     let mut rows = Vec::new();
     for stage in 0..14u32 {
-        let gpu = ctx.det_rsqrt_stage(&y, stage).await.map_err(|e| JsValue::from_str(&e))?;
+        let gpu = ctx.det_rsqrt_stage(&y, stage).await.map_err(|e| jserr(&e))?;
         let mut bad = 0usize;
         let mut first = String::new();
         for (i, &g) in gpu.iter().enumerate() {
@@ -1086,13 +1160,13 @@ pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
         let t = x[base] * inv;
         cpu[row] = [ms_acc, rc, ms, arg, inv, t, t * wn[0]];
     }
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let mut rows = Vec::new();
     for stage in 0..7u32 {
         let gpu = ctx
             .det_rmsnorm_stage(&x, &wn, T as u32, D as u32, 1e-5, stage)
             .await
-            .map_err(|e| JsValue::from_str(&e))?;
+            .map_err(|e| jserr(&e))?;
         let mut bad = 0;
         let mut first = String::new();
         for (i, &g) in gpu.iter().enumerate() {
@@ -1150,13 +1224,13 @@ pub async fn ferric_rmsnorm_diff() -> std::result::Result<String, JsValue> {
     const D: usize = 64;
     let x = det(T * D, 1);
     let wn: Vec<f32> = det(D, 3).iter().map(|v| v + 1.0).collect();
-    let ctx = Context::new().await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let xt = ctx.tensor(&x, &[T, D]);
     let wt = ctx.tensor(&wn, &[D]);
     let g = ctx
         .to_vec(&ctx.rmsnorm_t(&xt, &wt, T as u32, D as u32, 1e-5))
         .await
-        .map_err(|e| JsValue::from_str(&e))?;
+        .map_err(|e| jserr(&e))?;
     let mut rows = Vec::new();
     for row in 0..T {
         let base = row * D;
