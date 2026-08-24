@@ -778,3 +778,36 @@ The deployment consequence is concrete: **corpus vectors are per-quantisation, n
 The page now splits the diagnostic by magnitude rather than reporting one message. Above 0.95 it says
 the file was built with a different *quantisation* and names the fix; below, it says different model.
 A near-miss almost always means the former, and the old wording sent the reader hunting the latter.
+
+## U. Re-measured after the tokenizer fix — the result stands (2026-08-21)
+
+Everything in §Q–§T was measured before `04151cf`, which corrected a real defect in the tokenizer:
+`tokenizer.ggml.pre` was read nowhere, so the Qwen family got GPT-2's pre-tokenizer and mid-word
+punctuation split differently from the reference. The invented-facts corpus is built from
+**hyphenated proper nouns**, and those names *are* the retrieval signal — every distractor is a
+structurally identical sentence differing only in the entity. So every retrieval figure had been
+computed through a component since proven wrong on precisely the text carrying the signal.
+
+Re-run on the 1000-chunk corpus with the identical retriever and corpus:
+
+| chunks | margin before | margin after | Δ |
+|---|---|---|---|
+| 22 | 0.4016 | 0.4042 | +0.0026 |
+| 100 | 0.2324 | 0.2326 | +0.0002 |
+| 400 | 0.1947 | 0.1960 | +0.0013 |
+| 1000 | 0.1610 | 0.1619 | +0.0009 |
+
+**retrieval@1 is 22/22 at every size in BOTH runs, and 22 distinct passages in both.** `top1` moves
+0.8299 → 0.8305. Mean margin change **+0.0011, and all seven sizes move the same direction** — a
+small systematic improvement, consistent with vectors that now match the reference checkpoint.
+
+**Nothing in §Q–§T changes.** The reason the fix barely moved the numbers is the reason the bench
+could not have caught the bug: corpus and query pass through the same tokenizer, so ranking is
+invariant to a consistent change in it. That is a property of the measurement, not a defence of it —
+the vectors *were* wrong against the reference, and only a comparison with an independent
+implementation could show it.
+
+**Provenance:** figures in §Q–§T were produced before `04151cf` and re-confirmed after it. §S's
+extrapolated 140,000-chunk ceiling uses the settled decay rate, which moves from −0.0225 to −0.0223
+per doubling — inside the noise of a seven-point fit either way, so the figure is unchanged and
+remains an extrapolation rather than a measurement.
