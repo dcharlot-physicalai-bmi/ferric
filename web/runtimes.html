@@ -79,7 +79,19 @@ try {
       const probe = await embedder.embed('ferric model fingerprint probe');
       let dotP = 0; for (let k = 0; k < nEmbd; k++) dotP += probe[k] * fileProbe[k];
       document.getElementById('info').textContent += ' · probe-cos ' + dotP.toFixed(6);
-      if (!(dotP > 0.999)) throw new Error('corpus vectors were made by a DIFFERENT model (probe cosine ' + dotP.toFixed(4) + ')');
+      // Two failure modes, and they need different advice. MEASURED on qwen3-embed-0.6b: the same
+      // weights across FABRICS (native Metal vs Chrome/Dawn, different kernel variants by capability)
+      // land at probe cosine 1.000000, while Q8_0 vs Q4_K_M of that same checkpoint land at 0.986131 —
+      // requantisation moves an embedding far more than the fabric does. So a near-miss here almost
+      // always means the file was built with a different QUANTISATION of the right model, which is a
+      // one-command fix, and saying "a different model" would send the reader hunting the wrong thing.
+      if (!(dotP > 0.999)) {
+        throw new Error(dotP > 0.95
+          ? 'corpus vectors were built with a different QUANTISATION of this model (probe cosine '
+            + dotP.toFixed(6) + '; same weights across fabrics measure 1.000000, Q8_0 vs Q4_K_M measures '
+            + '0.986131). Re-run embed_corpus with the exact checkpoint this page loads.'
+          : 'corpus vectors were made by a DIFFERENT model (probe cosine ' + dotP.toFixed(6) + ')');
+      }
       const base = 16 + nEmbd * 4;
       corpusVecs = [];
       for (let i = 0; i < nChunks; i++) corpusVecs.push(new Float32Array(buf, base + i * nEmbd * 4, nEmbd));

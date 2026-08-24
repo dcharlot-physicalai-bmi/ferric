@@ -746,3 +746,35 @@ claim is **no degradation**, never improvement. What matters is the size. With a
 weights-outside system ships **860 MB against the memoriser's 1117 MB** — so the headline moves from
 "ties at equal bytes" to **wins at 1.3x smaller**, still 22/22 against 0/22 on facts nothing could
 have memorised.
+
+## T. Quantisation moves an embedding ~50x more than the fabric does (2026-08-21)
+
+The tab's model-identity gate accepts `probe cosine > 0.999`, a threshold set in §O to tolerate
+cross-fabric kernel selection. That raises a question the artifacts can now answer: **is a
+requantised model the same model by that test?** It decides whether one `.fvec` can serve every
+client regardless of which quantisation they downloaded.
+
+Same 120-chunk corpus, same checkpoint, embedded twice — `qwen3-embed-0.6b` at Q8_0 and at Q4_K_M:
+
+| comparison | probe cosine | the gate |
+|---|---|---|
+| same weights, **different fabric** (native Metal vs Chrome/Dawn) | **1.000000** | passes |
+| same checkpoint, **different quantisation** (Q8_0 vs Q4_K_M) | **0.986131** | **fails** |
+
+All 120 corpus vectors move together: min 0.9637, median 0.9777, max 0.9832 — **120/120 below the
+gate**. So the threshold is well calibrated: it admits the noise it was written for and rejects a
+change two orders of magnitude larger.
+
+**But "different model" is not the same as "unusable vectors".** Ranking each chunk against the
+*other* file's vectors, **120/120 still rank themselves first**. The geometry moved uniformly enough
+that retrieval would have worked. The gate refuses a mix that would in fact have functioned — and
+that is the right default, because it cannot see ranking, only geometry, and a genuinely different
+model can also preserve some rankings by luck.
+
+The deployment consequence is concrete: **corpus vectors are per-quantisation, not per-model.** One
+`.fvec` cannot serve clients that chose different quantisations; each needs its own, which is one
+`embed_corpus` run.
+
+The page now splits the diagnostic by magnitude rather than reporting one message. Above 0.95 it says
+the file was built with a different *quantisation* and names the fix; below, it says different model.
+A near-miss almost always means the former, and the old wording sent the reader hunting the latter.
