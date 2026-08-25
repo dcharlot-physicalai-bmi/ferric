@@ -81,6 +81,31 @@ discriminating: at 32 codes it emits a single token sequence for all eighty trai
 process collapses to the same stream, and held-out accuracy is undefined rather than low. That is a
 property of the quantizer's resolution against the data, not a seed effect.
 
+**Real sensor data: signal to text does not work yet, and the baseline is why that is legible.**
+`examples/hydraulic` ingests the UCI Condition Monitoring of Hydraulic Systems corpus (CC BY 4.0,
+not redistributed here) — 2,205 cycles, 17 channels at four sampling rates, five independent label
+axes. Tokenization runs end to end; 150 strided cycles give 606 tokens per cycle and visit 2,597 of
+32,768 codes. Training the language half on those captions, 225 train / 75 held out, three seeds:
+
+| axis | mean | sd | majority | chance |
+|---|---|---|---|---|
+| cooler | 33.3% | 1.9 | 34.7% | 33% |
+| valve | 50.7% | 0.0 | **50.7%** | 25% |
+| pump_leak | 56.0% | 0.0 | **56.0%** | 33% |
+| accumulator | 29.3% | 0.0 | 34.7% | 25% |
+| stable | 36.0% | 0.0 | 64.0% | 50% |
+
+Every axis is at or below the accuracy of simply predicting the training majority, and two match
+their majority exactly with no variation across seeds. The model converges to a constant per axis
+and reads nothing from the signal. Against the chance column alone, valve at 50.7% against 25% would
+look like twice chance; the majority column is what makes it a null. **A benchmark reporting only
+accuracy and chance would have called this a result.**
+
+The tokenizer here is untrained, and an untrained encoder on real multi-rate data visits under 8% of
+its code space. That bounds what this says: it is evidence about this configuration, not about the
+architecture, and the next thing to try is training the tokenizer on the corpus rather than scaling
+the language half.
+
 **The energy accounting is arithmetic, not measurement.** A decoder touches its vocabulary twice per
 position — one row on the way in, every row at the output head on the way out — so the head is what
 grows with codebook size:
