@@ -15,6 +15,33 @@
 //! | norm | pre-RMSNorm | **post-LayerNorm, with bias** |
 //! | FFN | gated SwiGLU | **plain GELU** |
 //!
+//! ## ⚠ VERIFIED FOR BERT, **NOT** FOR XLM-ROBERTA
+//!
+//! Reference-diffed against `llama-embedding`:
+//!
+//! | checkpoint | arch | quant | cosine |
+//! |---|---|---|---|
+//! | bge-small-en-v1.5 | BERT, 12L d=384 | F16 | **0.999999–1.000000** |
+//! | bge-small-en-v1.5 | BERT, 12L d=384 | Q4_K_M | **0.999996** |
+//! | bge-reranker-v2-m3 | XLM-R, 24L d=1024 | Q4_K_M | **0.9615** ❌ |
+//!
+//! The XLM-R gap is an OPEN BUG. What it is not, each ruled out by measurement rather than argument:
+//!
+//! * **not quantisation** — Q4_K_M bge-small is 0.999996, same code path, so the Q4_K matmul agrees
+//!   with llama.cpp. (This also clears every Q4_K result elsewhere in the project.)
+//! * **not tokenisation** — Ferric's ids are identical to `llama-tokenize` on both halves of a pair.
+//! * **not the classification head** — the plain EMBEDDING path diverges by the same amount.
+//! * **not accumulation over depth or length** — it is 0.926 at FOUR tokens and 0.961 at fourteen,
+//!   so it is present from the first block rather than compounding.
+//! * **not the LayerNorm epsilon** — declared 1e-5 here against bge-small's 1e-12, and read correctly.
+//! * **not primarily the position offset** — sweeping 0..3 moves it 0.9615 → 0.9762, never near 0.999.
+//!
+//! So it is structural and specific to this checkpoint family, in the embedding construction or an
+//! early block. The reranker head itself is implemented (`score`) and DISCRIMINATES correctly —
+//! +6 relevant, −9 irrelevant, same ordering as llama.cpp — but the logits differ, so `/v1/rerank`
+//! is deliberately NOT built on it yet. Ordering being right is exactly what would make a rank
+//! benchmark pass while the model is wrong.
+//!
 //! `bert.attention.causal = false` is read rather than assumed, because an encoder run with a causal
 //! mask does not fail — it returns embeddings where every token saw only its left context, which is
 //! a different and worse vector that no test comparing Ferric to itself could catch.
@@ -34,6 +61,12 @@ pub struct Cfg {
     /// GGUF `bert.pooling_type`: 1 MEAN, 2 CLS. Read, never assumed — see the module note.
     pub pooling: u32,
     pub causal: bool,
+    /// **Where position 0 lives in `position_embd`.** RoBERTa-family checkpoints (XLM-R, and so
+    /// bge-reranker-v2-m3) reserve the first slots for padding and start real positions at
+    /// `padding_idx + 1` = 2; original BERT starts at 0. The table is sized for the offset —
+    /// bge-reranker declares 8192 rows for a 512-token context — so reading from 0 silently uses the
+    /// wrong row for EVERY token and produces a plausible, wrong score.
+    pub pos_offset: usize,
 }
 
 impl Cfg {
@@ -60,6 +93,13 @@ impl Cfg {
             eps: f("attention.layer_norm_epsilon").unwrap_or(1e-12),
             pooling: match md.get("bert.pooling_type") { Some(Meta::U(v)) => *v as u32, _ => 2 },
             causal,
+            // Inferred from the padding id, which is what the convention is actually keyed on:
+            // RoBERTa sets pad=1 and starts positions at 2; BERT sets pad=0 and starts at 0.
+            pos_offset: std::env::var("FERRIC_BERT_POS_OFFSET").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(match md.get("tokenizer.ggml.padding_token_id") {
+                    Some(Meta::U(v)) if *v > 0 => *v as usize + 1,
+                    _ => 0,
+                }),
         })
     }
 }
@@ -83,7 +123,14 @@ pub struct Bert {
     typ_embd: Vec<f32>,      // [n_type, d]
     embd_norm_w: Tensor, embd_norm_b: Tensor,
     blocks: Vec<Block>,
+    /// The **classification head**, present only on cross-encoder rerankers. Its existence is what
+    /// separates a reranker from an embedder in an otherwise identical file: same `general.architecture
+    /// = bert`, same blocks, but four extra tensors that turn a pooled vector into ONE relevance
+    /// score. Absent on bge-small; present on bge-reranker-v2-m3.
+    cls: Option<ClsHead>,
 }
+
+struct ClsHead { w: Tensor, b: Tensor, ow: Tensor, ob: Tensor }
 
 /// Load a `[rows, cols]` tensor as f32. GGUF dims are reversed relative to row-major, so a weight
 /// listed `[in, out]` is `[out, in]` in memory — which is exactly `matmul_bt`'s expected layout.
@@ -122,6 +169,13 @@ impl Bert {
             typ_embd: g.dequant("token_types.weight")?,
             embd_norm_w: t1(ctx, g, "token_embd_norm.weight")?,
             embd_norm_b: t1(ctx, g, "token_embd_norm.bias")?,
+            cls: match g.tensor("cls.weight") {
+                Some(_) => Some(ClsHead {
+                    w: t2(ctx, g, "cls.weight")?, b: t1(ctx, g, "cls.bias")?,
+                    ow: t2(ctx, g, "cls.output.weight")?, ob: t1(ctx, g, "cls.output.bias")?,
+                }),
+                None => None,
+            },
             blocks, cfg,
         })
     }
@@ -129,7 +183,7 @@ impl Bert {
     /// One bidirectional forward over the whole sequence. Returns `[t, d]` hidden states.
     pub fn forward(&self, ids: &[u32]) -> Result<Tensor, String> {
         let (d, t) = (self.cfg.d, ids.len());
-        if t > self.cfg.n_ctx {
+        if t + self.cfg.pos_offset > self.pos_embd.len() / d {
             return Err(format!("{t} tokens exceeds this encoder's {} position embeddings; BERT has \
                                 no RoPE to extrapolate with, so a longer input must be truncated by \
                                 the caller rather than silently wrapped", self.cfg.n_ctx));
@@ -139,8 +193,9 @@ impl Bert {
         let mut e = vec![0f32; t * d];
         for (p, &id) in ids.iter().enumerate() {
             let (tk, ps) = ((id as usize) * d, p * d);
+            let pe = (p + self.cfg.pos_offset) * d;
             for j in 0..d {
-                e[ps + j] = self.tok_embd[tk + j] + self.pos_embd[ps + j] + self.typ_embd[j];
+                e[ps + j] = self.tok_embd[tk + j] + self.pos_embd[pe + j] + self.typ_embd[j];
             }
         }
         let mut h = Tensor::from_vec(&self.ctx, &e, &[t, d])
@@ -177,5 +232,29 @@ impl Bert {
             h = h.add(&ff).layernorm(&b.out_norm_w, &b.out_norm_b, self.cfg.eps);
         }
         Ok(h)
+    }
+
+    /// Whether this checkpoint carries a reranker head.
+    pub fn is_reranker(&self) -> bool { self.cls.is_some() }
+
+    /// **Cross-encoder relevance score** for one (query, passage) pair, already joined into `ids`.
+    ///
+    /// This is what makes a reranker worth its cost and a bi-encoder cheap: the query and the passage
+    /// go through the network TOGETHER, so every query token can attend to every passage token. A
+    /// bi-encoder embeds them apart and compares two summaries. Scoring N passages therefore costs N
+    /// forwards, which is why it runs over a retrieved shortlist rather than the corpus.
+    ///
+    /// Head: pooled CLS → dense → tanh → linear → one logit. Returned RAW, not squashed: llama.cpp
+    /// reports the logit, ordering is invariant to any monotone squash, and a sigmoid here would make
+    /// scores from two implementations incomparable for no gain.
+    pub async fn score(&self, ids: &[u32]) -> Result<f32, String> {
+        let c = self.cls.as_ref().ok_or(
+            "this checkpoint has no cls.* head, so it embeds but cannot score a pair;              reranking needs a cross-encoder such as bge-reranker")?;
+        let h = self.forward(ids)?;
+        // CLS is position 0 for every cross-encoder in this family.
+        let pooled = h.narrow(0, 0, 1).reshape(&[1, self.cfg.d]);
+        let z = pooled.matmul_bt(&c.w).add(&c.b).tanh();
+        let out = z.matmul_bt(&c.ow).add(&c.ob).to_vec().await;
+        out.first().copied().ok_or_else(|| "empty score output".into())
     }
 }

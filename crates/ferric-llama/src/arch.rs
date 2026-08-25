@@ -117,8 +117,10 @@ pub const REGISTRY: &[Arch] = &[
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
-                  at cosine 0.999999-1.000000 over 3-to-39-token inputs. EMBEDS ONLY — generation is \
-                  refused, there is no head to generate from" },
+                  at cosine 0.999999 (F16) and 0.999996 (Q4_K_M) over 3-to-39-token inputs. EMBEDS ONLY — \
+                  generation is refused, there is no head to generate from. ⚠ VERIFIED FOR BERT ONLY: \
+                  XLM-RoBERTa checkpoints (bge-reranker-v2-m3) diverge at cosine 0.9615 for reasons \
+                  not yet found — see the bert module header for what has been ruled out" },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
@@ -319,10 +321,21 @@ mod tests {
         for a in REGISTRY {
             let served = match a.runtime {
                 Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4
-                    | Runtime::DeepSeek2 => true,
+                    | Runtime::DeepSeek2 | Runtime::Bert => true,
             };
             assert!(served, "{} names a runtime with no dispatch", a.name);
         }
+    }
+
+    #[test]
+    fn the_encoder_row_is_marked_as_embedding_only() {
+        // The registry now mixes generators with a runtime that CANNOT generate. A caller reading
+        // `status: Verified` and reaching for `generate` must find that stated here, because the
+        // refusal itself lives two crates away in ferric-web.
+        let bert = REGISTRY.iter().find(|a| a.name == "bert").expect("bert row");
+        assert_eq!(bert.runtime, Runtime::Bert);
+        assert!(bert.note.contains("EMBEDS ONLY"),
+                "the encoder row must say it cannot generate; note reads: {}", bert.note);
     }
 
     #[test]
