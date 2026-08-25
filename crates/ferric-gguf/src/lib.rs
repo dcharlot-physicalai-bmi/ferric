@@ -525,32 +525,122 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
 pub struct GgufFile {
     pub metadata: HashMap<String, Meta>,
     pub tensors: Vec<TensorInfo>,
-    f: std::cell::RefCell<std::fs::File>,
-    data_start: u64,
+    /// One entry per FILE. A single-file model has exactly one; a sharded model has `split.count`.
+    shards: Vec<Shard>,
+    /// `tensors[i]` lives in `shards[owner[i]]`. Parallel to `tensors`, so the merged tensor table
+    /// looks exactly like a single file's to every caller while `raw` still reads from the right one.
+    owner: Vec<usize>,
+}
+
+struct Shard { f: std::cell::RefCell<std::fs::File>, data_start: u64, len: u64 }
+
+/// Parse one file's header, growing the prefix read until it succeeds.
+fn open_one(path: &std::path::Path) -> Result<(HashMap<String, Meta>, Vec<TensorInfo>, Shard), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
+    // Header = magic + metadata (which includes the tokenizer vocab, often megabytes) + tensor
+    // infos. Its size isn't known up front, so read a prefix and grow until it parses.
+    let mut cap = (8usize << 20).min(len);
+    loop {
+        let mut buf = vec![0u8; cap];
+        let n = read_prefix(&mut f, &mut buf)?;
+        buf.truncate(n);
+        match parse(buf) {
+            Ok(g) => return Ok((g.metadata, g.tensors,
+                                Shard { f: std::cell::RefCell::new(f), data_start: g.data_start as u64,
+                                        len: len as u64 })),
+            Err(e) => {
+                if cap >= len { return Err(e); }
+                cap = (cap * 4).min(len);
+            }
+        }
+    }
+}
+
+/// Rebuild a shard path for `no` (0-based) from any sibling's path.
+///
+/// `llama-gguf-split` names parts `<prefix>-%05d-of-%05d.gguf`, so the shape is recovered by finding
+/// `-of-` and stepping back over the five digits and the dash before it. Derived rather than guessed:
+/// the caller may hand us ANY shard, not necessarily the first.
+fn shard_path(any: &std::path::Path, no: usize, count: usize) -> Result<std::path::PathBuf, String> {
+    let name = any.file_name().and_then(|s| s.to_str()).ok_or("shard path has no file name")?;
+    let stem = name.strip_suffix(".gguf").ok_or_else(|| format!("{name}: not a .gguf"))?;
+    let at = stem.rfind("-of-").ok_or_else(|| format!(
+        "{name} declares split.count {count} but is not named <prefix>-00001-of-{count:05}.gguf, so \
+         its siblings cannot be located"))?;
+    if at < 6 { return Err(format!("{name}: malformed split suffix")); }
+    let prefix = &stem[..at - 6];
+    Ok(any.with_file_name(format!("{prefix}-{:05}-of-{:05}.gguf", no + 1, count)))
 }
 
 impl GgufFile {
+    /// Open a GGUF, following `split.count` to its sibling shards when the file is one part of many.
+    ///
+    /// Large open-weight checkpoints are distributed as `model-00001-of-00009.gguf` and friends —
+    /// llama.cpp, vLLM and Ollama all follow the parts automatically. Before this, Ferric loaded the
+    /// first shard alone, saw a tensor table covering a FRACTION of the model, and failed far away
+    /// with `no tensor 'blk.11.attn_v.weight'` — a message that names a tensor rather than the fact
+    /// that 182 of 310 were in files it never opened. Any shard may be passed; the rest are derived.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<GgufFile, String> {
-        let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
-        // Header = magic + metadata (which includes the tokenizer vocab, often megabytes) + tensor
-        // infos. Its size isn't known up front, so read a prefix and grow until it parses.
-        let mut cap = (8usize << 20).min(len);
-        loop {
-            let mut buf = vec![0u8; cap];
-            let n = read_prefix(&mut f, &mut buf)?;
-            buf.truncate(n);
-            match parse(buf) {
-                Ok(g) => return Ok(GgufFile {
-                    metadata: g.metadata, tensors: g.tensors,
-                    data_start: g.data_start as u64, f: std::cell::RefCell::new(f),
-                }),
-                Err(e) => {
-                    if cap >= len { return Err(e); }
-                    cap = (cap * 4).min(len);
-                }
+        let path = path.as_ref();
+        let (metadata, tensors, shard) = open_one(path)?;
+        let count = match metadata.get("split.count") { Some(Meta::U(v)) => *v as usize, _ => 1 };
+        if count <= 1 {
+            let owner = vec![0; tensors.len()];
+            return Ok(GgufFile { metadata, tensors, shards: vec![shard], owner });
+        }
+
+        // Shard 0 carries the model metadata — tokenizer, architecture, everything. Later parts
+        // carry only their own tensor tables, so shard 0 is loaded even when a later part was passed.
+        let this_no = match metadata.get("split.no") { Some(Meta::U(v)) => *v as usize, _ => 0 };
+        let want = match metadata.get("split.tensors.count") { Some(Meta::U(v)) => *v as usize, _ => 0 };
+
+        let mut md: Option<HashMap<String, Meta>> = None;
+        let mut all: Vec<TensorInfo> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        let mut shards: Vec<Shard> = Vec::new();
+        let mut carried = Some((metadata, tensors, shard));
+
+        for no in 0..count {
+            let (m, ts, sh) = if no == this_no {
+                carried.take().ok_or("split.no names the same shard twice")?
+            } else {
+                open_one(&shard_path(path, no, count)?)?
+            };
+            if no == 0 { md = Some(m); }
+            let idx = shards.len();
+            shards.push(sh);
+            owner.extend(std::iter::repeat(idx).take(ts.len()));
+            all.extend(ts);
+        }
+
+        let metadata = md.ok_or("shard 0 was never loaded")?;
+        // A count checksum is necessary and NOT sufficient: truncating a shard leaves its header and
+        // tensor table intact, so the tensor count still adds up while the bytes are gone. Measured —
+        // cutting part 3 to 200 KB passed the count check and loaded 310 tensors. `read_exact` would
+        // eventually catch it, but as "failed to fill whole buffer" from inside one tensor read rather
+        // than as a truncated file. So each shard is checked against the span its own tensors claim.
+        for (i, sh) in shards.iter().enumerate() {
+            let end = all.iter().zip(&owner).filter(|(_, o)| **o == i)
+                .try_fold(0u64, |m, (t, _)| {
+                    let n: usize = t.dims.iter().product::<u64>() as usize;
+                    Ok::<u64, String>(m.max(sh.data_start + t.offset + type_size(t.ggml_type, n)? as u64))
+                })?;
+            if end > sh.len {
+                return Err(format!(
+                    "shard {} of {count} is {} bytes but its tensor table claims data out to {end} — \
+                     the file is truncated", i + 1, sh.len));
             }
         }
+        // The count is a CHECKSUM on the set of files, and the only thing standing between a missing
+        // part and a model that loads with holes in it. A short set must fail here, naming the
+        // shortfall, rather than 200 lines later naming one tensor.
+        if want != 0 && all.len() != want {
+            return Err(format!(
+                "split.tensors.count declares {want} tensors but the {count} shards hold {}; a part is \
+                 missing or truncated", all.len()));
+        }
+        Ok(GgufFile { metadata, tensors: all, shards, owner })
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
@@ -559,18 +649,29 @@ impl GgufFile {
     /// tensor's absolute position is `data_start() + t.offset` — which is what a streaming reader needs
     /// in order to fetch weights positionally without going through this handle (whose `File` sits behind
     /// a `RefCell` and is therefore not shareable across threads).
-    pub fn data_start(&self) -> u64 { self.data_start }
+    /// ⚠ Shard 0's data offset. For a SHARDED model `TensorInfo::offset` is relative to the data
+    /// section of whichever file holds that tensor, so `data_start() + t.offset` is only an absolute
+    /// position when [`GgufFile::shard_count`] is 1. Positional readers must check that first.
+    pub fn data_start(&self) -> u64 { self.shards[0].data_start }
 
     /// The tensor's raw on-disk bytes — packed, exactly as stored (feed straight to a native
     /// quantized matmul so the weights never round-trip through f32).
     pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
-        let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        // By INDEX, not by reference: `owner` is parallel to `tensors`, and a sharded model's offsets
+        // are relative to the data section of the file that holds them, not to the first file's.
+        let i = self.tensors.iter().position(|t| t.name == name)
+            .ok_or_else(|| format!("no tensor '{name}'"))?;
+        let t = &self.tensors[i];
         let n: usize = t.dims.iter().product::<u64>() as usize;
         let sz = type_size(t.ggml_type, n)?;
+        let sh = &self.shards[self.owner[i]];
         let mut buf = vec![0u8; sz];
-        read_at(&mut self.f.borrow_mut(), self.data_start + t.offset, &mut buf)?;
+        read_at(&mut sh.f.borrow_mut(), sh.data_start + t.offset, &mut buf)?;
         Ok(buf)
     }
+
+    /// How many files back this model. 1 for an ordinary GGUF, `split.count` for a sharded one.
+    pub fn shard_count(&self) -> usize { self.shards.len() }
 
     pub fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
         let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
