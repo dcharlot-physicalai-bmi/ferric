@@ -353,3 +353,165 @@ mod pre_tests {
         assert_eq!(Pre::from_gguf(None), Pre::Gpt2, "a file with no key is what the tree assumed for all");
     }
 }
+
+/// **WordPiece** — the BERT family's tokenizer (`tokenizer.ggml.model == "bert"`).
+///
+/// Needed because the small embedding and reranker checkpoints the field actually ships — bge, gte,
+/// MiniLM, e5 — are BERT encoders, and none of them could be loaded without this. A 67 MB bge-small
+/// replaces a 396 MB decoder-based retriever at the same job.
+///
+/// Three stages, in llama.cpp's order:
+///   1. **clean + lowercase**, dropping control characters,
+///   2. **basic split** on whitespace, with punctuation and CJK becoming their own tokens,
+///   3. **greedy longest-match** per word against the vocab, continuations prefixed `##`; a word with
+///      no match at some position emits `[UNK]` for the WHOLE word, not for the failing piece.
+///
+/// ⚠ Accent folding is NOT implemented. llama.cpp applies NFD and drops combining marks, so `café`
+/// tokenises there as `cafe` and here as whatever the vocab holds for the composed form. English
+/// checkpoints are unaffected; this is stated rather than hidden because a wrong tokenisation does not
+/// fail, it silently embeds a different string.
+pub struct WordPiece {
+    vocab: HashMap<String, u32>,
+    pub cls: u32,
+    pub sep: u32,
+    pub unk: u32,
+    max_piece: usize,
+}
+
+impl WordPiece {
+    pub fn new(vocab: HashMap<String, u32>, cls: u32, sep: u32, unk: u32) -> WordPiece {
+        // Longest vocab entry in CHARS, less the word-start marker, so the greedy window can
+        // still reach the longest real piece.
+        let max_piece = vocab.keys().map(|k| k.chars().count()).max().unwrap_or(1);
+        WordPiece { vocab, cls, sep, unk, max_piece }
+    }
+
+    /// Punctuation as BERT defines it: the four ASCII bands plus anything Unicode calls punctuation.
+    /// Each punctuation character becomes its OWN basic token, which is why `Halvorsen-Reyes` splits
+    /// at the hyphen where the byte-level BPE families keep it attached.
+    fn is_punct(c: char) -> bool {
+        let cp = c as u32;
+        (33..=47).contains(&cp) || (58..=64).contains(&cp)
+            || (91..=96).contains(&cp) || (123..=126).contains(&cp)
+            || matches!(cp, 0x2000..=0x206F | 0x3000..=0x303F | 0xFF00..=0xFF65)
+    }
+
+    /// CJK gets one token per character, never merged across the boundary.
+    fn is_cjk(c: char) -> bool {
+        let cp = c as u32;
+        matches!(cp, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF
+                   | 0xF900..=0xFAFF | 0x2F800..=0x2FA1F)
+    }
+
+    /// Whitespace + punctuation + CJK splitting, lowercased, controls dropped.
+    fn basic_split(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for ch in text.chars() {
+            for c in ch.to_lowercase() {
+                if c.is_whitespace() {
+                    if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                } else if Self::is_punct(c) || Self::is_cjk(c) {
+                    if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                    out.push(c.to_string());
+                } else if c == '\u{0}' || c == '\u{fffd}' || (c.is_control() && !c.is_whitespace()) {
+                    // dropped
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+        if !cur.is_empty() { out.push(cur); }
+        out
+    }
+
+    /// Greedy longest-match-first within one word. Returns `None` when any position fails, because
+    /// BERT emits `[UNK]` for the entire word rather than keeping the pieces it managed to match.
+    fn piece(&self, word: &str) -> Option<Vec<u32>> {
+        let ch: Vec<char> = word.chars().collect();
+        if ch.len() > 200 { return None; } // BERT's max_input_chars_per_word
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < ch.len() {
+            let mut end = ch.len().min(start + self.max_piece);
+            let mut hit = None;
+            while end > start {
+                let mut s: String = ch[start..end].iter().collect();
+                // GGUF stores a WordPiece vocab in the SPM convention, NOT HuggingFace's: the
+                // word-INITIAL piece carries `▁` (U+2581) and continuations are bare. HF is the
+                // mirror image — bare initial, `##` continuation. Measured in bge-small-en-v1.5:
+                // `▁the` is 1996 and `the` is 10760, and `##ffa` does not exist at all while `ffa`
+                // does. Reading it the HF way makes almost every word [UNK], which is what the first
+                // version of this did.
+                if start == 0 { s.insert(0, '\u{2581}'); }
+                if let Some(&id) = self.vocab.get(&s) { hit = Some((id, end)); break; }
+                end -= 1;
+            }
+            let (id, e) = hit?;
+            out.push(id);
+            start = e;
+        }
+        Some(out)
+    }
+
+    /// Encode with the `[CLS] … [SEP]` wrapping the checkpoint was trained on. The pooling position
+    /// for a CLS-pooled model is index 0, so dropping the wrapper silently pools the wrong vector.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut ids = vec![self.cls];
+        for w in Self::basic_split(text) {
+            match self.piece(&w) {
+                Some(p) => ids.extend(p),
+                None => ids.push(self.unk),
+            }
+        }
+        ids.push(self.sep);
+        ids
+    }
+}
+
+#[cfg(test)]
+mod wordpiece_tests {
+    use super::WordPiece;
+    use std::collections::HashMap;
+
+    fn wp(entries: &[(&str, u32)]) -> WordPiece {
+        let v: HashMap<String, u32> = entries.iter().map(|(s, i)| (s.to_string(), *i)).collect();
+        WordPiece::new(v, 101, 102, 100)
+    }
+
+    #[test]
+    fn the_word_start_marker_is_SPM_not_huggingface() {
+        // The defect this replaced: reading the vocab the HuggingFace way (bare initial, `##`
+        // continuation) makes almost every word [UNK], because GGUF stores the mirror image.
+        // `▁una` + `ffa` + `ble` is how bge-small-en-v1.5 actually holds "unaffable".
+        let t = wp(&[("\u{2581}una", 1), ("ffa", 2), ("ble", 3)]);
+        assert_eq!(t.encode("unaffable"), vec![101, 1, 2, 3, 102]);
+        // The same pieces under the HF convention must NOT resolve — proof the marker is load-bearing.
+        let hf = wp(&[("una", 1), ("##ffa", 2), ("##ble", 3)]);
+        assert_eq!(hf.encode("unaffable"), vec![101, 100, 102], "HF-style vocab cannot match here");
+    }
+
+    #[test]
+    fn punctuation_becomes_its_own_word_and_gets_the_marker() {
+        // `Halvorsen-Reyes` splits at the hyphen and the hyphen is a word of its own — the opposite
+        // of the byte-level BPE families, where a mid-word hyphen ATTACHES to the following word.
+        let t = wp(&[("\u{2581}a", 1), ("\u{2581}-", 2), ("\u{2581}b", 3)]);
+        assert_eq!(t.encode("a-b"), vec![101, 1, 2, 3, 102]);
+    }
+
+    #[test]
+    fn an_unmatched_word_is_UNK_as_a_WHOLE_not_piecewise() {
+        // BERT discards the pieces it did match. Emitting them would silently change the input the
+        // model sees rather than marking it unknown.
+        let t = wp(&[("\u{2581}ab", 1), ("\u{2581}zz", 9)]);
+        assert_eq!(t.encode("abqq"), vec![101, 100, 102], "partial match must not leak pieces");
+        assert_eq!(t.encode("zz"), vec![101, 9, 102]);
+    }
+
+    #[test]
+    fn casing_is_folded_and_cls_sep_always_wrap() {
+        let t = wp(&[("\u{2581}the", 5)]);
+        assert_eq!(t.encode("THE"), vec![101, 5, 102]);
+        assert_eq!(t.encode(""), vec![101, 102], "an empty string is still CLS+SEP, not empty");
+    }
+}

@@ -12,3 +12,6 @@ categories = ["text-processing", "science"]
 
 [dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+ferric-gguf = { path = "../ferric-gguf", version = "0.3" }

@@ -254,6 +254,15 @@ pub fn open_from_source(
 /// in the read (which would inflate every byte figure and quietly pull in other tensors' data).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn layer_runs(g: &GgufFile) -> Result<Vec<LayerDesc>, String> {
+    // Streaming reads ONE backing object positionally, so `data_start() + offset` must be an absolute
+    // file position. In a sharded checkpoint each tensor's offset is relative to the data section of
+    // whichever part holds it, so that arithmetic silently addresses the wrong bytes — the right
+    // COUNT of bytes, from the wrong place, which produces fluent garbage rather than an error.
+    // Streaming across parts is a different feature; until it exists this refuses.
+    if g.shard_count() > 1 {
+        return Err(format!(
+            "this checkpoint is {} shards and the streaming reader addresses one file positionally;              merge it (llama-gguf-split --merge) or load it whole", g.shard_count()));
+    }
     layer_runs_of(&g.tensors, g.data_start())
 }
 
@@ -317,6 +326,11 @@ pub fn open_with(
         &*backing, u64::MAX, 1 << 20, 64 << 20)
         .or_else(|_| std::fs::read(path).map(|b| { let n = b.len(); (b, n) }).map_err(|e| e.to_string()))?;
     let src = GgufBacked::new(header, Arc::clone(&backing))?;
+    // Same reason as `layer_runs`: one `Backing` cannot address a multi-part checkpoint.
+    if file.shard_count() > 1 {
+        return Err(format!(
+            "this checkpoint is {} shards and the streaming reader addresses one file positionally;              merge it (llama-gguf-split --merge) or load it whole", file.shard_count()));
+    }
     let runs = layer_runs_of(&file.tensors, file.data_start())?;
     let plan = plan_layers(&runs, budget_bytes, 0, 4096);
     if !plan.fits(budget_bytes) {
