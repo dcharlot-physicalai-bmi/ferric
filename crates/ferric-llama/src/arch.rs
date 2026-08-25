@@ -49,11 +49,14 @@ pub enum Runtime {
     DeepSeek2,
     /// [`crate::cosmos`] — loads from safetensors rather than GGUF.
     Cosmos,
+    /// [`crate::bert`] — encoder-only. Embeddings and rerankers, not generation.
+    Bert,
 }
 
 impl Runtime {
     pub fn label(self) -> &'static str {
         match self {
+            Runtime::Bert => "bert",
             Runtime::Dense => "dense",
             Runtime::Hybrid => "hybrid",
             Runtime::Lfm2 => "lfm2",
@@ -111,6 +114,11 @@ pub struct Arch {
 /// describe work in progress, and is not allowed to let it serve traffic.
 pub const REGISTRY: &[Arch] = &[
     // ---- dense GQA family ----------------------------------------------------------------
+    Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
+           note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
+                  cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
+                  at cosine 0.999999-1.000000 over 3-to-39-token inputs. EMBEDS ONLY — generation is \
+                  refused, there is no head to generate from" },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,

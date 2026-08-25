@@ -413,6 +413,9 @@ enum WebRuntime {
     /// (4.7 GB) does not, so the browser story for this family is a requantized file by necessity,
     /// not preference.
     Gemma4(ferric_llama::gemma4::Gemma4),
+    /// BERT encoders — bge, gte, MiniLM, e5 and the cross-encoder rerankers. Embedding-only: there
+    /// is no LM head to generate from, and `generate` refuses rather than inventing one.
+    Bert(ferric_llama::bert::Bert),
 }
 
 #[wasm_bindgen]
@@ -433,6 +436,9 @@ pub struct FerricModel {
     /// must append it to match the reference / native build.
     add_eos: bool,
     eos_id: Option<u32>,
+    /// Present only for `tokenizer.ggml.model == "bert"`. The BERT family does not share the
+    /// byte-level BPE or the SentencePiece path; it needs WordPiece with [CLS]…[SEP].
+    wordpiece: Option<ferric_tokenizer::WordPiece>,
     /// GGUF `<arch>.pooling_type`, as llama.cpp writes it: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK.
     ///
     /// This key was read NOWHERE in the tree until 2026-08-21 and every embed path hardcoded LAST.
@@ -484,7 +490,14 @@ impl FerricModel {
         // not, which exposed it. The file carries real scores for all 262,144 tokens, and scored
         // greedy merge (Spm) is the algorithm that matches its piece style.
         let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "llama" || s == "gemma4");
-        let (bpe, spm) = if is_spm {
+        // BERT carries NO merge table — WordPiece scores its pieces the way SentencePiece does, so
+        // demanding merges rejects every encoder checkpoint with "no merges". The real tokenizer for
+        // these files is the `wordpiece` field built below; the Bpe here is an empty placeholder that
+        // embed() never reaches, and generation is refused for encoders anyway.
+        let is_wpm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "bert");
+        let (bpe, spm) = if is_wpm {
+            (Bpe::new(vocab, &[]), None)
+        } else if is_spm {
             let scores: Vec<f32> = match g.metadata().get("tokenizer.ggml.scores") {
                 Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
                 _ => Vec::new(),
@@ -501,6 +514,20 @@ impl FerricModel {
             // and makes the merge `- Re` unreachable. Diffed against llama.cpp: token 67960 vs 12,693.
             (Bpe::new_with_pre(vocab, &merges, ferric_tokenizer::Pre::from_gguf(
                 match g.metadata().get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None })), None)
+        };
+        // WordPiece when the file says so. Built from the same token table; the ids it needs
+        // ([CLS], [SEP], [UNK]) are named by their own metadata keys rather than hardcoded, because a
+        // checkpoint may renumber them.
+        let wordpiece = match g.metadata().get("tokenizer.ggml.model") {
+            Some(Meta::Str(m)) if m == "bert" => {
+                let uu = |k: &str, d: u32| match g.metadata().get(k) { Some(Meta::U(v)) => *v as u32, _ => d };
+                Some(ferric_tokenizer::WordPiece::new(
+                    toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect(),
+                    uu("tokenizer.ggml.cls_token_id", 101),
+                    uu("tokenizer.ggml.seperator_token_id", 102),
+                    uu("tokenizer.ggml.unknown_token_id", 100)))
+            }
+            _ => None,
         };
         let add_space_prefix = !matches!(g.metadata().get("tokenizer.ggml.add_space_prefix"), Some(Meta::Bool(false)));
         let u2b = gpt2_byte_decoder();
@@ -558,6 +585,7 @@ impl FerricModel {
         let model = match arch.as_str() {
             "lfm2" => WebRuntime::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).map_err(err)?),
             "gemma4" => WebRuntime::Gemma4(ferric_llama::gemma4::Gemma4::load(&ctx, &g).map_err(err)?),
+            "bert" => WebRuntime::Bert(ferric_llama::bert::Bert::load(&ctx, &g).map_err(err)?),
             // Everything the dense loader genuinely serves; it feature-detects within this family.
             "qwen2" | "qwen3" | "llama" | "phi3" | "gemma" | "gemma2" | "gemma3" | "" =>
                 WebRuntime::Dense(Qwen3::load(&ctx, &g).map_err(err)?),
@@ -568,7 +596,7 @@ impl FerricModel {
         };
         // Default OFF, exactly as native: quantizing the KV cache trades accuracy for memory and that
         // is the caller's decision. `set_kv_cache` opts in.
-        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, pooling, specials, eos_set,
+        Ok(FerricModel { ctx, model, bpe, spm, add_space_prefix, toks, u2b, token_bytes, add_bos, bos_id, add_eos, eos_id, wordpiece, pooling, specials, eos_set,
                          kv_fmt: None, kv_grouped_k: false })
     }
 
@@ -576,6 +604,7 @@ impl FerricModel {
     pub fn info(&self) -> String {
         let kind = match &self.model {
             WebRuntime::Dense(_) => "dense", WebRuntime::Lfm2(_) => "lfm2", WebRuntime::Gemma4(_) => "gemma4",
+            WebRuntime::Bert(_) => "bert",
         };
         format!("{} layers · {kind} · {:?}", self.n_layer(), self.ctx.backend)
     }
@@ -640,8 +669,23 @@ impl FerricModel {
         // Dense-only: the trained embedding checkpoints (Qwen3-Embedding) are dense, and LFM2 has no
         // LAST-pooling embedding reference to compare against. Refuse with a message rather than pool
         // an arbitrary hidden state and hand back plausible cosine scores that mean nothing.
+        // BERT encoders carry their own contract and it is NOT the decoder one: WordPiece with the
+        // [CLS]…[SEP] wrapping the checkpoint was trained on, bidirectional attention, and the
+        // pooling position the file declares (bge-small says CLS, i.e. index 0). Appending an EOS or
+        // pooling the last position here would return a plausible vector from the wrong place.
+        if let WebRuntime::Bert(m) = &self.model {
+            let wp = self.wordpiece.as_ref().ok_or_else(|| jserr(
+                "this BERT checkpoint has no WordPiece vocab (tokenizer.ggml.model should be \"bert\")"))?;
+            let ids = wp.encode(&text);
+            let n = m.cfg.d;
+            let v = m.forward(&ids).map_err(|e| jserr(&e))?.to_vec().await;
+            let t = (v.len() / n).max(1);
+            let pooled = pool(&v, t, n, m.cfg.pooling).map_err(|e| jserr(&e))?;
+            let norm = pooled.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            return Ok(pooled.iter().map(|x| x / norm).collect());
+        }
         let WebRuntime::Dense(m) = &self.model else {
-            return Err(jserr("embed() is available on dense embedding models only"));
+            return Err(jserr("embed() is available on dense embedding models and BERT encoders only"));
         };
         let n = m.cfg.n_embd;
         // Raw piece tokenization (like native Engine::embed) — embeddings embed literal text, so DON'T
@@ -791,6 +835,7 @@ impl FerricModel {
             WebRuntime::Dense(m) => m.cfg.n_vocab,
             WebRuntime::Lfm2(m) => m.cfg.n_vocab,
             WebRuntime::Gemma4(m) => m.cfg.n_vocab,
+            WebRuntime::Bert(m) => m.cfg.n_vocab,
         }
     }
     fn n_layer(&self) -> usize {
@@ -798,6 +843,7 @@ impl FerricModel {
             WebRuntime::Dense(m) => m.cfg.n_layer,
             WebRuntime::Lfm2(m) => m.cfg.n_layer,
             WebRuntime::Gemma4(m) => m.cfg.n_layer,
+            WebRuntime::Bert(m) => m.cfg.n_layer,
         }
     }
     /// The dense config, on the paths that are dense-only (embeddings, grouped-K). Panics on lfm2 by
@@ -861,12 +907,19 @@ impl FerricModel {
         let eos = |t: u32| self.eos_set.contains(&t);
         // Each runtime carries its own cache type; the loop below only ever needs "logits for these
         // tokens, continuing this cache", so the dispatch lives in one closure-shaped match.
+        // An encoder has no KV cache and no LM head — there is nothing to generate.
+        if matches!(&self.model, WebRuntime::Bert(_)) {
+            return Err(jserr("this is a BERT encoder: it has no LM head, so it embeds but cannot generate"));
+        }
         let mut cache = match &self.model {
             WebRuntime::Dense(_) => WebCache::Dense(Cache::with_kv_config(self.dense_cfg(), self.kv_fmt, self.kv_grouped_k)),
             WebRuntime::Lfm2(m) => WebCache::Lfm2(
                 ferric_llama::lfm2::Cache::with_kv_config(&m.cfg, self.kv_fmt, self.kv_grouped_k)),
             WebRuntime::Gemma4(m) => WebCache::Gemma4(
                 ferric_llama::gemma4::Cache::with_kv_config(&m.cfg, self.kv_fmt, self.kv_grouped_k)),
+            // Unreachable: refused above. Kept as an arm so ADDING a runtime is a compile error here
+            // rather than a silent fallthrough — the property arch.rs exists to preserve.
+            WebRuntime::Bert(_) => return Err(jserr("BERT encoders cannot generate")),
         };
         let mut seq = ids.clone();
         let mut emitted = String::new();
