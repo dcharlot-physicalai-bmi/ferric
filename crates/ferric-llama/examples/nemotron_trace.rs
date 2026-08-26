@@ -86,4 +86,33 @@ async fn run() {
         if matches!(g.metadata.get("tokenizer.ggml.eos_token_id"), Some(Meta::U(e)) if *e as usize == best) { break; }
     }
     println!("  generated: {:?}", out.replace('\u{2581}', " ").replace('Ġ', " "));
+
+    // ---- the state check: incremental must equal stateless, token for token ----
+    //
+    // This is the only test that means anything for a cache. A state bug does not error — it drifts,
+    // and drift reads as a plausible alternative continuation. So the incremental path decodes the
+    // SAME greedy sequence one token at a time and must agree exactly with the path that re-runs the
+    // whole prefix, which is itself reference-verified.
+    let mut cache = ferric_llama::nemotron_h::Cache::new(&ctx, &m.cfg);
+    let mut cseq = ids.clone();
+    let mut cout = String::new();
+    let mut fed: usize = 0;
+    for _ in 0..steps {
+        let new = &cseq[fed..];
+        let lg = m.forward_cached(new, &mut cache).expect("cached forward").to_vec().await;
+        fed = cseq.len();
+        let last = &lg[lg.len() - n..];
+        let (best, _) = last.iter().enumerate()
+            .fold((0usize, f32::MIN), |acc, (i, &x)| if x > acc.1 { (i, x) } else { acc });
+        cout.push_str(toks.get(best).map(String::as_str).unwrap_or("?"));
+        cseq.push(best as u32);
+        if matches!(g.metadata.get("tokenizer.ggml.eos_token_id"), Some(Meta::U(e)) if *e as usize == best) { break; }
+    }
+    println!("  cached:    {:?}", cout.replace('\u{2581}', " ").replace('Ġ', " "));
+    println!("  state: {:.1} MB, INDEPENDENT of sequence length", cache.bytes() as f64 / 1e6);
+    assert_eq!(cout, out,
+               "the incremental path diverged from the stateless one. A cache bug drifts rather than \
+                errors, so this equality is the whole test: conv state must carry the PRE-convolution \
+                signal, and ssm_scan must advance the state it was handed.");
+    println!("  ✅ incremental == stateless");
 }

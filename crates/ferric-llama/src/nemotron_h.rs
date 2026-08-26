@@ -359,6 +359,119 @@ impl NemotronH {
         Ok(y.contiguous().matmul_q(&b.o))
     }
 
+    /// **Stateful forward.** `ids` are the NEW tokens; the cache carries everything before them.
+    ///
+    /// This is the path that makes the architecture worth having: per token it does O(1) work in the
+    /// SSM blocks instead of re-running the prefix. The stateless `forward` stays because it is what
+    /// the reference comparison was done against, and because a state bug that only shows up after
+    /// several steps is far easier to find with a known-good path to diff against.
+    pub fn forward_cached(&self, ids: &[u32], cache: &mut Cache) -> Result<Tensor, String> {
+        let c = &self.cfg;
+        let (d, t) = (c.d, ids.len());
+        let mut e = vec![0f32; t * d];
+        for (p, &id) in ids.iter().enumerate() {
+            let src = (id as usize) * d;
+            if src + d > self.tok_embd.len() { return Err(format!("token {id} outside the table")); }
+            e[p * d..(p + 1) * d].copy_from_slice(&self.tok_embd[src..src + d]);
+        }
+        let mut h = Tensor::from_vec(&self.ctx, &e, &[t, d]);
+
+        for il in 0..c.n_layer {
+            let out = match c.kind[il] {
+                BlockKind::Ssm => {
+                    let b = self.ssm[il].as_ref().ok_or("ssm block missing")?;
+                    let n = h.rmsnorm(&b.norm, c.eps);
+                    self.mamba2_cached(b, &n, t, il, cache)?
+                }
+                BlockKind::Ffn => {
+                    let b = self.ffn[il].as_ref().ok_or("ffn block missing")?;
+                    let n = h.rmsnorm(&b.norm, c.eps);
+                    let up = n.matmul_q(&b.up);
+                    let act = up.relu();
+                    act.mul(&act).matmul_q(&b.down)
+                }
+                BlockKind::Attn => {
+                    let b = self.attn[il].as_ref().ok_or("attn block missing")?;
+                    let n = h.rmsnorm(&b.norm, c.eps);
+                    self.attention_cached(b, &n, il, cache)?
+                }
+            };
+            h = h.add(&out);
+        }
+        cache.pos += t;
+        let h = h.rmsnorm(&self.out_norm, c.eps);
+        Ok(h.contiguous().matmul_q(&self.head))
+    }
+
+    /// Mamba-2 with carried conv and scan state. Identical arithmetic to [`Self::mamba2`]; the only
+    /// differences are that the conv sees `[state; new]` and that the scan starts from the carried
+    /// `h` rather than zeros.
+    fn mamba2_cached(&self, b: &SsmBlock, h: &Tensor, t: usize, il: usize, cache: &mut Cache)
+        -> Result<Tensor, String> {
+        let c = &self.cfg;
+        let (inner, ng, ns, nh, hp) = (c.ssm_inner, c.ssm_groups, c.ssm_state, c.ssm_heads, c.ssm_head_dim);
+        let xbc_w = inner + 2 * ng * ns;
+        let zxbcdt = h.contiguous().matmul_q(&b.in_w);
+        let z   = zxbcdt.narrow(1, 0, inner).contiguous();
+        let xbc = zxbcdt.narrow(1, inner, xbc_w).contiguous();
+        let dt  = zxbcdt.narrow(1, inner + xbc_w, nh).contiguous();
+
+        // PRE-conv signal in, PRE-conv signal out. Concatenate the carried rows, convolve the whole
+        // thing, then keep only the new outputs — which is exactly the reference's CONCAT -> SSM_CONV.
+        let prev = cache.conv[il].as_ref().ok_or("conv state missing")?;
+        let joined = prev.cat(&xbc, 0);
+        let convd = joined.depthwise_conv1d_causal(&b.conv_w, c.ssm_conv);
+        let keep = convd.shape[0] - t;
+        let xbc_out = convd.narrow(0, keep, t).contiguous().add(&b.conv_b).silu();
+        // Carry the last conv_kernel-1 rows of the PRE-conv signal forward.
+        let jt = joined.shape[0];
+        cache.conv[il] = Some(joined.narrow(0, jt - (c.ssm_conv - 1), c.ssm_conv - 1).contiguous());
+
+        let x  = xbc_out.narrow(1, 0, inner).contiguous();
+        let bb = xbc_out.narrow(1, inner, ng * ns).contiguous();
+        let cc = xbc_out.narrow(1, inner + ng * ns, ng * ns).contiguous();
+
+        let dts = dt.add(&b.dt_b).softplus();
+        let dtv = pollster::block_on(dts.to_vec());
+        let mut da = vec![0f32; t * nh];
+        for ti in 0..t { for hd in 0..nh { da[ti * nh + hd] = (dtv[ti * nh + hd] * b.a[hd]).exp(); } }
+        let da = Tensor::from_vec(&self.ctx, &da, &[t, nh]);
+
+        // `ssm_scan` updates `h0` IN PLACE, so the carried state advances by construction rather than
+        // by a copy the caller has to remember to make.
+        let h0 = cache.ssm[il].as_ref().ok_or("ssm state missing")?.clone();
+        let y = x.ssm_scan(&da, &dts, &bb, &cc, &b.d, &h0, nh, hp, ns, ng);
+        cache.ssm[il] = Some(h0);
+
+        let gated = z.silu().mul(&y);
+        let gw = b.gnorm.broadcast_to(&[t, inner]);
+        let normed = gated.reshape(&[t * ng, inner / ng]).rmsnorm_weightless(c.eps)
+            .reshape(&[t, inner]).mul(&gw);
+        Ok(normed.contiguous().matmul_q(&b.out_w))
+    }
+
+    /// Attention with a growing KV cache. Still no positional term — see the module header.
+    fn attention_cached(&self, b: &AttnBlock, h: &Tensor, il: usize, cache: &mut Cache)
+        -> Result<Tensor, String> {
+        let c = &self.cfg;
+        let nkv = c.n_kv.iter().copied().find(|&x| x > 0).ok_or("no KV head count")?;
+        let q = h.matmul_q(&b.q);
+        let kn = h.matmul_q(&b.k);
+        let vn = h.matmul_q(&b.v);
+        let (k, v) = match cache.kv[il].take() {
+            Some((ko, vo)) => (ko.cat(&kn, 0), vo.cat(&vn, 0)),
+            None => (kn, vn),
+        };
+        cache.kv[il] = Some((k.clone(), v.clone()));
+        // `causal_attention` derives the K/V row count from the QUERY length, which is right only
+        // when they match. A one-token step against a seven-row cache panicked with
+        // "reshape changes numel: 1024 vs 7168". The windowed variant carries the `s >= t` case
+        // explicitly — it computes `off = s - t` so query i sits at absolute position `off + i` —
+        // and window 0 means full causal, which is what every block here wants.
+        let y = ferric_tensor::nn::causal_attention_win(&q, &k, &v, c.n_head, nkv, 0, 0.0);
+        Ok(y.contiguous().matmul_q(&b.o))
+    }
+
     /// One Mamba-2 mixer. Sequencing and every convention here was read off `llama-eval-callback`;
     /// see the module header for the dump it came from.
     fn mamba2(&self, b: &SsmBlock, h: &Tensor, t: usize) -> Result<Tensor, String> {
@@ -408,4 +521,57 @@ impl NemotronH {
 
 impl SsmBlock {
     fn conv_w_apply(&self, x: &Tensor, l: usize) -> Tensor { x.depthwise_conv1d_causal(&self.conv_w, l) }
+}
+
+
+/// Incremental state: what a decode step carries instead of re-running the prefix.
+///
+/// An SSM's whole claim is O(1) per token against attention's O(T). Without this the runtime is
+/// O(T^2) and strictly worse than the transformer it replaces, so the state is the feature, not an
+/// optimisation of it.
+///
+/// Three kinds, one per block kind:
+///
+/// * **conv** — `[conv_kernel-1, xbc]` of the **PRE-convolution** signal. The reference concatenates
+///   state onto the new rows and convolves the result: its `CONCAT` feeds `SSM_CONV` a `{5, 9728}`
+///   for two new tokens, i.e. 3 carried rows. Storing the conv OUTPUT instead would drift plausibly
+///   rather than fail — the same trap `lfm2::Cache` documents for its short-conv.
+/// * **ssm** — `[n_head * head_dim * state]`, which `Tensor::ssm_scan` already updates in place.
+/// * **kv** — only the four attention blocks have any.
+pub struct Cache {
+    pub pos: usize,
+    conv: Vec<Option<Tensor>>,
+    ssm: Vec<Option<Tensor>>,
+    kv: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl Cache {
+    pub fn new(ctx: &Arc<Context>, cfg: &Cfg) -> Cache {
+        let mut c = Cache { pos: 0, conv: Vec::new(), ssm: Vec::new(), kv: Vec::new() };
+        let xbc = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
+        for il in 0..cfg.n_layer {
+            match cfg.kind[il] {
+                BlockKind::Ssm => {
+                    c.conv.push(Some(Tensor::from_vec(ctx, &vec![0f32; (cfg.ssm_conv - 1) * xbc],
+                                                      &[cfg.ssm_conv - 1, xbc])));
+                    c.ssm.push(Some(Tensor::from_vec(ctx,
+                        &vec![0f32; cfg.ssm_heads * cfg.ssm_head_dim * cfg.ssm_state],
+                        &[cfg.ssm_heads * cfg.ssm_head_dim * cfg.ssm_state])));
+                }
+                _ => { c.conv.push(None); c.ssm.push(None); }
+            }
+            c.kv.push(None);
+        }
+        c
+    }
+
+    /// Bytes the state occupies, which is the number that makes the architecture's case. It is
+    /// independent of sequence length — the whole point — so a caller can size a deployment from it
+    /// without knowing how long the conversation runs.
+    pub fn bytes(&self) -> usize {
+        let t = |o: &Option<Tensor>| o.as_ref().map(|x| x.numel() * 4).unwrap_or(0);
+        self.conv.iter().map(t).sum::<usize>()
+            + self.ssm.iter().map(t).sum::<usize>()
+            + self.kv.iter().map(|o| o.as_ref().map(|(k, v)| (k.numel() + v.numel()) * 4).unwrap_or(0)).sum::<usize>()
+    }
 }
