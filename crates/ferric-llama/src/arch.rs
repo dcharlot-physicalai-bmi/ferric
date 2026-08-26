@@ -117,15 +117,15 @@ pub struct Arch {
 /// describe work in progress, and is not allowed to let it serve traffic.
 pub const REGISTRY: &[Arch] = &[
     // ---- dense GQA family ----------------------------------------------------------------
-    Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Parts,
-           note: "Mamba-2 / attention / MLP hybrid — the first non-transformer here. Cfg and the \
-                  per-block SCHEDULE are read and reconciled against the weights (4B: 21 SSM, 17 MLP, \
-                  4 attention at blocks 12/17/24/32; z|x|BC|dt = 7680+7680+2048+96 = 17504; conv over \
-                  xBC = 9728; grouped norm 8x960 = inner). The FORWARD pass is not written: the risk \
-                  left is convention, not shape — whether ssm_a is used directly or exponentiated, \
-                  where dt's bias sits relative to softplus, how B/C map to the 8 groups. Each is one \
-                  line and each is fluent-and-wrong when wrong, so they get resolved per-op against \
-                  llama-eval-callback before this becomes Verified" },
+    Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Loads,
+           note: "Mamba-2 / attention / MLP hybrid — the FIRST non-transformer runtime here. 42 blocks: \
+                  21 state-space mixers, 17 ReLU^2 MLPs, 4 attention. RUNS and reproduces the \
+                  reference: from 'The capital of France is' it generates ' Paris.', matching \
+                  llama.cpp. Embedding sum is exact and block 0 agrees to 0.10%. ⚠ NOT Verified: \
+                  per-block sums scatter up to 29% deeper in the stack and that is unexplained (sums \
+                  cancel, so it may be nothing), and there is NO incremental state — every decode \
+                  step re-runs the whole prefix, which is O(T^2) and precisely what an SSM exists to \
+                  avoid. ⛔ There is NO RoPE despite rope.dimension_count being declared" },
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
