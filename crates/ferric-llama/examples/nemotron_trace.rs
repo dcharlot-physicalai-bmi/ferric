@@ -57,6 +57,22 @@ async fn run() {
     // No incremental state here: every step re-runs the whole prefix. That is O(T^2) and exactly what
     // an SSM exists to avoid, but carrying conv and scan state across steps is a separate correctness
     // problem, and conflating the two is how a state bug gets attributed to the mixer.
+    // FERRIC_NEMO_TOPK=1 prints the top-10 at the FINAL position, which is the comparison that
+    // settles numerics-versus-defect where greedy decoding diverges. A pick that sits inside the
+    // reference's top few on a flat distribution is a near-tie flipping; a pick the reference does
+    // not rank at all is a different distribution, i.e. a bug.
+    if std::env::var("FERRIC_NEMO_TOPK").ok().as_deref() == Some("1") {
+        let last = &lv[lv.len() - n..];
+        let mx = last.iter().cloned().fold(f32::MIN, f32::max);
+        let den: f32 = last.iter().map(|x| (x - mx).exp()).sum();
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|a, b| last[*b].partial_cmp(&last[*a]).unwrap());
+        println!("  ferric top-10:");
+        for &i in idx.iter().take(10) {
+            let lp = (last[i] - mx) - den.ln();
+            println!("    id {i:<7} logprob {lp:>8.4}  {:?}", toks.get(i));
+        }
+    }
     let steps: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(12);
     let mut seq = ids.clone();
     let mut out = String::new();

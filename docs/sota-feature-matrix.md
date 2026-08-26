@@ -858,3 +858,61 @@ Three things worth carrying forward:
 3. **Per-op tracing is bounded; end-to-end comparison is not.** `FERRIC_BERT_TRACE=1` prints a sum per
    checkpoint tensor against the reference's 512. The first line disagreed on token *count* — 4 vs 3 —
    which no parameter sweep could have reached.
+
+## W. The first non-transformer: Nemotron-H, verified (2026-08-25)
+
+`general.architecture = nemotron_h` — NVIDIA's Mamba-2 / attention / MLP hybrid, current (official
+NVIDIA GGUF, llama.cpp support March 2026). Of 42 blocks in Nemotron-3-Nano-4B, **21 are state-space
+mixers, 17 are ReLU² MLPs, and four are attention**. Sequence mixing is a recurrence, not a quadratic
+attention matrix, which is the point of the family.
+
+**Verified at the distribution.** On the same 8-token prompt the top-10 match the reference token for
+token *in the same order*, logprobs agreeing to ~0.01:
+
+| rank | llama.cpp | Ferric |
+|---|---|---|
+| 1 | `<\|im_end\|>` −0.7757 | `<\|im_end\|>` −0.7843 |
+| 2 | " The" −2.5101 | " The" −2.4986 |
+| 3 | " This" −3.1766 | " This" −3.1770 |
+| 4 | " It" −3.3102 | " It" −3.3060 |
+
+### What the trace bought, measured
+
+The per-op trace was built **before** the first end-to-end comparison — the ordering the BERT port
+earned by spending nine hypotheses on a harness bug. It localised the one real defect on its first
+run:
+
+```
+embd        -0.302475  vs  -0.302475   exact
+blk0 (SSM)  -2.730604  vs  -175.85     WRONG
+```
+
+Embedding right, first SSM block wrong, so the search was one block wide. **The grouped norm is two
+steps, not one**: the reference normalises each 960-wide group with *no weight*, then multiplies by
+the full `{960, 8}` = 7680 tensor whose values differ per group. Passing that 7680-wide weight to
+`rmsnorm` over 960-wide rows reads the wrong slice for seven groups in eight. After the fix, 0.10%.
+
+### ⛔ The metadata lies about RoPE
+
+The file declares `rope.dimension_count = 78`. The reference graph contains **zero** ROPE ops —
+attention here is position-free because the SSM layers carry position. Trusting the key would have
+rotated 78 of 128 head dims and produced fluent, wrong text with every shape assertion passing.
+
+Also read off the graph rather than inferred: SILU covers **all** of xBC so the D-skip uses the silu'd
+x; `dt` bypasses the conv while `x` does not; SWIGLU takes `z` **first**; and Ferric's `ssm_scan` adds
+`D·x` internally where ggml emits it as a separate node, so doing both would double the skip term.
+
+### Two metrics that do NOT grade fidelity
+
+**Per-block sums.** Their error tracks the cancellation ratio `|sum|/max|v|` — 5.18 → 0.10%, 0.14 →
+13.85%. A sum that is a near-cancellation of large opposing values turns a tiny per-element difference
+into a huge relative error *in the sum* while the tensor is fine. Sums localise a gross defect; they
+cannot measure agreement.
+
+**Greedy token paths.** Both runtimes emit " Paris." then split. The leader at that position holds
+under half the mass, so which of several near-ties wins says nothing. The distribution comparison is
+the test; the token path is not.
+
+⚠ **No incremental state yet.** Every decode step re-runs the whole prefix — O(T²), which is precisely
+what a state-space model exists to avoid. Carrying conv and scan state is a separate correctness
+problem, and conflating it with mixer correctness is how a state bug gets misattributed.

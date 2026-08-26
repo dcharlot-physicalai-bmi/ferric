@@ -71,14 +71,14 @@
 
 use ferric_core::Context;
 use ferric_signal::{
-    cross_entropy, decoder_forward_var, embed_var, forward_var, lm_forward_var, mse,
-    straight_through, DecoderWeights, EncoderConfig, EncoderWeights, Example, Fsq, HybridVocab,
-    Patcher, RevIn, SensorLm, Sequencer, Span, Weights,
+    build_words, compact, decoder_forward_var, forward_var, majority, mse, nb_probe,
+    permutation_control, shuffled, straight_through, train_captions, DecoderWeights, EncoderConfig,
+    EncoderWeights, Fsq, HybridVocab, Patcher, RevIn, Sequencer, Span, Weights,
 };
 use ferric_tensor::autograd::Var;
 use ferric_tensor::optim::Adam;
 use ferric_tensor::Tensor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
@@ -103,24 +103,6 @@ fn tok_cfg(patch: usize) -> EncoderConfig {
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
-}
-
-/// Deterministic Fisher-Yates, so "shuffled" is reproducible and a reported number can be rerun.
-fn shuffled(n: usize, seed: u64) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..n).collect();
-    let mut s = seed;
-    let mut next = move || {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    for i in (1..n).rev() {
-        let j = (next() % (i as u64 + 1)) as usize;
-        idx.swap(i, j);
-    }
-    idx
 }
 
 /// Read one channel file: one row per cycle, tab-separated samples.
@@ -157,42 +139,6 @@ fn read_channel(dir: &str, name: &str, want_cols: usize, want: &[usize]) -> Resu
         rows.push(vals);
     }
     Ok(rows)
-}
-
-/// One word per (axis, value) pair, plus a terminator at id 0. A caption is then five words and an
-/// end marker, and the five axes stay separable at scoring time.
-fn build_words(labels: &[Vec<i32>]) -> (Vec<String>, Vec<Vec<u32>>) {
-    let mut words = vec!["<end>".to_string()];
-    let mut per_axis: Vec<Vec<i32>> = vec![Vec::new(); LABELS.len()];
-    for row in labels {
-        for (a, &v) in row.iter().enumerate() {
-            if !per_axis[a].contains(&v) {
-                per_axis[a].push(v);
-            }
-        }
-    }
-    for a in 0..LABELS.len() {
-        per_axis[a].sort_unstable();
-        for v in &per_axis[a] {
-            words.push(format!("{}={}", LABELS[a], v));
-        }
-    }
-    let idx = |a: usize, v: i32| -> u32 {
-        let mut base = 1usize;
-        for k in 0..a {
-            base += per_axis[k].len();
-        }
-        (base + per_axis[a].iter().position(|&x| x == v).unwrap()) as u32
-    };
-    let caps: Vec<Vec<u32>> = labels
-        .iter()
-        .map(|row| {
-            let mut c: Vec<u32> = (0..LABELS.len()).map(|a| idx(a, row[a])).collect();
-            c.push(0);
-            c
-        })
-        .collect();
-    (words, caps)
 }
 
 /// Train one tokenizer — encoder, FSQ bottleneck, decoder — to reconstruct its own patches.
@@ -293,254 +239,6 @@ fn recon_error(
     }
     let mean = sum / n as f64;
     (se / n as f64, sumsq / n as f64 - mean * mean)
-}
-
-/// Compact the signal vocabulary down to the codes the TRAINING cycles actually use.
-///
-/// The full codebook is 32,768 rows, and this corpus visits a few thousand of them. Every unvisited
-/// row is an untrained embedding AND a class in the output softmax, so the decoder spends most of
-/// its capacity and all of its traffic on codes that cannot occur. The README's own conclusion from
-/// the synthetic sweep was to size the codebook to the corpus rather than inherit 32,768 from a
-/// model trained on 23 billion tokens; this is that, applied to real data.
-///
-/// **Built from the training cycles only.** A vocabulary fitted to every code the held-out cycles
-/// contain has already been told something about them. Held-out codes outside the training set map
-/// to one reserved id, and the share of held-out tokens that lands there is returned, because a
-/// compaction that silently discards a third of the held-out signal is not a free win.
-fn compact(
-    per_cycle: &[Vec<Vec<u32>>],
-    train_idx: &[usize],
-    held_idx: &[usize],
-) -> (Vec<Vec<Vec<u32>>>, u32, f64) {
-    let mut seen: Vec<u32> = train_idx
-        .iter()
-        .flat_map(|&i| per_cycle[i].iter().flatten().copied())
-        .collect::<HashSet<u32>>()
-        .into_iter()
-        .collect();
-    seen.sort_unstable();
-    let map: HashMap<u32, u32> =
-        seen.iter().enumerate().map(|(k, &c)| (c, k as u32)).collect();
-    let unk = seen.len() as u32;
-    let remapped: Vec<Vec<Vec<u32>>> = per_cycle
-        .iter()
-        .map(|chans| {
-            chans
-                .iter()
-                .map(|run| run.iter().map(|c| map.get(c).copied().unwrap_or(unk)).collect())
-                .collect()
-        })
-        .collect();
-    let (mut miss, mut total) = (0usize, 0usize);
-    for &i in held_idx {
-        for run in &per_cycle[i] {
-            for c in run {
-                total += 1;
-                if !map.contains_key(c) {
-                    miss += 1;
-                }
-            }
-        }
-    }
-    (remapped, unk + 1, miss as f64 / total.max(1) as f64 * 100.0)
-}
-
-/// What one seed produced: held-out accuracy per axis, and whether the model said anything.
-struct SeedResult {
-    acc: Vec<f64>,
-    /// Distinct words the model actually emitted at each axis position across the held-out set.
-    distinct: Vec<usize>,
-}
-
-/// Train signal-to-text for one seed.
-#[allow(clippy::too_many_arguments)]
-fn train_seed(
-    ctx: &Arc<Context>,
-    seq: &Sequencer,
-    rows_tokens: &[Vec<Vec<u32>>],
-    caps: &[Vec<u32>],
-    train_idx: &[usize],
-    held_idx: &[usize],
-    steps: usize,
-    batch: usize,
-    lm_cfg: EncoderConfig,
-    sequential: bool,
-    seed: u64,
-) -> SeedResult {
-    let rows = seq.embedding_rows();
-    let lm_cfg = lm_cfg;
-    let cfg = lm_cfg;
-    let lm = SensorLm::deterministic(ctx, cfg, rows, seed).unwrap();
-    // The embedding table trains with the rest: a signal code the corpus never visited is an
-    // untrained row, and this corpus visits only a fraction of the code space.
-    let mut params: Vec<Tensor> = std::iter::once(lm.embed.clone()).chain(lm.params_flat()).collect();
-    let mut opt = Adam::new(&params, 2e-3);
-
-    let build = |i: usize| -> Example {
-        let prompt = seq.encode(&[Span::Signal(rows_tokens[i].clone())]).unwrap();
-        let target = seq.encode(&[Span::Text(caps[i].clone())]).unwrap();
-        let target_from = prompt.len();
-        let mut tokens = prompt;
-        tokens.extend(target);
-        Example { tokens, target_from }
-    };
-
-    // GRADIENT ACCUMULATION over `batch` examples per optimizer step.
-    //
-    // `lm_forward_var` takes `[t, d]`, with no batch axis, and giving it two examples stacked
-    // would let one attend to the other — the same coupling the tokenizer path already had to
-    // correct. Summing gradients instead leaves every example encoded on its own and only
-    // averages what the optimizer sees. At batch 1 the gradient from a single 600-token sequence
-    // with a six-word target is noisy enough that the cheapest descent direction is the label
-    // marginal, which is exactly the constant-output failure the `distinct` column below counts.
-    // Presentation ORDER is a variable here, not a detail. This corpus is laid out by
-    // experimental condition, so walking it in index order feeds the decoder long runs of
-    // near-identical labels. `sequential` reproduces that walk so the two can be compared.
-    let mut order: Vec<usize> = if sequential {
-        (0..train_idx.len()).collect()
-    } else {
-        shuffled(train_idx.len(), seed ^ 0x5EED)
-    };
-    let mut cursor = 0usize;
-    for _ in 0..steps {
-        let mut acc: Vec<Tensor> = Vec::new();
-        for _ in 0..batch.max(1) {
-            if cursor >= order.len() {
-                if !sequential {
-                    order = shuffled(train_idx.len(), seed ^ 0x5EED ^ cursor as u64);
-                }
-                cursor = 0;
-            }
-            let i = train_idx[order[cursor]];
-            cursor += 1;
-            let e = build(i);
-            let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
-            let emb = embed_var(ctx, &vars[0], &e.tokens).unwrap();
-            let logits = lm_forward_var(ctx, cfg, &vars[1..], &emb).unwrap();
-            let loss = cross_entropy(ctx, &logits, &e.tokens, e.target_from, rows).unwrap();
-            loss.backward();
-            let grads: Vec<Tensor> = vars.iter().map(|v| v.grad().expect("no gradient")).collect();
-            acc = if acc.is_empty() {
-                grads
-            } else {
-                acc.iter()
-                    .zip(grads.iter())
-                    .map(|(a, g)| Var::leaf(a.clone()).add(&Var::leaf(g.clone())).value().clone())
-                    .collect()
-            };
-        }
-        let inv = 1.0 / batch.max(1) as f32;
-        let grads: Vec<Tensor> = acc
-            .iter()
-            .map(|a| {
-                let sc = Var::leaf(Tensor::from_vec(ctx, &[inv], &[1])).broadcast_to(&a.shape);
-                Var::leaf(a.clone()).mul(&sc).value().clone()
-            })
-            .collect();
-        opt.step(&mut params, &grads);
-    }
-
-    // Score each axis at its own caption position: the model sees the signal plus the caption
-    // words before this axis, and must produce this axis's word.
-    let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
-    let mut right = vec![0usize; LABELS.len()];
-    // What the model EMITTED, not just whether it was right. A model that answers the same word
-    // for every held-out cycle scores the frequency of that word and looks like a weak learner in
-    // an accuracy column; counting distinct predictions says outright that it never varied.
-    let mut said: Vec<HashSet<usize>> = vec![HashSet::new(); LABELS.len()];
-    for &i in held_idx {
-        let e = build(i);
-        for a in 0..LABELS.len() {
-            let upto = e.target_from + a;
-            let emb = embed_var(ctx, &vars[0], &e.tokens[..upto]).unwrap();
-            let logits =
-                pollster::block_on(lm_forward_var(ctx, cfg, &vars[1..], &emb).unwrap().value().to_vec());
-            let last = (upto - 1) * rows as usize;
-            let row = &logits[last..last + rows as usize];
-            let best = row.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
-            said[a].insert(best);
-            if best == seq.vocab().text(caps[i][a]).unwrap() as usize {
-                right[a] += 1;
-            }
-        }
-    }
-    SeedResult {
-        acc: right.iter().map(|&r| r as f64 / held_idx.len() as f64 * 100.0).collect(),
-        distinct: said.iter().map(|s| s.len()).collect(),
-    }
-}
-
-/// Multinomial naive Bayes over channel-tagged code counts: does the TOKEN STREAM carry the label
-/// at all, independent of whether a language model can read it?
-///
-/// This is the instrument that makes a null attributable. If signal-to-text sits on the majority
-/// baseline, there are two very different reasons — the tokens do not encode the fault, or they do
-/// and the decoder cannot extract it — and an accuracy column cannot tell them apart. A classifier
-/// with no capacity to speak, reading the same tokens, separates them.
-///
-/// A feature is (channel, code), not code alone: the same code from a pressure channel and from a
-/// temperature channel is not the same evidence.
-fn nb_probe(
-    per_cycle: &[Vec<Vec<u32>>],
-    labels: &[Vec<i32>],
-    train_idx: &[usize],
-    held_idx: &[usize],
-    axis: usize,
-) -> f64 {
-    let feat = |c: usize, code: u32| -> u64 { (c as u64) << 32 | code as u64 };
-    let classes: Vec<i32> = {
-        let mut v: Vec<i32> = train_idx.iter().map(|&i| labels[i][axis]).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    // Per class: total count of each feature, and the class's total mass.
-    let mut counts: Vec<HashMap<u64, f64>> = vec![HashMap::new(); classes.len()];
-    let mut totals = vec![0.0f64; classes.len()];
-    let mut vocab: HashSet<u64> = HashSet::new();
-    for &i in train_idx {
-        let k = classes.iter().position(|&v| v == labels[i][axis]).unwrap();
-        for (c, run) in per_cycle[i].iter().enumerate() {
-            for &code in run {
-                *counts[k].entry(feat(c, code)).or_insert(0.0) += 1.0;
-                totals[k] += 1.0;
-                vocab.insert(feat(c, code));
-            }
-        }
-    }
-    let v = vocab.len() as f64;
-    let alpha = 1.0f64;
-    let mut right = 0usize;
-    for &i in held_idx {
-        let mut best = (f64::NEG_INFINITY, 0usize);
-        for k in 0..classes.len() {
-            let denom = totals[k] + alpha * v;
-            let mut lp = 0.0f64;
-            for (c, run) in per_cycle[i].iter().enumerate() {
-                for &code in run {
-                    let n = counts[k].get(&feat(c, code)).copied().unwrap_or(0.0);
-                    lp += ((n + alpha) / denom).ln();
-                }
-            }
-            if lp > best.0 {
-                best = (lp, k);
-            }
-        }
-        if classes[best.1] == labels[i][axis] {
-            right += 1;
-        }
-    }
-    right as f64 / held_idx.len() as f64 * 100.0
-}
-
-/// Majority-class accuracy: the most frequent TRAIN value, scored on HELD OUT.
-fn majority(labels: &[Vec<i32>], train_idx: &[usize], held_idx: &[usize], axis: usize) -> f64 {
-    let mut counts: HashMap<i32, usize> = HashMap::new();
-    for &i in train_idx {
-        *counts.entry(labels[i][axis]).or_insert(0) += 1;
-    }
-    let maj = counts.iter().max_by_key(|(_, &c)| c).map(|(&v, _)| v).unwrap_or(0);
-    held_idx.iter().filter(|&&i| labels[i][axis] == maj).count() as f64 / held_idx.len() as f64 * 100.0
 }
 
 /// Tokenize every cycle of every channel with a given set of encoders.
@@ -754,21 +452,14 @@ fn main() {
     println!("    {} distinct label COMBINATIONS — a caption is compositional here, not one-of-N",
              combos.len());
 
+    // One label vector per axis, which is what the library instruments take: a probe asks about
+    // ONE axis at a time, and bundling the five into a row was only ever convenient here.
+    let per_axis: Vec<Vec<i32>> =
+        (0..LABELS.len()).map(|a| labels.iter().map(|r| r[a]).collect()).collect();
+
     // ---- the probe: do the tokens carry the label at all? ----
     println!("\n  TOKEN PROBE  naive Bayes over (channel, code) counts. No language model, no");
     println!("  capacity to speak — just whether the token stream separates the classes.\n");
-    // THE CONTROL. A probe that beats majority is only evidence if the SAME probe, on the same
-    // tokens, fails when the labels are permuted. Without this, a probe that is simply
-    // mis-scored — scoring on training rows, leaking an index — reads as a discovery. Five
-    // permutations, each scored against its own permuted majority, and the worst case is
-    // reported: one lucky permutation is not a control.
-    let perms: Vec<Vec<Vec<i32>>> = (0..5)
-        .map(|k| {
-            let order = shuffled(n, 0xC0FF_EE00 + k);
-            order.iter().map(|&i| labels[i].clone()).collect()
-        })
-        .collect();
-
     print!("  {:<13} {:>10}", "axis", "majority");
     for (name, _, _) in &arms {
         print!(" {:>12}", *name);
@@ -781,23 +472,18 @@ fn main() {
     println!(" {:->12}", "");
     let mut control_worst = 0.0f64;
     for a in 0..LABELS.len() {
-        let maj = majority(&labels, &train_idx, &held_idx, a);
+        let maj = majority(&per_axis[a], &train_idx, &held_idx);
         print!("  {:<13} {maj:>9.1}%", LABELS[a]);
         for (_, pc, _) in &arms {
-            let acc = nb_probe(pc, &labels, &train_idx, &held_idx, a);
+            let acc = nb_probe(pc, &per_axis[a], &train_idx, &held_idx);
             let mark = if acc > maj + 1e-9 { "*" } else { " " };
             print!(" {acc:>11.1}%{mark}");
         }
-        // The control runs on the LAST arm's tokens — the best tokenizer available, so the
-        // control is run where a spurious result would be easiest to get.
+        // The control runs on the LAST arm's tokens — the best tokenizer available, so it is run
+        // where a spurious result would be easiest to get.
         let last_arm = &arms[arms.len() - 1].1;
-        let over: Vec<f64> = perms
-            .iter()
-            .map(|pl| {
-                nb_probe(last_arm, pl, &train_idx, &held_idx, a) - majority(pl, &train_idx, &held_idx, a)
-            })
-            .collect();
-        let worst = over.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let worst =
+            permutation_control(last_arm, &per_axis[a], &train_idx, &held_idx, 5, 0xC0FF_EE00);
         control_worst = control_worst.max(worst);
         print!(" {:>+11.1}pt", worst);
         println!();
@@ -819,7 +505,7 @@ fn main() {
     }
 
     // ---- signal to text on real captions ----
-    let (words, caps) = build_words(&labels);
+    let (words, caps) = build_words(LABELS, &labels);
     let vocab_words = words.len() as u32;
     let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(600);
     let seeds: usize = flag(&args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(3);
@@ -868,9 +554,13 @@ fn main() {
 
     for (name, pc, seq2) in &cells {
         println!("\n  cell: {name}  ({} embedding rows)", seq2.embedding_rows());
-        let mut runs: Vec<SeedResult> = Vec::new();
+        let mut runs: Vec<ferric_signal::SeedResult> = Vec::new();
         for s in 0..seeds {
-            let r = train_seed(&ctx, seq2, pc, &caps, &train_idx, &held_idx, steps, batch, lm_cfg, sequential, 3 + s as u64 * 17);
+            let r = train_captions(
+                &ctx, seq2, pc, &caps, &train_idx, &held_idx, steps, batch, lm_cfg, sequential,
+                LABELS.len(), 3 + s as u64 * 17,
+            )
+            .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
             println!("    seed {}: {}", 3 + s * 17,
                      r.acc.iter().enumerate().map(|(a, v)| format!("{}={v:.0}%", LABELS[a])).collect::<Vec<_>>().join("  "));
             runs.push(r);
@@ -887,8 +577,8 @@ fn main() {
             let v: Vec<f64> = runs.iter().map(|r| r.acc[a]).collect();
             let m = v.iter().sum::<f64>() / v.len() as f64;
             let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt();
-            let n_vals = labels.iter().map(|r| r[a]).collect::<HashSet<_>>().len();
-            let maj_acc = majority(&labels, &train_idx, &held_idx, a);
+            let n_vals = per_axis[a].iter().collect::<HashSet<_>>().len();
+            let maj_acc = majority(&per_axis[a], &train_idx, &held_idx);
             // How many DIFFERENT words the model emitted at this position, averaged over seeds.
             // 1.0 means it answered the same thing for every held-out cycle.
             let said = runs.iter().map(|r| r.distinct[a] as f64).sum::<f64>() / runs.len() as f64;

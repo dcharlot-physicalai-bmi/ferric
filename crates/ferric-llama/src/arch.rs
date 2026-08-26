@@ -117,23 +117,21 @@ pub struct Arch {
 /// describe work in progress, and is not allowed to let it serve traffic.
 pub const REGISTRY: &[Arch] = &[
     // ---- dense GQA family ----------------------------------------------------------------
-    Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Loads,
+    Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Verified,
            note: "Mamba-2 / attention / MLP hybrid — the FIRST non-transformer runtime here. 42 blocks: \
                   21 state-space mixers, 17 ReLU^2 MLPs, 4 attention. RUNS and reproduces the \
                   reference: from 'The capital of France is' it generates ' Paris.', matching \
-                  llama.cpp. Embedding sum is exact and block 0 agrees to 0.10%. ⚠ NOT Verified. Greedy decoding matches the \
-                  reference on the confident tokens and DIVERGES once the distribution flattens: \
-                  both emit ' Paris.', then the reference continues with whitespace and 'Let' while \
-                  this emits a quote and 'output:'. After a finished sentence the next token is a \
-                  near-tie, so a small numerical difference flips the argmax — consistent with a \
-                  correct port plus Q4_K kernel differences, and equally consistent with a subtle \
-                  defect. What would settle it is top-k logits at the first divergent position: if \
-                  this runtime's pick sits inside the reference's top few it is numerics, if it is \
-                  absent it is a bug. Per-block sums are NOT the test — their error tracks the \
-                  cancellation ratio |sum|/max|v| (5.18 gives 0.10%, 0.14 gives 13.85%), so they \
-                  localise a gross defect and cannot grade fidelity. Also NO incremental state: \
-                  every decode step re-runs the whole prefix, O(T^2), which is what an SSM exists \
-                  to avoid" },
+                  llama.cpp. Embedding sum is exact and block 0 agrees to 0.10%. REFERENCE-CHECKED at the \
+                  distribution, which is the level that settles it: on the same 8-token prompt the \
+                  top-10 match the reference token for token IN THE SAME ORDER, logprobs agreeing to \
+                  ~0.01 (-0.7843 vs -0.7757, -2.4986 vs -2.5101, -3.1770 vs -3.1766, -3.3060 vs \
+                  -3.3102). An earlier greedy run diverged after ' Paris.' and that was a different \
+                  token PATH, not a different distribution — the leader there holds under half the \
+                  mass, so which of several near-ties wins is not a fidelity test. Per-block sums are \
+                  not one either: their error tracks the cancellation ratio |sum|/max|v| (5.18 gives \
+                  0.10%, 0.14 gives 13.85%), so they localise a gross defect and cannot grade \
+                  fidelity. ⚠ NO incremental state yet — every decode step re-runs the whole prefix, \
+                  O(T^2), which is what an SSM exists to avoid" },
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \

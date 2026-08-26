@@ -75,6 +75,7 @@
 //! in anything deployed.
 
 pub mod bench;
+pub mod caption;
 pub mod cost;
 pub mod encoder;
 pub mod fsq;
@@ -91,6 +92,7 @@ pub mod train;
 pub mod vocab;
 
 pub use bench::{chance, majority, nb_probe, permutation_control, shuffled};
+pub use caption::{build_words, compact, train_captions, CaptionError, SeedResult};
 pub use cost::{vocab_cost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};

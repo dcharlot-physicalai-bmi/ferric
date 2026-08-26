@@ -40,8 +40,8 @@
 //! number of windows per recording, spread across the whole of it, keeps the design balanced.
 
 use ferric_signal::{
-    chance, majority, nb_probe, permutation_control, EncoderConfig, EncoderWeights, Fsq, MatFile,
-    Patcher, RevIn,
+    build_words, chance, compact, majority, nb_probe, permutation_control, train_captions,
+    EncoderConfig, EncoderWeights, Fsq, HybridVocab, MatFile, Patcher, RevIn, Sequencer,
 };
 use ferric_tensor::Tensor;
 use std::collections::{BTreeMap, HashSet};
@@ -324,5 +324,79 @@ fn main() {
     println!("  permuted, worst of five, each against its own majority. Read it before the probe:");
     println!("  an effect the size of its control is not an effect.");
     println!("\n  The tokenizer is UNTRAINED. RevIn normalises every channel of every window, so");
-    println!("  absolute amplitude is gone by construction and what is read is shape.\n");
+    println!("  absolute amplitude is gone by construction and what is read is shape.");
+
+    if !args.iter().any(|a| a == "--train") {
+        println!("\n  Pass --train to run signal-to-text on these conditions.\n");
+        return;
+    }
+
+    // ---- signal to text: say the condition in words ----
+    //
+    // Every axis stays in the caption under BOTH splits, so the task is the same one in each and
+    // the two columns stay comparable. An axis whose held-out classes are absent from training is
+    // reported as unanswerable rather than scored, exactly as in the probe table above — the model
+    // is still trained on it and still spends capacity there, which is the honest cost of asking.
+    let rows: Vec<Vec<i32>> =
+        (0..docs.len()).map(|i| (0..AXES.len()).map(|a| per_axis[a][i]).collect()).collect();
+    let (words, caps) = build_words(AXES, &rows);
+    let (remapped, size, unk_pct) = compact(&docs, &train, &held);
+    let fq = Fsq::new(vec![size]).unwrap();
+    let seq = Sequencer::new(HybridVocab::new(words.len() as u32, fq).unwrap());
+    let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(250);
+    let batch: usize = flag(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(8);
+    let seeds: usize = flag(&args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let lm_cfg = EncoderConfig { patch_len: 16, d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, latent_dim: 5 };
+
+    println!("\n  SIGNAL -> TEXT  {} train / {} held out, {} caption words", train.len(), held.len(), words.len());
+    println!("  vocabulary compacted to {size} signal rows from {}; {unk_pct:.2}% of held-out tokens",
+             q.codebook_size());
+    println!("  were unseen in training. {} embedding rows.", seq.embedding_rows());
+    println!("  {steps} optimizer steps x batch {batch} = {} examples seen, {seeds} seeds, shuffled\n",
+             steps * batch);
+
+    let mut runs = Vec::new();
+    for s in 0..seeds {
+        let r = train_captions(
+            &ctx, &seq, &remapped, &caps, &train, &held, steps, batch, lm_cfg, false,
+            AXES.len(), 3 + s as u64 * 17,
+        )
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
+        println!("    seed {}: {}", 3 + s * 17,
+                 r.acc.iter().enumerate().map(|(a, v)| format!("{}={v:.0}%", AXES[a]))
+                     .collect::<Vec<_>>().join("  "));
+        runs.push(r);
+    }
+
+    println!("\n  {:<10} {:>8} {:>7} {:>10} {:>8} {:>10}",
+             "axis", "mean", "sd", "majority", "chance", "said");
+    println!("  {:-<10} {:->8} {:->7} {:->10} {:->8} {:->10}", "", "", "", "", "", "");
+    for (a, name) in AXES.iter().enumerate() {
+        let labels = &per_axis[a];
+        let train_cls: HashSet<i32> = train.iter().map(|&i| labels[i]).collect();
+        let held_cls: HashSet<i32> = held.iter().map(|&i| labels[i]).collect();
+        let v: Vec<f64> = runs.iter().map(|r| r.acc[a]).collect();
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt();
+        let said = runs.iter().map(|r| r.distinct[a] as f64).sum::<f64>() / runs.len() as f64;
+        let n_cls = labels.iter().collect::<HashSet<_>>().len();
+        if !held_cls.is_subset(&train_cls) {
+            println!("  {name:<10} {m:>7.1}% {sd:>6.1} {:>10} {:>8} {said:>7.1} of {n_cls}   <- not askable under this split",
+                     "-", "-");
+            continue;
+        }
+        let maj = majority(labels, &train, &held);
+        let verdict = if said <= 1.0 {
+            "  <- one word for every window"
+        } else if m > maj + 1e-9 {
+            ""
+        } else {
+            "  <- at or below majority"
+        };
+        println!("  {name:<10} {m:>7.1}% {sd:>6.1} {maj:>9.1}% {:>7.1}% {said:>7.1} of {n_cls}{verdict}",
+                 chance(labels));
+    }
+    println!("\n  `said` counts the distinct words the decoder actually emitted at that position");
+    println!("  across the held-out set. 1.0 means it answered the same thing every time, which");
+    println!("  scores that word's frequency and reads as a weak learner in an accuracy column.\n");
 }
