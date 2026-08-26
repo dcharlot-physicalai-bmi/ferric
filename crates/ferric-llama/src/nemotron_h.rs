@@ -29,6 +29,38 @@
 //! ssm_a, ssm_d   [1, 96]           one per SSM head; head_dim = 7680/96 = 80
 //! ```
 //!
+//! ## The conventions, READ OFF the reference graph
+//!
+//! `llama-eval-callback` on Nemotron-3-Nano-4B, 2 tokens. Every line below is a shape from that dump,
+//! not a reading of the Mamba-2 paper — these are exactly the choices `ssm_scan`'s doc warns are
+//! "a checkpoint convention" whose wrong value is fluent and wrong.
+//!
+//! ```text
+//! MUL_MAT  ssm_in {3136 -> 17504}          split: z 7680 | xBC 9728 | dt 96
+//! SSM_CONV over xBC only  {5,9728}x{4,9728}   z and dt BYPASS the conv
+//! ADD      conv1d.bias
+//! SILU                                     applied to ALL of xBC, so x is silu'd BEFORE the scan
+//!          views of it: x {80,96,T}  B {128,8,T}  C {128,8,T}
+//! ADD      dt + ssm_dt.bias  {96,T}        dt comes straight from ssm_in, NOT through the conv
+//! SSM_SCAN
+//! MUL      x * ssm_d {1,96}   ->  ADD "mamba2_y_add_d"
+//! SWIGLU   (z, y_with_d)                   z is the FIRST operand: silu(z) * y
+//! RESHAPE  {80,96,T} -> {960,8,T}          then RMS_NORM + MUL ssm_norm — the grouped norm
+//! MUL_MAT  ssm_out {7680 -> 3136}  ->  ADD residual
+//! ```
+//!
+//! ### Reconciling with Ferric's kernel
+//!
+//! `Tensor::ssm_scan` states its own contract in its bindings and it differs from ggml's in one way
+//! that matters: `da` is **`exp(dt*A)` already formed** and `dt` is **already softplus'd**, so those
+//! two are the caller's job; and the kernel adds `D*x` **internally** (`acc + dv * xv`), where ggml
+//! does it externally as the `mamba2_y_add_d` node above. So the port passes silu'd `x` plus
+//! `d_skip` and must NOT repeat that add — doing both would double the skip term, which is finite,
+//! fluent and wrong.
+//!
+//! Group mapping is contiguous: the kernel computes `heads_per_group = n_head / n_group` and
+//! `group = head / heads_per_group`, i.e. heads 0..11 → group 0 for the 4B's 96 heads over 8 groups.
+//!
 //! ⚠ The remaining risk is **convention, not shape**: whether `ssm_a` is used directly or
 //! exponentiated, whether `dt` takes a softplus and where its bias lands, and how B/C map onto the 8
 //! groups. `Tensor::ssm_scan`'s own doc flags these as "a checkpoint convention — getting them wrong
