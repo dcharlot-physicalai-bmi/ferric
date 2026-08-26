@@ -35,6 +35,20 @@
 //!   so it is present from the first block rather than compounding.
 //! * **not the LayerNorm epsilon** — declared 1e-5 here against bge-small's 1e-12, and read correctly.
 //! * **not primarily the position offset** — sweeping 0..3 moves it 0.9615 → 0.9762, never near 0.999.
+//! * **not the GELU variant** — ggml uses the tanh approximation and this now does too, worth 0.0004
+//!   (0.972166 erf → 0.972585 tanh). A real correctness fix, not the bug.
+//! * **not the pooler** — `--pooling cls` returns the RAW CLS state, confirmed by comparing against
+//!   `tanh(dense(CLS))` instead: cosine 0.032, near-orthogonal. The two are very different vectors,
+//!   so this rules the question out rather than leaving it ambiguous.
+//! * **not the token-type embedding** — non-zero here (max |v| 0.205) and added by both.
+//!
+//! Best achieved: **0.9726** (offset 2, tanh GELU). The remaining gap is roughly 0.027 of cosine and
+//! no single-parameter hypothesis accounts for it.
+//!
+//! **The right next instrument is `llama-eval-callback`**, which dumps every tensor in llama.cpp's
+//! graph. Comparing per-LAYER hidden states finds the first block where the two diverge, which is a
+//! bounded search; comparing whole-model outputs and guessing at parameters is not, and four wrong
+//! turns here are the evidence for that.
 //!
 //! So it is structural and specific to this checkpoint family, in the embedding construction or an
 //! early block. The reranker head itself is implemented (`score`) and DISCRIMINATES correctly —
@@ -228,7 +242,16 @@ impl Bert {
             let attn = cat.reshape(&[t, d]).matmul_bt(&b.o).add(&b.ob);
             // POST-norm: normalise the residual sum, not the input to the sublayer.
             h = h.add(&attn).layernorm(&b.attn_norm_w, &b.attn_norm_b, self.cfg.eps);
-            let ff = h.matmul_bt(&b.up).add(&b.upb).gelu().matmul_bt(&b.down).add(&b.downb);
+            // ggml's `ggml_gelu` is the TANH approximation, not the exact erf form, and llama.cpp's
+            // BERT graph uses LLM_FFN_GELU which maps to it. Selectable while this is being pinned
+            // down; the default follows ggml.
+            let up = h.matmul_bt(&b.up).add(&b.upb);
+            let act = if std::env::var("FERRIC_BERT_GELU_ERF").ok().as_deref() == Some("1") {
+                up.gelu()
+            } else {
+                up.gelu_tanh()
+            };
+            let ff = act.matmul_bt(&b.down).add(&b.downb);
             h = h.add(&ff).layernorm(&b.out_norm_w, &b.out_norm_b, self.cfg.eps);
         }
         Ok(h)
@@ -236,6 +259,18 @@ impl Bert {
 
     /// Whether this checkpoint carries a reranker head.
     pub fn is_reranker(&self) -> bool { self.cls.is_some() }
+
+    /// **BERT's pooler**: `tanh(dense(CLS))`, the first half of the classification head.
+    ///
+    /// This is a distinct output from the raw CLS hidden state, and which one a tool means by "CLS
+    /// pooling" is not obvious: a checkpoint with no `cls.*` tensors can only mean the raw state,
+    /// while one that has them may mean either. Exposed separately so a reference diff can say which,
+    /// instead of a mismatch being blamed on the encoder.
+    pub async fn pooler(&self, h: &Tensor) -> Result<Vec<f32>, String> {
+        let c = self.cls.as_ref().ok_or("no cls.* pooler on this checkpoint")?;
+        let pooled = h.narrow(0, 0, 1).reshape(&[1, self.cfg.d]);
+        Ok(pooled.matmul_bt(&c.w).add(&c.b).tanh().to_vec().await)
+    }
 
     /// **Cross-encoder relevance score** for one (query, passage) pair, already joined into `ids`.
     ///

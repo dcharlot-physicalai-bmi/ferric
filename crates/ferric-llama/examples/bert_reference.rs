@@ -36,9 +36,19 @@ async fn run() {
     let h = m.forward(&ids).expect("forward").to_vec().await;
     let (t, d) = (ids.len(), m.cfg.d);
     // Pool where the checkpoint says: 2 = CLS (index 0), 1 = MEAN over tokens.
-    let pooled: Vec<f32> = match m.cfg.pooling {
-        1 => (0..d).map(|c| (0..t).map(|r| h[r * d + c]).sum::<f32>() / t as f32).collect(),
-        _ => h[0..d].to_vec(),
+    // FERRIC_BERT_POOLER=1 applies BERT's pooler — tanh(dense(CLS)) — instead of returning the raw
+    // CLS state. Which of the two a reference tool means by "cls pooling" is genuinely ambiguous for a
+    // checkpoint that HAS the pooler tensors, and comparing the wrong one blames the encoder for a
+    // difference that is entirely in the last two ops.
+    let use_pooler = std::env::var("FERRIC_BERT_POOLER").ok().as_deref() == Some("1");
+    let pooled: Vec<f32> = if use_pooler {
+        let hs = ferric_tensor::Tensor::from_vec(&ctx, &h, &[t, d]);
+        m.pooler(&hs).await.expect("pooler")
+    } else {
+        match m.cfg.pooling {
+            1 => (0..d).map(|c| (0..t).map(|r| h[r * d + c]).sum::<f32>() / t as f32).collect(),
+            _ => h[0..d].to_vec(),
+        }
     };
     let dot: f32 = pooled.iter().zip(&want).map(|(a, b)| a * b).sum();
     let (na, nb): (f32, f32) = (pooled.iter().map(|x| x * x).sum::<f32>().sqrt(),
