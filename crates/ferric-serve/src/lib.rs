@@ -168,6 +168,13 @@ fn byte_decoder() -> HashMap<char, u8> {
 pub(crate) struct Engine {
     ctx: Arc<Context>,
     model: Model,
+    /// A cross-encoder reranker, loaded SEPARATELY from `FERRIC_RERANK_MODEL`.
+    ///
+    /// It is a second model, not a mode of the first: rerankers are encoders with a classification
+    /// head, they have no KV cache and no LM head, and nothing in `Model` fits them. llama-server
+    /// takes the same shape with its own `--reranking` flag. Absent by default, so `/v1/rerank`
+    /// answers 400 with what to set rather than pretending the endpoint does not exist.
+    reranker: Option<ferric_llama::bert::Reranker>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -215,6 +222,13 @@ struct PrefixSlot { fed: Vec<u32>, cache: qwen35::Cache, mc: qwen35::MtpCache }
 impl Engine {
     fn load(path: &str, name: String) -> Engine {
         let ctx = Arc::new(pollster::block_on(Context::new()).unwrap());
+        // Loaded before the main model so a bad reranker path fails immediately rather than after a
+        // multi-GB load, and so the panic names which of the two files was wrong.
+        let reranker = std::env::var("FERRIC_RERANK_MODEL").ok().map(|rp| {
+            let rg = GgufFile::open(&rp).unwrap_or_else(|e| panic!("open FERRIC_RERANK_MODEL {rp}: {e:?}"));
+            ferric_llama::bert::Reranker::load(&ctx, &rg)
+                .unwrap_or_else(|e| panic!("load FERRIC_RERANK_MODEL {rp}: {e}"))
+        });
         let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
             Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
@@ -280,6 +294,12 @@ impl Engine {
             // Cosmos loads from safetensors, so it cannot arrive down a GGUF path at all.
             ferric_llama::arch::Runtime::Cosmos =>
                 panic!("{arch} loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
+            // An encoder cannot be the chat model: no KV cache, no LM head, nothing to generate. It
+            // is served through FERRIC_RERANK_MODEL and /v1/rerank instead. Refusing here keeps the
+            // exhaustive match honest — adding a runtime must be a compile error, not a fallthrough.
+            ferric_llama::arch::Runtime::Bert => panic!(
+                "{path} is a BERT encoder and cannot serve chat or completions. Point \
+                 FERRIC_RERANK_MODEL at it and load a generative model here instead"),
         };
         eprintln!("arch {arch:?} -> {} runtime ({}) — {}",
                   entry.runtime.label(), entry.status.label(), entry.note);
@@ -323,7 +343,7 @@ impl Engine {
         // The break-even is `E_draft / E_main`, estimated from shape: one MTP block against the main
         // model's `n_layer`. A structural estimate, not a measurement — see `specgate`.
         let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -865,6 +885,7 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
         ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
+        ("POST", "/v1/rerank") | ("POST", "/rerank") => rerank(eng, stream, body),
         // Unrecognised: let the caller answer, so there is exactly one 404 writer.
         _ => return false,
     }
@@ -873,6 +894,48 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
 
 /// OpenAI-compatible `/v1/embeddings`: `input` is a string or array of strings → L2-normalized vectors.
 /// Runs on an embedding model (e.g. Qwen3-Embedding, a Qwen3-arch model with no lm_head).
+/// **POST /v1/rerank** — cross-encoder relevance scoring over a shortlist.
+///
+/// Body: `{"query": str, "documents": [str], "top_n"?: int, "return_documents"?: bool}`.
+/// Returns `{"results": [{"index", "relevance_score", "document"?}]}` best-first, the shape Cohere
+/// defined and Jina, Voyage and llama-server all followed.
+///
+/// Scores are RAW logits, matching llama.cpp: ordering is invariant to any monotone squash, and a
+/// sigmoid here would make two implementations' numbers incomparable for no gain. Measured against
+/// llama-server on bge-reranker-v2-m3: 6.585 vs 6.570 relevant, -8.366 vs -8.361 irrelevant.
+fn rerank(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
+    let bad = |stream: &mut TcpStream, m: &str| write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
+    let Some(rr) = eng.reranker.as_ref() else {
+        return bad(stream, "no reranker loaded: set FERRIC_RERANK_MODEL to a cross-encoder GGUF \
+                            (e.g. bge-reranker-v2-m3). A reranker is a SECOND model — an encoder with \
+                            a classification head — not a mode of the chat model");
+    };
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad(stream, &format!("bad json: {e}")) };
+    let Some(query) = req["query"].as_str() else { return bad(stream, "`query` must be a string") };
+    // Error rather than skip a non-string: dropping one would misalign every `index` returned, which
+    // is the field the caller uses to map results back to its own list.
+    let docs: Vec<String> = match &req["documents"] {
+        Value::Array(a) => {
+            let mut v = Vec::with_capacity(a.len());
+            for x in a { match x.as_str() { Some(s) => v.push(s.to_string()), None => return bad(stream, "`documents` must contain only strings") } }
+            v
+        }
+        _ => return bad(stream, "`documents` must be an array of strings"),
+    };
+    if docs.is_empty() { return bad(stream, "`documents` must not be empty"); }
+    let ranked = match pollster::block_on(rr.rank(query, &docs)) {
+        Ok(r) => r, Err(e) => return bad(stream, &format!("rerank failed: {e}")),
+    };
+    let want_docs = req["return_documents"].as_bool().unwrap_or(false);
+    let top_n = req["top_n"].as_u64().map(|n| n as usize).unwrap_or(ranked.len()).min(ranked.len());
+    let results: Vec<Value> = ranked[..top_n].iter().map(|(i, s)| {
+        let mut o = json!({"index": i, "relevance_score": s});
+        if want_docs { o["document"] = json!({"text": docs[*i]}); }
+        o
+    }).collect();
+    write_json(stream, 200, &json!({"object": "list", "model": eng.name, "results": results}));
+}
+
 fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let bad = |stream: &mut TcpStream, m: &str| write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad(stream, &format!("bad json: {e}")) };

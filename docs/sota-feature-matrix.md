@@ -811,3 +811,50 @@ implementation could show it.
 extrapolated 140,000-chunk ceiling uses the settled decay rate, which moves from −0.0225 to −0.0223
 per doubling — inside the noise of a seven-point fit either way, so the figure is unchanged and
 remains an extrapolation rather than a measurement.
+
+## V. Closing the open-weight gaps (2026-08-25)
+
+Prompted by Stripe's $7–8B acquisition of OpenRouter — model routing priced as infrastructure — a
+sweep of Ferric against the 2026 open-weight tooling landscape. Ferric was stronger than expected on
+the standards (an **MCP client** over stdio and Streamable-HTTP already, plus guided decoding, tool
+calling, speculative decode, LoRA, imatrix). The real holes were in loading and retrieval.
+
+| gap | status | evidence |
+|---|---|---|
+| **Sharded GGUF** (`model-00001-of-0000N`) | ✅ closed | 310 tensors byte-identical to the merged original, opened from part 1, 2 AND 3 |
+| Streaming vs sharded input | ✅ refuses | positional readers cannot address multi-file checkpoints |
+| **WordPiece** | ✅ closed | 3/3 vs `llama-tokenize` |
+| **BERT encoders** | ✅ closed | 0.999999 (F16), 0.999996 (Q4_K_M) vs `llama-embedding` |
+| **XLM-RoBERTa** | ✅ closed | 0.999995–1.000000 |
+| **Cross-encoder rerankers** | ✅ closed | 6.585 vs 6.570; −8.366 vs −8.361 |
+| **`/v1/rerank`** | ✅ closed | live HTTP, Cohere response shape, `top_n` + `return_documents` |
+| Q4_K matmul fidelity | ✅ verified | 0.999996 — retires a risk under every quantised result here |
+
+**Sharded GGUF was not a missing feature — it was "cannot open the file."** Every large checkpoint on
+HuggingFace ships split; llama.cpp, vLLM and Ollama all follow the parts. Ferric loaded part 1 alone,
+saw 128 of 310 tensors, and failed with `no tensor 'blk.11.attn_v.weight'` — a message naming a
+tensor rather than the 182 in files it never opened. Two checks now guard it, because the first alone
+was insufficient: the tensor count against `split.tensors.count`, **and** each shard's declared data
+span against its actual length (truncating a part to 200 KB leaves the header intact, so the count
+check passed and 310 tensors loaded).
+
+### ⛔ The most expensive lesson: verification does not transfer between files
+
+A "0.9615 XLM-R encoder divergence" was recorded here as an open bug and chased through nine
+hypotheses — quantisation, the pooler, GELU, token types, the LayerNorm epsilon, the position offset.
+Every elimination was correct. None was the cause. `bert_reference` hardcoded a **WordPiece**
+tokenizer, right for `tokenizer.ggml.model == "bert"` and wrong for XLM-R's `"t5"`, and fed the
+encoder four tokens for "Paris" where llama.cpp uses three.
+
+Three things worth carrying forward:
+
+1. **The tokenizer family is declared, not implied.** `bge-small` and `bge-reranker-v2-m3` are both
+   `general.architecture = bert`; one is WordPiece, the other SentencePiece. `bert::Reranker` now owns
+   its tokenizer so no caller re-derives this.
+2. **A better number can mean a wronger parameter.** A position offset of 2 scored cosine 0.9726
+   against the correct 0's 0.9615 — with another defect present, tuning toward the final scalar moved
+   *away* from the reference. `llama-eval-callback` settled it: the reference's position-embedding sum
+   for three tokens is −37.445366 and rows 0..2 sum to −37.445358.
+3. **Per-op tracing is bounded; end-to-end comparison is not.** `FERRIC_BERT_TRACE=1` prints a sum per
+   checkpoint tensor against the reference's 512. The first line disagreed on token *count* — 4 vs 3 —
+   which no parameter sweep could have reached.

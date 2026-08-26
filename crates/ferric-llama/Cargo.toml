@@ -20,6 +20,11 @@ ferric-tier = { path = "../ferric-tier", version = "0.3" }
 ferric-kv = { path = "../ferric-kv", version = "0.3" }
 ferric-gguf = { path = "../ferric-gguf", version = "0.3" }
 pollster = "1.0.1" # MoE routing reads router logits back mid-forward (eager tensors → cheap)
+# Promoted from dev-dependencies for bert::Reranker, which owns its tokenizer ON PURPOSE: the
+# family is declared by tokenizer.ggml.model and is NOT implied by general.architecture — bge-small
+# is "bert"/WordPiece and bge-reranker-v2-m3 is the same arch but "t5"/SentencePiece. Making every
+# caller re-derive that is how a four-token "Paris" got compared against a three-token reference.
+ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.3" }
 
 [dev-dependencies]
 ferric-certify = { path = "../ferric-certify" }

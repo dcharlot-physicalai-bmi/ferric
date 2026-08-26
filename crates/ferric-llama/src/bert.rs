@@ -324,3 +324,100 @@ impl Bert {
         out.first().copied().ok_or_else(|| "empty score output".into())
     }
 }
+
+/// **A cross-encoder reranker, tokenizer included.**
+///
+/// Owning the tokenizer is the point. A BERT checkpoint declares `tokenizer.ggml.model` and the
+/// family is NOT implied by the architecture: `bge-small` is `"bert"` (WordPiece) while
+/// `bge-reranker-v2-m3` is the same `general.architecture = bert` but `"t5"` (SentencePiece), because
+/// it is XLM-RoBERTa underneath. Hardcoding either one produced a four-token "Paris" against
+/// llama.cpp's three and cost nine hypotheses chasing a model bug that did not exist. Every caller
+/// getting this right independently is not a plan; the decision lives here once.
+pub struct Reranker {
+    model: Bert,
+    tok: RerankTok,
+    bos: u32,
+    eos: u32,
+}
+
+enum RerankTok {
+    Wordpiece(ferric_tokenizer::WordPiece),
+    Spm(ferric_tokenizer::Spm),
+}
+
+impl Reranker {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Reranker, String> {
+        let model = Bert::load(ctx, g)?;
+        if !model.is_reranker() {
+            return Err("this checkpoint has no cls.* head: it embeds but cannot score pairs. \
+                        Reranking needs a cross-encoder such as bge-reranker".into());
+        }
+        let md = g.metadata();
+        let toks: Vec<String> = match md.get("tokenizer.ggml.tokens") {
+            Some(Meta::Arr(v)) => v.iter()
+                .map(|x| if let Meta::Str(s) = x { s.clone() } else { String::new() }).collect(),
+            _ => return Err("no tokenizer.ggml.tokens".into()),
+        };
+        let u = |k: &str, d: u32| match md.get(k) { Some(Meta::U(v)) => *v as u32, _ => d };
+        let kind = match md.get("tokenizer.ggml.model") { Some(Meta::Str(s)) => s.as_str(), _ => "bert" };
+        let tok = match kind {
+            "bert" => RerankTok::Wordpiece(ferric_tokenizer::WordPiece::new(
+                toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect(),
+                u("tokenizer.ggml.cls_token_id", 101),
+                u("tokenizer.ggml.seperator_token_id", 102),
+                u("tokenizer.ggml.unknown_token_id", 100))),
+            _ => {
+                let scores: Vec<f32> = match md.get("tokenizer.ggml.scores") {
+                    Some(Meta::Arr(v)) => v.iter()
+                        .map(|x| if let Meta::F(f) = x { *f as f32 } else { 0.0 }).collect(),
+                    _ => Vec::new(),
+                };
+                RerankTok::Spm(ferric_tokenizer::Spm::new(toks.clone(), scores))
+            }
+        };
+        Ok(Reranker {
+            bos: u("tokenizer.ggml.bos_token_id", u("tokenizer.ggml.cls_token_id", 0)),
+            eos: u("tokenizer.ggml.eos_token_id", u("tokenizer.ggml.seperator_token_id", 2)),
+            model, tok,
+        })
+    }
+
+    /// The pair layout llama.cpp's `format_rerank` builds: **BOS query EOS doc EOS**.
+    ///
+    /// One separator, no second BOS. Deduced from the reference's own token count rather than from
+    /// the RoBERTa papers, which describe a doubled separator: llama-server reported 39 prompt tokens
+    /// for two pairs of 6 query and 10/11 doc content tokens, and of the three candidate layouts only
+    /// this one gives 19 + 20 = 39. Two wrong layouts were tried first and BOTH kept the correct
+    /// ordering, which is exactly why a ranking benchmark cannot catch this.
+    fn pair(&self, query: &str, doc: &str) -> Vec<u32> {
+        let enc = |s: &str| match &self.tok {
+            // WordPiece adds its own [CLS]/[SEP]; strip them so the pair layout supplies the wrapping.
+            RerankTok::Wordpiece(w) => { let v = w.encode(s); v[1..v.len().saturating_sub(1)].to_vec() }
+            RerankTok::Spm(s2) => s2.encode_piece(s, true),
+        };
+        let mut ids = vec![self.bos];
+        ids.extend(enc(query));
+        ids.push(self.eos);
+        ids.extend(enc(doc));
+        ids.push(self.eos);
+        ids
+    }
+
+    /// Relevance logit for one pair. Raw, not squashed: llama.cpp reports the logit, ordering is
+    /// invariant to any monotone squash, and squashing would make the two incomparable for no gain.
+    pub async fn score(&self, query: &str, doc: &str) -> Result<f32, String> {
+        self.model.score(&self.pair(query, doc)).await
+    }
+
+    /// Score every document and return `(index, logit)` sorted best-first.
+    ///
+    /// N documents cost N forwards — the query and the passage go through the network TOGETHER, which
+    /// is what a cross-encoder buys over comparing two independent embeddings, and why this runs over
+    /// a retrieved shortlist rather than a corpus.
+    pub async fn rank(&self, query: &str, docs: &[String]) -> Result<Vec<(usize, f32)>, String> {
+        let mut out = Vec::with_capacity(docs.len());
+        for (i, d) in docs.iter().enumerate() { out.push((i, self.score(query, d).await?)); }
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+}
