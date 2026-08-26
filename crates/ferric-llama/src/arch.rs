@@ -130,8 +130,12 @@ pub const REGISTRY: &[Arch] = &[
                   mass, so which of several near-ties wins is not a fidelity test. Per-block sums are \
                   not one either: their error tracks the cancellation ratio |sum|/max|v| (5.18 gives \
                   0.10%, 0.14 gives 13.85%), so they localise a gross defect and cannot grade \
-                  fidelity. ⚠ NO incremental state yet — every decode step re-runs the whole prefix, \
-                  O(T^2), which is what an SSM exists to avoid" },
+                  fidelity. INCREMENTAL STATE WORKS and is the architecture's whole argument: 85.4 MB of \
+                  conv+SSM+KV that does NOT grow with the conversation, against a transformer's KV \
+                  cache that does. Verified by EQUALITY — a cache bug drifts rather than raising, so \
+                  the reference-checked stateless path stays and the cached one must reproduce it \
+                  token for token, which it does. ⚠ conv state is the PRE-convolution signal, not the \
+                  conv output; storing the output drifts plausibly instead of failing" },
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
