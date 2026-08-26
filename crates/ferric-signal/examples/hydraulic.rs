@@ -483,13 +483,13 @@ fn main() {
         // where a spurious result would be easiest to get.
         let last_arm = &arms[arms.len() - 1].1;
         let worst =
-            permutation_control(last_arm, &per_axis[a], &train_idx, &held_idx, 5, 0xC0FF_EE00);
+            permutation_control(last_arm, &per_axis[a], &train_idx, &held_idx, 20, 0xC0FF_EE00);
         control_worst = control_worst.max(worst);
         print!(" {:>+11.1}pt", worst);
         println!();
     }
     println!("\n  * beats the majority baseline. `control` is the same probe on the same tokens with");
-    println!("  the CYCLE-TO-LABEL assignment permuted, reported as the best of five permutations");
+    println!("  the CYCLE-TO-LABEL assignment permuted, reported as the worst of twenty permutations");
     println!("  against each permutation's own majority: {control_worst:+.1} points at worst. A control");
     println!("  near zero is what makes a starred column mean something.");
     println!("\n  RevIn normalises every channel of every cycle to zero mean and unit scale before");

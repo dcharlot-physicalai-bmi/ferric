@@ -139,6 +139,12 @@ pub fn nb_probe(docs: &[Vec<Vec<u32>>], labels: &[i32], train: &[usize], held: &
 /// balance, and any correlation structure inside a label — exactly as it was. The worst of several
 /// is reported because one lucky permutation is not a control.
 ///
+/// **Worst-of-N grows with N, and that is the direction to err in.** Five rounds on one corpus gave
+/// +9.0 points on an axis where a different five gave +2.0 — a control that swings five points
+/// between draws is under-sampled, and under-sampling a control makes results look better than
+/// they are. Twenty is the default the examples use; the number of rounds belongs next to the
+/// figure, because "worst of five" and "worst of twenty" are not the same quantity.
+///
 /// A control near zero is what makes a positive probe mean something. **Read it before reading the
 /// probe**, and read it against the same held-out size: it shrinks as n grows and is worth tens of
 /// points at small n.

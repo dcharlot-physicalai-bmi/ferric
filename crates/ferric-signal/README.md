@@ -47,6 +47,7 @@ open.
 | `train` | Straight-through estimator | Gradient must behave as if rounding were the identity |
 | `language` | Mixed text/signal sequences, causal LM | Encode/decode inverses; a position cannot see its future |
 | `bench` | Majority baseline, token probe, permutation control | The control must collapse on features that certainly carry the label, and shrink as n grows |
+| `caption` | Signal-to-text training, caption vocabulary, compaction | Shared by both corpus ingests, so the protocol is one implementation |
 | `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |
 | `inflate` | DEFLATE/zlib decompression | Streams compressed elsewhere, including the dynamic-Huffman branch; the Adler-32 trailer is checked |
 
@@ -138,16 +139,16 @@ token stream separates the classes at all:
 
 | axis | majority | probe, untrained tokenizer | probe, trained tokenizer | permutation control |
 |---|---|---|---|---|
-| cooler | 36.0% | 75.0% | 76.0% | +9.0 pt |
-| valve | 54.0% | 59.0% | 54.0% | +1.0 pt |
-| pump_leak | 55.0% | 62.0% | 60.0% | +2.0 pt |
-| accumulator | 33.0% | 48.0% | 54.0% | +5.0 pt |
-| stable | 63.0% | 77.0% | 81.0% | +4.0 pt |
+| cooler | 36.0% | 75.0% | 76.0% | +11.0 pt |
+| valve | 54.0% | 59.0% | 54.0% | +2.0 pt |
+| pump_leak | 55.0% | 62.0% | 60.0% | +3.0 pt |
+| accumulator | 33.0% | 48.0% | 54.0% | +6.0 pt |
+| stable | 63.0% | 77.0% | 81.0% | +3.0 pt |
 
 Run while the decoder was still emitting a constant, this said the tokens carried `cooler`, `stable`
 and `accumulator` well clear of the control and `pump_leak` barely. The repaired decoder landed in
 exactly those places, and `pump_leak` is the axis that stays at majority in every cell. **At 100
-held-out examples the control sits at +1 to +9 points; at 10 it reached +40**, which is the whole
+held-out examples the control sits at +2 to +11 points; at 10 it reached +40**, which is the whole
 reason the probe is reported with one.
 
 RevIn normalises every channel of every cycle to zero mean and unit scale before patching, so
@@ -193,7 +194,7 @@ conditions. 30 one-second windows per recording spread across the whole of it, t
 | fault type | 5 | 20.0% | 33.3% | **67.8%** | **65.6%** |
 | torque | 3 | 33.3% | 33.3% | **51.3%** | not askable |
 | severity | 5 | 20.0% | 33.3% | **51.8%** | **52.9%** |
-| *permutation control* | | | | −1.1 / +2.9 / −2.0 pt | +0.2 / — / +0.2 pt |
+| *permutation control* | | | | −0.7 / +4.9 / +1.8 pt | +2.0 / — / +2.4 pt |
 
 The two columns are two different questions. *Within recording* holds out the last third of every
 recording, so train and test windows share a machine, a mounting and a day's noise floor — the
@@ -208,8 +209,14 @@ produce a number that looks like a failure and is a question that was never pose
 
 At 180 held-out windows the same run gave fault +24.5 with a control of +0.0, and torque +9.5
 against a control of **+7.2** — a positive-looking axis that is not one. At 450 the controls fall
-to ±3 and torque separates properly. That is the control being worth its cost twice: once by
-vetoing, once by clearing.
+to a few points and torque separates properly at +18. That is the control being worth its cost
+twice: once by vetoing, once by clearing.
+
+**Every control here is the worst of twenty permutations, and the round count belongs next to the
+figure.** Worst-of-N grows with N, which is the direction to err in. Five rounds on the hydraulic
+corpus gave +9.0 points on an axis where a different five gave +2.0 — a control that swings five
+points between draws is under-sampled, and under-sampling a control makes results look better than
+they are.
 
 **Two traps in this corpus, both silent.** The 2 Nm unbalance recordings are spelled
 `Unbalalnce` — left alone that is a sixth fault class containing exactly one torque, so "fault

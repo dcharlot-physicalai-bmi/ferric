@@ -306,7 +306,7 @@ fn main() {
         }
         let maj = majority(labels, &train, &held);
         let acc = nb_probe(&docs, labels, &train, &held);
-        let ctl = permutation_control(&docs, labels, &train, &held, 5, 0xC0FF_EE);
+        let ctl = permutation_control(&docs, labels, &train, &held, 20, 0xC0FF_EE);
         controls.push(ctl);
         let mark = if acc > maj + 1e-9 { "*" } else { " " };
         println!("  {name:<10} {n_cls:>8} {:>9.1}% {maj:>9.1}% {acc:>11.1}%{mark}", chance(labels));
@@ -321,7 +321,7 @@ fn main() {
         }
     }
     println!("\n  `control` is the same probe on the same tokens with the window-to-label assignment");
-    println!("  permuted, worst of five, each against its own majority. Read it before the probe:");
+    println!("  permuted, worst of twenty, each against its own majority. Read it before the probe:");
     println!("  an effect the size of its control is not an effect.");
     println!("\n  The tokenizer is UNTRAINED. RevIn normalises every channel of every window, so");
     println!("  absolute amplitude is gone by construction and what is read is shape.");
