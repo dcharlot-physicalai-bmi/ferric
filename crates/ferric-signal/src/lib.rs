@@ -44,10 +44,16 @@
 //! ## What is not
 //!
 //! **There are no published weights.** The towers run, are the right size, and train end to end
-//! through the bottleneck — 25.5 dB on synthetic physics in a single run — but nothing here has
-//! been trained on real sensor data, and nothing has been compared against a reference
-//! implementation's outputs, because no reference weights were located. Training the language half
-//! additionally needs sensor-text PAIRS, which is a data question rather than an engineering one.
+//! through the bottleneck — 25.5 dB on synthetic physics in a single run, 8.1 and 11.3 dB held out
+//! on a real multi-rate sensor corpus. Nothing here has been compared against a reference
+//! implementation's outputs, because no reference weights were located.
+//!
+//! **What is trained on real data, and what that showed.** `examples/hydraulic` trains the
+//! tokenizer and the language half on the UCI hydraulic corpus and reports held-out accuracy
+//! against a majority baseline and a label-permutation control. Four of five label axes clear the
+//! majority baseline and one does not. The first version of that experiment was a null caused by
+//! presenting a condition-ordered corpus in corpus order; the README records the ladder that
+//! isolated it, and every run now prints how many distinct words the decoder actually emitted.
 //!
 //! **Figures in this crate's documentation and examples are single runs unless a seed count is
 //! given.** Held-out accuracy at these sample sizes carries a standard deviation of roughly six
@@ -57,6 +63,10 @@
 //!
 //! Reconstruction quality is asserted nowhere in the test suite. A threshold over untrained
 //! weights would either be vacuous or would quietly become a quality claim.
+//!
+//! **A trainable embedding table goes through a materialized one-hot**, because `Var` has no row
+//! gather. It is correct and it allocates `t x rows` floats per step, which wants a native gather
+//! in anything deployed.
 
 pub mod cost;
 pub mod encoder;

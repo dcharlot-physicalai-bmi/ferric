@@ -37,6 +37,29 @@
 //! already encoded them, and the language model downstream inherits that. Transduction is still
 //! leakage when the number being reported is held-out accuracy.
 //!
+//! ## Presentation order is part of the protocol, not a detail
+//!
+//! The same fact that forces a strided sample — the corpus is stored in experimental-condition
+//! order — also makes walking it in index order the wrong way to train. An earlier version of this
+//! example did exactly that, and produced a clean null: one word emitted for every held-out cycle
+//! on three of five axes, sd 0.0 across seeds, every axis at its majority baseline. It was reported
+//! as evidence about the tokenizer. It was evidence about the loop.
+//!
+//! Holding corpus, split, tokenizer and examples-seen fixed and varying only presentation
+//! (400 cycles, 300 train, 2,000 examples, three seeds, held-out accuracy):
+//!
+//! ```text
+//!   protocol                    cooler     valve  pump_leak  accumulator    stable
+//!   majority                      36.0      54.0       55.0         33.0      63.0
+//!   batch 1, corpus order    37.0+-0.0 54.0+-0.0  55.0+-0.0    23.3+-6.9 72.0+-0.0
+//!   batch 1, shuffled        54.3+-6.1 66.7+-3.8  58.3+-1.7    37.3+-4.6 85.0+-1.6
+//!   batch 8, shuffled        84.7+-1.7 72.3+-4.1  57.0+-0.8    43.3+-3.4 85.3+-0.5
+//! ```
+//!
+//! `--sequential` reproduces the first row. The `said` column in every run's output counts the
+//! distinct words the decoder actually emitted, so a repeat of this failure announces itself
+//! instead of arriving as a plausible-looking accuracy column.
+//!
 //! ## What this example claims
 //!
 //! With `--tok-steps 0` (the default) the encoder is random, and the structure counts describe
@@ -341,6 +364,7 @@ fn train_seed(
     steps: usize,
     batch: usize,
     lm_cfg: EncoderConfig,
+    sequential: bool,
     seed: u64,
 ) -> SeedResult {
     let rows = seq.embedding_rows();
@@ -369,13 +393,22 @@ fn train_seed(
     // averages what the optimizer sees. At batch 1 the gradient from a single 600-token sequence
     // with a six-word target is noisy enough that the cheapest descent direction is the label
     // marginal, which is exactly the constant-output failure the `distinct` column below counts.
-    let mut order = shuffled(train_idx.len(), seed ^ 0x5EED);
+    // Presentation ORDER is a variable here, not a detail. This corpus is laid out by
+    // experimental condition, so walking it in index order feeds the decoder long runs of
+    // near-identical labels. `sequential` reproduces that walk so the two can be compared.
+    let mut order: Vec<usize> = if sequential {
+        (0..train_idx.len()).collect()
+    } else {
+        shuffled(train_idx.len(), seed ^ 0x5EED)
+    };
     let mut cursor = 0usize;
     for _ in 0..steps {
         let mut acc: Vec<Tensor> = Vec::new();
         for _ in 0..batch.max(1) {
             if cursor >= order.len() {
-                order = shuffled(train_idx.len(), seed ^ 0x5EED ^ cursor as u64);
+                if !sequential {
+                    order = shuffled(train_idx.len(), seed ^ 0x5EED ^ cursor as u64);
+                }
                 cursor = 0;
             }
             let i = train_idx[order[cursor]];
@@ -571,7 +604,23 @@ fn main() {
     // Stride, not prefix. See the module docs: a prefix is one experimental condition.
     let stride = (all_labels.len() / max_cycles.max(1)).max(1);
     let picked: Vec<usize> = (0..all_labels.len()).step_by(stride).take(max_cycles).collect();
-    let labels: Vec<Vec<i32>> = picked.iter().map(|&i| all_labels[i].clone()).collect();
+    let mut labels: Vec<Vec<i32>> = picked.iter().map(|&i| all_labels[i].clone()).collect();
+    // THE CONTROL RUN. Permuting which cycle carries which caption destroys the signal-to-label
+    // correspondence and leaves everything else — split, class balance, caption vocabulary, the
+    // correlations WITHIN a caption — exactly as it was. A cell that still scores above its
+    // majority under this is not reading the signal.
+    //
+    // It matters most for axes 1..4, which are scored with the earlier caption words teacher-
+    // forced. Those five axes are not independent in this rig's experimental design, so a decoder
+    // could in principle answer `stable` from `cooler` and never look at a sensor. Under
+    // permutation that shortcut survives and the signal does not, which is what makes the two
+    // separable at all.
+    if args.iter().any(|a| a == "--control") {
+        let order = shuffled(labels.len(), 0xBADC_0DE);
+        labels = order.iter().map(|&i| labels[i].clone()).collect();
+        println!("  CONTROL: cycle-to-caption assignment permuted");
+    }
+    let labels = labels;
     println!("\nUCI HYDRAULIC  {} of {} cycles, every {stride}th (ordered corpus: a prefix would be one condition)",
              labels.len(), all_labels.len());
 
@@ -775,6 +824,7 @@ fn main() {
     let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(600);
     let seeds: usize = flag(&args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(3);
     let batch: usize = flag(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(8);
+    let sequential = args.iter().any(|a| a == "--sequential");
     let lm_dim: usize = flag(&args, "--lm-dim").and_then(|v| v.parse().ok()).unwrap_or(64);
     let lm_layers: usize = flag(&args, "--lm-layers").and_then(|v| v.parse().ok()).unwrap_or(2);
     let lm_cfg = EncoderConfig {
@@ -790,7 +840,8 @@ fn main() {
              train_idx.len(), held_idx.len());
     println!("  {steps} optimizer steps x batch {batch} = {} examples seen, {seeds} seeds",
              steps * batch);
-    println!("  decoder: d_model {lm_dim}, {lm_layers} layers");
+    println!("  decoder: d_model {lm_dim}, {lm_layers} layers, examples presented {}",
+             if sequential { "in corpus order" } else { "shuffled" });
     println!("  captions are compositional: five axes scored separately");
 
     // Every (tokenizer, vocabulary) cell runs at the SAME seeds, so a difference between cells is
@@ -819,7 +870,7 @@ fn main() {
         println!("\n  cell: {name}  ({} embedding rows)", seq2.embedding_rows());
         let mut runs: Vec<SeedResult> = Vec::new();
         for s in 0..seeds {
-            let r = train_seed(&ctx, seq2, pc, &caps, &train_idx, &held_idx, steps, batch, lm_cfg, 3 + s as u64 * 17);
+            let r = train_seed(&ctx, seq2, pc, &caps, &train_idx, &held_idx, steps, batch, lm_cfg, sequential, 3 + s as u64 * 17);
             println!("    seed {}: {}", 3 + s * 17,
                      r.acc.iter().enumerate().map(|(a, v)| format!("{}={v:.0}%", LABELS[a])).collect::<Vec<_>>().join("  "));
             runs.push(r);
