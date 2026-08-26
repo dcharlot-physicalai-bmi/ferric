@@ -20,6 +20,8 @@
 //!
 //! - [`fsq`] — Finite Scalar Quantization. The discrete bottleneck, with round-trip and
 //!   bijection verified exhaustively over the entire code space rather than sampled.
+//! - [`bench`] — the instruments a labelled result has to be read through: a majority baseline, a
+//!   token probe with no capacity to speak, and a permutation control.
 //! - [`cost`] — exact operations and bytes per token, and why a per-token figure without its
 //!   window length is underspecified.
 //! - [`encoder`] — tower shape, exact parameter accounting against the published 9.5M, and the
@@ -72,6 +74,7 @@
 //! gather. It is correct and it allocates `t x rows` floats per step, which wants a native gather
 //! in anything deployed.
 
+pub mod bench;
 pub mod cost;
 pub mod encoder;
 pub mod fsq;
@@ -87,6 +90,7 @@ pub mod tower;
 pub mod train;
 pub mod vocab;
 
+pub use bench::{chance, majority, nb_probe, permutation_control, shuffled};
 pub use cost::{vocab_cost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};

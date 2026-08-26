@@ -46,10 +46,11 @@ open.
 | `store` | Save and load weights | Save/load must yield **identical tokens**; every truncation point refused |
 | `train` | Straight-through estimator | Gradient must behave as if rounding were the identity |
 | `language` | Mixed text/signal sequences, causal LM | Encode/decode inverses; a position cannot see its future |
+| `bench` | Majority baseline, token probe, permutation control | The control must collapse on features that certainly carry the label, and shrink as n grows |
 | `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |
 | `inflate` | DEFLATE/zlib decompression | Streams compressed elsewhere, including the dynamic-Huffman branch; the Adler-32 trailer is checked |
 
-**139 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
+**147 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
@@ -181,6 +182,42 @@ held-out tokens land there — gives 3,046 embedding rows against 32,788, and th
 
 **10.8x fewer rows, every axis within a seed's spread.** The output head is what scales with
 vocabulary, so this is the traffic argument below, measured on real data rather than derived.
+
+**A second real corpus: rotating machinery, and a fault type that survives an unseen operating
+point.** 45 recordings, four accelerometers at 25.6 kHz, a perfectly balanced 3 torques x 15
+conditions. 30 one-second windows per recording spread across the whole of it, tokenized by an
+**untrained** encoder, read by the same naive-Bayes probe. 1,350 windows, 450 held out.
+
+| axis | classes | chance | majority | within recording | across recording |
+|---|---|---|---|---|---|
+| fault type | 5 | 20.0% | 33.3% | **67.8%** | **65.6%** |
+| torque | 3 | 33.3% | 33.3% | **51.3%** | not askable |
+| severity | 5 | 20.0% | 33.3% | **51.8%** | **52.9%** |
+| *permutation control* | | | | −1.1 / +2.9 / −2.0 pt | +0.2 / — / +0.2 pt |
+
+The two columns are two different questions. *Within recording* holds out the last third of every
+recording, so train and test windows share a machine, a mounting and a day's noise floor — the
+protocol most of this literature uses, and it flatters. *Across recording* holds out every 4 Nm
+recording: nothing about a held-out recording was seen, and **training contains no 4 Nm at all**.
+
+**Fault type costs 2.2 points to move between them.** A random projection through a discrete
+bottleneck separates five fault types at twice the majority baseline on machines and at an
+operating point it was never trained on. The torque axis is reported as *not askable* under that
+split rather than scored, because its held-out class is absent from training — scoring it would
+produce a number that looks like a failure and is a question that was never posed.
+
+At 180 held-out windows the same run gave fault +24.5 with a control of +0.0, and torque +9.5
+against a control of **+7.2** — a positive-looking axis that is not one. At 450 the controls fall
+to ±3 and torque separates properly. That is the control being worth its cost twice: once by
+vetoing, once by clearing.
+
+**Two traps in this corpus, both silent.** The 2 Nm unbalance recordings are spelled
+`Unbalalnce` — left alone that is a sixth fault class containing exactly one torque, so "fault
+type" and "torque" become partly the same question. And recordings are not the same length: 60 s
+for the bearing faults, 120 s for misalignment and unbalance, 300 s for normal. Taking every
+non-overlapping window would hand `Normal` five times the examples of `BPFI` and make the class
+balance an artifact of recording length; a fixed number of windows per recording keeps the design
+balanced. Both are handled, and the normalisation count is printed.
 
 **Reading the corpora at all: a MATLAB v5 reader, checked against another implementation.** Three
 of the four public sensor corpora this crate was pointed at ship as `.mat`, and none could be
