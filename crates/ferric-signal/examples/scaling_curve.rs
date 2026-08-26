@@ -24,7 +24,7 @@
 //! - Train variants are `0..N` per kind; held-out variants are `100..104` per kind. `N` is
 //!   required to stay at or below 100 so the index ranges cannot overlap.
 //! - The tokenizer (encoder + FSQ) is UNTRAINED and FIXED across every run, seed 7. The language
-//!   half is what trains; the embedding table is frozen throughout.
+//!   half is what trains; the embedding table is frozen unless `--train-embeddings` is passed.
 //! - Compute per step is constant: every step accumulates gradients over a 5-example batch. The
 //!   training set is laid out variant-major, so every batch of 5 contains one example of EACH
 //!   kind at every corpus size — class composition does not vary with N. What a bigger corpus
@@ -241,10 +241,8 @@ fn main() {
     println!("\nSCALING  {} variants/kind = {} examples, {} steps, batch {} (one of each kind per batch){}",
              variants, train.len(), steps, BATCH,
              if control { "  [CONTROL: random labels]" } else { "" });
-    if train_embed {
-        println!("  embedding table UNFROZEN: {} rows train with the LM", rows);
-    }
-    println!("  tokenizer fixed and untrained; embedding frozen; LM trains");
+    println!("  tokenizer fixed and untrained; LM trains; embedding table {}",
+             if train_embed { "UNFROZEN and training" } else { "frozen" });
     println!("  codebook: {} levels/dim = {} codes; embedding table {} rows",
              fsq_levels, q.codebook_size(), rows);
     println!("  distinct signal codes in the training set: {}", train_codes.len());
@@ -365,5 +363,6 @@ fn main() {
     println!("  and counted above; the control tests eval-side contamination and memorisation");
     println!("  capacity, not the split. Held-out n={} gives ~{:.0}% granularity per example.",
              h.scored, if h.scored > 0 { 100.0 / h.scored as f64 } else { f64::NAN });
-    println!("  The tokenizer is untrained and the embedding frozen: this measures the LM half only.\n");
+    println!("  The tokenizer is untrained{}: this measures the LM half only.\n",
+             if train_embed { " and the embedding table trained" } else { " and the embedding frozen" });
 }

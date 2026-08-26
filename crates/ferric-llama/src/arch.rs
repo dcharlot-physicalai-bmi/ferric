@@ -117,10 +117,10 @@ pub const REGISTRY: &[Arch] = &[
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
-                  at cosine 0.999999 (F16) and 0.999996 (Q4_K_M) over 3-to-39-token inputs. EMBEDS ONLY — \
-                  generation is refused, there is no head to generate from. ⚠ VERIFIED FOR BERT ONLY: \
-                  XLM-RoBERTa checkpoints (bge-reranker-v2-m3) diverge at cosine 0.9615 for reasons \
-                  not yet found — see the bert module header for what has been ruled out" },
+                  at cosine 0.999999 (F16) and 0.999996 (Q4_K_M), AND XLM-RoBERTa (bge-reranker-v2-m3, 24L \
+                  d=1024 Q4_K_M) at 0.999995-1.000000, over 3-to-39-token inputs. Cross-encoder \
+                  scoring matches the reference to 0.24%. EMBEDS AND SCORES — generation is refused, \
+                  there is no LM head to generate from" },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
@@ -334,8 +334,14 @@ mod tests {
         // refusal itself lives two crates away in ferric-web.
         let bert = REGISTRY.iter().find(|a| a.name == "bert").expect("bert row");
         assert_eq!(bert.runtime, Runtime::Bert);
-        assert!(bert.note.contains("EMBEDS ONLY"),
-                "the encoder row must say it cannot generate; note reads: {}", bert.note);
+        // Assert the PROPERTY, not one phrasing. The first version matched the literal "EMBEDS ONLY"
+        // and went red when the note was corrected to "EMBEDS AND SCORES" — a real change in what the
+        // runtime does (it gained cross-encoder scoring) that left the no-generation contract intact.
+        // A test pinned to wording fails on edits and passes on substance, which is backwards.
+        assert!(bert.note.contains("generation is refused"),
+                "the encoder row must state that generation is refused; note reads: {}", bert.note);
+        assert!(!bert.note.contains("VERIFIED FOR BERT ONLY"),
+                "the XLM-R qualifier was retracted once the divergence turned out to be a test bug");
     }
 
     #[test]

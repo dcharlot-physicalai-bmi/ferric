@@ -15,46 +15,39 @@
 //! | norm | pre-RMSNorm | **post-LayerNorm, with bias** |
 //! | FFN | gated SwiGLU | **plain GELU** |
 //!
-//! ## ⚠ VERIFIED FOR BERT, **NOT** FOR XLM-ROBERTA
-//!
-//! Reference-diffed against `llama-embedding`:
+//! ## Verified against llama.cpp
 //!
 //! | checkpoint | arch | quant | cosine |
 //! |---|---|---|---|
 //! | bge-small-en-v1.5 | BERT, 12L d=384 | F16 | **0.999999–1.000000** |
 //! | bge-small-en-v1.5 | BERT, 12L d=384 | Q4_K_M | **0.999996** |
-//! | bge-reranker-v2-m3 | XLM-R, 24L d=1024 | Q4_K_M | **0.9615** ❌ |
+//! | bge-reranker-v2-m3 | XLM-R, 24L d=1024 | Q4_K_M | **0.999995–1.000000** |
 //!
-//! The XLM-R gap is an OPEN BUG. What it is not, each ruled out by measurement rather than argument:
+//! Cross-encoder scoring matches too: 6.585 against the reference's 6.570 on a relevant pair, −8.366
+//! against −8.361 on an irrelevant one.
 //!
-//! * **not quantisation** — Q4_K_M bge-small is 0.999996, same code path, so the Q4_K matmul agrees
-//!   with llama.cpp. (This also clears every Q4_K result elsewhere in the project.)
-//! * **not tokenisation** — Ferric's ids are identical to `llama-tokenize` on both halves of a pair.
-//! * **not the classification head** — the plain EMBEDDING path diverges by the same amount.
-//! * **not accumulation over depth or length** — it is 0.926 at FOUR tokens and 0.961 at fourteen,
-//!   so it is present from the first block rather than compounding.
-//! * **not the LayerNorm epsilon** — declared 1e-5 here against bge-small's 1e-12, and read correctly.
-//! * **not primarily the position offset** — sweeping 0..3 moves it 0.9615 → 0.9762, never near 0.999.
-//! * **not the GELU variant** — ggml uses the tanh approximation and this now does too, worth 0.0004
-//!   (0.972166 erf → 0.972585 tanh). A real correctness fix, not the bug.
-//! * **not the pooler** — `--pooling cls` returns the RAW CLS state, confirmed by comparing against
-//!   `tanh(dense(CLS))` instead: cosine 0.032, near-orthogonal. The two are very different vectors,
-//!   so this rules the question out rather than leaving it ambiguous.
-//! * **not the token-type embedding** — non-zero here (max |v| 0.205) and added by both.
+//! ## ⛔ The "XLM-R divergence" was a bug in the TEST, and it cost nine hypotheses
 //!
-//! Best achieved: **0.9726** (offset 2, tanh GELU). The remaining gap is roughly 0.027 of cosine and
-//! no single-parameter hypothesis accounts for it.
+//! For several hours this file carried a note describing a 0.9615 encoder divergence on XLM-R as an
+//! open bug, with quantisation, the pooler, GELU, token types, the LayerNorm epsilon and the position
+//! offset each eliminated by measurement. Every one of those eliminations was correct and none of
+//! them was the cause, because the cause was not in the model at all: `bert_reference` built a
+//! **WordPiece** tokenizer unconditionally, which is right for `tokenizer.ggml.model == "bert"` and
+//! wrong for XLM-R's `"t5"`. It fed the encoder four tokens for "Paris" where llama.cpp's graph uses
+//! three. A harness that tokenises differently from the reference is not comparing the model.
 //!
-//! **The right next instrument is `llama-eval-callback`**, which dumps every tensor in llama.cpp's
-//! graph. Comparing per-LAYER hidden states finds the first block where the two diverge, which is a
-//! bounded search; comparing whole-model outputs and guessing at parameters is not, and four wrong
-//! turns here are the evidence for that.
+//! Two things follow, and they are worth more than the fix:
 //!
-//! So it is structural and specific to this checkpoint family, in the embedding construction or an
-//! early block. The reranker head itself is implemented (`score`) and DISCRIMINATES correctly —
-//! +6 relevant, −9 irrelevant, same ordering as llama.cpp — but the logits differ, so `/v1/rerank`
-//! is deliberately NOT built on it yet. Ordering being right is exactly what would make a rank
-//! benchmark pass while the model is wrong.
+//! 1. **Verification does not transfer between files.** `rerank_reference` used SPM and its ids were
+//!    confirmed identical to `llama-tokenize`; that confirmation was silently carried over to a
+//!    sibling example written an hour earlier with a different tokenizer hardcoded.
+//! 2. **Per-op tracing found it on the first run, and end-to-end comparison never could.** The final
+//!    cosine is one scalar every stage feeds, so it can be nudged by tuning any of them — an offset
+//!    of 2 scored a BETTER cosine (0.9726) than the correct 0 (0.9615) while being wrong. The trace
+//!    prints token COUNT and per-tensor sums, and "4 tokens vs 3" is unambiguous.
+//!
+//! `FERRIC_BERT_TRACE=1` emits a sum per checkpoint tensor for diffing against `llama-eval-callback`,
+//! whose own dump gives 512 reference sums for a three-token input. Start there for the next port.
 //!
 //! `bert.attention.causal = false` is read rather than assumed, because an encoder run with a causal
 //! mask does not fail — it returns embeddings where every token saw only its left context, which is
@@ -109,11 +102,18 @@ impl Cfg {
             causal,
             // Inferred from the padding id, which is what the convention is actually keyed on:
             // RoBERTa sets pad=1 and starts positions at 2; BERT sets pad=0 and starts at 0.
+            // ZERO. llama.cpp indexes `position_embd` with raw positions for every BERT-family
+            // checkpoint, RoBERTa included — settled against the reference rather than reasoned from
+            // the RoBERTa papers: `llama-eval-callback` reports the position-embedding sum for three
+            // tokens as -37.445366, and rows 0..2 of this file's table sum to -37.445358, while rows
+            // 2..4 give -20.41. The `padding_idx + 1` convention lives in the HF modelling code, not
+            // in the converted table.
+            //
+            // ⚠ An offset of 2 scored a BETTER cosine (0.9726 vs 0.9615) while being WRONG. Tuning a
+            // parameter toward a better whole-model number, with another defect still present, moves
+            // it away from the reference. Only a per-op comparison can say which value is correct.
             pos_offset: std::env::var("FERRIC_BERT_POS_OFFSET").ok().and_then(|v| v.parse().ok())
-                .unwrap_or(match md.get("tokenizer.ggml.padding_token_id") {
-                    Some(Meta::U(v)) if *v > 0 => *v as usize + 1,
-                    _ => 0,
-                }),
+                .unwrap_or(0),
         })
     }
 }
@@ -153,6 +153,17 @@ fn t2(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, Str
     let (a, b) = (i.dims[0] as usize, *i.dims.get(1).unwrap_or(&1) as usize);
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[b, a]))
 }
+/// Summary statistics for a trace line. Mean and max|v| localise a divergence without dumping
+/// megabytes: a wrong op moves them immediately, a correct one keeps them equal to several digits.
+fn stats(v: &[f32]) -> String {
+    let n = v.len().max(1) as f32;
+    let sum: f32 = v.iter().sum();
+    let mean = sum / n;
+    let absmean = v.iter().map(|x| x.abs()).sum::<f32>() / n;
+    let mx = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    format!("sum {sum:+.6}  mean {mean:+.6}  mean|v| {absmean:.6}  max|v| {mx:.6}")
+}
+
 fn t1(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, String> {
     let i = g.tensor(name).ok_or_else(|| format!("no {name}"))?;
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[1, i.dims[0] as usize]))
@@ -196,6 +207,13 @@ impl Bert {
 
     /// One bidirectional forward over the whole sequence. Returns `[t, d]` hidden states.
     pub fn forward(&self, ids: &[u32]) -> Result<Tensor, String> {
+        self.forward_traced(ids).map(|(h, _)| h)
+    }
+
+    /// `forward`, plus a checkpoint tensor after each named op, for diffing against
+    /// `llama-eval-callback`. Tensors are Arc-backed so collecting them is a handle copy, and the
+    /// caller reads them asynchronously — which is why this returns them instead of printing.
+    pub fn forward_traced(&self, ids: &[u32]) -> Result<(Tensor, Vec<(String, Tensor)>), String> {
         let (d, t) = (self.cfg.d, ids.len());
         if t + self.cfg.pos_offset > self.pos_embd.len() / d {
             return Err(format!("{t} tokens exceeds this encoder's {} position embeddings; BERT has \
@@ -212,12 +230,23 @@ impl Bert {
                 e[ps + j] = self.tok_embd[tk + j] + self.pos_embd[pe + j] + self.typ_embd[j];
             }
         }
+        let mut tr: Vec<(String, Tensor)> = Vec::new();
+        if std::env::var("FERRIC_BERT_TRACE").ok().as_deref() == Some("1") {
+            // Host-side already, so no GPU read is needed and it prints directly. This is the tensor
+            // llama.cpp calls `inp_embd`: token + type + position, before the embedding LayerNorm.
+            eprintln!("TRACE inp_embd          {}", stats(&e));
+        }
         let mut h = Tensor::from_vec(&self.ctx, &e, &[t, d])
             .layernorm(&self.embd_norm_w, &self.embd_norm_b, self.cfg.eps);
 
+        // Per-tensor trace, to be diffed against `llama-eval-callback`. Comparing whole-model
+        // outputs and guessing at parameters is an unbounded search — four wrong turns' worth of
+        // evidence for that. The first layer whose stats disagree localises the bug to one op.
+        let trace = std::env::var("FERRIC_BERT_TRACE").ok().as_deref() == Some("1");
+        if trace { tr.push(("inp_norm".into(), h.clone())); }
         let (nh, dh) = (self.cfg.n_head, d / self.cfg.n_head);
         let scale = 1.0 / (dh as f32).sqrt();
-        for b in &self.blocks {
+        for (_il, b) in self.blocks.iter().enumerate() {
             let q = h.matmul_bt(&b.q).add(&b.qb);
             let k = h.matmul_bt(&b.k).add(&b.kb);
             let v = h.matmul_bt(&b.v).add(&b.vb);
@@ -242,6 +271,7 @@ impl Bert {
             let attn = cat.reshape(&[t, d]).matmul_bt(&b.o).add(&b.ob);
             // POST-norm: normalise the residual sum, not the input to the sublayer.
             h = h.add(&attn).layernorm(&b.attn_norm_w, &b.attn_norm_b, self.cfg.eps);
+            if trace { tr.push((format!("l{_il}.attn_out_norm"), h.clone())); }
             // ggml's `ggml_gelu` is the TANH approximation, not the exact erf form, and llama.cpp's
             // BERT graph uses LLM_FFN_GELU which maps to it. Selectable while this is being pinned
             // down; the default follows ggml.
@@ -253,8 +283,9 @@ impl Bert {
             };
             let ff = act.matmul_bt(&b.down).add(&b.downb);
             h = h.add(&ff).layernorm(&b.out_norm_w, &b.out_norm_b, self.cfg.eps);
+            if trace { tr.push((format!("l{_il}.layer_out_norm"), h.clone())); }
         }
-        Ok(h)
+        Ok((h, tr))
     }
 
     /// Whether this checkpoint carries a reranker head.

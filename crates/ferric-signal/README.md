@@ -137,9 +137,12 @@ what it checks and what it cannot.
 generator wrote. Nothing has been compared against a reference implementation's outputs, because no
 reference weights were located.
 
-**The embedding table is frozen** during language training, because the autograd layer has no row
-gather. A frozen embedding cannot learn that two signal codes mean similar things, which caps what a
-small corpus can teach.
+**The embedding table trains through a materialized one-hot**, not a native row gather, because the
+autograd layer has none. A one-hot `[t, rows]` times the table is gather in the forward pass and
+matmul's existing backward is the scatter-add — correct, but it allocates `t x rows` floats per
+step, which is tens of megabytes at these sizes and would want a real gather in a deployment. The
+cost of NOT training the table was measured on synthetic pairs at 60% against 38% held-out;
+`examples/scaling_curve.rs --train-embeddings` is the switch.
 
 **Energy is not measured unless a meter exists.** `cargo run --example token_cost` reports the exact
 operation count always, and prints `NOT MEASURED` when no hardware counter is readable rather than

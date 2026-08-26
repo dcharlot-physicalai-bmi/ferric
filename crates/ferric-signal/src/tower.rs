@@ -233,9 +233,10 @@ impl EncoderWeights {
 /// The decoder tower: latents back to patches.
 ///
 /// Mirrors [`EncoderWeights`] exactly except at the two ends — it takes the quantizer's latent
-/// width in and emits a patch out, where the encoder does the reverse. That asymmetry is why
-/// `EncoderConfig::params` cannot simply be doubled to size an autoencoder, and why the sizing
-/// test in `encoder.rs` swaps those two terms explicitly rather than assuming symmetry.
+/// width in and emits a patch out, where the encoder does the reverse. The two end matrices are
+/// therefore the encoder's two, transposed, so the tower **totals are identical** and doubling
+/// [`EncoderConfig::params`] is the right way to size an autoencoder. See
+/// [`EncoderConfig::decoder_params`] for why the opposite reading is the intuitive one and wrong.
 pub struct DecoderWeights {
     pub cfg: EncoderConfig,
     /// `[d_model, latent_dim]`.

@@ -23,17 +23,47 @@ async fn run() {
         _ => panic!("no tokens"),
     };
     let u = |k: &str, d: u32| match g.metadata.get(k) { Some(Meta::U(v)) => *v as u32, _ => d };
-    let wp = WordPiece::new(toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect::<HashMap<_, _>>(),
-                            u("tokenizer.ggml.cls_token_id", 101),
-                            u("tokenizer.ggml.seperator_token_id", 102),
-                            u("tokenizer.ggml.unknown_token_id", 100));
-    let ids = wp.encode(text);
+    // ROUTE ON `tokenizer.ggml.model`. This example built a WordPiece unconditionally, which is right
+    // for bge-small ("bert") and WRONG for every XLM-R checkpoint ("t5", SentencePiece/Unigram) — and
+    // that alone produced the 0.9615 "encoder divergence" chased through nine hypotheses. It gave four
+    // tokens for "Paris" where llama.cpp's graph dump says three. A harness that tokenises differently
+    // from the reference is not comparing the model at all.
+    let model_kind = match g.metadata.get("tokenizer.ggml.model") {
+        Some(Meta::Str(s)) => s.clone(), _ => "bert".into(),
+    };
+    let ids: Vec<u32> = if model_kind == "bert" {
+        let wp = WordPiece::new(toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect::<HashMap<_, _>>(),
+                                u("tokenizer.ggml.cls_token_id", 101),
+                                u("tokenizer.ggml.seperator_token_id", 102),
+                                u("tokenizer.ggml.unknown_token_id", 100));
+        wp.encode(text)
+    } else {
+        let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {
+            Some(Meta::Arr(v)) => v.iter().map(|x| if let Meta::F(f) = x { *f as f32 } else { 0.0 }).collect(),
+            _ => Vec::new(),
+        };
+        let spm = ferric_tokenizer::Spm::new(toks.clone(), scores);
+        let mut v = vec![u("tokenizer.ggml.bos_token_id", 0)];
+        v.extend(spm.encode_piece(text, true));
+        v.push(u("tokenizer.ggml.eos_token_id", 2));
+        v
+    };
+    println!("  tokenizer: {model_kind}");
     let m = Bert::load(&ctx, &g).expect("load bert");
     println!("bert {} layers · d={} · heads={} · pooling={} · causal={}",
              m.cfg.n_layer, m.cfg.d, m.cfg.n_head, m.cfg.pooling, m.cfg.causal);
     println!("  {} tokens", ids.len());
 
-    let h = m.forward(&ids).expect("forward").to_vec().await;
+    // FERRIC_BERT_TRACE=1 prints a sum per checkpoint tensor, to be diffed against the sums
+    // `llama-eval-callback` prints for the same ops. The FIRST disagreement names the op — which is a
+    // bounded search, unlike comparing the final vector and guessing at parameters.
+    let (hs, tr) = m.forward_traced(&ids).expect("forward");
+    for (name, t) in &tr {
+        let v = t.to_vec().await;
+        let sum: f32 = v.iter().sum();
+        eprintln!("TRACE {name:<20} sum {sum:+.6}");
+    }
+    let h = hs.to_vec().await;
     let (t, d) = (ids.len(), m.cfg.d);
     // Pool where the checkpoint says: 2 = CLS (index 0), 1 = MEAN over tokens.
     // FERRIC_BERT_POOLER=1 applies BERT's pooler — tanh(dense(CLS)) — instead of returning the raw
