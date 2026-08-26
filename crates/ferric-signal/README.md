@@ -46,8 +46,9 @@ open.
 | `store` | Save and load weights | Save/load must yield **identical tokens**; every truncation point refused |
 | `train` | Straight-through estimator | Gradient must behave as if rounding were the identity |
 | `language` | Mixed text/signal sequences, causal LM | Encode/decode inverses; a position cannot see its future |
+| `mat` | MATLAB v5 reader, the format sensor corpora ship in | **518 CWRU channels and 61 rotating channels agree with `scipy.io` exactly**; every truncation point refused |
 
-**107 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
+**123 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
@@ -180,6 +181,28 @@ held-out tokens land there — gives 3,046 embedding rows against 32,788, and th
 **10.8x fewer rows, every axis within a seed's spread.** The output head is what scales with
 vocabulary, so this is the traffic argument below, measured on real data rather than derived.
 
+**Reading the corpora at all: a MATLAB v5 reader, checked against another implementation.** Three
+of the four public sensor corpora this crate was pointed at ship as `.mat`, and none could be opened.
+`mat` reads them: both byte orders, both tag forms, numeric and char and struct and cell including
+nesting.
+
+| corpus | files | series | agreement with `scipy.io` |
+|---|---|---|---|
+| CWRU bearings | 161 | 518 | **518 / 518**, length, first, last and full sum |
+| Rotating machinery (vibration) | 1 sampled | 61 | **61 / 61**, same fields |
+
+Agreement is checked against a table written by a different implementation — a parser validated
+only against its own output agrees with its own bugs. `--check` compares length, first sample, last
+sample and the sum of every series, and exits non-zero on any disagreement.
+
+Two things fell out of doing it this way. **The reader refuses exactly the 15 CWRU files `scipy`
+refuses**, all truncated downloads, and names the byte where each ran short — a half-file
+tokenizes perfectly well and would otherwise have been scored as data. And `channels()` first
+required a series to have at most one dimension above 1, which is right for `[N, 1]` and wrong for
+every multi-channel recording: on the rotating corpus that returned 57 metadata scalars and **none
+of its 6.1M samples**, parsed successfully and empty. MATLAB is column-major, so surfacing each
+column as its own channel costs nothing but the decision to do it.
+
 **The energy accounting is arithmetic, not measurement.** A decoder touches its vocabulary twice per
 position — one row on the way in, every row at the output head on the way out — so the head is what
 grows with codebook size:
@@ -216,8 +239,12 @@ redistributed here. Nothing has been compared against a reference implementation
 no reference weights were located.
 
 **One corpus is not a claim about sensors in general.** Everything measured on real data comes from
-a single hydraulic test rig, five label axes, one split. Three of the four downloaded corpora are
-Matlab v5 `.mat` files this crate cannot yet read, which is the next piece of engineering.
+a single hydraulic test rig, five label axes, one split. The other corpora now open (see below) but
+nothing has been trained on them.
+
+**`mat` does not inflate.** The wind-turbine corpus compresses every element with zlib, and the
+reader refuses it by name rather than returning an empty file. That is a missing feature with a
+known shape, not a parsing limit.
 
 **The embedding table trains through a materialized one-hot**, not a native row gather, because the
 autograd layer has none. A one-hot `[t, rows]` times the table is gather in the forward pass and

@@ -26,6 +26,8 @@
 //!   parameter-free positional encoding.
 //! - [`language`] — mixed text/signal sequences: the piece that makes this sensor-LANGUAGE
 //!   rather than a sensor codec.
+//! - [`mat`] — a strict MATLAB v5 reader, because three of the four public sensor corpora this
+//!   crate was pointed at ship as `.mat` and none of them could be opened at all.
 //! - [`patch`] — the signal front end: patching, and reversible per-channel normalization whose
 //!   inverse is checked directly rather than against a reference model.
 //! - [`tower`] — encoder and decoder forward passes, each on both the `Tensor` and `Var`
@@ -72,6 +74,7 @@ pub mod cost;
 pub mod encoder;
 pub mod fsq;
 pub mod language;
+pub mod mat;
 pub mod patch;
 pub mod receipt;
 pub mod sha256;
@@ -85,6 +88,7 @@ pub use cost::{vocab_cost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};
 pub use receipt::{agree, agreement, Agreement, TokenReceipt, TokenSpec};
+pub use mat::{MatClass, MatError, MatFile, MatValue};
 pub use language::{cross_entropy, embed_var, lm_forward_var, Example, SensorLm, Sequencer, Span, Task};
 pub use patch::{PatchError, Patcher, RevIn};
 pub use tower::{decoder_forward_var, forward_var, Block, DecoderWeights, EncoderWeights};
