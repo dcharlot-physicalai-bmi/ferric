@@ -123,16 +123,17 @@ pub const REGISTRY: &[Arch] = &[
                   reference: from 'The capital of France is' it generates ' Paris.', matching \
                   llama.cpp. Embedding sum is exact and block 0 agrees to 0.10%. ⚠ NOT Verified. Greedy decoding matches the \
                   reference on the confident tokens and DIVERGES once the distribution flattens: \
-                  both emit ' Paris.', then llama.cpp continues '  \\n\\nLet' and this emits '\\"] \
-                  output:'. After a finished sentence the next token is a near-tie, so a small \
-                  numerical difference flips the argmax — consistent with a correct port plus Q4_K \
-                  kernel differences, and equally consistent with a subtle defect. What would settle \
-                  it is comparing top-k logits at the first divergent position: if this runtime's \
-                  pick sits inside the reference's top few, it is numerics; if it is absent, it is a \
-                  bug. Per-block sums are NOT the test — their error tracks the cancellation ratio \
-                  |sum|/max|v| (5.18 -> 0.10%, 0.14 -> 13.85%), so they localise a gross defect and \
-                  cannot grade fidelity. Also NO incremental state: every decode step re-runs the \
-                  whole prefix, O(T^2), which is what an SSM exists to avoid" },
+                  both emit ' Paris.', then the reference continues with whitespace and 'Let' while \
+                  this emits a quote and 'output:'. After a finished sentence the next token is a \
+                  near-tie, so a small numerical difference flips the argmax — consistent with a \
+                  correct port plus Q4_K kernel differences, and equally consistent with a subtle \
+                  defect. What would settle it is top-k logits at the first divergent position: if \
+                  this runtime's pick sits inside the reference's top few it is numerics, if it is \
+                  absent it is a bug. Per-block sums are NOT the test — their error tracks the \
+                  cancellation ratio |sum|/max|v| (5.18 gives 0.10%, 0.14 gives 13.85%), so they \
+                  localise a gross defect and cannot grade fidelity. Also NO incremental state: \
+                  every decode step re-runs the whole prefix, O(T^2), which is what an SSM exists \
+                  to avoid" },
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
