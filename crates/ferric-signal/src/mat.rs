@@ -21,7 +21,9 @@
 //! - `mxSTRUCT` and `mxCELL`, including nesting
 //! - both tag forms, and both byte orders
 //!
-//! And explicitly NOT `miCOMPRESSED`, `mxSPARSE`, `mxOBJECT`, or complex arrays. Each is refused
+//! - `miCOMPRESSED`, through [`crate::inflate`]
+//!
+//! And explicitly NOT `mxSPARSE`, `mxOBJECT`, or complex arrays. Each is refused
 //! by name in [`MatError`]. **A reader that returns an empty variable list for a file it cannot
 //! parse is worse than one that fails**, because the caller sees a corpus with nothing in it and
 //! has no way to tell that from a corpus that was not read.
@@ -98,7 +100,8 @@ impl MatClass {
             1 => "mxCELL", 2 => "mxSTRUCT", 3 => "mxOBJECT", 4 => "mxCHAR", 5 => "mxSPARSE",
             6 => "mxDOUBLE", 7 => "mxSINGLE", 8 => "mxINT8", 9 => "mxUINT8", 10 => "mxINT16",
             11 => "mxUINT16", 12 => "mxINT32", 13 => "mxUINT32", 14 => "mxINT64",
-            15 => "mxUINT64", _ => "unknown",
+            15 => "mxUINT64", 16 => "mxFUNCTION", 17 => "mxOPAQUE", 18 => "mxOBJECT",
+            _ => "unknown",
         }
     }
 }
@@ -113,8 +116,13 @@ pub enum MatError {
     BadEndianMark { got: [u8; 2] },
     /// An element claims more bytes than the file has left.
     Truncated { at: usize, want: usize, have: usize },
-    /// `miCOMPRESSED`. Named separately because it is a missing FEATURE, not a broken file.
-    Compressed { at: usize },
+    /// A `miCOMPRESSED` element whose zlib stream would not inflate. Named separately from a
+    /// parse failure because the two have different causes: a bad stream is a damaged download,
+    /// a parse failure after a good stream is this reader's problem.
+    Inflate { at: usize, why: crate::InflateError },
+    /// A `miCOMPRESSED` element somewhere the format does not put one — nested inside a struct or
+    /// cell, where only `miMATRIX` is legal.
+    NestedCompressed { at: usize },
     /// A data type this reader does not decode.
     UnsupportedDataType { at: usize, code: u32 },
     /// An array class this reader does not decode, named.
@@ -137,10 +145,12 @@ impl std::fmt::Display for MatError {
             Self::Truncated { at, want, have } => {
                 write!(f, "truncated at byte {at}: element wants {want} bytes, {have} remain")
             }
-            Self::Compressed { at } => write!(
-                f,
-                "element at byte {at} is miCOMPRESSED (zlib); this reader has no inflate"
-            ),
+            Self::Inflate { at, why } => {
+                write!(f, "compressed element at byte {at} would not inflate: {why}")
+            }
+            Self::NestedCompressed { at } => {
+                write!(f, "miCOMPRESSED element at byte {at}, where only miMATRIX is legal")
+            }
             Self::UnsupportedDataType { at, code } => {
                 write!(f, "unsupported MAT data type {code} at byte {at}")
             }
@@ -209,11 +219,33 @@ impl MatValue {
     }
 }
 
-/// A parsed MAT-file: its header text and its variables in file order.
+/// The name MATLAB's unnamed function-workspace element is given, matching what other readers
+/// call it. MATLAB identifiers cannot begin with an underscore, so this cannot collide with a
+/// variable somebody stored.
+pub const WORKSPACE: &str = "__function_workspace__";
+
+/// A top-level variable this reader could not decode, and why.
+///
+/// Recorded rather than dropped. A file that ends with a `datetime` this reader does not
+/// understand still has its channels in it, and failing the whole file would throw away 88 MB of
+/// accelerometer to avoid a timestamp — but a reader that silently returns fewer variables than
+/// the file contains is the same "successfully parsed and empty" failure in a smaller costume.
+/// So: skip, and say what was skipped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skipped {
+    /// Byte offset of the element in the file.
+    pub at: usize,
+    pub why: MatError,
+}
+
+/// A parsed MAT-file: its header text, its variables in file order, and anything it had to skip.
 #[derive(Debug, Clone)]
 pub struct MatFile {
     pub header: String,
     pub vars: Vec<(String, MatValue)>,
+    /// Top-level variables that could not be decoded. **Check this before treating an empty or
+    /// short variable list as the file's contents.**
+    pub skipped: Vec<Skipped>,
 }
 
 impl MatFile {
@@ -236,6 +268,7 @@ impl MatFile {
         };
 
         let mut vars = Vec::new();
+        let mut skipped: Vec<Skipped> = Vec::new();
         let mut off = 128;
         while off < bytes.len() {
             // Trailing padding shorter than a tag is not an element; stop rather than error.
@@ -243,17 +276,54 @@ impl MatFile {
                 break;
             }
             let tag = read_tag(bytes, off, le)?;
-            match tag.dtype {
-                dt::MATRIX => {
-                    let (name, value) = parse_matrix(&bytes[tag.data..tag.data + tag.nbytes], le)?;
-                    vars.push((name, value));
+            // A top-level element carries its own length, so one this reader cannot decode can be
+            // stepped over EXACTLY rather than guessed past. That is the only reason skipping is
+            // safe here and is not offered for nested elements: a failure inside a struct leaves
+            // the field list compromised, so it fails the whole variable, which is then recorded
+            // here as skipped.
+            let decoded = match tag.dtype {
+                dt::MATRIX => parse_matrix(&bytes[tag.data..tag.data + tag.nbytes], le),
+                // A compressed element inflates to ONE complete element — tag included — not to
+                // a file, so it is unwrapped here rather than handed back to `parse`.
+                dt::COMPRESSED => crate::inflate_zlib(&bytes[tag.data..tag.data + tag.nbytes])
+                    .map_err(|why| MatError::Inflate { at: off, why })
+                    .and_then(|raw| {
+                        let inner = read_tag(&raw, 0, le)?;
+                        if inner.dtype != dt::MATRIX {
+                            return Err(MatError::UnexpectedElement {
+                                want: dt::MATRIX,
+                                got: inner.dtype,
+                                at: off,
+                            });
+                        }
+                        parse_matrix(&raw[inner.data..inner.data + inner.nbytes], le)
+                    }),
+                code => Err(MatError::UnsupportedDataType { at: off, code }),
+            };
+            match decoded {
+                // A top-level element with NO NAME is MATLAB's own function workspace, not a
+                // variable anybody stored. It is given the conventional name every other reader
+                // uses so it is visible rather than hidden, and `channels()` leaves it out — it
+                // is a 1x1152 byte buffer of interpreter state, and surfacing it as a series puts
+                // interpreter internals in front of a caller looking at sensor data.
+                Ok((name, value)) if name.is_empty() => {
+                    vars.push((WORKSPACE.to_string(), value))
                 }
-                dt::COMPRESSED => return Err(MatError::Compressed { at: off }),
-                code => return Err(MatError::UnsupportedDataType { at: off, code }),
+                Ok((name, value)) => vars.push((name, value)),
+                Err(why) => skipped.push(Skipped { at: off, why }),
             }
             off = tag.next;
         }
-        Ok(Self { header, vars })
+        // A file where NOTHING decoded is a failure, not an empty file. Without this, a corrupt
+        // download returns Ok with no variables and reads as a corpus with nothing in it.
+        if vars.is_empty() {
+            if let Some(first) = skipped.into_iter().next() {
+                return Err(first.why);
+            }
+        } else {
+            return Ok(Self { header, vars, skipped });
+        }
+        Ok(Self { header, vars, skipped: Vec::new() })
     }
 
     /// One variable by name.
@@ -272,6 +342,10 @@ impl MatFile {
     pub fn channels(&self) -> BTreeMap<String, &[f64]> {
         let mut out = BTreeMap::new();
         for (name, v) in &self.vars {
+            // Interpreter internals are not channels. See `WORKSPACE`.
+            if name.starts_with("__") {
+                continue;
+            }
             collect(name, v, &mut out);
         }
         out
@@ -376,8 +450,15 @@ fn read_tag(b: &[u8], off: usize, le: bool) -> Result<Tag, MatError> {
     if nbytes > have {
         return Err(MatError::Truncated { at: off, want: nbytes, have });
     }
-    // Every element is padded out to an eight-byte boundary.
-    let next = data + nbytes.div_ceil(8) * 8;
+    // Every element is padded out to an eight-byte boundary — EXCEPT a compressed one, which is
+    // followed immediately by the next element.
+    //
+    // Found by walking the wind-turbine corpus rather than by reading the specification: its
+    // first element is 1,594 bytes, and the next element's tag is at 1,730, not at the 1,736 a
+    // padding rule gives. Pad it and every subsequent offset is wrong, so a 92 MB file reads as
+    // one variable and then a garbage tag — which is exactly what it did.
+    let pad = if w0 == dt::COMPRESSED { nbytes } else { nbytes.div_ceil(8) * 8 };
+    let next = data + pad;
     Ok(Tag { dtype: w0, nbytes, data, next: next.min(b.len()) })
 }
 
@@ -414,7 +495,7 @@ fn read_numeric(b: &[u8], tag: &Tag, le: bool) -> Result<Vec<f64>, MatError> {
                 (if le { (hi << 32) | lo } else { (lo << 32) | hi }) as f64
             })
             .collect(),
-        dt::COMPRESSED => return Err(MatError::Compressed { at: tag.data }),
+        dt::COMPRESSED => return Err(MatError::NestedCompressed { at: tag.data }),
         code => return Err(MatError::UnsupportedDataType { at: tag.data, code }),
     })
 }
@@ -430,7 +511,22 @@ fn parse_matrix(b: &[u8], le: bool) -> Result<(String, MatValue), MatError> {
     let class_code = w0 & 0xff;
     let complex = (w0 >> 8) & 0x08 != 0;
 
-    // 2. dimensions.
+    // 2. THE CLASS IS RESOLVED BEFORE THE DIMENSIONS ARE READ, because not every class has any.
+    //
+    // `mxOPAQUE` — MATLAB's `string`, `datetime`, `table` and function handles — does not follow
+    // the standard preamble at all: where a numeric array has dimensions, it has a class-name
+    // string. Checking dims first turns "this is a class I do not read" into "expected data type
+    // 5, found 1", which sends a reader looking for a corrupt file. The wind corpus ends with
+    // twenty-odd opaque variables after its channels, so this is the message that will actually
+    // be met.
+    let Some(class) = MatClass::from_code(class_code) else {
+        return Err(MatError::UnsupportedClass {
+            name: MatClass::name(class_code),
+            code: class_code,
+        });
+    };
+
+    // 3. dimensions.
     let dim_tag = read_tag(b, flags_tag.next, le)?;
     if dim_tag.dtype != dt::INT32 {
         return Err(MatError::UnexpectedElement {
@@ -441,18 +537,12 @@ fn parse_matrix(b: &[u8], le: bool) -> Result<(String, MatValue), MatError> {
     }
     let dims: Vec<usize> = read_numeric(b, &dim_tag, le)?.iter().map(|&v| v as usize).collect();
 
-    // 3. name.
+    // 4. name.
     let name_tag = read_tag(b, dim_tag.next, le)?;
     let name = String::from_utf8_lossy(&b[name_tag.data..name_tag.data + name_tag.nbytes])
         .trim_end_matches('\0')
         .to_string();
 
-    let Some(class) = MatClass::from_code(class_code) else {
-        return Err(MatError::UnsupportedClass {
-            name: MatClass::name(class_code),
-            code: class_code,
-        });
-    };
     if complex {
         return Err(MatError::ComplexArray { name });
     }
@@ -481,7 +571,7 @@ fn parse_matrix(b: &[u8], le: bool) -> Result<(String, MatValue), MatError> {
                 for _ in 0..fields.len() {
                     let t = read_tag(b, off, le)?;
                     if t.dtype == dt::COMPRESSED {
-                        return Err(MatError::Compressed { at: off });
+                        return Err(MatError::NestedCompressed { at: off });
                     }
                     if t.dtype != dt::MATRIX {
                         return Err(MatError::UnexpectedElement {
@@ -503,7 +593,7 @@ fn parse_matrix(b: &[u8], le: bool) -> Result<(String, MatValue), MatError> {
             for _ in 0..total {
                 let t = read_tag(b, off, le)?;
                 if t.dtype == dt::COMPRESSED {
-                    return Err(MatError::Compressed { at: off });
+                    return Err(MatError::NestedCompressed { at: off });
                 }
                 if t.dtype != dt::MATRIX {
                     return Err(MatError::UnexpectedElement {
@@ -719,27 +809,26 @@ mod tests {
         assert!(!ch.contains_key("Signal.units"));
     }
 
-    /// EVERY TRUNCATION POINT REFUSED. A half-downloaded corpus file must fail, not yield the
-    /// first half of a recording — a short channel tokenizes perfectly well and would be scored
-    /// as data.
+    /// A HALF-DOWNLOADED CORPUS FILE MUST NEVER YIELD HALF A RECORDING. A short channel tokenizes
+    /// perfectly well and would be scored as data, so what is asserted is that no prefix returns a
+    /// variable the whole file does not, or the same variable with different values. A prefix that
+    /// ends exactly on an element boundary is a legal shorter file and is allowed to parse — it
+    /// just cannot carry more than it should.
     #[test]
-    fn every_truncation_point_of_a_valid_file_is_refused() {
-        let full = file_of(&[struct_fixture(true), double_vector("x", &[1.0, 2.0, 3.0], true)], true);
-        assert!(MatFile::parse(&full).is_ok());
-        for cut in 0..full.len() {
-            let r = MatFile::parse(&full[..cut]);
-            match &r {
-                Err(_) => {}
-                Ok(f) => {
-                    // The only tolerable success is a prefix that ends exactly on an element
-                    // boundary, which is a shorter but internally complete file.
-                    let complete = f.vars.iter().all(|(_, v)| !v.dims().is_empty());
-                    assert!(
-                        complete && cut != full.len(),
-                        "truncating to {cut} bytes of {} parsed as {} complete variables",
-                        full.len(),
-                        f.vars.len()
-                    );
+    fn no_truncation_of_a_valid_file_yields_content_the_whole_file_does_not() {
+        let bytes = file_of(&[struct_fixture(true), double_vector("x", &[1.0, 2.0, 3.0], true)], true);
+        let full = MatFile::parse(&bytes).unwrap();
+        assert_eq!(full.vars.len(), 2);
+        for cut in 0..bytes.len() {
+            if let Ok(part) = MatFile::parse(&bytes[..cut]) {
+                assert!(
+                    part.vars.len() < full.vars.len(),
+                    "truncating to {cut} of {} bytes returned all {} variables",
+                    bytes.len(),
+                    full.vars.len()
+                );
+                for (i, (n, v)) in part.vars.iter().enumerate() {
+                    assert_eq!((n, v), (&full.vars[i].0, &full.vars[i].1), "at {cut} bytes");
                 }
             }
         }
@@ -761,18 +850,151 @@ mod tests {
         assert!(matches!(MatFile::parse(&h), Err(MatError::BadEndianMark { .. })));
     }
 
-    /// Compression is a MISSING FEATURE, and says so. The wind-turbine corpus is compressed end to
-    /// end, so this is the error a caller will actually meet; "unsupported data type 15" would
-    /// send them looking for a corrupt file.
+    /// A COMPRESSED FILE WRITTEN BY ANOTHER IMPLEMENTATION. The wind-turbine corpus compresses
+    /// every element, so this is the path a third of the `.mat` corpora take; it exercises `mat`
+    /// and `inflate` together, which is the only way either matters here.
+    const COMPRESSED_MAT: &[u8] = &[
+        0x4d, 0x41, 0x54, 0x4c, 0x41, 0x42, 0x20, 0x35, 0x2e, 0x30, 0x20, 0x4d, 0x41, 0x54, 0x2d,
+        0x66, 0x69, 0x6c, 0x65, 0x20, 0x50, 0x6c, 0x61, 0x74, 0x66, 0x6f, 0x72, 0x6d, 0x3a, 0x20,
+        0x70, 0x6f, 0x73, 0x69, 0x78, 0x2c, 0x20, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x20,
+        0x6f, 0x6e, 0x3a, 0x20, 0x57, 0x65, 0x64, 0x20, 0x41, 0x75, 0x67, 0x20, 0x32, 0x36, 0x20,
+        0x31, 0x30, 0x3a, 0x31, 0x35, 0x3a, 0x31, 0x32, 0x20, 0x32, 0x30, 0x32, 0x36, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x49, 0x4d, 0x0f, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00,
+        0x00, 0x78, 0x9c, 0xe3, 0x63, 0x60, 0x60, 0xf0, 0x00, 0x62, 0x36, 0x20, 0xe6, 0x80, 0xd2,
+        0x20, 0xc0, 0x0a, 0xe5, 0x33, 0x03, 0x31, 0x23, 0x18, 0x33, 0x32, 0x94, 0x01, 0x69, 0x4e,
+        0x20, 0x96, 0x60, 0x80, 0x81, 0x1f, 0xf6, 0x50, 0xc6, 0x01, 0x08, 0xc5, 0xe5, 0x00, 0x00,
+        0x54, 0x2d, 0x03, 0x56,
+    ];
+
     #[test]
-    fn compression_is_refused_by_name_not_as_a_bad_type() {
-        let mut f = header(true);
-        f.extend(el(dt::COMPRESSED, &[0x78, 0x9c, 0x00, 0x00], true));
-        match MatFile::parse(&f) {
-            Err(MatError::Compressed { .. }) => {}
-            other => panic!("expected Compressed, got {other:?}"),
+    fn a_compressed_element_inflates_and_parses() {
+        let m = MatFile::parse(COMPRESSED_MAT).unwrap();
+        let v = m.var("v").unwrap();
+        assert_eq!(v.dims(), &[3, 1]);
+        assert_eq!(v.numeric().unwrap(), &[1.5, -2.0, 3.25]);
+    }
+
+    /// A damaged compressed element must be reported as a damaged STREAM, not as a parse failure:
+    /// the two send a caller to different places, one to the download and one to this reader.
+    #[test]
+    fn a_compressed_element_that_will_not_inflate_says_so() {
+        let mut bad = COMPRESSED_MAT.to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        match MatFile::parse(&bad) {
+            Err(MatError::Inflate { why, .. }) => {
+                assert!(matches!(why, crate::InflateError::ChecksumMismatch { .. }), "{why:?}");
+            }
+            other => panic!("expected Inflate, got {other:?}"),
         }
-        assert!(format!("{}", MatError::Compressed { at: 128 }).contains("zlib"));
+    }
+
+    /// Truncating a compressed file must never yield content. The zlib trailer is what makes this
+    /// reliable — without it a short stream can inflate to a shorter, well-formed-looking array.
+    ///
+    /// The property asserted is NOT "every prefix errors": a 128-byte prefix is exactly the
+    /// header, which is a legal file with no variables, and calling that a failure would be
+    /// asserting something untrue about the format. What must hold is that no prefix returns a
+    /// variable the full file does not, or the same variable with different values.
+    #[test]
+    fn no_truncation_of_a_compressed_file_yields_content_the_whole_file_does_not() {
+        let full = MatFile::parse(COMPRESSED_MAT).unwrap();
+        for cut in 0..COMPRESSED_MAT.len() {
+            if let Ok(part) = MatFile::parse(&COMPRESSED_MAT[..cut]) {
+                assert!(
+                    part.vars.len() < full.vars.len(),
+                    "truncating to {cut} bytes returned all {} variables",
+                    full.vars.len()
+                );
+                for (i, (n, v)) in part.vars.iter().enumerate() {
+                    assert_eq!((n, v), (&full.vars[i].0, &full.vars[i].1), "at {cut} bytes");
+                }
+            }
+        }
+    }
+
+    /// COMPRESSED ELEMENTS ARE NOT PADDED to an eight-byte boundary, and everything after one is
+    /// at the wrong offset if they are. Found by walking the wind corpus: its first element is
+    /// 1,594 bytes and the next tag is at 1,730, not the 1,736 a padding rule gives. A 92 MB file
+    /// read as one variable followed by a garbage tag.
+    #[test]
+    fn a_compressed_element_is_followed_immediately_by_the_next_one() {
+        let payload = [0u8; 5];
+        let mut b = el(dt::COMPRESSED, &payload, true);
+        assert_eq!(b.len(), 16, "the element itself is still written padded");
+        let t = read_tag(&b, 0, true).unwrap();
+        assert_eq!(t.nbytes, 5);
+        assert_eq!(t.next, 8 + 5, "a compressed element must not be padded past its own bytes");
+        // An uncompressed element of the same size IS padded.
+        b = el(dt::DOUBLE, &payload, true);
+        assert_eq!(read_tag(&b, 0, true).unwrap().next, 8 + 8);
+    }
+
+    /// A top-level variable this reader cannot decode is STEPPED OVER, not fatal — and it is
+    /// recorded. The wind corpus stores an `mxOPAQUE` in the middle of its channel list, and
+    /// twelve channels including the tachometer come after it; failing the file to avoid a
+    /// MATLAB object would throw those away. Silently returning fewer variables would be worse.
+    #[test]
+    fn an_undecodable_variable_is_skipped_recorded_and_the_rest_still_read() {
+        // Class 17 is mxOPAQUE, which does not use the standard preamble at all.
+        let mut opaque = Vec::new();
+        let mut flags = u32b(17, true);
+        flags.extend(u32b(0, true));
+        opaque.extend(el(dt::UINT32, &flags, true));
+        opaque.extend(el(dt::INT8, b"MCOS", true));
+        let bytes = file_of(
+            &[
+                double_vector("before", &[1.0], true),
+                opaque,
+                double_vector("after", &[2.0, 3.0], true),
+            ],
+            true,
+        );
+        let m = MatFile::parse(&bytes).unwrap();
+        assert_eq!(m.vars.len(), 2, "the readable variables must survive");
+        assert_eq!(m.var("before").unwrap().numeric().unwrap(), &[1.0]);
+        assert_eq!(m.var("after").unwrap().numeric().unwrap(), &[2.0, 3.0]);
+        assert_eq!(m.skipped.len(), 1);
+        assert!(
+            matches!(m.skipped[0].why, MatError::UnsupportedClass { code: 17, .. }),
+            "{:?}",
+            m.skipped[0]
+        );
+    }
+
+    /// A file where NOTHING decoded is a failure, not an empty file — otherwise a corrupt
+    /// download returns Ok with no variables and reads as a corpus with nothing in it.
+    #[test]
+    fn a_file_where_nothing_decodes_is_an_error_not_an_empty_file() {
+        let mut opaque = Vec::new();
+        let mut flags = u32b(17, true);
+        flags.extend(u32b(0, true));
+        opaque.extend(el(dt::UINT32, &flags, true));
+        opaque.extend(el(dt::INT8, b"MCOS", true));
+        match MatFile::parse(&file_of(&[opaque], true)) {
+            Err(MatError::UnsupportedClass { code: 17, .. }) => {}
+            other => panic!("expected the error, got {other:?}"),
+        }
+    }
+
+    /// MATLAB's unnamed function-workspace element is interpreter state, not a recording. It stays
+    /// visible in `vars` under the conventional name and is kept out of `channels()`: a 1x1152
+    /// byte buffer of interpreter internals presented as a series is exactly the kind of thing
+    /// that gets tokenized and scored.
+    #[test]
+    fn the_function_workspace_is_named_but_is_not_a_channel() {
+        let mut ws = preamble(9, 0, &[1, 4], "", true);
+        ws.extend(el(dt::UINT8, &[1u8, 2, 3, 4], true));
+        let bytes = file_of(&[double_vector("real", &[1.0, 2.0], true), ws], true);
+        let m = MatFile::parse(&bytes).unwrap();
+        assert_eq!(m.vars.len(), 2);
+        assert!(m.var(WORKSPACE).is_some(), "it must stay visible, not vanish");
+        let ch = m.channels();
+        assert_eq!(ch.len(), 1);
+        assert!(ch.contains_key("real"));
     }
 
     #[test]

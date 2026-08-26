@@ -70,6 +70,8 @@ fn main() {
     }
 
     let (mut ok, mut failed, mut chans, mut samples) = (0usize, 0usize, 0usize, 0usize);
+    let mut skipped_total = 0usize;
+    let mut skips: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let (mut matched, mut mismatched) = (0usize, 0usize);
 
@@ -85,6 +87,10 @@ fn main() {
                 let c = m.channels();
                 chans += c.len();
                 samples += c.values().map(|s| s.len()).sum::<usize>();
+                skipped_total += m.skipped.len();
+                for sk in &m.skipped {
+                    *skips.entry(format!("{}", sk.why)).or_insert(0) += 1;
+                }
                 if want.is_empty() && files.len() <= 4 {
                     println!("\n{name}  ({} bytes)\n  {}", bytes.len(), m.header);
                     for (n, v) in &m.vars {
@@ -117,7 +123,7 @@ fn main() {
             Err(e) => {
                 failed += 1;
                 let key = match &e {
-                    MatError::Compressed { .. } => "miCOMPRESSED (zlib)".to_string(),
+                    MatError::Inflate { why, .. } => format!("zlib stream: {why}"),
                     MatError::UnsupportedClass { name, .. } => format!("class {name}"),
                     other => format!("{other}"),
                 };
@@ -128,6 +134,14 @@ fn main() {
 
     println!("\n  {} files: {ok} read, {failed} refused", files.len());
     println!("  {chans} channels, {samples} samples");
+    if skipped_total > 0 {
+        // Reported, not swallowed: a variable this reader stepped over is still a variable the
+        // file contains.
+        println!("  {skipped_total} variables SKIPPED inside files that otherwise read:");
+        for (why, n) in &skips {
+            println!("    x{n}: {why}");
+        }
+    }
     for (e, n) in &errors {
         println!("    refused x{n}: {e}");
     }

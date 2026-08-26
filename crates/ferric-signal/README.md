@@ -46,9 +46,10 @@ open.
 | `store` | Save and load weights | Save/load must yield **identical tokens**; every truncation point refused |
 | `train` | Straight-through estimator | Gradient must behave as if rounding were the identity |
 | `language` | Mixed text/signal sequences, causal LM | Encode/decode inverses; a position cannot see its future |
-| `mat` | MATLAB v5 reader, the format sensor corpora ship in | **518 CWRU channels and 61 rotating channels agree with `scipy.io` exactly**; every truncation point refused |
+| `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |
+| `inflate` | DEFLATE/zlib decompression | Streams compressed elsewhere, including the dynamic-Huffman branch; the Adler-32 trailer is checked |
 
-**123 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
+**139 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
@@ -182,26 +183,51 @@ held-out tokens land there — gives 3,046 embedding rows against 32,788, and th
 vocabulary, so this is the traffic argument below, measured on real data rather than derived.
 
 **Reading the corpora at all: a MATLAB v5 reader, checked against another implementation.** Three
-of the four public sensor corpora this crate was pointed at ship as `.mat`, and none could be opened.
-`mat` reads them: both byte orders, both tag forms, numeric and char and struct and cell including
-nesting.
+of the four public sensor corpora this crate was pointed at ship as `.mat`, and none could be
+opened. `mat` reads all three: both byte orders, both tag forms, numeric and char and struct and
+cell including nesting, and zlib-compressed elements through `inflate`.
 
 | corpus | files | series | agreement with `scipy.io` |
 |---|---|---|---|
-| CWRU bearings | 161 | 518 | **518 / 518**, length, first, last and full sum |
-| Rotating machinery (vibration) | 1 sampled | 61 | **61 / 61**, same fields |
+| CWRU bearings | 161 | 518 | **518 / 518** |
+| Rotating machinery (vibration) | 1 sampled | 61 | **61 / 61** |
+| Wind-turbine drivetrain (compressed) | 1 sampled | 138 | **138 / 138** |
 
 Agreement is checked against a table written by a different implementation — a parser validated
 only against its own output agrees with its own bugs. `--check` compares length, first sample, last
-sample and the sum of every series, and exits non-zero on any disagreement.
+sample and the sum of every series, and exits non-zero on any disagreement. One 92 MB compressed
+file yields 180.7M samples in 1.8 s.
 
-Two things fell out of doing it this way. **The reader refuses exactly the 15 CWRU files `scipy`
-refuses**, all truncated downloads, and names the byte where each ran short — a half-file
-tokenizes perfectly well and would otherwise have been scored as data. And `channels()` first
-required a series to have at most one dimension above 1, which is right for `[N, 1]` and wrong for
-every multi-channel recording: on the rotating corpus that returned 57 metadata scalars and **none
-of its 6.1M samples**, parsed successfully and empty. MATLAB is column-major, so surfacing each
-column as its own channel costs nothing but the decision to do it.
+**Four things the real corpora caught that no fixture would have.**
+
+*Compressed elements are not padded.* Every other element is padded to an eight-byte boundary. A
+compressed one is followed immediately by the next. The wind corpus's first element is 1,594 bytes
+and the next tag is at 1,730, not 1,736 — pad it and a 92 MB file reads as one variable followed by
+a garbage tag.
+
+*`channels()` first required at most one dimension above 1*, which is right for `[N, 1]` and wrong
+for every multi-channel recording. On the rotating corpus that returned 57 metadata scalars and
+**none of its 6.1M samples** — parsed successfully, and empty. The recording is `[1536000, 4]`, four
+accelerometers for sixty seconds. MATLAB is column-major, so each column is already contiguous.
+
+*A variable this reader cannot decode is stepped over and recorded, not fatal.* The wind corpus
+stores an `mxOPAQUE` — a MATLAB object — in the middle of its channel list, with twelve channels
+including the tachometer after it. Failing the file to avoid a MATLAB object would throw those away;
+silently returning fewer variables would be worse. So `MatFile::skipped` says what was stepped over
+and why, and a file where *nothing* decoded is an error rather than an empty file.
+
+*MATLAB's unnamed function-workspace element is interpreter state, not a recording.* It arrived as a
+1×1152 unnamed channel. It stays visible in `vars` under the conventional name and is kept out of
+`channels()`.
+
+And **the reader refuses exactly the 15 CWRU files `scipy` refuses**, all truncated downloads,
+naming the byte where each ran short — a half-file tokenizes perfectly well and would otherwise
+have been scored as data.
+
+**`inflate` is written out rather than depended on.** This crate carries two path dependencies and
+`pollster`, and wrote its own SHA-256 for the same reason. The Adler-32 trailer is checked, which
+is what makes a silent partial decode impossible: a sensor channel that is wrong in its second half
+still tokenizes.
 
 **The energy accounting is arithmetic, not measurement.** A decoder touches its vocabulary twice per
 position — one row on the way in, every row at the output head on the way out — so the head is what
@@ -242,9 +268,8 @@ no reference weights were located.
 a single hydraulic test rig, five label axes, one split. The other corpora now open (see below) but
 nothing has been trained on them.
 
-**`mat` does not inflate.** The wind-turbine corpus compresses every element with zlib, and the
-reader refuses it by name rather than returning an empty file. That is a missing feature with a
-known shape, not a parsing limit.
+**`mat` does not read every class.** `mxSPARSE`, `mxOBJECT`, `mxOPAQUE` and complex arrays are
+refused by name. `inflate` decompresses and does not compress.
 
 **The embedding table trains through a materialized one-hot**, not a native row gather, because the
 autograd layer has none. A one-hot `[t, rows]` times the table is gather in the forward pass and

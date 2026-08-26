@@ -26,6 +26,8 @@
 //!   parameter-free positional encoding.
 //! - [`language`] — mixed text/signal sequences: the piece that makes this sensor-LANGUAGE
 //!   rather than a sensor codec.
+//! - [`inflate`] — DEFLATE/zlib decompression, written out because a third of the `.mat` corpora
+//!   compress every element and this crate keeps its dependency list short enough to read.
 //! - [`mat`] — a strict MATLAB v5 reader, because three of the four public sensor corpora this
 //!   crate was pointed at ship as `.mat` and none of them could be opened at all.
 //! - [`patch`] — the signal front end: patching, and reversible per-channel normalization whose
@@ -73,6 +75,7 @@
 pub mod cost;
 pub mod encoder;
 pub mod fsq;
+pub mod inflate;
 pub mod language;
 pub mod mat;
 pub mod patch;
@@ -88,6 +91,7 @@ pub use cost::{vocab_cost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};
 pub use receipt::{agree, agreement, Agreement, TokenReceipt, TokenSpec};
+pub use inflate::{adler32, inflate_raw, inflate_zlib, InflateError};
 pub use mat::{MatClass, MatError, MatFile, MatValue};
 pub use language::{cross_entropy, embed_var, lm_forward_var, Example, SensorLm, Sequencer, Span, Task};
 pub use patch::{PatchError, Patcher, RevIn};
