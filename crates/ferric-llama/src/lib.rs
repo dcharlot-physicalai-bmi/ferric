@@ -94,7 +94,8 @@ pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 pub mod unipc;
 
 pub mod arch;
-pub mod bert; // general.architecture registry: what runs, and the refusal for what does not
+pub mod bert;
+pub mod nemotron_h; // general.architecture registry: what runs, and the refusal for what does not
 
 pub mod gemma4; // Google Gemma 4 (E2B/E4B): per-layer embeddings, shared KV, two head widths
 

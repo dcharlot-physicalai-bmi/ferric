@@ -51,12 +51,15 @@ pub enum Runtime {
     Cosmos,
     /// [`crate::bert`] — encoder-only. Embeddings and rerankers, not generation.
     Bert,
+    /// [`crate::nemotron_h`] — Mamba-2 state-space mixers with a few attention layers.
+    NemotronH,
 }
 
 impl Runtime {
     pub fn label(self) -> &'static str {
         match self {
             Runtime::Bert => "bert",
+            Runtime::NemotronH => "nemotron_h",
             Runtime::Dense => "dense",
             Runtime::Hybrid => "hybrid",
             Runtime::Lfm2 => "lfm2",
@@ -114,6 +117,15 @@ pub struct Arch {
 /// describe work in progress, and is not allowed to let it serve traffic.
 pub const REGISTRY: &[Arch] = &[
     // ---- dense GQA family ----------------------------------------------------------------
+    Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Parts,
+           note: "Mamba-2 / attention / MLP hybrid — the first non-transformer here. Cfg and the \
+                  per-block SCHEDULE are read and reconciled against the weights (4B: 21 SSM, 17 MLP, \
+                  4 attention at blocks 12/17/24/32; z|x|BC|dt = 7680+7680+2048+96 = 17504; conv over \
+                  xBC = 9728; grouped norm 8x960 = inner). The FORWARD pass is not written: the risk \
+                  left is convention, not shape — whether ssm_a is used directly or exponentiated, \
+                  where dt's bias sits relative to softplus, how B/C map to the 8 groups. Each is one \
+                  line and each is fluent-and-wrong when wrong, so they get resolved per-op against \
+                  llama-eval-callback before this becomes Verified" },
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
@@ -321,7 +333,7 @@ mod tests {
         for a in REGISTRY {
             let served = match a.runtime {
                 Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4
-                    | Runtime::DeepSeek2 | Runtime::Bert => true,
+                    | Runtime::DeepSeek2 | Runtime::Bert | Runtime::NemotronH => true,
             };
             assert!(served, "{} names a runtime with no dispatch", a.name);
         }

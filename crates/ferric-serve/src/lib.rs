@@ -294,6 +294,11 @@ impl Engine {
             // Cosmos loads from safetensors, so it cannot arrive down a GGUF path at all.
             ferric_llama::arch::Runtime::Cosmos =>
                 panic!("{arch} loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
+            // Registered Status::Parts — resolve() refuses it before this match is reached, so this
+            // arm exists to keep the match exhaustive rather than to be taken. When the forward pass
+            // lands it becomes a real load; until then the refusal names what is missing.
+            ferric_llama::arch::Runtime::NemotronH => panic!(
+                "{arch} is registered but its forward pass is not written yet — see arch.rs"),
             // An encoder cannot be the chat model: no KV cache, no LM head, nothing to generate. It
             // is served through FERRIC_RERANK_MODEL and /v1/rerank instead. Refusing here keeps the
             // exhaustive match honest — adding a runtime must be a compile error, not a fallthrough.
