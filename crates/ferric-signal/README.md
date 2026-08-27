@@ -338,6 +338,28 @@ training adequacy when capacity differs.** Both configurations saw the same 3,20
 same 360 training examples — 8.9 passes each — and that was sufficient for one and not the other.
 Holding the obvious quantity fixed was not holding the relevant one fixed.
 
+**Tripling the budget instead does not move severity either, and it costs fault ten points.** Same
+width, same corpus, 1,200 optimizer steps against 400:
+
+| budget | fault | torque | severity | distinct words, fault |
+|---|---|---|---|---|
+| 400 steps (8.9 passes) | **45.6% ± 2.3** | 34.3% ± 2.8 | 33.7% ± 1.8 | 4.0 of 5 |
+| 1,200 steps (26.7 passes) | 35.7% ± 2.3 | 37.8% ± 3.5 | 30.9% ± 2.3 | 4.7 of 5 |
+
+**The two failures are now both on the table, and one column tells them apart at the same low
+accuracy.** The wide model scored 24.4% emitting *one* word for every window; the long-trained one
+scores 35.7% emitting *4.7 of 5*. Under-training collapses variety; overfitting keeps it and loses
+accuracy. Read as accuracy alone, both rows say "worse" and nothing else.
+
+So **severity sits on its majority baseline in five of five seed-runs across two budgets**, while
+the probe reads 51.1% from the same tokens with a control of +5.6. Neither of the two obvious knobs
+touches it. What remains is inductive bias, and that is a more specific claim than "the decoder is
+weaker": a counting model fits 6,534 features from 360 examples because that is what counting
+models do, and a half-million-parameter decoder given three supervised words per 410-token document
+does not. **The probe is not a weaker model that happens to win — it is the right shape for this
+much data**, which is a statement about how much sensor-text pairing a sensor-language model needs
+rather than about this architecture.
+
 **Torque at this size is inside its own control** — the probe's +9.5 over majority against a
 control of **+12.2**. It is not a result at 180 held-out examples. At 450 the same probe gives 51.3%
 with a control of +4.9 and it is one. The same axis, the same tokens, and the answer changes with
