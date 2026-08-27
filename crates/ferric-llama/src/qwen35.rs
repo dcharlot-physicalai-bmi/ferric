@@ -527,12 +527,23 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
 /// only quote; with it, it is a number you can check on your own checkpoint. That is the whole
 /// reason this exists.
 ///
-/// ⚠ **It records the TENSOR, not its contents.** `moe_ffn` runs inside `ferric_tensor::batch`,
-/// which defers submission until the outermost closure returns (`lib.rs:1802`), so a `to_vec()`
-/// there would read a buffer whose writes have not been submitted. `Tensor` is `Clone` over an
-/// `Arc<wgpu::Buffer>`, so recording costs a refcount bump and keeps the buffer alive; the caller
-/// reads back AFTER the forward, where it is safe and where the sync is not on the hot path. The
-/// existing `FERRIC_LAYER_SUMS` hook makes the same choice by sitting outside the batch.
+/// ⚠ **It records the TENSOR, not its contents — for COST, not correctness.**
+///
+/// ⛔ This comment first said a `to_vec()` here "would read a buffer whose writes have not been
+/// submitted". **That is wrong**, and it was committed. `readback` flushes any open batch as its
+/// first act (`lib.rs`: "A read must see all prior compute, so flush any open batch first"), so a
+/// mid-batch readback is CORRECT. What it costs is the batching: `flush_batch` `take()`s the
+/// pending segments, so the enclosing closure runs unbatched for its remainder — forfeiting the
+/// per-layer batching that removed ~38 ms/token.
+///
+/// The design is unchanged and still right; only the reason is. `Tensor` is `Clone` over an
+/// `Arc<wgpu::Buffer>`, so recording costs a refcount bump, and the caller reads back after the
+/// forward where the sync is off the hot path. `FERRIC_LAYER_SUMS` sits outside the batch for the
+/// same reason.
+///
+/// ⭐ The correction matters beyond this hook: it means expert STREAMING can read routing from
+/// inside `moe_ffn` and pay a flush, rather than needing `forward_cached` restructured around it.
+/// A wrongly-asserted correctness hazard was about to buy an invasive rewrite.
 ///
 /// Layout of each recorded row is `moe_topk`'s: `[w_0..w_{k-1} | idx_0..idx_{k-1}]`, `[T, 2k]`,
 /// indices stored as f32 and exact for `n_expert <= 2^24`. So the ids are the SECOND half of a row.
