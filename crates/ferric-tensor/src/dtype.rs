@@ -801,6 +801,8 @@ pub enum QShard {
     Q4_1(Q4_1Weights),
     Q5_0(Q5_0Weights),
     Q5_1(Q5_1Weights),
+    Q2_K(Q2_KWeights),
+    Q3_K(Q3_KWeights),
     Q4_K(Q4_KWeights),
     Q5_K(Q5_KWeights),
     Q6_K(Q6_KWeights),
@@ -834,8 +836,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -845,6 +847,8 @@ impl QShard {
             8 => QShard::Q8_0(Q8_0Weights::from_bytes(ctx, bytes, rows, cols)),
             12 => QShard::Q4_K(Q4_KWeights::from_bytes(ctx, bytes, rows, cols)),
             13 => QShard::Q5_K(Q5_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            10 => QShard::Q2_K(Q2_KWeights::from_bytes(ctx, bytes, rows, cols)),
+            11 => QShard::Q3_K(Q3_KWeights::from_bytes(ctx, bytes, rows, cols)),
             14 => QShard::Q6_K(Q6_KWeights::from_bytes(ctx, bytes, rows, cols)),
             20 => QShard::Iq4Nl(Iq4NlWeights::from_bytes(ctx, bytes, rows, cols)),
             23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
@@ -877,6 +881,8 @@ impl QMatrix {
             6 => Some((32, 22)),   // Q5_0
             7 => Some((32, 24)),   // Q5_1
             8 => Some((32, 34)),   // Q8_0
+            10 => Some((256, 84)), // Q2_K
+            11 => Some((256, 110)),// Q3_K
             12 => Some((256, 144)),// Q4_K
             13 => Some((256, 176)),// Q5_K
             14 => Some((256, 210)),// Q6_K
@@ -998,6 +1004,8 @@ impl Tensor {
             QShard::Q5_1(w) => self.matmul_q5_1(w),
             QShard::Q4_K(w) => self.matmul_q4_k(w),
             QShard::Q5_K(w) => self.matmul_q5_k(w),
+            QShard::Q2_K(w) => self.matmul_q2_k(w),
+            QShard::Q3_K(w) => self.matmul_q3_k(w),
             QShard::Q6_K(w) => self.matmul_q6_k(w),
             QShard::Q8_0(w) => self.matmul_q8_0(w),
             QShard::Iq4Xs(w) => self.matmul_iq4_xs(w),
@@ -1129,6 +1137,133 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     coopStoreT(acc, &c[ci], nn);
 }
 "#;
+
+/// **Q2_K packed weight** — 2 bits/weight, 84 bytes per 256 (2.625 bpw), the smallest K-quant tier.
+///
+/// `codes` is the 64 `qs` bytes as 16 words; `aux` is `[d|dmin, 16 scale bytes]` as 5 words. Both
+/// super-block scales ride in ONE word so a single `unpack2x16float` yields the pair, and the 16
+/// sub-block bytes need no rearrangement — each already packs its 4-bit scale and 4-bit min.
+pub struct Q2_KWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 16 u32/block: qs
+    aux: Arc<wgpu::Buffer>,   // 5 u32/block: [d|dmin, 16 scale/min bytes]
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Q2_KWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q2_KWeights {
+        assert_eq!(cols % 256, 0, "Q2_K cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 84, "unexpected Q2_K byte length");
+        let nblk = rows * (cols / 256);
+        let mut codes: Vec<u32> = vec![0; nblk * 16];
+        let mut aux: Vec<u32> = vec![0; nblk * 5];
+        let word = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        for b in 0..nblk {
+            let src = &bytes[b * 84..b * 84 + 84];
+            for w in 0..16 { codes[b * 16 + w] = word(src, 16 + w * 4); }
+            // d in the low half, dmin in the high half — one unpack2x16float in-kernel.
+            // ⚠ dmin is SIGNED and Ferric's quantizer emits negative ones; f16 bit-patterns pass
+            // through unchanged here, and `unpack2x16float` decodes the sign for free.
+            let d = u16::from_le_bytes([src[80], src[81]]) as u32;
+            let dmin = u16::from_le_bytes([src[82], src[83]]) as u32;
+            aux[b * 5] = d | (dmin << 16);
+            for w in 0..4 { aux[b * 5 + 1 + w] = word(src, w * 4); }
+        }
+        let mk = |label, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Q2_KWeights { ctx: ctx.clone(), codes: mk("q2k.codes", &codes), aux: mk("q2k.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 84 }
+}
+
+/// **Q3_K packed weight** — 3 bits/weight, 110 bytes per 256 (3.4375 bpw).
+///
+/// ⭐ The sixteen 6-bit scales are UNSHUFFLED ON LOAD, not in the kernel. On disk they are woven
+/// through 12 bytes as low-nibbles plus a plane of high-2-bit pairs; every matmul would otherwise
+/// redo that `aux`/`kmask` dance per super-block per output row. Done once here, `aux` carries them
+/// as plain bytes and the kernel does one subtract.
+pub struct Q3_KWeights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 24 u32/block: 8 words hmask, then 16 words qs
+    aux: Arc<wgpu::Buffer>,   // 5 u32/block: [d, 16 already-unshuffled 6-bit scale bytes]
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Q3_KWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Q3_KWeights {
+        assert_eq!(cols % 256, 0, "Q3_K cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 110, "unexpected Q3_K byte length");
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let nblk = rows * (cols / 256);
+        let mut codes: Vec<u32> = vec![0; nblk * 24];
+        let mut aux: Vec<u32> = vec![0; nblk * 5];
+        let word = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        for b in 0..nblk {
+            let src = &bytes[b * 110..b * 110 + 110];
+            for w in 0..8 { codes[b * 24 + w] = word(src, w * 4); }            // hmask (32 B)
+            for w in 0..16 { codes[b * 24 + 8 + w] = word(src, 32 + w * 4); }  // qs (64 B)
+            aux[b * 5] = u16::from_le_bytes([src[108], src[109]]) as u32;      // d
+            let mut a = [0u32; 4];
+            for k in 0..3 { a[k] = word(src, 96 + k * 4); }
+            let tmp = a[2];
+            a[2] = ((a[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+            a[3] = ((a[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+            a[0] = (a[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+            a[1] = (a[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+            aux[b * 5 + 1..b * 5 + 5].copy_from_slice(&a);
+        }
+        let mk = |label, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Q3_KWeights { ctx: ctx.clone(), codes: mk("q3k.codes", &codes), aux: mk("q3k.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 110 }
+}
+
+impl Tensor {
+    /// y = x·Wᵀ for a packed **Q2_K** [out, in] weight, dequantized per-super-block in-kernel.
+    pub fn matmul_q2_k(&self, w: &Q2_KWeights) -> Tensor {
+        self.matmul_k_packed(&w.codes, &w.aux, w.rows, w.cols, Q2_K_HELPERS, Q2_K_BODY, "q2_k")
+    }
+    /// y = x·Wᵀ for a packed **Q3_K** [out, in] weight, dequantized per-super-block in-kernel.
+    pub fn matmul_q3_k(&self, w: &Q3_KWeights) -> Tensor {
+        self.matmul_k_packed(&w.codes, &w.aux, w.rows, w.cols, Q3_K_HELPERS, Q3_K_BODY, "q3_k")
+    }
+
+    /// The shared driver for a 256-super-block packed matmul: pick flat or split-k by shape, splice
+    /// the format's helpers and body into the shell, dispatch.
+    ///
+    /// The two shells bind exactly `(x, codes, aux, out, info)` and know nothing about the format —
+    /// only the spliced body does — so a new K-quant needs a body, not a kernel. They carry Q6_K's
+    /// name because it was the first to use them.
+    fn matmul_k_packed(&self, codes: &Arc<wgpu::Buffer>, aux: &Arc<wgpu::Buffer>, o_dim: usize,
+                       cols: usize, helpers: &str, body: &str, tag: &str) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, cols, "inner dim mismatch: x[..,{inn}] vs W[..,{cols}]");
+        let out = empty(&self.ctx, rows * o_dim);
+        let n = rows * o_dim;
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, o_dim) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_K_SPLITK_WGSL, format!("matmul_{tag}_splitk"))
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_K_FLAT_WGSL, format!("matmul_{tag}_flat"))
+        };
+        let src = wgsl.replace("__HELPERS__", helpers).replace("__BODY__", body);
+        let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
+        run(&self.ctx, &src, &label,
+            &[x.buf.as_ref(), codes.as_ref(), aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, o_dim as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, o_dim])
+    }
+}
 
 /// **Q6_K** weights held packed on the GPU — llama.cpp's 6-bit K-quant. `Q4_K_M`, the default, stores
 /// its embedding/output and some `ffn_down` tensors as Q6_K, so a real Q4_K_M model can't run without
@@ -3053,6 +3188,80 @@ __INNER__
 // Q6_K: byte accessors into the packed ql|qh codes and int8 scales, plus the per-super-block body
 // that reassembles each 6-bit quant (4 low bits from ql, 2 high from qh) and accumulates
 // x · d · scale · (q−32). Two 128-value halves, 4 quant groups per half — the llama.cpp layout.
+/// The flat and split-k shells bind exactly `(x, codes, aux, out, info)` and contain no format
+/// knowledge — only the spliced `__BODY__` does. They are named for Q6_K because it was the first
+/// format to use them; these aliases say so at the point of reuse rather than leaving a Q2_K matmul
+/// looking like it borrowed someone else's kernel.
+const MATMUL_K_FLAT_WGSL: &str = MATMUL_Q6_K_FLAT_WGSL;
+const MATMUL_K_SPLITK_WGSL: &str = MATMUL_Q6_K_SPLITK_WGSL;
+
+// ---- Q2_K: 4 levels per 16-element sub-block, affine (scale AND min per sub-block) ----
+//
+// ⚠ The `qs` walk is the trap. A byte holds four 2-bit quants that belong to four DIFFERENT
+// sub-blocks: the SHIFT selects the sub-block and the byte INDEX selects the element within it.
+// Reading `qs` sequentially — the obvious loop — yields plausibly-scaled garbage, not an error.
+// Element `e` of the super-block is at `qs[hf*32 + g*16 + l] >> (2*j)` for
+// `e = hf*128 + j*32 + g*16 + l`, which is why the loop nests half → j → group → l.
+const Q2_K_HELPERS: &str = r#"
+fn q2b(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn q2s(ab: u32, i: u32) -> u32 { return (aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+"#;
+const Q2_K_BODY: &str = r#"
+            let cb = bi * 16u; let ab = bi * 5u;
+            let dd = unpack2x16float(aux[ab]);
+            let xbb = r * in_dim + blk * 256u;
+            for (var hf: u32 = 0u; hf < 2u; hf = hf + 1u) {
+                for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+                    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+                        let sc = q2s(ab, hf * 8u + j * 2u + g);
+                        let dl = dd.x * f32(sc & 0xFu);
+                        let ml = dd.y * f32(sc >> 4u);
+                        let qo = hf * 32u + g * 16u;
+                        let xo = xbb + hf * 128u + j * 32u + g * 16u;
+                        for (var l: u32 = 0u; l < 16u; l = l + 1u) {
+                            let q = (q2b(cb, qo + l) >> (2u * j)) & 3u;
+                            acc = acc + x[xo + l] * (dl * f32(q) - ml);
+                        }
+                    }
+                }
+            }
+"#;
+
+// ---- Q3_K: 8 levels per 16-element sub-block, symmetric, third bit on its own plane ----
+//
+// ⚠ Two traps. The high plane is INVERTED — bit SET means add nothing, bit CLEAR means subtract 4 —
+// so the quant range is −4..3 and reading it the intuitive way flips the sign of most weights while
+// staying finite. And the bit selector runs 1..128 across BOTH halves rather than restarting, so the
+// mask bit is `hf*4 + j` over a 32-byte plane shared by the whole super-block, not a per-half one.
+//
+// The sixteen 6-bit scales are unshuffled at LOAD time (see `Q3_KWeights::from_bytes`), so `aux`
+// holds plain bytes here and the kernel only subtracts the bias.
+const Q3_K_HELPERS: &str = r#"
+fn q3h(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn q3q(cb: u32, i: u32) -> u32 { return (codes[cb + 8u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn q3s(ab: u32, i: u32) -> f32 { let b = (aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; return f32(i32(b) - 32); }
+"#;
+const Q3_K_BODY: &str = r#"
+            let cb = bi * 24u; let ab = bi * 5u;
+            let d = unpack2x16float(aux[ab]).x;
+            let xbb = r * in_dim + blk * 256u;
+            for (var hf: u32 = 0u; hf < 2u; hf = hf + 1u) {
+                for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+                    let m = 1u << (hf * 4u + j);
+                    for (var g: u32 = 0u; g < 2u; g = g + 1u) {
+                        let dl = d * q3s(ab, hf * 8u + j * 2u + g);
+                        let qo = hf * 32u + g * 16u;
+                        let xo = xbb + hf * 128u + j * 32u + g * 16u;
+                        for (var l: u32 = 0u; l < 16u; l = l + 1u) {
+                            var q = i32((q3q(cb, qo + l) >> (2u * j)) & 3u);
+                            if ((q3h(cb, g * 16u + l) & m) == 0u) { q = q - 4; }
+                            acc = acc + x[xo + l] * dl * f32(q);
+                        }
+                    }
+                }
+            }
+"#;
+
 const Q6_K_HELPERS: &str = r#"
 fn qlb(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
 fn qhb(cb: u32, i: u32) -> u32 { return (codes[cb + 32u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }

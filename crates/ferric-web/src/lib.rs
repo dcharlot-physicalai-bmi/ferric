@@ -24,9 +24,11 @@ use wasm_bindgen::prelude::*;
 ///
 /// That made every one of this crate's ~43 error paths unusable from the native examples: a refusal
 /// the browser reports cleanly killed the process here with a diagnostic about the wrong thing.
-/// Found by pointing `retrieval_scale` at a Q3_K_M checkpoint — a quantisation this runtime genuinely
-/// does not implement (ferric-tensor covers Q4_K/Q5_K/Q6_K, not Q3_K type 11 or Q2_K type 10), so the
-/// refusal was CORRECT and only its delivery was broken.
+/// Found by pointing `retrieval_scale` at a Q3_K_M checkpoint, which at the time this runtime
+/// genuinely could not run, so the refusal was CORRECT and only its delivery was broken. ⚠ That
+/// example no longer reproduces it — Q2_K and Q3_K gained packed kernels on 2026-08-26 — which is
+/// worth stating rather than quietly leaving a repro that now passes for the wrong reason. Any
+/// checkpoint whose type is still outside `QMatrix::block_bytes` reproduces it identically.
 ///
 /// Native builds therefore panic with the actual message. A panic is still not a returned error — see
 /// [`FerricModel::load_native`] and [`FerricModel::embed_native`] for the seams that do return one —
@@ -728,18 +730,18 @@ mod preflight_tests {
     use ferric_tensor::QMatrix;
 
     #[test]
-    fn the_k_quants_this_runtime_implements_are_exactly_Q4_Q5_Q6() {
+    fn every_k_quant_tier_now_has_a_native_matmul() {
         // `unsupported_tensors` is a filter over this predicate, so the predicate is the thing worth
-        // pinning. These four numbers are why a Q3_K_M file aborted the native benches: llama-quantize
-        // produces types 10 and 11 happily, ferric-tensor has a matmul for neither, and until the
-        // preflight existed that refusal arrived as `function not implemented on non-wasm32 targets`.
-        assert!(QMatrix::block_bytes(10).is_none(), "Q2_K (10) has no native matmul");
-        assert!(QMatrix::block_bytes(11).is_none(), "Q3_K (11) has no native matmul");
-        assert!(QMatrix::block_bytes(12).is_some(), "Q4_K (12) does");
-        assert!(QMatrix::block_bytes(13).is_some(), "Q5_K (13) does");
-        assert!(QMatrix::block_bytes(14).is_some(), "Q6_K (14) does");
-        // If any of the first two ever gains a kernel, this test is the reminder to delete the
-        // corresponding line rather than to relax the assertion.
+        // pinning. This test used to assert the OPPOSITE for 10 and 11 — "Q2_K has no native
+        // matmul", "Q3_K has no native matmul" — and said in a comment that gaining a kernel meant
+        // deleting the line rather than relaxing the assertion. Both gained one on 2026-08-26, so
+        // both lines are inverted here, which is the whole reason a claim like this is worth a test:
+        // the old behaviour was that a Q3_K_M file aborted the native benches outright.
+        for (ty, name) in [(10, "Q2_K"), (11, "Q3_K"), (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K")] {
+            assert!(QMatrix::block_bytes(ty).is_some(),
+                    "{name} ({ty}) has no native matmul, so it loads through the f32 dense fallback \
+                     at 4 bytes per weight — correct output, several times the memory, no error");
+        }
     }
 
     #[test]
@@ -749,6 +751,8 @@ mod preflight_tests {
         assert_eq!(QMatrix::block_bytes(12), Some((256, 144)), "Q4_K super-block");
         assert_eq!(QMatrix::block_bytes(14), Some((256, 210)), "Q6_K super-block");
         assert_eq!(QMatrix::block_bytes(8), Some((32, 34)), "Q8_0");
+        assert_eq!(QMatrix::block_bytes(10), Some((256, 84)), "Q2_K super-block");
+        assert_eq!(QMatrix::block_bytes(11), Some((256, 110)), "Q3_K super-block");
     }
 }
 
@@ -881,10 +885,11 @@ impl FerricModel {
     /// **aborted the process** with `function not implemented on non-wasm32 targets` — a message
     /// about wasm-bindgen, for a problem that is entirely about a tensor type.
     ///
-    /// Measured: `llama-quantize` will happily produce Q3_K_M and Q2_K of a checkpoint this runtime
-    /// otherwise runs, and `ferric-tensor` implements Q4_K, Q5_K and Q6_K but not Q3_K (ggml type 11)
-    /// or Q2_K (type 10). Pointing a bench at one of those files looked like a crash and was in fact
-    /// a correct refusal with no voice.
+    /// Measured on a Q3_K_M checkpoint: pointing a bench at one looked like a crash and was in fact
+    /// a correct refusal with no voice. ⚠ Q2_K (type 10) and Q3_K (type 11) have had packed kernels
+    /// since 2026-08-26 and now pass this preflight; the function is unchanged because it never named
+    /// a type — it asks `QMatrix::block_bytes`, so it tracks what the tensor layer actually supports
+    /// instead of a list that goes stale the first time someone adds a kernel.
     ///
     /// This returns the offending `(tensor name, ggml type)` pairs and touches no GPU and no
     /// wasm-bindgen, so it works identically on both targets and can be called before any allocation.
