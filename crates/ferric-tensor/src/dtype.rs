@@ -747,6 +747,36 @@ impl Q5_0Weights {
         Q5_0Weights { ctx: ctx.clone(), codes: mk("q5_0.codes", &codes), scales: mk("q5_0.scales", &scales), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 22 }
+    /// Overwrite `n` consecutive rows in place. See [`Q4_KWeights::write_rows`].
+    ///
+    /// Unlike Q8_0 nothing is shared between blocks here — each block owns `scales[2b]` (qh) and
+    /// `scales[2b+1]` (d) — so any row range is a clean byte range and no alignment rule applies.
+    pub fn write_rows(&self, row0: usize, bytes: &[u8], n_rows: usize) -> Result<(), String> {
+        let bpr = self.cols / 32;
+        if row0 + n_rows > self.rows {
+            return Err(format!("rows {row0}..{} exceed the weight's {} rows", row0 + n_rows, self.rows));
+        }
+        if bytes.len() != n_rows * bpr * 22 {
+            return Err(format!("{} bytes for {n_rows} rows x {bpr} blocks (need {})",
+                               bytes.len(), n_rows * bpr * 22));
+        }
+        let (blk0, nblk) = (row0 * bpr, n_rows * bpr);
+        let mut codes: Vec<u32> = vec![0; nblk * 4];
+        let mut scales: Vec<u32> = vec![0; nblk * 2];
+        for b in 0..nblk {
+            let src = &bytes[b * 22..b * 22 + 22];
+            scales[b * 2] = u32::from_le_bytes([src[2], src[3], src[4], src[5]]);        // qh
+            scales[b * 2 + 1] = u16::from_le_bytes([src[0], src[1]]) as u32;             // d
+            for w in 0..4 {
+                let c = &src[6 + w * 4..6 + w * 4 + 4];
+                codes[b * 4 + w] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        self.ctx.queue.write_buffer(&self.codes, (blk0 * 4 * 4) as u64, bytemuck::cast_slice(&codes));
+        self.ctx.queue.write_buffer(&self.scales, (blk0 * 2 * 4) as u64, bytemuck::cast_slice(&scales));
+        Ok(())
+    }
+
 }
 
 /// **Q5_1** weights held packed on the GPU — the affine 5-bit (`value = (nibble|5th-bit)·d + m`).
@@ -1456,6 +1486,43 @@ impl Q8_0Weights {
         Q8_0Weights { ctx: ctx.clone(), codes: mk("q8_0.codes", &codes), scales: mk("q8_0.scales", &scales), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 34 }
+    /// Overwrite `n` consecutive rows in place. See [`Q4_KWeights::write_rows`].
+    ///
+    /// ⚠ **Q8_0 PACKS TWO BLOCKS' SCALES INTO ONE `u32`** (`scales[b/2] |= d << (16 * (b%2))`), and
+    /// `write_buffer` overwrites rather than read-modify-writes. So a block range that starts or
+    /// ends mid-word would clobber the neighbouring block's scale — a block belonging to a DIFFERENT
+    /// expert, which then dequantises against someone else's `d`. Refused rather than risked.
+    ///
+    /// In practice expert-major slabs are even-aligned (`blocks_per_row = cols/32` is even for any
+    /// `cols >= 64`), so this refuses nothing real — but "in practice" is not a guarantee, and the
+    /// failure it guards is silent.
+    pub fn write_rows(&self, row0: usize, bytes: &[u8], n_rows: usize) -> Result<(), String> {
+        let bpr = self.cols / 32;
+        if row0 + n_rows > self.rows {
+            return Err(format!("rows {row0}..{} exceed the weight's {} rows", row0 + n_rows, self.rows));
+        }
+        if bytes.len() != n_rows * bpr * 34 {
+            return Err(format!("{} bytes for {n_rows} rows x {bpr} blocks (need {})",
+                               bytes.len(), n_rows * bpr * 34));
+        }
+        let (blk0, nblk) = (row0 * bpr, n_rows * bpr);
+        if blk0 % 2 != 0 || nblk % 2 != 0 {
+            return Err(format!("Q8_0 shares one scale word between blocks {blk0} and {}; writing an \
+                                odd-aligned range ({blk0}, {nblk} blocks) would clobber a neighbouring \
+                                expert's scale", blk0 + 1));
+        }
+        let mut codes: Vec<u32> = vec![0; nblk * 8];
+        let mut scales: Vec<u32> = vec![0; nblk / 2];
+        for b in 0..nblk {
+            let src = &bytes[b * 34..b * 34 + 34];
+            scales[b / 2] |= (u16::from_le_bytes([src[0], src[1]]) as u32) << (16 * (b % 2));
+            for w in 0..8 { codes[b * 8 + w] = u32::from_le_bytes([src[2 + w * 4], src[3 + w * 4], src[4 + w * 4], src[5 + w * 4]]); }
+        }
+        self.ctx.queue.write_buffer(&self.codes, (blk0 * 8 * 4) as u64, bytemuck::cast_slice(&codes));
+        self.ctx.queue.write_buffer(&self.scales, (blk0 / 2 * 4) as u64, bytemuck::cast_slice(&scales));
+        Ok(())
+    }
+
 }
 
 impl Tensor {

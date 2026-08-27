@@ -422,11 +422,8 @@ impl StreamedExperts {
         match &self.down {
             DownSlab::Q6(w) => w.write_rows(row0, bytes, n),
             DownSlab::Q4(w) => w.write_rows(row0, bytes, n),
-            // ⚠ Only the two formats a Q4_K_M MoE actually uses have a row writer. Refusing names
-            // the gap; silently skipping the write would leave the slot holding the PREVIOUS
-            // expert's down projection while its gate|up is the new one — half of each.
-            DownSlab::Q8(_) => Err("streamed experts: Q8_0 down slab has no write_rows yet".into()),
-            DownSlab::Q5(_) => Err("streamed experts: Q5_0 down slab has no write_rows yet".into()),
+            DownSlab::Q8(w) => w.write_rows(row0, bytes, n),
+            DownSlab::Q5(w) => w.write_rows(row0, bytes, n),
         }
     }
 }
