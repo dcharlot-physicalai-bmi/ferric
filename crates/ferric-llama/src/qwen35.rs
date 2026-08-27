@@ -272,10 +272,124 @@ pub enum MoeExperts {
     Slab { gate_up: Q4_KWeights, down: DownSlab },
     /// All-Q8_0 slab — the MTP draft block's expert format.
     Slab8 { gate_up: Q8_0Weights, down: Q8_0Weights },
+    /// **A slab holding only C experts, filled on demand.** Runs a MoE whose routed experts do not
+    /// fit: the kernel derives its row base as `e * 2*eff` from whatever id `selw` carries, so a
+    /// C-expert slab with ids remapped to `[0, C)` runs the SAME kernel unchanged.
+    Streamed(StreamedExperts),
     /// One QMatrix pair per expert — the general fallback for other quant combinations.
     /// ⚠️ Routes on the CPU via a mid-forward readback: correct but slow, and the readback lands
     /// inside the caller's `batch()` — avoid for anything on the hot path.
     PerExpert(Vec<Expert>),
+}
+
+/// Routed experts held in a fixed number of GPU slots and fetched on miss.
+///
+/// This is what `ferric_tier::ExpertCache` was written for and never had a consumer for. The three
+/// pieces it needs all landed separately: `ExpertCache::place` says WHICH slot, `write_rows` puts
+/// bytes THERE, and the id kernel already reads its row base from `selw` so nothing about the
+/// arithmetic changes.
+///
+/// ⚠ **The win is VRAM, not host RAM.** The backing holds every expert's quantised bytes; only `C`
+/// of them are resident on the device. On a discrete GPU that is the whole point. On unified memory
+/// it is neutral until the backing is a FILE — which is a one-line swap (`SliceBacking` →
+/// `FileBacking`) precisely because this is written against `Backing` rather than a `Vec<u8>`.
+///
+/// ⚠ `slot_bytes` is passed as 1 deliberately. `ExpertCache` allocates a HOST buffer per slot for
+/// its own `get` path, which this type never calls — at a real expert size that would be hundreds of
+/// megabytes of untouched memory. The cost is that `ExpertStats::bytes_read` undercounts, so bytes
+/// are tallied here instead. Decoupling the cache's index from its buffers is the proper fix.
+pub struct StreamedExperts {
+    gate_up: Q4_KWeights,
+    down: DownSlab,
+    cache: std::sync::Mutex<ferric_tier::ExpertCache>,
+    gu_src: Box<dyn ferric_tier::Backing + Send + Sync>,
+    dn_src: Box<dyn ferric_tier::Backing + Send + Sync>,
+    gu_bytes: usize,
+    dn_bytes: usize,
+    layer: u32,
+    pub capacity: usize,
+    /// Experts fetched from the backing, and slot hits. Tallied here — see the `slot_bytes` note.
+    pub fetched: std::sync::atomic::AtomicU64,
+    pub hits: std::sync::atomic::AtomicU64,
+}
+
+impl StreamedExperts {
+    /// Resolve one token's `k` expert ids to slab slots, fetching any that are absent.
+    ///
+    /// ⚠ `note_selected` FIRST, for the whole group, before any `place`. It protects this step's
+    /// experts from eviction, so a miss on the first cannot evict the third. Placing one at a time
+    /// without it is the failure `ExpertCache` documents at its capacity floor.
+    fn resolve(&self, ids: &[u32]) -> Result<Vec<u32>, String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut c = self.cache.lock().map_err(|_| "expert cache poisoned")?;
+        c.note_selected(self.layer, ids);
+        let mut slots = Vec::with_capacity(ids.len());
+        for &e in ids {
+            let (slot, miss) = c.place(self.layer, e).map_err(|x| format!("place({e}): {x}"))?;
+            if miss {
+                let mut gu = vec![0u8; self.gu_bytes];
+                let mut dn = vec![0u8; self.dn_bytes];
+                // On ANY read failure the slot must go back, or a failed fetch strands it forever:
+                // Loading is never a hit and never a victim, so the cache would shrink by one.
+                let r = self.gu_src.read_at(e as u64 * self.gu_bytes as u64, &mut gu)
+                    .and_then(|_| self.dn_src.read_at(e as u64 * self.dn_bytes as u64, &mut dn));
+                if let Err(x) = r {
+                    let _ = c.abort(slot, self.layer, e);
+                    return Err(format!("fetch expert {e}: {x}"));
+                }
+                // ⚠ Plainly `rows / capacity`. The first version wrote
+                // `2 * (rows / (2 * capacity))`, which is arithmetically the same and fragile for no
+                // reason: two integer divisions where one will do, and it silently disagrees with
+                // `down_rows_per_expert` the moment either is edited. Both slabs are built
+                // expert-major with exactly `capacity` experts, so both derive the stride the same
+                // way or the two halves of an expert land at different offsets.
+                let gr = self.rows_per_expert(self.gate_up.rows);
+                let dr = self.down_rows_per_expert();
+                if let Err(x) = self.gate_up.write_rows(slot * gr, &gu, gr)
+                    .and_then(|_| self.write_down(slot * dr, &dn, dr)) {
+                    let _ = c.abort(slot, self.layer, e);
+                    return Err(format!("write expert {e}: {x}"));
+                }
+                c.commit(slot, self.layer, e).map_err(|x| format!("commit({e}): {x}"))?;
+                self.fetched.fetch_add(1, Relaxed);
+            } else {
+                self.hits.fetch_add(1, Relaxed);
+            }
+            slots.push(slot as u32);
+        }
+        Ok(slots)
+    }
+
+    /// Rows one expert occupies in a slab built expert-major over `capacity` experts.
+    ///
+    /// ⚠ Asserts divisibility rather than truncating. A slab whose rows are not a multiple of
+    /// `capacity` means the geometry is wrong, and silently flooring would place every expert past
+    /// the first at a drifting offset — plausible weights, wrong ones.
+    fn rows_per_expert(&self, rows: usize) -> usize {
+        assert!(self.capacity > 0 && rows % self.capacity == 0,
+                "slab has {rows} rows for {} experts — not expert-major", self.capacity);
+        rows / self.capacity
+    }
+
+    fn down_rows_per_expert(&self) -> usize {
+        let rows = match &self.down {
+            DownSlab::Q6(w) => w.rows, DownSlab::Q4(w) => w.rows,
+            DownSlab::Q8(w) => w.rows, DownSlab::Q5(w) => w.rows,
+        };
+        self.rows_per_expert(rows)
+    }
+
+    fn write_down(&self, row0: usize, bytes: &[u8], n: usize) -> Result<(), String> {
+        match &self.down {
+            DownSlab::Q6(w) => w.write_rows(row0, bytes, n),
+            DownSlab::Q4(w) => w.write_rows(row0, bytes, n),
+            // ⚠ Only the two formats a Q4_K_M MoE actually uses have a row writer. Refusing names
+            // the gap; silently skipping the write would leave the slot holding the PREVIOUS
+            // expert's down projection while its gate|up is the new one — half of each.
+            DownSlab::Q8(_) => Err("streamed experts: Q8_0 down slab has no write_rows yet".into()),
+            DownSlab::Q5(_) => Err("streamed experts: Q5_0 down slab has no write_rows yet".into()),
+        }
+    }
 }
 
 /// Mixture-of-experts FFN (qwen35moe): a softmax router picks the top-k of `experts`, each a SwiGLU FFN,
@@ -466,10 +580,40 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
             gu.extend_from_slice(&u_full[e * u_per..(e + 1) * u_per]);
         }
         let d_full = g.raw(&b("ffn_down_exps.weight"))?;
-        MoeExperts::Slab {
-            gate_up: Q4_KWeights::from_bytes(ctx, &gu, ne * 2 * eff, d),
-            down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) }
-                  else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) },
+        // FERRIC_MOE_SLOTS=C holds only C of the ne routed experts on the device and fetches the
+        // rest on demand. Opt-in, because it trades the batched fast path's zero syncs for a
+        // readback per (token, layer) — see the streamed branch in `moe_ffn`.
+        let slots: Option<usize> = std::env::var("FERRIC_MOE_SLOTS").ok().and_then(|v| v.parse().ok());
+        match slots {
+            // ⚠ `c` must be at least top_k + 1 (ExpertCache's own floor) AND smaller than the
+            // expert count, or streaming is either impossible or pointless. 0 means resident.
+            Some(c) if c > cfg.n_expert_used && c < ne => {
+                let (gu_per, dn_per) = (gu.len() / ne, d_full.len() / ne);
+                // Seed the slabs with the first C experts' bytes. Contents are irrelevant — every
+                // slot is overwritten before use — but the ALLOCATION has to be the right shape, and
+                // building from real bytes gets the geometry from the same code the resident path
+                // uses instead of a second derivation of it.
+                let gate_up = Q4_KWeights::from_bytes(ctx, &gu[..c * gu_per], c * 2 * eff, d);
+                let down = if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full[..c * dn_per], c * d, eff)) }
+                           else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full[..c * dn_per], c * d, eff)) };
+                // One cache per layer, so n_layers = 1 and every key uses layer 0.
+                let cache = ferric_tier::ExpertCache::new(1, ne as u32, 1, c, cfg.n_expert_used)
+                    .map_err(|e| format!("blk.{il} streamed experts: {e}"))?;
+                MoeExperts::Streamed(StreamedExperts {
+                    gate_up, down,
+                    cache: std::sync::Mutex::new(cache),
+                    gu_src: Box::new(ferric_tier::SliceBacking::new(gu)),
+                    dn_src: Box::new(ferric_tier::SliceBacking::new(d_full)),
+                    gu_bytes: gu_per, dn_bytes: dn_per, layer: 0, capacity: c,
+                    fetched: std::sync::atomic::AtomicU64::new(0),
+                    hits: std::sync::atomic::AtomicU64::new(0),
+                })
+            }
+            _ => MoeExperts::Slab {
+                gate_up: Q4_KWeights::from_bytes(ctx, &gu, ne * 2 * eff, d),
+                down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) }
+                      else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) },
+            },
         }
     } else if gt == 8 && dt == 8 {
         // All-Q8_0 experts (the MTP draft block): same slab layout, Q8_0 kernels.
@@ -905,7 +1049,79 @@ impl Qwen35 {
         // expert and its sigmoid gate are plain matmuls that batch over rows already. Zero syncs,
         // and the dispatch count is independent of T — a multi-token speculative-verify forward
         // costs the same FFN dispatches as single-token decode.
-        if !matches!(&m.experts, MoeExperts::PerExpert(_)) {
+        // Streamed experts: resolve ids to slots, fetching absent ones, then run the SAME kernels
+        // on a C-expert slab. The kernel derives its row base from whatever id `selw` carries
+        // (`dtype.rs`: `let e = u32(selw[...]); let base = e * (2u * eff);`), so remapping ids to
+        // slots is the entire difference.
+        if let MoeExperts::Streamed(st) = &m.experts {
+            let k = m.n_used;
+            let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale);
+            // ⚠ This readback is CORRECT inside `batch` — `readback` flushes any open batch as its
+            // first act. What it costs is the batching for the remainder of the enclosing closure,
+            // which is the price of streaming and is not avoidable: you cannot fetch an expert
+            // without first learning, on the CPU, which experts were chosen.
+            let sel = pollster::block_on(selw.to_vec());
+            // ⛔ RESOLVING EVERY TOKEN AND THEN RUNNING ONE KERNEL IS WRONG, and the invariance check
+            // caught it on its first run: three slot counts, three different logit vectors. A
+            // prompt's expert UNION is up to `t * k` — far more than `capacity` — so by the time the
+            // kernel ran, early tokens' slots had been evicted and refilled and their remapped
+            // indices pointed at whatever expert landed there. Nothing errors; the weights are real,
+            // just the wrong ones.
+            //
+            // So tokens are grouped into chunks whose union fits, and each chunk is resolved and
+            // executed before the next one is allowed to evict anything. Within a chunk the whole
+            // union is passed to `note_selected`, which is what makes it un-evictable — protecting
+            // one token's group at a time protects only the group being placed, not the ones already
+            // placed and still needed.
+            let ids_of = |ti: usize| -> Vec<u32> {
+                (0..k).map(|j| sel[ti * 2 * k + k + j] as u32).collect()
+            };
+            let mut parts: Vec<Tensor> = Vec::new();
+            let mut ti = 0usize;
+            while ti < t {
+                // Grow the chunk while the running union still fits in the slabs.
+                let mut union: Vec<u32> = Vec::new();
+                let mut end = ti;
+                while end < t {
+                    let mut u2 = union.clone();
+                    for e in ids_of(end) { if !u2.contains(&e) { u2.push(e) } }
+                    if u2.len() > st.capacity && end > ti { break }
+                    assert!(u2.len() <= st.capacity,
+                            "one token needs {} experts but only {} slots exist; FERRIC_MOE_SLOTS                              must be at least top_k", u2.len(), st.capacity);
+                    union = u2;
+                    end += 1;
+                }
+                let slot_of = st.resolve(&union).unwrap_or_else(|e| panic!("streamed experts: {e}"));
+                let map: std::collections::HashMap<u32, u32> =
+                    union.iter().copied().zip(slot_of).collect();
+
+                let rows = end - ti;
+                let mut chunk = vec![0f32; rows * 2 * k];
+                for r in 0..rows {
+                    for j in 0..2 * k {
+                        let v = sel[(ti + r) * 2 * k + j];
+                        // Weights pass through untouched; only the id half is remapped.
+                        chunk[r * 2 * k + j] = if j < k { v } else { map[&(v as u32)] as f32 };
+                    }
+                }
+                let csel = Tensor::from_vec(&self.ctx, &chunk, &[rows, 2 * k]);
+                let hc = if rows == t { h.clone() } else { h.narrow(0, ti, rows).contiguous() };
+                let mid = hc.matmul_q4_k_swiglu_id(&st.gate_up, &csel, k, self.cfg.expert_ff);
+                parts.push(st.down.wsum(&mid, &csel, d));
+                ti = end;
+            }
+            let routed = parts.iter().skip(1).fold(parts[0].clone(), |a, b| a.cat(b, 0));
+            let sh = self.expert(h, &m.shared, self.cfg.shared_ff);
+            let sh = match &m.sh_gate {
+                Some(sg) => {
+                    let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]);
+                    sh.mul(&gate)
+                }
+                None => sh,
+            };
+            return routed.add(&sh);
+        }
+        if !matches!(&m.experts, MoeExperts::PerExpert(_) | MoeExperts::Streamed(_)) {
             let k = m.n_used;
             // h·routerᵀ directly (no transpose materialized — a permute+contiguous here measured a
             // fixed ~17 ms/layer batch-splitting stall): logits [T, ne], token-major, which is also
@@ -921,7 +1137,7 @@ impl Qwen35 {
                     let mid = h.matmul_q8_0_swiglu_id(gate_up, &selw, k, self.cfg.expert_ff);
                     mid.matmul_q8_0_id_wsum(down, &selw, d)
                 }
-                MoeExperts::PerExpert(_) => unreachable!(),
+                MoeExperts::PerExpert(_) | MoeExperts::Streamed(_) => unreachable!("handled above"),
             };
             let sh = self.expert(h, &m.shared, self.cfg.shared_ff);
             let sh = match &m.sh_gate {
@@ -943,7 +1159,8 @@ impl Qwen35 {
         for ti in 0..t {
             let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]
             let routed = match &m.experts {
-                MoeExperts::Slab { .. } | MoeExperts::Slab8 { .. } => unreachable!("slab path handled above"),
+                MoeExperts::Slab { .. } | MoeExperts::Slab8 { .. } | MoeExperts::Streamed(_) =>
+                    unreachable!("slab and streamed paths handled above"),
                 // General fallback (other quant combos): CPU routing via one small readback.
                 MoeExperts::PerExpert(experts) => {
                     let lg = pollster::block_on(m.router.matmul(&h_t.reshape(&[d, 1])).to_vec());
