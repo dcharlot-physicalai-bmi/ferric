@@ -80,6 +80,15 @@ pub struct SeedResult {
     /// Distinct words the model actually emitted at each axis position across the held-out set.
     /// **1 means it answered the same thing every time.**
     pub distinct: Vec<usize>,
+    /// Share of held-out predictions at each axis position that were not a valid word for that
+    /// axis at all — a signal code, an end marker, or another axis's word.
+    ///
+    /// **"Wrong answer" and "not answering the question" are different failures.** An accuracy of
+    /// exactly 0.0% is the signature of the second: a model that had settled on the wrong caption
+    /// word would still be right whenever that word happened to be correct, so it lands on that
+    /// word's frequency rather than on nothing. Zero means the argmax is leaving the caption
+    /// vocabulary, and no amount of staring at an accuracy column says so.
+    pub off_axis: Vec<f64>,
 }
 
 /// One word per (axis, value) pair, plus a terminator at id 0.
@@ -259,8 +268,18 @@ pub fn train_captions(
 
     // Score each axis at its own caption position: the model sees the signal plus the caption
     // words before this axis, and must produce this axis's word.
+    // Which embedding rows are legal answers at each caption position, derived from the captions
+    // themselves so no extra plumbing can fall out of step with `build_words`.
+    let mut legal: Vec<HashSet<usize>> = vec![HashSet::new(); n_axes];
+    for c in caps {
+        for (a, w) in c.iter().take(n_axes).enumerate() {
+            legal[a].insert(seq.vocab().text(*w)? as usize);
+        }
+    }
+
     let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
     let mut right = vec![0usize; n_axes];
+    let mut off = vec![0usize; n_axes];
     // What the model EMITTED, not just whether it was right. A model that answers the same word
     // for every held-out cycle scores the frequency of that word and looks like a weak learner in
     // an accuracy column; counting distinct predictions says outright that it never varied.
@@ -283,14 +302,112 @@ pub fn train_captions(
                 .map(|(i, _)| i)
                 .ok_or(PatchError::Ragged { len: 0, channels: rows as usize })?;
             said[a].insert(best);
+            if !legal[a].contains(&best) {
+                off[a] += 1;
+            }
             if best == seq.vocab().text(caps[i][a])? as usize {
                 right[a] += 1;
             }
         }
     }
+    let n = held_idx.len().max(1) as f64;
     Ok(SeedResult {
-        acc: right.iter().map(|&r| r as f64 / held_idx.len() as f64 * 100.0).collect(),
+        acc: right.iter().map(|&r| r as f64 / n * 100.0).collect(),
         distinct: said.iter().map(|s| s.len()).collect(),
+        off_axis: off.iter().map(|&o| o as f64 / n * 100.0).collect(),
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caption_is_one_word_per_axis_plus_a_terminator() {
+        let labels = vec![vec![3, 100], vec![20, 100], vec![3, 80]];
+        let (words, caps) = build_words(&["cooler", "valve"], &labels);
+        // id 0 is the terminator, then cooler's two values, then valve's two.
+        assert_eq!(words[0], "<end>");
+        assert_eq!(&words[1..], &["cooler=3", "cooler=20", "valve=80", "valve=100"]);
+        for (c, row) in caps.iter().zip(&labels) {
+            assert_eq!(c.len(), row.len() + 1);
+            assert_eq!(*c.last().unwrap(), 0, "every caption ends with the terminator");
+        }
+        // The words a caption points at must spell its own labels back.
+        for (c, row) in caps.iter().zip(&labels) {
+            assert_eq!(words[c[0] as usize], format!("cooler={}", row[0]));
+            assert_eq!(words[c[1] as usize], format!("valve={}", row[1]));
+        }
+    }
+
+    /// Values are sorted per axis, so a caption vocabulary does not depend on the order examples
+    /// happened to arrive in — two runs over a shuffled corpus must build the same words.
+    #[test]
+    fn the_caption_vocabulary_does_not_depend_on_example_order() {
+        let a = vec![vec![3, 100], vec![20, 80], vec![100, 90]];
+        let b = vec![vec![100, 90], vec![3, 100], vec![20, 80]];
+        let (wa, _) = build_words(&["x", "y"], &a);
+        let (wb, _) = build_words(&["x", "y"], &b);
+        assert_eq!(wa, wb);
+    }
+
+    /// The axes must stay separable: two examples differing on ONE axis differ in exactly one
+    /// caption position. If they did not, a per-axis score would be measuring something blended.
+    #[test]
+    fn changing_one_label_changes_exactly_one_caption_word() {
+        let labels = vec![vec![0, 5, 9], vec![1, 5, 9]];
+        let (_, caps) = build_words(&["a", "b", "c"], &labels);
+        let diff = caps[0].iter().zip(&caps[1]).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 1);
+    }
+
+    fn docs(v: &[&[&[u32]]]) -> Vec<Vec<Vec<u32>>> {
+        v.iter().map(|d| d.iter().map(|r| r.to_vec()).collect()).collect()
+    }
+
+    #[test]
+    fn compaction_densely_renumbers_the_codes_training_actually_used() {
+        // Training uses 5, 900 and 30000; held-out also uses 77, which training never saw.
+        let d = docs(&[&[&[900, 5]], &[&[30000]], &[&[77, 5]]]);
+        let (out, size, miss) = compact(&d, &[0, 1], &[2]);
+        // Three training codes plus one reserved id for everything unseen.
+        assert_eq!(size, 4);
+        // Sorted, so 5 -> 0, 900 -> 1, 30000 -> 2, and anything else -> 3.
+        assert_eq!(out[0], vec![vec![1, 0]]);
+        assert_eq!(out[1], vec![vec![2]]);
+        assert_eq!(out[2], vec![vec![3, 0]], "an unseen code goes to the reserved id");
+        // One of the held-out example's two tokens was unseen.
+        assert!((miss - 50.0).abs() < 1e-9, "miss rate was {miss}");
+    }
+
+    /// **The miss rate is the number that says whether compaction was free.** A vocabulary built
+    /// from training that does not cover the held-out set is discarding held-out signal, and the
+    /// accuracy that follows would be reported as if it had not.
+    #[test]
+    fn a_held_out_set_of_entirely_unseen_codes_reports_a_full_miss() {
+        let d = docs(&[&[&[1, 2]], &[&[500, 501]]]);
+        let (_, _, miss) = compact(&d, &[0], &[1]);
+        assert!((miss - 100.0).abs() < 1e-9, "miss rate was {miss}");
+    }
+
+    /// Compaction must not merge two documents that were different, or the corpus quietly loses
+    /// examples to collisions and every count after it is wrong.
+    #[test]
+    fn compaction_keeps_distinct_documents_distinct() {
+        let d = docs(&[&[&[10, 20]], &[&[20, 10]], &[&[10, 10]]]);
+        let (out, _, _) = compact(&d, &[0, 1, 2], &[]);
+        assert_ne!(out[0], out[1]);
+        assert_ne!(out[0], out[2]);
+        assert_ne!(out[1], out[2]);
+    }
+
+    /// Compaction is built from the TRAINING examples only. A vocabulary fitted to codes that only
+    /// the held-out set contains has already been told something about it.
+    #[test]
+    fn compaction_never_reserves_a_row_for_a_code_only_the_held_out_set_uses() {
+        let d = docs(&[&[&[1]], &[&[2]], &[&[3]], &[&[4]]]);
+        let (_, size, _) = compact(&d, &[0, 1], &[2, 3]);
+        assert_eq!(size, 3, "two training codes plus one reserved id, and nothing for 3 or 4");
+    }
+}

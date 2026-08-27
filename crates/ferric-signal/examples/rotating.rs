@@ -368,9 +368,9 @@ fn main() {
         runs.push(r);
     }
 
-    println!("\n  {:<10} {:>8} {:>7} {:>10} {:>8} {:>10}",
-             "axis", "mean", "sd", "majority", "chance", "said");
-    println!("  {:-<10} {:->8} {:->7} {:->10} {:->8} {:->10}", "", "", "", "", "", "");
+    println!("\n  {:<10} {:>8} {:>7} {:>10} {:>8} {:>10} {:>8}",
+             "axis", "mean", "sd", "majority", "chance", "said", "off-axis");
+    println!("  {:-<10} {:->8} {:->7} {:->10} {:->8} {:->10} {:->8}", "", "", "", "", "", "", "");
     for (a, name) in AXES.iter().enumerate() {
         let labels = &per_axis[a];
         let train_cls: HashSet<i32> = train.iter().map(|&i| labels[i]).collect();
@@ -379,9 +379,10 @@ fn main() {
         let m = v.iter().sum::<f64>() / v.len() as f64;
         let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt();
         let said = runs.iter().map(|r| r.distinct[a] as f64).sum::<f64>() / runs.len() as f64;
+        let off = runs.iter().map(|r| r.off_axis[a]).sum::<f64>() / runs.len() as f64;
         let n_cls = labels.iter().collect::<HashSet<_>>().len();
         if !held_cls.is_subset(&train_cls) {
-            println!("  {name:<10} {m:>7.1}% {sd:>6.1} {:>10} {:>8} {said:>7.1} of {n_cls}   <- not askable under this split",
+            println!("  {name:<10} {m:>7.1}% {sd:>6.1} {:>10} {:>8} {said:>7.1} of {n_cls} {off:>7.0}%  <- not askable under this split",
                      "-", "-");
             continue;
         }
@@ -393,10 +394,14 @@ fn main() {
         } else {
             "  <- at or below majority"
         };
-        println!("  {name:<10} {m:>7.1}% {sd:>6.1} {maj:>9.1}% {:>7.1}% {said:>7.1} of {n_cls}{verdict}",
+        println!("  {name:<10} {m:>7.1}% {sd:>6.1} {maj:>9.1}% {:>7.1}% {said:>7.1} of {n_cls} {off:>7.0}%{verdict}",
                  chance(labels));
     }
     println!("\n  `said` counts the distinct words the decoder actually emitted at that position");
     println!("  across the held-out set. 1.0 means it answered the same thing every time, which");
-    println!("  scores that word's frequency and reads as a weak learner in an accuracy column.\n");
+    println!("  scores that word's frequency and reads as a weak learner in an accuracy column.");
+    println!("  `off-axis` is the share of predictions that were not a word for that axis at all —");
+    println!("  a signal code, an end marker, another axis's word. An accuracy of exactly 0.0% is");
+    println!("  its signature: a decoder settled on the WRONG caption word still scores that");
+    println!("  word's frequency, so nothing at all means the argmax left the caption vocabulary.\n");
 }
