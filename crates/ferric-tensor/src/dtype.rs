@@ -1554,6 +1554,54 @@ impl Q4_KWeights {
         Q4_KWeights { ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), codes_t, aux_t, rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 144 }
+
+    /// **Overwrite `n` consecutive rows in place** — the primitive expert residency needs and the
+    /// tensor layer did not have. Nothing in this file wrote into a built weight before now
+    /// (`write_buffer` count was zero), which is why no runtime can stream an expert: there was no
+    /// way to put a fetched one anywhere.
+    ///
+    /// Blocks are row-major (`b = row * cols/256 + j`), so a row RANGE is a contiguous byte range in
+    /// both `codes` and `aux`, and the write is two `write_buffer` calls with no repacking of
+    /// neighbours. The buffers already carry `COPY_DST`.
+    ///
+    /// ⚠ **Refuses when the transposed copies exist.** `FERRIC_Q4K_TRANS` builds `codes_t`/`aux_t`
+    /// as a reordered duplicate; writing only the row-major pair would leave them stale and every
+    /// kernel that reads them would return the PREVIOUS expert — finite, plausible, and wrong.
+    /// Refusing beats silently updating one of two representations.
+    ///
+    /// ⚠ Cost is not assumed. `lib.rs:1488` measured `write_buffer` LOSING to fresh allocation for
+    /// a few dozen bytes, because wgpu's staging belt has a fixed overhead. An expert here is ~2 MB,
+    /// where that overhead amortises — but this is stated as a reason not to extrapolate the old
+    /// measurement, not as a claim about the new one. Measure it on a working streaming path.
+    pub fn write_rows(&self, row0: usize, bytes: &[u8], n_rows: usize) -> Result<(), String> {
+        if self.codes_t.is_some() || self.aux_t.is_some() {
+            return Err("write_rows on a weight with FERRIC_Q4K_TRANS transposed copies: they would \
+                        go stale and kernels reading them would return the previous expert".into());
+        }
+        let bpr = self.cols / 256;
+        if row0 + n_rows > self.rows {
+            return Err(format!("rows {row0}..{} exceed the weight's {} rows", row0 + n_rows, self.rows));
+        }
+        if bytes.len() != n_rows * bpr * 144 {
+            return Err(format!("{} bytes for {n_rows} rows x {bpr} blocks (need {})",
+                               bytes.len(), n_rows * bpr * 144));
+        }
+        let nblk = n_rows * bpr;
+        let mut codes: Vec<u32> = vec![0; nblk * 32];
+        let mut aux: Vec<u32> = vec![0; nblk * 4];
+        for b in 0..nblk {
+            let src = &bytes[b * 144..b * 144 + 144];
+            aux[b * 4] = u16::from_le_bytes([src[0], src[1]]) as u32
+                       | ((u16::from_le_bytes([src[2], src[3]]) as u32) << 16);
+            for w in 0..3 { aux[b * 4 + 1 + w] = u32::from_le_bytes([src[4 + w * 4], src[5 + w * 4], src[6 + w * 4], src[7 + w * 4]]); }
+            for w in 0..32 { codes[b * 32 + w] = u32::from_le_bytes([src[16 + w * 4], src[17 + w * 4], src[18 + w * 4], src[19 + w * 4]]); }
+        }
+        let blk0 = row0 * bpr;
+        self.ctx.queue.write_buffer(&self.codes, (blk0 * 32 * 4) as u64, bytemuck::cast_slice(&codes));
+        self.ctx.queue.write_buffer(&self.aux, (blk0 * 4 * 4) as u64, bytemuck::cast_slice(&aux));
+        Ok(())
+    }
+
 }
 
 impl Tensor {
