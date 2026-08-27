@@ -110,7 +110,10 @@ impl Cfg {
             n_vocab,
             eps: f("attention.layer_norm_rms_epsilon")?,
             rope_base: f("rope.freq_base")?,
-            n_rot: u("rope.dimension_count")?,
+            // ⚠ OPTIONAL, not required. qwen3moe omits `rope.dimension_count` entirely; llama.cpp
+            // falls back to the head dimension, and requiring it here refused the single
+            // most-downloaded GGUF on the platform for a key it never had.
+            n_rot: match uo("rope.dimension_count") { 0 => u("attention.key_length")?, v => v },
             full_attention_interval: g.metadata().get(&key("full_attention_interval")).and_then(|m| if let Meta::U(v) = m { Some(*v as usize) } else { None }).unwrap_or(4),
             conv_kernel: uo("ssm.conv_kernel"),
             n_k_heads: uo("ssm.group_count"),
@@ -467,7 +470,14 @@ impl StreamedExperts {
 pub struct MoeFfn {
     pub router: Tensor,        // [n_expert, n_embd] f32 — routed-expert gate
     pub experts: MoeExperts,   // n_expert routed experts (each [n_embd→expert_ff→n_embd])
-    pub shared: Expert,        // always-on shared expert
+    /// The always-on shared expert — **`None` for the MoE families that have none**.
+    ///
+    /// qwen35moe and laguna both carry one, so this was a plain `Expert` and every new MoE family
+    /// without one needed its own parallel FFN path instead of this runtime. `lfm2moe` got exactly
+    /// that treatment this morning; `qwen3moe` (`expert_shared_feed_forward_length = 0`, 12.5M
+    /// downloads) would have been the second. Presence-detected from the tensors, so a family that
+    /// has one keeps it and a family that does not is no longer a fork.
+    pub shared: Option<Expert>,
     pub sh_gate: Option<Tensor>, // [n_embd] f32 — sigmoid(x·sh_gate) scales the shared expert (qwen35moe); laguna's shared expert is ungated
     pub n_used: usize,         // top-k
     pub sigmoid: bool,         // router scores via sigmoid (laguna/DeepSeek-style) instead of softmax
@@ -765,10 +775,17 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
     Ok(Ffn::Moe(MoeFfn {
         router: f32t(ctx, g, &b("ffn_gate_inp.weight"), &[ne, d])?,
         experts,
-        shared: Expert {
-            gate_up: qm_cat(ctx, g, &[&b("ffn_gate_shexp.weight"), &b("ffn_up_shexp.weight")])?,
-            down: qm(ctx, g, &b("ffn_down_shexp.weight"))?,
-        },
+        // Presence, not the metadata width: `expert_shared_feed_forward_length` and the tensors
+        // must agree, and the tensors are what the forward pass will actually read.
+        shared: if g.tensor(&b("ffn_gate_shexp.weight")).is_some() {
+            Some(Expert {
+                gate_up: qm_cat(ctx, g, &[&b("ffn_gate_shexp.weight"), &b("ffn_up_shexp.weight")])?,
+                down: qm(ctx, g, &b("ffn_down_shexp.weight"))?,
+            })
+        } else if cfg.shared_ff != 0 {
+            return Err(format!("blk.{il}: expert_shared_feed_forward_length is {} but there are no \
+                                ffn_*_shexp tensors", cfg.shared_ff));
+        } else { None },
         sh_gate,
         n_used: cfg.n_expert_used,
         sigmoid: cfg.gating_sigmoid,
@@ -975,10 +992,20 @@ impl Qwen35 {
         let (t, hd, nh) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head);
         let nkv = self.cfg.n_head_kv;
         // One fused matmul emits [q_and_gate | k | v]; split it back out.
+        // ⚠ THE GATE IS NOT UNIVERSAL. qwen35 and laguna pack a per-head sigmoid gate alongside q, so
+        // `attn_q` is `nh · 2·hd` wide; qwen3moe ships plain GQA at `nh · hd`. This reshape was
+        // unconditionally `hd * 2` and refused Qwen3-Coder-30B-A3B — the most-downloaded GGUF on the
+        // platform — with "reshape changes numel: 40960 vs 20480", a factor of exactly two.
+        //
+        // Detected from the tensor WIDTH, not the arch name, like every other optional feature in
+        // this loader (`ssm_out` → GDN, `ffn_gate_exps` → MoE, `ffn_gate_shexp` → shared expert).
+        let gated = w.q_out == nh * hd * 2;
+        debug_assert!(gated || w.q_out == nh * hd,
+                      "attn_q is {} wide: neither nh·hd ({}) nor nh·2hd ({})", w.q_out, nh * hd, nh * hd * 2);
         let qkv = w.wqkv.matmul(h);
-        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[t, nh, hd * 2]);
+        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[t, nh, if gated { hd * 2 } else { hd }]);
         let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[t, nh * hd]);
-        let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[t, nh * hd]);
+        let gate = if gated { Some(qf.narrow(2, hd, hd).contiguous().reshape(&[t, nh * hd])) } else { None };
 
         let k = qkv.narrow(1, w.q_out, w.kv_out).reshape(&[t, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[t, nkv * hd]);
         let v = qkv.narrow(1, w.q_out + w.kv_out, w.kv_out).contiguous();
@@ -1029,7 +1056,8 @@ impl Qwen35 {
             Some((qk, qv)) => Some(LayerCache::AttnQ { k: qk, v: qv }),
             None => Some(LayerCache::Attn { k: kc, v: vc }),
         };
-        o.mul(&gate.sigmoid()).matmul_q(&w.wo)
+        // Ungated (qwen3moe): straight to wo. A ones-multiply would cost a dispatch to do nothing.
+        match &gate { Some(g) => o.mul(&g.sigmoid()), None => o }.matmul_q(&w.wo)
     }
 
     fn gdn(&self, h: &Tensor, w: &GdnW, cache: &mut Option<LayerCache>) -> Tensor {
@@ -1226,7 +1254,10 @@ impl Qwen35 {
                 ti = end;
             }
             let routed = parts.iter().skip(1).fold(parts[0].clone(), |a, b| a.cat(b, 0));
-            let sh = self.expert(h, &m.shared, self.cfg.shared_ff);
+            // No shared expert (qwen3moe): the routed sum IS the block output. Adding a zero
+            // tensor instead would cost a dispatch per layer to change nothing.
+            let Some(shared) = &m.shared else { return routed };
+            let sh = self.expert(h, shared, self.cfg.shared_ff);
             let sh = match &m.sh_gate {
                 Some(sg) => {
                     let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]);
@@ -1254,7 +1285,8 @@ impl Qwen35 {
                 }
                 MoeExperts::PerExpert(_) | MoeExperts::Streamed(_) => unreachable!("handled above"),
             };
-            let sh = self.expert(h, &m.shared, self.cfg.shared_ff);
+            let Some(shared) = &m.shared else { return routed };
+            let sh = self.expert(h, shared, self.cfg.shared_ff);
             let sh = match &m.sh_gate {
                 Some(sg) => {
                     let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]); // [T,1]→[T,d]
@@ -1306,16 +1338,22 @@ impl Qwen35 {
                     acc.expect("top-k is at least 1")
                 }
             };
-            // shared expert — sigmoid-gated for qwen35moe (GPU-side, no readback), plain for laguna
-            let sh = self.expert(&h_t, &m.shared, self.cfg.shared_ff);
-            let sh = match &m.sh_gate {
-                Some(sg) => {
-                    let gate = sg.reshape(&[1, d]).matmul(&h_t.reshape(&[d, 1])).sigmoid().broadcast_to(&[1, d]);
-                    sh.mul(&gate)
+            // shared expert — sigmoid-gated for qwen35moe (GPU-side, no readback), plain for laguna,
+            // absent entirely for qwen3moe.
+            match &m.shared {
+                None => rows.push(routed),
+                Some(shared) => {
+                    let sh = self.expert(&h_t, shared, self.cfg.shared_ff);
+                    let sh = match &m.sh_gate {
+                        Some(sg) => {
+                            let gate = sg.reshape(&[1, d]).matmul(&h_t.reshape(&[d, 1])).sigmoid().broadcast_to(&[1, d]);
+                            sh.mul(&gate)
+                        }
+                        None => sh,
+                    };
+                    rows.push(routed.add(&sh));
                 }
-                None => sh,
-            };
-            rows.push(routed.add(&sh));
+            }
         }
         let mut it = rows.into_iter();
         let mut o = it.next().expect("moe_ffn: empty input");
@@ -1623,9 +1661,11 @@ impl Qwen35 {
         debug_assert_eq!(n, caches.len(), "one row per sequence");
 
         let qkv = w.wqkv.matmul(h);                                   // <-- batched: the win
-        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[n, nh, hd * 2]);
+        // Same shape-detection as the solo path; see `attn`.
+        let gated = w.q_out == nh * hd * 2;
+        let qf = qkv.narrow(1, 0, w.q_out).reshape(&[n, nh, if gated { hd * 2 } else { hd }]);
         let q = qf.narrow(2, 0, hd).rmsnorm(&w.q_norm, self.cfg.eps).reshape(&[n, nh * hd]);
-        let gate = qf.narrow(2, hd, hd).contiguous().reshape(&[n, nh * hd]);
+        let gate = if gated { Some(qf.narrow(2, hd, hd).contiguous().reshape(&[n, nh * hd])) } else { None };
         let k = qkv.narrow(1, w.q_out, w.kv_out).reshape(&[n, nkv, hd]).rmsnorm(&w.k_norm, self.cfg.eps).reshape(&[n, nkv * hd]);
         let v = qkv.narrow(1, w.q_out + w.kv_out, w.kv_out).contiguous();
 
@@ -1676,7 +1716,7 @@ impl Qwen35 {
             };
         }
         let o = Self::stack_rows(outs);
-        o.mul(&gate.sigmoid()).matmul_q(&w.wo)                        // <-- batched again
+        match &gate { Some(g) => o.mul(&g.sigmoid()), None => o }.matmul_q(&w.wo)   // <-- batched again
     }
 
     /// Laguna attention (sliding-window or YaRN full) for N sequences, one token each.

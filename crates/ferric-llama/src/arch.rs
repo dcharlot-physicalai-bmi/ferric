@@ -197,6 +197,19 @@ pub const REGISTRY: &[Arch] = &[
            note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order. ⚠ the YaRN long-rope \
                   SUB-PATH is unverified: it ran through rope_scaled, which applied no rotation at \
                   all until 2026-08-15, so any earlier check passed without exercising it" },
+    // ---- Qwen3-era MoE -------------------------------------------------------------------
+    //
+    // ⚠ THE MOST-DOWNLOADED GGUF ON HUGGING FACE (Qwen3-Coder-30B-A3B, 12.5M) and this runtime
+    // refused it — while supporting qwen3 dense, qwen35 dense AND qwen35moe. The gap was never a
+    // forward pass: the mixer is presence-detected (no ssm_out → Attn), the FFN is presence-detected
+    // (ffn_gate_exps → MoE), and the metadata prefix already follows general.architecture. It was
+    // two fields. `rope.dimension_count` was REQUIRED and qwen3moe does not emit it, and `MoeFfn`
+    // demanded a shared expert that qwen3moe does not have.
+    Arch { name: "qwen3moe", runtime: Runtime::Hybrid, status: Status::Loads,
+           note: "Qwen3-30B-A3B / Qwen3-Coder-30B-A3B: plain GQA (no gated-delta-net) + 128 routed \
+                  experts, top-8, expert width 768, NO shared expert and NO selection bias — so a \
+                  softmax router straight through moe_topk. head_dim comes from attention.key_length \
+                  (128), which is NOT n_embd/n_head (64). Not diffed against a reference" },
     Arch { name: "qwen35moe", runtime: Runtime::Hybrid, status: Status::Verified,
            note: "as qwen35 with an MoE FFN" },
     Arch { name: "laguna", runtime: Runtime::Hybrid, status: Status::Loads,
