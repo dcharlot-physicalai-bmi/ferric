@@ -63,7 +63,7 @@ pub async fn ferric_worker_exec(input: Vec<u8>) -> Vec<u8> {
 }
 
 // Same deterministic matrices as the native example, so the browser result must match.
-fn gen(m: u32, k: u32, n: u32) -> (Vec<f32>, Vec<f32>) {
+fn r#gen(m: u32, k: u32, n: u32) -> (Vec<f32>, Vec<f32>) {
     let a: Vec<f32> = (0..(m * k) as usize).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
     let b: Vec<f32> = (0..(k * n) as usize).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1).collect();
     (a, b)
@@ -75,7 +75,7 @@ fn gen(m: u32, k: u32, n: u32) -> (Vec<f32>, Vec<f32>) {
 pub async fn ferric_matmul_demo(m: u32, k: u32, n: u32) -> std::result::Result<String, JsValue> {
     console_error_panic_hook::set_once();
     let ctx = Context::new().await.map_err(|e| jserr(&e))?;
-    let (a, b) = gen(m, k, n);
+    let (a, b) = r#gen(m, k, n);
     let gpu = ctx.matmul(&a, &b, m, k, n).await.map_err(|e| jserr(&e))?;
     let cpu = matmul_cpu(&a, &b, m as usize, k as usize, n as usize);
     let diff = max_abs_diff(&gpu, &cpu);
@@ -107,7 +107,7 @@ impl FerricFabric {
 
     /// Run an `n×n·n×n` matmul on the tab's WebGPU; returns the output checksum.
     pub async fn gpu_matmul(&self, n: u32) -> std::result::Result<f32, JsValue> {
-        let (a, b) = gen(n, n, n);
+        let (a, b) = r#gen(n, n, n);
         let out = Tensor::from_vec(&self.ctx, &a, &[n as usize, n as usize])
             .matmul(&Tensor::from_vec(&self.ctx, &b, &[n as usize, n as usize]))
             .to_vec()
@@ -117,14 +117,14 @@ impl FerricFabric {
 
     /// The same matmul on the in-wasm CPU reference; returns the output checksum (should match the GPU).
     pub fn cpu_matmul(&self, n: u32) -> f32 {
-        let (a, b) = gen(n, n, n);
+        let (a, b) = r#gen(n, n, n);
         matmul_cpu(&a, &b, n as usize, n as usize, n as usize).iter().sum()
     }
 
     /// Correctness: the **max per-element** absolute difference between the WebGPU and CPU results
     /// (bounded by fp rounding, ~1e-6 — unlike a summed checksum, this does not accumulate with size).
     pub async fn verify(&self, n: u32) -> std::result::Result<f32, JsValue> {
-        let (a, b) = gen(n, n, n);
+        let (a, b) = r#gen(n, n, n);
         let gpu = Tensor::from_vec(&self.ctx, &a, &[n as usize, n as usize])
             .matmul(&Tensor::from_vec(&self.ctx, &b, &[n as usize, n as usize]))
             .to_vec()

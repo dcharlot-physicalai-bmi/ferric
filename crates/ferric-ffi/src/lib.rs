@@ -97,14 +97,14 @@ fn cstr<'a>(p: *const c_char) -> Option<&'a str> { if p.is_null() { None } else 
 fn out(s: String) -> *mut c_char { CString::new(s).unwrap_or_default().into_raw() }
 
 /// Load a GGUF model. Returns an opaque handle, or NULL on failure.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ferric_load(model_path: *const c_char) -> *mut FerricHandle {
     let Some(path) = cstr(model_path) else { return std::ptr::null_mut() };
     match FerricHandle::load(path) { Ok(h) => Box::into_raw(Box::new(h)), Err(_) => std::ptr::null_mut() }
 }
 
 /// Greedy free-text completion of `prompt` for up to `max_tokens`. Caller frees the result string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
     out(h.run(p, max_tokens as usize, None))
@@ -112,7 +112,7 @@ pub extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, m
 
 /// Schema-constrained generation: output is guaranteed-conformant JSON. `schema` is a JSON-Schema
 /// string (empty → any valid JSON object). Caller frees the result string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_char, schema: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
     let sch = ferric_agent::guide::compile_str(cstr(schema).unwrap_or(""));
@@ -124,9 +124,9 @@ pub extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_ch
 }
 
 /// Free a string returned by `ferric_generate*`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ferric_free_string(s: *mut c_char) { if !s.is_null() { unsafe { drop(CString::from_raw(s)); } } }
 
 /// Free a model handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ferric_free(h: *mut FerricHandle) { if !h.is_null() { unsafe { drop(Box::from_raw(h)); } } }

@@ -1447,8 +1447,15 @@ mod kvq_cache_tests {
         let msg = e.downcast_ref::<String>().map(String::as_str).unwrap_or("");
         assert!(msg.contains("is not a KV cache format"), "unexpected panic message: {msg:?}");
 
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        match restore { Some(v) => std::env::set_var("FERRIC_KVQ", v), None => unsafe { std::env::remove_var("FERRIC_KVQ") } }
+        // Edition 2024 makes both env mutators unsafe: writing the environment races with any
+        // other thread reading it. This is a #[test] restoring the variable it saved at the top
+        // of the same test, and cargo's test harness runs each test on its own thread with no
+        // other reader of FERRIC_KVQ, so the pair is sound here. Both arms are marked; cargo fix
+        // caught only the remove_var and left its sibling on the same line.
+        match restore {
+            Some(v) => unsafe { std::env::set_var("FERRIC_KVQ", v) },
+            None => unsafe { std::env::remove_var("FERRIC_KVQ") },
+        }
     }
 
     /// Using the wrong accessor would store an empty prefix and seed one — a cache that is quietly not

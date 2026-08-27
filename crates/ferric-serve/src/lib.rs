@@ -106,7 +106,7 @@ impl Model {
     /// produced by `new_cache` on this same `Model`.
     fn forward_batch(&self, tokens: &[u32], caches: &mut [&mut ModelCache]) -> Tensor {
         macro_rules! b {
-            ($m:expr, $variant:path) => {{
+            ($m:expr_2021, $variant:path) => {{
                 let mut cs: Vec<_> = caches.iter_mut()
                     .map(|c| match &mut **c { $variant(x) => x, _ => unreachable!("model/cache kind mismatch") })
                     .collect();
@@ -539,25 +539,25 @@ impl Engine {
         let mut cache = self.model.new_cache();
         let n_vocab = self.model.n_vocab();
         let mut rng: u64 = 0x2545_F491_4F6C_DD1D; // deterministic seed → reproducible sampling
-        let mut gen: Vec<u32> = Vec::new();
+        let mut r#gen: Vec<u32> = Vec::new();
         let mut emitted = String::new();
         for step in 0..max_tokens {
-            let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*gen.last().unwrap()] };
+            let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*r#gen.last().unwrap()] };
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
             let Some(next) = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng) else { break };
             if self.eos.contains(&next) { break; }
             if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
-            gen.push(next);
+            r#gen.push(next);
             // Re-detok the whole generation and emit only the new suffix (handles multi-byte UTF-8).
-            let full = self.detok(&gen);
+            let full = self.detok(&r#gen);
             if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
                 let delta = full[emitted.len()..].to_string();
                 on_delta(&delta);
                 emitted = full;
             }
         }
-        (emitted, prompt.len(), gen.len())
+        (emitted, prompt.len(), r#gen.len())
     }
 
     /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
@@ -599,7 +599,7 @@ impl Engine {
         let n_vocab = self.model.n_vocab();
         let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
         let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
-        let mut gen: Vec<u32> = Vec::new();
+        let mut r#gen: Vec<u32> = Vec::new();
         let mut emitted = String::new();
         // One-slot prompt-prefix reuse: when this prompt extends the cached conversation, resume
         // its caches and prefill only the new suffix.
@@ -613,10 +613,10 @@ impl Engine {
         };
         // Commit one token: advance the guide, then stream the newly-decoded suffix.
         macro_rules! commit {
-            ($tok:expr) => {{
+            ($tok:expr_2021) => {{
                 if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[$tok as usize].as_ref()) { for &c in b { g.step(c); } }
-                gen.push($tok);
-                let full = self.detok(&gen);
+                r#gen.push($tok);
+                let full = self.detok(&r#gen);
                 if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
                     let delta = full[emitted.len()..].to_string();
                     on_delta(&delta);
@@ -651,7 +651,7 @@ impl Engine {
         // conditional acceptance ~65-71%). The larger verify `t` flips near-tie logits vs single-token
         // decode a little more often than the 1-token path, so 1-token stays the byte-identical default.
         let draft2 = std::env::var("FERRIC_SPEC_DRAFT").ok().as_deref() == Some("2");
-        while gen.len() < max_tokens {
+        while r#gen.len() < max_tokens {
             if draft2 {
                 // Draft d1 (advances the real mc past ptoks), then d2 recursively on a throwaway clone.
                 let (l1, h1) = m.mtp_forward_h(&ptoks, &phid, &mut mc);
@@ -672,7 +672,7 @@ impl Engine {
                 // where the decision is ALREADY made rather than re-derived, so the tally cannot drift
                 // from the branch it describes.
                 drafted += 2;
-                if t1 != d1 || gen.len() >= max_tokens {
+                if t1 != d1 || r#gen.len() >= max_tokens {
                     // Reject both (or stop): discard the forward, re-feed t1 next iter.
                     cache = snap;
                     unfed.push(t1);
@@ -685,7 +685,7 @@ impl Engine {
                 let Some(t2) = t2.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
                 commit!(t2);
                 accepted += 1;   // d1 matched
-                if t2 != d2 || gen.len() >= max_tokens {
+                if t2 != d2 || r#gen.len() >= max_tokens {
                     // Accept d1 only: d2's cache entry is wrong → discard forward, re-feed [d1, t2].
                     cache = snap;
                     unfed = { let mut u = unfed.clone(); u.push(d1); u.push(t2); u };
@@ -722,7 +722,7 @@ impl Engine {
                 break;
             };
             commit!(truth);
-            if truth == d && gen.len() < max_tokens {
+            if truth == d && r#gen.len() < max_tokens {
                 fed.extend_from_slice(&toks); // everything this forward fed is now known-valid
                 // Accepted: the draft's own logits row is valid too — take the next token from it.
                 let pend = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
@@ -744,7 +744,7 @@ impl Engine {
             }
         }
         save_slot!();
-        (emitted, prompt.len(), gen.len(), drafted, accepted)
+        (emitted, prompt.len(), r#gen.len(), drafted, accepted)
     }
 }
 
@@ -817,7 +817,8 @@ pub fn run() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
-            "--no-batch" => { std::env::set_var("FERRIC_NOBATCH", "1"); i += 1; }
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            "--no-batch" => { unsafe { std::env::set_var("FERRIC_NOBATCH", "1") }; i += 1; }
             "--mcp" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("stdio".to_string(), c.clone())); } i += 2; }
             "--mcp-http" => { if let Some(c) = args.get(i + 1) { mcp_cmds.push(("http".to_string(), c.clone())); } i += 2; }
             _ => i += 1,

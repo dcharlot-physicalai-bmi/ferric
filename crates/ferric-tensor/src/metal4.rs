@@ -1484,7 +1484,8 @@ mod tests {
             eprintln!("no Metal 4 tensor support — skipping");
             return;
         }
-        std::env::set_var("FERRIC_METAL4", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         let (rows, d, dk) = (128usize, 512usize, 256usize);
         let xv: Vec<f32> = (0..rows * d).map(|i| 0.02 * (((i + 1) % 13) as f32 - 6.0)).collect();
         let w1v: Vec<f32> = (0..d * d).map(|i| 0.02 * (((i + 7) % 11) as f32 - 5.0)).collect();
@@ -1503,7 +1504,8 @@ mod tests {
             let v = x.matmul_bt(&wk);
             (y, q, kkk, v)
         });
-        std::env::remove_var("FERRIC_METAL4");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("FERRIC_METAL4") };
         let (gy, gq, gk, gv) = (
             pollster::block_on(y.to_vec()),
             pollster::block_on(q.to_vec()),
@@ -1553,7 +1555,8 @@ mod tests {
         if resident_for(&ctx).is_none() {
             return;
         }
-        std::env::set_var("FERRIC_METAL4", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         let (n, hw, c, o) = (1usize, 34usize, 32usize, 64usize);
         let xv: Vec<f32> = (0..n * hw * hw * c).map(|i| 0.05 * (((i + 3) % 11) as f32 - 5.0)).collect();
         let wv: Vec<f32> = (0..3 * 3 * c * o).map(|i| 0.05 * (((i + 5) % 7) as f32 - 3.0)).collect();
@@ -1576,7 +1579,8 @@ mod tests {
             let a2 = xc.conv2d(&wc, (1, 1), (1, 1)); // same config again → forces a run split
             (a, b, a2)
         });
-        std::env::remove_var("FERRIC_METAL4");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("FERRIC_METAL4") };
         let (gv, gm, gv2) = (
             pollster::block_on(cv.to_vec()),
             pollster::block_on(mm.to_vec()),

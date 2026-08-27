@@ -156,7 +156,7 @@ struct Gen<S> {
     /// batched forward is verified not to have.
     rng: u64,
     prompt: Vec<u32>,
-    gen: Vec<u32>,
+    r#gen: Vec<u32>,
     emitted: String,
     state: Option<S>,
     /// The token to feed on the next decode step.
@@ -168,8 +168,8 @@ impl<S> Gen<S> {
     /// Byte-for-byte the same delta logic as the serial `Engine::generate`, including the
     /// char-boundary guard that keeps multi-byte UTF-8 from being split across SSE frames.
     fn commit<M: ServeModel<State = S>>(&mut self, m: &M, tok: u32) {
-        self.gen.push(tok);
-        let full = m.text_of(&self.gen);
+        self.r#gen.push(tok);
+        let full = m.text_of(&self.r#gen);
         if full.len() > self.emitted.len() && full.is_char_boundary(self.emitted.len()) {
             let delta = full[self.emitted.len()..].to_string();
             if self.streaming {
@@ -292,7 +292,7 @@ fn route<M: ServeModel>(
             temperature: req["temperature"].as_f64().unwrap_or(0.0) as f32,
             // Same fixed seed as `Engine::generate`, per sequence.
             rng: 0x2545_F491_4F6C_DD1D,
-            prompt, gen: Vec::new(), emitted: String::new(), state: None, next: 0,
+            prompt, r#gen: Vec::new(), emitted: String::new(), state: None, next: 0,
         });
         return;
     }
@@ -373,7 +373,7 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
 /// diverging from it. Fixing it is a one-line change in three places and belongs in its own commit,
 /// where the change is visible instead of hidden inside a batching diff.
 fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>) {
-    let (ptok, gtok) = (g.prompt.len(), g.gen.len());
+    let (ptok, gtok) = (g.prompt.len(), g.r#gen.len());
     if g.streaming {
         send_sse(&mut g.stream, &json!({
             "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),

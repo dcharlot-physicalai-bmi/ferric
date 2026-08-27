@@ -19,7 +19,7 @@ use objc2::AnyThread;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 
-fn gen(rows: usize, cols: usize, salt: usize) -> Vec<f32> {
+fn r#gen(rows: usize, cols: usize, salt: usize) -> Vec<f32> {
     (0..rows * cols).map(|i| 0.05 * (((i + salt) % 13) as f32 - 6.0)).collect()
 }
 fn cpu_ref_f16(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -135,8 +135,8 @@ fn bench(
 pub fn run() {
     // tile constraints: M % 64 == 0, N % 32 == 0
     let (m, k, n) = (128usize, 64usize, 64usize);
-    let a = gen(m, k, 1);
-    let b = gen(k, n, 7);
+    let a = r#gen(m, k, 1);
+    let b = r#gen(k, n, 7);
     let cpu = cpu_ref_f16(&a, &b, m, k, n);
 
     let device = MTLCreateSystemDefaultDevice().expect("no Metal device");

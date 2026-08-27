@@ -43,7 +43,7 @@ impl NpuBackend for ReferenceNpu {
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
-fn gen(n: usize, salt: usize) -> Vec<f32> {
+fn r#gen(n: usize, salt: usize) -> Vec<f32> {
     (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
 }
 
@@ -84,7 +84,7 @@ async fn run() {
     let mut npu_ran = false;
     // (a) direct NPU dispatch: prove Device::Npu actually executes and is correct
     for &nn in &[16usize, 48, 96] {
-        let (a, b) = (gen(nn * nn, 1), gen(nn * nn, 7));
+        let (a, b) = (r#gen(nn * nn, 1), r#gen(nn * nn, 7));
         let via_npu = fabric.devices[npu].bmm(&a, &b, 1, nn, nn, nn);
         let oracle = fabric.devices[cpu].bmm(&a, &b, 1, nn, nn, nn);
         let e = max_abs_diff(&via_npu, &oracle);
@@ -97,7 +97,7 @@ async fn run() {
     }
     // (b) adaptive routing: the Planner picks a device per size across the whole fabric
     for &nn in &[8usize, 64, 256, 512] {
-        let (a, b) = (gen(nn * nn, 2), gen(nn * nn, 5));
+        let (a, b) = (r#gen(nn * nn, 2), r#gen(nn * nn, 5));
         let (res, dev) = planner.adaptive_bmm(&fabric, &a, &b, [1, nn, nn, nn]);
         let oracle = fabric.devices[cpu].bmm(&a, &b, 1, nn, nn, nn);
         let e = max_abs_diff(&res, &oracle);

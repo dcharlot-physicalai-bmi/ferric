@@ -13,7 +13,7 @@ use ferric_tensor::{device_sync, Tensor};
 use std::sync::Arc;
 use std::time::Instant;
 
-fn gen(n: usize, salt: usize) -> Vec<f32> {
+fn r#gen(n: usize, salt: usize) -> Vec<f32> {
     (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
 }
 
@@ -53,14 +53,16 @@ fn main() {
     println!("\n=== portable WGSL vs resident Metal-4 tensor units (same tensors, same call) ===");
     println!("  {:>5}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "N", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
     for &nn in &[512usize, 1024, 2048] {
-        let (av, bv) = (gen(nn * nn, 1), gen(nn * nn, 7));
+        let (av, bv) = (r#gen(nn * nn, 1), r#gen(nn * nn, 7));
         let a = Tensor::from_vec(&ctx, &av, &[nn, nn]);
         let b = Tensor::from_vec(&ctx, &bv, &[nn, nn]);
         let flops = 2.0 * (nn as f64).powi(3);
 
-        std::env::remove_var("FERRIC_METAL4");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("FERRIC_METAL4") };
         let (t_wgsl, r_wgsl) = time_matmul(&a, &b, 3);
-        std::env::set_var("FERRIC_METAL4", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         let (t_m4, r_m4) = time_matmul(&a, &b, 3);
 
         // verify: ≤1024 against the fp16 CPU oracle; 2048 against the WGSL f32 result (fp16 tol)
@@ -87,8 +89,8 @@ fn main() {
     // the training pattern: same shape over and over → every call after the first reuses the cache
     println!("\n=== cache-reuse cadence (training pattern, N=1024, 20 back-to-back calls) ===");
     let nn = 1024;
-    let a = Tensor::from_vec(&ctx, &gen(nn * nn, 3), &[nn, nn]);
-    let b = Tensor::from_vec(&ctx, &gen(nn * nn, 9), &[nn, nn]);
+    let a = Tensor::from_vec(&ctx, &r#gen(nn * nn, 3), &[nn, nn]);
+    let b = Tensor::from_vec(&ctx, &r#gen(nn * nn, 9), &[nn, nn]);
     let _ = pollster::block_on(a.matmul(&b).to_vec());
     let t0 = Instant::now();
     for _ in 0..20 {
@@ -103,11 +105,12 @@ fn main() {
     println!("\n=== linear layers (x·Wᵀ, HF layout — the ferric-llama hot path) ===");
     println!("  {:>22}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
     for &(rows, inn, out_f) in &[(32usize, 2048usize, 8192usize), (64, 4096, 4096)] {
-        let x = Tensor::from_vec(&ctx, &gen(rows * inn, 1), &[rows, inn]);
-        let w = Tensor::from_vec(&ctx, &gen(out_f * inn, 7), &[out_f, inn]);
+        let x = Tensor::from_vec(&ctx, &r#gen(rows * inn, 1), &[rows, inn]);
+        let w = Tensor::from_vec(&ctx, &r#gen(out_f * inn, 7), &[out_f, inn]);
         let flops = 2.0 * (rows * inn * out_f) as f64;
 
-        std::env::remove_var("FERRIC_METAL4");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("FERRIC_METAL4") };
         let time_bt = |reps: usize| {
             let _ = pollster::block_on(x.matmul_bt_act(&w, 2).to_vec());
             let t0 = Instant::now();
@@ -119,7 +122,8 @@ fn main() {
             (t0.elapsed().as_secs_f64() / reps as f64, res)
         };
         let (t_wgsl, r_wgsl) = time_bt(3);
-        std::env::set_var("FERRIC_METAL4", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         let (t_m4, r_m4) = time_bt(3);
         let err = max_abs_diff(&r_m4, &r_wgsl);
         assert!(err < 5e-2, "resident linear off at {rows}x{inn}x{out_f}: err {err}");
@@ -149,9 +153,10 @@ fn main() {
         }
         let qw = ferric_tensor::Q2_0Weights::from_bytes(&ctx, &packed, out_f, inn);
         for toks in [32usize, 128, 512] {
-            let x = Tensor::from_vec(&ctx, &gen(toks * inn, 5), &[toks, inn]);
+            let x = Tensor::from_vec(&ctx, &r#gen(toks * inn, 5), &[toks, inn]);
             let flops = 2.0 * (toks * inn * out_f) as f64;
-            std::env::remove_var("FERRIC_METAL4");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("FERRIC_METAL4") };
             let time_q = |reps: usize| {
                 let _ = pollster::block_on(x.matmul_q2_0(&qw).to_vec());
                 let t0 = Instant::now();
@@ -163,7 +168,8 @@ fn main() {
                 (t0.elapsed().as_secs_f64() / reps as f64, res)
             };
             let (t_fused, r_fused) = time_q(3);
-            std::env::set_var("FERRIC_METAL4", "1");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_METAL4", "1") };
             let (t_m4, r_m4) = time_q(3);
             // fp16-contract tolerance, relative to the result scale
             let scale = r_fused.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
@@ -185,10 +191,11 @@ fn main() {
     println!("\n=== conv2d (NHWC, 3x3, same-pad — CNN backbone shapes) ===");
     println!("  {:>26}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
     for &(n, hw, c, o) in &[(1usize, 64usize, 64usize, 128usize), (8, 32, 128, 128)] {
-        let x = Tensor::from_vec(&ctx, &gen(n * hw * hw * c, 1), &[n, hw, hw, c]);
-        let w = Tensor::from_vec(&ctx, &gen(3 * 3 * c * o, 7), &[3, 3, c, o]);
+        let x = Tensor::from_vec(&ctx, &r#gen(n * hw * hw * c, 1), &[n, hw, hw, c]);
+        let w = Tensor::from_vec(&ctx, &r#gen(3 * 3 * c * o, 7), &[3, 3, c, o]);
         let flops = 2.0 * (n * hw * hw * o * 3 * 3 * c) as f64;
-        std::env::remove_var("FERRIC_METAL4");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("FERRIC_METAL4") };
         let time_conv = |reps: usize| {
             let _ = pollster::block_on(x.conv2d(&w, (1, 1), (1, 1)).to_vec());
             let t0 = Instant::now();
@@ -200,7 +207,8 @@ fn main() {
             (t0.elapsed().as_secs_f64() / reps as f64, res)
         };
         let (t_wgsl, r_wgsl) = time_conv(3);
-        std::env::set_var("FERRIC_METAL4", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         let (t_m4, r_m4) = time_conv(3);
         let scale = r_wgsl.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         let err = max_abs_diff(&r_m4, &r_wgsl);

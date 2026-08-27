@@ -13,7 +13,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
 
-fn gen(n: usize, salt: usize) -> Vec<f32> {
+fn r#gen(n: usize, salt: usize) -> Vec<f32> {
     (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
 }
 
@@ -48,7 +48,7 @@ async fn run() {
     let sizes = [8usize, 32, 64, 128, 256, 384, 512, 768, 1024, 1408];
     let mut worst_err = 0.0f32;
     for &nn in &sizes {
-        let (a, b) = (gen(nn * nn, 1), gen(nn * nn, 7));
+        let (a, b) = (r#gen(nn * nn, 1), r#gen(nn * nn, 7));
         let (res, dev) = planner.adaptive_bmm(&fabric, &a, &b, [1, nn, nn, nn]);
         let oracle = fabric.devices[cpu].bmm(&a, &b, 1, nn, nn, nn);
         let err = max_abs_diff(&res, &oracle);

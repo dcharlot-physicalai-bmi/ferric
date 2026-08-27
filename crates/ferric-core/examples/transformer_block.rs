@@ -5,7 +5,7 @@ use ferric_core::{cpu, matmul_cpu, max_abs_diff, Context};
 
 fn main() { pollster::block_on(run()); }
 
-fn gen(n: usize, a: usize, b: usize, s: f32) -> Vec<f32> {
+fn r#gen(n: usize, a: usize, b: usize, s: f32) -> Vec<f32> {
     (0..n).map(|i| ((i * a % b) as f32 - (b as f32) / 2.0) * s).collect()
 }
 
@@ -17,11 +17,11 @@ async fn run() {
     let scale = 1.0 / (d as f32).sqrt();
 
     // deterministic inputs + weights
-    let x = gen(t * d, 7, 23, 0.1);
-    let (wq, wk, wv, wo) = (gen(d * d, 3, 17, 0.05), gen(d * d, 5, 19, 0.05), gen(d * d, 11, 13, 0.05), gen(d * d, 7, 29, 0.05));
-    let (ln1w, ln1b) = (gen(d, 1, 7, 0.01).iter().map(|v| 1.0 + v).collect::<Vec<_>>(), gen(d, 2, 11, 0.02));
-    let (ln2w, ln2b) = (gen(d, 3, 5, 0.01).iter().map(|v| 1.0 + v).collect::<Vec<_>>(), gen(d, 4, 13, 0.02));
-    let (w1, w2) = (gen(d * h, 5, 31, 0.03), gen(h * d, 7, 23, 0.03));
+    let x = r#gen(t * d, 7, 23, 0.1);
+    let (wq, wk, wv, wo) = (r#gen(d * d, 3, 17, 0.05), r#gen(d * d, 5, 19, 0.05), r#gen(d * d, 11, 13, 0.05), r#gen(d * d, 7, 29, 0.05));
+    let (ln1w, ln1b) = (r#gen(d, 1, 7, 0.01).iter().map(|v| 1.0 + v).collect::<Vec<_>>(), r#gen(d, 2, 11, 0.02));
+    let (ln2w, ln2b) = (r#gen(d, 3, 5, 0.01).iter().map(|v| 1.0 + v).collect::<Vec<_>>(), r#gen(d, 4, 13, 0.02));
+    let (w1, w2) = (r#gen(d * h, 5, 31, 0.03), r#gen(h * d, 7, 23, 0.03));
 
     // ---- GPU: build the block as a graph, everything stays on device until to_vec ----
     let (u, uu) = (|v: &[f32], s: &[usize]| ctx.tensor(v, s), t as u32);

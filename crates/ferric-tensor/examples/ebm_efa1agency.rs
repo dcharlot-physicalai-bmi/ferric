@@ -83,10 +83,10 @@ impl Efa1 {
     fn genetic(&self, bi: usize, s: [f32; 6], g: [f32; 3], warm: [f32; 3], seed: u32) -> ([f32; 3], f32) {
         let nj = NJ[bi]; let (pop, gens) = (16u32, 8u32); let mut evals = 0.0f32;
         let mut center = warm; let mut best = (warm, self.energy(bi, s, g, warm)); evals += 1.0;
-        for gen in 0..gens { let sigma = 1.5 * (0.6f32).powi(gen as i32);
+        for r#gen in 0..gens { let sigma = 1.5 * (0.6f32).powi(r#gen as i32);
             let mut gbest = best;
             for m in 0..pop { let mut a = [0.0f32; 3];
-                for i in 0..nj { let r = u(seed.wrapping_mul(9973).wrapping_add(gen * 1000 + m * 10 + i as u32), 77) * 2.0 - 1.0;
+                for i in 0..nj { let r = u(seed.wrapping_mul(9973).wrapping_add(r#gen * 1000 + m * 10 + i as u32), 77) * 2.0 - 1.0;
                     a[i] = (center[i] + sigma * r).clamp(-UMAX, UMAX); }
                 let e = self.energy(bi, s, g, a); evals += 1.0; if e < gbest.1 { gbest = (a, e); } }
             best = gbest; center = best.0; }

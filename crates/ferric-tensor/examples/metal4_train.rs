@@ -37,9 +37,11 @@ async fn run_size(ctx: &Arc<ferric_core::Context>, b: usize, d: usize) {
         let m4 = mode > 0;
         let dag = mode == 2;
         if m4 {
-            std::env::set_var("FERRIC_METAL4", "1");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_METAL4", "1") };
         } else {
-            std::env::remove_var("FERRIC_METAL4");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("FERRIC_METAL4") };
         }
         let mut params = vec![
             Tensor::from_vec(ctx, &seq(d * d, 2.0), &[d, d]),

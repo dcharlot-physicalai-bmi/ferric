@@ -5,18 +5,19 @@ use ferric_tensor::{device_sync, Tensor};
 use std::sync::Arc;
 use std::time::Instant;
 
-fn gen(n: usize, salt: usize) -> Vec<f32> {
+fn r#gen(n: usize, salt: usize) -> Vec<f32> {
     (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
 }
 
 fn main() {
     let ctx = Arc::new(pollster::block_on(Context::new()).unwrap());
-    std::env::set_var("FERRIC_METAL4", "1");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("FERRIC_METAL4", "1") };
     let (rows, d) = (256usize, 2048usize);
-    let x = Tensor::from_vec(&ctx, &gen(rows * d, 1), &[rows, d]);
-    let wq = Tensor::from_vec(&ctx, &gen(2048 * d, 2), &[2048, d]);
-    let wk = Tensor::from_vec(&ctx, &gen(512 * d, 3), &[512, d]);
-    let wv = Tensor::from_vec(&ctx, &gen(512 * d, 4), &[512, d]);
+    let x = Tensor::from_vec(&ctx, &r#gen(rows * d, 1), &[rows, d]);
+    let wq = Tensor::from_vec(&ctx, &r#gen(2048 * d, 2), &[2048, d]);
+    let wk = Tensor::from_vec(&ctx, &r#gen(512 * d, 3), &[512, d]);
+    let wv = Tensor::from_vec(&ctx, &r#gen(512 * d, 4), &[512, d]);
 
     // same-shape: 3x q-proj (cache hits after first)
     let _ = pollster::block_on(x.matmul_bt(&wq).to_vec());

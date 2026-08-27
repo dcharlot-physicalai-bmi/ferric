@@ -49,9 +49,11 @@ async fn run() {
             let k = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 11), &[s, nkv * dh]);
             let v = Tensor::from_vec(&ctx, &fill(s * nkv * dh, 22), &[s, nkv * dh]);
 
-            std::env::set_var("FERRIC_SPLITKV", "1");           // force the original single-pass path
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_SPLITKV", "1") };           // force the original single-pass path
             let base = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
-            std::env::remove_var("FERRIC_SPLITKV");             // let the heuristic choose
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("FERRIC_SPLITKV") };             // let the heuristic choose
             let got = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
 
             let d = base.iter().zip(&got).fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
@@ -93,7 +95,12 @@ async fn run() {
         let bench = |on: bool| {
             let (q, k, v) = (&q, &k, &v);
             async move {
-                if on { std::env::remove_var("FERRIC_SPLITKV"); } else { std::env::set_var("FERRIC_SPLITKV", "1"); }
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                // Both env mutators are unsafe in Edition 2024: writing the environment races
+                // with any thread reading it. Single-threaded example setup, so sound here.
+                // cargo fix wrapped only the set_var and left remove_var on the same line.
+                if on { unsafe { std::env::remove_var("FERRIC_SPLITKV") }; }
+                else { unsafe { std::env::set_var("FERRIC_SPLITKV", "1") }; }
                 let _ = q.fused_decode_attention(k, v, nh, nkv, dh).to_vec().await;
                 let mut ms = Vec::new();
                 for _ in 0..7 {
@@ -112,7 +119,8 @@ async fn run() {
         let on = bench(true).await;
         println!("  {s:>8} {off:>9.3} ms {on:>9.3} ms {:>9.2}x", off / on);
     }
-    std::env::remove_var("FERRIC_SPLITKV");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("FERRIC_SPLITKV") };
 
     // ---- the gate, in two dimensions, because one is not enough to set a constant ----
     //
@@ -147,7 +155,8 @@ async fn run() {
         let mut grid: Vec<Vec<f64>> = SPLITS.iter().map(|_| Vec::new()).collect();
         for _ in 0..CAL_REPEATS {
             for (si, &n) in SPLITS.iter().enumerate() {
-                std::env::set_var("FERRIC_SPLITKV", n.to_string());
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::set_var("FERRIC_SPLITKV", n.to_string()) };
                 let _ = q.fused_decode_attention(&k, &v, nh, nkv, dh).to_vec().await;
                 let mut ms = Vec::new();
                 for _ in 0..7 {
@@ -182,7 +191,8 @@ async fn run() {
         let beats_one = times[0] / times[bi];
         recommend.push((s, if lead < 0.10 { 0 } else { SPLITS[bi] }, beats_one));
     }
-    std::env::remove_var("FERRIC_SPLITKV");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("FERRIC_SPLITKV") };
 
     println!("\n  {CAL_REPEATS} passes over the grid, median per cell. A `~` marks a winner leading the");
     println!("  runner-up by under 10%, i.e. a tie the argmin should not be trusted to break.");
