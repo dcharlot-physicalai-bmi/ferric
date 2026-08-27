@@ -247,6 +247,22 @@ is answering rather than guessing a constant. **Severity is a null**: below majo
 standard deviation of 18.4 across three seeds that ran 0%, 40% and 2% — which is not a weak
 signal, it is no signal with a lot of variance.
 
+**And part of the severity failure is not a wrong answer at all.** A cheaper configuration of the
+same experiment — 12 windows per recording instead of 30, the same epoch budget four times faster —
+reproduces fault at 41.9% ± 4.7 against the same 33.3% majority, and adds the column that says what
+the decoder was doing at each position:
+
+| axis | mean | sd | majority | distinct words | not a word for this axis |
+|---|---|---|---|---|---|
+| fault type | 41.9% | 4.7 | 33.3% | 4.3 of 5 | **0%** |
+| torque | 0.0% | 0.0 | not askable | 1.7 of 3 | **0%** |
+| severity | 23.0% | 13.1 | 33.3% | 3.0 of 5 | **27%** |
+
+Torque is the clean control for the column: 0.0% accuracy with 0% off-axis is a decoder answering
+with legal torque words and never the right one, which is exactly what an axis whose held-out class
+was never trained on should look like. Severity is the other failure — **27% of its predictions are
+not a severity word at all** — and the two are indistinguishable in an accuracy column.
+
 **The budget, not the architecture, was what stood between the two.** At 250 optimizer steps —
 2.2 passes over the training set, where the hydraulic corpus had 6.7 — every axis collapsed to one
 word, standard deviation 0.000, sitting exactly on its majority baseline. That is the same
