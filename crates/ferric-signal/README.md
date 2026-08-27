@@ -270,10 +270,33 @@ signature as the presentation-order null above, and it would have read as a mode
 probe had already placed the fault signal in the tokens at 65.6%, so the diagnosis was decoder-side
 before anything was retrained, and 800 steps confirmed it.
 
-**The probe is still ahead of the decoder**, 65.6% against 48.2% on the same tokens and the same
-split. A bag-of-codes classifier with no capacity to speak extracts more of the fault signal than
-the decoder trained to say it. That gap is the honest measure of how much of this is a language
-problem rather than a representation one.
+**The probe is still ahead of the decoder.** Run at matched size — 12 windows per recording, 180
+held out, same tokens, same splits, three seeds for the decoder:
+
+| axis | split | probe | probe's control | decoder | majority |
+|---|---|---|---|---|---|
+| fault | within recording | 57.8% | +1.7 | 45.6% ± 2.3 | 33.3% |
+| fault | across recording | 53.9% | +0.6 | 41.9% ± 4.7 | 33.3% |
+| torque | within recording | 42.8% | **+12.2** | 34.3% ± 2.8 | 33.3% |
+| severity | within recording | 51.1% | +5.6 | 33.7% ± 1.8 | 33.3% |
+| severity | across recording | 48.3% | +1.7 | 23.0% ± 13.1 | 33.3% |
+
+Three things fall out of reading it as a whole rather than a row at a time.
+
+**The language half generalizes as well as the representation does.** Crossing from within-recording
+to across-recording costs the probe 3.9 points on fault and the decoder 3.7. Whatever the decoder is
+failing to do, it is not failing to transfer.
+
+**Severity is a decoder failure, not a token failure — and not a generalization failure either.**
+The probe finds 17.8 points of severity signal above majority with a control of +5.6, and the
+decoder gets none of it: 33.7% against a 33.3% baseline *within recording*, where train and test
+share a machine. The tokens carry it and the decoder cannot read it at all.
+
+**Torque at this size is inside its own control** — the probe's +9.5 over majority against a
+control of **+12.2**. It is not a result at 180 held-out examples. At 450 the same probe gives 51.3%
+with a control of +4.9 and it is one. The same axis, the same tokens, and the answer changes with
+the held-out size: which is the whole reason the control is printed beside the figure and never
+inferred from a previous run.
 
 **Two traps in this corpus, both silent.** The 2 Nm unbalance recordings are spelled
 `Unbalalnce` — left alone that is a sixth fault class containing exactly one torque, so "fault
