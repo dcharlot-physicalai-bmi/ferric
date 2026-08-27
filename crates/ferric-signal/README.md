@@ -292,6 +292,30 @@ The probe finds 17.8 points of severity signal above majority with a control of 
 decoder gets none of it: 33.7% against a 33.3% baseline *within recording*, where train and test
 share a machine. The tokens carry it and the decoder cannot read it at all.
 
+**A registered prediction about decoder width, refuted.** The probe pools a document into a count
+over 6,534 observed (channel, code) pairs; the decoder pools it into `d_model` numbers. At 64 that
+is a narrower summary by two orders of magnitude, and it was the obvious candidate for the axis the
+probe reads and the decoder cannot. The prediction — written down and committed before the run —
+was that doubling `d_model` would lift severity above its majority baseline. Doubling it made
+everything worse:
+
+| decoder | fault | torque | severity | distinct words, fault |
+|---|---|---|---|---|
+| `d_model` 64 | **45.6% ± 2.3** | 34.3% ± 2.8 | 33.7% ± 1.8 | 4.0 of 5 |
+| `d_model` 128 | 24.4% ± 6.3 | 34.3% ± 1.7 | 31.9% ± 1.7 | **1.0 of 5** |
+
+**And the `said` column says which kind of worse.** `1.0 of 5` is one word for every held-out
+window — the collapse signature of a model that has not been trained enough, not of one that has
+overfitted. An overfitted decoder emits varied words and generalizes badly; this one stopped
+answering. So the wider model was **under-trained at a step budget that was adequate for the
+narrower one**, and the experiment as designed cannot separate "width does not help" from "width
+needs more steps."
+
+That is a flaw in the design, and it is worth naming precisely: **matched epochs is not matched
+training adequacy when capacity differs.** Both configurations saw the same 3,200 examples over the
+same 360 training examples — 8.9 passes each — and that was sufficient for one and not the other.
+Holding the obvious quantity fixed was not holding the relevant one fixed.
+
 **Torque at this size is inside its own control** — the probe's +9.5 over majority against a
 control of **+12.2**. It is not a result at 180 held-out examples. At 450 the same probe gives 51.3%
 with a control of +4.9 and it is one. The same axis, the same tokens, and the answer changes with
