@@ -46,6 +46,7 @@ open.
 | `store` | Save and load weights | Save/load must yield **identical tokens**; every truncation point refused |
 | `train` | Straight-through estimator | Gradient must behave as if rounding were the identity |
 | `language` | Mixed text/signal sequences, causal LM | Encode/decode inverses; a position cannot see its future |
+| `synth` | Parameterized physical processes with known ground truth | The generator behind every synthetic figure here; each family is deterministic and reproducible |
 | `bench` | Majority baseline, token probe, permutation control | The control must collapse on features that certainly carry the label, and shrink as n grows |
 | `caption` | Signal-to-text training, caption vocabulary, compaction | Shared by both corpus ingests, so the protocol is one implementation |
 | `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |

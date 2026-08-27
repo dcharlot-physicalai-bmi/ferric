@@ -7,6 +7,13 @@
 //! recording per (torque, fault, severity). Not redistributed here; point `--data` at your own
 //! copy, extracted from the archive.
 //!
+//! **The vibration half is the one with a usable design.** The same dataset's acoustic archive
+//! holds five recordings — three fault classes, one torque — which cannot support a split that
+//! holds out whole recordings, because two of those classes have exactly one. Only a
+//! within-recording split would run there, and it would report a flattering number for a question
+//! the data cannot answer. The current-and-temperature half is 45 recordings in TDMS, a format
+//! this crate does not read.
+//!
 //! ## Why this corpus after the hydraulic one
 //!
 //! Its label space is the one the hydraulic corpus does not have: **perfectly balanced on torque**
