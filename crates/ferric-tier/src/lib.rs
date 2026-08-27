@@ -64,6 +64,10 @@ mod plan;
 /// without the overlap.
 #[cfg(not(target_arch = "wasm32"))]
 mod prefetch;
+/// Several full copies of one checkpoint, read in parallel and weighted by measured bandwidth.
+/// Scoped threads, so not on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+mod mirror;
 
 pub use expert::{ExpertCache, ExpertStats};
 pub use fabric::{additive_ceiling, makespan, split_n, EnergyModel, FabricProfile, Split};
@@ -74,6 +78,8 @@ pub use staged::{SliceBacking, StagedBacking};
 pub use plan::{align_up, plan_layers, LayerDesc, LayerPlan, RING_SLOTS};
 #[cfg(not(target_arch = "wasm32"))]
 pub use prefetch::{PrefetchCache, PrefetchStats};
+#[cfg(not(target_arch = "wasm32"))]
+pub use mirror::{MirroredBacking, MIN_SPLIT_BYTES};
 
 /// Where a weight was served from on a given fetch.
 ///
@@ -129,6 +135,12 @@ pub enum TierError {
     BudgetTooSmall { need: u64, have: u64 },
     /// A weight id outside the configured shape.
     OutOfRange(WeightId),
+    /// Two devices of a mirror returned different bytes for the same range.
+    ///
+    /// Kept distinct from `Io` for the same reason `ShortRead` is: this is the specific condition
+    /// that produces a buffer of the right length holding bytes from two different versions of the
+    /// checkpoint. Every component `Backing` honoured its contract; the composite did not.
+    MirrorMismatch(String),
     /// A synchronous read asked for bytes that were never staged.
     ///
     /// Only reachable on the asynchronous path ([`StagedBacking`]): a browser cannot block a sync read on
@@ -145,6 +157,7 @@ impl core::fmt::Display for TierError {
                 write!(f, "budget too small: need {need} bytes, have {have}")
             }
             TierError::OutOfRange(id) => write!(f, "weight out of range: {id:?}"),
+            TierError::MirrorMismatch(m) => write!(f, "mirror mismatch: {m}"),
             TierError::NotStaged { offset, len } => write!(
                 f, "bytes not staged: [{offset}, {}) — the prefetch missed this range", offset + *len as u64),
         }
