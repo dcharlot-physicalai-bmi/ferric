@@ -428,12 +428,20 @@ rigs, four laboratories, sampling rates spanning four orders of magnitude, and o
 not vibration at all. Held out by *recording*, reported per corpus, trained round-robin so corpus
 size does not decide whose gradients win.
 
-| corpus | machine | held-out SNR | same 15 bits, no training | verdict |
-|---|---|---|---|---|
-| hydraulic | test rig, pressures and flows | **9.0 dB** | 4.6 dB | tokenizer, by 4.4 dB |
-| wind | turbine nacelle | **7.2 dB** | 4.5 dB | tokenizer, by 2.7 dB |
-| rotating | gearbox rig, 25.6 kHz | 1.4 dB | 1.3 dB | tie |
-| CWRU | bearing stand, 12–48 kHz | 1.1 dB | **1.4 dB** | **the baseline wins** |
+| corpus | machine | held-out SNR | same 15 bits, no training |
+|---|---|---|---|
+| hydraulic | test rig, pressures and flows | 9.0 dB | *being remeasured* |
+| wind | turbine nacelle | 7.2 dB | *being remeasured* |
+| rotating | gearbox rig, 25.6 kHz | 1.4 dB | *being remeasured* |
+| CWRU | bearing stand, 12–48 kHz | 1.1 dB | *being remeasured* |
+
+⚠ **The baseline column is being remeasured and the figures published here on 27 August were wrong
+in the model's favour.** The coefficient was quantized over a span of `4·√n` ≈ 45 when a DCT-II
+coefficient of a unit-scale patch is bounded by `n` = 128 and reaches `n/2` = 64 for a pure cosine,
+so every strong coefficient clipped. A pure cosine came back at 10.7 dB from a scheme that should
+reconstruct it almost exactly. **An understated baseline flatters every model measured against it**,
+so the tokenizer's margins were larger than they should have been and its losses smaller. The bound
+is now `n`, from Cauchy-Schwarz on a patch with `Σx² = n`, and the corrected table follows.
 
 **The baseline spends exactly the same bit rate and learns nothing.** The tokenizer emits one code
 from 32,768 per 128-sample patch — 15 bits. The baseline spends 15 bits naming which of the 128 DCT

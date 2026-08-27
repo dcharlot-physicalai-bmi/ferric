@@ -167,6 +167,62 @@ pub fn permutation_control(
     worst
 }
 
+/// A NON-LEARNED RECONSTRUCTION BASELINE AT A MATCHED BIT RATE.
+///
+/// An FSQ tokenizer over 32,768 codes spends **15 bits per patch**. This spends the same 15 bits in
+/// a way that involves no training at all — 7 bits to name which of 128 DCT coefficients is
+/// largest, 8 bits to quantize its value — and reconstructs from that one coefficient. Returns the
+/// mean squared error against the patch it was given.
+///
+/// The 7-bit index assumes a 128-sample patch, which is where the budgets line up exactly; at other
+/// patch lengths the index costs `log2(n)` and the comparison is approximate. Callers are expected
+/// to say which they are doing.
+///
+/// It exists because reconstruction was reported in this crate for a long time with no baseline at
+/// all, while every classification figure carried three. Decibels against a signal's own variance
+/// say how much of it survived; they do not say whether a scheme that learned nothing would have
+/// done as well. **Adding this reversed two of four rows** the first time it was run: a
+/// 9.5M-parameter trained tokenizer lost to one untrained coefficient on one corpus and tied on
+/// another. A corpus where the learned model barely beats one coefficient is telling you about the
+/// SIGNAL and not about the training.
+pub fn dct_baseline(patch: &[f32]) -> f64 {
+    let n = patch.len();
+    // DCT-II, O(n^2). n is 128 here and this runs once per held-out patch, not in a training loop.
+    let mut coef = vec![0.0f64; n];
+    for (k, c) in coef.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (i, &x) in patch.iter().enumerate() {
+            acc += x as f64
+                * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * k as f64).cos();
+        }
+        *c = acc;
+    }
+    let (best, &peak) = coef
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .unwrap();
+    // 8 bits for the value, over the range a coefficient of a unit-scale patch cannot exceed.
+    //
+    // THE BOUND IS `n`, NOT `sqrt(n)`. By Cauchy-Schwarz a DCT-II coefficient is at most
+    // `sqrt(n * sum(x^2))`, and a RevIn-normalised patch has `sum(x^2) = n`, so the bound is `n`.
+    // The first version of this used `4*sqrt(n)` — 45 where the coefficient of a pure cosine is
+    // `n/2` = 64 — so every strong coefficient CLAMPED, and a pure cosine came back at 10.7 dB
+    // instead of 40+. That understates the baseline, which flatters every model measured against
+    // it, which is the direction a baseline must never be wrong in.
+    let span = n as f64;
+    let q = ((peak / span).clamp(-1.0, 1.0) * 127.0).round() / 127.0 * span;
+    // Inverse DCT-III of the single retained coefficient.
+    let mut se = 0.0f64;
+    for (i, &x) in patch.iter().enumerate() {
+        let r = 2.0 / n as f64
+            * q
+            * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * best as f64).cos();
+        se += (x as f64 - r) * (x as f64 - r);
+    }
+    se / n as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +399,61 @@ mod tests {
         let mut sorted = a.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..500).collect::<Vec<_>>());
+    }
+
+    /// A PURE COSINE IS EXACTLY ONE DCT COEFFICIENT, so a one-coefficient baseline must reconstruct
+    /// it almost perfectly. If the transform or its inverse were mis-normalised the error would be
+    /// large here, the baseline would be understated, and every model compared against it would
+    /// look better than it is.
+    #[test]
+    fn one_coefficient_reconstructs_a_pure_cosine() {
+        let n = 128usize;
+        for k in [1usize, 5, 17, 60] {
+            let patch: Vec<f32> = (0..n)
+                .map(|i| {
+                    ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * k as f64).cos() as f32
+                })
+                .collect();
+            let var = {
+                let m = patch.iter().sum::<f32>() as f64 / n as f64;
+                patch.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>() / n as f64
+            };
+            let mse = dct_baseline(&patch);
+            let snr = 10.0 * (var / mse.max(1e-18)).log10();
+            assert!(snr > 20.0, "k={k}: only {snr:.1} dB from one coefficient on a pure cosine");
+        }
+    }
+
+    /// And it must NOT reconstruct broadband noise, which is the other half of the claim: the
+    /// baseline is weak where a signal has no dominant component, so a model that beats it there is
+    /// doing real work.
+    #[test]
+    fn one_coefficient_barely_touches_broadband_noise() {
+        let n = 128usize;
+        let order = shuffled(n, 31337);
+        let patch: Vec<f32> =
+            (0..n).map(|i| ((order[i] as f32 / n as f32) - 0.5) * 2.0).collect();
+        let m = patch.iter().sum::<f32>() as f64 / n as f64;
+        let var = patch.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>() / n as f64;
+        let snr = 10.0 * (var / dct_baseline(&patch).max(1e-18)).log10();
+        assert!(snr < 6.0, "one coefficient captured {snr:.1} dB of broadband noise");
+    }
+
+    /// The budgets line up exactly at a 128-sample patch: 7 bits of index plus 8 of value is 15,
+    /// and an FSQ codebook of 32,768 is 15. Asserted so a future change to either side has to
+    /// notice that it broke the comparison.
+    #[test]
+    fn the_baseline_spends_the_same_fifteen_bits_as_the_codebook() {
+        let index_bits = (128f64).log2() as u32;
+        let value_bits = 8u32;
+        assert_eq!(index_bits + value_bits, 15);
+        assert_eq!(crate::Fsq::signal_15bit().codebook_size(), 1 << 15);
+    }
+
+    /// A constant patch has no variance to recover and must not produce a NaN or a negative error.
+    #[test]
+    fn a_flat_patch_is_handled_rather_than_dividing_by_nothing() {
+        let mse = dct_baseline(&vec![0.7f32; 128]);
+        assert!(mse.is_finite() && mse >= 0.0, "flat patch gave {mse}");
     }
 }

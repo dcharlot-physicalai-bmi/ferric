@@ -47,7 +47,7 @@
 //! are about unseen machines and not about unseen seconds of a seen machine.
 
 use ferric_signal::{
-    decoder_forward_var, forward_var, mse, shuffled, straight_through, DecoderWeights,
+    dct_baseline, decoder_forward_var, forward_var, mse, shuffled, straight_through, DecoderWeights,
     EncoderConfig, EncoderWeights, Fsq, MatFile, Patcher, RevIn, Weights,
 };
 use ferric_core::Context;
@@ -250,54 +250,15 @@ fn clip_global(ctx: &Arc<Context>, grads: &[Tensor], max: f32) -> Vec<Tensor> {
         .collect()
 }
 
-/// A NON-LEARNED BASELINE AT EXACTLY THE SAME BIT RATE.
-///
-/// The tokenizer spends **15 bits per 128-sample patch**: one code from a 32,768-entry space. This
-/// spends the same 15 bits a way that involves no training at all — 7 bits to name which of the 128
-/// DCT coefficients is largest, 8 bits to quantize its value — and reconstructs from that alone.
-///
-/// It exists because reconstruction has been reported here with no baseline. Decibels against the
-/// signal's own variance say how much of it survived; they do not say whether a scheme that learned
-/// nothing would have done as well. A corpus where the learned tokenizer barely beats one
-/// coefficient is telling you something about the SIGNAL — broadband vibration is close to
-/// incompressible at this rate — and not about the training.
-fn dct_baseline(patch: &[f32]) -> f64 {
-    let n = patch.len();
-    // DCT-II, O(n^2). n is 128 here and this runs once per held-out patch, not in a training loop.
-    let mut coef = vec![0.0f64; n];
-    for (k, c) in coef.iter_mut().enumerate() {
-        let mut acc = 0.0f64;
-        for (i, &x) in patch.iter().enumerate() {
-            acc += x as f64
-                * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * k as f64).cos();
-        }
-        *c = acc;
-    }
-    let (best, &peak) = coef
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-        .unwrap();
-    // 8 bits for the value, over a range the normalized patch cannot exceed: RevIn gives unit
-    // scale, so a coefficient is bounded by n in the worst case and by sqrt(n) in practice.
-    let span = (n as f64).sqrt() * 4.0;
-    let q = ((peak / span).clamp(-1.0, 1.0) * 127.0).round() / 127.0 * span;
-    // Inverse DCT-III of the single retained coefficient.
-    let mut se = 0.0f64;
-    for (i, &x) in patch.iter().enumerate() {
-        let r = 2.0 / n as f64
-            * q
-            * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * best as f64).cos();
-        se += (x as f64 - r) * (x as f64 - r);
-    }
-    se / n as f64
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(4000);
     let per_file: usize = flag(&args, "--windows").and_then(|v| v.parse().ok()).unwrap_or(4);
     let out = flag(&args, "--out");
+    // Bounds the I/O, not the science: reading every rotating recording means parsing 3.4 GB to
+    // keep a few hundred windows. Raised deliberately when the question is whether the vibration
+    // corpora were starved rather than rate-limited.
+    let max_files: usize = flag(&args, "--max-files").and_then(|v| v.parse().ok()).unwrap_or(40);
 
     let patcher = Patcher::contiguous(PATCH).unwrap();
     let lr: f32 = flag(&args, "--lr").and_then(|v| v.parse().ok()).unwrap_or(3e-4);
@@ -307,13 +268,13 @@ fn main() {
         corpora.push(load_hydraulic(&d, 400, &patcher));
     }
     if let Some(d) = flag(&args, "--cwru") {
-        corpora.push(load_mat("cwru", &d, per_file, 2, &patcher, 40));
+        corpora.push(load_mat("cwru", &d, per_file, 2, &patcher, max_files));
     }
     if let Some(d) = flag(&args, "--rotating") {
-        corpora.push(load_mat("rotating", &d, per_file, 4, &patcher, 16));
+        corpora.push(load_mat("rotating", &d, per_file, 4, &patcher, max_files.min(45)));
     }
     if let Some(d) = flag(&args, "--wind") {
-        corpora.push(load_mat("wind", &d, per_file, 6, &patcher, 10));
+        corpora.push(load_mat("wind", &d, per_file, 6, &patcher, max_files.min(10)));
     }
     // EVERY WINDOW IS CHECKED BEFORE ANY OF IT IS TRAINED ON. A single non-finite sample anywhere
     // in four corpora poisons the loss the first time its window is drawn, which surfaces as a
