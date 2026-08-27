@@ -60,7 +60,7 @@ pub fn majority(labels: &[i32], train: &[usize], held: &[usize]) -> f64 {
     // Ties broken by the smaller label so the baseline is deterministic.
     let maj = counts
         .iter()
-        .max_by_key(|(&v, &c)| (c, std::cmp::Reverse(v)))
+        .max_by_key(|&(&v, &c)| (c, std::cmp::Reverse(v)))
         .map(|(&v, _)| v)
         .unwrap_or(0);
     held.iter().filter(|&&i| labels[i] == maj).count() as f64 / held.len() as f64 * 100.0

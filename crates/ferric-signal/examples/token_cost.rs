@@ -9,7 +9,7 @@
 //! come to be wrong.
 
 use ferric_joule::{measure, MacBattery, Meter, Nameplate, Rapl};
-use ferric_signal::{EncoderConfig, Fsq, Patcher, RevIn};
+use ferric_signal::{embed_cost, EncoderConfig, Fsq, Patcher, RevIn};
 
 fn main() {
     let cfg = EncoderConfig::signal_4m();
@@ -97,5 +97,33 @@ fn main() {
             println!("  That is what most published AI energy figures actually are.");
         }
     }
+    println!();
+
+    // ---- what a trainable embedding costs without a row gather ----
+    //
+    // Reported here rather than left as a remark in the docs, because it is the largest single
+    // term in a caption training run and it is exactly computable. The configurations below are
+    // the two this crate has actually trained.
+    println!("TRAINABLE EMBEDDING, ONE-HOT AGAINST A NATIVE GATHER");
+    println!("  `Var` has no row-gather backward, so a lookup is a one-hot [t, rows] times the");
+    println!("  table. Correct, and this is what it moves per optimizer step:\n");
+    println!("  {:<28} {:>6} {:>8} {:>12} {:>12} {:>9}",
+             "run", "t", "rows", "one-hot", "gather", "ratio");
+    println!("  {:-<28} {:->6} {:->8} {:->12} {:->12} {:->9}", "", "", "", "", "", "");
+    for (name, t, rows, d) in [
+        ("hydraulic, full codebook", 594usize, 32_788u32, 64usize),
+        ("hydraulic, compacted", 594, 3_046, 64),
+        ("rotating, compacted", 405, 7_883, 64),
+    ] {
+        let c = embed_cost(t, rows, d);
+        println!("  {name:<28} {t:>6} {rows:>8} {:>9.2} MB {:>9.2} MB {:>8.0}x",
+                 c.onehot_bytes() as f64 / 1e6,
+                 c.gather_bytes() as f64 / 1e6,
+                 c.traffic_ratio());
+    }
+    println!("\n  The ratio is rows / d_model exactly, so it grows with the VOCABULARY and not");
+    println!("  with the sequence — which is why compacting the vocabulary to the codes a corpus");
+    println!("  actually uses is a traffic result as much as a modelling one. The backward pass");
+    println!("  touches the same matrix again.");
     println!();
 }

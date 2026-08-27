@@ -139,6 +139,39 @@ pub fn vocab_cost(rows: u32, d_model: usize) -> VocabCost {
 }
 
 #[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    #[test]
+    fn the_one_hot_traffic_ratio_is_the_vocabulary_over_the_width() {
+        // The rotating caption run: 405 positions, 7,883 rows, width 64.
+        let c = embed_cost(405, 7_883, 64);
+        assert_eq!(c.onehot_bytes(), 405 * 7_883 * 4);
+        assert_eq!(c.gather_bytes(), 405 * 64 * 4);
+        // 7883 / 64 = 123.17, and it does NOT depend on the sequence length.
+        assert!((c.traffic_ratio() - 7_883.0 / 64.0).abs() < 1e-9);
+        assert!((embed_cost(4_050, 7_883, 64).traffic_ratio() - c.traffic_ratio()).abs() < 1e-9);
+    }
+
+    /// The compaction the caption path performs is a traffic reduction as much as a modelling one,
+    /// and this is the size of it: 32,768 rows against 7,883 on the same run.
+    #[test]
+    fn compacting_the_vocabulary_cuts_the_lookup_traffic_by_the_same_factor() {
+        let full = embed_cost(405, 32_768 + 20, 64);
+        let compact = embed_cost(405, 7_883, 64);
+        let saved = full.onehot_bytes() as f64 / compact.onehot_bytes() as f64;
+        assert!(saved > 4.0, "compaction saved only {saved:.2}x");
+        assert_eq!(full.onehot_flops() / compact.onehot_flops(), 4);
+    }
+
+    #[test]
+    fn the_one_hot_matmul_is_two_operations_per_element() {
+        let c = embed_cost(2, 5, 3);
+        assert_eq!(c.onehot_flops(), 2 * 2 * 5 * 3);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -234,4 +267,56 @@ mod tests {
         assert!(k.flops_per_token().is_nan(), "an empty window has no per-token cost to report");
         assert_eq!(k.quadratic_share(), 0.0);
     }
+}
+
+/// What a TRAINABLE embedding table costs when the autograd layer has no row gather.
+///
+/// [`crate::embed_var`] builds a one-hot matrix `[t, rows]` and multiplies it by the table, because
+/// that is gather in the forward pass and matmul's existing backward is exactly the scatter-add a
+/// trainable table needs. It is correct, and it is the reason a caption training run is slow: the
+/// one-hot is `t x rows` floats where a gather would move `t x d_model`.
+///
+/// The crate's own experiments make this concrete rather than theoretical. A rotating-machinery
+/// caption run has `t = 405`, `rows = 7,883` and `d_model = 64`, so **every optimizer step
+/// materialises 12.8 MB to look up 104 KB of embedding** — 123x the traffic, before the backward
+/// pass touches it again.
+///
+/// This is reported rather than fixed here because the gather belongs in the tensor crate, and
+/// this one does not reach into a shared dependency while other work is in flight there. A number
+/// is the right way to carry an argument for that work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedCost {
+    pub seq_len: usize,
+    pub rows: u32,
+    pub d_model: usize,
+}
+
+impl EmbedCost {
+    /// Bytes the one-hot matrix occupies, in f32.
+    pub fn onehot_bytes(&self) -> u64 {
+        self.seq_len as u64 * self.rows as u64 * 4
+    }
+
+    /// Bytes a native row gather would move: one row of `d_model` per position.
+    pub fn gather_bytes(&self) -> u64 {
+        self.seq_len as u64 * self.d_model as u64 * 4
+    }
+
+    /// How much more traffic the one-hot costs. Equals `rows / d_model` exactly, which is why it
+    /// grows with the vocabulary and not with the sequence.
+    pub fn traffic_ratio(&self) -> f64 {
+        self.onehot_bytes() as f64 / self.gather_bytes().max(1) as f64
+    }
+
+    /// Multiply-accumulates in the one-hot matmul, counted as two operations each.
+    ///
+    /// A gather does none of these: every one of them multiplies by a zero or a one.
+    pub fn onehot_flops(&self) -> u64 {
+        2 * self.seq_len as u64 * self.rows as u64 * self.d_model as u64
+    }
+}
+
+/// Cost of one trainable-embedding lookup over a sequence.
+pub fn embed_cost(seq_len: usize, rows: u32, d_model: usize) -> EmbedCost {
+    EmbedCost { seq_len, rows, d_model }
 }

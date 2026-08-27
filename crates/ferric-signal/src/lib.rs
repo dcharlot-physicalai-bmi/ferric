@@ -93,7 +93,7 @@ pub mod vocab;
 
 pub use bench::{chance, majority, nb_probe, permutation_control, shuffled};
 pub use caption::{build_words, compact, train_captions, CaptionError, SeedResult};
-pub use cost::{vocab_cost, TokenCost, VocabCost};
+pub use cost::{embed_cost, vocab_cost, EmbedCost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};
 pub use fsq::{Fsq, FsqError};
 pub use receipt::{agree, agreement, Agreement, TokenReceipt, TokenSpec};

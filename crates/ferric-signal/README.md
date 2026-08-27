@@ -51,7 +51,7 @@ open.
 | `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |
 | `inflate` | DEFLATE/zlib decompression | Streams compressed elsewhere, including the dynamic-Huffman branch; the Adler-32 trailer is checked |
 
-**147 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
+**157 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
@@ -181,8 +181,21 @@ held-out tokens land there — gives 3,046 embedding rows against 32,788, and th
 | full codebook | 32,788 | 80.7 ±8.6 | 68.7 ±4.7 | 58.0 ±1.4 | 42.7 ±2.1 | 86.7 ±1.2 |
 | compacted | 3,046 | 84.7 ±1.7 | 72.3 ±4.1 | 57.0 ±0.8 | 43.3 ±3.4 | 85.3 ±0.5 |
 
-**10.8x fewer rows, every axis within a seed's spread.** The output head is what scales with
-vocabulary, so this is the traffic argument below, measured on real data rather than derived.
+**10.8x fewer rows, every axis within a seed's spread** — and the same 10.8x off the training
+traffic, exactly. A trainable embedding here goes through a materialized one-hot `[t, rows]`,
+because the autograd layer has no row gather, so the lookup moves `t x rows` floats where a gather
+would move `t x d_model`:
+
+| run | positions | rows | one-hot | a gather | ratio |
+|---|---|---|---|---|---|
+| hydraulic, full codebook | 594 | 32,788 | **77.90 MB** | 0.15 MB | 512x |
+| hydraulic, compacted | 594 | 3,046 | 7.24 MB | 0.15 MB | 48x |
+| rotating, compacted | 405 | 7,883 | 12.77 MB | 0.10 MB | 123x |
+
+Per optimizer step, before the backward pass touches the same matrix again. The ratio is
+`rows / d_model` exactly, so it grows with the vocabulary and not with the sequence — which is what
+makes sizing a codebook to its corpus an energy result and not only a modelling one. `embed_cost`
+computes it and `cargo run --example token_cost` prints it.
 
 **A second real corpus: rotating machinery, and a fault type that survives an unseen operating
 point.** 45 recordings, four accelerometers at 25.6 kHz, a perfectly balanced 3 torques x 15
