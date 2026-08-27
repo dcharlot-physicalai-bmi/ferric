@@ -1427,24 +1427,28 @@ mod kvq_cache_tests {
         let restore = std::env::var("FERRIC_KVQ").ok();
 
         for v in ["", "off", "0", "f32", "none", "  OFF  "] {
-            std::env::set_var("FERRIC_KVQ", v);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_KVQ", v) };
             assert!(kvq_from_env().is_none(), "FERRIC_KVQ={v:?} must mean f32");
         }
         for (v, want) in [("q8_0", KvqFmt::Q8_0), ("q4_0", KvqFmt::Q4_0), ("q4_1", KvqFmt::Q4_1)] {
-            std::env::set_var("FERRIC_KVQ", v);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_KVQ", v) };
             assert_eq!(kvq_from_env(), Some(want), "FERRIC_KVQ={v:?}");
         }
 
         // A typo must be LOUD. `q8` is a real one — the ggml name is `q8_0` — and falling back to f32
         // would run full precision while the operator believed the cache was a quarter the size, with
         // no symptom but memory that failed to drop.
-        std::env::set_var("FERRIC_KVQ", "q8");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_KVQ", "q8") };
         let e = std::panic::catch_unwind(kvq_from_env)
             .expect_err("FERRIC_KVQ=q8 must panic, not silently mean f32");
         let msg = e.downcast_ref::<String>().map(String::as_str).unwrap_or("");
         assert!(msg.contains("is not a KV cache format"), "unexpected panic message: {msg:?}");
 
-        match restore { Some(v) => std::env::set_var("FERRIC_KVQ", v), None => std::env::remove_var("FERRIC_KVQ") }
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        match restore { Some(v) => std::env::set_var("FERRIC_KVQ", v), None => unsafe { std::env::remove_var("FERRIC_KVQ") } }
     }
 
     /// Using the wrong accessor would store an empty prefix and seed one — a cache that is quietly not

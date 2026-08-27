@@ -133,7 +133,7 @@ impl FabricProfile {
     {
         let reduce = |v: &[f64], name: &str| -> Result<f64, String> {
             if v.len() < 3 {
-                return Err(format!("{name}: {} sample(s); a spread cannot be judged from fewer                                     than 3", v.len()));
+                return Err(format!("{name}: {} sample(s); a spread cannot be judged from fewer than 3", v.len()));
             }
             let mut w: Vec<f64> = v.to_vec();
             w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -144,7 +144,10 @@ impl FabricProfile {
             let spread = hi / lo;
             if spread > max_spread {
                 return Err(format!(
-                    "{name}: samples spread {spread:.2}x (max/min {lo:.3e}..{hi:.3e}), over the                      {max_spread:.2}x this plan is allowed to be built from. The split depends on                      BH − BP, so noise this wide changes the plan rather than blurring it —                      re-measure on an idle machine instead of widening the tolerance"));
+                    "{name}: samples spread {spread:.2}x (max/min {lo:.3e}..{hi:.3e}), over the {max_spread:.2}x \
+                    this plan is allowed to be built from. The split depends on BH − BP, so noise this wide \
+                    changes the plan rather than blurring it — re-measure on an idle machine instead of widening \
+                    the tolerance"));
             }
             Ok(w[w.len() / 2])
         };

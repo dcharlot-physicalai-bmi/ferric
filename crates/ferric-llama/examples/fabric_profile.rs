@@ -139,7 +139,13 @@ async fn run() {
         Ok(p) => p,
         Err(e) => {
             println!("\n  ⛔ REFUSING TO PLAN: {e}");
-            println!("\n  This is the point of the guard. The split depends on BH − BP, so noise\n                        this wide changes the PLAN rather than blurring a number — measured here as\n                        BR flipping 0.14 -> 0.00 GB/s between runs, which moves 8 missing experts\n                        from a 5/3 split to 8/0. Close the other builds and run it again.");
+            println!();
+            for l in [
+                "  This is the point of the guard. The split depends on BH − BP, so noise this",
+                "  wide changes the PLAN rather than blurring a number — measured here as BR",
+                "  flipping 0.14 -> 0.00 GB/s between runs, which moves 8 missing experts from a",
+                "  5/3 split to 8/0. Close the other builds and run it again.",
+            ] { println!("{l}"); }
             return;
         }
     };
