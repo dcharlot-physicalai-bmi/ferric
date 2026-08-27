@@ -4567,7 +4567,7 @@ mod format_reachability {
     /// Types with a native packed kernel. Must be in `block_bytes`.
     const PACKED: &[(u32, &str)] = &[
         (2, "Q4_0"), (3, "Q4_1"), (6, "Q5_0"), (7, "Q5_1"), (8, "Q8_0"),
-        (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"),
+        (10, "Q2_K"), (11, "Q3_K"), (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"),
         (20, "IQ4_NL"), (23, "IQ4_XS"),
         (39, "MXFP4"),
         (42, "Q2_0"),
