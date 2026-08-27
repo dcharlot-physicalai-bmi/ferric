@@ -20,6 +20,28 @@
 //! Every rate is the median of several passes and the spread is printed, because a single timing on
 //! a laptop is a measurement of what else was running.
 //!
+//! ## ⛔ Striping on one device: TWO RUNS DISAGREED ON THE SIGN
+//!
+//! The sharpest test of Colibri's aggregation claim is the case that must not work — two file
+//! handles on a single physical device. Run minutes apart on the same hardware:
+//!
+//! ```text
+//!            single handle    mirrored     verdict
+//!   run 1       3.62 GB/s     2.46 GB/s    32% SLOWER than solo
+//!   run 2       5.05 GB/s     7.58 GB/s    50% FASTER than solo
+//! ```
+//!
+//! **Opposite directions.** I wrote run 1's number into this header as a finding — "striping on one
+//! device is a loss" — and run 2 refuted it. That was a conclusion from a single median-of-five on a
+//! machine at load 200, which is precisely what [`ferric_tier::FabricProfile::from_samples`] refuses
+//! to do for BP/BH/BD. I built that guard and then took a measurement without it.
+//!
+//! So this now applies the same rule to itself: it reports a verdict only when BOTH the solo and
+//! mirrored samples are stable, and otherwise says the machine cannot answer. ⚠ The `additive_ceiling`
+//! CAVEAT is unaffected — that two devices behind one controller cannot exceed its ceiling is
+//! arithmetic, not a measurement. What was unsupported was my claim about which side of it a shared
+//! device lands on.
+//!
 //! ⚠ The energy model is measured by difference against an idle baseline. On a machine whose only
 //! meter is whole-system, that is the honest construction — and it is why the idle figure is printed
 //! rather than folded away.
@@ -27,7 +49,8 @@
 //!   cargo run -p ferric-llama --example fabric_profile --release -- [model.gguf]
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
-use ferric_tier::{EnergyModel, FabricProfile};
+use ferric_tier::{additive_ceiling, makespan, EnergyModel, FabricProfile, FileBacking,
+                  MirroredBacking, Backing};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -130,6 +153,94 @@ async fn run() {
         println!("  {:<28} {:>10.2}   {:>8.2}x", "BD  backing store", gb(bd), bd_spread);
     } else {
         println!("  {:<28} {:>10}   {:>9}", "BD  backing store", "n/a", "-");
+    }
+
+    // ⛔ THIS BLOCK USED TO SIT BELOW THE PROFILE CONSTRUCTION, WHICH RETURNS EARLY WHEN THE
+    // SPREAD GUARD FIRES — so on any machine noisy enough to trigger the refusal, which is every
+    // machine this has run on, the mirror measurement never executed. It was added specifically to
+    // give MirroredBacking a consumer outside its own tests, and it was itself unreachable.
+    // It needs nothing from FabricProfile; it measures its own rates. So it runs first.
+    // ---- does striping actually add? measured, on this machine ------------------------------
+    //
+    // Colibri's figure for a 9+3 GB/s pair is 12/9 = EXACTLY perfect linear aggregation. That is the
+    // ceiling and it holds only for genuinely independent paths — so the sharpest available test is
+    // the opposite case: TWO HANDLES ON ONE DEVICE. They cannot add, and if the mirror claims they
+    // do, the model is describing arithmetic rather than the machine.
+    //
+    // ⚠ This is also the only thing that exercises MirroredBacking outside its own tests. A type
+    // with no consumer is how ferric-joule's `Saving` carried four defects through 82 passing tests.
+    if let (Ok(a), Ok(b)) = (FileBacking::open(&path), FileBacking::open(&path)) {
+        let flen = a.len();
+        const CH: usize = 16 << 20;
+        if flen > 8 * CH as u64 {
+            let mut buf = vec![0u8; CH];
+            // A moving offset over a file far larger than RAM, so the page cache is not the subject.
+            let mut solo = Vec::new();
+            for i in 0..5u64 {
+                let off = (i * 11 + 3) * (flen / 53) % (flen - CH as u64);
+                let t = Instant::now();
+                a.read_at(off, &mut buf).expect("solo read");
+                solo.push(CH as f64 / t.elapsed().as_secs_f64());
+                std::hint::black_box(buf[0]);
+            }
+            let solo_s = solo.clone();
+            let solo_bw = median(&mut solo);
+
+            let mut m = MirroredBacking::new(
+                vec![Box::new(a) as Box<dyn Backing + Sync>, Box::new(b)],
+                vec![solo_bw, solo_bw],
+            ).expect("mirror of two handles on one file");
+            // Same file twice, so verification MUST pass — the happy path on real data, which the
+            // unit tests can only fake.
+            m.verify(&MirroredBacking::spread_probes(flen, 5, 65536)).expect("a file matches itself");
+
+            let mut pair = Vec::new();
+            for i in 0..5u64 {
+                let off = (i * 17 + 7) * (flen / 53) % (flen - CH as u64);
+                let t = Instant::now();
+                m.read_at(off, &mut buf).expect("mirrored read");
+                pair.push(CH as f64 / t.elapsed().as_secs_f64());
+                std::hint::black_box(buf[0]);
+            }
+            let (solo_spread, pair_spread) = (spread(&solo_s), spread(&pair));
+            let pair_bw = median(&mut pair);
+            let ceiling = additive_ceiling(&[solo_bw, solo_bw]);
+            // What the model PREDICTS the split takes, against what it actually took.
+            let plan_predicted = makespan(&[solo_bw, solo_bw], &[(CH / 2) as u64, (CH / 2) as u64], 1);
+            let measured = CH as f64 / pair_bw;
+
+            println!("\n  striping two handles on ONE device (the case that must NOT add):");
+            println!("    single handle      {:>8.2} GB/s", gb(solo_bw));
+            println!("    both, mirrored     {:>8.2} GB/s", gb(pair_bw));
+            println!("    additive ceiling   {:>8.2} GB/s   <- what perfect aggregation would give",
+                     gb(ceiling));
+            println!("    reached            {:>8.0}% of the ceiling", 100.0 * pair_bw / ceiling);
+            println!("    model predicts {:.4} s for the split, measured {:.4} s ({:.2}x)",
+                     plan_predicted, measured, measured / plan_predicted.max(1e-12));
+            // ⛔ THE SAME RULE THIS FILE APPLIES TO BP/BH/BD, APPLIED HERE. Two runs of the
+            // un-guarded version disagreed on the SIGN (2.46 vs 7.58 GB/s mirrored), so a verdict
+            // from one median is not a finding, it is whatever else the machine was doing.
+            const MAX: f64 = 1.5;
+            if solo_spread > MAX || pair_spread > MAX {
+                println!("    ⛔ NO VERDICT: samples spread {solo_spread:.2}x solo / {pair_spread:.2}x \
+                          mirrored, over {MAX:.1}x.");
+                println!("       Two runs of this measurement without a guard disagreed on the SIGN.");
+                println!("       Whether a shared device gains or loses from striping is not something");
+                println!("       this machine can currently answer. Re-run when it is idle.");
+            } else if pair_bw < solo_bw {
+                println!("    ⭐⭐ WORSE THAN ONE HANDLE ({:.0}% of solo). Splitting across a shared",
+                         100.0 * pair_bw / solo_bw);
+                println!("       device is not a smaller gain, it is a LOSS — two request streams");
+                println!("       contend for one queue and pay seeks for it.");
+            } else if pair_bw < ceiling * 0.9 {
+                println!("    ⭐ Two handles on one device do not reach the ceiling. Colibri's");
+                println!("       12/9 = 1.33x needs INDEPENDENT devices; `additive_ceiling` is a bound");
+                println!("       to measure against, never a rate to plan with.");
+            } else {
+                println!("    ⚠ It DID approach the ceiling — which on one device means the reads were");
+                println!("       served from cache, not from the device. Treat this number as void.");
+            }
+        }
     }
 
     // ⚠ Built from SAMPLES, not from the medians printed above, so an unstable measurement is
