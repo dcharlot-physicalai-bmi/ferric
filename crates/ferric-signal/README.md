@@ -231,6 +231,33 @@ corpus gave +9.0 points on an axis where a different five gave +2.0 — a contro
 points between draws is under-sampled, and under-sampling a control makes results look better than
 they are.
 
+**The decoder says it in words, on recordings it never saw.** Training a causal decoder over the
+hybrid vocabulary to emit a three-word caption — fault, torque, severity — under the *across
+recording* split, 900 train / 450 held out, three seeds:
+
+| axis | mean | sd | majority | chance | distinct words emitted |
+|---|---|---|---|---|---|
+| fault type | **48.2%** | 5.2 | 33.3% | 20.0% | 4.7 of 5 |
+| torque | — | — | — | — | not askable under this split |
+| severity | 14.1% | 18.4 | 33.3% | 20.0% | 3.3 of 5 |
+
+Fault clears the majority baseline by 14.9 points while emitting nearly the full vocabulary, so it
+is answering rather than guessing a constant. **Severity is a null**: below majority, and a
+standard deviation of 18.4 across three seeds that ran 0%, 40% and 2% — which is not a weak
+signal, it is no signal with a lot of variance.
+
+**The budget, not the architecture, was what stood between the two.** At 250 optimizer steps —
+2.2 passes over the training set, where the hydraulic corpus had 6.7 — every axis collapsed to one
+word, standard deviation 0.000, sitting exactly on its majority baseline. That is the same
+signature as the presentation-order null above, and it would have read as a modelling result. The
+probe had already placed the fault signal in the tokens at 65.6%, so the diagnosis was decoder-side
+before anything was retrained, and 800 steps confirmed it.
+
+**The probe is still ahead of the decoder**, 65.6% against 48.2% on the same tokens and the same
+split. A bag-of-codes classifier with no capacity to speak extracts more of the fault signal than
+the decoder trained to say it. That gap is the honest measure of how much of this is a language
+problem rather than a representation one.
+
 **Two traps in this corpus, both silent.** The 2 Nm unbalance recordings are spelled
 `Unbalalnce` — left alone that is a sixth fault class containing exactly one torque, so "fault
 type" and "torque" become partly the same question. And recordings are not the same length: 60 s
