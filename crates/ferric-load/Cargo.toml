@@ -1,13 +1,13 @@
 [package]
 name = "ferric-load"
-description = "Ferric weight loading — a pure-Rust safetensors reader (F32/F16/BF16/F64 → f32). How real Llama/SmolVLA checkpoints enter the ecosystem."
+description = "Ferric safetensors — pure-Rust reader for the format open weights are PUBLISHED in: lazy multi-shard loading via model.safetensors.index.json, FP8 (E4M3/E5M2) with companion scale tensors, and every integer dtype. No Python, no C++."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["safetensors", "weights", "ai", "llm", "ml"]
+keywords = ["safetensors", "fp8", "weights", "llm", "ml"]
 categories = ["science"]
 exclude = ["testdata/"]
 
