@@ -40,22 +40,52 @@
 //! 40.4% at 192). "Gap closed" goes negative: the shipped policy is not merely failing to beat LRU,
 //! it is behind it.
 //!
-//! ## Why, and it follows from the other measurement
+//! ## ⛔ MY FIRST EXPLANATION WAS WRONG, AND THE SWEEP THAT KILLED IT ALSO GIVES THE FIX
 //!
-//! `route_predictability` found the exploitable structure here is TEMPORAL — same layer, previous
-//! token, 41.0%. Now count the frequency signal: 12 layers x 256 experts = 3,072 cells, 103 tokens x
-//! 8 = 824 uses per layer, so a given (layer, expert) is touched about **3 times** across the whole
-//! trace. Three samples do not estimate a frequency. Hotness-LFU is therefore ranking mostly on
-//! noise and using recency only to break ties — it has frequency as the primary key and recency as
-//! the secondary, on a workload where recency is the signal that exists.
+//! I wrote: "a cell is touched ~3 times in the whole trace, so frequency is mostly noise". The policy
+//! never sees a whole-trace count. `DECAY_TOKENS = 16` halves hotness every 16 tokens
+//! (`expert.rs:42`, `:168`) while a cell is selected only `k/n_expert = 8/256 = 0.5` times per
+//! window — so the primary ranking key (`expert.rs:238`) holds **0 or 1 almost always**, about one
+//! bit of range. My reason predicted a longer trace would repair the signal; the code says it cannot.
+//! (The "~3" was also wrong: Belady's 75.7% at cap 768 bounds it at **≥4.1** per *touched* cell.)
 //!
-//! ⭐ So the two measurements agree on a mechanism: **this router's usage is flat enough that
-//! frequency carries little information, and the cache is keyed on the weaker of the two axes.**
-//! Below the working set that does not matter, because ANY retention beats a cyclic LRU's zero.
-//! Above it, it costs up to 7 points.
+//! Made falsifiable by parameterising the decay rate — `end_token()` calls per token, so the
+//! effective window is `DECAY_TOKENS / d`:
+//!
+//! ```text
+//!    capacity       LRU         d=0         d=1         d=4        d=16
+//!         192     40.4%       25.9%       33.2%       41.1%       40.4%
+//!         384     51.9%       38.4%       47.0%       51.8%       52.0%
+//! ```
+//!
+//! ⭐ **d = 4 BEATS LRU** (41.1 vs 40.4 at cap 192; 51.8 vs 51.9 at 384). So frequency is NOT the
+//! wrong key here — `DECAY_TOKENS = 16` is simply too slow a horizon for this workload, and the
+//! deficit is a **constant**, not an axis. That is a far better outcome for the shipped design than
+//! my original claim, and I would not have found it by defending the claim.
+//!
+//! ⭐ **d = 0 — true LFU, hotness accumulating forever — is the WORST arm at 25.9%.** Exactly the
+//! opposite of "a longer trace would help". And **d = 16 converges to LRU to a tenth of a point**,
+//! which is the sanity check the sweep needed: halving every token leaves hotness binary, so the
+//! policy degenerates to recency and must land on LRU. It does.
+//!
+//! The sub-floor rows are consistent: below the working set, slow decay is what retains anything at
+//! all, which is why d = 1 wins there and loses above it. One horizon cannot serve both regimes,
+//! and `DECAY_TOKENS` is fixed at compile time.
 //!
 //! ⚠ **What this does NOT say.** One checkpoint, 9,888 accesses against the vendor trace's 100,096,
-//! and the routing was captured during PREFILL then replayed token-major, which models decode. The
+//! and the routing was captured during PREFILL then replayed token-major, which models decode —
+//! adversarial review cleared that one: `moe_topk` has no `T==1` specialisation and the GDN mixer is
+//! a sequential recurrence, so position *t*'s hidden state is identical either way.
+//!
+//! ⚠ **The floor here is 96 because `FERRIC_MAX_LAYERS=12` truncated the model; a deployed one is
+//! ~320.** Read the sweep by its RATIO to the floor, never by absolute capacity. ⭐ The routing is
+//! unaffected — layer *l* depends only on layers < *l*, so these are the full model's selections for
+//! these 12 layers. A labelling defect, not a fidelity one.
+//!
+//! ⚠ **Unseparated confound:** one cache over six concatenated prompts, never reset. Mean prompt is
+//! 17.2 tokens against a 16–32-token heat horizon, so every token sits inside a domain-switch window.
+//! Mitigating: `ExpertCache` exposes no reset at all, so a server genuinely never resets it — this is
+//! deployed behaviour, but the table measures a multi-document stream, not steady state. The
 //! crate's cited "LRU 36.24%, dead flat 8→64 GB" is a much larger model whose working set exceeded
 //! every budget tested — i.e. entirely the regime where hotness-LFU wins here. Both results can be
 //! true at once, and the honest reading is that the right policy depends on which side of the
@@ -151,14 +181,18 @@ fn belady_hits(seq: &[Access], cap: usize) -> (u64, u64) {
 }
 
 /// The SHIPPED policy, driven exactly as a runtime would drive it.
+/// `decays_per_token` calls `end_token()` that many times at each token boundary, which scales the
+/// effective decay window: `DECAY_TOKENS / decays_per_token`. **0 disables decay entirely** — hotness
+/// then accumulates over the whole trace, which is true LFU and the thing the original write-up
+/// mistakenly believed it was measuring.
 fn shipped_hits(seq: &[Access], cap: usize, n_layers: u32, n_experts: u32, k: usize,
-                slot: usize, backing: &dyn Backing) -> Option<(u64, u64)> {
+                slot: usize, backing: &dyn Backing, decays_per_token: u32) -> Option<(u64, u64)> {
     let mut c = ExpertCache::new(n_layers, n_experts, slot, cap, k).ok()?;
     let mut tok = usize::MAX;
     let mut i = 0usize;
     while i < seq.len() {
         if seq[i].token != tok {
-            if tok != usize::MAX { c.end_token(); }
+            if tok != usize::MAX { for _ in 0..decays_per_token { c.end_token() } }
             tok = seq[i].token;
         }
         // `note_selected` is documented as once per (token, layer) BEFORE the gets — it bumps
@@ -247,8 +281,22 @@ async fn run() {
     const SLOT: usize = 64; // hit rate is what is being measured; real bytes are applied after
     let backing = SliceBacking::new(vec![0u8; n_layers as usize * ne as usize * SLOT]);
     let floor = moe.len() * k;
-    println!("  working-set floor (n_layers x top_k) = {floor} entries\n");
-    println!("  {:>9}  {:>10}  {:>10}  {:>10}  {:>12}", "capacity", "LRU", "shipped", "Belady", "gap closed");
+    // ⛔ THE FLOOR PUBLISHED FIRST WAS A TRUNCATION ARTIFACT. FERRIC_MAX_LAYERS caps the model at 12
+    // layers; the checkpoint has far more, so a DEPLOYED cache's floor is several times this one and
+    // a reader sizing against 96 lands on the wrong side of the boundary the whole conclusion turns
+    // on. ⭐ The recorded ROUTING is unaffected — layer l depends only on layers < l, so these are
+    // the full model's selections for these 12 layers. It is a labelling defect, not a fidelity one.
+    let full_blocks = match g.metadata.get("qwen35moe.block_count") {
+        Some(Meta::U(v)) => *v as usize, _ => moe.len(),
+    };
+    println!("  working-set floor: {floor} entries HERE (12 layers x top-{k})");
+    println!("  ⚠ the checkpoint has {full_blocks} blocks, so a DEPLOYED floor is ~{} entries.",
+             full_blocks * k);
+    println!("    Read the sweep by its RATIO to the floor, never by absolute capacity.\n");
+    // ⛔ This column WAS "gap closed" = (shipped−LRU)/(Belady−LRU). It normalises a deficit by
+    // headroom the deficit does not live in, and it printed −7% for BOTH a −1.7 point gap (cap 96)
+    // and a −0.8 point one (cap 768). Raw points say what happened.
+    println!("  {:>9}  {:>10}  {:>10}  {:>10}  {:>12}", "capacity", "LRU", "shipped", "Belady", "shipped−LRU");
     println!("  {:-<60}", "");
 
     let mut caps: Vec<usize> = vec![k + 1, floor / 4, floor / 2, floor, floor * 2, floor * 4, floor * 8];
@@ -257,24 +305,46 @@ async fn run() {
     for cap in caps {
         let (lh, lg) = lru_hits(&seq, cap);
         let (bh, _) = belady_hits(&seq, cap);
-        let sh = shipped_hits(&seq, cap, n_layers, ne, k, SLOT, &backing);
+        let sh = shipped_hits(&seq, cap, n_layers, ne, k, SLOT, &backing, 1);
         let (l, b) = (lh as f64 / lg as f64, bh as f64 / lg as f64);
         match sh {
             Some((s, sg)) => {
                 assert_eq!(sg, lg, "the policies saw different access counts");
                 let s = s as f64 / sg as f64;
-                let closed = if b - l > 1e-9 { 100.0 * (s - l) / (b - l) } else { f64::NAN };
-                println!("  {cap:>9}  {:>9.1}%  {:>9.1}%  {:>9.1}%  {:>11.0}%",
-                         100.0 * l, 100.0 * s, 100.0 * b, closed);
+                println!("  {cap:>9}  {:>9.1}%  {:>9.1}%  {:>9.1}%  {:>+11.1}",
+                         100.0 * l, 100.0 * s, 100.0 * b, 100.0 * (s - l));
             }
             None => println!("  {cap:>9}  {:>9.1}%  {:>10}  {:>9.1}%  {:>12}",
                              100.0 * l, "refused", 100.0 * b, "-"),
         }
     }
 
-    println!("\n  'gap closed' is the shipped policy's share of the LRU→Belady headroom: 0% means it");
-    println!("  is LRU, 100% means it is clairvoyant. Belady is offline and unreachable; it is the");
-    println!("  ceiling that says whether a better ONLINE policy is worth writing at all.");
+    // ---- D1: is the deficit about FREQUENCY, or about one constant? ------------------------
+    //
+    // The original write-up said frequency is unmeasurable because a cell is touched ~3 times in the
+    // whole trace. The policy never sees a whole-trace count: DECAY_TOKENS=16 halves hotness every
+    // 16 tokens while a cell is selected only k/n_expert = 0.5 times per window, so the primary
+    // ranking key holds 0 or 1 almost always. If that is the cause, TURNING DECAY OFF should recover
+    // the signal; if frequency is genuinely the wrong axis, no decay rate helps.
+    println!("\n  decay sweep — end_token() calls per token (0 = never decay = true LFU):");
+    println!("  {:>9}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}", "capacity", "LRU", "d=0", "d=1", "d=4", "d=16");
+    println!("  {:-<66}", "");
+    for cap in [192usize, 384] {
+        let (lh, lg) = lru_hits(&seq, cap);
+        let mut row = format!("  {cap:>9}  {:>7.1}%", 100.0 * lh as f64 / lg as f64);
+        for d in [0u32, 1, 4, 16] {
+            match shipped_hits(&seq, cap, n_layers, ne, k, SLOT, &backing, d) {
+                Some((h, gt)) => row.push_str(&format!("  {:>9.1}%", 100.0 * h as f64 / gt as f64)),
+                None => row.push_str(&format!("  {:>10}", "refused")),
+            }
+        }
+        println!("{row}");
+    }
+    println!("  If any decay rate reaches LRU, the deficit is a CONSTANT (DECAY_TOKENS), not the axis.");
+    println!("  If none does at any rate, \"frequency is the wrong key here\" is earned.");
+
+    println!("\n  Belady is offline and unreachable; it is the ceiling that says whether a better");
+    println!("  ONLINE policy is worth writing at all.");
     println!("\n  ⚠ {} accesses from prefill over {} prompts on {} of the checkpoint's layers.",
              seq.len(), PROMPTS.len(), moe.len());
     println!("     The crate's cited 36.24%/25.5-point figures come from a 100,096-request vendor");
