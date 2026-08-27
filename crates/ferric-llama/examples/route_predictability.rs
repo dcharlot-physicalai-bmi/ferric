@@ -5,6 +5,39 @@
 //! is worth building, and it is not checkable from the outside — so this checks it on a real local
 //! checkpoint, with every content-free baseline that could produce the same number for no reason.
 //!
+//! ## ⭐ THE RESULT: Colibri prefetches along the wrong axis
+//!
+//! Measured on Qwen3.6-35B-A3B (256 experts, top-8), 12 MoE layers, 6 prompts, 506 (L → L+1) pairs
+//! with popularity fitted on a held-out split:
+//!
+//! ```text
+//!   identity  (L's set -> L+1)               2.7%   <- AT CHANCE
+//!   per-layer popularity [held-out]         10.0%
+//!   global popularity   [held-out]           6.5%
+//!   previous token, same layer              41.0%   <- the real structure
+//!   random top-k (the floor)                 3.1%
+//!   Colibri's published figure               71.6%
+//! ```
+//!
+//! **Cross-layer prediction is worth nothing here.** Identity sits at the random floor — consecutive
+//! layers choose essentially independent expert sets, uniformly across every layer measured (0–5%,
+//! so it is not an early-layer artifact). Even *static per-layer popularity*, which requires no
+//! prediction at all, beats it nearly 4×.
+//!
+//! **The exploitable correlation is TEMPORAL.** The same layer's choice for the *previous token*
+//! predicts 41.0% — 15.2× identity and 13.1× the floor. Routing follows the hidden state, and the
+//! hidden state changes slowly from token to token and completely from layer to layer. That is the
+//! mechanism, and it points at a different axis than one-layer-ahead prefetch.
+//!
+//! ⭐ **Which is the axis `ferric_tier::ExpertCache` already exploits** — hotness-LFU with an LRU
+//! tiebreak is precisely a bet on temporal reuse. So this measurement CONFIRMS the cache Ferric
+//! shipped and REFUTES the prefetcher it was tempting to add. The prefetcher does not get built.
+//!
+//! ⚠ **Scope, honestly:** 12 of 41 layers (`FERRIC_MAX_LAYERS`), one checkpoint, 506 pairs. Colibri
+//! measured GLM-5.2, a different router — this does not show their number is wrong *for their
+//! model*, it shows the premise does not transfer to this one, which is the only thing a single
+//! checkpoint can show. Anyone shipping expert speculation should run this on their own weights.
+//!
 //! ## What "predictable" has to mean, and the trap in it
 //!
 //! The only predictor available while layer L runs is **layer L's own chosen set**. So "predictable
@@ -158,6 +191,10 @@ async fn run() {
 
     // ---- score ----------------------------------------------------------------------------
     let (mut identity, mut pop_layer, mut pop_global, mut prev_tok, mut n) = (0.0, 0.0, 0.0, 0.0, 0u64);
+    // ⛔ Its own denominator. `prev_tok` is only defined for ti > 0, and dividing it by `n` — which
+    // counts every pair including the first token's — understated it by (T-1)/T. A predictor scored
+    // against a larger population than it was evaluated on is penalised for pairs it never saw.
+    let mut n_prev = 0u64;
     let mut by_layer: Vec<(f64, f64, u64)> = vec![(0.0, 0.0, 0); moe_layers.len()];
     for pr in eval {
         for (ti, tok) in pr.iter().enumerate() {
@@ -166,7 +203,7 @@ async fn run() {
                 identity += overlap(next, cur);
                 pop_layer += overlap(next, &l_top[li + 1]);
                 pop_global += overlap(next, &g_top);
-                if ti > 0 { prev_tok += overlap(next, &pr[ti - 1][li + 1]); }
+                if ti > 0 { prev_tok += overlap(next, &pr[ti - 1][li + 1]); n_prev += 1; }
                 let b = &mut by_layer[li + 1];
                 b.0 += overlap(next, cur); b.1 += overlap(next, &l_top[li + 1]); b.2 += 1;
                 n += 1;
@@ -183,17 +220,28 @@ async fn run() {
     println!("  {:<34} {:>9.1}%", "identity  (L's set -> L+1)", 100.0 * identity / f);
     println!("  {:<34} {:>9.1}%", "per-layer popularity [held-out]", 100.0 * pop_layer / f);
     println!("  {:<34} {:>9.1}%", "global popularity   [held-out]", 100.0 * pop_global / f);
-    println!("  {:<34} {:>9.1}%", "previous token, same layer", 100.0 * prev_tok / f);
+    println!("  {:<34} {:>9.1}%", "previous token, same layer",
+             if n_prev == 0 { f64::NAN } else { 100.0 * prev_tok / n_prev as f64 });
     println!("  {:<34} {:>9.1}%", "random top-k (the floor)", 100.0 * random_floor);
 
     let (id_s, pl_s) = (identity / f, pop_layer / f);
     println!("\n  Colibri's published figure for this quantity: 71.6%");
+    println!("  ⚠ SCOPE: {} of the checkpoint's MoE layers, {} prompts, {n} pairs ({n_prev} for\n  \
+              prev-token). One checkpoint. Colibri measured GLM-5.2, a different router.",
+             moe_layers.len(), PROMPTS.len());
     println!("\n  {:<34} {:>10}", "per-layer detail (first 12)", "id / pop");
     for (li, b) in by_layer.iter().enumerate().take(13).skip(1) {
         if b.2 == 0 { continue }
         println!("  {:<34} {:>9}", format!("  MoE layer {}", moe_layers[li]),
                  format!("{:.0}% / {:.0}%", 100.0 * b.0 / b.2 as f64, 100.0 * b.1 / b.2 as f64));
     }
+
+    let pt = if n_prev == 0 { 0.0 } else { prev_tok / n_prev as f64 };
+    println!("\n  ---- what the structure actually is ----");
+    println!("  previous-token beats identity {:.1}x and the floor {:.1}x, so the exploitable",
+             pt / id_s.max(1e-9), pt / random_floor);
+    println!("  correlation is TEMPORAL, not cross-layer. That is what a hotness/recency cache");
+    println!("  already exploits, and it is the axis Colibri's one-layer-ahead prefetch does not.");
 
     println!("\n  ---- the registered decision ----");
     if id_s > pl_s + 0.05 {
