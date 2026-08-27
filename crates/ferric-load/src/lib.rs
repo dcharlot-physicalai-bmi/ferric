@@ -16,6 +16,7 @@
 //! the eager path needs the entire checkpoint resident AND a second copy expanded to f32.
 
 pub mod fp8;
+pub mod hf;
 
 use half::{bf16, f16};
 use std::collections::{BTreeMap, HashMap};
