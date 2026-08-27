@@ -266,6 +266,71 @@ impl FabricProfile {
     }
 }
 
+
+/// **Split indivisible work across N heterogeneous paths so they finish together.**
+///
+/// The two-path bus/host split above is the case FreeToken solves. The same arithmetic is what
+/// Colibri's dual-SSD striping needs — and what any fabric with more than two ways to move a byte
+/// needs — so it is worth having once, in general, rather than twice in special cases.
+///
+/// ## Why not the closed form
+///
+/// Continuously the answer is obvious: `n_i = m·B_i/ΣB`, everyone finishing at `m/ΣB`. Experts are
+/// indivisible, and rounding that vector is wrong for the same reason rounding `q*` was wrong —
+/// the objective is a max, and a max is not minimised by rounding each term to nearest.
+///
+/// So: assign items one at a time, each to whichever path would finish it soonest. For unit jobs on
+/// uniform machines that greedy is exactly optimal, not merely good, and `split_n_matches_brute_force`
+/// checks it against exhaustive enumeration rather than taking the claim on trust.
+///
+/// Paths with a non-positive or non-finite rate are given nothing — they are not errors here, since
+/// a fabric legitimately has dead paths (see `residual_host() <= 0`), and refusing the whole plan
+/// because one path is idle would be worse than routing around it.
+pub fn split_n(bandwidths: &[f64], m: u64) -> Vec<u64> {
+    let mut out = vec![0u64; bandwidths.len()];
+    let usable: Vec<usize> = (0..bandwidths.len())
+        .filter(|&i| bandwidths[i] > 0.0 && bandwidths[i].is_finite()).collect();
+    if usable.is_empty() || m == 0 { return out }
+    for _ in 0..m {
+        // The path whose completion time after taking one more item is lowest. Ties go to the
+        // lower index so the result is deterministic — a split that reorders between runs would
+        // make its own measurement irreproducible.
+        let best = usable.iter().copied()
+            .min_by(|&a, &b| {
+                let ta = (out[a] + 1) as f64 / bandwidths[a];
+                let tb = (out[b] + 1) as f64 / bandwidths[b];
+                ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+            })
+            .expect("usable is non-empty");
+        out[best] += 1;
+    }
+    out
+}
+
+/// Makespan of an N-way split: the slowest path, since they run concurrently.
+pub fn makespan(bandwidths: &[f64], split: &[u64], bytes_per_item: u64) -> f64 {
+    split.iter().zip(bandwidths).fold(0.0f64, |acc, (&n, &b)| {
+        if n == 0 { acc }
+        else if !(b > 0.0) { f64::INFINITY }   // work parked on a dead path never finishes
+        else { acc.max(n as f64 * bytes_per_item as f64 / b) }
+    })
+}
+
+/// ⚠ **The ceiling on striping, which is NOT a promise of it.**
+///
+/// Colibri reports that "a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive
+/// alone". 12/9 = 1.333, so the published figure is *exactly* perfect linear aggregation — every
+/// byte of the slow drive's bandwidth added with no loss. That is the best case and it holds only
+/// when the paths are genuinely independent; two NVMe drives behind one PCIe root complex, or one
+/// controller, share a ceiling and add to less than their sum.
+///
+/// This returns the additive ceiling so a caller can compare it against a MEASURED aggregate and see
+/// the shortfall. It is deliberately not usable as a profile: build those from
+/// [`FabricProfile::from_samples`], which measures.
+pub fn additive_ceiling(bandwidths: &[f64]) -> f64 {
+    bandwidths.iter().filter(|b| **b > 0.0 && b.is_finite()).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +514,84 @@ mod tests {
                 "refused a 1.03x spread at a 1.05x tolerance");
         // Too few samples to judge a spread at all is a refusal, not a pass.
         assert!(FabricProfile::from_samples(&[1.0e9, 1.0e9], &steady, &steady, 1.5).is_err());
+    }
+
+
+    /// The greedy claims to be OPTIMAL, not merely good, so it is checked against every possible
+    /// assignment. Exhaustive enumeration over compositions of m into n parts — small m and n, but
+    /// complete, which is what a claim of optimality requires.
+    #[test]
+    fn split_n_matches_brute_force() {
+        fn best(bw: &[f64], m: u64, bytes: u64) -> f64 {
+            // enumerate all compositions of m into bw.len() parts
+            fn go(bw: &[f64], left: u64, acc: &mut Vec<u64>, bytes: u64, out: &mut f64) {
+                if acc.len() == bw.len() - 1 {
+                    acc.push(left);
+                    *out = out.min(makespan(bw, acc, bytes));
+                    acc.pop();
+                    return;
+                }
+                for take in 0..=left { acc.push(take); go(bw, left - take, acc, bytes, out); acc.pop(); }
+            }
+            let mut o = f64::INFINITY;
+            go(bw, m, &mut Vec::new(), bytes, &mut o);
+            o
+        }
+        for bw in [vec![9.0e9, 3.0e9], vec![8.0e9, 12.0e9], vec![1.0, 1.0, 1.0],
+                   vec![9.0e9, 3.0e9, 1.0e9], vec![5.0, 2.0, 2.0], vec![7.0, 1.0, 3.0, 2.0]] {
+            for m in 0..=12u64 {
+                let got = split_n(&bw, m);
+                assert_eq!(got.iter().sum::<u64>(), m, "split lost items: {got:?} for m={m}");
+                let mine = makespan(&bw, &got, S);
+                let opt = best(&bw, m, S);
+                assert!((mine - opt).abs() < 1e-9 || (mine - opt) / opt.max(1e-12) < 1e-12,
+                        "bw {bw:?} m={m}: greedy {got:?} takes {mine:.6}, optimum is {opt:.6}");
+            }
+        }
+    }
+
+    /// ⭐ TWO INDEPENDENTLY WRITTEN ALGORITHMS FOR ONE QUANTITY. `split_for_latency` is a closed form
+    /// over `q* = m·BP/BH` with a floor/ceil comparison; `split_n` is a greedy that knows nothing
+    /// about that derivation. On the two-path fabric they must agree, and if they ever disagree one
+    /// of them is wrong — which is worth more than either checking itself.
+    #[test]
+    fn the_closed_form_and_the_greedy_agree_on_two_paths() {
+        for (bp, bh) in [(8.0e9, 20.0e9), (0.29e9, 0.43e9), (1.0e9, 1.05e9), (3.0e9, 12.0e9),
+                         (5.0e9, 6.0e9), (0.5e9, 9.0e9), (2.0e9, 2.0e9)] {
+            let p = FabricProfile::measured(bp, bh, 3.0e9).unwrap();
+            for m in [0u64, 1, 2, 5, 8, 16, 47, 64, 129] {
+                let closed = p.split_for_latency(m);
+                let greedy = split_n(&[p.pcie, p.residual_host()], m);
+                let (a, b) = (
+                    makespan(&[p.pcie, p.residual_host()], &[closed.to_device, closed.on_host], S),
+                    makespan(&[p.pcie, p.residual_host()], &greedy, S),
+                );
+                assert!((a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
+                        "BP {bp:.2e} BH {bh:.2e} m={m}: closed form {closed:?} takes {a:.6}, \
+                         greedy {greedy:?} takes {b:.6}");
+            }
+        }
+    }
+
+    /// ⚠ Colibri's dual-SSD figure is EXACTLY additive, which is the ceiling rather than a law.
+    #[test]
+    fn striping_reaches_the_additive_ceiling_only_when_paths_are_independent() {
+        let (fast, slow) = (9.0e9, 3.0e9);
+        assert_eq!(additive_ceiling(&[fast, slow]), 12.0e9);
+        // The published claim, reproduced from the arithmetic: 12/9 = 1.333.
+        let m = 120u64;
+        let solo = makespan(&[fast], &split_n(&[fast], m), S);
+        let pair = makespan(&[fast, slow], &split_n(&[fast, slow], m), S);
+        let speedup = solo / pair;
+        assert!((speedup - 4.0 / 3.0).abs() < 0.02,
+                "perfect striping of 9+3 should be ~1.33x the fast drive alone, got {speedup:.3}");
+        // ⚠ And a SHARED ceiling is the realistic case: two drives behind one 10 GB/s link do not
+        // add to 12. The model must be able to express that, or it can only describe the best case.
+        let shared = makespan(&[7.0e9, 3.0e9], &split_n(&[7.0e9, 3.0e9], m), S);
+        assert!(shared > pair, "a bandwidth-limited pair must be slower than an independent one");
+        // Dead paths are routed around rather than treated as an error.
+        assert_eq!(split_n(&[5.0e9, 0.0], 10), vec![10, 0]);
+        assert_eq!(split_n(&[0.0, f64::NAN], 10), vec![0, 0], "no usable path: nothing is assigned");
     }
 
     #[test]

@@ -66,7 +66,7 @@ mod plan;
 mod prefetch;
 
 pub use expert::{ExpertCache, ExpertStats};
-pub use fabric::{EnergyModel, FabricProfile, Split};
+pub use fabric::{additive_ceiling, makespan, split_n, EnergyModel, FabricProfile, Split};
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileBacking;
 pub use layer::{LayerCache, LayerStats};
