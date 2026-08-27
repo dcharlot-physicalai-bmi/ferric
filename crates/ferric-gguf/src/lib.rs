@@ -436,11 +436,41 @@ fn check_declared_strides(tensors: &[TensorInfo], data_len: usize, align: usize)
 /// Uniform read access over a GGUF, however it's held: the eager in-memory `Gguf` (the browser path
 /// — the whole file is fetched into a `Vec<u8>`) and the lazy file-backed `GgufFile` (native, one
 /// tensor in RAM at a time) both implement it, so model loaders are written once against the trait.
+fn ferric_gguf_type_size(t: &TensorInfo) -> Result<usize, String> {
+    type_size(t.ggml_type, t.dims.iter().product::<u64>() as usize)
+}
+
 pub trait GgufSource {
     fn metadata(&self) -> &HashMap<String, Meta>;
     fn tensor(&self, name: &str) -> Option<&TensorInfo>;
     fn raw(&self, name: &str) -> Result<Vec<u8>, String>;
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String>;
+
+    /// **Read a sub-range of a tensor without materialising the whole tensor.**
+    ///
+    /// A MoE's routed-expert tensors are the bulk of a checkpoint — 97.5% of DeepSeek-V4-Flash — so
+    /// a caller that wants ONE expert should not have to hold all of them to get it. That is the
+    /// difference between streaming experts and merely relocating them.
+    ///
+    /// The default is correct and eager: it reads the whole tensor and slices. Overriding it is what
+    /// makes a source lazy, and [`GgufFile`] does. Callers may therefore use this unconditionally and
+    /// get laziness where the source can provide it, rather than branching on the source type.
+    /// Where a tensor's bytes live on disk: `(file, absolute offset, length)`.
+    ///
+    /// `raw_range` is lazy but borrows `self`. A streaming expert cache outlives the loader that
+    /// built it, so it needs an OWNED handle — which means a path. Sources that are not file-backed
+    /// return `None` and the caller falls back to holding the bytes.
+    fn tensor_file_range(&self, _name: &str) -> Option<(std::path::PathBuf, u64, u64)> { None }
+
+    fn raw_range(&self, name: &str, off: u64, dst: &mut [u8]) -> Result<(), String> {
+        let all = self.raw(name)?;
+        let end = off as usize + dst.len();
+        if end > all.len() {
+            return Err(format!("{name}: range {off}..{end} exceeds the tensor's {} bytes", all.len()));
+        }
+        dst.copy_from_slice(&all[off as usize..end]);
+        Ok(())
+    }
 }
 
 impl Gguf {
@@ -539,7 +569,11 @@ pub struct GgufFile {
     owner: Vec<usize>,
 }
 
-struct Shard { f: std::cell::RefCell<std::fs::File>, data_start: u64, len: u64 }
+struct Shard { f: std::cell::RefCell<std::fs::File>, data_start: u64, len: u64,
+               /// Kept so a caller can open its OWN handle on this file. `raw_range` is lazy but
+               /// borrows `self`; a streaming cache has to outlive the loader that built it, and
+               /// an owned path is the only thing that crosses that boundary.
+               path: std::path::PathBuf }
 
 /// Parse one file's header, growing the prefix read until it succeeds.
 fn open_one(path: &std::path::Path) -> Result<(HashMap<String, Meta>, Vec<TensorInfo>, Shard), String> {
@@ -555,7 +589,7 @@ fn open_one(path: &std::path::Path) -> Result<(HashMap<String, Meta>, Vec<Tensor
         match parse(buf) {
             Ok(g) => return Ok((g.metadata, g.tensors,
                                 Shard { f: std::cell::RefCell::new(f), data_start: g.data_start as u64,
-                                        len: len as u64 })),
+                                        len: len as u64, path: path.to_path_buf() })),
             Err(e) => {
                 if cap >= len { return Err(e); }
                 cap = (cap * 4).min(len);
@@ -692,6 +726,32 @@ impl GgufSource for GgufFile {
     fn tensor(&self, name: &str) -> Option<&TensorInfo> { GgufFile::tensor(self, name) }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> { GgufFile::raw(self, name) }
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String> { GgufFile::dequant(self, name) }
+    fn tensor_file_range(&self, name: &str) -> Option<(std::path::PathBuf, u64, u64)> {
+        let idx = self.tensors.iter().position(|t| t.name == name)?;
+        let t = &self.tensors[idx];
+        let sh = &self.shards[self.owner[idx]];
+        let n = ferric_gguf_type_size(t).ok()? as u64;
+        Some((sh.path.clone(), sh.data_start + t.offset, n))
+    }
+
+    /// Seek straight to the range. This is what makes expert streaming possible: the caller reads
+    /// one expert's bytes without the other 255 ever entering memory.
+    fn raw_range(&self, name: &str, off: u64, dst: &mut [u8]) -> Result<(), String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let idx = self.tensors.iter().position(|t| t.name == name)
+            .ok_or_else(|| format!("no tensor '{name}'"))?;
+        let t = &self.tensors[idx];
+        let n = ferric_gguf_type_size(t)?;
+        let end = off as usize + dst.len();
+        if end > n {
+            return Err(format!("{name}: range {off}..{end} exceeds the tensor's {n} bytes"));
+        }
+        let sh = &self.shards[self.owner[idx]];
+        let mut f = sh.f.borrow_mut();
+        f.seek(SeekFrom::Start(sh.data_start + t.offset + off))
+            .map_err(|e| format!("{name}: seek: {e}"))?;
+        f.read_exact(dst).map_err(|e| format!("{name}: read: {e}"))
+    }
 }
 
 fn read_prefix(f: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, String> {

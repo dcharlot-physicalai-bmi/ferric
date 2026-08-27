@@ -282,6 +282,45 @@ pub enum MoeExperts {
     PerExpert(Vec<Expert>),
 }
 
+/// A byte range of a file served as if it began at zero.
+///
+/// `GgufSource::raw_range` is lazy but borrows the source; a streaming cache outlives the loader
+/// that built it, so it needs its own handle. `tensor_file_range` hands over the path and the
+/// absolute offset, and this owns a `FileBacking` on it.
+struct RangeBacking { f: ferric_tier::FileBacking, base: u64, len: u64 }
+
+impl ferric_tier::Backing for RangeBacking {
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ferric_tier::TierError> {
+        let end = off + dst.len() as u64;
+        if end > self.len {
+            return Err(ferric_tier::TierError::Io(format!("range read {off}..{end} past {}", self.len)));
+        }
+        self.f.read_at(self.base + off, dst)
+    }
+}
+
+/// One expert's gate bytes immediately followed by its up bytes.
+///
+/// ⚠ The gate|up slab is INTERLEAVED per expert — it matches `swiglu_id`'s `base + o` / `base + eff
+/// + o` addressing — and that interleaving exists nowhere on disk: gate and up are two separate
+/// tensors. So a per-expert read is two reads, and this is the only place that knows it. Reads must
+/// be whole experts; a partial one would silently straddle the seam between the two tensors.
+struct PairBacking { g: RangeBacking, u: RangeBacking, g_per: usize, u_per: usize }
+
+impl ferric_tier::Backing for PairBacking {
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ferric_tier::TierError> {
+        let per = (self.g_per + self.u_per) as u64;
+        if off % per != 0 || dst.len() as u64 != per {
+            return Err(ferric_tier::TierError::Io(format!(
+                "paired backing serves whole experts only ({per} bytes, aligned); got {} at {off}",
+                dst.len())));
+        }
+        let e = off / per;
+        self.g.read_at(e * self.g_per as u64, &mut dst[..self.g_per])?;
+        self.u.read_at(e * self.u_per as u64, &mut dst[self.g_per..])
+    }
+}
+
 /// Routed experts held in a fixed number of GPU slots and fetched on miss.
 ///
 /// This is what `ferric_tier::ExpertCache` was written for and never had a consumer for. The three
@@ -537,6 +576,62 @@ pub(crate) fn yarn_freq_scale(n_rot: usize, base: f32, factor: f32, orig_ctx: us
 /// Load a layer's FFN — a dense SwiGLU (qwen35), or a mixture-of-experts (qwen35moe): softmax router +
 /// `n_expert` routed SwiGLU experts + an always-on sigmoid-gated shared expert. The stacked 3D `*_exps`
 /// tensors slice cleanly per expert (each expert is whole rows, so quant-block boundaries are respected).
+/// Build streamed experts for one layer, materialising **no expert tensor**.
+///
+/// Returns `Ok(None)` when the source cannot say where its tensors live on disk — an in-memory or
+/// converted source, for instance — so the caller falls back to the resident path rather than
+/// silently reading everything into a "streaming" cache, which is what the first version did.
+fn try_streamed(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, c: usize, dt: u32)
+    -> Result<Option<StreamedExperts>, String>
+{
+    use ferric_tier::{Backing, FileBacking};
+    let b = |s: &str| format!("blk.{il}.{s}");
+    let (ne, eff, d) = (cfg.n_expert, cfg.expert_ff, cfg.n_embd);
+
+    let (Some(gr), Some(ur), Some(dr)) = (g.tensor_file_range(&b("ffn_gate_exps.weight")),
+                                          g.tensor_file_range(&b("ffn_up_exps.weight")),
+                                          g.tensor_file_range(&b("ffn_down_exps.weight")))
+    else { return Ok(None) };
+
+    let rb = |(path, base, len): (std::path::PathBuf, u64, u64)| -> Result<RangeBacking, String> {
+        Ok(RangeBacking { f: FileBacking::open(&path).map_err(|e| format!("{}: {e:?}", path.display()))?,
+                          base, len })
+    };
+    let (g_per, u_per, d_per) = ((gr.2 / ne as u64) as usize, (ur.2 / ne as u64) as usize,
+                                 (dr.2 / ne as u64) as usize);
+    let gu_src = PairBacking { g: rb(gr)?, u: rb(ur)?, g_per, u_per };
+    let dn_src = rb(dr)?;
+    let (gu_per, dn_per) = (g_per + u_per, d_per);
+
+    // Seed the slabs by reading the first C experts THROUGH the backings — C reads, not ne. The
+    // contents are irrelevant (every slot is overwritten before use) but the allocation must be the
+    // right shape, and reading them the same way the cache will proves the backings work before any
+    // forward depends on them.
+    let mut gu_seed = vec![0u8; c * gu_per];
+    let mut dn_seed = vec![0u8; c * dn_per];
+    for e in 0..c {
+        gu_src.read_at((e * gu_per) as u64, &mut gu_seed[e * gu_per..(e + 1) * gu_per])
+            .map_err(|x| format!("blk.{il} seed gate|up expert {e}: {x:?}"))?;
+        dn_src.read_at((e * dn_per) as u64, &mut dn_seed[e * dn_per..(e + 1) * dn_per])
+            .map_err(|x| format!("blk.{il} seed down expert {e}: {x:?}"))?;
+    }
+
+    let gate_up = Q4_KWeights::from_bytes(ctx, &gu_seed, c * 2 * eff, d);
+    let down = if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &dn_seed, c * d, eff)) }
+               else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &dn_seed, c * d, eff)) };
+    // One cache per layer, so n_layers = 1 and every key uses layer 0.
+    let cache = ferric_tier::ExpertCache::new(1, ne as u32, 1, c, cfg.n_expert_used)
+        .map_err(|e| format!("blk.{il} streamed experts: {e:?}"))?;
+    Ok(Some(StreamedExperts {
+        gate_up, down,
+        cache: std::sync::Mutex::new(cache),
+        gu_src: Box::new(gu_src), dn_src: Box::new(dn_src),
+        gu_bytes: gu_per, dn_bytes: dn_per, layer: 0, capacity: c,
+        fetched: std::sync::atomic::AtomicU64::new(0),
+        hits: std::sync::atomic::AtomicU64::new(0),
+    }))
+}
+
 fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Result<Ffn, String> {
     let b = |s: &str| format!("blk.{il}.{s}");
     // Dense FFN: non-MoE models, and a MoE model's leading dense blocks (laguna: layer 0).
@@ -565,14 +660,31 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
     let (gt, ut) = (g.tensor(&b("ffn_gate_exps.weight")).ok_or("no gate_exps")?.ggml_type,
                     g.tensor(&b("ffn_up_exps.weight")).ok_or("no up_exps")?.ggml_type);
     if gt != ut { return Err(format!("blk.{il}: gate/up expert quants differ ({gt} vs {ut})")); }
-    let g_full = g.raw(&b("ffn_gate_exps.weight"))?;
-    let u_full = g.raw(&b("ffn_up_exps.weight"))?;
-    let (g_per, u_per) = (g_full.len() / ne, u_full.len() / ne);
     let dt = g.tensor(&b("ffn_down_exps.weight")).ok_or("no down_exps")?.ggml_type;
+
+    // ⭐ STREAMED PATH IS CHOSEN BEFORE THE EAGER READS. `g.raw()` on an expert tensor materialises
+    // every expert — the bulk of the checkpoint — so deciding to stream AFTER those calls would have
+    // relocated the memory rather than saved it. That was the shape of the first version and it is
+    // the difference between "runs a model larger than memory" and "holds it twice".
+    // ⚠ `c` must exceed top_k (ExpertCache's own floor) and be under the expert count, or streaming
+    // is impossible or pointless. Unset, 0, or out of range means fully resident.
+    let streamed = match std::env::var("FERRIC_MOE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c) if c > cfg.n_expert_used && c < ne && gt == 12 && (dt == 14 || dt == 12) =>
+            try_streamed(ctx, g, il, cfg, c, dt)?,
+        _ => None,
+    };
     // Fast path: pack ALL experts into one slab per projection for the batched selected-expert
     // kernels. gate|up interleaved per expert (matching swiglu_id's `base + o` / `base + eff + o`
     // addressing); the down tensor is already expert-major on disk — its raw bytes ARE the slab.
-    let experts = if gt == 12 && (dt == 14 || dt == 12) {
+    let experts = match streamed {
+      Some(st) => MoeExperts::Streamed(st),
+      None => {
+        // Eager reads live HERE and nowhere earlier: `raw()` on an expert tensor materialises every
+        // expert, which is the bulk of the checkpoint.
+        let g_full = g.raw(&b("ffn_gate_exps.weight"))?;
+        let u_full = g.raw(&b("ffn_up_exps.weight"))?;
+        let (g_per, u_per) = (g_full.len() / ne, u_full.len() / ne);
+        if gt == 12 && (dt == 14 || dt == 12) {
         // Q4_K gate|up + Q6_K or Q4_K down (Q4_K_M alternates the down format per layer)
         let mut gu = Vec::with_capacity(g_full.len() + u_full.len());
         for e in 0..ne {
@@ -580,40 +692,10 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
             gu.extend_from_slice(&u_full[e * u_per..(e + 1) * u_per]);
         }
         let d_full = g.raw(&b("ffn_down_exps.weight"))?;
-        // FERRIC_MOE_SLOTS=C holds only C of the ne routed experts on the device and fetches the
-        // rest on demand. Opt-in, because it trades the batched fast path's zero syncs for a
-        // readback per (token, layer) — see the streamed branch in `moe_ffn`.
-        let slots: Option<usize> = std::env::var("FERRIC_MOE_SLOTS").ok().and_then(|v| v.parse().ok());
-        match slots {
-            // ⚠ `c` must be at least top_k + 1 (ExpertCache's own floor) AND smaller than the
-            // expert count, or streaming is either impossible or pointless. 0 means resident.
-            Some(c) if c > cfg.n_expert_used && c < ne => {
-                let (gu_per, dn_per) = (gu.len() / ne, d_full.len() / ne);
-                // Seed the slabs with the first C experts' bytes. Contents are irrelevant — every
-                // slot is overwritten before use — but the ALLOCATION has to be the right shape, and
-                // building from real bytes gets the geometry from the same code the resident path
-                // uses instead of a second derivation of it.
-                let gate_up = Q4_KWeights::from_bytes(ctx, &gu[..c * gu_per], c * 2 * eff, d);
-                let down = if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full[..c * dn_per], c * d, eff)) }
-                           else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full[..c * dn_per], c * d, eff)) };
-                // One cache per layer, so n_layers = 1 and every key uses layer 0.
-                let cache = ferric_tier::ExpertCache::new(1, ne as u32, 1, c, cfg.n_expert_used)
-                    .map_err(|e| format!("blk.{il} streamed experts: {e}"))?;
-                MoeExperts::Streamed(StreamedExperts {
-                    gate_up, down,
-                    cache: std::sync::Mutex::new(cache),
-                    gu_src: Box::new(ferric_tier::SliceBacking::new(gu)),
-                    dn_src: Box::new(ferric_tier::SliceBacking::new(d_full)),
-                    gu_bytes: gu_per, dn_bytes: dn_per, layer: 0, capacity: c,
-                    fetched: std::sync::atomic::AtomicU64::new(0),
-                    hits: std::sync::atomic::AtomicU64::new(0),
-                })
-            }
-            _ => MoeExperts::Slab {
-                gate_up: Q4_KWeights::from_bytes(ctx, &gu, ne * 2 * eff, d),
-                down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) }
-                      else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) },
-            },
+        MoeExperts::Slab {
+            gate_up: Q4_KWeights::from_bytes(ctx, &gu, ne * 2 * eff, d),
+            down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) }
+                  else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) },
         }
     } else if gt == 8 && dt == 8 {
         // All-Q8_0 experts (the MTP draft block): same slab layout, Q8_0 kernels.
@@ -637,6 +719,8 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
                 else { QMatrix::from_dense(ctx, &ferric_gguf::deq_raw(&bytes, 2 * eff * d, gt)?, 2 * eff, d) };
             Ok(Expert { gate_up, down })
         }).collect::<Result<Vec<_>, String>>()?)
+        }
+      }
     };
     // Shared-expert gate (qwen35moe) and expert-selection bias (laguna) are arch-dependent extras —
     // presence-detected, like everything else.
