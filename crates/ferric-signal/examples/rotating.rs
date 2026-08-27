@@ -353,14 +353,25 @@ fn main() {
     let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(250);
     let batch: usize = flag(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(8);
     let seeds: usize = flag(&args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(3);
-    let lm_cfg = EncoderConfig { patch_len: 16, d_model: 64, n_layers: 2, n_heads: 4, d_ff: 128, latent_dim: 5 };
+    let lm_dim: usize = flag(&args, "--lm-dim").and_then(|v| v.parse().ok()).unwrap_or(64);
+    let lm_layers: usize = flag(&args, "--lm-layers").and_then(|v| v.parse().ok()).unwrap_or(2);
+    let lm_cfg = EncoderConfig {
+        patch_len: 16, d_model: lm_dim, n_layers: lm_layers, n_heads: 4, d_ff: lm_dim * 2, latent_dim: 5,
+    };
 
     println!("\n  SIGNAL -> TEXT  {} train / {} held out, {} caption words", train.len(), held.len(), words.len());
     println!("  vocabulary compacted to {size} signal rows from {}; {unk_pct:.2}% of held-out tokens",
              q.codebook_size());
     println!("  were unseen in training. {} embedding rows.", seq.embedding_rows());
-    println!("  {steps} optimizer steps x batch {batch} = {} examples seen, {seeds} seeds, shuffled\n",
+    println!("  {steps} optimizer steps x batch {batch} = {} examples seen, {seeds} seeds, shuffled",
              steps * batch);
+    // THE PREDICTION THIS FLAG EXISTS TO TEST. The probe pools a document into a count over every
+    // observed (channel, code) pair — thousands of features. The decoder pools the same document
+    // into `d_model` numbers. At 64 against a 6,600-code vocabulary that is a narrower summary by
+    // two orders of magnitude, which is a candidate explanation for the axis the probe reads and
+    // the decoder cannot: severity, at 51.1% against 33.7%, WITHIN recording.
+    println!("  decoder: d_model {lm_dim}, {lm_layers} layers, {} signal rows to pool into {lm_dim} numbers\n",
+             size - 1);
 
     let mut runs = Vec::new();
     for s in 0..seeds {
