@@ -39,7 +39,19 @@ async fn run() {
     let bpe = ferric_tokenizer::Bpe::new(vocab, &merges);
     let mut ids: Vec<u32> = bpe.encode(prompt);
     if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id") {
-        if matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) { ids.insert(0, *bos as u32); }
+        // ⚠ ABSENT is not FALSE. Neither LFM2.5 GGUF declares `add_bos_token`, while both declare
+        // `bos_token_id` and their chat template opens with `{{- bos_token -}}`. Requiring the flag
+        // to be explicitly true fed LFM2.5-8B-A1B no BOS, and it answered
+        //   "The capital of France is France is France is ..."
+        // With one — "the city of Paris." Ten hypotheses were eliminated inside the MoE (routing,
+        // slab addressing, byte counts, expert compute vs a per-expert reference at 1.8e-8) before
+        // the fault turned out to be here, in the harness. `ferric-serve` had it right all along:
+        // `_ => bos_id.is_some()`. This now matches, because two policies for one question is how
+        // the server and its own examples came to disagree.
+        let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(Meta::Bool(b)) => *b, _ => true,
+        };
+        if add_bos { ids.insert(0, *bos as u32); }
     }
     let vn = m.cfg.n_vocab;
     let am = |l: &[f32]| l[l.len() - vn..].iter().enumerate()

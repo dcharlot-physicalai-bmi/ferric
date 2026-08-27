@@ -208,6 +208,15 @@ pub const REGISTRY: &[Arch] = &[
     // ---- short-conv hybrid ---------------------------------------------------------------
     Arch { name: "lfm2", runtime: Runtime::Lfm2, status: Status::Verified,
            note: "Liquid LFM2/LFM2.5; per-layer kv array marks conv blocks, conv state is PRE-conv" },
+    Arch { name: "lfm2moe", runtime: Runtime::Lfm2, status: Status::Loads,
+           note: "LFM2.5-8B-A1B: the same conv/attention schedule as lfm2, with the FFN made a \
+                  mixture after `leading_dense_block_count` dense blocks (2 of 24). 32 experts, \
+                  top-4, expert width 1792 — which is NOT feed_forward_length (7168, the dense \
+                  blocks'). Sigmoid router with an exp_probs_b selection bias, and NO shared \
+                  expert, unlike qwen35moe and laguna. RUNS: \"The capital of France is the \
+                  city of Paris.\" Its expert compute is checked against an independent per-expert \
+                  implementation (FERRIC_MOE_REF) and agrees to 1.8e-8, but nothing has been diffed \
+                  against a REFERENCE RUNTIME, so this is not Verified" },
 
     // ---- safetensors-only ----------------------------------------------------------------
     Arch { name: "cosmos3_edge", runtime: Runtime::Cosmos, status: Status::Loads,

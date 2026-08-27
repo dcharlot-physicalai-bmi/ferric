@@ -20,7 +20,8 @@
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::kvquant::{KvStore, KvqFmt};
-use ferric_tensor::{append2, nn, KvBuf, QMatrix, Tensor};
+use crate::qwen35::DownSlab;
+use ferric_tensor::{append2, nn, KvBuf, Q4_KWeights, Q6_KWeights, QMatrix, Tensor};
 use std::sync::Arc;
 
 pub struct Cfg {
@@ -28,6 +29,16 @@ pub struct Cfg {
     pub n_vocab: usize, pub eps: f32, pub rope_base: f32, pub conv_l: usize,
     /// Per-block KV head count; `0` marks a short-conv block. Read from the ARRAY, never a scalar.
     pub kv: Vec<usize>,
+    /// Routed experts per MoE block; `0` for plain `lfm2` (every block dense).
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    /// Expert hidden width — `expert_feed_forward_length`, NOT `feed_forward_length`. They differ
+    /// (1792 vs 7168 on LFM2.5-8B-A1B): the dense width belongs to the leading dense blocks.
+    pub expert_ff: usize,
+    /// Blocks `0..leading_dense` keep a dense SwiGLU FFN; the rest are MoE. Two on the 8B-A1B.
+    pub leading_dense: usize,
+    /// `expert_gating_func == 2` — sigmoid router scores rather than softmax.
+    pub gating_sigmoid: bool,
 }
 
 enum Mixer {
@@ -35,9 +46,41 @@ enum Mixer {
     Attn { q: QMatrix, k: QMatrix, v: QMatrix, o: QMatrix, q_norm: Tensor, k_norm: Tensor, n_kv: usize },
 }
 
+/// A block's feed-forward half.
+///
+/// `lfm2` is dense everywhere. `lfm2moe` (LFM2.5-8B-A1B) keeps `leading_dense` dense blocks and
+/// makes the rest a mixture — same conv/attention mixers above it, so the ONLY difference between
+/// the two architectures is this enum.
+enum Ffn {
+    Dense { gate: QMatrix, up: QMatrix, down: QMatrix },
+    /// Router + all experts packed expert-major into one slab per projection, which is the layout
+    /// `matmul_q4_k_swiglu_id` addresses (`base + o` / `base + eff + o` per expert).
+    Moe {
+        router: Tensor,            // [n_expert, d] f32
+        gate_up: Q4_KWeights,      // [n_expert · 2·eff, d] — gate|up interleaved PER EXPERT
+        /// `[n_expert · d, eff]` — already expert-major on disk, so its raw bytes ARE the slab.
+        ///
+        /// ⚠ Q4_K_M ALTERNATES THE DOWN FORMAT PER LAYER. On LFM2.5-8B-A1B block 2's down_exps is
+        /// Q6_K and block 3's is Q4_K. Pinning it to Q6_K loaded block 2 and then refused block 3 —
+        /// the good outcome only because it was an assertion; reading Q4_K bytes as Q6_K blocks
+        /// would have produced a running, wrong model.
+        down: DownSlab,
+        /// `exp_probs_b.bias`, on-GPU. Added to the scores for SELECTION ONLY; the combining
+        /// weights come from the UNBIASED scores. Letting it reach the weights yields a model that
+        /// runs and is wrong — see `instella::route`, which pins exactly this.
+        sel_bias: Tensor,          // [n_expert] f32
+        /// **A second, independent implementation of the same experts**, built only under
+        /// `FERRIC_MOE_REF`. Per-expert `QMatrix` pairs driven by ordinary `matmul_q` — no slab, no
+        /// id-indexed kernel, no fused addressing. Everything about the slab path has now been
+        /// checked by READING it (byte counts, row strides, gate|up order, the WGSL itself) and it
+        /// still produces wrong text, so the remaining move is to compute the same thing a different
+        /// way and diff. `Some` here costs a full second copy of the experts, hence the env gate.
+        reference: Option<Vec<(QMatrix, QMatrix)>>,   // (gate|up fused [2·eff, d], down [d, eff])
+    },
+}
+
 struct Block {
-    norm: Tensor, mixer: Mixer, ffn_norm: Tensor,
-    gate: QMatrix, up: QMatrix, down: QMatrix,
+    norm: Tensor, mixer: Mixer, ffn_norm: Tensor, ffn: Ffn,
 }
 
 /// Per-sequence decode state: KV for attention blocks, a rolling window for conv blocks.
@@ -153,18 +196,95 @@ pub struct Lfm2 {
     embd_raw: Vec<u8>,
 }
 
+
+impl Ffn {
+    /// One FFN block for `[T, d]` rows.
+    ///
+    /// The MoE path is three dispatches and **no CPU readback**: router → per-token top-k rows
+    /// `[T, 2k]` (scores, selection and renormalised weights computed on-GPU) → one fused
+    /// gate|up+SwiGLU over the selected experts → one down+weighted-sum. Reading the routing back to
+    /// pick experts on the host would sync the queue once per block per token.
+    fn forward(&self, hn: &Tensor, cfg: &Cfg, ctx: &Arc<Context>) -> Tensor {
+        match self {
+            Ffn::Dense { gate, up, down } =>
+                hn.matmul_q(gate).silu().mul(&hn.matmul_q(up)).matmul_q(down),
+            Ffn::Moe { router, gate_up, down, sel_bias, reference } => {
+                let k = cfg.n_expert_used;
+                // `scale = 1.0`: lfm2moe renormalises the selected weights to sum to 1 and applies
+                // no routed multiplier (laguna's 2.5 is laguna's, not a default).
+                let selw = hn.matmul_bt(router).moe_topk(Some(sel_bias), k, cfg.gating_sigmoid, 1.0);
+                let mid = hn.matmul_q4_k_swiglu_id(gate_up, &selw, k, cfg.expert_ff);
+                let out = down.wsum(&mid, &selw, cfg.d);
+                if let Some(refs) = reference {
+                    // Same tokens, same routing, different arithmetic. A disagreement localises the
+                    // fault to the slab path; agreement clears it and moves the search elsewhere.
+                    let sv = pollster::block_on(selw.to_vec());
+                    let hv = pollster::block_on(out.to_vec());
+                    let t = hn.shape[0];
+                    let mut worst = 0f32;
+                    for ti in 0..t {
+                        let row = hn.narrow(0, ti, 1).contiguous();
+                        let mut acc = vec![0f32; cfg.d];
+                        for j in 0..k {
+                            let w = sv[ti * 2 * k + j];
+                            let e = sv[ti * 2 * k + k + j] as usize;
+                            let (gu_e, dn_e) = &refs[e];
+                            let m = row.matmul_q(gu_e);                 // [1, 2·eff]
+                            let mv = pollster::block_on(m.to_vec());
+                            let act: Vec<f32> = (0..cfg.expert_ff)
+                                .map(|o| { let g = mv[o]; (g / (1.0 + (-g).exp())) * mv[cfg.expert_ff + o] })
+                                .collect();
+                            let y = Tensor::from_vec(ctx, &act, &[1, cfg.expert_ff]).matmul_q(dn_e);
+                            for (a, v) in acc.iter_mut().zip(pollster::block_on(y.to_vec())) { *a += w * v; }
+                        }
+                        for (i, a) in acc.iter().enumerate() {
+                            let dd = (a - hv[ti * cfg.d + i]).abs();
+                            if dd > worst { worst = dd; }
+                        }
+                    }
+                    eprintln!("  REF    max|slab - per_expert| = {worst:.6e}");
+                }
+                out
+            }
+        }
+    }
+}
+
 impl Lfm2 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Lfm2, String> {
         let md = g.metadata();
-        let u = |k: &str| match md.get(&format!("lfm2.{k}")) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing lfm2.{k}")) };
-        let f = |k: &str| match md.get(&format!("lfm2.{k}")) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing lfm2.{k}")) };
+        // `lfm2moe` prefixes every key with its own arch name, so the prefix is read from the file
+        // rather than hardcoded. Everything else about the two is identical up to the FFN.
+        let arch = match md.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => "lfm2".to_string() };
+        let ap = arch.clone();
+        let u = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {ap}.{k}")) };
+        let uo = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => 0 };
+        let f = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {ap}.{k}")) };
         let n_layer = u("block_count")?;
         let d = u("embedding_length")?;
         let n_head = u("attention.head_count")?;
         let eps = f("attention.layer_norm_rms_epsilon")?;
         let rope_base = f("rope.freq_base")?;
         let conv_l = u("shortconv.l_cache")?;
-        let kv: Vec<usize> = match md.get("lfm2.attention.head_count_kv") {
+        // MoE shape. `n_expert == 0` is the plain-lfm2 case and keeps every block dense.
+        let n_expert = uo("expert_count");
+        let n_expert_used = uo("expert_used_count");
+        let expert_ff = uo("expert_feed_forward_length");
+        let leading_dense = uo("leading_dense_block_count");
+        let gating_sigmoid = uo("expert_gating_func") == 2;
+        if n_expert > 0 {
+            // Refuse rather than guess: every one of these is load-bearing, and a zero silently
+            // produces a model that routes to nothing or slices experts at the wrong width.
+            if n_expert_used == 0 || n_expert_used > n_expert {
+                return Err(format!("{arch}: expert_used_count {n_expert_used} outside 1..={n_expert}"));
+            }
+            if expert_ff == 0 { return Err(format!("{arch}: expert_feed_forward_length is 0")); }
+            if !(1..=8).contains(&n_expert_used) {
+                return Err(format!("{arch}: expert_used_count {n_expert_used} is outside the \
+                                    slab kernels' supported top-k range of 1..=8"));
+            }
+        }
+        let kv: Vec<usize> = match md.get(&format!("{arch}.attention.head_count_kv")) {
             Some(Meta::Arr(v)) => v.iter().map(|m| match m { Meta::U(x) => *x as usize, Meta::I(x) => *x as usize, _ => 0 }).collect(),
             Some(Meta::U(v)) => vec![*v as usize; n_layer],
             _ => return Err("no lfm2.attention.head_count_kv".into()),
@@ -203,16 +323,83 @@ impl Lfm2 {
                     out_proj: qm(&b("shortconv.out_proj.weight")),
                 }
             };
+            // Presence-detected, not assumed from the index: a block is MoE if its expert tensors
+            // are there. `leading_dense` says where the boundary SHOULD be, and disagreeing with the
+            // file would slice a dense block as if it held 32 experts.
+            let is_moe = n_expert > 0 && g.tensor(&b("ffn_gate_exps.weight")).is_some();
+            if n_expert > 0 && is_moe != (il >= leading_dense) {
+                panic!("blk.{il}: leading_dense_block_count says {} but the expert tensors say {}",
+                       if il >= leading_dense { "MoE" } else { "dense" },
+                       if is_moe { "MoE" } else { "dense" });
+            }
+            let ffn = if is_moe {
+                let eff = expert_ff;
+                let (gt, ut) = (g.tensor(&b("ffn_gate_exps.weight")).unwrap().ggml_type,
+                                g.tensor(&b("ffn_up_exps.weight")).unwrap().ggml_type);
+                let dt = g.tensor(&b("ffn_down_exps.weight")).unwrap().ggml_type;
+                assert!(gt == 12 && ut == 12 && (dt == 14 || dt == 12),
+                        "blk.{il}: expert quants are gate={gt} up={ut} down={dt}; this path needs \
+                         Q4_K gate/up (12) and a Q6_K (14) or Q4_K (12) down");
+                // Interleave gate|up PER EXPERT so one slab serves the fused-SwiGLU kernel, whose
+                // addressing is `base + o` for gate and `base + eff + o` for up.
+                let gf = g.raw(&b("ffn_gate_exps.weight")).unwrap();
+                let uf = g.raw(&b("ffn_up_exps.weight")).unwrap();
+                // ⚠ THE ASSUMPTION EVERYTHING DOWNSTREAM RESTS ON: that `raw()` hands back exactly
+                // n_expert · eff rows of Q4_K. If the byte count is not what the shape implies, every
+                // expert after the first is read at the wrong offset — and since each slice is still
+                // VALID Q4_K, the result is finite, correctly-sized, and wrong.
+                let q4k_row = d / 256 * 144;                  // 8 super-blocks × 144 B at d=2048
+                let q6k_row = eff / 256 * 210;
+                assert_eq!(gf.len(), n_expert * eff * q4k_row,
+                           "blk.{il}: gate_exps is {} B, shape says {} experts × {eff} rows × {q4k_row} B",
+                           gf.len(), n_expert);
+                assert_eq!(uf.len(), n_expert * eff * q4k_row, "blk.{il}: up_exps byte count");
+                let (gp, up_) = (gf.len() / n_expert, uf.len() / n_expert);
+                let mut gu = Vec::with_capacity(gf.len() + uf.len());
+                for e in 0..n_expert {
+                    gu.extend_from_slice(&gf[e * gp..(e + 1) * gp]);
+                    gu.extend_from_slice(&uf[e * up_..(e + 1) * up_]);
+                }
+                let df = g.raw(&b("ffn_down_exps.weight")).unwrap();
+                let want_d = n_expert * d * if dt == 14 { q6k_row } else { eff / 256 * 144 };
+                assert_eq!(df.len(), want_d,
+                           "blk.{il}: down_exps is {} B, shape says {want_d}", df.len());
+                // No shared expert on lfm2moe — unlike qwen35moe and laguna, which both carry one.
+                // Its absence is why this does not reuse qwen35's MoeFfn, whose `shared` is required.
+                let bias = g.dequant(&b("exp_probs_b.bias"))
+                    .unwrap_or_else(|_| vec![0f32; n_expert]);
+                let reference = if std::env::var("FERRIC_MOE_REF").is_ok() {
+                    Some((0..n_expert).map(|e| {
+                        let mut one = Vec::with_capacity(gp + up_);
+                        one.extend_from_slice(&gf[e * gp..(e + 1) * gp]);
+                        one.extend_from_slice(&uf[e * up_..(e + 1) * up_]);
+                        let dpe = df.len() / n_expert;
+                        (QMatrix::from_bytes(ctx, &one, gt, 2 * eff, d).unwrap(),
+                         QMatrix::from_bytes(ctx, &df[e * dpe..(e + 1) * dpe], dt, d, eff).unwrap())
+                    }).collect())
+                } else { None };
+                Ffn::Moe {
+                    reference,
+                    router: ft(&b("ffn_gate_inp.weight"), &[n_expert, d]),
+                    gate_up: Q4_KWeights::from_bytes(ctx, &gu, n_expert * 2 * eff, d),
+                    down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) }
+                          else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) },
+                    sel_bias: Tensor::from_vec(ctx, &bias, &[n_expert]),
+                }
+            } else {
+                Ffn::Dense { gate: qm(&b("ffn_gate.weight")), up: qm(&b("ffn_up.weight")),
+                             down: qm(&b("ffn_down.weight")) }
+            };
             Block {
                 norm: ft(&b("attn_norm.weight"), &[d]), mixer,
-                ffn_norm: ft(&b("ffn_norm.weight"), &[d]),
-                gate: qm(&b("ffn_gate.weight")), up: qm(&b("ffn_up.weight")), down: qm(&b("ffn_down.weight")),
+                ffn_norm: ft(&b("ffn_norm.weight"), &[d]), ffn,
             }
         }).collect();
 
         Ok(Lfm2 {
             ctx: ctx.clone(),
-            cfg: Cfg { n_layer, d, n_head, head_dim, n_vocab, eps, rope_base, conv_l, kv },
+            cfg: Cfg { n_layer, d, n_head, head_dim, n_vocab, eps, rope_base, conv_l, kv,
+                       n_expert, n_expert_used, expert_ff, leading_dense, gating_sigmoid },
             blocks,
             // `token_embd_norm` is the FINAL norm, not a norm on the embeddings — llama.cpp maps it
             // through a dedicated enum whose comment reads "fix for wrong tensor name".
@@ -308,7 +495,7 @@ impl Lfm2 {
             };
             x = x.add(&op);
             let hn = x.rmsnorm(&blk.ffn_norm, eps);
-            x = x.add(&hn.matmul_q(&blk.gate).silu().mul(&hn.matmul_q(&blk.up)).matmul_q(&blk.down));
+            x = x.add(&blk.ffn.forward(&hn, &self.cfg, &self.ctx));
         }
         cache.pos += t;
         x.rmsnorm(&self.out_norm, eps)
@@ -441,8 +628,9 @@ impl Lfm2 {
             x = x.add(&op);
             let hn = x.rmsnorm(&blk.ffn_norm, eps);
             // The FFN is the largest weight read in the block and it batches with no per-row state at
-            // all: rmsnorm, SwiGLU and the three projections are row-independent.
-            x = x.add(&hn.matmul_q(&blk.gate).silu().mul(&hn.matmul_q(&blk.up)).matmul_q(&blk.down));
+            // all: rmsnorm, SwiGLU and the three projections are row-independent. The MoE path is
+            // row-independent too — each row routes on its own logits — so batching stays valid.
+            x = x.add(&blk.ffn.forward(&hn, &self.cfg, &self.ctx));
         }
         for c in caches.iter_mut() { c.pos += 1; }
         x.rmsnorm(&self.out_norm, eps).matmul_q(&self.head)
@@ -456,7 +644,8 @@ mod kvq_tests {
     /// 16 blocks in LFM2.5-1.2B's shape: 10 conv, 6 attention.
     fn cfg() -> Cfg {
         let kv: Vec<usize> = (0..16).map(|i| if i % 3 == 2 { 8 } else { 0 }).collect();
-        Cfg { n_layer: 16, d: 2048, n_head: 32, head_dim: 64, n_vocab: 65536, eps: 1e-5,
+        Cfg { n_expert: 0, n_expert_used: 0, expert_ff: 0, leading_dense: 0, gating_sigmoid: false,
+              n_layer: 16, d: 2048, n_head: 32, head_dim: 64, n_vocab: 65536, eps: 1e-5,
               rope_base: 1e6, conv_l: 3, kv }
     }
 

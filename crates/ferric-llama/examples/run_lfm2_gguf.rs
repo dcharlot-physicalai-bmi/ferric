@@ -68,10 +68,15 @@ async fn run() {
 
     let g = GgufFile::open(path).expect("open gguf");
     let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
-    assert_eq!(arch, "lfm2", "this loader is for general.architecture = lfm2, got {arch:?}");
+    // Both arch strings share this runtime — lfm2moe is lfm2 with the FFN made a mixture after
+    // `leading_dense_block_count` blocks. Every metadata key is prefixed with the arch's OWN name,
+    // so the prefix is read from the file rather than hardcoded.
+    assert!(arch == "lfm2" || arch == "lfm2moe",
+            "this loader is for general.architecture = lfm2 or lfm2moe, got {arch:?}");
 
-    let u = |k: &str| match g.metadata.get(&format!("lfm2.{k}")) { Some(Meta::U(v)) => *v as usize, _ => panic!("missing lfm2.{k}") };
-    let f = |k: &str| match g.metadata.get(&format!("lfm2.{k}")) { Some(Meta::F(v)) => *v, _ => panic!("missing lfm2.{k}") };
+    let u = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => panic!("missing {arch}.{k}") };
+    let uo = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => 0 };
+    let f = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::F(v)) => *v, _ => panic!("missing {arch}.{k}") };
     let n_layer = u("block_count");
     let d = u("embedding_length");
     let n_head = u("attention.head_count");
@@ -79,10 +84,10 @@ async fn run() {
     let rope_base = f("rope.freq_base") as f32;
     let conv_l = u("shortconv.l_cache");
     // The schedule. Nonzero = attention with that many KV heads; 0 = short conv.
-    let kv_per_layer: Vec<usize> = match g.metadata.get("lfm2.attention.head_count_kv") {
+    let kv_per_layer: Vec<usize> = match g.metadata.get(&format!("{arch}.attention.head_count_kv")) {
         Some(Meta::Arr(v)) => v.iter().map(|m| match m { Meta::U(x) => *x as usize, Meta::I(x) => *x as usize, _ => 0 }).collect(),
         Some(Meta::U(v)) => vec![*v as usize; n_layer],
-        _ => panic!("no lfm2.attention.head_count_kv"),
+        _ => panic!("no {arch}.attention.head_count_kv"),
     };
     assert_eq!(kv_per_layer.len(), n_layer, "schedule must cover every block");
     let head_dim = d / n_head;
