@@ -76,8 +76,33 @@ async fn run() {
         }
     }
 
+    // ⚠ BYTES, not seconds. Device residency is exact and load-independent — unlike a throughput
+    // number, which on a shared box measures the box — and it is the quantity streaming exists to
+    // reduce, so it is the number worth printing.
+    //
+    // A streamed run cannot MEASURE the all-resident figure (it never builds that slab), so it
+    // derives one. `all_resident=` is therefore printed by BOTH paths — measured when resident,
+    // derived when streamed — so the sweep's own rows check the derivation instead of taking it on
+    // faith. Same model, same layers: the two numbers must agree exactly.
+    let (mut on_device, mut all_resident) = (0u64, 0u64);
+    for l in &m.layers {
+        if let Ffn::Moe(mo) = &l.ffn {
+            on_device += mo.experts.device_bytes();
+            all_resident += match &mo.experts {
+                MoeExperts::Streamed(st) => st.all_resident_bytes(m.cfg.n_expert),
+                other => other.device_bytes(),
+            };
+        }
+    }
     println!("slots={slots:<5} streamed_layers={streamed:<4} resident_layers={resident:<4} \
               fetched={fetched:<7} slot_hits={hits:<7} argmax={argmax:<7} logits_fnv={h:016x}");
+    // Exact bytes, not just GB: at 2 decimals two figures can differ by 10 MB and still print the
+    // same, so a rounded agreement between the derived and measured rows would prove nothing.
+    let how = if streamed > 0 { "derived" } else { "measured" };
+    println!("  routed experts on device {:.2} GB ({on_device} B)   all_resident {:.2} GB ({all_resident} B, {how})   {:.1}x",
+             on_device as f64 / 1e9, all_resident as f64 / 1e9,
+             all_resident as f64 / on_device.max(1) as f64);
+
     if streamed > 0 {
         assert!(fetched > 0, "every MoE layer is streamed but nothing was ever fetched — the slabs \
                               are serving whatever they were seeded with");

@@ -251,6 +251,12 @@ pub struct Expert { pub gate_up: QMatrix, pub down: QMatrix }
 pub enum DownSlab { Q6(Q6_KWeights), Q4(Q4_KWeights), Q8(ferric_tensor::Q8_0Weights), Q5(ferric_tensor::Q5_0Weights) }
 
 impl DownSlab {
+    pub fn nbytes(&self) -> usize {
+        match self {
+            DownSlab::Q6(w) => w.nbytes(), DownSlab::Q4(w) => w.nbytes(),
+            DownSlab::Q8(w) => w.nbytes(), DownSlab::Q5(w) => w.nbytes(),
+        }
+    }
     pub(crate) fn wsum(&self, mid: &Tensor, selw: &Tensor, d: usize) -> Tensor {
         match self {
             DownSlab::Q6(w) => mid.matmul_q6_k_id_wsum(w, selw, d),
@@ -280,6 +286,21 @@ pub enum MoeExperts {
     /// ⚠️ Routes on the CPU via a mid-forward readback: correct but slow, and the readback lands
     /// inside the caller's `batch()` — avoid for anything on the hot path.
     PerExpert(Vec<Expert>),
+}
+
+impl MoeExperts {
+    /// Bytes this layer's routed experts occupy ON THE DEVICE.
+    ///
+    /// Reported instead of a rate because it is **exact and load-independent**: it says the same
+    /// thing on a busy box as on an idle one, and it is the quantity streaming exists to reduce.
+    pub fn device_bytes(&self) -> u64 {
+        (match self {
+            MoeExperts::Slab { gate_up, down } => gate_up.nbytes() + down.nbytes(),
+            MoeExperts::Slab8 { gate_up, down } => gate_up.nbytes() + down.nbytes(),
+            MoeExperts::Streamed(st) => return st.slab_bytes(),
+            MoeExperts::PerExpert(es) => es.iter().map(|e| e.gate_up.nbytes() + e.down.nbytes()).sum(),
+        }) as u64
+    }
 }
 
 /// A byte range of a file served as if it began at zero.
@@ -408,6 +429,19 @@ impl StreamedExperts {
         assert!(self.capacity > 0 && rows % self.capacity == 0,
                 "slab has {rows} rows for {} experts — not expert-major", self.capacity);
         rows / self.capacity
+    }
+
+    /// Bytes the C-expert slabs occupy ON THE DEVICE — the slabs, not the file-backed remainder.
+    pub fn slab_bytes(&self) -> u64 { (self.gate_up.nbytes() + self.down.nbytes()) as u64 }
+
+    /// What these same slabs WOULD occupy holding all `n_expert` experts.
+    ///
+    /// ⚠ DERIVED, not measured — the resident slab is never built in a streamed run. Rows scale
+    /// exactly with expert count at a fixed row size, so this is arithmetic rather than an
+    /// estimate; `moe_slots` still checks it against a real resident load, because "exact given my
+    /// assumptions" is how a wrong assumption gets published as a measurement.
+    pub fn all_resident_bytes(&self, n_expert: usize) -> u64 {
+        self.slab_bytes() / self.capacity as u64 * n_expert as u64
     }
 
     fn down_rows_per_expert(&self) -> usize {
