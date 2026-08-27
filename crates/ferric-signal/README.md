@@ -421,6 +421,39 @@ have been scored as data.
 is what makes a silent partial decode impossible: a sensor channel that is wrong in its second half
 still tokenizes.
 
+**One tokenizer across four corpora, at the published size — and a baseline that reverses two of
+the four rows.** `examples/universal` trains a single encoder, FSQ bottleneck and decoder on four
+independent sensor corpora at once: **9,576,448 parameters, 0.8% from the published 9.5M**. Four
+rigs, four laboratories, sampling rates spanning four orders of magnitude, and one corpus that is
+not vibration at all. Held out by *recording*, reported per corpus, trained round-robin so corpus
+size does not decide whose gradients win.
+
+| corpus | machine | held-out SNR | same 15 bits, no training | verdict |
+|---|---|---|---|---|
+| hydraulic | test rig, pressures and flows | **9.0 dB** | 4.6 dB | tokenizer, by 4.4 dB |
+| wind | turbine nacelle | **7.2 dB** | 4.5 dB | tokenizer, by 2.7 dB |
+| rotating | gearbox rig, 25.6 kHz | 1.4 dB | 1.3 dB | tie |
+| CWRU | bearing stand, 12–48 kHz | 1.1 dB | **1.4 dB** | **the baseline wins** |
+
+**The baseline spends exactly the same bit rate and learns nothing.** The tokenizer emits one code
+from 32,768 per 128-sample patch — 15 bits. The baseline spends 15 bits naming which of the 128 DCT
+coefficients is largest (7) and quantizing it (8), and reconstructs from that one coefficient. At
+273:1 compression, **a 9.5M-parameter trained tokenizer does not beat one DCT coefficient on
+high-rate vibration**, while adding 4.4 dB on smooth hydraulic signals.
+
+Reconstruction had been reported in this crate with no baseline at all — decibels against the
+signal's own variance say how much survived, not whether a scheme that learned nothing would have
+done as well. The 25.5 dB synthetic figure above has the same gap and should be read with it in
+mind.
+
+**What this does and does not establish.** The split between the smooth corpora and the vibration
+corpora held constant across a 6x change in training budget, which is the shape of a property of the
+signals rather than of the optimization. But CWRU and rotating contributed only ~200 training
+windows each here, and their *training* loss fell substantially while held-out did not move —
+overfitting. So this is a joint statement about the bit rate and the data volume, and the two are
+not separated. What would separate them is more recordings from those corpora at the same bit rate;
+if the gap survives that, it is the rate.
+
 **The energy accounting is arithmetic, not measurement.** A decoder touches its vocabulary twice per
 position — one row on the way in, every row at the output head on the way out — so the head is what
 grows with codebook size:
