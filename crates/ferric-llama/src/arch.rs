@@ -159,6 +159,26 @@ pub const REGISTRY: &[Arch] = &[
     Arch { name: "gemma3", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; 1-in-6 global attention, local rope base 10000" },
 
+    // ---- Muse Glimmer (2026-08-09) --------------------------------------------------------
+    //
+    // ⚠ THIS ROW WAS MISSING while the loader carried FOUR architecture-specific branches for it —
+    // `rope_is_interleaved` (NORM pairing), `nope_global`, `embd_rmsnorm`, `post_norm_eps = 1e-8` —
+    // plus `logit_scale` placement audited against `muse-glimmer.cpp`, a complete 50-layer vision
+    // tower in `glimmer_vision.rs`, and two examples. `resolve()` refused the string, so none of it
+    // could be reached: the work existed and the model could not load.
+    //
+    // Status is `Loads`, and deliberately not higher. Every per-detail choice above was read off the
+    // reference implementation, but no end-to-end run has ever happened — it could not, because this
+    // row's absence is what stopped it. `examples/muse_glimmer_vl.rs` is the test that settles it:
+    // caption an image and compare against llama-mtmd-cli. Until someone runs that with weights in
+    // hand, "the branches are reference-checked" is a claim about the source, not about the output.
+    Arch { name: "muse-glimmer", runtime: Runtime::Dense, status: Status::Loads,
+           note: "NORM (interleaved) rope, NoPE on the global layers, RMSNorm on the embeddings, \
+                  post-attn/post-FFN norms at eps 1e-8, and logit_scale applied AFTER the LM head \
+                  (on the queries it would have produced fluent, wrong text). Vision is separate: \
+                  glimmer_vision::VisionTower loads the mmproj and its rows splice into the text \
+                  sequence via Qwen3::forward_embeds. NOT diffed end to end against the reference" },
+
     // ---- Gemma 4 (2026-04-02) -------------------------------------------------------------
     Arch { name: "gemma4", runtime: Runtime::Gemma4, status: Status::Loads,
            note: "E2B/E4B dense path: per-layer embeddings, shared KV (blocks >= n-shared reuse 13/14), \

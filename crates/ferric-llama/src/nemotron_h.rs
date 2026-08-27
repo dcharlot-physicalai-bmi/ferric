@@ -365,6 +365,11 @@ impl NemotronH {
     /// SSM blocks instead of re-running the prefix. The stateless `forward` stays because it is what
     /// the reference comparison was done against, and because a state bug that only shows up after
     /// several steps is far easier to find with a known-good path to diff against.
+    /// A cache sized for this model. `Cache::new` needs the `Context` and the model already holds
+    /// one, so without this every caller had to carry a second handle — which is why `ferric-serve`,
+    /// whose `Model::new_cache` takes no context, could not construct one.
+    pub fn new_cache(&self) -> Cache { Cache::new(&self.ctx, &self.cfg) }
+
     pub fn forward_cached(&self, ids: &[u32], cache: &mut Cache) -> Result<Tensor, String> {
         let c = &self.cfg;
         let (d, t) = (c.d, ids.len());

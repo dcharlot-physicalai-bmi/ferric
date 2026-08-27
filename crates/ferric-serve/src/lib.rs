@@ -40,12 +40,33 @@ use ferric_tensor::Tensor;
 /// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
 /// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
 /// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
-pub(crate) enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2) }
-pub(crate) enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache) }
+pub(crate) enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2), NemotronH(ferric_llama::nemotron_h::NemotronH) }
+pub(crate) enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache), NemotronH(ferric_llama::nemotron_h::Cache) }
 impl Model {
-    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab, Model::DeepSeek2(m) => m.cfg.n_vocab } }
-    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer, Model::DeepSeek2(m) => m.cfg.n_layer } }
-    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d, Model::DeepSeek2(m) => m.cfg.d } }
+    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab, Model::DeepSeek2(m) => m.cfg.n_vocab, Model::NemotronH(m) => m.cfg.n_vocab } }
+    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer, Model::DeepSeek2(m) => m.cfg.n_layer, Model::NemotronH(m) => m.cfg.n_layer } }
+    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d, Model::DeepSeek2(m) => m.cfg.d, Model::NemotronH(m) => m.cfg.d } }
+    /// **Which runtimes `Engine::load` can build a generative `Model` from.**
+    ///
+    /// The dispatch consults this before matching, so "the registry says supported" and "the server
+    /// can load it" are one list instead of two. They were two, and they drifted: `nemotron_h` sat at
+    /// `Status::Verified` — its note claiming it reproduces the reference and generates " Paris." —
+    /// while the dispatch arm still panicked "its forward pass is not written yet", stale since the
+    /// port landed. Nothing failed, because the test guarding this returned `true` from all eight of
+    /// its match arms.
+    ///
+    /// `Err` is for runtimes that are not generative AT ALL, not for ones nobody has wired yet — a
+    /// missing wiring must be a compile error here, which the exhaustive match makes it.
+    pub(crate) fn dispatchable(r: ferric_llama::arch::Runtime) -> Result<(), &'static str> {
+        use ferric_llama::arch::Runtime as R;
+        match r {
+            R::Dense | R::Hybrid | R::Lfm2 | R::Gemma4 | R::DeepSeek2 | R::NemotronH => Ok(()),
+            R::Bert => Err("a BERT encoder: no KV cache and no LM head, so it cannot serve chat or \
+                            completions. Point FERRIC_RERANK_MODEL at it instead"),
+            R::Cosmos => Err("loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
+        }
+    }
+
     fn new_cache(&self) -> ModelCache {
         match self {
             Model::Dense(m) => ModelCache::Dense(qwen3::Cache::new(&m.cfg)),
@@ -53,6 +74,9 @@ impl Model {
             Model::Lfm2(m) => ModelCache::Lfm2(ferric_llama::lfm2::Cache::new(&m.cfg)),
             Model::Gemma4(m) => ModelCache::Gemma4(ferric_llama::gemma4::Cache::new(&m.cfg)),
             Model::DeepSeek2(m) => ModelCache::DeepSeek2(ferric_llama::deepseek2::Cache::new(&m.cfg)),
+            // The only runtime whose cache needs the GPU context; it carries its own, hence
+            // `new_cache` on the model rather than `Cache::new` here.
+            Model::NemotronH(m) => ModelCache::NemotronH(m.new_cache()),
         }
     }
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
@@ -62,6 +86,10 @@ impl Model {
             (Model::Lfm2(m), ModelCache::Lfm2(c)) => m.forward(tokens, c),
             (Model::Gemma4(m), ModelCache::Gemma4(c)) => m.forward(tokens, c),
             (Model::DeepSeek2(m), ModelCache::DeepSeek2(c)) => m.forward(tokens, c),
+            // Returns Result because a token id outside the embedding table is a real, reachable
+            // input error rather than a bug; the server has no way to recover, so it names it.
+            (Model::NemotronH(m), ModelCache::NemotronH(c)) =>
+                m.forward_cached(tokens, c).unwrap_or_else(|e| panic!("nemotron_h forward: {e}")),
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
@@ -98,6 +126,10 @@ impl Model {
             // MLA, DeepSeekMoE routing and YaRN. None of these three has a checkpoint-dependent branch
             // in its batched path, so there is no predicate for them to consult.
             Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => true,
+            // No `forward_batch` exists for it at all. Mamba-2 carries a per-sequence recurrent
+            // state and a conv window, so a batched path is a real port plus its own proof — not a
+            // loop — and until both exist this must stay false.
+            Model::NemotronH(_) => false,
         }
     }
 
@@ -119,6 +151,9 @@ impl Model {
             Model::Lfm2(m) => b!(m, ModelCache::Lfm2),
             Model::Gemma4(m) => b!(m, ModelCache::Gemma4),
             Model::DeepSeek2(m) => b!(m, ModelCache::DeepSeek2),
+            // Unreachable via the scheduler, which consults `supports_batching` first; this arm is
+            // what makes adding a runtime a compile error rather than a silent wrong answer.
+            Model::NemotronH(_) => unreachable!("nemotron_h has no batched path; supports_batching is false"),
         }
     }
 
@@ -143,6 +178,13 @@ impl Model {
                 let mut c = ferric_llama::deepseek2::Cache::new(&m.cfg);
                 m.forward_hidden_cached(ids, &mut c)
             }
+            // `nemotron_h` exposes no pre-head hidden state: `forward_cached` returns logits and
+            // `forward_traced` returns per-op captures, neither of which is "all blocks then the
+            // final norm". Refusing names what is missing; returning the logits would silently make
+            // every embedding from this model wrong while looking like a vector.
+            Model::NemotronH(_) => panic!(
+                "nemotron_h cannot produce embeddings: no pre-head hidden-state path exists. It \
+                 serves chat and completions; point the embedding endpoint at another model"),
         }
     }
 }
@@ -280,6 +322,7 @@ impl Engine {
         // fluent, confident, WRONG text with no error anywhere. Refusing is the feature.
         let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
         let entry = ferric_llama::arch::resolve(&arch).unwrap_or_else(|e| panic!("{e}"));
+        if let Err(why) = Model::dispatchable(entry.runtime) { panic!("{path} ({arch}) is {why}"); }
         let model = match entry.runtime {
             ferric_llama::arch::Runtime::Hybrid =>
                 Model::Hybrid(Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load hybrid model: {e}"))),
@@ -291,20 +334,20 @@ impl Engine {
                 Model::Gemma4(ferric_llama::gemma4::Gemma4::load(&ctx, &g).unwrap_or_else(|e| panic!("load gemma4: {e}"))),
             ferric_llama::arch::Runtime::DeepSeek2 =>
                 Model::DeepSeek2(ferric_llama::deepseek2::DeepSeek2::load(&ctx, &g).unwrap_or_else(|e| panic!("load deepseek2: {e}"))),
-            // Cosmos loads from safetensors, so it cannot arrive down a GGUF path at all.
             ferric_llama::arch::Runtime::Cosmos =>
-                panic!("{arch} loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
-            // Registered Status::Parts — resolve() refuses it before this match is reached, so this
-            // arm exists to keep the match exhaustive rather than to be taken. When the forward pass
-            // lands it becomes a real load; until then the refusal names what is missing.
-            ferric_llama::arch::Runtime::NemotronH => panic!(
-                "{arch} is registered but its forward pass is not written yet — see arch.rs"),
-            // An encoder cannot be the chat model: no KV cache, no LM head, nothing to generate. It
-            // is served through FERRIC_RERANK_MODEL and /v1/rerank instead. Refusing here keeps the
-            // exhaustive match honest — adding a runtime must be a compile error, not a fallthrough.
-            ferric_llama::arch::Runtime::Bert => panic!(
-                "{path} is a BERT encoder and cannot serve chat or completions. Point \
-                 FERRIC_RERANK_MODEL at it and load a generative model here instead"),
+                unreachable!("Cosmos is refused by Model::dispatchable before this match"),
+            // ⚠ This arm PANICKED with "its forward pass is not written yet" long after the forward
+            // pass landed and the registry promoted the row to Status::Verified. The registry and the
+            // dispatch are two lists that must agree and nothing made them; the note at arch.rs
+            // claimed it generates " Paris." while this line refused to load it at all.
+            ferric_llama::arch::Runtime::NemotronH =>
+                Model::NemotronH(ferric_llama::nemotron_h::NemotronH::load(&ctx, &g)
+                    .unwrap_or_else(|e| panic!("load nemotron_h: {e}"))),
+            // Both refusals are already delivered by the `dispatchable` check above, so these arms
+            // cannot be reached. They stay because the exhaustive match is what turns "someone added
+            // a Runtime" into a compile error rather than a fallthrough.
+            ferric_llama::arch::Runtime::Bert =>
+                unreachable!("Bert is refused by Model::dispatchable before this match"),
         };
         eprintln!("arch {arch:?} -> {} runtime ({}) — {}",
                   entry.runtime.label(), entry.status.label(), entry.note);
@@ -1144,6 +1187,205 @@ mod tests {
     }
 }
 
+
+// ============================================================================================
+// Oracle-free self-consistency
+// ============================================================================================
+
+/// **What can Ferric prove about a model with no second runtime to check against?**
+///
+/// `arch.rs` defines `Status::Verified` as "output was compared against the reference
+/// implementation and matched". That definition has a hard edge: `laguna` sits one rung below it
+/// not because anything is known to be wrong, but because llama.cpp answers
+/// `unknown model architecture: laguna`, so there is nothing to diff against. An architecture's
+/// confidence ceiling should not be set by another runtime's coverage.
+///
+/// These checks need only Ferric. Each is a property a correct forward pass satisfies **by
+/// construction**, and each is violated by a real class of bug:
+///
+/// * **determinism** — the same tokens twice must give the same bits. Runs FIRST: if it fails, the
+///   other two comparisons are noise and their verdicts mean nothing.
+/// * **prefill vs decode** — prefilling T tokens in one call and stepping them one at a time
+///   through the cache run genuinely different kernels (batched attention over T rows vs. a
+///   single-row step against stored K/V), and must agree. Catches cache offset errors, position
+///   bugs, and state leaking between steps.
+/// * **prefix causality** — row `k` of a T-token prefill must equal the last row of a `k+1`-token
+///   prefill. Position `k` cannot see position `k+1`. Catches mask leaks and residual wiring that
+///   carries future state backwards.
+///
+/// ## Why the verdict is a ratio and not a bit-compare
+///
+/// The obvious form of these invariants is bit-identity, and that is what this checked first. It
+/// FAILED on qwen3 — a `Verified` architecture — by 3.05e-5. The cause is not a bug: `q2_0_split_k`
+/// selects the split-K kernel at `rows <= 2` and the flat one above it, so a 1-row decode step and
+/// a 6-row prefill sum the same products **in a different order**. Pinning either kernel with
+/// `FERRIC_Q2_0_KERNEL` drops the difference to exactly `0e0` on both comparisons — which is the
+/// evidence that summation order was the whole of it.
+///
+/// So the default verdict is relative: `max|Δ| / max|logit|`. The two regimes this must separate
+/// are far apart — reordered f32 accumulation lands around 1e-6 relative, while a mask leak or a
+/// wrong RoPE base moves a logit by O(1) — so the gate sits at 1e-4, a hundredfold above the noise
+/// and four orders below a real defect. `bitwise` is still reported, because on a pinned kernel it
+/// is the stronger statement and it does hold.
+///
+/// ## What this cannot do — measured, not argued
+///
+/// These prove **self-consistency, not correctness**. That is easy to write and easy to
+/// under-weight, so it was tested: `FERRIC_ROPE_NORM=1` forces qwen3 (a NEOX architecture) onto the
+/// interleaved RoPE pairing, which rotates the wrong partners — the exact defect that once let
+/// `llama` hold a `verified` badge while answering "The capital of France is located in the United
+/// States". Under that flag every check still passes, at 1.27e-6, indistinguishable from a healthy
+/// run:
+///
+/// ```text
+///   baseline            logits_fnv 183cb6f239f401c6   self-consistent
+///   FERRIC_ROPE_NORM=1  logits_fnv 9d74409388e892db   self-consistent
+/// ```
+///
+/// The fingerprints differ, so the fault genuinely took; the verdicts do not, because a wrong
+/// rotation applied in prefill and decode alike is wrong *consistently*. (`max_abs_logit` was 24.116
+/// in BOTH runs — reading that alone says the flag did nothing, which is why the fingerprint is
+/// reported.)
+///
+/// So the bounded claim is: these rule out the **cache, mask, and position** class of bug — state
+/// leaking between steps, a prefill that disagrees with its own decode, a token that can see its
+/// future. They say nothing about whether the arithmetic being applied consistently is the RIGHT
+/// arithmetic. They cannot promote an architecture to `Verified`, and nothing here should be read as
+/// licensing that. What they do is separate "no evidence exists" from "evidence exists and it
+/// holds" — which for an architecture no other runtime will load is the whole of the difference.
+pub struct SelfCheck {
+    pub arch: String,
+    pub n_tok: usize,
+    pub deterministic: bool,
+    /// Agreement within the relative gate — the verdict that tolerates kernel selection.
+    pub prefill_matches_decode: bool,
+    pub causal: bool,
+    /// Agreement to the last bit. True only when one kernel serves both row counts.
+    pub bitwise: bool,
+    pub max_abs_diff: f32,
+    pub max_abs_logit: f32,
+    /// FNV over the RAW BITS of the reference prefill's last-token logits.
+    ///
+    /// Not part of any verdict — it answers a different question, and one that bit this very
+    /// session: **did the thing I changed change the model at all?** Two runs under different
+    /// settings that report the same fingerprint did the same arithmetic, whatever the setting
+    /// claimed to do. `max_abs_logit` is too coarse to serve: a real change can leave the largest
+    /// logit untouched, and an ineffective flag can be mistaken for a tolerated one.
+    pub logits_fnv: u64,
+    /// **Did a deliberately corrupted run actually fail?** Not optional and not env-gated: a check
+    /// that has never been seen to fail is not evidence. The first version of this WAS env-gated
+    /// and asserted only that the mutated run failed — which it did, while the clean run was
+    /// failing identically, so the control passed without the mutation causing anything.
+    pub control_ok: bool,
+}
+
+impl SelfCheck {
+    /// Relative disagreement — the quantity the gate is applied to.
+    pub fn rel(&self) -> f32 {
+        if self.max_abs_logit > 0.0 { self.max_abs_diff / self.max_abs_logit } else { self.max_abs_diff }
+    }
+    /// A pass requires the control to have fired. Green with a dead control is not a pass.
+    pub fn passed(&self) -> bool {
+        self.control_ok && self.deterministic && self.prefill_matches_decode && self.causal
+    }
+}
+
+/// Gate on relative disagreement. See `SelfCheck` for why this is not zero by default.
+const SELFCHECK_REL_GATE: f32 = 1e-4;
+
+/// Run the oracle-free checks against a GGUF, including the mutation control.
+pub fn self_check(path: &str) -> SelfCheck {
+    let eng = Engine::load(path, "selfcheck".to_string());
+    let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
+    let arch = match g.metadata.get("general.architecture") {
+        Some(Meta::Str(s)) => s.clone(), _ => String::new(),
+    };
+    let vn = eng.model.n_vocab();
+
+    // Fixed ids rather than text: this must run on an architecture whose tokenizer may be unusual,
+    // and the invariants are about the forward pass, not about tokenization.
+    let n_tok = 6usize;
+    let toks: Vec<u32> = (0..n_tok).map(|i| ((i * 977 + 13) % vn.max(1)) as u32).collect();
+
+    let prefill = |t: &[u32]| -> Vec<f32> {
+        let mut c = eng.model.new_cache();
+        pollster::block_on(eng.model.forward_cached(t, &mut c).to_vec())
+    };
+
+    // ---- 1. determinism (must come first) ----
+    let a = prefill(&toks);
+    let deterministic = a == prefill(&toks);
+
+    let mut max_abs_diff = 0f32;
+    let mut bitwise = true;
+    let mut max_abs_logit = 0f32;
+    for v in &a { let m = v.abs(); if m > max_abs_logit { max_abs_logit = m; } }
+    let mut logits_fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in &a[a.len() - vn..] {
+        logits_fnv ^= v.to_bits() as u64;
+        logits_fnv = logits_fnv.wrapping_mul(0x1000_0000_01b3);
+    }
+
+    // NaN-safe by construction: `f32::max` RETURNS THE OTHER OPERAND on NaN, so folding with it
+    // would report a maximum difference of zero on a NaN-poisoned run and read as a pass. Bits are
+    // compared first; the magnitude is commentary on a difference already detected.
+    //
+    // A free fn rather than a closure so the control below can call it WITHOUT its result feeding
+    // `bitwise` — a deliberately corrupted comparison must not be able to set the real verdict.
+    fn worst(x: &[f32], y: &[f32]) -> (f32, bool) {
+        if x.len() != y.len() { return (f32::INFINITY, false); }
+        let (mut w, mut bit_eq) = (0f32, true);
+        for (p, q) in x.iter().zip(y) {
+            if p.to_bits() != q.to_bits() { bit_eq = false; }
+            let d = (p - q).abs();
+            if d.is_nan() { w = f32::INFINITY; } else if d > w { w = d; }
+        }
+        (w, bit_eq)
+    }
+
+    // ---- 2. prefill vs decode ----
+    let mut c = eng.model.new_cache();
+    let mut stepped: Vec<f32> = Vec::new();
+    for t in &toks {
+        stepped = pollster::block_on(eng.model.forward_cached(&[*t], &mut c).to_vec());
+    }
+    let last_prefill = &a[a.len() - vn..];
+    let (d_pd, bw_pd) = worst(last_prefill, &stepped[stepped.len() - vn..]);
+    bitwise &= bw_pd;
+    if d_pd > max_abs_diff { max_abs_diff = d_pd; }
+
+    // ---- 3. prefix causality ----
+    let mut d_causal = 0f32;
+    for k in 1..n_tok {
+        let short = prefill(&toks[..k]);
+        let (d, bw) = worst(&short[short.len() - vn..], &a[(k - 1) * vn..k * vn]);
+        bitwise &= bw;
+        if d > d_causal { d_causal = d; }
+    }
+    if d_causal > max_abs_diff { max_abs_diff = d_causal; }
+
+    let gate = |d: f32| -> bool {
+        if max_abs_logit > 0.0 { d / max_abs_logit <= SELFCHECK_REL_GATE } else { d == 0.0 }
+    };
+    let prefill_matches_decode = gate(d_pd);
+    let causal = gate(d_causal);
+
+    // ---- 4. the control: corrupt one logit and require the gate to REJECT it ----
+    //
+    // The perturbation is sized to the gate, not to a bit: a one-bit flip is ~1e-7 relative and
+    // would sit UNDER a 1e-4 gate, so a bit-flip control would fail to fire and be mistaken for a
+    // dead check. It is set ten times the gate — the smallest corruption the verdict claims to
+    // catch. Firing here proves the gate rejects what it says it rejects; it does not prove the
+    // invariants are sensitive to model bugs, which only a real bug can show.
+    let mut corrupted = last_prefill.to_vec();
+    corrupted[0] += max_abs_logit * SELFCHECK_REL_GATE * 10.0;
+    let (d_ctl, _) = worst(&corrupted, &stepped[stepped.len() - vn..]);
+    let control_ok = !gate(d_ctl);
+
+    SelfCheck { arch, n_tok, deterministic, prefill_matches_decode, causal, bitwise,
+                max_abs_diff, max_abs_logit, logits_fnv, control_ok }
+}
+
 #[cfg(test)]
 mod batching_support {
     /// Pins, against the source rather than against a belief, that every runtime the server is willing
@@ -1227,4 +1469,53 @@ mod batching_support {
         // A brand-new runtime cannot slip past either list: Model::supports_batching is an exhaustive
         // match, so the compiler forces a decision before this test ever runs.
     }
+    #[test]
+    fn every_verified_registry_row_can_actually_be_loaded() {
+        // THE TEST THAT WAS MISSING. `nemotron_h` shipped at Status::Verified, with a note claiming
+        // it reproduces the reference and generates " Paris.", while this server's dispatch panicked
+        // "its forward pass is not written yet". Two lists that had to agree, and nothing made them.
+        //
+        // The registry's guard for this lived in ferric-llama and could not see ferric-serve, so it
+        // asserted the only thing it could reach — that each row NAMES a runtime — with a match whose
+        // eight arms all returned `true`. It was `assert!(true)` and it passed for as long as the
+        // contradiction existed.
+        //
+        // `Verified` is the registry's strongest claim. A row carrying it that this server refuses is
+        // a lie in the strongest place, so that is what this asserts.
+        use crate::Model;
+        use ferric_llama::arch::{Status, REGISTRY};
+        for a in REGISTRY {
+            if a.status != Status::Verified { continue; }
+            if let Err(why) = Model::dispatchable(a.runtime) {
+                // Non-generative runtimes are legitimately un-loadable HERE, but only the two that
+                // are non-generative by nature. Anything else is drift.
+                assert!(matches!(a.runtime, ferric_llama::arch::Runtime::Bert
+                                          | ferric_llama::arch::Runtime::Cosmos),
+                        "{} is Status::Verified but this server refuses it: {why}", a.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_runnable_row_is_either_loadable_here_or_non_generative() {
+        // The weaker companion, covering `Loads` rows too: the registry may describe work in
+        // progress, but a row it calls runnable must not be one this server has simply never wired.
+        use crate::Model;
+        use ferric_llama::arch::{Runtime, REGISTRY};
+        let mut refused: Vec<&str> = Vec::new();
+        for a in REGISTRY {
+            if !a.status.runnable() { continue; }
+            if Model::dispatchable(a.runtime).is_err() { refused.push(a.name); }
+        }
+        // Exactly the two non-generative runtimes, named — so ADDING a refusal is a test failure
+        // rather than a silent loss of support.
+        let mut expect: Vec<&str> = REGISTRY.iter()
+            .filter(|a| a.status.runnable() && matches!(a.runtime, Runtime::Bert | Runtime::Cosmos))
+            .map(|a| a.name).collect();
+        refused.sort(); expect.sort();
+        assert_eq!(refused, expect,
+                   "a runnable registry row is refused by this server for a reason other than being \
+                    an encoder or a safetensors-only model");
+    }
+
 }
