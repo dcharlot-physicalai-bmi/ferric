@@ -46,6 +46,9 @@
 #![forbid(unsafe_code)]
 
 mod expert;
+/// Splitting work across a heterogeneous fabric: which missing experts cross the bus,
+/// and which execute in place. Pure arithmetic over measured bandwidths, so it runs on wasm too.
+mod fabric;
 /// Real file I/O. Not on wasm, which has no filesystem — the browser supplies its own [`Backing`]
 /// (fetch, OPFS, or an in-memory buffer).
 #[cfg(not(target_arch = "wasm32"))]
@@ -63,6 +66,7 @@ mod plan;
 mod prefetch;
 
 pub use expert::{ExpertCache, ExpertStats};
+pub use fabric::{EnergyModel, FabricProfile, Split};
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileBacking;
 pub use layer::{LayerCache, LayerStats};
