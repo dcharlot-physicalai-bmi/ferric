@@ -1185,180 +1185,9 @@ impl Qwen35 {
     /// experts, take the top-k, renormalize their weights (Qwen's norm_topk_prob), run only those k
     /// experts, and add the always-on shared expert scaled by `sigmoid(x·sh_gate)`.
     fn moe_ffn(&self, h: &Tensor, m: &MoeFfn) -> Tensor {
-        let (t, d) = (h.shape[0], self.cfg.n_embd);
-        // Slab fast path: ALL tokens in 4 dispatches, fully on-GPU. router [ne,d]·hᵀ → per-token
-        // top-k rows [T,2k] (scores+selection+renormed weights, no CPU readback) → ONE batched
-        // gate|up+swiglu dispatch [T,k,eff] → ONE down+weighted-sum dispatch [T,d]. The shared
-        // expert and its sigmoid gate are plain matmuls that batch over rows already. Zero syncs,
-        // and the dispatch count is independent of T — a multi-token speculative-verify forward
-        // costs the same FFN dispatches as single-token decode.
-        // Streamed experts: resolve ids to slots, fetching absent ones, then run the SAME kernels
-        // on a C-expert slab. The kernel derives its row base from whatever id `selw` carries
-        // (`dtype.rs`: `let e = u32(selw[...]); let base = e * (2u * eff);`), so remapping ids to
-        // slots is the entire difference.
-        if let MoeExperts::Streamed(st) = &m.experts {
-            let k = m.n_used;
-            let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale);
-            // ⚠ This readback is CORRECT inside `batch` — `readback` flushes any open batch as its
-            // first act. What it costs is the batching for the remainder of the enclosing closure,
-            // which is the price of streaming and is not avoidable: you cannot fetch an expert
-            // without first learning, on the CPU, which experts were chosen.
-            let sel = pollster::block_on(selw.to_vec());
-            // ⛔ RESOLVING EVERY TOKEN AND THEN RUNNING ONE KERNEL IS WRONG, and the invariance check
-            // caught it on its first run: three slot counts, three different logit vectors. A
-            // prompt's expert UNION is up to `t * k` — far more than `capacity` — so by the time the
-            // kernel ran, early tokens' slots had been evicted and refilled and their remapped
-            // indices pointed at whatever expert landed there. Nothing errors; the weights are real,
-            // just the wrong ones.
-            //
-            // So tokens are grouped into chunks whose union fits, and each chunk is resolved and
-            // executed before the next one is allowed to evict anything. Within a chunk the whole
-            // union is passed to `note_selected`, which is what makes it un-evictable — protecting
-            // one token's group at a time protects only the group being placed, not the ones already
-            // placed and still needed.
-            let ids_of = |ti: usize| -> Vec<u32> {
-                (0..k).map(|j| sel[ti * 2 * k + k + j] as u32).collect()
-            };
-            let mut parts: Vec<Tensor> = Vec::new();
-            let mut ti = 0usize;
-            while ti < t {
-                // Grow the chunk while the running union still fits in the slabs.
-                let mut union: Vec<u32> = Vec::new();
-                let mut end = ti;
-                while end < t {
-                    let mut u2 = union.clone();
-                    for e in ids_of(end) { if !u2.contains(&e) { u2.push(e) } }
-                    if u2.len() > st.capacity && end > ti { break }
-                    assert!(u2.len() <= st.capacity,
-                            "one token needs {} experts but only {} slots exist; FERRIC_MOE_SLOTS                              must be at least top_k", u2.len(), st.capacity);
-                    union = u2;
-                    end += 1;
-                }
-                let slot_of = st.resolve(&union).unwrap_or_else(|e| panic!("streamed experts: {e}"));
-                let map: std::collections::HashMap<u32, u32> =
-                    union.iter().copied().zip(slot_of).collect();
-
-                let rows = end - ti;
-                let mut chunk = vec![0f32; rows * 2 * k];
-                for r in 0..rows {
-                    for j in 0..2 * k {
-                        let v = sel[(ti + r) * 2 * k + j];
-                        // Weights pass through untouched; only the id half is remapped.
-                        chunk[r * 2 * k + j] = if j < k { v } else { map[&(v as u32)] as f32 };
-                    }
-                }
-                let csel = Tensor::from_vec(&self.ctx, &chunk, &[rows, 2 * k]);
-                let hc = if rows == t { h.clone() } else { h.narrow(0, ti, rows).contiguous() };
-                let mid = hc.matmul_q4_k_swiglu_id(&st.gate_up, &csel, k, self.cfg.expert_ff);
-                parts.push(st.down.wsum(&mid, &csel, d));
-                ti = end;
-            }
-            let routed = parts.iter().skip(1).fold(parts[0].clone(), |a, b| a.cat(b, 0));
-            // No shared expert (qwen3moe): the routed sum IS the block output. Adding a zero
-            // tensor instead would cost a dispatch per layer to change nothing.
-            let Some(shared) = &m.shared else { return routed };
-            let sh = self.expert(h, shared, self.cfg.shared_ff);
-            let sh = match &m.sh_gate {
-                Some(sg) => {
-                    let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]);
-                    sh.mul(&gate)
-                }
-                None => sh,
-            };
-            return routed.add(&sh);
-        }
-        if !matches!(&m.experts, MoeExperts::PerExpert(_) | MoeExperts::Streamed(_)) {
-            let k = m.n_used;
-            // h·routerᵀ directly (no transpose materialized — a permute+contiguous here measured a
-            // fixed ~17 ms/layer batch-splitting stall): logits [T, ne], token-major, which is also
-            // the layout moe_topk's per-token thread scans contiguously.
-            let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale); // [T, 2k]
-            if route_trace::enabled() { route_trace::record(selw.clone()); }
-            let routed = match &m.experts {
-                MoeExperts::Slab { gate_up, down } => {
-                    let mid = h.matmul_q4_k_swiglu_id(gate_up, &selw, k, self.cfg.expert_ff); // [T, k, eff]
-                    down.wsum(&mid, &selw, d)                                                 // [T, d]
-                }
-                MoeExperts::Slab8 { gate_up, down } => {
-                    let mid = h.matmul_q8_0_swiglu_id(gate_up, &selw, k, self.cfg.expert_ff);
-                    mid.matmul_q8_0_id_wsum(down, &selw, d)
-                }
-                MoeExperts::PerExpert(_) | MoeExperts::Streamed(_) => unreachable!("handled above"),
-            };
-            let Some(shared) = &m.shared else { return routed };
-            let sh = self.expert(h, shared, self.cfg.shared_ff);
-            let sh = match &m.sh_gate {
-                Some(sg) => {
-                    let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]); // [T,1]→[T,d]
-                    sh.mul(&gate)
-                }
-                None => sh,
-            };
-            return routed.add(&sh);
-        }
-        // ⚠ The per-expert path is NOT traced. Recording only the slab path would make the trace
-        // look complete while silently omitting every layer stored per-expert — coverage that
-        // reads as coverage and is not. Refuse instead.
-        assert!(!route_trace::enabled(),
-                "FERRIC_ROUTE_TRACE is set but this layer uses the per-expert (non-slab) MoE path, \
-                 which has no tap. The trace would be silently incomplete, so it is refused.");
-        let mut rows: Vec<Tensor> = Vec::with_capacity(t);
-        for ti in 0..t {
-            let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]
-            let routed = match &m.experts {
-                MoeExperts::Slab { .. } | MoeExperts::Slab8 { .. } | MoeExperts::Streamed(_) =>
-                    unreachable!("slab and streamed paths handled above"),
-                // General fallback (other quant combos): CPU routing via one small readback.
-                MoeExperts::PerExpert(experts) => {
-                    let lg = pollster::block_on(m.router.matmul(&h_t.reshape(&[d, 1])).to_vec());
-                    let probs: Vec<f32> = if m.sigmoid {
-                        lg.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect()
-                    } else {
-                        let maxl = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let e: Vec<f32> = lg.iter().map(|x| (x - maxl).exp()).collect();
-                        let sum: f32 = e.iter().sum();
-                        e.into_iter().map(|x| x / sum).collect()
-                    };
-                    let selp: Vec<f32> = match &m.sel_bias {
-                        Some(bias) => probs.iter().zip(bias).map(|(p, b)| p + b).collect(),
-                        None => probs.clone(),
-                    };
-                    let mut idx: Vec<usize> = (0..selp.len()).collect();
-                    idx.sort_by(|&a, &b| selp[b].partial_cmp(&selp[a]).unwrap());
-                    let sel = &idx[..m.n_used.min(idx.len())];
-                    let wsum: f32 = sel.iter().map(|&e| probs[e]).sum();
-                    let mut acc: Option<Tensor> = None;
-                    for &e in sel {
-                        let w = probs[e] / wsum * m.scale;
-                        // scale via a broadcast [1,1] scalar — a 4-byte upload instead of an n_embd-sized one
-                        let ws = Tensor::from_vec(&self.ctx, &[w], &[1, 1]).broadcast_to(&[1, d]);
-                        let y = self.expert(&h_t, &experts[e], self.cfg.expert_ff).mul(&ws);
-                        acc = Some(match acc { Some(a) => a.add(&y), None => y });
-                    }
-                    acc.expect("top-k is at least 1")
-                }
-            };
-            // shared expert — sigmoid-gated for qwen35moe (GPU-side, no readback), plain for laguna,
-            // absent entirely for qwen3moe.
-            match &m.shared {
-                None => rows.push(routed),
-                Some(shared) => {
-                    let sh = self.expert(&h_t, shared, self.cfg.shared_ff);
-                    let sh = match &m.sh_gate {
-                        Some(sg) => {
-                            let gate = sg.reshape(&[1, d]).matmul(&h_t.reshape(&[d, 1])).sigmoid().broadcast_to(&[1, d]);
-                            sh.mul(&gate)
-                        }
-                        None => sh,
-                    };
-                    rows.push(routed.add(&sh));
-                }
-            }
-        }
-        let mut it = rows.into_iter();
-        let mut o = it.next().expect("moe_ffn: empty input");
-        for r in it { o = o.cat(&r, 0); }
-        o
+        m.forward(&self.ctx, h, MoeDims { d: self.cfg.n_embd,
+                                          expert_ff: self.cfg.expert_ff,
+                                          shared_ff: self.cfg.shared_ff })
     }
 
     /// Prefill forward over `tokens` → logits [T, n_vocab]. Stateless (allocates a throwaway cache).
@@ -1952,5 +1781,206 @@ mod kvq_tests {
         assert!(src.contains("self.attn(&h, w, lc, pos, None)"),
                 "the MTP draft path stopped passing None — it now quantizes a cache whose history is \
                  thrown away every round; that needs its own justification and its own test");
+    }
+}
+
+
+/// The three widths a mixture-of-experts FFN needs, named once so every runtime can map its own
+/// config onto them instead of the MoE path reaching into one particular `Cfg`.
+#[derive(Clone, Copy)]
+pub struct MoeDims { pub d: usize, pub expert_ff: usize, pub shared_ff: usize }
+
+impl Expert {
+    /// One expert: fused gate|up, SwiGLU at `ff`, then down. It never used `self` on the model,
+    /// which is why it could move without touching a kernel.
+    pub fn forward(&self, h: &Tensor, ff: usize) -> Tensor {
+        h.matmul_q(&self.gate_up).swiglu(ff).matmul_q(&self.down)
+    }
+}
+
+impl MoeFfn {
+    /// **The MoE forward, independent of any one runtime.**
+    ///
+    /// This was a method on `Qwen35` reading three widths off its `Cfg`, so every other family
+    /// wanting a mixture had to write its own: `lfm2moe` got a hand-rolled copy, `gemma4` refuses
+    /// MoE checkpoints outright, and `nemotron_h_moe` is unregistered. The only dependencies were
+    /// ever `n_embd`, `expert_ff`, `shared_ff` and the context — so they are parameters now, and a
+    /// runtime supplies them under whatever names its own config uses.
+    pub fn forward(&self, ctx: &Arc<Context>, h: &Tensor, dims: MoeDims) -> Tensor {
+        let m = self;
+        let (t, d) = (h.shape[0], dims.d);
+        // Slab fast path: ALL tokens in 4 dispatches, fully on-GPU. router [ne,d]·hᵀ → per-token
+        // top-k rows [T,2k] (scores+selection+renormed weights, no CPU readback) → ONE batched
+        // gate|up+swiglu dispatch [T,k,eff] → ONE down+weighted-sum dispatch [T,d]. The shared
+        // expert and its sigmoid gate are plain matmuls that batch over rows already. Zero syncs,
+        // and the dispatch count is independent of T — a multi-token speculative-verify forward
+        // costs the same FFN dispatches as single-token decode.
+        // Streamed experts: resolve ids to slots, fetching absent ones, then run the SAME kernels
+        // on a C-expert slab. The kernel derives its row base from whatever id `selw` carries
+        // (`dtype.rs`: `let e = u32(selw[...]); let base = e * (2u * eff);`), so remapping ids to
+        // slots is the entire difference.
+        if let MoeExperts::Streamed(st) = &m.experts {
+            let k = m.n_used;
+            let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale);
+            // ⚠ This readback is CORRECT inside `batch` — `readback` flushes any open batch as its
+            // first act. What it costs is the batching for the remainder of the enclosing closure,
+            // which is the price of streaming and is not avoidable: you cannot fetch an expert
+            // without first learning, on the CPU, which experts were chosen.
+            let sel = pollster::block_on(selw.to_vec());
+            // ⛔ RESOLVING EVERY TOKEN AND THEN RUNNING ONE KERNEL IS WRONG, and the invariance check
+            // caught it on its first run: three slot counts, three different logit vectors. A
+            // prompt's expert UNION is up to `t * k` — far more than `capacity` — so by the time the
+            // kernel ran, early tokens' slots had been evicted and refilled and their remapped
+            // indices pointed at whatever expert landed there. Nothing errors; the weights are real,
+            // just the wrong ones.
+            //
+            // So tokens are grouped into chunks whose union fits, and each chunk is resolved and
+            // executed before the next one is allowed to evict anything. Within a chunk the whole
+            // union is passed to `note_selected`, which is what makes it un-evictable — protecting
+            // one token's group at a time protects only the group being placed, not the ones already
+            // placed and still needed.
+            let ids_of = |ti: usize| -> Vec<u32> {
+                (0..k).map(|j| sel[ti * 2 * k + k + j] as u32).collect()
+            };
+            let mut parts: Vec<Tensor> = Vec::new();
+            let mut ti = 0usize;
+            while ti < t {
+                // Grow the chunk while the running union still fits in the slabs.
+                let mut union: Vec<u32> = Vec::new();
+                let mut end = ti;
+                while end < t {
+                    let mut u2 = union.clone();
+                    for e in ids_of(end) { if !u2.contains(&e) { u2.push(e) } }
+                    if u2.len() > st.capacity && end > ti { break }
+                    assert!(u2.len() <= st.capacity,
+                            "one token needs {} experts but only {} slots exist; FERRIC_MOE_SLOTS                              must be at least top_k", u2.len(), st.capacity);
+                    union = u2;
+                    end += 1;
+                }
+                let slot_of = st.resolve(&union).unwrap_or_else(|e| panic!("streamed experts: {e}"));
+                let map: std::collections::HashMap<u32, u32> =
+                    union.iter().copied().zip(slot_of).collect();
+
+                let rows = end - ti;
+                let mut chunk = vec![0f32; rows * 2 * k];
+                for r in 0..rows {
+                    for j in 0..2 * k {
+                        let v = sel[(ti + r) * 2 * k + j];
+                        // Weights pass through untouched; only the id half is remapped.
+                        chunk[r * 2 * k + j] = if j < k { v } else { map[&(v as u32)] as f32 };
+                    }
+                }
+                let csel = Tensor::from_vec(ctx, &chunk, &[rows, 2 * k]);
+                let hc = if rows == t { h.clone() } else { h.narrow(0, ti, rows).contiguous() };
+                let mid = hc.matmul_q4_k_swiglu_id(&st.gate_up, &csel, k, dims.expert_ff);
+                parts.push(st.down.wsum(&mid, &csel, d));
+                ti = end;
+            }
+            let routed = parts.iter().skip(1).fold(parts[0].clone(), |a, b| a.cat(b, 0));
+            // No shared expert (qwen3moe): the routed sum IS the block output. Adding a zero
+            // tensor instead would cost a dispatch per layer to change nothing.
+            let Some(shared) = &m.shared else { return routed };
+            let sh = shared.forward(h, dims.shared_ff);
+            let sh = match &m.sh_gate {
+                Some(sg) => {
+                    let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]);
+                    sh.mul(&gate)
+                }
+                None => sh,
+            };
+            return routed.add(&sh);
+        }
+        if !matches!(&m.experts, MoeExperts::PerExpert(_) | MoeExperts::Streamed(_)) {
+            let k = m.n_used;
+            // h·routerᵀ directly (no transpose materialized — a permute+contiguous here measured a
+            // fixed ~17 ms/layer batch-splitting stall): logits [T, ne], token-major, which is also
+            // the layout moe_topk's per-token thread scans contiguously.
+            let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale); // [T, 2k]
+            if route_trace::enabled() { route_trace::record(selw.clone()); }
+            let routed = match &m.experts {
+                MoeExperts::Slab { gate_up, down } => {
+                    let mid = h.matmul_q4_k_swiglu_id(gate_up, &selw, k, dims.expert_ff); // [T, k, eff]
+                    down.wsum(&mid, &selw, d)                                                 // [T, d]
+                }
+                MoeExperts::Slab8 { gate_up, down } => {
+                    let mid = h.matmul_q8_0_swiglu_id(gate_up, &selw, k, dims.expert_ff);
+                    mid.matmul_q8_0_id_wsum(down, &selw, d)
+                }
+                MoeExperts::PerExpert(_) | MoeExperts::Streamed(_) => unreachable!("handled above"),
+            };
+            let Some(shared) = &m.shared else { return routed };
+            let sh = shared.forward(h, dims.shared_ff);
+            let sh = match &m.sh_gate {
+                Some(sg) => {
+                    let gate = h.matmul_bt(&sg.reshape(&[1, d])).sigmoid().broadcast_to(&[t, d]); // [T,1]→[T,d]
+                    sh.mul(&gate)
+                }
+                None => sh,
+            };
+            return routed.add(&sh);
+        }
+        // ⚠ The per-expert path is NOT traced. Recording only the slab path would make the trace
+        // look complete while silently omitting every layer stored per-expert — coverage that
+        // reads as coverage and is not. Refuse instead.
+        assert!(!route_trace::enabled(),
+                "FERRIC_ROUTE_TRACE is set but this layer uses the per-expert (non-slab) MoE path, \
+                 which has no tap. The trace would be silently incomplete, so it is refused.");
+        let mut rows: Vec<Tensor> = Vec::with_capacity(t);
+        for ti in 0..t {
+            let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]
+            let routed = match &m.experts {
+                MoeExperts::Slab { .. } | MoeExperts::Slab8 { .. } | MoeExperts::Streamed(_) =>
+                    unreachable!("slab and streamed paths handled above"),
+                // General fallback (other quant combos): CPU routing via one small readback.
+                MoeExperts::PerExpert(experts) => {
+                    let lg = pollster::block_on(m.router.matmul(&h_t.reshape(&[d, 1])).to_vec());
+                    let probs: Vec<f32> = if m.sigmoid {
+                        lg.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect()
+                    } else {
+                        let maxl = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let e: Vec<f32> = lg.iter().map(|x| (x - maxl).exp()).collect();
+                        let sum: f32 = e.iter().sum();
+                        e.into_iter().map(|x| x / sum).collect()
+                    };
+                    let selp: Vec<f32> = match &m.sel_bias {
+                        Some(bias) => probs.iter().zip(bias).map(|(p, b)| p + b).collect(),
+                        None => probs.clone(),
+                    };
+                    let mut idx: Vec<usize> = (0..selp.len()).collect();
+                    idx.sort_by(|&a, &b| selp[b].partial_cmp(&selp[a]).unwrap());
+                    let sel = &idx[..m.n_used.min(idx.len())];
+                    let wsum: f32 = sel.iter().map(|&e| probs[e]).sum();
+                    let mut acc: Option<Tensor> = None;
+                    for &e in sel {
+                        let w = probs[e] / wsum * m.scale;
+                        // scale via a broadcast [1,1] scalar — a 4-byte upload instead of an n_embd-sized one
+                        let ws = Tensor::from_vec(ctx, &[w], &[1, 1]).broadcast_to(&[1, d]);
+                        let y = experts[e].forward(&h_t, dims.expert_ff).mul(&ws);
+                        acc = Some(match acc { Some(a) => a.add(&y), None => y });
+                    }
+                    acc.expect("top-k is at least 1")
+                }
+            };
+            // shared expert — sigmoid-gated for qwen35moe (GPU-side, no readback), plain for laguna,
+            // absent entirely for qwen3moe.
+            match &m.shared {
+                None => rows.push(routed),
+                Some(shared) => {
+                    let sh = shared.forward(&h_t, dims.shared_ff);
+                    let sh = match &m.sh_gate {
+                        Some(sg) => {
+                            let gate = sg.reshape(&[1, d]).matmul(&h_t.reshape(&[d, 1])).sigmoid().broadcast_to(&[1, d]);
+                            sh.mul(&gate)
+                        }
+                        None => sh,
+                    };
+                    rows.push(routed.add(&sh));
+                }
+            }
+        }
+        let mut it = rows.into_iter();
+        let mut o = it.next().expect("moe_ffn: empty input");
+        for r in it { o = o.cat(&r, 0); }
+        o
     }
 }
