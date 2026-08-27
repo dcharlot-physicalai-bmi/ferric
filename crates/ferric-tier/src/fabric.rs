@@ -113,8 +113,48 @@ impl Split {
 }
 
 impl FabricProfile {
+    /// ⭐ A profile from repeated SAMPLES, which refuses a measurement too unstable to plan from.
+    ///
+    /// `measured` takes three numbers and cannot tell a solid rate from a lucky one. That gap is not
+    /// theoretical: profiling this crate's own machine twice minutes apart gave BP 0.29 then 0.52
+    /// GB/s and BH 0.43 then 0.52, with a within-run max/min spread of **12.2x** on BH — and because
+    /// the split depends on the DIFFERENCE `BR = BH − BP`, that noise flipped BR from 0.14 GB/s to
+    /// 0.00 and the plan for 8 missing experts from 5-across-3-in-place to 8-across-0. Same machine,
+    /// same binary, opposite answers.
+    ///
+    /// A number with a 12x spread is a guess wearing a measurement's clothes, and a planner that
+    /// accepts one produces a confident plan with nothing downstream able to tell. So: median of the
+    /// samples, and a refusal naming the path whose spread exceeds `max_spread`.
+    ///
+    /// ⚠ The usual cause is contention, not the fabric — these numbers came off a machine running
+    /// another build. Re-profile on a quiet machine rather than widening the tolerance.
+    pub fn from_samples(pcie: &[f64], host: &[f64], disk: &[f64], max_spread: f64)
+        -> Result<FabricProfile, String>
+    {
+        let reduce = |v: &[f64], name: &str| -> Result<f64, String> {
+            if v.len() < 3 {
+                return Err(format!("{name}: {} sample(s); a spread cannot be judged from fewer                                     than 3", v.len()));
+            }
+            let mut w: Vec<f64> = v.to_vec();
+            w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let (lo, hi) = (w[0], w[w.len() - 1]);
+            if !(lo > 0.0) || !hi.is_finite() {
+                return Err(format!("{name}: samples span {lo}..{hi}, which is not a rate"));
+            }
+            let spread = hi / lo;
+            if spread > max_spread {
+                return Err(format!(
+                    "{name}: samples spread {spread:.2}x (max/min {lo:.3e}..{hi:.3e}), over the                      {max_spread:.2}x this plan is allowed to be built from. The split depends on                      BH − BP, so noise this wide changes the plan rather than blurring it —                      re-measure on an idle machine instead of widening the tolerance"));
+            }
+            Ok(w[w.len() / 2])
+        };
+        FabricProfile::measured(reduce(pcie, "pcie")?, reduce(host, "host")?, reduce(disk, "disk")?)
+    }
+
     /// A profile from three measured rates. Refuses non-positive or non-finite values rather than
     /// producing a plan from them.
+    ///
+    /// ⚠ Prefer [`FabricProfile::from_samples`]: this cannot tell a solid rate from a lucky one.
     pub fn measured(pcie: f64, host: f64, disk: f64) -> Result<FabricProfile, String> {
         for (v, n) in [(pcie, "pcie"), (host, "host"), (disk, "disk")] {
             if !(v > 0.0) || !v.is_finite() {
@@ -381,6 +421,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ⛔ THE MEASUREMENT IS THE WEAK LINK, so it gets a guard. Real numbers off this machine:
+    /// two profiling runs minutes apart gave BP 0.29 vs 0.52 GB/s and BH 0.43 vs 0.52, flipping
+    /// BR from 0.14 to 0.00 and the plan from 5/3 to 8/0. Noise in a DIFFERENCE changes plans; it
+    /// does not merely blur them.
+    #[test]
+    fn a_profile_refuses_samples_too_noisy_to_plan_from() {
+        let steady = [1.0e9, 1.02e9, 0.99e9, 1.01e9, 1.0e9];
+        let noisy = [0.1e9, 1.22e9, 0.4e9, 0.9e9, 0.15e9]; // 12.2x, the real observed spread
+        assert!(FabricProfile::from_samples(&steady, &steady, &steady, 1.5).is_ok());
+        let e = FabricProfile::from_samples(&steady, &noisy, &steady, 1.5).unwrap_err();
+        assert!(e.contains("host") && e.contains("spread"), "unhelpful refusal: {e}");
+        // The guard must be able to FIRE on each path independently, or it only guards one.
+        for (i, name) in [(0, "pcie"), (1, "host"), (2, "disk")] {
+            let mut arg = [&steady[..], &steady[..], &steady[..]];
+            arg[i] = &noisy;
+            let e = FabricProfile::from_samples(arg[0], arg[1], arg[2], 1.5).unwrap_err();
+            assert!(e.contains(name), "noise on {name} was reported as: {e}");
+        }
+        // And it must not fire on data that is merely imperfect.
+        assert!(FabricProfile::from_samples(&steady, &steady, &steady, 1.05).is_ok(),
+                "refused a 1.03x spread at a 1.05x tolerance");
+        // Too few samples to judge a spread at all is a refusal, not a pass.
+        assert!(FabricProfile::from_samples(&[1.0e9, 1.0e9], &steady, &steady, 1.5).is_err());
     }
 
     #[test]

@@ -61,6 +61,7 @@ async fn run() {
         assert!(s[0].is_finite(), "the read-back produced {}, so the upload was not real", s[0]);
         bp.push((N * 4) as f64 / dt);
     }
+    let bp_s = bp.clone();
     let bp_spread = spread(&bp);
     let bp = median(&mut bp);
 
@@ -87,6 +88,7 @@ async fn run() {
         std::hint::black_box(acc);
         bh.push((EW / 2) as f64 / dt);
     }
+    let bh_s = bh.clone();
     let bh_spread = spread(&bh);
     let bh = median(&mut bh);
 
@@ -115,6 +117,7 @@ async fn run() {
             }
         }
     }
+    let bd_s = bd.clone();
     let (bd_spread, bd) = if bd.is_empty() { (f64::NAN, f64::NAN) }
                           else { (spread(&bd), median(&mut bd)) };
 
@@ -129,8 +132,17 @@ async fn run() {
         println!("  {:<28} {:>10}   {:>9}", "BD  backing store", "n/a", "-");
     }
 
-    let p = FabricProfile::measured(bp, bh, if bd.is_finite() { bd } else { 1.0 })
-        .expect("a profile from measured rates");
+    // ⚠ Built from SAMPLES, not from the medians printed above, so an unstable measurement is
+    // refused rather than planned from. 4.0x is generous — it is set where a contended laptop still
+    // gets an answer — and the two runs that motivated the guard were at 12.2x.
+    let p = match FabricProfile::from_samples(&bp_s, &bh_s, if bd_s.is_empty() { &[1.0, 1.0, 1.0] } else { &bd_s }, 4.0) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("\n  ⛔ REFUSING TO PLAN: {e}");
+            println!("\n  This is the point of the guard. The split depends on BH − BP, so noise\n                        this wide changes the PLAN rather than blurring a number — measured here as\n                        BR flipping 0.14 -> 0.00 GB/s between runs, which moves 8 missing experts\n                        from a 5/3 split to 8/0. Close the other builds and run it again.");
+            return;
+        }
+    };
     let br = p.residual_host();
     println!("\n  residual host bandwidth BR = BH - BP = {:.2} GB/s", gb(br));
     if br <= 0.0 {
