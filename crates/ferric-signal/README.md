@@ -56,6 +56,28 @@ open.
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
+## How to read a number from this crate
+
+Every held-out figure here is reported with four columns beside it, because each one separates a
+failure that accuracy alone merges. They cost almost nothing to compute and each has changed a
+verdict in this repository at least once.
+
+| column | what it separates | what it has caught here |
+|---|---|---|
+| **majority** | "at chance" from "predicting the training prior" | a null published as a result: valve at 50.7% against 25% chance reads as twice chance, and is exactly its majority baseline |
+| **control** | a real effect from what permuted labels can produce | a probe effect of +9.5 sitting inside a control of +12.2 — not a result — and the same axis clearing its control at a larger held-out size |
+| **said** | "answered one thing every time" from "at chance" | a decoder emitting one word for every held-out example, which scores that word's frequency and reads as a weak learner |
+| **off-axis** | "wrong word" from "not a word at all" | 27% of one axis's predictions leaving the caption vocabulary, invisible behind an accuracy of 23% |
+
+Two properties of the control are worth stating outright, because both have bitten here. **It is a
+function of the held-out size** — the same probe on the same tokens gave +40 points at 10 held-out
+examples and +1 at 450 — so it is computed in the run that produced the figure and never quoted
+from another. And **worst-of-N grows with N**, so the number of permutations belongs beside it;
+five rounds swung five points between draws on this corpus, and twenty is the default.
+
+A figure without a seed count is a single run. At these sample sizes held-out accuracy carries a
+standard deviation of several points, so a difference smaller than that is not a measurement.
+
 ## Measured results
 
 The first three results below are **synthetic**: five parameterized physical process families from
