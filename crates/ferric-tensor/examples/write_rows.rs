@@ -18,7 +18,7 @@
 //! product that could hide a compensating error.
 //!
 //!   cargo run -p ferric-tensor --example write_rows --release
-use ferric_tensor::{Q4_KWeights, Tensor};
+use ferric_tensor::{Q4_KWeights, Q6_KWeights, Tensor};
 use std::sync::Arc;
 
 const COLS: usize = 256;
@@ -72,6 +72,34 @@ async fn run() {
     assert!(b.write_rows(0, &rowbytes(4)[..BLK - 1], 1).is_err(), "accepted a short byte slice");
     assert!(b.write_rows(0, &slab(&[4, 5]), 1).is_err(), "accepted 2 rows of bytes for n_rows=1");
 
-    println!("\n  ✅ bit-exact replacement, the original is genuinely changed, and out-of-range or\n  \
-              mis-sized writes are refused. This is the call expert streaming was missing.");
+    // ---- Q6_K: the down projection, which a Q4_K_M MoE stores separately ------------------
+    //
+    // ⚠ Covering only Q4_K would leave gate|up swappable and `down` pinned to whatever it was built
+    // with — the two halves of ONE expert disagreeing. That does not error, it produces plausible
+    // wrong output, so the second half needs the same probe as the first.
+    const B6: usize = 210;
+    let r6 = |seed: u64| -> Vec<u8> {
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..B6).map(|_| { st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (st >> 33) as u8 }).collect()
+    };
+    let s6 = |seeds: &[u64]| -> Vec<u8> { seeds.iter().flat_map(|&x| r6(x)).collect() };
+    let a6 = Q6_KWeights::from_bytes(&ctx, &s6(&[1, 2, 3]), ROWS, COLS);
+    let b6 = Q6_KWeights::from_bytes(&ctx, &s6(&[1, 2, 3]), ROWS, COLS);
+    let c6 = Q6_KWeights::from_bytes(&ctx, &s6(&[1, 9, 3]), ROWS, COLS);
+    b6.write_rows(1, &r6(9), 1).expect("write Q6_K row 1");
+    let (v6a, v6b, v6c) = (probe.matmul_q6_k(&a6).to_vec().await,
+                           probe.matmul_q6_k(&b6).to_vec().await,
+                           probe.matmul_q6_k(&c6).to_vec().await);
+    let (b6c, b6a) = (maxdiff(&v6b, &v6c), maxdiff(&v6b, &v6a));
+    println!("\n  Q6_K (the down slab):");
+    println!("  max |B − C|  {b6c:.3e}");
+    println!("  max |B − A|  {b6a:.3e}");
+    assert_eq!(b6c, 0.0, "Q6_K written slab does not match one BUILT with the same rows");
+    assert!(b6a > 0.0, "Q6_K write_rows did nothing — the original is unchanged");
+    assert!(b6.write_rows(ROWS, &r6(4), 1).is_err(), "Q6_K wrote past the last row");
+    assert!(b6.write_rows(0, &r6(4)[..B6 - 1], 1).is_err(), "Q6_K accepted a short slice");
+
+    println!("\n  ✅ BOTH halves of an expert are replaceable, bit-exact, with the original genuinely\n  \
+              changed and out-of-range or mis-sized writes refused. Q4_K gate|up and Q6_K down are\n  \
+              what a Q4_K_M MoE actually stores, so streaming needs both.");
 }

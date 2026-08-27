@@ -1300,6 +1300,42 @@ impl Q6_KWeights {
         Q6_KWeights { ctx: ctx.clone(), codes: mk("q6k.codes", &codes), aux: mk("q6k.aux", &aux), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 210 }
+
+    /// Overwrite `n` consecutive rows in place — the Q6_K twin of [`Q4_KWeights::write_rows`].
+    ///
+    /// A Q4_K_M MoE stores gate|up as Q4_K and **down as Q6_K**, so streaming an expert needs both.
+    /// Adding only the Q4_K half would have made the gate|up slab swappable and left the down slab
+    /// pinned to whatever it was built with — the two halves of one expert disagreeing, which
+    /// produces finite, plausible, wrong output rather than an error.
+    ///
+    /// Same layout argument: blocks are row-major, so a row range is contiguous in both buffers.
+    /// 210 bytes per block — `ql` 128, `qh` 64, 16 int8 scales, then the f16 `d`.
+    pub fn write_rows(&self, row0: usize, bytes: &[u8], n_rows: usize) -> Result<(), String> {
+        let bpr = self.cols / 256;
+        if row0 + n_rows > self.rows {
+            return Err(format!("rows {row0}..{} exceed the weight's {} rows", row0 + n_rows, self.rows));
+        }
+        if bytes.len() != n_rows * bpr * 210 {
+            return Err(format!("{} bytes for {n_rows} rows x {bpr} blocks (need {})",
+                               bytes.len(), n_rows * bpr * 210));
+        }
+        let nblk = n_rows * bpr;
+        let mut codes: Vec<u32> = vec![0; nblk * 48];
+        let mut aux: Vec<u32> = vec![0; nblk * 5];
+        let word = |src: &[u8], o: usize| u32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]]);
+        for b in 0..nblk {
+            let src = &bytes[b * 210..b * 210 + 210];
+            for w in 0..32 { codes[b * 48 + w] = word(src, w * 4); }            // ql
+            for w in 0..16 { codes[b * 48 + 32 + w] = word(src, 128 + w * 4); } // qh
+            aux[b * 5] = u16::from_le_bytes([src[208], src[209]]) as u32;       // d
+            for w in 0..4 { aux[b * 5 + 1 + w] = word(src, 192 + w * 4); }      // 16 scale bytes
+        }
+        let blk0 = row0 * bpr;
+        self.ctx.queue.write_buffer(&self.codes, (blk0 * 48 * 4) as u64, bytemuck::cast_slice(&codes));
+        self.ctx.queue.write_buffer(&self.aux, (blk0 * 5 * 4) as u64, bytemuck::cast_slice(&aux));
+        Ok(())
+    }
+
 }
 
 impl Tensor {
