@@ -435,13 +435,26 @@ size does not decide whose gradients win.
 | rotating | gearbox rig, 25.6 kHz | 1.4 dB | *being remeasured* |
 | CWRU | bearing stand, 12–48 kHz | 1.1 dB | *being remeasured* |
 
-⚠ **The baseline column is being remeasured and the figures published here on 27 August were wrong
-in the model's favour.** The coefficient was quantized over a span of `4·√n` ≈ 45 when a DCT-II
-coefficient of a unit-scale patch is bounded by `n` = 128 and reaches `n/2` = 64 for a pure cosine,
-so every strong coefficient clipped. A pure cosine came back at 10.7 dB from a scheme that should
-reconstruct it almost exactly. **An understated baseline flatters every model measured against it**,
-so the tokenizer's margins were larger than they should have been and its losses smaller. The bound
-is now `n`, from Cauchy-Schwarz on a patch with `Σx² = n`, and the corrected table follows.
+**The baseline is now the strongest of four matched-budget coders, chosen per corpus.** Three
+hand-picked value coders in a row were weak in different directions, and each one quietly handed
+points to the model. A uniform scale narrow enough to resolve small coefficients clips the large
+ones — a pure cosine came back at 10.7 dB from a scheme that should reconstruct it almost exactly.
+One wide enough not to clip is too coarse, and cost 3.2 dB on the smoothest corpus. μ-law removes
+the clipping but spends resolution covering three decades most corpora do not use. So the choice is
+no longer made by hand: all four are evaluated over each corpus and the strongest reported, with the
+winner named. Different corpora do pick differently, which is exactly why hand-picking was wrong.
+
+| corpus | strongest 15-bit baseline | coder it chose |
+|---|---|---|
+| hydraulic | **5.2 dB** | uniform, span `n/2` |
+| wind | **5.1 dB** | uniform, span `n/2` |
+| CWRU | 1.6 dB | uniform, span `n` |
+| rotating | 1.4 dB | uniform, span `n` |
+
+⚠ **The baseline figures published here on 27 August were wrong in the model's favour** — 4.6 and
+4.5 dB where the strongest coder gives 5.2 and 5.1. The qualitative reading survives the correction
+and the margins do not: against the corrected baseline the tokenizer wins hydraulic by 3.8 dB rather
+than 4.4 and wind by 2.1 rather than 2.7, still loses CWRU, still ties rotating.
 
 **The baseline spends exactly the same bit rate and learns nothing.** The tokenizer emits one code
 from 32,768 per 128-sample patch — 15 bits. The baseline spends 15 bits naming which of the 128 DCT

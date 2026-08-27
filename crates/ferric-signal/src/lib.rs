@@ -91,7 +91,10 @@ pub mod tower;
 pub mod train;
 pub mod vocab;
 
-pub use bench::{chance, dct_baseline, majority, nb_probe, permutation_control, shuffled};
+pub use bench::{
+    best_dct_baseline, chance, dct_baseline, dct_baseline_with, majority, nb_probe,
+    permutation_control, quantized_level, shuffled, ValueCode, VALUE_CODES,
+};
 pub use caption::{build_words, compact, train_captions, CaptionError, SeedResult};
 pub use cost::{embed_cost, vocab_cost, EmbedCost, TokenCost, VocabCost};
 pub use encoder::{EncoderConfig, ParamBreakdown, sinusoidal_positions};

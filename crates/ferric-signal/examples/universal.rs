@@ -47,7 +47,7 @@
 //! are about unseen machines and not about unseen seconds of a seen machine.
 
 use ferric_signal::{
-    dct_baseline, decoder_forward_var, forward_var, mse, shuffled, straight_through, DecoderWeights,
+    best_dct_baseline, decoder_forward_var, forward_var, mse, shuffled, straight_through, DecoderWeights,
     EncoderConfig, EncoderWeights, Fsq, MatFile, Patcher, RevIn, Weights,
 };
 use ferric_core::Context;
@@ -314,6 +314,35 @@ fn main() {
                  c.name, c.train.len(), c.held.len(), c.files, c.skipped);
     }
 
+    // The baseline is a property of the DATA, not of the model, so it can be measured on its own.
+    // Useful when a training run is already in flight, or when only the baseline has changed.
+    // Corpus loading is deterministic given the same flags, so the window counts printed above are
+    // what pairs this with a training run — check them before pairing anything.
+    if args.iter().any(|a| a == "--baseline-only") {
+        println!("\n  MATCHED-BIT-RATE BASELINE ONLY. No model is trained or evaluated here.");
+        println!("\n  {:<12} {:>8} {:>12} {:>10}  {}",
+                 "corpus", "windows", "MSE", "SNR", "strongest coder");
+        println!("  {:-<12} {:->8} {:->12} {:->10}  {:->16}", "", "", "", "", "");
+        for c in &corpora {
+            let (mse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
+            let (mut sum, mut sumsq, mut cnt) = (0.0f64, 0.0f64, 0usize);
+            for b in &c.held {
+                for &v in b {
+                    sum += v as f64;
+                    sumsq += (v as f64) * (v as f64);
+                    cnt += 1;
+                }
+            }
+            let cf = cnt.max(1) as f64;
+            let var = sumsq / cf - (sum / cf) * (sum / cf);
+            let snr = 10.0 * (var / mse.max(1e-12)).log10();
+            println!("  {:<12} {:>8} {mse:>12.5} {snr:>9.1}dB  {code:?}", c.name, c.held.len());
+        }
+        println!("\n  15 bits per {PATCH}-sample patch: 7 to name the largest DCT coefficient,");
+        println!("  8 to quantize it. The same 15 bits an FSQ code over 32,768 spends.\n");
+        return;
+    }
+
     let Ok(ctx) = pollster::block_on(Context::new()) else {
         eprintln!("no GPU context; this example needs one");
         std::process::exit(1);
@@ -415,25 +444,20 @@ fn main() {
     // the whole claim a universal tokenizer makes is about the hard ones.
     println!("\n  HELD-OUT RECONSTRUCTION, PER CORPUS");
     println!("  recordings the training set never touched.\n");
-    println!("  {:<12} {:>8} {:>12} {:>10} {:>12} {:>12}",
-             "corpus", "windows", "MSE", "SNR", "1-coef DCT", "codes used");
+    println!("  {:<12} {:>8} {:>12} {:>10} {:>12} {:>12}  {}",
+             "corpus", "windows", "MSE", "SNR", "1-coef DCT", "codes used", "coder");
     println!("  {:-<12} {:->8} {:->12} {:->10} {:->12} {:->12}", "", "", "", "", "", "");
     let mut all_codes: HashSet<u32> = HashSet::new();
     for c in &corpora {
         let mut codes = HashSet::new();
         let (m, v) = recon(&ctx, cfg, &q, &enc, &dec, &c.held, &mut codes);
         let snr = 10.0 * (v / m.max(1e-12)).log10();
-        // The baseline gets the SAME 15 bits per patch and no training.
-        let (mut bse, mut bn) = (0.0f64, 0usize);
-        for b in &c.held {
-            for patch in b.chunks(PATCH) {
-                bse += dct_baseline(patch);
-                bn += 1;
-            }
-        }
-        let bmse = if bn == 0 { f64::NAN } else { bse / bn as f64 };
+        // The baseline gets the SAME 15 bits per patch and no training, at whichever of the
+        // matched-budget value coders is STRONGEST on this corpus — a baseline chosen to be weak
+        // would flatter the model.
+        let (bmse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
         let bsnr = 10.0 * (v / bmse.max(1e-12)).log10();
-        println!("  {:<12} {:>8} {m:>12.5} {snr:>9.1}dB {bsnr:>11.1}dB {:>12}",
+        println!("  {:<12} {:>8} {m:>12.5} {snr:>9.1}dB {bsnr:>11.1}dB {:>12}  {code:?}",
                  c.name, c.held.len(), codes.len());
         all_codes.extend(&codes);
     }

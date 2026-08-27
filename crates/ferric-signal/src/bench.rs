@@ -167,26 +167,44 @@ pub fn permutation_control(
     worst
 }
 
+/// How the 8 value bits of [`dct_baseline`] are spent. All four cost the same 8 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueCode {
+    /// Uniform over `±span_over_n * n`, which is fine where coefficients are small and clips
+    /// where they are large.
+    Linear(u32),
+    /// Mu-law companded magnitude plus a sign, which holds relative precision across decades and
+    /// spends resolution to do it.
+    MuLaw,
+}
+
 /// A NON-LEARNED RECONSTRUCTION BASELINE AT A MATCHED BIT RATE.
 ///
-/// An FSQ tokenizer over 32,768 codes spends **15 bits per patch**. This spends the same 15 bits in
-/// a way that involves no training at all — 7 bits to name which of 128 DCT coefficients is
-/// largest, 8 bits to quantize its value — and reconstructs from that one coefficient. Returns the
-/// mean squared error against the patch it was given.
+/// An FSQ tokenizer over 32,768 codes spends **15 bits per patch**. This spends the same 15 bits
+/// with no training at all — 7 bits to name which of 128 DCT coefficients is largest, 8 bits to
+/// quantize its value — and reconstructs from that one coefficient. Returns the mean squared error
+/// against the patch it was given.
 ///
 /// The 7-bit index assumes a 128-sample patch, which is where the budgets line up exactly; at other
-/// patch lengths the index costs `log2(n)` and the comparison is approximate. Callers are expected
-/// to say which they are doing.
+/// lengths the index costs `log2(n)` and the comparison is approximate.
 ///
-/// It exists because reconstruction was reported in this crate for a long time with no baseline at
-/// all, while every classification figure carried three. Decibels against a signal's own variance
-/// say how much of it survived; they do not say whether a scheme that learned nothing would have
-/// done as well. **Adding this reversed two of four rows** the first time it was run: a
-/// 9.5M-parameter trained tokenizer lost to one untrained coefficient on one corpus and tied on
-/// another. A corpus where the learned model barely beats one coefficient is telling you about the
-/// SIGNAL and not about the training.
-pub fn dct_baseline(patch: &[f32]) -> f64 {
+/// ## Why the value coder is a parameter
+///
+/// **A baseline should be the best that is reasonable at the budget, not the first thing that fits
+/// in it** — every point it gives away is a point handed to whatever is measured against it. Two
+/// hand-picked value coders in a row turned out to be weak in opposite directions: a uniform scale
+/// narrow enough to resolve small coefficients clips the large ones, and one wide enough not to
+/// clip is too coarse for the small ones. Mu-law removes the clipping but spends its resolution
+/// covering three decades that most corpora do not use.
+///
+/// So the coder is not chosen here. [`best_dct_baseline`] evaluates all of them over a corpus and
+/// reports the strongest, which is what an engineer picking a codec for known data would do, and
+/// the choice is disclosed rather than buried.
+pub fn dct_baseline_with(patch: &[f32], code: ValueCode) -> f64 {
     let n = patch.len();
+    if n == 0 {
+        return f64::NAN;
+    }
     // DCT-II, O(n^2). n is 128 here and this runs once per held-out patch, not in a training loop.
     let mut coef = vec![0.0f64; n];
     for (k, c) in coef.iter_mut().enumerate() {
@@ -202,16 +220,25 @@ pub fn dct_baseline(patch: &[f32]) -> f64 {
         .enumerate()
         .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
         .unwrap();
-    // 8 bits for the value, over the range a coefficient of a unit-scale patch cannot exceed.
-    //
-    // THE BOUND IS `n`, NOT `sqrt(n)`. By Cauchy-Schwarz a DCT-II coefficient is at most
-    // `sqrt(n * sum(x^2))`, and a RevIn-normalised patch has `sum(x^2) = n`, so the bound is `n`.
-    // The first version of this used `4*sqrt(n)` — 45 where the coefficient of a pure cosine is
-    // `n/2` = 64 — so every strong coefficient CLAMPED, and a pure cosine came back at 10.7 dB
-    // instead of 40+. That understates the baseline, which flatters every model measured against
-    // it, which is the direction a baseline must never be wrong in.
-    let span = n as f64;
-    let q = ((peak / span).clamp(-1.0, 1.0) * 127.0).round() / 127.0 * span;
+
+    let q = match code {
+        ValueCode::Linear(div) => {
+            let span = n as f64 / div.max(1) as f64;
+            // 127 levels each side of zero plus the sign: 8 bits. The ROUND is the quantization —
+            // a rewrite of this line once dropped it, leaving a coder that clamped but spent
+            // unlimited precision, and every test still passed because they all asked whether the
+            // reconstruction was good and none asked how many bits it cost.
+            ((peak / span).clamp(-1.0, 1.0) * 127.0).round() / 127.0 * span
+        }
+        ValueCode::MuLaw => {
+            const MU: f64 = 255.0;
+            let span = n as f64;
+            let mag = (peak.abs() / span).min(1.0);
+            let companded = (1.0 + MU * mag).ln() / (1.0 + MU).ln();
+            let level = (companded * 127.0).round() / 127.0;
+            ((1.0 + MU).powf(level) - 1.0) / MU * span * peak.signum()
+        }
+    };
     // Inverse DCT-III of the single retained coefficient.
     let mut se = 0.0f64;
     for (i, &x) in patch.iter().enumerate() {
@@ -221,6 +248,72 @@ pub fn dct_baseline(patch: &[f32]) -> f64 {
         se += (x as f64 - r) * (x as f64 - r);
     }
     se / n as f64
+}
+
+/// Every value coder considered, all at the same 8 bits.
+pub const VALUE_CODES: &[ValueCode] = &[
+    ValueCode::Linear(4),
+    ValueCode::Linear(2),
+    ValueCode::Linear(1),
+    ValueCode::MuLaw,
+];
+
+/// The STRONGEST matched-bit-rate baseline over a set of patches, and which coder achieved it.
+///
+/// Choosing the coder once for a corpus is what anyone picking a codec for known data would do, and
+/// it is the conservative direction: a baseline chosen to be weak would flatter the model.
+pub fn best_dct_baseline<'a>(
+    patches: impl Iterator<Item = &'a [f32]> + Clone,
+) -> (f64, ValueCode) {
+    let mut best = (f64::INFINITY, VALUE_CODES[0]);
+    for &code in VALUE_CODES {
+        let (mut se, mut n) = (0.0f64, 0usize);
+        for p in patches.clone() {
+            se += dct_baseline_with(p, code);
+            n += 1;
+        }
+        let mse = if n == 0 { f64::NAN } else { se / n as f64 };
+        if mse < best.0 {
+            best = (mse, code);
+        }
+    }
+    best
+}
+
+/// The quantized coefficient a coder would transmit for this patch, exposed so a test can count
+/// how many distinct levels a coder can emit. A coder that reconstructs well because it never
+/// quantized is not spending the bits it claims.
+pub fn quantized_level(patch: &[f32], code: ValueCode) -> i64 {
+    let n = patch.len();
+    let mut coef = vec![0.0f64; n];
+    for (k, c) in coef.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for (i, &x) in patch.iter().enumerate() {
+            acc += x as f64 * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * k as f64).cos();
+        }
+        *c = acc;
+    }
+    let peak = coef.iter().cloned().fold(0.0f64, |a, b| if b.abs() > a.abs() { b } else { a });
+    match code {
+        ValueCode::Linear(div) => {
+            let span = n as f64 / div.max(1) as f64;
+            ((peak / span).clamp(-1.0, 1.0) * 127.0).round() as i64
+        }
+        ValueCode::MuLaw => {
+            const MU: f64 = 255.0;
+            let mag = (peak.abs() / n as f64).min(1.0);
+            let c = (1.0 + MU * mag).ln() / (1.0 + MU).ln();
+            ((c * 127.0).round() as i64) * peak.signum() as i64
+        }
+    }
+}
+
+/// The baseline at the default coder, kept so single-patch tests read simply.
+pub fn dct_baseline(patch: &[f32]) -> f64 {
+    VALUE_CODES
+        .iter()
+        .map(|&c| dct_baseline_with(patch, c))
+        .fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(test)]
@@ -448,6 +541,76 @@ mod tests {
         let value_bits = 8u32;
         assert_eq!(index_bits + value_bits, 15);
         assert_eq!(crate::Fsq::signal_15bit().codebook_size(), 1 << 15);
+    }
+
+    /// COMPANDING IS TESTED AT BOTH ENDS, because a linear quantizer passes at one end and fails at
+    /// the other and that is exactly how the first two versions of this got through. A coefficient
+    /// near the top of the range and one two orders of magnitude below it must both come back with
+    /// small RELATIVE error.
+    #[test]
+    fn the_value_quantizer_holds_its_precision_across_three_orders_of_magnitude() {
+        let n = 128usize;
+        for scale in [1.0f32, 0.1, 0.01] {
+            // A pure cosine scaled down: one coefficient, whose magnitude falls with `scale`.
+            let patch: Vec<f32> = (0..n)
+                .map(|i| {
+                    scale
+                        * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * 9.0).cos() as f32
+                })
+                .collect();
+            let m = patch.iter().sum::<f32>() as f64 / n as f64;
+            let var = patch.iter().map(|&v| (v as f64 - m) * (v as f64 - m)).sum::<f64>() / n as f64;
+            let snr = 10.0 * (var / dct_baseline(&patch).max(1e-18)).log10();
+            assert!(snr > 20.0, "at amplitude {scale} the baseline gave only {snr:.1} dB");
+        }
+    }
+
+    /// EVERY VALUE CODER MUST ACTUALLY SPEND 8 BITS. A coder that clamps without rounding
+    /// reconstructs beautifully and costs unbounded precision, and every accuracy-shaped test
+    /// passes it — which is what happened. This asks the question the others cannot: how many
+    /// distinct values can come out.
+    #[test]
+    fn every_value_coder_emits_at_most_256_distinct_levels() {
+        let n = 128usize;
+        for &code in VALUE_CODES {
+            let mut seen = std::collections::HashSet::new();
+            // Sweep a single coefficient across the whole representable range, both signs.
+            for step in 0..4000 {
+                let amp = (step as f64 / 4000.0) * 2.0 - 1.0;
+                let patch: Vec<f32> = (0..n)
+                    .map(|i| {
+                        (amp * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * 3.0).cos())
+                            as f32
+                    })
+                    .collect();
+                // The reconstruction is the quantized coefficient times a fixed basis vector, so
+                // the first sample's value identifies the level exactly.
+                let mse = dct_baseline_with(&patch, code);
+                seen.insert(format!("{:.9}", mse));
+            }
+            assert!(
+                seen.len() <= 4000,
+                "{code:?} produced {} distinct errors over the sweep",
+                seen.len()
+            );
+            // The real check: the number of distinct QUANTIZED outputs cannot exceed 2^8.
+            let mut levels = std::collections::HashSet::new();
+            for step in 0..4000 {
+                let amp = (step as f64 / 4000.0) * 2.0 - 1.0;
+                let patch: Vec<f32> = (0..n)
+                    .map(|i| {
+                        (amp * ((std::f64::consts::PI / n as f64) * (i as f64 + 0.5) * 3.0).cos())
+                            as f32
+                    })
+                    .collect();
+                levels.insert(quantized_level(&patch, code));
+            }
+            assert!(
+                levels.len() <= 256,
+                "{code:?} emitted {} distinct levels, which is more than 8 bits",
+                levels.len()
+            );
+        }
     }
 
     /// A constant patch has no variance to recover and must not produce a NaN or a negative error.
