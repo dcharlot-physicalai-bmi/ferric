@@ -20,7 +20,7 @@
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::kvquant::{KvStore, KvqFmt};
-use crate::qwen35::DownSlab;
+use crate::qwen35::{DownSlab, MoeDims, MoeExperts, MoeFfn};
 use ferric_tensor::{append2, nn, KvBuf, Q4_KWeights, Q6_KWeights, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -55,28 +55,12 @@ enum Ffn {
     Dense { gate: QMatrix, up: QMatrix, down: QMatrix },
     /// Router + all experts packed expert-major into one slab per projection, which is the layout
     /// `matmul_q4_k_swiglu_id` addresses (`base + o` / `base + eff + o` per expert).
-    Moe {
-        router: Tensor,            // [n_expert, d] f32
-        gate_up: Q4_KWeights,      // [n_expert · 2·eff, d] — gate|up interleaved PER EXPERT
-        /// `[n_expert · d, eff]` — already expert-major on disk, so its raw bytes ARE the slab.
-        ///
-        /// ⚠ Q4_K_M ALTERNATES THE DOWN FORMAT PER LAYER. On LFM2.5-8B-A1B block 2's down_exps is
-        /// Q6_K and block 3's is Q4_K. Pinning it to Q6_K loaded block 2 and then refused block 3 —
-        /// the good outcome only because it was an assertion; reading Q4_K bytes as Q6_K blocks
-        /// would have produced a running, wrong model.
-        down: DownSlab,
-        /// `exp_probs_b.bias`, on-GPU. Added to the scores for SELECTION ONLY; the combining
-        /// weights come from the UNBIASED scores. Letting it reach the weights yields a model that
-        /// runs and is wrong — see `instella::route`, which pins exactly this.
-        sel_bias: Tensor,          // [n_expert] f32
-        /// **A second, independent implementation of the same experts**, built only under
-        /// `FERRIC_MOE_REF`. Per-expert `QMatrix` pairs driven by ordinary `matmul_q` — no slab, no
-        /// id-indexed kernel, no fused addressing. Everything about the slab path has now been
-        /// checked by READING it (byte counts, row strides, gate|up order, the WGSL itself) and it
-        /// still produces wrong text, so the remaining move is to compute the same thing a different
-        /// way and diff. `Some` here costs a full second copy of the experts, hence the env gate.
-        reference: Option<Vec<(QMatrix, QMatrix)>>,   // (gate|up fused [2·eff, d], down [d, eff])
-    },
+    /// ⭐ THE SAME `MoeFfn` qwen35moe/qwen3moe use — not a second implementation.
+    ///
+    /// This variant carried its own router + slab + wsum because the MoE forward was a method on
+    /// `Qwen35` and unreachable from here. It is `MoeFfn::forward(ctx, h, MoeDims)` now, so lfm2moe
+    /// runs the SAME path qwen35moe does, and a fix to one is a fix to both.
+    Moe(MoeFfn),
 }
 
 struct Block {
@@ -208,44 +192,10 @@ impl Ffn {
         match self {
             Ffn::Dense { gate, up, down } =>
                 hn.matmul_q(gate).silu().mul(&hn.matmul_q(up)).matmul_q(down),
-            Ffn::Moe { router, gate_up, down, sel_bias, reference } => {
-                let k = cfg.n_expert_used;
-                // `scale = 1.0`: lfm2moe renormalises the selected weights to sum to 1 and applies
-                // no routed multiplier (laguna's 2.5 is laguna's, not a default).
-                let selw = hn.matmul_bt(router).moe_topk(Some(sel_bias), k, cfg.gating_sigmoid, 1.0);
-                let mid = hn.matmul_q4_k_swiglu_id(gate_up, &selw, k, cfg.expert_ff);
-                let out = down.wsum(&mid, &selw, cfg.d);
-                if let Some(refs) = reference {
-                    // Same tokens, same routing, different arithmetic. A disagreement localises the
-                    // fault to the slab path; agreement clears it and moves the search elsewhere.
-                    let sv = pollster::block_on(selw.to_vec());
-                    let hv = pollster::block_on(out.to_vec());
-                    let t = hn.shape[0];
-                    let mut worst = 0f32;
-                    for ti in 0..t {
-                        let row = hn.narrow(0, ti, 1).contiguous();
-                        let mut acc = vec![0f32; cfg.d];
-                        for j in 0..k {
-                            let w = sv[ti * 2 * k + j];
-                            let e = sv[ti * 2 * k + k + j] as usize;
-                            let (gu_e, dn_e) = &refs[e];
-                            let m = row.matmul_q(gu_e);                 // [1, 2·eff]
-                            let mv = pollster::block_on(m.to_vec());
-                            let act: Vec<f32> = (0..cfg.expert_ff)
-                                .map(|o| { let g = mv[o]; (g / (1.0 + (-g).exp())) * mv[cfg.expert_ff + o] })
-                                .collect();
-                            let y = Tensor::from_vec(ctx, &act, &[1, cfg.expert_ff]).matmul_q(dn_e);
-                            for (a, v) in acc.iter_mut().zip(pollster::block_on(y.to_vec())) { *a += w * v; }
-                        }
-                        for (i, a) in acc.iter().enumerate() {
-                            let dd = (a - hv[ti * cfg.d + i]).abs();
-                            if dd > worst { worst = dd; }
-                        }
-                    }
-                    eprintln!("  REF    max|slab - per_expert| = {worst:.6e}");
-                }
-                out
-            }
+            // `shared_ff: 0` — lfm2moe has no shared expert, and `MoeFfn.shared` is None, so the
+            // width is never read. `scale` lives on the MoeFfn (1.0 here; laguna's 2.5 is laguna's).
+            Ffn::Moe(m) => m.forward(ctx, hn,
+                                     MoeDims { d: cfg.d, expert_ff: cfg.expert_ff, shared_ff: 0 }),
         }
     }
 }
@@ -368,24 +318,25 @@ impl Lfm2 {
                 // Its absence is why this does not reuse qwen35's MoeFfn, whose `shared` is required.
                 let bias = g.dequant(&b("exp_probs_b.bias"))
                     .unwrap_or_else(|_| vec![0f32; n_expert]);
-                let reference = if std::env::var("FERRIC_MOE_REF").is_ok() {
-                    Some((0..n_expert).map(|e| {
-                        let mut one = Vec::with_capacity(gp + up_);
-                        one.extend_from_slice(&gf[e * gp..(e + 1) * gp]);
-                        one.extend_from_slice(&uf[e * up_..(e + 1) * up_]);
-                        let dpe = df.len() / n_expert;
-                        (QMatrix::from_bytes(ctx, &one, gt, 2 * eff, d).unwrap(),
-                         QMatrix::from_bytes(ctx, &df[e * dpe..(e + 1) * dpe], dt, d, eff).unwrap())
-                    }).collect())
-                } else { None };
-                Ffn::Moe {
-                    reference,
+                let bias = g.dequant(&b("exp_probs_b.bias"))
+                    .unwrap_or_else(|_| vec![0f32; n_expert]);
+                Ffn::Moe(MoeFfn {
                     router: ft(&b("ffn_gate_inp.weight"), &[n_expert, d]),
-                    gate_up: Q4_KWeights::from_bytes(ctx, &gu, n_expert * 2 * eff, d),
-                    down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) }
-                          else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) },
-                    sel_bias: Tensor::from_vec(ctx, &bias, &[n_expert]),
-                }
+                    experts: MoeExperts::Slab {
+                        gate_up: Q4_KWeights::from_bytes(ctx, &gu, n_expert * 2 * eff, d),
+                        down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) }
+                              else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) },
+                    },
+                    // No shared expert on lfm2moe, unlike qwen35moe and laguna. That this is now an
+                    // Option is what let this variant stop being a second implementation.
+                    shared: None,
+                    sh_gate: None,
+                    n_used: n_expert_used,
+                    sigmoid: gating_sigmoid,
+                    gpu_bias: Some(Tensor::from_vec(ctx, &bias, &[n_expert])),
+                    sel_bias: Some(bias),
+                    scale: 1.0,
+                })
             } else {
                 Ffn::Dense { gate: qm(&b("ffn_gate.weight")), up: qm(&b("ffn_up.weight")),
                              down: qm(&b("ffn_down.weight")) }
