@@ -220,6 +220,96 @@ impl ExpertCache {
         Ok((&self.buffers[victim][..], Tier::Backing))
     }
 
+    /// **Decide where an expert lives, moving no bytes.** The GPU counterpart of [`Self::get`].
+    ///
+    /// `get` copies into a host buffer this cache owns, which is the wrong shape for a weight that
+    /// must end up in a GPU slab — it would hold every expert twice. `place` runs the same residency
+    /// and eviction logic and returns the SLOT, so a runtime can `write_rows` a fetched expert into
+    /// that row of its slab. This is the call that was missing between this crate and the tensor
+    /// layer, and the reason `ExpertCache` had no runtime consumer.
+    ///
+    /// Returns `(slot, was_miss)`. On a miss the slot is marked [`Slot::Loading`] — never a hit and
+    /// never a victim — and the caller **must** call [`Self::commit`] once the bytes are in place, or
+    /// [`Self::abort`] if the fetch failed. That is the same discipline `get` follows on its error
+    /// path: a slot whose tag and contents could disagree is never published.
+    ///
+    /// ⚠ Placing the same expert twice without committing is an ERROR, not a second allocation.
+    /// Without that check a caller retrying a failed fetch would burn a fresh slot each attempt and
+    /// quietly shrink the cache to nothing.
+    pub fn place(&mut self, layer: u32, expert: u32) -> Result<(usize, bool), TierError> {
+        let c = self.cell(layer, expert)?;
+        self.stats.gets += 1;
+        self.clock += 1;
+
+        if let Some(s) = self.index[c] {
+            let s = s as usize;
+            // A hit needs BOTH the index entry and a slot that actually holds this expert. An index
+            // pointing at a `Loading` slot means a place is outstanding, not that the expert is here.
+            if self.slots[s] == (Slot::Holds { layer, expert }) {
+                self.last_used[s] = self.clock;
+                self.stats.hits += 1;
+                return Ok((s, false));
+            }
+            return Err(TierError::Io(format!(
+                "expert ({layer}, {expert}) is already placed in slot {s} and not yet committed;                  placing again would allocate a second slot and leak the first")));
+        }
+
+        let victim = self.pick_victim()?;
+        // Drop the old occupant's index entry BEFORE the slot changes state, so a failed fill cannot
+        // leave a cell pointing at a row whose contents have been overwritten.
+        if let Slot::Holds { layer: ol, expert: oe } = self.slots[victim] {
+            let oc = ol as usize * self.n_experts as usize + oe as usize;
+            self.index[oc] = None;
+            self.stats.evictions += 1;
+        }
+        self.slots[victim] = Slot::Loading;
+        // Point the cell at the reserved slot so a duplicate `place` is detected rather than served.
+        self.index[c] = Some(victim as u32);
+        Ok((victim, true))
+    }
+
+    /// Publish a slot filled after [`Self::place`]. Until this runs the slot is not a valid entry.
+    pub fn commit(&mut self, slot: usize, layer: u32, expert: u32) -> Result<(), TierError> {
+        let c = self.cell(layer, expert)?;
+        if self.slots.get(slot) != Some(&Slot::Loading) {
+            return Err(TierError::Io(format!(
+                "commit on slot {slot}, which is not awaiting a fill — commit without a matching                  place would publish whatever bytes happen to be there")));
+        }
+        if self.index[c] != Some(slot as u32) {
+            return Err(TierError::Io(format!(
+                "commit of ({layer}, {expert}) into slot {slot}, which was reserved for something                  else — publishing here would give the slot a tag its contents do not match")));
+        }
+        self.slots[slot] = Slot::Holds { layer, expert };
+        self.last_used[slot] = self.clock;
+        self.stats.misses += 1;
+        self.stats.bytes_read += self.slot_bytes as u64;
+        Ok(())
+    }
+
+    /// Release a slot reserved by [`Self::place`] whose fill failed.
+    ///
+    /// ⚠ Without this a failed fetch strands a `Loading` slot forever — never a hit, never a victim —
+    /// so the cache silently shrinks by one every time a read fails.
+    pub fn abort(&mut self, slot: usize, layer: u32, expert: u32) -> Result<(), TierError> {
+        let c = self.cell(layer, expert)?;
+        if self.slots.get(slot) != Some(&Slot::Loading) {
+            return Err(TierError::Io(format!("abort on slot {slot}, which is not awaiting a fill")));
+        }
+        // ⛔ THE TAG MUST MATCH, for the same reason `commit` checks it. The first version freed the
+        // slot on ANY tag and only cleared the index when it happened to match — so aborting under
+        // the wrong expert emptied a slot while the RIGHT expert's cell still pointed at it. The
+        // next `place` for that expert then reported a hit on an Empty slot, i.e. served whatever
+        // bytes were there. Freeing is destructive, so it needs the same authority as publishing.
+        if self.index[c] != Some(slot as u32) {
+            return Err(TierError::Io(format!(
+                "abort of ({layer}, {expert}) on slot {slot}, which was reserved for something else \
+                 — freeing it would strand the reserving expert's index entry")));
+        }
+        self.index[c] = None;
+        self.slots[slot] = Slot::Empty;
+        Ok(())
+    }
+
     /// Victim selection: **lowest hotness wins; ties broken by oldest use.**
     ///
     /// Frequency-primary is the whole point — see the module docs on the 25.5-point Belady gap that pure
@@ -253,6 +343,85 @@ impl ExpertCache {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+
+    /// `place` must reuse the slot a resident expert already occupies, without evicting anything.
+    #[test]
+    fn placing_a_resident_expert_returns_its_slot_and_evicts_nothing() {
+        let mut c = ExpertCache::new(2, 8, 64, 5, 2).unwrap();
+        c.note_selected(0, &[3]);
+        let (slot, miss) = c.place(0, 3).unwrap();
+        assert!(miss, "first placement must be a miss");
+        c.commit(slot, 0, 3).unwrap();
+        let (again, miss2) = c.place(0, 3).unwrap();
+        assert_eq!(again, slot, "a resident expert moved slots");
+        assert!(!miss2, "a resident expert reported a miss");
+        assert_eq!(c.stats().evictions, 0);
+    }
+
+    /// ⛔ Until `commit`, the expert is NOT resident. A `place` that published immediately would
+    /// hand out a slot whose bytes the caller has not written yet — the tag and contents disagree,
+    /// which is exactly what `Slot::Loading` exists to prevent.
+    #[test]
+    fn an_uncommitted_placement_is_not_a_hit_and_is_not_a_victim() {
+        let mut c = ExpertCache::new(1, 8, 64, 3, 2).unwrap();
+        let (s0, _) = c.place(0, 1).unwrap();
+        // Same expert again: an error, not a second slot. Retrying a failed fetch must not leak.
+        assert!(c.place(0, 1).is_err(), "a duplicate place allocated a second slot");
+        // A different expert must not be given the reserved slot.
+        let (s1, _) = c.place(0, 2).unwrap();
+        assert_ne!(s1, s0, "a Loading slot was handed out as a victim");
+        c.commit(s1, 0, 2).unwrap();
+        // And the reserved slot is still not a valid entry.
+        assert!(c.place(0, 2).unwrap().0 == s1, "committed expert lost its slot");
+    }
+
+    /// A failed fill must give the slot back, or the cache shrinks by one on every failure.
+    #[test]
+    fn abort_returns_a_reserved_slot_to_the_pool() {
+        let mut c = ExpertCache::new(1, 8, 64, 3, 2).unwrap();
+        let (s, _) = c.place(0, 1).unwrap();
+        c.abort(s, 0, 1).unwrap();
+        // The slot is reusable, and the expert is not resident.
+        let (s2, miss) = c.place(0, 1).unwrap();
+        assert!(miss, "an aborted expert reported as resident");
+        assert_eq!(s2, s, "the aborted slot was not reused");
+    }
+
+    /// commit must refuse a slot nobody reserved, and refuse to publish under the wrong tag.
+    #[test]
+    fn commit_refuses_anything_it_did_not_reserve() {
+        let mut c = ExpertCache::new(1, 8, 64, 4, 2).unwrap();
+        assert!(c.commit(0, 0, 1).is_err(), "committed a slot with no matching place");
+        let (s, _) = c.place(0, 1).unwrap();
+        assert!(c.commit(s, 0, 7).is_err(), "published slot under an expert it was not reserved for");
+        // ⛔ THIS LINE WAS `assert!(... .is_err() || true)` — vacuous, and written precisely because
+        // I did not know the semantics. It hid a real bug: abort freed the slot on ANY tag while
+        // only clearing the index on a match, stranding the reserving expert's cell pointing at an
+        // Empty slot. When you are unsure what a call should do, that is the moment to decide, not
+        // to write an assertion that cannot fail.
+        assert!(c.abort(s, 0, 7).is_err(), "aborted a slot reserved for a different expert");
+        // And the reservation must have survived both refusals intact.
+        c.commit(s, 0, 1).unwrap();
+        assert_eq!(c.place(0, 1).unwrap(), (s, false), "the reservation did not survive the refusals");
+    }
+
+    /// `place` must honour the protected working set exactly as `get` does, or a step can evict an
+    /// expert it is still using — the failure `note_selected` exists to prevent.
+    #[test]
+    fn place_will_not_evict_this_steps_own_experts() {
+        let mut c = ExpertCache::new(1, 8, 64, 3, 2).unwrap();
+        c.note_selected(0, &[1, 2]);
+        let (a, _) = c.place(0, 1).unwrap(); c.commit(a, 0, 1).unwrap();
+        let (b, _) = c.place(0, 2).unwrap(); c.commit(b, 0, 2).unwrap();
+        // Third expert, capacity 3: fits. Fourth would have to evict a protected one.
+        let (d, _) = c.place(0, 3).unwrap(); c.commit(d, 0, 3).unwrap();
+        c.note_selected(0, &[1, 2]);
+        // Only slot `d` is unprotected, so it must be the victim.
+        let (v, miss) = c.place(0, 4).unwrap();
+        assert!(miss);
+        assert_eq!(v, d, "evicted a protected expert instead of the unprotected one");
+    }
 
     struct Synth { reads: RefCell<u64> }
     impl Synth {
