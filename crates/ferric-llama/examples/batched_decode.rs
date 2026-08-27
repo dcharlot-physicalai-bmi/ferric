@@ -63,13 +63,13 @@ async fn run() {
             let mut c = Cache::new(&m.cfg);
             let l = m.forward_cached(p, &mut c).to_vec().await;
             let mut tok = am(&l[l.len() - vn..]);
-            let mut gen = vec![tok];
+            let mut r#gen = vec![tok];
             for _ in 1..STEPS {
                 let l = m.forward_cached(&[tok], &mut c).to_vec().await;
                 tok = am(&l[l.len() - vn..]);
-                gen.push(tok);
+                r#gen.push(tok);
             }
-            ref_out.push(gen);
+            ref_out.push(r#gen);
         }
 
         // ---- batched: same sequences, one forward per step ----

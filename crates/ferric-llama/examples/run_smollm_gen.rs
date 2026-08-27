@@ -46,15 +46,15 @@ async fn run() {
     println!("prompt {prompt:?} → ids {ids:?}");
     assert_eq!(ids, vec![504, 3575, 282, 4649, 314], "tokenizer disagrees with HF");
 
-    let mut gen = Vec::new();
+    let mut r#gen = Vec::new();
     for _ in 0..8 {
         let logits = logits_last(&ctx, &g, &ids).to_vec().await;
         let last = &logits[(ids.len() - 1) * VOCAB..];
         let next = last.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
-        ids.push(next); gen.push(next);
+        ids.push(next); r#gen.push(next);
     }
     println!("generated ids {gen:?}");
-    assert_eq!(gen, vec![260, 3575, 282, 260, 1798, 30, 198, 198], "generation disagrees with numpy reference");
+    assert_eq!(r#gen, vec![260, 3575, 282, 260, 1798, 30, 198, 198], "generation disagrees with numpy reference");
     println!("  TEXT: {:?}", bpe.decode(&ids));
     println!("✅ Ferric GENERATES REAL TEXT from SmolLM2-135M — tokenizer matches HF, generation matches numpy");
 }

@@ -162,14 +162,14 @@ async fn run() {
             let mut c = Cache::new(&m.cfg);
             let l = m.forward(p, &mut c).to_vec().await;
             let mut tok = am(&l[l.len() - vn..]);
-            let (mut gen, mut lgs) = (vec![tok], Vec::new());
+            let (mut r#gen, mut lgs) = (vec![tok], Vec::new());
             for _ in 1..STEPS {
                 let l = m.forward(&[tok], &mut c).to_vec().await;
                 lgs.push(l[l.len() - vn..].to_vec());
                 tok = am(&l[l.len() - vn..]);
-                gen.push(tok);
+                r#gen.push(tok);
             }
-            solo_tok.push(gen);
+            solo_tok.push(r#gen);
             solo_lg.push(lgs);
         }
 

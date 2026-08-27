@@ -519,6 +519,45 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
     }))
 }
 
+
+/// **Routing observability** — an opt-in tap on the MoE router's top-k selection.
+///
+/// Colibri and FreeToken both build their expert-streaming policies on routing statistics, and
+/// neither exposes the routing itself. Without it "routing is N% predictable" is a number you can
+/// only quote; with it, it is a number you can check on your own checkpoint. That is the whole
+/// reason this exists.
+///
+/// ⚠ **It records the TENSOR, not its contents.** `moe_ffn` runs inside `ferric_tensor::batch`,
+/// which defers submission until the outermost closure returns (`lib.rs:1802`), so a `to_vec()`
+/// there would read a buffer whose writes have not been submitted. `Tensor` is `Clone` over an
+/// `Arc<wgpu::Buffer>`, so recording costs a refcount bump and keeps the buffer alive; the caller
+/// reads back AFTER the forward, where it is safe and where the sync is not on the hot path. The
+/// existing `FERRIC_LAYER_SUMS` hook makes the same choice by sitting outside the batch.
+///
+/// Layout of each recorded row is `moe_topk`'s: `[w_0..w_{k-1} | idx_0..idx_{k-1}]`, `[T, 2k]`,
+/// indices stored as f32 and exact for `n_expert <= 2^24`. So the ids are the SECOND half of a row.
+///
+/// ⚠ Entries are appended in call order, one per MoE-layer invocation. Not every layer is MoE, so
+/// position is NOT the layer index — the caller reconstructs it from its own list of MoE layers.
+pub mod route_trace {
+    use ferric_tensor::Tensor;
+    use std::sync::{Mutex, OnceLock};
+
+    static SINK: OnceLock<Mutex<Vec<Tensor>>> = OnceLock::new();
+    fn sink() -> &'static Mutex<Vec<Tensor>> { SINK.get_or_init(|| Mutex::new(Vec::new())) }
+
+    /// Gated on `FERRIC_ROUTE_TRACE`, so the traced and untraced paths differ by one env read.
+    pub fn enabled() -> bool { std::env::var("FERRIC_ROUTE_TRACE").is_ok() }
+
+    /// Record one MoE layer's `[T, 2k]` selection tensor. Cheap: an `Arc` clone.
+    pub fn record(t: Tensor) { if let Ok(mut g) = sink().lock() { g.push(t) } }
+
+    /// Drain everything recorded so far, in call order.
+    pub fn take() -> Vec<Tensor> {
+        sink().lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+    }
+}
+
 impl Qwen35 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
         let mut cfg = Cfg::from_gguf(g)?;
@@ -861,6 +900,7 @@ impl Qwen35 {
             // fixed ~17 ms/layer batch-splitting stall): logits [T, ne], token-major, which is also
             // the layout moe_topk's per-token thread scans contiguously.
             let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale); // [T, 2k]
+            if route_trace::enabled() { route_trace::record(selw.clone()); }
             let routed = match &m.experts {
                 MoeExperts::Slab { gate_up, down } => {
                     let mid = h.matmul_q4_k_swiglu_id(gate_up, &selw, k, self.cfg.expert_ff); // [T, k, eff]
@@ -882,6 +922,12 @@ impl Qwen35 {
             };
             return routed.add(&sh);
         }
+        // ⚠ The per-expert path is NOT traced. Recording only the slab path would make the trace
+        // look complete while silently omitting every layer stored per-expert — coverage that
+        // reads as coverage and is not. Refuse instead.
+        assert!(!route_trace::enabled(),
+                "FERRIC_ROUTE_TRACE is set but this layer uses the per-expert (non-slab) MoE path, \
+                 which has no tap. The trace would be silently incomplete, so it is refused.");
         let mut rows: Vec<Tensor> = Vec::with_capacity(t);
         for ti in 0..t {
             let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]

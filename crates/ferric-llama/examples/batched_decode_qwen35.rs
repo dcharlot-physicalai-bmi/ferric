@@ -101,17 +101,17 @@ async fn run() {
             let mut c = Cache::new(&m.cfg);
             let l = m.forward_cached(p, &mut c, n_layer).to_vec().await;
             let mut tok = am(&l[l.len() - vn..]);
-            let mut gen = vec![tok];
+            let mut r#gen = vec![tok];
             let mut rows: Vec<Vec<f32>> = Vec::new();
             let t0 = std::time::Instant::now();
             for _ in 1..steps {
                 let l = m.forward_cached(&[tok], &mut c, n_layer).to_vec().await;
                 rows.push(l[l.len() - vn..].to_vec());
                 tok = am(&l[l.len() - vn..]);
-                gen.push(tok);
+                r#gen.push(tok);
             }
             t_solo += t0.elapsed().as_secs_f64();
-            ref_out.push(gen);
+            ref_out.push(r#gen);
             ref_logits.push(rows);
         }
 

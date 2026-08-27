@@ -31,7 +31,7 @@ async fn run() {
     let mut kcache = vec![Vec::<f32>::new(); NL];
     let mut vcache = vec![Vec::<f32>::new(); NL];
     let mut seq = prompt_ids.clone();
-    let mut gen = Vec::new();
+    let mut r#gen = Vec::new();
     for pos in 0..prompt_ids.len() + steps - 1 {
         let tok = seq[pos];
         let mut x = get("model.embed_tokens.weight").gather_rows(&[tok]); // [1, D]
@@ -56,7 +56,7 @@ async fn run() {
         let x = x.rmsnorm(get("model.norm.weight"), EPS);
         let logits = nn::linear_hf(&x, get("model.embed_tokens.weight")).to_vec().await;
         let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
-        if pos + 1 >= prompt_ids.len() { gen.push(next); seq.push(next); }
+        if pos + 1 >= prompt_ids.len() { r#gen.push(next); seq.push(next); }
     }
     let kv_ms = t0.elapsed().as_secs_f64() * 1e3;
 
@@ -64,6 +64,6 @@ async fn run() {
     println!("  prompt {prompt:?} → generated ids {gen:?}");
     println!("  TEXT: {:?}", bpe.decode(&seq));
     println!("  {steps} tokens in {kv_ms:.0} ms (O(S)/step KV cache)");
-    assert_eq!(gen, vec![260, 3575, 282, 260, 1798, 30, 198, 198], "KV-cache generation disagrees with the validated full-recompute output");
+    assert_eq!(r#gen, vec![260, 3575, 282, 260, 1798, 30, 198, 198], "KV-cache generation disagrees with the validated full-recompute output");
     println!("✅ On-GPU KV-cache generation on a REAL model — same text as full recompute, O(S)/step");
 }

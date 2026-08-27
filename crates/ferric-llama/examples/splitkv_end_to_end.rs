@@ -69,12 +69,14 @@ async fn run() {
     // Warm every pipeline on BOTH paths before any clock starts, or the first arm pays for compiling
     // the other one's shaders. Cheap and easy to forget.
     for v in ["1", "4"] {
-        std::env::set_var("FERRIC_SPLITKV", v);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("FERRIC_SPLITKV", v) };
         let mut c = Cache::new(&m.cfg);
         let _ = m.forward_cached(&vec![100u32; CHUNK], &mut c).to_vec().await;
         let _ = m.forward_cached(&[200u32], &mut c).to_vec().await;
     }
-    std::env::remove_var("FERRIC_SPLITKV");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("FERRIC_SPLITKV") };
 
     println!("\n  {:>8} {:>10} {:>13} {:>13} {:>10} {:>12}",
              "context", "splits", "1 workgroup", "split-KV", "speedup", "attn share");
@@ -88,8 +90,10 @@ async fn run() {
 
         let mut bench = |force: Option<&str>| {
             match force {
-                Some(v) => std::env::set_var("FERRIC_SPLITKV", v),
-                None => std::env::remove_var("FERRIC_SPLITKV"),
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                Some(v) => unsafe { std::env::set_var("FERRIC_SPLITKV", v) },
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var("FERRIC_SPLITKV") },
             }
             async {
                 let mut best = f64::INFINITY;
@@ -119,7 +123,8 @@ async fn run() {
         println!("  {s:>8} {splits:>10} {off:>10.2} ms {on:>10.2} ms {:>9.2}x {:>11.1}%",
                  off / on, share.max(0.0));
     }
-    std::env::remove_var("FERRIC_SPLITKV");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("FERRIC_SPLITKV") };
 
     println!("\n  Expected shape: ~1.00x at 512 (below the gate, so both arms run the same kernel and");
     println!("  this row is a NULL CONTROL — a speedup here would mean the harness is measuring noise),");

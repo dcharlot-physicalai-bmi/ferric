@@ -83,13 +83,13 @@ async fn check(m: &Gemma4, prompts: &[Vec<u32>], steps: usize) -> (f32, f32) {
         let mut cache = Cache::new(&m.cfg);
         let l = prefill(m, p, &mut cache).await;
         let mut tok = argmax(&l);
-        let mut gen = vec![tok];
+        let mut r#gen = vec![tok];
         for _ in 1..steps {
             let l = m.forward(&[tok], &mut cache).to_vec().await;
             tok = argmax(&l);
-            gen.push(tok);
+            r#gen.push(tok);
         }
-        solo_out.push(gen);
+        solo_out.push(r#gen);
         solo_caches.push(cache);
     }
 

@@ -123,15 +123,15 @@ async fn run() {
             let mut cache = Cache::new(c);
             let l = m.forward(p, &mut cache).to_vec().await;
             let mut tok = am(&l[l.len() - vn..]);
-            let mut gen = vec![tok];
+            let mut r#gen = vec![tok];
             for _ in 1..STEPS {
                 let t0 = std::time::Instant::now();
                 let l = m.forward(&[tok], &mut cache).to_vec().await;
                 solo_ms += t0.elapsed().as_secs_f64() * 1000.0;
                 tok = am(&l[l.len() - vn..]);
-                gen.push(tok);
+                r#gen.push(tok);
             }
-            solo.push(gen);
+            solo.push(r#gen);
         }
 
         // ---- batched: the same sequences, one forward per step ----
