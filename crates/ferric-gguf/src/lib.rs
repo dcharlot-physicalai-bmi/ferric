@@ -13,6 +13,7 @@ use std::collections::HashMap;
 // ---- ggml tensor type codes we handle ----
 pub mod backed;
 pub mod imatrix;
+pub mod quantize;
 pub mod quantplan;
 
 const F32: u32 = 0;
@@ -23,6 +24,8 @@ const Q4_1: u32 = 3; // 4-bit affine: value = nibble·d + m (f16 d, f16 min per 
 const Q5_0: u32 = 6; // 5-bit symmetric: value = ((nibble | 5th-bit) − 16)·d (f16 d, u32 qh per 32-block)
 const Q5_1: u32 = 7; // 5-bit affine: value = (nibble | 5th-bit)·d + m (f16 d, f16 min, u32 qh per 32-block)
 const Q8_0: u32 = 8;
+const Q2_K: u32 = 10; // 2-bit K-quant: 16 sub-blocks of 16, 4-bit scale AND 4-bit min per sub-block
+const Q3_K: u32 = 11; // 3-bit K-quant: 16 sub-blocks of 16, 6-bit scales packed across 12 bytes
 const Q4_K: u32 = 12;
 const Q5_K: u32 = 13;
 const Q6_K: u32 = 14;
@@ -478,6 +481,8 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q4_1 => n / 32 * 20,
         Q5_0 => n / 32 * 22,
         Q5_1 => n / 32 * 24,
+        Q2_K => n / 256 * 84,
+        Q3_K => n / 256 * 110,
         Q4_K => n / 256 * 144,
         Q5_K => n / 256 * 176,
         Q6_K => n / 256 * 210,
@@ -504,6 +509,8 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q4_1 => deq_q4_1(raw, n),
         Q5_0 => deq_q5_0(raw, n),
         Q5_1 => deq_q5_1(raw, n),
+        Q2_K => deq_q2_k(raw, n),
+        Q3_K => deq_q3_k(raw, n),
         Q4_K => deq_q4_k(raw, n),
         Q5_K => deq_q5_k(raw, n),
         Q6_K => deq_q6_k(raw, n),
@@ -811,6 +818,101 @@ fn deq_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
             for l in 0..32 { out[y + l] = d1 * ((qs[q + l] & 0x0F) + if qh[l] & b1 != 0 { 16 } else { 0 }) as f32 - mm1; }
             for l in 0..32 { out[y + l + 32] = d2 * ((qs[q + l] >> 4) + if qh[l] & b2 != 0 { 16 } else { 0 }) as f32 - mm2; }
             y += 64; q += 32; is += 2;
+        }
+    }
+    out
+}
+
+/// **Q2_K** — 2 bits per weight, 84 bytes per 256 (2.625 bpw). Two f16 super-scales, `d` for the
+/// scale and `dmin` for the min, and SIXTEEN sub-blocks of 16 each carrying its own 4-bit scale and
+/// 4-bit min packed into one byte: `value = d·(sc & 0xF)·q − dmin·(sc >> 4)`.
+///
+/// ⚠ The `q` walk is NOT sequential and the byte order is the trap. Each of the 64 `qs` bytes holds
+/// four 2-bit quants, but they belong to four DIFFERENT sub-blocks: the shift selects the sub-block
+/// and the byte index selects the element within it. Reading `qs` straight through — the obvious
+/// translation — produces plausibly-scaled garbage rather than an error, so this mirrors
+/// `dequantize_row_q2_K`'s exact loop nesting instead of restructuring it.
+fn deq_q2_k(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(84).take(n / 256).enumerate() {
+        let sc = &blk[0..16];
+        let d = rd_f16(&blk[80..82]);
+        let dmin = rd_f16(&blk[82..84]);
+        let mut y = bi * 256;
+        let mut is = 0usize;
+        for half in 0..2 {
+            let q = &blk[16 + half * 32..16 + half * 32 + 32];
+            for j in 0..4 {
+                let shift = 2 * j;
+                for grp in 0..2 {
+                    let s = sc[is];
+                    is += 1;
+                    let (dl, ml) = (d * (s & 0xF) as f32, dmin * (s >> 4) as f32);
+                    for l in 0..16 {
+                        out[y] = dl * ((q[grp * 16 + l] >> shift) & 3) as f32 - ml;
+                        y += 1;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// **Q3_K** — 3 bits per weight, 110 bytes per 256 (3.4375 bpw). One f16 super-scale, 16 sub-blocks
+/// of 16, and the third bit of every quant held in a separate 32-byte `hmask` plane.
+///
+/// Two traps, both silent.
+///
+/// The high bit is INVERTED: `hmask` set means add nothing, hmask CLEAR subtracts 4. So the quant is
+/// `(qs & 3) − 4·(hmask bit == 0)`, giving the signed range −4..3. Reading it the intuitive way —
+/// set means add 4 — flips the sign of most weights and still produces finite, plausibly-scaled
+/// output. And `m` advances once per sub-block PAIR, not per element.
+///
+/// The 16 six-bit scales are packed across 12 bytes as four little-endian `u32`s, low 4 bits of each
+/// scale in the first eight bytes and the high 2 bits spread across the last four. Reconstructed
+/// exactly as the reference does it, then read back as sixteen bytes, biased by −32.
+fn deq_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(110).take(n / 256).enumerate() {
+        let hm = &blk[0..32];
+        let d_all = rd_f16(&blk[108..110]);
+
+        let mut aux = [0u32; 4];
+        for k in 0..3 {
+            aux[k] = u32::from_le_bytes([blk[96 + k * 4], blk[97 + k * 4], blk[98 + k * 4], blk[99 + k * 4]]);
+        }
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let mut scales = [0i8; 16];
+        for k in 0..4 {
+            for (b, v) in aux[k].to_le_bytes().iter().enumerate() { scales[k * 4 + b] = *v as i8; }
+        }
+
+        let mut y = bi * 256;
+        let mut is = 0usize;
+        let mut m = 1u8;
+        for half in 0..2 {
+            let q = &blk[32 + half * 32..32 + half * 32 + 32];
+            for j in 0..4 {
+                let shift = 2 * j;
+                for grp in 0..2 {
+                    let dl = d_all * (scales[is] as i32 - 32) as f32;
+                    is += 1;
+                    for l in 0..16 {
+                        let i = grp * 16 + l;
+                        let q3 = ((q[i] >> shift) & 3) as i32 - if hm[i] & m != 0 { 0 } else { 4 };
+                        out[y] = dl * q3 as f32;
+                        y += 1;
+                    }
+                }
+                m <<= 1;
+            }
         }
     }
     out
