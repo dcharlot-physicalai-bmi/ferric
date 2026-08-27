@@ -673,6 +673,51 @@ pub fn time_it<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     (out, t.elapsed())
 }
 
+/// **A median that refuses when its samples are too unstable to be a measurement.**
+///
+/// ⛔ This exists because I wrote the same guard three times and forgot it twice. `FabricProfile`
+/// has one for bandwidth samples; the mirror-striping measurement did not, published a direction,
+/// and two runs minutes apart disagreed on the SIGN; the readback-cost gate did not, and produced a
+/// 265x spread on a loaded machine. **A guard protects the code path it is wired into, never the
+/// class of mistake** — so the guard has to be the easy thing to reach for, not a thing to remember.
+///
+/// `max_spread` is max/min, not a standard deviation: timing distributions on a contended machine
+/// are not normal, and one 200x outlier is exactly the event that matters. A ratio sees it; a
+/// standard deviation buries it under n.
+///
+/// ⚠ Refuses on fewer than 3 samples too. A spread cannot be judged from two.
+pub fn stable_median(samples: &[f64], max_spread: f64, what: &str) -> Result<f64, String> {
+    if samples.len() < 3 {
+        return Err(format!("{what}: {} sample(s) — a spread cannot be judged from fewer than 3",
+                           samples.len()));
+    }
+    // ⛔ EVERY sample, checked BEFORE sorting. Checking only the extremes afterwards is what the
+    // first version did, and it let `[1.0, NaN, 1.0]` through: `partial_cmp` has no ordering for
+    // NaN, so `unwrap_or(Equal)` leaves it wherever it started — the MIDDLE — where `v[0]` and
+    // `v[len-1]` are both 1.0, the spread reads 1.00, and the returned median is NaN. A guard
+    // against bad measurements that emits NaN is worse than no guard, because it emits it with
+    // authority. Its own test caught this.
+    if let Some(bad) = samples.iter().find(|x| !x.is_finite()) {
+        return Err(format!("{what}: a sample is {bad}, which is not finite. NaN has no ordering, so \
+                            it sorts arbitrarily and hides in the middle where checking the extremes \
+                            cannot see it"));
+    }
+    let mut v: Vec<f64> = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).expect("all samples were checked finite above"));
+    let (lo, hi) = (v[0], v[v.len() - 1]);
+    if !(lo > 0.0) {
+        return Err(format!("{what}: minimum sample is {lo}, which is not a rate or a duration"));
+    }
+    let spread = hi / lo;
+    if spread > max_spread {
+        return Err(format!(
+            "{what}: spread {spread:.2}x (min {lo:.4}, max {hi:.4}) exceeds the {max_spread:.2}x \
+             this figure may be reported from. The median of samples that unstable is whatever else \
+             the machine was doing — re-measure when it is idle rather than widening the tolerance"));
+    }
+    Ok(v[v.len() / 2])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,4 +966,48 @@ mod boundary_tests {
         assert_eq!(M(Boundary::SYSTEM).boundary().label(), "accel+host+idle");
         assert_eq!(Nameplate::new(1.0).boundary(), Boundary::SYSTEM);
     }
+
+    /// The guard has to FIRE on real instability and NOT fire on ordinary jitter, or it is either
+    /// decorative or useless. Both directions, with the boundary pinned from each side.
+    ///
+    /// ⛔ Written first with the arithmetic wrong: `[1.00, 1.02, 0.99, 1.01, 1.00]` spreads
+    /// 1.02/0.99 = **1.030**, and the test asserted it should PASS at a 1.02 tolerance. The guard
+    /// refused, correctly, and the test was the thing that was broken. Spread is a RATIO of the
+    /// extremes — eyeballing the values is how you get this wrong.
+    #[test]
+    fn stable_median_refuses_exactly_the_samples_that_fooled_me() {
+        let steady = [1.00, 1.02, 0.99, 1.01, 1.00]; // spread 1.030
+        assert_eq!(stable_median(&steady, 1.5, "x").unwrap(), 1.00);
+        // The boundary, from both sides — a guard that only ever fires is not a guard.
+        assert!(stable_median(&steady, 1.05, "x").is_ok(), "1.030 refused at a 1.05 tolerance");
+        assert!(stable_median(&steady, 1.02, "x").is_err(), "1.030 accepted at a 1.02 tolerance");
+
+        // The real sample sets from this session, each with its ACTUAL spread computed rather than
+        // assumed, and a tolerance chosen to sit below it.
+        for (name, s, tol) in [
+            // ⚠ Striping's failure was BETWEEN runs (2.46 vs 7.58 GB/s minutes apart), which a
+            // within-run guard cannot see. These are its within-run samples, spread 3.08 — included
+            // to keep that distinction visible rather than to claim the guard would have caught it.
+            ("striping", vec![2.46, 7.58, 3.1, 6.9, 2.5], 2.0),
+            ("pcie", vec![0.1585, 1.224, 0.4, 0.9, 0.15], 4.0),        // 8.16
+            ("readback-warm", vec![0.485, 128.7, 0.5, 0.49, 0.6], 4.0), // 265.4
+        ] {
+            let e = stable_median(&s, tol, name).unwrap_err();
+            assert!(e.contains(name) && e.contains("spread"), "unhelpful refusal for {name}: {e}");
+        }
+        assert!(stable_median(&[1.0, 1.0], 1.5, "x").is_err(), "two samples cannot show a spread");
+        assert!(stable_median(&[0.0, 1.0, 1.0], 1.5, "x").is_err(), "a zero is not a rate");
+        // ⛔ THIS ONE FOUND A REAL BUG. NaN in the MIDDLE survived a check on the extremes: it
+        // sorts arbitrarily, both ends read 1.0, spread reads 1.00, and the median came back NaN.
+        // Every position, because the position is the whole point.
+        for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for pos in 0..3 {
+                let mut v = [1.0, 1.0, 1.0];
+                v[pos] = n;
+                let r = stable_median(&v, 1.5, "x");
+                assert!(r.is_err(), "{n} at position {pos} passed the guard: {r:?}");
+            }
+        }
+    }
+
 }
