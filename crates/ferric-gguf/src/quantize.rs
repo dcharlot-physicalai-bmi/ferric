@@ -238,7 +238,11 @@ mod tests {
         const KMASK1: u32 = 0x0303_0303;
         const KMASK2: u32 = 0x0f0f_0f0f;
         for seed in 0..64u8 {
-            let s: [u8; 16] = std::array::from_fn(|i| (i as u8 * 13 + seed * 7) % 64);
+            // Computed in u32: seed reaches 63 and 63 * 7 = 441, so the intermediate
+            // overflows u8 and panics in a debug build before the mod ever runs. The
+            // values wanted are the mod-64 ones, which u32 gives exactly.
+            let s: [u8; 16] =
+                std::array::from_fn(|i| ((i as u32 * 13 + seed as u32 * 7) % 64) as u8);
             let mut p = [0u8; 12];
             pack_q3_scales(&s, &mut p);
             let mut aux = [0u32; 4];
