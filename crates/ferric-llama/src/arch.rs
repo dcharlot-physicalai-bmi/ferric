@@ -53,6 +53,9 @@ pub enum Runtime {
     Bert,
     /// [`crate::nemotron_h`] — Mamba-2 state-space mixers with a few attention layers.
     NemotronH,
+    /// [`crate::parakeet`] — Conformer encoder + RNN-T decoder. SPEECH: waveform in, text out.
+    /// Not a generative text runtime; `ferric-serve` refuses it the way it refuses `Bert`.
+    Parakeet,
 }
 
 impl Runtime {
@@ -60,6 +63,7 @@ impl Runtime {
         match self {
             Runtime::Bert => "bert",
             Runtime::NemotronH => "nemotron_h",
+            Runtime::Parakeet => "parakeet",
             Runtime::Dense => "dense",
             Runtime::Hybrid => "hybrid",
             Runtime::Lfm2 => "lfm2",
@@ -136,6 +140,16 @@ pub const REGISTRY: &[Arch] = &[
                   the reference-checked stateless path stays and the cached one must reproduce it \
                   token for token, which it does. ⚠ conv state is the PRE-convolution signal, not the \
                   conv output; storing the output drifts plausibly instead of failing" },
+    // ---- speech ---------------------------------------------------------------------------
+    //
+    // Ferric's first non-text modality. Two of the top-40 most-downloaded GGUF repos share this
+    // arch (parakeet-unified-en-0.6b, nemotron-3.5-asr-streaming-0.6b) and neither could be loaded.
+    Arch { name: "parakeet", runtime: Runtime::Parakeet, status: Status::Verified,
+           note: "NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T. TRANSCRIBES — every \
+                  word correct on three LibriSpeech utterances (residual WER is punctuation the \
+                  references do not carry). Waveform in, text out: NOT a chat model, and \
+                  ferric-serve refuses it the way it refuses bert" },
+
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
                   cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
@@ -379,15 +393,35 @@ mod tests {
     }
 
     #[test]
-    fn every_runnable_architecture_names_a_runtime_that_exists() {
-        // Guards the registry against drifting from the code: a row pointing at a runtime that was
-        // renamed or removed would advertise support that cannot be dispatched.
+    fn every_runtime_declares_whether_it_generates_text() {
+        // ⚠ THIS TEST USED TO BE `assert!(true)`. Its match returned `true` from all eight arms, so
+        // `assert!(served)` could not fail — and it sat green while `nemotron_h` was Status::Verified
+        // and ferric-serve panicked "its forward pass is not written yet".
+        //
+        // What it CAN check from this crate (which cannot see ferric-serve) is that every runtime
+        // has a stated answer to "does this generate text from tokens?" — the property that decides
+        // whether a row belongs on a chat endpoint at all. The registry↔dispatch agreement itself is
+        // tested where it is visible, in ferric-serve's
+        // `every_verified_registry_row_can_actually_be_loaded`.
+        //
+        // The exhaustive match is the real guard: adding `Parakeet` made this a COMPILE ERROR rather
+        // than a silent pass, which is exactly how a new modality should arrive.
         for a in REGISTRY {
-            let served = match a.runtime {
-                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Cosmos | Runtime::Gemma4
-                    | Runtime::DeepSeek2 | Runtime::Bert | Runtime::NemotronH => true,
+            let generates_text = match a.runtime {
+                Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Gemma4
+                    | Runtime::DeepSeek2 | Runtime::NemotronH | Runtime::Cosmos => true,
+                // Encoder: embeddings and cross-encoder scores, no LM head.
+                Runtime::Bert => false,
+                // Speech: takes a WAVEFORM, not tokens.
+                Runtime::Parakeet => false,
             };
-            assert!(served, "{} names a runtime with no dispatch", a.name);
+            // A row that does not generate text must say so in its note, because every summary of
+            // this registry reads like a list of chat models otherwise.
+            if !generates_text {
+                let n = a.note.to_ascii_lowercase();
+                assert!(n.contains("refus") || n.contains("not a chat model") || n.contains("waveform"),
+                        "{} does not generate text but its note does not say so: {}", a.name, a.note);
+            }
         }
     }
 

@@ -64,6 +64,9 @@ impl Model {
             R::Bert => Err("a BERT encoder: no KV cache and no LM head, so it cannot serve chat or \
                             completions. Point FERRIC_RERANK_MODEL at it instead"),
             R::Cosmos => Err("loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
+            R::Parakeet => Err("a speech recogniser: it takes a WAVEFORM and returns text, and has \
+                                no KV cache, no LM head and no token input. Use the parakeet \
+                                examples; it cannot serve chat or completions"),
         }
     }
 
@@ -336,6 +339,8 @@ impl Engine {
                 Model::DeepSeek2(ferric_llama::deepseek2::DeepSeek2::load(&ctx, &g).unwrap_or_else(|e| panic!("load deepseek2: {e}"))),
             ferric_llama::arch::Runtime::Cosmos =>
                 unreachable!("Cosmos is refused by Model::dispatchable before this match"),
+            ferric_llama::arch::Runtime::Parakeet =>
+                unreachable!("Parakeet is refused by Model::dispatchable before this match"),
             // ⚠ This arm PANICKED with "its forward pass is not written yet" long after the forward
             // pass landed and the registry promoted the row to Status::Verified. The registry and the
             // dispatch are two lists that must agree and nothing made them; the note at arch.rs
@@ -1489,8 +1494,13 @@ mod batching_support {
             if let Err(why) = Model::dispatchable(a.runtime) {
                 // Non-generative runtimes are legitimately un-loadable HERE, but only the two that
                 // are non-generative by nature. Anything else is drift.
+                // The refusable set: runtimes that are non-generative BY NATURE. `Parakeet` joined
+                // it when speech landed — it takes a waveform, not tokens. Adding a runtime here
+                // must be a deliberate edit, which is the whole point: this test went red the moment
+                // parakeet was registered, rather than letting a third refusal in unnoticed.
                 assert!(matches!(a.runtime, ferric_llama::arch::Runtime::Bert
-                                          | ferric_llama::arch::Runtime::Cosmos),
+                                          | ferric_llama::arch::Runtime::Cosmos
+                                          | ferric_llama::arch::Runtime::Parakeet),
                         "{} is Status::Verified but this server refuses it: {why}", a.name);
             }
         }
@@ -1510,7 +1520,8 @@ mod batching_support {
         // Exactly the two non-generative runtimes, named — so ADDING a refusal is a test failure
         // rather than a silent loss of support.
         let mut expect: Vec<&str> = REGISTRY.iter()
-            .filter(|a| a.status.runnable() && matches!(a.runtime, Runtime::Bert | Runtime::Cosmos))
+            .filter(|a| a.status.runnable()
+                        && matches!(a.runtime, Runtime::Bert | Runtime::Cosmos | Runtime::Parakeet))
             .map(|a| a.name).collect();
         refused.sort(); expect.sort();
         assert_eq!(refused, expect,
