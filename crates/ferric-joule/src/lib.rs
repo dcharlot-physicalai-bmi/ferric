@@ -586,6 +586,384 @@ impl Meter for MacBattery {
     fn boundary(&self) -> Boundary { Boundary::SYSTEM }
 }
 
+/// What a [`Macmon`] reading encloses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacmonScope {
+    /// `cpu + gpu + ane + ram`: the SoC and its memory, which is what the computation actually
+    /// draws. Excludes display, peripherals and anything charging a battery.
+    Soc,
+    /// `sys_power`: the whole machine at the wall. On a laptop this includes the display and, while
+    /// plugged in, whatever current is going into the battery — which is not the computation and
+    /// does not belong in a per-token figure.
+    System,
+}
+
+/// Apple Silicon SoC power, read WITHOUT root through `macmon`.
+///
+/// This is the meter that made an energy figure possible on this hardware at all. The battery route
+/// ([`MacBattery`]) only works on battery, and `powermetrics` needs root; `macmon` reads the same
+/// counters sudoless, so a plugged-in machine can be measured.
+///
+/// ## Why this is `Derived` and not `Measured`
+///
+/// `macmon` reports instantaneous POWER, so joules come from integrating samples over time. This
+/// crate's existing line is exactly that: [`Rapl`] reads a cumulative ENERGY counter and is
+/// `Measured`; anything that samples watts and integrates is `Derived`, as `nvidia-smi` and the
+/// battery route already are. The number still comes from hardware sensors — what it inherits is
+/// sampling error, not modelling error.
+///
+/// ## What it does NOT isolate
+///
+/// **These counters are system-wide, not per-process.** Everything else running on the machine is
+/// inside the number. A figure attributed to one workload therefore needs an idle baseline measured
+/// on the same machine in the same thermal state, and even then it is an attribution rather than an
+/// isolation. [`Session`] and the caller must say so.
+pub struct Macmon {
+    scope: MacmonScope,
+    state: std::sync::Arc<std::sync::Mutex<MacmonState>>,
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+/// One `macmon` line, kept whole. The context fields are not decoration: a power figure is only
+/// reproducible if a reader can tell what state the machine was in, and the frequency columns are
+/// the ones that actually move when the machine is throttling.
+#[derive(Debug, Clone, Copy)]
+pub struct MacmonSample {
+    /// Seconds since the meter started, from the local clock at receipt.
+    pub t: f64,
+    pub cpu: f64,
+    pub gpu: f64,
+    pub ane: f64,
+    pub ram: f64,
+    pub sys: f64,
+    pub cpu_temp: f64,
+    pub gpu_temp: f64,
+    pub pcpu_mhz: f64,
+    pub ecpu_mhz: f64,
+    pub gpu_mhz: f64,
+    pub cpu_active: f64,
+}
+
+impl MacmonSample {
+    /// `cpu + gpu + ane + ram`.
+    ///
+    /// **Not `all_power`**, which is `cpu + gpu + ane` and excludes DRAM entirely. RAM is 7–9% of
+    /// the SoC total and rises for a bandwidth-bound kernel — and this crate's own arithmetic puts
+    /// the tokenizer at ~8 FLOP per weight byte against the 100–300 a modern part needs to be
+    /// compute-bound, so DRAM is a first-order term for exactly this workload.
+    pub fn soc(&self) -> f64 {
+        self.cpu + self.gpu + self.ane + self.ram
+    }
+}
+
+#[derive(Default)]
+struct MacmonState {
+    joules: f64,
+    watt_sum: f64,
+    last: Option<Instant>,
+    first: Option<Instant>,
+    all: Vec<MacmonSample>,
+}
+
+impl Macmon {
+    /// Start sampling. Returns `None` if `macmon` is not installed or produced no usable line
+    /// within a short window — never a meter that silently reports zero.
+    pub fn start(scope: MacmonScope, interval_ms: u64) -> Option<Self> {
+        let mut child = std::process::Command::new("macmon")
+            .args(["pipe", "-i", &interval_ms.to_string(), "-s", "0"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MacmonState::default()));
+        let worker = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Some(mut sample) = parse_sample(&line) else { continue };
+                let w = match scope {
+                    MacmonScope::Soc => sample.soc(),
+                    MacmonScope::System => sample.sys,
+                };
+                let now = Instant::now();
+                let Ok(mut st) = worker.lock() else { return };
+                // TRAPEZOID over the ACTUAL interval between samples, not the nominal one. The
+                // requested `-i` is not the delivered interval — a loaded machine runs late, and
+                // multiplying by the flag would count time at a power never observed. Trapezoid
+                // rather than a left sum because a rectangle systematically misses the ramp on
+                // every edge, and every edge biases the same direction so it never averages out.
+                if let Some(prev) = st.last {
+                    let dt = now.duration_since(prev).as_secs_f64();
+                    let prev_w = st.all.last().map(|s| match scope {
+                        MacmonScope::Soc => s.soc(),
+                        MacmonScope::System => s.sys,
+                    });
+                    st.joules += match prev_w {
+                        Some(p) => 0.5 * (p + w) * dt,
+                        None => w * dt,
+                    };
+                } else {
+                    st.first = Some(now);
+                }
+                sample.t = st.first.map(|f| now.duration_since(f).as_secs_f64()).unwrap_or(0.0);
+                st.last = Some(now);
+                st.watt_sum += w;
+                st.all.push(sample);
+            }
+        });
+        let me = Self {
+            scope,
+            state,
+            child: std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
+        };
+        // Wait for the meter to actually produce something. Checked up front so a benchmark fails
+        // at the start rather than producing an hour of nothing.
+        for _ in 0..40 {
+            if me.samples() > 0 {
+                return Some(me);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    /// Samples accumulated so far. **A joules figure over one or two samples is not a measurement**,
+    /// and the caller is expected to check this before reporting.
+    pub fn samples(&self) -> usize {
+        self.state.lock().map(|s| s.all.len()).unwrap_or(0)
+    }
+
+    /// Every sample so far, whole. Callers integrating a sub-window need these rather than the
+    /// running total, because a running total cannot be windowed after the fact.
+    pub fn trace(&self) -> Vec<MacmonSample> {
+        self.state.lock().map(|s| s.all.clone()).unwrap_or_default()
+    }
+
+    /// Energy over `[t0, t1]` seconds since start, trapezoid with INTERPOLATED EDGES.
+    ///
+    /// Returns `None` unless a sample exists strictly on each side of the window — truncating to
+    /// the interior samples instead loses a systematic few percent, in the same direction for every
+    /// arm, so it never averages out. Callers must therefore pad each measured block with a few
+    /// seconds of captured samples on both sides.
+    pub fn energy_over(&self, t0: f64, t1: f64) -> Option<f64> {
+        if t1 <= t0 {
+            return None;
+        }
+        let all = self.trace();
+        let w = |s: &MacmonSample| match self.scope {
+            MacmonScope::Soc => s.soc(),
+            MacmonScope::System => s.sys,
+        };
+        let before = all.iter().rposition(|s| s.t <= t0)?;
+        let after = all.iter().position(|s| s.t >= t1)?;
+        if after <= before {
+            return None;
+        }
+        let at = |t: f64| -> f64 {
+            let i = all.iter().rposition(|s| s.t <= t).unwrap_or(0);
+            let j = (i + 1).min(all.len() - 1);
+            if j == i || all[j].t <= all[i].t {
+                return w(&all[i]);
+            }
+            let f = (t - all[i].t) / (all[j].t - all[i].t);
+            w(&all[i]) + f * (w(&all[j]) - w(&all[i]))
+        };
+        let mut pts: Vec<(f64, f64)> = vec![(t0, at(t0))];
+        for s in &all[before + 1..after] {
+            pts.push((s.t, w(s)));
+        }
+        pts.push((t1, at(t1)));
+        Some(pts.windows(2).map(|p| 0.5 * (p[0].1 + p[1].1) * (p[1].0 - p[0].0)).sum())
+    }
+
+    /// Mean power over every sample seen, which is what makes a figure comparable across runs of
+    /// different length.
+    pub fn mean_watts(&self) -> Option<f64> {
+        let s = self.state.lock().ok()?;
+        (!s.all.is_empty()).then(|| s.watt_sum / s.all.len() as f64)
+    }
+
+    /// Seconds spanned by the integration window — the time actually accounted for, which is one
+    /// sample interval shorter than the process has been alive.
+    pub fn window_secs(&self) -> f64 {
+        let Ok(s) = self.state.lock() else { return 0.0 };
+        match (s.first, s.last) {
+            (Some(a), Some(b)) => b.duration_since(a).as_secs_f64(),
+            _ => 0.0,
+        }
+    }
+
+    pub fn scope(&self) -> MacmonScope {
+        self.scope
+    }
+
+    /// Stop the sampler. Also runs on drop, so a forgotten meter does not outlive its program.
+    pub fn stop(&self) {
+        if let Ok(mut c) = self.child.lock() {
+            if let Some(mut child) = c.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for Macmon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Pull one sample out of a `macmon pipe` JSON line.
+///
+/// Parsed by field name rather than with a JSON library because this crate carries no dependencies.
+/// **Each lookup includes the opening quote** — `"ram_power":` — which is what keeps it from
+/// matching inside `"gpu_ram_power":`, a collision that would silently add the wrong term and that
+/// nothing downstream would report.
+fn parse_sample(line: &str) -> Option<MacmonSample> {
+    let field = |k: &str| -> Option<f64> {
+        let pat = format!("\"{k}\":");
+        let i = line.find(&pat)? + pat.len();
+        let rest = &line[i..];
+        let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+        rest[..end].trim().parse().ok()
+    };
+    Some(MacmonSample {
+        t: 0.0,
+        cpu: field("cpu_power")?,
+        gpu: field("gpu_power")?,
+        ane: field("ane_power").unwrap_or(0.0),
+        ram: field("ram_power").unwrap_or(0.0),
+        sys: field("sys_power").unwrap_or(f64::NAN),
+        cpu_temp: field("cpu_temp_avg").unwrap_or(f64::NAN),
+        gpu_temp: field("gpu_temp_avg").unwrap_or(f64::NAN),
+        pcpu_mhz: field("pcpu_freq_mhz").unwrap_or(f64::NAN),
+        ecpu_mhz: field("ecpu_freq_mhz").unwrap_or(f64::NAN),
+        gpu_mhz: field("gpu_freq_mhz").unwrap_or(f64::NAN),
+        cpu_active: field("cpu_active_ratio").unwrap_or(f64::NAN),
+    })
+}
+
+impl Meter for Macmon {
+    fn read_joules(&self) -> Option<f64> {
+        let s = self.state.lock().ok()?;
+        (!s.all.is_empty()).then_some(s.joules)
+    }
+    fn class(&self) -> Class {
+        Class::Derived
+    }
+    fn source(&self) -> &'static str {
+        match self.scope {
+            MacmonScope::Soc => "macmon:soc",
+            MacmonScope::System => "macmon:system",
+        }
+    }
+    fn boundary(&self) -> Boundary {
+        match self.scope {
+            // The SoC is accelerator and host on the same die, with its memory. No facility term on
+            // a laptop, and no provisioned-idle term because there is no fleet.
+            MacmonScope::Soc => Boundary { accelerator: true, host: true, idle: false, facility: false },
+            MacmonScope::System => Boundary::SYSTEM,
+        }
+    }
+}
+
+/// One precondition on the machine, and whether it currently holds.
+#[derive(Debug, Clone)]
+pub struct Gate {
+    pub name: &'static str,
+    pub ok: bool,
+    /// What was actually read, so a failure names a number rather than a mood.
+    pub detail: String,
+    /// Why this gate exists — printed on failure, because a refused measurement is only useful if
+    /// the reader learns what to change.
+    pub because: &'static str,
+}
+
+/// Whether this machine is in a state where a power difference means anything.
+///
+/// **These are not caveats, they are admission criteria.** A joules-per-workload figure is a
+/// difference between two system-wide windows, and on a machine that is loaded, swapping, or
+/// running off its battery because the adapter cannot keep up, that difference is dominated by
+/// things that have nothing to do with the workload — routinely including a NEGATIVE marginal
+/// power, which is not a small number but a meaningless one.
+///
+/// Checked before and after every measured block. A failure makes the block void rather than
+/// caveated: [`Meter::read_joules`] returning `None` is this crate's whole position on the matter.
+pub fn power_gates() -> Vec<Gate> {
+    let read = |cmd: &str, args: &[&str]| -> String {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
+    let mut gates = Vec::new();
+
+    // Load average. A saturated machine schedules the workload against everything else, and the
+    // difference measures the contention rather than the work.
+    let la = read("sysctl", &["-n", "vm.loadavg"]);
+    let load1: f64 = la
+        .trim()
+        .trim_start_matches('{')
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(f64::NAN);
+    gates.push(Gate {
+        name: "load average (1 min)",
+        ok: load1 < 2.0,
+        detail: format!("{load1:.2}, gate < 2.0"),
+        because: "a saturated machine measures its own contention, not the workload",
+    });
+
+    // Swap. Paging is memory traffic that is not the workload's, and it moves DRAM power directly.
+    let su = read("sysctl", &["-n", "vm.swapusage"]);
+    let num = |k: &str| -> f64 {
+        su.split(k)
+            .nth(1)
+            .and_then(|r| r.trim().trim_start_matches('=').trim().split('M').next().map(str::trim).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(f64::NAN)
+    };
+    let (used, total) = (num("used"), num("total"));
+    let ratio = used / total;
+    gates.push(Gate {
+        name: "swap in use",
+        ok: ratio < 0.5,
+        detail: format!("{used:.0}M of {total:.0}M = {ratio:.2}, gate < 0.50"),
+        because: "paging is DRAM traffic that belongs to no workload and lands in ram_power",
+    });
+
+    // Battery current. Plugged in is not the same as mains-powered: an adapter smaller than the
+    // load leaves the battery financing the difference, and that term inverts sign the moment
+    // demand drops between blocks.
+    let io = read("ioreg", &["-rn", "AppleSmartBattery"]);
+    let amps: f64 = io
+        .lines()
+        .find(|l| l.contains("\"InstantAmperage\""))
+        .and_then(|l| l.split('=').nth(1))
+        .map(str::trim)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| if v > u64::MAX / 2 { v as i128 - (1i128 << 64) } else { v as i128 } as f64)
+        .unwrap_or(f64::NAN);
+    gates.push(Gate {
+        name: "battery current",
+        ok: amps.abs() < 100.0,
+        detail: format!("{amps:.0} mA, gate |I| < 100 mA"),
+        because: "an undersized adapter makes the battery finance the run, and that term changes sign between blocks",
+    });
+
+    gates
+}
+
+/// Whether every gate holds.
+pub fn machine_is_measurable() -> bool {
+    power_gates().iter().all(|g| g.ok)
+}
+
 /// Nameplate arithmetic. Present so that sizing work has something to use, and classed `Estimated` so
 /// it can never back a claim.
 ///
