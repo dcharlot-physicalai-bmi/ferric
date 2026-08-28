@@ -70,6 +70,52 @@ impl Cfg {
         let b = |k: &str, d: bool| -> bool {
             match md.get(k) { Some(Meta::Bool(v)) => *v, _ => d }
         };
+        // ⛔ REFUSE THE VARIANTS THIS FORWARD PASS DOES NOT IMPLEMENT.
+        //
+        // `general.architecture = "parakeet"` names a FAMILY, not a configuration.
+        // nemotron-3.5-asr-streaming-0.6b shares the arch string and differs in six ways at once —
+        // chunked-limited attention (left 56 / right 13, not full context), a CAUSAL depthwise conv
+        // (conv_context_right = 0, not symmetric), LayerNorm in the conv module instead of
+        // BatchNorm, no input scaling, no per-feature normalisation, and a prompt-conditioned
+        // multilingual head (13088 tokens, prompt.field = target_lang).
+        //
+        // Loading it anyway would produce a transcript. The wrong one. `arch::resolve` guards
+        // against near-miss ARCHITECTURES; nothing guarded against near-miss VARIANTS WITHIN one.
+        // ⚠ GUARD ON THE CONTEXT VALUES, NOT THE STYLE STRING. parakeet-unified ALSO declares
+        // `att_context_style = "chunked_limited_with_rc"` — with left = right = -1, meaning
+        // UNLIMITED, which is full attention and transcribes correctly. A first version refused on
+        // the style name and broke the model that already worked. The style names the SCHEME; the
+        // -1s say it is not actually limited.
+        let ctx_of = |k: &str| -> i64 {
+            match md.get(k) { Some(Meta::U(v)) => *v as i64, Some(Meta::I(v)) => *v, _ => -1 }
+        };
+        let (cl, cr_att) = (ctx_of("stt.parakeet.encoder.att_context_left"),
+                            ctx_of("stt.parakeet.encoder.att_context_right"));
+        if cl >= 0 || cr_att >= 0 {
+            let style = match md.get("stt.parakeet.encoder.att_context_style") {
+                Some(Meta::Str(v)) => v.clone(), _ => "chunked".into(),
+            };
+            return Err(format!("parakeet variant limits attention context (style {style:?}, \
+                left {cl}, right {cr_att}); this runtime implements FULL-CONTEXT offline \
+                attention only. Streaming models need the chunk mask and cache — unimplemented"));
+        }
+            let cr = match md.get("stt.parakeet.encoder.conv_context_right") {
+                Some(Meta::U(v)) => *v as i64, Some(Meta::I(v)) => *v, _ => -1,
+            };
+            let ck = match md.get("stt.parakeet.encoder.conv_kernel") { Some(Meta::U(v)) => *v as i64, _ => 0 };
+            if cr >= 0 && ck > 0 && cr != ck / 2 {
+                return Err(format!("conv_context_right is {cr} for kernel {ck}: this runtime \
+                    implements the SYMMETRIC depthwise conv (right = k/2 = {}) only", ck / 2));
+            }
+            if matches!(md.get("stt.parakeet.encoder.conv_norm_type"), Some(Meta::Str(v)) if v != "batch_norm") {
+                return Err("conv_norm_type is not batch_norm; this runtime folds BatchNorm's \
+                            running statistics and has no LayerNorm path in the conv module".into());
+            }
+            if md.get("stt.parakeet.prompt.field").is_some() {
+                return Err("prompt-conditioned (multilingual) parakeet: the decoder needs a \
+                            language prompt token this runtime does not supply".into());
+            }
+
         Ok(Cfg {
             sample_rate: u("stt.frontend.sample_rate")?,
             n_fft: u("stt.frontend.n_fft")?,
@@ -109,6 +155,13 @@ impl Linear {
     /// GGUF stores `[in, out]` with `in` fastest, so the row-major bytes ARE `[out, in]` — which is
     /// the layout `matmul_bt` wants. Getting this backwards transposes every projection and still
     /// produces finite numbers.
+    /// `bias` is a REQUEST, not an assertion: the tensor is used if present and skipped if not.
+    ///
+    /// ⚠ ANOTHER FALSE UNIVERSAL, this one mine. parakeet-unified carries `ff1.linear1.bias`;
+    /// nemotron-3.5-asr-streaming — SAME `general.architecture` — does not, and the reference makes
+    /// it `bias=config.attention_bias`, a per-checkpoint flag. Demanding it refused a second model
+    /// that the runtime otherwise handles completely. Presence is ground truth, like everywhere else
+    /// in this tree.
     fn load(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, bias: bool) -> Result<Linear, String> {
         let t = g.tensor(name).ok_or_else(|| format!("missing {name}"))?;
         // ⚠ POINTWISE CONVS ARE RANK 3. `conv.pointwise1.weight` is [1, 1024, 2048] — a Conv1d of
@@ -122,8 +175,8 @@ impl Linear {
                                      kernel-1 pointwise conv", t.dims.len(), t.dims)),
         };
         let w = Tensor::from_vec(ctx, &g.dequant(name)?, &[o, i]);
-        let b = if bias {
-            let bn = name.replace(".weight", ".bias");
+        let bn = name.replace(".weight", ".bias");
+        let b = if bias && g.tensor(&bn).is_some() {
             Some(Tensor::from_vec(ctx, &g.dequant(&bn)?, &[o]))
         } else { None };
         Ok(Linear { w, b })
@@ -196,6 +249,16 @@ impl Parakeet {
         let t1 = |n: &str, shape: &[usize]| -> Result<Tensor, String> {
             Ok(Tensor::from_vec(ctx, &g.dequant(n)?, shape))
         };
+        // An ABSENT bias is mathematically a ZERO bias, so optional-bias tensors load as zeros
+        // rather than as Option plumbing through the forward pass. Which biases exist varies BY
+        // CHECKPOINT within one architecture — parakeet-unified has ff/conv biases, and
+        // nemotron-3.5-asr-streaming (same general.architecture) does not.
+        let t1z = |n: &str, shape: &[usize]| -> Result<Tensor, String> {
+            match g.tensor(n) {
+                Some(_) => Ok(Tensor::from_vec(ctx, &g.dequant(n)?, shape)),
+                None => Ok(Tensor::from_vec(ctx, &vec![0f32; shape.iter().product()], shape)),
+            }
+        };
 
         // pre_encode: the conv indices are NOT contiguous (0,2,3,5,6 — the gaps are activations in
         // the original nn.Sequential), so they are discovered rather than assumed.
@@ -206,7 +269,7 @@ impl Parakeet {
             let t = g.tensor(&wn).expect("checked");
             let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
             let o = dims[3];
-            pre_conv.push((t1(&wn, &dims)?, t1(&format!("enc.pre_encode.conv.{i}.bias"), &[o])?));
+            pre_conv.push((t1(&wn, &dims)?, t1z(&format!("enc.pre_encode.conv.{i}.bias"), &[o])?));
         }
         if pre_conv.is_empty() { return Err("no enc.pre_encode.conv.* tensors".into()); }
         let pre_out = Linear::load(ctx, g, "enc.pre_encode.out.weight", true)?;
@@ -235,7 +298,7 @@ impl Parakeet {
                     // [k, 1, d] as stored — kernel-major. Reshaping it to [d, k] here would have
                     // the right element COUNT and the wrong order, which no assert would catch.
                     dw_w: t1(&b("conv.depthwise.weight"), &[cfg.conv_kernel, 1, d])?,
-                    dw_b: t1(&b("conv.depthwise.bias"), &[d])?,
+                    dw_b: t1z(&b("conv.depthwise.bias"), &[d])?,
                     bn: BatchNorm {
                         w: t1(&b("conv.bn.weight"), &[d])?,
                         b: t1(&b("conv.bn.bias"), &[d])?,
