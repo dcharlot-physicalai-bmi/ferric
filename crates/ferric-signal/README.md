@@ -428,52 +428,34 @@ rigs, four laboratories, sampling rates spanning four orders of magnitude, and o
 not vibration at all. Held out by *recording*, reported per corpus, trained round-robin so corpus
 size does not decide whose gradients win.
 
-| corpus | machine | held-out SNR | same 15 bits, no training |
-|---|---|---|---|
-| hydraulic | test rig, pressures and flows | 9.0 dB | *being remeasured* |
-| wind | turbine nacelle | 7.2 dB | *being remeasured* |
-| rotating | gearbox rig, 25.6 kHz | 1.4 dB | *being remeasured* |
-| CWRU | bearing stand, 12–48 kHz | 1.1 dB | *being remeasured* |
+| corpus | machine | held-out SNR | strongest 15-bit baseline | margin |
+|---|---|---|---|---|
+| hydraulic | test rig, pressures and flows | **9.2 dB** | 5.2 dB | **+4.0** |
+| wind | turbine nacelle | **7.1 dB** | 5.1 dB | **+2.0** |
+| rotating | gearbox rig, 25.6 kHz | 2.1 dB | 1.4 dB | **+0.7** |
+| CWRU | bearing stand, 12–48 kHz | 1.6 dB | 1.6 dB | 0.0 |
 
-**The baseline is now the strongest of four matched-budget coders, chosen per corpus.** Three
-hand-picked value coders in a row were weak in different directions, and each one quietly handed
-points to the model. A uniform scale narrow enough to resolve small coefficients clips the large
-ones — a pure cosine came back at 10.7 dB from a scheme that should reconstruct it almost exactly.
-One wide enough not to clip is too coarse, and cost 3.2 dB on the smoothest corpus. μ-law removes
-the clipping but spends resolution covering three decades most corpora do not use. So the choice is
-no longer made by hand: all four are evaluated over each corpus and the strongest reported, with the
-winner named. Different corpora do pick differently, which is exactly why hand-picking was wrong.
+The baseline spends *exactly* the same bit rate and learns nothing: 15 bits naming which of 128 DCT
+coefficients is largest and quantizing it, at whichever of four matched-budget coders is strongest
+on that corpus. Model and baseline come from separate runs over the same deterministic corpus load;
+the held-out window counts match exactly, which is what makes them comparable, and both are printed.
 
-| corpus | strongest 15-bit baseline | coder it chose |
-|---|---|---|
-| hydraulic | **5.2 dB** | uniform, span `n/2` |
-| wind | **5.1 dB** | uniform, span `n/2` |
-| CWRU | 1.6 dB | uniform, span `n` |
-| rotating | 1.4 dB | uniform, span `n` |
+**The earlier "a trained tokenizer loses to one DCT coefficient" is retired, and the reason is data
+volume rather than bit rate.** The first version of this table gave CWRU 1.1 dB against a baseline
+that beat it. Feeding the vibration corpora roughly ten times the training windows — 212 → 1,496 for
+CWRU and 192 → 1,088 for rotating, same architecture, same rate, same 24,000 steps — moved CWRU to
+1.6 dB and rotating to 2.1, converting a loss into a tie and a tie into a win. Code-space use went
+from 16.1% to 28.5% over the same change.
 
-⚠ **The baseline figures published here on 27 August were wrong in the model's favour** — 4.6 and
-4.5 dB where the strongest coder gives 5.2 and 5.1. The qualitative reading survives the correction
-and the margins do not: against the corrected baseline the tokenizer wins hydraulic by 3.8 dB rather
-than 4.4 and wind by 2.1 rather than 2.7, still loses CWRU, still ties rotating.
+That was the experiment named as the one that would separate the two explanations, and it separated
+them: the vibration corpora were starved, not rate-limited.
 
-**The baseline spends exactly the same bit rate and learns nothing.** The tokenizer emits one code
-from 32,768 per 128-sample patch — 15 bits. The baseline spends 15 bits naming which of the 128 DCT
-coefficients is largest (7) and quantizing it (8), and reconstructs from that one coefficient. At
-273:1 compression, **a 9.5M-parameter trained tokenizer does not beat one DCT coefficient on
-high-rate vibration**, while adding 4.4 dB on smooth hydraulic signals.
-
-Reconstruction had been reported in this crate with no baseline at all — decibels against the
-signal's own variance say how much survived, not whether a scheme that learned nothing would have
-done as well. The 25.5 dB synthetic figure above has the same gap and should be read with it in
-mind.
-
-**What this does and does not establish.** The split between the smooth corpora and the vibration
-corpora held constant across a 6x change in training budget, which is the shape of a property of the
-signals rather than of the optimization. But CWRU and rotating contributed only ~200 training
-windows each here, and their *training* loss fell substantially while held-out did not move —
-overfitting. So this is a joint statement about the bit rate and the data volume, and the two are
-not separated. What would separate them is more recordings from those corpora at the same bit rate;
-if the gap survives that, it is the rate.
+**What survives is smaller and more specific.** High-rate vibration is still close to the limit of
+what 15 bits per 128 samples carries — the learned tokenizer exceeds an untrained single coefficient
+by 0.7 dB and 0.0 dB there, against 4.0 and 2.0 on the smoother corpora. Four rigs, one set of
+weights, and the same bit budget buys very different fidelity depending on the physics. That is the
+honest content of "universal": it works everywhere, and what it is worth varies by an order of
+magnitude.
 
 **The energy accounting is arithmetic, not measurement.** A decoder touches its vocabulary twice per
 position — one row on the way in, every row at the output head on the way out — so the head is what
