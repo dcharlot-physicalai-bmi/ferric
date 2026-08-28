@@ -144,6 +144,13 @@ pub const REGISTRY: &[Arch] = &[
     //
     // Ferric's first non-text modality. Two of the top-40 most-downloaded GGUF repos share this
     // arch (parakeet-unified-en-0.6b, nemotron-3.5-asr-streaming-0.6b) and neither could be loaded.
+    // NVIDIA's own converter emits `asr`; the community one emits `parakeet`. Same architecture,
+    // different tensor names and key namespace — one `Naming` map holds every difference so this
+    // stays one runtime rather than two loaders.
+    Arch { name: "asr", runtime: Runtime::Parakeet, status: Status::Loads,
+           note: "NVIDIA NeMo ASR export (parakeet-ctc-1.1b): the same Conformer encoder with a CTC \
+                  head instead of RNN-T. Ships its own mel filterbank (preprocessor.fb) and \
+                  precomputed positional encoding. Waveform in, text out — NOT a chat model" },
     Arch { name: "parakeet", runtime: Runtime::Parakeet, status: Status::Verified,
            note: "NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T. TRANSCRIBES — every \
                   word correct on three LibriSpeech utterances (residual WER is punctuation the \

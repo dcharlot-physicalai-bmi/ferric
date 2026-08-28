@@ -56,13 +56,83 @@ pub struct Cfg {
     pub vocab: usize,
     /// The RNN-T blank id — `vocab - 1` on every published parakeet, but read, not assumed.
     pub blank_id: u32,
+    /// Which tensor-naming convention this file uses. The SAME architecture ships under two
+    /// converters: `parakeet` (handy-computer: `enc.blocks.N.ff1.linear1`) and `asr` (NVIDIA's own:
+    /// `encoder.layers.N.feed_forward1.linear1`). Names differ; the forward pass does not.
+    pub naming: Naming,
+    /// `ctc` files have no predictor or joint — one linear from encoder states to vocab.
+    pub ctc: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Naming { Parakeet, Asr }
+
+impl Naming {
+    /// Per-layer tensor name for a logical role. Keeping the map in ONE place is what stops the two
+    /// conventions from becoming two loaders.
+    pub fn t(self, il: usize, role: &str) -> String {
+        match self {
+            Naming::Parakeet => format!("enc.blocks.{il}.{role}"),
+            Naming::Asr => {
+                let r = match role {
+                    "norm_ff1" => "norm_feed_forward1", "norm_ff2" => "norm_feed_forward2",
+                    "norm_attn" => "norm_self_att",
+                    "ff1.linear1.weight" => "feed_forward1.linear1.weight",
+                    "ff1.linear2.weight" => "feed_forward1.linear2.weight",
+                    "ff2.linear1.weight" => "feed_forward2.linear1.weight",
+                    "ff2.linear2.weight" => "feed_forward2.linear2.weight",
+                    "conv.pointwise1.weight" => "conv.pointwise_conv1.weight",
+                    "conv.pointwise2.weight" => "conv.pointwise_conv2.weight",
+                    "conv.depthwise.weight" => "conv.depthwise_conv.weight",
+                    "conv.depthwise.bias" => "conv.depthwise_conv.bias",
+                    "conv.bn.weight" => "conv.batch_norm.weight",
+                    "conv.bn.bias" => "conv.batch_norm.bias",
+                    "conv.bn.running_mean" => "conv.batch_norm.running_mean",
+                    "conv.bn.running_var" => "conv.batch_norm.running_var",
+                    o if o.starts_with("attn.") => return format!("encoder.layers.{il}.self_{}", &o[..]),
+                    o => o,
+                };
+                format!("encoder.layers.{il}.{r}")
+            }
+        }
+    }
+    /// Non-layer tensors.
+    pub fn pre_conv(self, i: usize) -> String {
+        match self { Naming::Parakeet => format!("enc.pre_encode.conv.{i}"),
+                     Naming::Asr => format!("encoder.pre_encode.conv.{i}") }
+    }
+    pub fn pre_out(self) -> &'static str {
+        match self { Naming::Parakeet => "enc.pre_encode.out.weight",
+                     Naming::Asr => "encoder.pre_encode.out.weight" }
+    }
 }
 
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         let md = g.metadata();
+        // Two converters ship the same architecture. `asr` is NVIDIA's own (parakeet-ctc-1.1b),
+        // `parakeet` is the community one. They differ in key namespace AND tensor names.
+        let naming = match md.get("general.architecture") {
+            Some(Meta::Str(a)) if a == "asr" => Naming::Asr,
+            _ => Naming::Parakeet,
+        };
+        // Read a key from whichever namespace this file uses. `asr` also states the frontend in
+        // SECONDS (window_size 0.025) where `parakeet` states SAMPLES (win_length 400).
+        let alt = |parakeet: &str, asr: &str| -> Option<&Meta> {
+            md.get(if naming == Naming::Asr { asr } else { parakeet })
+        };
         let u = |k: &str| -> Result<usize, String> {
             match md.get(k) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {k}")) }
+        };
+        let ua = |pk: &str, ak: &str| -> Result<usize, String> {
+            match alt(pk, ak) { Some(Meta::U(v)) => Ok(*v as usize),
+                                _ => Err(format!("missing {}", if naming == Naming::Asr { ak } else { pk })) }
+        };
+        let fa = |pk: &str, ak: &str, d: f32| -> f32 {
+            match alt(pk, ak) { Some(Meta::F(v)) => *v as f32, _ => d }
+        };
+        let ba = |pk: &str, ak: &str, d: bool| -> bool {
+            match alt(pk, ak) { Some(Meta::Bool(v)) => *v, _ => d }
         };
         let f = |k: &str, d: f32| -> f32 {
             match md.get(k) { Some(Meta::F(v)) => *v as f32, _ => d }
@@ -116,28 +186,39 @@ impl Cfg {
                             language prompt token this runtime does not supply".into());
             }
 
+        let sample_rate = ua("stt.frontend.sample_rate", "asr.preprocessor.sample_rate")?;
+        // asr states window/stride in SECONDS; parakeet in SAMPLES. Convert once, here.
+        let (win_length, hop_length) = if naming == Naming::Asr {
+            ((fa("", "asr.preprocessor.window_size", 0.025) * sample_rate as f32).round() as usize,
+             (fa("", "asr.preprocessor.window_stride", 0.010) * sample_rate as f32).round() as usize)
+        } else {
+            (u("stt.frontend.win_length")?, u("stt.frontend.hop_length")?)
+        };
+        let ctc = matches!(md.get("asr.head_type"), Some(Meta::Str(h)) if h == "ctc");
+        // CTC files have no predictor/joint; those widths are unused and must not be required.
+        let (pred_hidden, pred_layers, joint_hidden) = if ctc { (0, 0, 0) } else {
+            (u("stt.parakeet.predictor.hidden")?, u("stt.parakeet.predictor.n_layers")?,
+             u("stt.parakeet.joint.hidden")?)
+        };
+        // asr.ctc.num_classes EXCLUDES the blank; the head emits num_classes + 1.
+        let vocab = if ctc { u("asr.ctc.num_classes")? + 1 } else { u("stt.parakeet.predictor.vocab")? };
         Ok(Cfg {
-            sample_rate: u("stt.frontend.sample_rate")?,
-            n_fft: u("stt.frontend.n_fft")?,
-            hop_length: u("stt.frontend.hop_length")?,
-            win_length: u("stt.frontend.win_length")?,
-            num_mels: u("stt.frontend.num_mels")?,
+            naming, ctc, sample_rate, win_length, hop_length,
+            n_fft: ua("stt.frontend.n_fft", "asr.preprocessor.n_fft")?,
+            num_mels: ua("stt.frontend.num_mels", "asr.preprocessor.features")?,
             f_min: f("stt.frontend.f_min", 0.0),
-            f_max: f("stt.frontend.f_max", 8000.0),
-            pre_emphasis: f("stt.frontend.pre_emphasis", 0.97),
-            n_layers: u("stt.parakeet.encoder.n_layers")?,
-            d_model: u("stt.parakeet.encoder.d_model")?,
-            n_heads: u("stt.parakeet.encoder.n_heads")?,
-            d_ff: u("stt.parakeet.encoder.d_ff")?,
-            conv_kernel: u("stt.parakeet.encoder.conv_kernel")?,
-            subsampling_factor: u("stt.parakeet.encoder.subsampling_factor")?,
-            subsampling_channels: u("stt.parakeet.encoder.subsampling_channels")?,
-            xscaling: b("stt.parakeet.encoder.xscaling", true),
-            pred_hidden: u("stt.parakeet.predictor.hidden")?,
-            pred_layers: u("stt.parakeet.predictor.n_layers")?,
-            joint_hidden: u("stt.parakeet.joint.hidden")?,
-            vocab: u("stt.parakeet.predictor.vocab")?,
-            blank_id: match md.get("tokenizer.ggml.blank_token_id") {
+            f_max: fa("stt.frontend.f_max", "", sample_rate as f32 / 2.0),
+            pre_emphasis: fa("stt.frontend.pre_emphasis", "asr.preprocessor.preemph", 0.97),
+            n_layers: ua("stt.parakeet.encoder.n_layers", "asr.encoder.n_layers")?,
+            d_model: ua("stt.parakeet.encoder.d_model", "asr.encoder.d_model")?,
+            n_heads: ua("stt.parakeet.encoder.n_heads", "asr.encoder.n_heads")?,
+            d_ff: ua("stt.parakeet.encoder.d_ff", "asr.encoder.d_ff")?,
+            conv_kernel: ua("stt.parakeet.encoder.conv_kernel", "asr.encoder.conv_kernel_size")?,
+            subsampling_factor: ua("stt.parakeet.encoder.subsampling_factor", "asr.encoder.subsampling_factor")?,
+            subsampling_channels: ua("stt.parakeet.encoder.subsampling_channels", "asr.encoder.subsampling_conv_channels")?,
+            xscaling: ba("stt.parakeet.encoder.xscaling", "asr.encoder.xscaling", true),
+            pred_hidden, pred_layers, joint_hidden, vocab,
+            blank_id: match alt("tokenizer.ggml.blank_token_id", "asr.ctc.blank_id") {
                 Some(Meta::U(v)) => *v as u32,
                 // ⚠ Not defaulted silently: the blank is what RNN-T decoding advances on, and
                 // guessing it wrong yields an empty or infinitely-repeating transcript.
@@ -237,8 +318,16 @@ pub struct Parakeet {
     pub pre_conv: Vec<(Tensor, Tensor)>,   // (weight [kh,kw,c,o], bias)
     pub pre_out: Linear,
     pub blocks: Vec<Block>,
-    pub pred: Predictor,
-    pub joint: Joint,
+    /// RNN-T head. `None` on CTC files, which have no autoregressive decoder at all.
+    pub rnnt: Option<(Predictor, Joint)>,
+    /// CTC head: one linear from encoder states to vocab+blank. NVIDIA ships it as a kernel-1
+    /// Conv1d (`decoder.decoder_layers.0`, dims [1, d, vocab]), which `Linear::load` reads as a
+    /// matmul — the same rank-3 case as the conv module's pointwise layers.
+    pub ctc_head: Option<Linear>,
+    /// The mel filterbank as SHIPPED (`preprocessor.fb`), when the file carries one. The `asr`
+    /// converter embeds it, which removes the Slaney-vs-HTK and area-normalisation guesswork
+    /// entirely — six frontend conventions I had to recover from a reference for the other format.
+    pub fb: Option<Vec<Vec<f32>>>,
     pub tokens: Vec<String>,
 }
 
@@ -264,19 +353,19 @@ impl Parakeet {
         // the original nn.Sequential), so they are discovered rather than assumed.
         let mut pre_conv = Vec::new();
         for i in 0..12 {
-            let wn = format!("enc.pre_encode.conv.{i}.weight");
+            let wn = format!("{}.weight", cfg.naming.pre_conv(i));
             if g.tensor(&wn).is_none() { continue; }
             let t = g.tensor(&wn).expect("checked");
             let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
             let o = dims[3];
-            pre_conv.push((t1(&wn, &dims)?, t1z(&format!("enc.pre_encode.conv.{i}.bias"), &[o])?));
+            pre_conv.push((t1(&wn, &dims)?, t1z(&format!("{}.bias", cfg.naming.pre_conv(i)), &[o])?));
         }
         if pre_conv.is_empty() { return Err("no enc.pre_encode.conv.* tensors".into()); }
-        let pre_out = Linear::load(ctx, g, "enc.pre_encode.out.weight", true)?;
+        let pre_out = Linear::load(ctx, g, cfg.naming.pre_out(), true)?;
 
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for il in 0..cfg.n_layers {
-            let b = |s: &str| format!("enc.blocks.{il}.{s}");
+            let b = |s: &str| cfg.naming.t(il, s);
             let hd = d / cfg.n_heads;
             blocks.push(Block {
                 norm_ff1: Norm::load(ctx, g, &b("norm_ff1"), d)?,
@@ -314,42 +403,59 @@ impl Parakeet {
             });
         }
 
-        let mut lstm = Vec::with_capacity(cfg.pred_layers);
-        for i in 0..cfg.pred_layers {
-            let h = cfg.pred_hidden;
-            lstm.push(LstmLayer {
-                wx: t1(&format!("pred.lstm.{i}.Wx"), &[4 * h, h])?,
-                wh: t1(&format!("pred.lstm.{i}.Wh"), &[4 * h, h])?,
-                b:  t1(&format!("pred.lstm.{i}.bias"), &[4 * h])?,
-            });
-        }
-        let pred = Predictor {
-            embed: t1("pred.embed.weight", &[cfg.vocab, cfg.pred_hidden])?,
-            lstm,
+        // RNN-T head, or none on a CTC file.
+        let rnnt = if cfg.ctc { None } else {
+            let mut lstm = Vec::with_capacity(cfg.pred_layers);
+            for i in 0..cfg.pred_layers {
+                let h = cfg.pred_hidden;
+                lstm.push(LstmLayer {
+                    wx: t1(&format!("pred.lstm.{i}.Wx"), &[4 * h, h])?,
+                    wh: t1(&format!("pred.lstm.{i}.Wh"), &[4 * h, h])?,
+                    b:  t1(&format!("pred.lstm.{i}.bias"), &[4 * h])?,
+                });
+            }
+            Some((Predictor { embed: t1("pred.embed.weight", &[cfg.vocab, cfg.pred_hidden])?, lstm },
+                  Joint {
+                      enc: Linear::load(ctx, g, "joint.enc.weight", true)?,
+                      pred: Linear::load(ctx, g, "joint.pred.weight", true)?,
+                      out: Linear::load(ctx, g, "joint.out.weight", true)?,
+                  }))
         };
-        let joint = Joint {
-            enc: Linear::load(ctx, g, "joint.enc.weight", true)?,
-            pred: Linear::load(ctx, g, "joint.pred.weight", true)?,
-            out: Linear::load(ctx, g, "joint.out.weight", true)?,
+        let ctc_head = if cfg.ctc {
+            Some(Linear::load(ctx, g, "decoder.decoder_layers.0.weight", true)?)
+        } else { None };
+        // The shipped filterbank, [n_bins, n_mels] on disk → [n_mels][n_bins] to match `filterbank`.
+        let fb = match g.tensor("preprocessor.fb") {
+            Some(t) => {
+                let (nb, nm) = (t.dims[0] as usize, t.dims[1] as usize);
+                let v = g.dequant("preprocessor.fb")?;
+                Some((0..nm).map(|m| (0..nb).map(|b| v[m * nb + b]).collect()).collect())
+            }
+            None => None,
         };
-        let tokens: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
+        let tokens: Vec<String> = match g.metadata().get(
+            if cfg.naming == Naming::Asr { "asr.tokenizer.vocab" } else { "tokenizer.ggml.tokens" }) {
             Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
             _ => return Err("missing tokenizer.ggml.tokens".into()),
         };
-        if tokens.len() != cfg.vocab {
-            return Err(format!("{} tokens but predictor.vocab is {}", tokens.len(), cfg.vocab));
+        // CTC files list the vocab WITHOUT the blank; RNN-T files include it.
+        let want = if cfg.ctc { cfg.vocab - 1 } else { cfg.vocab };
+        if tokens.len() != want {
+            return Err(format!("{} tokens but the config implies {want}", tokens.len()));
         }
-        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, pred, joint, tokens })
+        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, rnnt, ctc_head, fb, tokens })
     }
 
     /// A load-time receipt. A schedule that silently collapsed shows up here rather than as a wrong
     /// transcript later — the same reason `nemotron_h::schedule` exists.
     pub fn describe(&self) -> String {
         format!("parakeet · {} conformer blocks · d_model {} · {} heads · d_ff {} · conv_k {} \
-                 · subsample {}x · {} mels @ {} Hz · RNN-T {}L LSTM h{} · joint h{} · vocab {} (blank {})",
+                 · subsample {}x · {} mels @ {} Hz · {} {}L LSTM h{} · joint h{} · vocab {} (blank {})",
                 self.blocks.len(), self.cfg.d_model, self.cfg.n_heads, self.cfg.d_ff,
                 self.cfg.conv_kernel, self.cfg.subsampling_factor, self.cfg.num_mels,
-                self.cfg.sample_rate, self.pred.lstm.len(), self.cfg.pred_hidden,
+                if self.cfg.ctc { "CTC" } else { "RNN-T" },
+                self.cfg.sample_rate,
+                self.rnnt.as_ref().map_or(0, |(p, _)| p.lstm.len()), self.cfg.pred_hidden,
                 self.cfg.joint_hidden, self.cfg.vocab, self.cfg.blank_id)
     }
 }
@@ -857,24 +963,52 @@ impl Parakeet {
     /// blank would otherwise emit forever — a real failure mode when the blank id is wrong.
     pub fn transcribe(&self, pcm: &[f32]) -> Result<String, String> {
         let enc = self.encode(pcm)?;
+        if let Some(head) = &self.ctc_head { return self.decode_ctc(&enc, head); }
+        self.decode_rnnt(&enc)
+    }
+
+    /// **CTC greedy decode**: argmax per frame, collapse runs of the same id, drop blanks.
+    ///
+    /// The collapse is over CONSECUTIVE frames, not the whole sequence — a genuine repeated letter
+    /// is separated by a blank frame, which is exactly what the blank is for. Deduplicating
+    /// globally would turn "little" into "litle".
+    fn decode_ctc(&self, enc: &Tensor, head: &Linear) -> Result<String, String> {
+        let logits = head.apply(enc);
+        let v = pollster::block_on(logits.to_vec());
+        let (t, nv) = (enc.shape[0], self.cfg.vocab);
+        let mut out: Vec<u32> = Vec::new();
+        let mut prev = u32::MAX;
+        for i in 0..t {
+            let row = &v[i * nv..(i + 1) * nv];
+            let best = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            if best != prev && best != self.cfg.blank_id { out.push(best); }
+            prev = best;
+        }
+        Ok(out.iter()
+            .map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default().replace('▁', " "))
+            .collect::<String>().trim().to_string())
+    }
+
+    fn decode_rnnt(&self, enc: &Tensor) -> Result<String, String> {
+        let (pred_w, joint_w) = self.rnnt.as_ref().ok_or("no RNN-T head")?;
         let (t, d) = (enc.shape[0], self.cfg.d_model);
         let encv = pollster::block_on(enc.to_vec());
         let h = self.cfg.pred_hidden;
-        let nl = self.pred.lstm.len();
+        let nl = pred_w.lstm.len();
 
         // Predictor weights to host once — the LSTM is sequential and tiny beside the encoder.
-        let lw: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = self.pred.lstm.iter()
+        let lw: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = pred_w.lstm.iter()
             .map(|l| (pollster::block_on(l.wx.to_vec()),
                       pollster::block_on(l.wh.to_vec()),
                       pollster::block_on(l.b.to_vec())))
             .collect();
-        let emb = pollster::block_on(self.pred.embed.to_vec());
-        let (je_w, je_b) = (pollster::block_on(self.joint.enc.w.to_vec()),
-                            pollster::block_on(self.joint.enc.b.as_ref().unwrap().to_vec()));
-        let (jp_w, jp_b) = (pollster::block_on(self.joint.pred.w.to_vec()),
-                            pollster::block_on(self.joint.pred.b.as_ref().unwrap().to_vec()));
-        let (jo_w, jo_b) = (pollster::block_on(self.joint.out.w.to_vec()),
-                            pollster::block_on(self.joint.out.b.as_ref().unwrap().to_vec()));
+        let emb = pollster::block_on(pred_w.embed.to_vec());
+        let (je_w, je_b) = (pollster::block_on(joint_w.enc.w.to_vec()),
+                            pollster::block_on(joint_w.enc.b.as_ref().unwrap().to_vec()));
+        let (jp_w, jp_b) = (pollster::block_on(joint_w.pred.w.to_vec()),
+                            pollster::block_on(joint_w.pred.b.as_ref().unwrap().to_vec()));
+        let (jo_w, jo_b) = (pollster::block_on(joint_w.out.w.to_vec()),
+                            pollster::block_on(joint_w.out.b.as_ref().unwrap().to_vec()));
         let jh = self.cfg.joint_hidden;
 
         if std::env::var("FERRIC_ASR_DEBUG").is_ok() {
@@ -926,7 +1060,7 @@ impl Parakeet {
                     for li in 0..nl {
                         let (wx, wh, b) = &lw[li];
                         let (mut hh, mut cc) = (hs[li].clone(), cs[li].clone());
-                        self.lstm_step(&self.pred.lstm[li], &inp, &mut hh, &mut cc, wx, wh, b);
+                        self.lstm_step(&pred_w.lstm[li], &inp, &mut hh, &mut cc, wx, wh, b);
                         hs[li] = hh.clone(); cs[li] = cc; inp = hh;
                     }
                     pred_out = inp; refresh = false;
