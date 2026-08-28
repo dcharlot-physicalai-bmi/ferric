@@ -521,9 +521,33 @@ of the *window* it sat in. The same token costs **5.4x more at 8192 patches than
 "X joules per token" without the window is not a tight figure missing context; it is an
 underspecified one.
 
-**At short windows this is bandwidth-bound**, at 8.1 FLOP per weight byte against the ~100–300 a
-modern part needs to be compute-bound. On a sensor node the bill is reading the weights, not the
-arithmetic — so quantize the weights rather than optimising the math.
+**This is bandwidth-bound at every window, and the weight-only figure says otherwise by 847x.**
+The intensity quoted here was 8.1 FLOP per *weight* byte against the ~100–300 a modern part needs
+to be compute-bound. That figure omitted the attention score matrix, which `tower::attention_v`
+materializes three times per layer at `[n_heads, t, t]` and which is quadratic where the weights are
+flat:
+
+| window | FLOP per weight byte | FLOP per byte actually moved | score bytes ÷ weight bytes |
+|---|---|---|---|
+| 16 | 8.1 | **8.04** | 0.003 |
+| 256 | 145.5 | **79.7** | 0.83 |
+| 282 | 162.3 | **81.1** | 1.00 |
+| 512 | 326.3 | **75.8** | 3.3 |
+| 8192 | 22,141.4 | **26.1** | 846 |
+
+At 16 patches the two agree to 1%, which is why the published figure stands where it was quoted. At
+8192 the weight-only number says 22,141 FLOP per byte — comfortably compute-bound, and wrong by
+**847x**. The honest figure is 26.1, still far below the 100–300 threshold.
+
+**The honest intensity is not monotonic.** It peaks at about 81 FLOP per byte near a window of 282
+patches — exactly where score traffic overtakes weight traffic — and falls away in both directions,
+never reaching compute-bound anywhere. The weight-only figure rises without limit and would tell you
+to use the longest window available. That is the opposite of what the traffic does.
+
+So the original conclusion survives and its scope was wrong: on a sensor node the bill is bytes
+moved, at *every* window — but past a few hundred patches those bytes are the score matrix, not the
+weights, and quantizing weights stops helping. `TokenCost::flops_per_byte` is the figure to use;
+`flops_per_weight_byte` is kept, and now documents that it answers a narrower question.
 
 ## The receipt
 

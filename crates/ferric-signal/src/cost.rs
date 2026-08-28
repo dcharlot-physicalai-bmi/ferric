@@ -30,6 +30,10 @@ pub struct TokenCost {
     pub quadratic_macs: u64,
     /// Weight bytes read once per forward pass, at 4 bytes per parameter.
     pub weight_bytes: u64,
+    /// Bytes of attention score matrix materialized — quadratic in the window, and omitted from
+    /// [`TokenCost::weight_bytes`] entirely. This is the term whose absence made an arithmetic
+    /// intensity figure look constant when it is not.
+    pub activation_bytes: u64,
 }
 
 impl TokenCost {
@@ -46,6 +50,24 @@ impl TokenCost {
     ///
     /// At a short window this is negligible and a per-token figure is nearly honest. As it rises,
     /// a per-token figure quoted without its window becomes progressively more misleading.
+    /// Every byte the pass moves that this model accounts for: weights plus attention scores.
+    ///
+    /// The weights are read once per window; the scores are quadratic in it. Reporting only the
+    /// first is what makes an intensity figure look constant when it is not.
+    pub fn bytes_moved(&self) -> u64 {
+        self.weight_bytes + self.activation_bytes
+    }
+
+    /// Arithmetic intensity against ALL accounted traffic.
+    ///
+    /// This is the figure to compare against the 100-300 FLOP/byte a modern part needs to be
+    /// compute-bound. [`TokenCost::flops_per_weight_byte`] answers a narrower question and agrees
+    /// with this one only while the window is short.
+    pub fn flops_per_byte(&self) -> f64 {
+        let b = self.bytes_moved();
+        if b == 0 { f64::NAN } else { self.flops() as f64 / b as f64 }
+    }
+
     pub fn quadratic_share(&self) -> f64 {
         let t = self.linear_macs + self.quadratic_macs;
         if t == 0 { 0.0 } else { self.quadratic_macs as f64 / t as f64 }
@@ -53,6 +75,11 @@ impl TokenCost {
 
     /// Arithmetic intensity: FLOPs per byte of weights read. Below the hardware's ratio the pass is
     /// bandwidth-bound, which is where a small model on an edge part actually lives.
+    /// Arithmetic intensity against WEIGHT traffic only.
+    ///
+    /// **Only meaningful while the window is short.** It omits the attention score matrix, which is
+    /// quadratic in the window and overtakes the weights at about 282 patches for this
+    /// configuration. Use [`TokenCost::flops_per_byte`] for anything longer.
     pub fn flops_per_weight_byte(&self) -> f64 {
         if self.weight_bytes == 0 { f64::NAN } else { self.flops() as f64 / self.weight_bytes as f64 }
     }
@@ -77,11 +104,26 @@ impl EncoderConfig {
         // scores = Q·Kᵀ and probs·V, each t² · d per layer.
         let attn = 2 * t * t * d * l;
 
+        // THE ATTENTION SCORE MATRIX, WHICH THE WEIGHT FIGURE OMITS ENTIRELY.
+        //
+        // `tower::attention_v` materializes exactly three `[n_heads, t, t]` tensors per layer —
+        // the matmul output, the scaled copy, and the softmax output. The scale factor does NOT
+        // add a fourth: `broadcast_to` is a zero-stride view, checked rather than assumed.
+        //
+        // This matters because it is quadratic where the weights are constant, so the two cross
+        // over: below about 282 patches the weights dominate the traffic and above it the scores
+        // do, by a factor that keeps growing. An arithmetic-intensity figure computed against
+        // weights alone is therefore only meaningful at short windows, and is off by roughly 800x
+        // at 8192.
+        let heads = self.n_heads as u64;
+        let scores = 3 * heads * t * t * 4 * l;
+
         TokenCost {
             window,
             linear_macs: embed + qkv + out_proj + ffn + head,
             quadratic_macs: attn,
             weight_bytes: self.params().total() as u64 * 4,
+            activation_bytes: scores,
         }
     }
 }
@@ -319,4 +361,67 @@ impl EmbedCost {
 /// Cost of one trainable-embedding lookup over a sequence.
 pub fn embed_cost(seq_len: usize, rows: u32, d_model: usize) -> EmbedCost {
     EmbedCost { seq_len, rows, d_model }
+}
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+    use crate::EncoderConfig;
+
+    fn cfg() -> EncoderConfig {
+        EncoderConfig { patch_len: 16, d_model: 256, n_layers: 5, n_heads: 4, d_ff: 896, latent_dim: 5 }
+    }
+
+    /// The attention score matrix is QUADRATIC where the weights are constant, so the two cross
+    /// over. Below the crossover an intensity figure computed against weights alone is roughly
+    /// right; above it, it is wrong by a factor that keeps growing.
+    #[test]
+    fn attention_traffic_overtakes_weight_traffic_at_a_computable_window() {
+        let c = cfg();
+        let short = c.cost(16);
+        let long = c.cost(8192);
+        assert!(
+            short.activation_bytes < short.weight_bytes / 100,
+            "at 16 patches the scores should be noise: {} vs {}",
+            short.activation_bytes, short.weight_bytes
+        );
+        assert!(
+            long.activation_bytes > long.weight_bytes * 100,
+            "at 8192 the scores should dominate: {} vs {}",
+            long.activation_bytes, long.weight_bytes
+        );
+        // The crossover is where 3 * heads * t^2 * 4 * layers == params * 4, near 282 patches.
+        let below = c.cost(256);
+        let above = c.cost(512);
+        assert!(below.activation_bytes < below.weight_bytes);
+        assert!(above.activation_bytes > above.weight_bytes);
+    }
+
+    /// THE FIGURE THIS CRATE PUBLISHES. ~8 FLOP per weight byte is quoted as the reason the
+    /// tokenizer is bandwidth-bound. It holds at short windows and it is not the whole traffic —
+    /// against everything moved, the intensity is a different number, and the gap is the point.
+    #[test]
+    fn intensity_against_all_traffic_differs_from_intensity_against_weights_alone() {
+        let c = cfg();
+        let short = c.cost(16);
+        // At a short window the two agree closely, which is why the published figure stands there.
+        let ratio_short = short.flops_per_weight_byte() / short.flops_per_byte();
+        assert!(ratio_short < 1.02, "at 16 patches they should nearly agree, got {ratio_short:.3}");
+        // At a long window they do not.
+        let long = c.cost(8192);
+        let ratio_long = long.flops_per_weight_byte() / long.flops_per_byte();
+        assert!(ratio_long > 100.0, "at 8192 they should diverge hugely, got {ratio_long:.1}");
+        // And the honest figure stays far below the 100-300 a part needs to be compute-bound.
+        assert!(long.flops_per_byte() < 100.0);
+    }
+
+    /// Both traffic terms must be counted per PASS, and the pass reads its weights once however
+    /// long the window is — so weight bytes do not scale and score bytes scale with the square.
+    #[test]
+    fn weight_traffic_is_flat_in_the_window_and_score_traffic_is_quadratic() {
+        let c = cfg();
+        let a = c.cost(64);
+        let b = c.cost(128);
+        assert_eq!(a.weight_bytes, b.weight_bytes);
+        assert_eq!(b.activation_bytes, 4 * a.activation_bytes);
+    }
 }
