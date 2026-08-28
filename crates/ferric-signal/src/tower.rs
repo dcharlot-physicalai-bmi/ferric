@@ -692,6 +692,67 @@ pub fn forward_var(
 }
 
 impl DecoderWeights {
+    /// Flatten to named tensors for [`crate::Weights`], in `params_flat` order.
+    ///
+    /// **A training run could not save what it needed to reproduce its own reconstruction number
+    /// until this existed.** Only the encoder was serializable, so a published checkpoint could
+    /// tokenize but not reconstruct, and the SNR table beside it had to be taken on trust or
+    /// recomputed by retraining. Names are prefixed so an encoder and a decoder can share one file
+    /// without either being able to load the other's tensors by accident.
+    pub fn to_weights(&self) -> crate::Weights {
+        let mut w = crate::Weights::new();
+        let names = Self::tensor_names(self.cfg.n_layers);
+        for (n, t) in names.iter().zip(self.params_flat()) {
+            w.push(n.clone(), &t.shape, pollster::block_on(t.to_vec()));
+        }
+        w
+    }
+
+    /// The canonical name for every tensor, in `params_flat` order, under a `dec.` prefix.
+    pub fn tensor_names(n_layers: usize) -> Vec<String> {
+        let mut v = vec!["dec.latent_up".to_string()];
+        for l in 0..n_layers {
+            for part in ["attn_norm", "wq", "wk", "wv", "wo", "ffn_norm", "w_gate", "w_up", "w_down"] {
+                v.push(format!("dec.block.{l}.{part}"));
+            }
+        }
+        v.push("dec.out_norm".into());
+        v.push("dec.patch_head".into());
+        v
+    }
+
+    /// Rebuild from a loaded file, checking every shape against the configuration.
+    pub fn from_weights(
+        ctx: &Arc<Context>,
+        cfg: EncoderConfig,
+        w: &crate::Weights,
+    ) -> Result<Self, crate::StoreError> {
+        let d = cfg.d_model;
+        let g = |name: &str, want: &[usize]| w.tensor(ctx, name, want);
+        let mut blocks = Vec::with_capacity(cfg.n_layers);
+        for l in 0..cfg.n_layers {
+            let p = |s: &str| format!("dec.block.{l}.{s}");
+            blocks.push(Block {
+                attn_norm: g(&p("attn_norm"), &[d])?,
+                wq: g(&p("wq"), &[d, d])?,
+                wk: g(&p("wk"), &[d, d])?,
+                wv: g(&p("wv"), &[d, d])?,
+                wo: g(&p("wo"), &[d, d])?,
+                ffn_norm: g(&p("ffn_norm"), &[d])?,
+                w_gate: g(&p("w_gate"), &[cfg.d_ff, d])?,
+                w_up: g(&p("w_up"), &[cfg.d_ff, d])?,
+                w_down: g(&p("w_down"), &[d, cfg.d_ff])?,
+            });
+        }
+        Ok(Self {
+            cfg,
+            latent_up: g("dec.latent_up", &[d, cfg.latent_dim])?,
+            blocks,
+            out_norm: g("dec.out_norm", &[d])?,
+            patch_head: g("dec.patch_head", &[cfg.patch_len, d])?,
+        })
+    }
+
     /// Every parameter tensor in the order [`decoder_forward_var`] expects.
     pub fn params_flat(&self) -> Vec<Tensor> {
         let mut v = vec![self.latent_up.clone()];
@@ -896,5 +957,98 @@ mod var_tests {
         // One short must be refused rather than silently reinterpreted.
         assert!(forward_var(&ctx, cfg, &vars[..vars.len() - 1],
                             &Var::leaf(Tensor::from_vec(&ctx, &vec![0.0; 8], &[1, 8]))).is_err());
+    }
+}
+#[cfg(test)]
+mod decoder_store_tests {
+    use super::*;
+    use crate::EncoderConfig;
+
+    fn ctx() -> Option<Arc<Context>> {
+        match pollster::block_on(Context::new()) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                if std::env::var("FERRIC_NO_GPU").is_ok() {
+                    eprintln!("FERRIC_NO_GPU set; skipping deliberately ({e:?})");
+                    None
+                } else {
+                    panic!("no GPU context ({e:?}). Set FERRIC_NO_GPU=1 to waive this on purpose.");
+                }
+            }
+        }
+    }
+
+    fn cfg() -> EncoderConfig {
+        EncoderConfig { patch_len: 8, d_model: 16, n_layers: 2, n_heads: 4, d_ff: 32, latent_dim: 5 }
+    }
+
+    /// A DECODER MUST SURVIVE THE ROUND TRIP BIT-EXACTLY, or a published reconstruction figure is
+    /// not reproducible from the published file — which is the whole reason this exists.
+    #[test]
+    fn a_decoder_round_trips_through_the_file_format_bit_exactly() {
+        let Some(ctx) = ctx() else { return };
+        let c = cfg();
+        let dec = DecoderWeights::deterministic(&ctx, c, 4242).unwrap();
+        let bytes = dec.to_weights().to_bytes();
+        let back = DecoderWeights::from_weights(&ctx, c, &crate::Weights::from_bytes(&bytes).unwrap())
+            .unwrap();
+        for (a, b) in dec.params_flat().iter().zip(back.params_flat()) {
+            assert_eq!(
+                pollster::block_on(a.to_vec()),
+                pollster::block_on(b.to_vec()),
+                "a tensor changed across the round trip"
+            );
+        }
+    }
+
+    /// The two towers share a file, so their names must not collide — otherwise loading a decoder
+    /// could silently pick up encoder tensors of the same shape and reconstruct from the wrong
+    /// half of the model.
+    #[test]
+    fn encoder_and_decoder_names_never_collide() {
+        let enc: std::collections::HashSet<String> =
+            EncoderWeights::tensor_names(5).into_iter().collect();
+        let dec: std::collections::HashSet<String> =
+            DecoderWeights::tensor_names(5).into_iter().collect();
+        assert_eq!(enc.len(), 5 * 9 + 3);
+        assert_eq!(dec.len(), 5 * 9 + 3);
+        assert!(enc.is_disjoint(&dec), "{:?}", enc.intersection(&dec).collect::<Vec<_>>());
+    }
+
+    /// One file must be able to hold both and give each back unchanged.
+    #[test]
+    fn one_file_holds_both_towers_and_returns_each_intact() {
+        let Some(ctx) = ctx() else { return };
+        let c = cfg();
+        let enc = EncoderWeights::deterministic(&ctx, c, 1).unwrap();
+        let dec = DecoderWeights::deterministic(&ctx, c, 2).unwrap();
+        let mut w = enc.to_weights();
+        for (n, shape, data) in &dec.to_weights().tensors {
+            w.push(n.clone(), shape, data.clone());
+        }
+        let bytes = w.to_bytes();
+        let loaded = crate::Weights::from_bytes(&bytes).unwrap();
+        let e2 = EncoderWeights::from_weights(&ctx, c, &loaded).unwrap();
+        let d2 = DecoderWeights::from_weights(&ctx, c, &loaded).unwrap();
+        for (a, b) in enc.params_flat().iter().zip(e2.params_flat()) {
+            assert_eq!(pollster::block_on(a.to_vec()), pollster::block_on(b.to_vec()));
+        }
+        for (a, b) in dec.params_flat().iter().zip(d2.params_flat()) {
+            assert_eq!(pollster::block_on(a.to_vec()), pollster::block_on(b.to_vec()));
+        }
+    }
+
+    /// A decoder saved at one shape must be REFUSED at another, by name and shape, rather than
+    /// loaded into a configuration it does not fit.
+    #[test]
+    fn a_decoder_is_refused_when_the_configuration_does_not_match() {
+        let Some(ctx) = ctx() else { return };
+        let c = cfg();
+        let dec = DecoderWeights::deterministic(&ctx, c, 7).unwrap();
+        let w = dec.to_weights();
+        let wrong = EncoderConfig { d_model: 32, ..c };
+        assert!(DecoderWeights::from_weights(&ctx, wrong, &w).is_err());
+        let fewer = EncoderConfig { n_layers: 3, ..c };
+        assert!(DecoderWeights::from_weights(&ctx, fewer, &w).is_err());
     }
 }

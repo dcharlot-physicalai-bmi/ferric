@@ -397,9 +397,33 @@ fn main() {
         }
         println!("\n  {} of {} codes visited ({:.1}%)",
                  all.len(), q.codebook_size(), all.len() as f64 / q.codebook_size() as f64 * 100.0);
-        println!("  Reconstruction needs the decoder, which a tokenizer checkpoint does not carry:");
-        println!("  what is verified here is that the file loads, its shapes match, and it produces");
-        println!("  tokens. The published SNR is reproduced by rerunning the training command.\n");
+
+        // RECONSTRUCTION FROM THE FILE, if the file carries a decoder. This is what makes the
+        // published SNR table checkable by someone who did not run the training.
+        match DecoderWeights::from_weights(&ctx, cfg, &file) {
+            Ok(d) => {
+                let dvars: Vec<Var> = d.params_flat().into_iter().map(Var::leaf).collect();
+                println!("\n  RECONSTRUCTION FROM THIS FILE");
+                println!("  {:<12} {:>8} {:>12} {:>10} {:>12}",
+                         "corpus", "windows", "MSE", "SNR", "15-bit base");
+                println!("  {:-<12} {:->8} {:->12} {:->10} {:->12}", "", "", "", "", "");
+                for c in &corpora {
+                    let mut codes = HashSet::new();
+                    let (m, v) = recon(&ctx, cfg, &q, &enc, &dvars, &c.held, &mut codes);
+                    let snr = 10.0 * (v / m.max(1e-12)).log10();
+                    let (bm, _) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
+                    let bsnr = 10.0 * (v / bm.max(1e-12)).log10();
+                    println!("  {:<12} {:>8} {m:>12.5} {snr:>9.1}dB {bsnr:>11.1}dB",
+                             c.name, c.held.len());
+                }
+                println!();
+            }
+            Err(_) => {
+                println!("\n  This file carries no decoder, so reconstruction cannot be checked from");
+                println!("  it — only that it loads, its shapes match, and it produces tokens. The");
+                println!("  published SNR would have to be reproduced by rerunning training.\n");
+            }
+        }
         return;
     }
     let enc0 = EncoderWeights::deterministic(&ctx, cfg, 11).unwrap();
@@ -485,13 +509,27 @@ fn main() {
 
     // Round-trip the trained encoder through the on-disk format: the weights that tokenize are
     // then weights that could have been loaded from a file.
-    let names = EncoderWeights::tensor_names(cfg.n_layers);
-    let refs: Vec<(&str, &Tensor)> =
-        names.iter().map(|s| s.as_str()).zip(weights[..n_enc].iter()).collect();
+    // BOTH TOWERS GO IN THE FILE. Saving only the encoder means a published checkpoint can
+    // tokenize but not reconstruct, so the SNR table beside it has to be taken on trust or
+    // recomputed by retraining — a claim nobody can check that looks like one anybody can. The
+    // first release of this model shipped that way because the decoder was not serializable.
+    let enames = EncoderWeights::tensor_names(cfg.n_layers);
+    let dnames = DecoderWeights::tensor_names(cfg.n_layers);
+    let refs: Vec<(&str, &Tensor)> = enames
+        .iter()
+        .map(|s| s.as_str())
+        .zip(weights[..n_enc].iter())
+        .chain(dnames.iter().map(|s| s.as_str()).zip(weights[n_enc..].iter()))
+        .collect();
     let file = Weights::from_tensors(&refs);
     let digest = file.digest();
     let enc = EncoderWeights::from_weights(&ctx, cfg, &file).unwrap();
-    let dec: Vec<Var> = weights[n_enc..].iter().cloned().map(Var::leaf).collect();
+    let dec: Vec<Var> = DecoderWeights::from_weights(&ctx, cfg, &file)
+        .unwrap()
+        .params_flat()
+        .into_iter()
+        .map(Var::leaf)
+        .collect();
 
     // PER CORPUS, HELD OUT. One pooled number would let an easy corpus carry the hard ones, and
     // the whole claim a universal tokenizer makes is about the hard ones.
