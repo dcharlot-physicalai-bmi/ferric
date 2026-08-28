@@ -349,6 +349,59 @@ fn main() {
     };
     let ctx = Arc::new(ctx);
     let q = Fsq::signal_15bit();
+
+    // VERIFY A PUBLISHED CHECKPOINT REPRODUCES ITS PUBLISHED NUMBERS.
+    //
+    // A weights file that cannot be loaded, or that loads and tokenizes differently, is worse than
+    // no weights file: it is a claim nobody can check that looks like one anybody can. This loads
+    // the file, re-derives the digest from what came back, and re-tokenizes the held-out set — so
+    // the number in the table is a number the artifact produces, not one the training process
+    // remembered.
+    if let Some(path) = flag(&args, "--load") {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("error: {path}: {e}"); std::process::exit(1) }
+        };
+        let file = match Weights::from_bytes(&bytes) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("error: {path}: {e:?}"); std::process::exit(1) }
+        };
+        println!("\n  LOADED {path}");
+        println!("  {} bytes, digest {}", bytes.len(), file.digest());
+        let enc = match EncoderWeights::from_weights(&ctx, cfg, &file) {
+            Ok(e) => e,
+            Err(e) => { eprintln!("error: shapes do not match this configuration: {e:?}"); std::process::exit(1) }
+        };
+        println!("\n  {:<12} {:>8} {:>12} {:>12}", "corpus", "windows", "codes used", "distinct seq");
+        println!("  {:-<12} {:->8} {:->12} {:->12}", "", "", "", "");
+        let mut all: HashSet<u32> = HashSet::new();
+        for c in &corpora {
+            let mut codes: HashSet<u32> = HashSet::new();
+            let mut seqs: HashSet<Vec<u32>> = HashSet::new();
+            for b in &c.held {
+                let t = b.len() / PATCH;
+                let lat = pollster::block_on(
+                    enc.forward(&ctx, &Tensor::from_vec(&ctx, b, &[t, PATCH])).unwrap().to_vec(),
+                );
+                let seq: Vec<u32> = (0..t)
+                    .map(|i| {
+                        q.to_index(&q.quantize(&lat[i * cfg.latent_dim..(i + 1) * cfg.latent_dim]).unwrap())
+                            .unwrap()
+                    })
+                    .collect();
+                codes.extend(&seq);
+                all.extend(&seq);
+                seqs.insert(seq);
+            }
+            println!("  {:<12} {:>8} {:>12} {:>12}", c.name, c.held.len(), codes.len(), seqs.len());
+        }
+        println!("\n  {} of {} codes visited ({:.1}%)",
+                 all.len(), q.codebook_size(), all.len() as f64 / q.codebook_size() as f64 * 100.0);
+        println!("  Reconstruction needs the decoder, which a tokenizer checkpoint does not carry:");
+        println!("  what is verified here is that the file loads, its shapes match, and it produces");
+        println!("  tokens. The published SNR is reproduced by rerunning the training command.\n");
+        return;
+    }
     let enc0 = EncoderWeights::deterministic(&ctx, cfg, 11).unwrap();
     let dec0 = DecoderWeights::deterministic(&ctx, cfg, 11 ^ 0x5DEE).unwrap();
     let n_enc = enc0.params_flat().len();
