@@ -686,11 +686,14 @@ impl Parakeet {
         let mut padded = pollster::block_on(g.to_vec());
         padded.extend(std::iter::repeat(0.0).take(pad * d));
         let gp = Tensor::from_vec(&self.ctx, &padded, &[t + pad, d]);
-        // dw_w is [k, 1, d] as stored; the kernel wants [d, k]-major, so transpose explicitly.
+        // ⚠ NO TRANSPOSE. GGUF dims [9, 1, 1024] list ne0 FIRST and ne0 is the INNERMOST axis, so
+        // the data is already w[c * 9 + k] — the [C, L] layout `depthwise_conv1d_causal` wants. The
+        // first version read it as [K][C] and transposed, scrambling every one of the 1024 kernels
+        // into a mix of nine different channels' taps. Same element count, same shapes, no assert
+        // could fire — the model just convolved with noise.
         let dwv = pollster::block_on(c.dw_w.to_vec());
-        let mut wk = vec![0f32; d * k];
-        for kk in 0..k { for ci in 0..d { wk[ci * k + kk] = dwv[kk * d + ci]; } }
-        let wk = Tensor::from_vec(&self.ctx, &wk, &[d, k]);
+        debug_assert_eq!(dwv.len(), d * k, "depthwise weight is {} floats, expected {}", dwv.len(), d * k);
+        let wk = Tensor::from_vec(&self.ctx, &dwv, &[d, k]);
         let conv = gp.depthwise_conv1d_causal(&wk, k).narrow(0, pad, t).contiguous();
 
         // BatchNorm at inference is affine over the running statistics — no op needed.
