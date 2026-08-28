@@ -487,13 +487,15 @@ real-data protocol's presentation-order defect is documented above with the ladd
 
 ## What is NOT here
 
-**The published weights are a tokenizer, not a model.** The four-corpus tokenizer above is
-released as
+**The published weights reproduce their own table.** The four-corpus tokenizer above is released as
 [`ferric-signal-tokenizer-v0.1`](https://github.com/dcharlot-physicalai-bmi/ferric/releases/tag/ferric-signal-tokenizer-v0.1)
-— encoder only, 19 MB, digest `cbe7ae0e…`, verifiable with `--load`. **No decoder ships with it**,
-so the reconstruction table is reproduced by rerunning the training command rather than by loading
-the file, and no language model ships at all. Nothing here has been compared against a reference
-implementation's outputs, because no reference weights were located.
+— both towers, 38 MB, digest `2cd72ffc…`. `--load` rebuilds it, re-tokenizes the held-out set and
+reconstructs from it, returning every SNR above to the decimal beside the same matched-bit-rate
+baseline. Those are figures the artifact produces, not figures the training run remembered.
+
+**No language model ships.** The decoder in that file reconstructs a signal from tokens, which is
+what makes the SNR checkable; it does not produce words. And nothing here has been compared against
+a reference implementation's outputs, because no reference weights were located.
 
 **One corpus is not a claim about sensors in general.** Everything measured on real data comes from
 a single hydraulic test rig, five label axes, one split. The other corpora now open (see below) but
