@@ -421,8 +421,8 @@ have been scored as data.
 is what makes a silent partial decode impossible: a sensor channel that is wrong in its second half
 still tokenizes.
 
-**One tokenizer across four corpora, at the published size — and a baseline that reverses two of
-the four rows.** `examples/universal` trains a single encoder, FSQ bottleneck and decoder on four
+**One tokenizer across four corpora, at the published size, and
+[released](https://github.com/dcharlot-physicalai-bmi/ferric/releases/tag/ferric-signal-tokenizer-v0.1).** `examples/universal` trains a single encoder, FSQ bottleneck and decoder on four
 independent sensor corpora at once: **9,576,448 parameters, 0.8% from the published 9.5M**. Four
 rigs, four laboratories, sampling rates spanning four orders of magnitude, and one corpus that is
 not vibration at all. Held out by *recording*, reported per corpus, trained round-robin so corpus
@@ -487,10 +487,13 @@ real-data protocol's presentation-order defect is documented above with the ladd
 
 ## What is NOT here
 
-**There are no published weights.** The tokenizer trains on the hydraulic corpus inside
-`examples/hydraulic` and its digest is printed, but no checkpoint is shipped and the corpus is not
-redistributed here. Nothing has been compared against a reference implementation's outputs, because
-no reference weights were located.
+**The published weights are a tokenizer, not a model.** The four-corpus tokenizer above is
+released as
+[`ferric-signal-tokenizer-v0.1`](https://github.com/dcharlot-physicalai-bmi/ferric/releases/tag/ferric-signal-tokenizer-v0.1)
+— encoder only, 19 MB, digest `cbe7ae0e…`, verifiable with `--load`. **No decoder ships with it**,
+so the reconstruction table is reproduced by rerunning the training command rather than by loading
+the file, and no language model ships at all. Nothing here has been compared against a reference
+implementation's outputs, because no reference weights were located.
 
 **One corpus is not a claim about sensors in general.** Everything measured on real data comes from
 a single hydraulic test rig, five label axes, one split. The other corpora now open (see below) but
