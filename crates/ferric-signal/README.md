@@ -420,14 +420,32 @@ Controlling it — one rate only — is what the two columns below differ by:
 | diameter | 40.7% vs 34.3% majority, control +3.8 → 1.7× | 42.7% vs 41.7%, control +2.8 → **inside its control** |
 
 **The diameter result was substantially the confound.** It survives the mixed-rate run and does not
-survive the controlled one. Fault survives both and clears its control by 1.4× — present, and not
-by much.
+survive the controlled one.
 
-So against the rotating corpus's fault axis at 65.6% against a +2.0 control — **sixteen times its
-control** — CWRU separates neither axis convincingly once the rate is held fixed. **Three times the
-recordings bought a weaker signal, not a stronger one.** Recordings alone were not the binding
-constraint; the corpora differ in how separable their labels are from the shape of a vibration
-window, and CWRU asks a harder question with a trap in it.
+**A PATCH SHOULD BE MATCHED IN DURATION, NOT IN SAMPLES — and the fixed-sample patch above is the
+wrong choice.** Those figures use a 256-sample patch, which spans 21 ms at CWRU's 12 kHz against
+10 ms at the rotating corpus's 25.6 kHz. Matching the duration instead — a 128-sample patch, same
+100 patches per channel, same everything else — more than doubles both effects:
+
+| axis | 256-sample patch (21 ms) | 128-sample patch (10.7 ms) |
+|---|---|---|
+| fault | 32.0% vs 25.0%, control +0.8 → **+7.0** | 42.7% vs 25.0%, control −0.3 → **+17.7** |
+| diameter | 47.0% vs 41.7%, control −0.8 → **+5.3** | 54.5% vs 41.7%, control −1.8 → **+12.8** |
+
+So CWRU does separate both axes, and the earlier "neither axis convincingly" was a property of my
+configuration rather than of the corpus. It remains weaker than rotating's fault at +32.3, but
++17.7 against a control of −0.3 is not marginal.
+
+**The control refused this comparison before it allowed it.** At 288 held-out windows the two
+configurations scored +3.8 and +6.9 against controls of +2.8 and +7.3 — the second larger effect
+sat *inside* a larger noise floor, and the honest reading was that the experiment could not tell
+them apart. At 960 the controls fall to ±1 and the answer is unambiguous. Raw accuracy said
+"duration-matching is better" in both runs; only one of them was entitled to.
+
+That has a direct consequence for the four-corpus tokenizer above, which uses **one fixed
+sample-count patch across corpora sampling from 1 Hz to 74 kHz** — a decision documented there as
+deliberate and, on this evidence, costing it most on exactly the vibration corpora where it does
+worst.
 
 Rate control costs something and the run prints it: at 12 kHz the healthy class does not exist at
 all, so `fault` becomes five kinds of defect with no negative case. `--rate all` restores the
