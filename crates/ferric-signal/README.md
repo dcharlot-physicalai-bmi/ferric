@@ -360,6 +360,36 @@ does not. **The probe is not a weaker model that happens to win — it is the ri
 much data**, which is a statement about how much sensor-text pairing a sensor-language model needs
 rather than about this architecture.
 
+**A third registered prediction, also refuted — and the three together say something specific.**
+The probe is naive Bayes over counts, so the obvious remaining explanation was that the decoder
+never sees a pooled summary. `--pool` adds the mean of every signal embedding to each caption
+position: the summary a counting model works from, handed over directly. It did not help.
+
+| decoder, within recording | fault | torque | severity |
+|---|---|---|---|
+| baseline | **45.6% ± 2.3** | 34.3% ± 2.8 | 33.7% ± 1.8 |
+| `d_model` 128 | 24.4% ± 6.3 | 34.3% ± 1.7 | 31.9% ± 1.7 |
+| 3× the budget | 35.7% ± 2.3 | 37.8% ± 3.5 | 30.9% ± 2.3 |
+| mean-pooled | 38.7% ± 5.7 | 37.6% ± 3.9 | 34.1% ± 2.6 |
+
+Severity sits on its 33.3% majority in every row. Width collapses the decoder, budget overfits it,
+and pooling costs fault seven points while moving severity 0.4.
+
+**Why pooling failed is the useful part.** A mean over embeddings is not a count over codes. Naive
+Bayes carries a 6,534-dimensional histogram — one number per observed (channel, code) pair — and
+averaging 64-dimensional vectors destroys exactly the per-code identity it runs on. So the probe's
+advantage is a representation two orders of magnitude wider than the decoder's *that requires no
+training at all*, because counts are given rather than learned.
+
+That closes the line: **the gap is not reachable by architecture at this data volume.** A learned
+model has to acquire its pooling, a 6,534-dimensional pooling cannot be acquired from 360 examples,
+and the width that would represent it needs a budget that overfits 360 examples first. The three
+refutations are consistent and they point at the corpus rather than the design.
+
+The transferable form: **how much sensor-text pairing a sensor-language model needs is set by the
+dimensionality of the evidence, not by the size of the model.** That is a claim about this field
+rather than about this crate, and it came out of three predictions that were all wrong.
+
 **Torque at this size is inside its own control** — the probe's +9.5 over majority against a
 control of **+12.2**. It is not a result at 180 held-out examples. At 450 the same probe gives 51.3%
 with a control of +4.9 and it is one. The same axis, the same tokens, and the answer changes with
