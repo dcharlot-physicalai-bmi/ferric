@@ -52,7 +52,7 @@ open.
 | `mat` | MATLAB v5 reader, the format sensor corpora ship in | **717 channels across three corpora agree with `scipy.io` exactly**; no truncation yields content |
 | `inflate` | DEFLATE/zlib decompression | Streams compressed elsewhere, including the dynamic-Huffman branch; the Adler-32 trailer is checked |
 
-**157 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
+**170 tests**, fourteen of them mutation-controlled: each was verified to fail when the line it
 names is broken. Several silent defects were caught that way and are documented at the code that
 fixes them.
 
