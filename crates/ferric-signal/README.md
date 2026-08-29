@@ -405,17 +405,33 @@ Three axes: fault type (six classes, including outer-race defects at three clock
 are separate conditions and not a detail), fault diameter, and motor load — balanced 41/40/40/40,
 which makes load the across-operating-point split.
 
-| corpus | recordings | axis | probe | majority | control | effect ÷ control |
-|---|---|---|---|---|---|---|
-| rotating | 45 | fault | 65.6% | 33.3% | +2.0 | **16×** |
-| CWRU | 138 | fault | 30.7% | 25.7% | +3.1 | 1.6× |
-| CWRU | 138 | diameter | 40.7% | 34.3% | +3.8 | 1.7× |
+**⛔ Sample rate is confounded with the label in this corpus, and a fixed-sample window turns that
+into a leak.** 105 recordings are at 12 kHz and 56 at 48 kHz — and **every healthy recording is at
+48 kHz, none at 12**. A window of a fixed number of samples therefore spans 2.1 s or 0.5 s
+depending on the file, so a model can separate healthy from faulty by detecting the sampling rate
+and never look at a bearing. The other classes split roughly 70/30 across rates, so they leak
+partially too.
 
-Both CWRU axes clear their controls and neither clears them comfortably. **Three times the
-recordings bought a much weaker signal, not a stronger one** — so recordings alone were not the
-binding constraint for this question, and the corpora differ in how separable their labels are from
-the shape of a vibration window. CWRU asks a harder question: six classes where three differ only
-in where the defect sits relative to the load zone.
+Controlling it — one rate only — is what the two columns below differ by:
+
+| axis | mixed rates | rate-controlled (12 kHz) |
+|---|---|---|
+| fault | 30.7% vs 25.7% majority, control +3.1 → 1.6× | 28.8% vs 25.0%, control +2.8 → **1.4×** |
+| diameter | 40.7% vs 34.3% majority, control +3.8 → 1.7× | 42.7% vs 41.7%, control +2.8 → **inside its control** |
+
+**The diameter result was substantially the confound.** It survives the mixed-rate run and does not
+survive the controlled one. Fault survives both and clears its control by 1.4× — present, and not
+by much.
+
+So against the rotating corpus's fault axis at 65.6% against a +2.0 control — **sixteen times its
+control** — CWRU separates neither axis convincingly once the rate is held fixed. **Three times the
+recordings bought a weaker signal, not a stronger one.** Recordings alone were not the binding
+constraint; the corpora differ in how separable their labels are from the shape of a vibration
+window, and CWRU asks a harder question with a trap in it.
+
+Rate control costs something and the run prints it: at 12 kHz the healthy class does not exist at
+all, so `fault` becomes five kinds of defect with no negative case. `--rate all` restores the
+contaminated corpus for anyone who wants to see the difference for themselves.
 
 **A confound I introduced nearly turned that into a false negative.** The first CWRU run used a
 4,096-sample window, giving documents of 32 tokens against the rotating run's 400 — twelve times

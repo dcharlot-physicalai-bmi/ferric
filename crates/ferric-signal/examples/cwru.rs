@@ -55,6 +55,8 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 /// One recording's labels, decoded from the condition code the page gives it.
 #[derive(Debug, Clone)]
 struct Condition {
+    /// Sampling rate of the source page, in kHz. **Not a nuisance field.**
+    rate: u32,
     fault: usize,
     /// Thousandths of an inch; 0 for a healthy bearing.
     diameter: i32,
@@ -63,11 +65,11 @@ struct Condition {
 }
 
 /// `IR007_2`, `OR014@6_0`, `B021_1`, `Normal_3`.
-fn decode(code: &str) -> Option<Condition> {
+fn decode(code: &str, rate: u32) -> Option<Condition> {
     let (head, load) = code.rsplit_once('_')?;
     let load: i32 = load.parse().ok()?;
     if head == "Normal" {
-        return Some(Condition { fault: 0, diameter: 0, load });
+        return Some(Condition { rate, fault: 0, diameter: 0, load });
     }
     // Outer-race codes carry the defect's clock position relative to the load zone, which is a
     // different condition rather than a detail: the same defect presents differently at 3, 6 and
@@ -87,7 +89,7 @@ fn decode(code: &str) -> Option<Condition> {
         ("OR", Some("12")) => "OR@12",
         _ => return None,
     };
-    Some(Condition { fault: FAULTS.iter().position(|f| *f == name)?, diameter, load })
+    Some(Condition { rate, fault: FAULTS.iter().position(|f| *f == name)?, diameter, load })
 }
 
 /// Pull `(file number, condition code)` out of the corpus's own pages.
@@ -95,8 +97,8 @@ fn decode(code: &str) -> Option<Condition> {
 /// A cell is scanned for a `files/NNN.mat` link and its text taken as the condition. Tags are
 /// stripped rather than parsed: the structure being relied on is one link and one code per cell,
 /// which is far more stable than any particular markup.
-fn labels_from_pages(dir: &str) -> BTreeMap<u32, String> {
-    let mut out = BTreeMap::new();
+fn labels_from_pages(dir: &str) -> BTreeMap<u32, (String, String)> {
+    let mut out: BTreeMap<u32, (String, String)> = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
     let mut files: Vec<_> = rd
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -130,7 +132,8 @@ fn labels_from_pages(dir: &str) -> BTreeMap<u32, String> {
             }
             let code = text.replace('\u{a0}', " ").trim().to_string();
             if let Ok(n) = num.parse::<u32>() {
-                out.entry(n).or_insert(code);
+                let page = p.file_name().unwrap().to_string_lossy().to_string();
+                out.entry(n).or_insert((code, page));
             }
         }
     }
@@ -148,6 +151,11 @@ fn main() {
     let patch: usize = flag(&args, "--patch").and_then(|v| v.parse().ok()).unwrap_or(256);
     let by_load = flag(&args, "--split").as_deref() == Some("load");
 
+    let rate_filter: Option<u32> = match flag(&args, "--rate").as_deref() {
+        Some("all") => None,
+        Some("48k") => Some(48),
+        _ => Some(12),
+    };
     let codes = labels_from_pages(&pages);
     println!("\nCWRU BEARINGS  {} labelled recordings in the pages", codes.len());
 
@@ -168,7 +176,7 @@ fn main() {
         let stem = p.file_stem().unwrap().to_string_lossy().to_string();
         let Ok(n) = stem.parse::<u32>() else { continue };
         match codes.get(&n) {
-            Some(code) => match decode(code) {
+            Some((code, page)) => match decode(code, if page.contains("48k") || page.contains("normal") { 48 } else { 12 }) {
                 Some(c) => records.push((p.clone(), c)),
                 None => undecoded.push((n, code.clone())),
             },
@@ -176,6 +184,38 @@ fn main() {
         }
     }
     println!("  {} files on disk, {} matched to a label", mats.len(), records.len());
+
+    // ⛔ SAMPLE RATE IS CONFOUNDED WITH THE LABEL IN THIS CORPUS, and a fixed-sample window turns
+    // that into a leak. 105 recordings are at 12 kHz and 56 at 48 kHz, and **every healthy
+    // recording is at 48 kHz** — zero at 12. A window of a fixed number of SAMPLES therefore spans
+    // 2.1 s or 0.5 s depending on the file, so a model can separate healthy from faulty by
+    // detecting the rate and never look at a bearing. The other classes split roughly 70/30 across
+    // rates, so they leak partially too.
+    //
+    // The default is therefore ONE RATE, and what that costs is printed rather than hidden: at
+    // 12 kHz the healthy class does not exist at all, so the fault axis is five classes of defect
+    // with no negative case. `--rate all` restores the contaminated corpus for anyone who wants to
+    // see the difference.
+    let mut by_rate: BTreeMap<u32, usize> = BTreeMap::new();
+    for (_, c) in &records {
+        *by_rate.entry(c.rate).or_insert(0) += 1;
+    }
+    let healthy_by_rate: BTreeMap<u32, usize> =
+        records.iter().filter(|(_, c)| c.fault == 0).fold(BTreeMap::new(), |mut m, (_, c)| {
+            *m.entry(c.rate).or_insert(0) += 1;
+            m
+        });
+    println!("  by sample rate: {by_rate:?}, of which healthy: {healthy_by_rate:?}");
+    if let Some(r) = rate_filter {
+        let before = records.len();
+        records.retain(|(_, c)| c.rate == r);
+        println!("  RATE-CONTROLLED to {r} kHz: {} of {before} recordings kept", records.len());
+        if !records.iter().any(|(_, c)| c.fault == 0) {
+            println!("  no healthy recording exists at {r} kHz, so `fault` is five kinds of defect");
+        }
+    } else {
+        println!("  --rate all: MIXED RATES, and the healthy class is separable by rate alone");
+    }
     // A file with no label, or a label that will not decode, is reported rather than dropped
     // quietly: a corpus silently smaller than it looks is the failure this crate keeps meeting.
     if !unlabelled.is_empty() {
