@@ -396,6 +396,35 @@ with a control of +4.9 and it is one. The same axis, the same tokens, and the an
 the held-out size: which is the whole reason the control is printed beside the figure and never
 inferred from a previous run.
 
+**A third corpus, three times the recordings, and a much weaker signal.** The three refutations
+above point at labelled *recordings* as the binding constraint — windows from one recording are not
+independent of each other, recordings are — so `examples/cwru` ingests the CWRU bearing set, whose
+condition labels live in the HTML pages beside the data. **All 161 files resolve to a label with
+none left over**, parsed from the pages rather than transcribed, and 138 carry both accelerometers.
+Three axes: fault type (six classes, including outer-race defects at three clock positions, which
+are separate conditions and not a detail), fault diameter, and motor load — balanced 41/40/40/40,
+which makes load the across-operating-point split.
+
+| corpus | recordings | axis | probe | majority | control | effect ÷ control |
+|---|---|---|---|---|---|---|
+| rotating | 45 | fault | 65.6% | 33.3% | +2.0 | **16×** |
+| CWRU | 138 | fault | 30.7% | 25.7% | +3.1 | 1.6× |
+| CWRU | 138 | diameter | 40.7% | 34.3% | +3.8 | 1.7× |
+
+Both CWRU axes clear their controls and neither clears them comfortably. **Three times the
+recordings bought a much weaker signal, not a stronger one** — so recordings alone were not the
+binding constraint for this question, and the corpora differ in how separable their labels are from
+the shape of a vibration window. CWRU asks a harder question: six classes where three differ only
+in where the defect sits relative to the load zone.
+
+**A confound I introduced nearly turned that into a false negative.** The first CWRU run used a
+4,096-sample window, giving documents of 32 tokens against the rotating run's 400 — twelve times
+shorter, because the corpora are at different sample rates and I carried a default across. At that
+length fault scored 21.4% *below* its 25.7% majority and the honest report would have been "this
+corpus separates nothing". Matching the document length moved it to 30.7%, above majority, and
+code-space use from 11.7% to 23.7%. Comparing two corpora means matching what the model sees, not
+what the flags say.
+
 **Two traps in this corpus, both silent.** The 2 Nm unbalance recordings are spelled
 `Unbalalnce` — left alone that is a sixth fault class containing exactly one torque, so "fault
 type" and "torque" become partly the same question. And recordings are not the same length: 60 s
