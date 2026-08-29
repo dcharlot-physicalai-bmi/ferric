@@ -177,6 +177,49 @@ pub fn compact(
     (remapped, unk + 1, miss as f64 / total.max(1) as f64 * 100.0)
 }
 
+/// Add the MEAN of every signal embedding to each caption position.
+///
+/// ## The hypothesis this exists to test
+///
+/// The token probe in [`crate::bench`] is multinomial naive Bayes over counts, and on one corpus it
+/// reads an axis at 51.1% that the decoder cannot read at all — 33.7% against a 33.3% majority,
+/// *within recording*, where train and test share a machine. Neither doubling the decoder's width
+/// nor tripling its budget moved it. What is left is inductive bias: a counting model fits
+/// thousands of features from a few hundred examples because counting is what it does, and a
+/// causal decoder given three supervised words per 410-token document does not.
+///
+/// A mean over the signal embeddings is the pooled summary a counting model works from, handed to
+/// the decoder directly. Attention can compute an average, but it has to learn to; this supplies
+/// it. If the gap is inductive bias, this closes some of it. If it changes nothing, the
+/// explanation is somewhere else and that is worth knowing before more capacity is bought.
+///
+/// Implemented as one constant `[t, t]` matmul rather than a slice-and-concatenate, because the
+/// autograd layer has matmul and does not have row slicing — and because leaving the sequence
+/// length alone means no position shifts and no change to where the caption starts.
+fn pool_signal_into_caption(
+    ctx: &Arc<Context>,
+    emb: &Var,
+    target_from: usize,
+) -> Result<Var, CaptionError> {
+    let shape = emb.value().shape.clone();
+    let t = shape[0];
+    if target_from == 0 || target_from >= t {
+        return Ok(emb.clone());
+    }
+    let w = 1.0 / target_from as f32;
+    // Row i, column j is 1/n over the signal positions when i is a caption position, else zero.
+    // `m @ emb` is then the mean signal embedding on every caption row and zero elsewhere, so
+    // adding it leaves the signal rows untouched.
+    let mut m = vec![0.0f32; t * t];
+    for i in target_from..t {
+        for j in 0..target_from {
+            m[i * t + j] = w;
+        }
+    }
+    let m = Var::leaf(Tensor::from_vec(ctx, &m, &[t, t]));
+    Ok(emb.add(&m.matmul(emb)))
+}
+
 /// Train a signal-to-text decoder for one seed and score every axis on the held-out set.
 #[allow(clippy::too_many_arguments)]
 pub fn train_captions(
@@ -190,6 +233,7 @@ pub fn train_captions(
     batch: usize,
     lm_cfg: EncoderConfig,
     sequential: bool,
+    pool: bool,
     n_axes: usize,
     seed: u64,
 ) -> Result<SeedResult, CaptionError> {
@@ -242,6 +286,7 @@ pub fn train_captions(
             let e = build(i)?;
             let vars: Vec<Var> = params.iter().cloned().map(Var::leaf).collect();
             let emb = embed_var(ctx, &vars[0], &e.tokens)?;
+            let emb = if pool { pool_signal_into_caption(ctx, &emb, e.target_from)? } else { emb };
             let logits = lm_forward_var(ctx, cfg, &vars[1..], &emb)?;
             let loss = cross_entropy(ctx, &logits, &e.tokens, e.target_from, rows)?;
             loss.backward();
@@ -289,6 +334,7 @@ pub fn train_captions(
         for a in 0..n_axes {
             let upto = e.target_from + a;
             let emb = embed_var(ctx, &vars[0], &e.tokens[..upto])?;
+            let emb = if pool { pool_signal_into_caption(ctx, &emb, e.target_from)? } else { emb };
             let logits =
                 pollster::block_on(lm_forward_var(ctx, cfg, &vars[1..], &emb)?.value().to_vec());
             let last = (upto - 1) * rows as usize;

@@ -353,6 +353,7 @@ fn main() {
     let steps: usize = flag(&args, "--steps").and_then(|v| v.parse().ok()).unwrap_or(250);
     let batch: usize = flag(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(8);
     let seeds: usize = flag(&args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let pool = args.iter().any(|a| a == "--pool");
     let lm_dim: usize = flag(&args, "--lm-dim").and_then(|v| v.parse().ok()).unwrap_or(64);
     let lm_layers: usize = flag(&args, "--lm-layers").and_then(|v| v.parse().ok()).unwrap_or(2);
     let lm_cfg = EncoderConfig {
@@ -376,7 +377,7 @@ fn main() {
     let mut runs = Vec::new();
     for s in 0..seeds {
         let r = train_captions(
-            &ctx, &seq, &remapped, &caps, &train, &held, steps, batch, lm_cfg, false,
+            &ctx, &seq, &remapped, &caps, &train, &held, steps, batch, lm_cfg, false, pool,
             AXES.len(), 3 + s as u64 * 17,
         )
         .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });

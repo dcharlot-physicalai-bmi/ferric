@@ -558,7 +558,7 @@ fn main() {
         for s in 0..seeds {
             let r = train_captions(
                 &ctx, seq2, pc, &caps, &train_idx, &held_idx, steps, batch, lm_cfg, sequential,
-                LABELS.len(), 3 + s as u64 * 17,
+                false, LABELS.len(), 3 + s as u64 * 17,
             )
             .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
             println!("    seed {}: {}", 3 + s * 17,
