@@ -243,6 +243,13 @@ operating point it was never trained on. The torque axis is reported as *not ask
 split rather than scored, because its held-out class is absent from training — scoring it would
 produce a number that looks like a failure and is a question that was never posed.
 
+⚠ **`across recording` is a condition-wise split, and that is not the strongest test available.** It
+holds out an operating point while the same physically defective component sits in both halves at
+the other two torques — the exact form two published critiques identify as not constituting a domain
+shift. The retraction further down explains why, and it cost the CWRU results in this README their
+headline. **The rotating numbers survive it**: on `--split part`, which holds out the seeded bearing
+itself, fault reaches 73.1% against a 25.0% majority. Read that section before quoting 65.6%.
+
 At 180 held-out windows the same run gave fault +24.5 with a control of +0.0, and torque +9.5
 against a control of **+7.2** — a positive-looking axis that is not one. At 450 the controls fall
 to a few points and torque separates properly at +18. That is the control being worth its cost
