@@ -250,8 +250,37 @@ fn main() {
     };
     let ctx = Arc::new(ctx);
     let q = Fsq::new(vec![8u32; 5]).unwrap();
-    let cfg = EncoderConfig { patch_len: patch, d_model: 32, n_layers: 2, n_heads: 4, d_ff: 64, latent_dim: 5 };
-    let enc = EncoderWeights::deterministic(&ctx, cfg, 7).unwrap();
+    // DOES THE RELEASED TOKENIZER BEAT AN UNTRAINED ONE ON A DOWNSTREAM TASK?
+    //
+    // The four-corpus checkpoint is reported by reconstruction SNR, which is what it was trained
+    // for. Whether its tokens SEPARATE LABELS better than an untrained projection is a different
+    // question and the one a user actually has. `--tokenizer` loads it in place of the untrained
+    // encoder; everything else — windows, split, probe, control — is unchanged, so the two arms
+    // differ only in the weights.
+    let (cfg, enc) = match flag(&args, "--tokenizer") {
+        Some(path) => {
+            let c = EncoderConfig {
+                patch_len: patch, d_model: 256, n_layers: 5, n_heads: 4, d_ff: 896, latent_dim: 5,
+            };
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| { eprintln!("error: {path}: {e}"); std::process::exit(1) });
+            let w = ferric_signal::Weights::from_bytes(&bytes)
+                .unwrap_or_else(|e| { eprintln!("error: {path}: {e:?}"); std::process::exit(1) });
+            let e = EncoderWeights::from_weights(&ctx, c, &w).unwrap_or_else(|e| {
+                eprintln!("error: shapes do not match patch_len {patch}: {e:?}");
+                eprintln!("the released checkpoint was trained at patch 128");
+                std::process::exit(1)
+            });
+            println!("\n  TOKENIZER: {path}");
+            println!("  digest {} — {} parameters", w.digest(), c.params().total());
+            (c, e)
+        }
+        None => {
+            let c = EncoderConfig { patch_len: patch, d_model: 32, n_layers: 2, n_heads: 4, d_ff: 64, latent_dim: 5 };
+            println!("\n  TOKENIZER: untrained, {} parameters", c.params().total());
+            (c, EncoderWeights::deterministic(&ctx, c, 7).unwrap())
+        }
+    };
     let patcher = Patcher::contiguous(patch).unwrap();
 
     println!("\n  {per_file} windows per recording, {window} samples each, {patch}-sample patches");

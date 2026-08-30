@@ -396,6 +396,28 @@ with a control of +4.9 and it is one. The same axis, the same tokens, and the an
 the held-out size: which is the whole reason the control is printed beside the figure and never
 inferred from a previous run.
 
+**Does the released tokenizer beat an untrained one at anything a user wants?** Reconstruction SNR
+is what it was trained for; whether its tokens SEPARATE LABELS is a different question and the one
+that matters downstream. Same windows, same split, same probe and control — only the weights differ:
+
+| axis | untrained projection (2.4k params) | released checkpoint (4.79M) | majority |
+|---|---|---|---|
+| fault | 42.7%, control −0.3 | **53.6%**, control −1.8 | 25.0% |
+| diameter | 54.5%, control −1.8 | **63.2%**, control −3.1 | 41.7% |
+
+**+28.6 and +21.5 points over majority against controls near zero**, where the untrained projection
+gets +17.7 and +12.8. Code-space use goes from 21.9% to 48.1%. The training transfers to a
+downstream task and not only to the objective it was trained on.
+
+⚠ **This is not a transfer result, and the distinction matters.** CWRU was in the checkpoint's own
+training set, and the two runs split it differently — the tokenizer held out every fourth *file*
+while this probe holds out every 3 HP *recording*, so most of the probe's held-out recordings were
+signals the tokenizer had already fitted. It never saw a label, so this is not leakage of the
+answer; it is a representation fitted to those exact recordings, which is transduction. The claim
+supported is "a tokenizer trained on this corpus's signals separates its labels better than an
+untrained one" — not "it transfers to a corpus it has never seen." A leave-one-corpus-out
+checkpoint is training now to ask the second question properly.
+
 **A third corpus, three times the recordings, and a much weaker signal.** The three refutations
 above point at labelled *recordings* as the binding constraint — windows from one recording are not
 independent of each other, recordings are — so `examples/cwru` ingests the CWRU bearing set, whose
