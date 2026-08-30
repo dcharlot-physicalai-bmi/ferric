@@ -25,7 +25,7 @@ fn main() { pollster::block_on(run()); }
 
 async fn run() {
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| format!("{}/.cache/ferric/qwen3.6-35b-a3b-q4km.gguf",
+        .unwrap_or_else(|| format!("{}/.cache/ferric/apodex-1.1-mini-q4km.gguf",
                                    std::env::var("HOME").unwrap()));
     let g = GgufFile::open(&path).expect("open gguf");
     let ctx = Arc::new(ferric_core::Context::new().await.expect("gpu"));

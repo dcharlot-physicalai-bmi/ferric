@@ -117,7 +117,7 @@ async fn run() {
 
     // ---- BD: backing store -----------------------------------------------------------------
     let path = std::env::args().nth(1)
-        .unwrap_or_else(|| format!("{}/.cache/ferric/qwen3.6-35b-a3b-q4km.gguf",
+        .unwrap_or_else(|| format!("{}/.cache/ferric/apodex-1.1-mini-q4km.gguf",
                                    std::env::var("HOME").unwrap()));
     let mut bd = Vec::new();
     if let Ok(f) = std::fs::File::open(&path) {
