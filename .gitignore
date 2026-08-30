@@ -21,6 +21,9 @@ crates/ferric-web/*_test.mjs
 # and `Instant::now()` panics — both compile clean, both broke browser speech. This one takes Chrome
 # from $CHROME rather than hardcoding it, so the reason for the blanket rule does not apply.
 !crates/ferric-web/speech_test.mjs
+# ...and the embedding run gate, for the same reason: it covers the third branch of the shared
+# browser load path (spm/pooling), which a speech or text-generation test never touches.
+!crates/ferric-web/embed_test.mjs
 crates/ferric-web/site/pkg/
 .phase0/
 

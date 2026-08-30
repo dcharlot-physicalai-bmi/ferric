@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>embed regression</title><pre id="log"></pre>
+<script type="module">
+// Exercises the OTHER branch of the shared load path I changed: embedding models take the
+// spm/wordpiece/pooling route, not the speech or dense-generate route.
+window.runEmbed = async () => {
+  const m = await import('/pkg/ferric_web.js'); await m.default();
+  if (!navigator.gpu) return 'NO_WEBGPU';
+  const model = await m.FerricModel.load(new Uint8Array(await (await fetch('/retriever.gguf')).arrayBuffer()));
+  const a = await model.embed('a cat sits on the mat');
+  const b = await model.embed('a feline rests on the rug');
+  const c = await model.embed('quarterly earnings exceeded analyst expectations');
+  const cos = (x, y) => x.reduce((s, v, i) => s + v * y[i], 0);
+  return JSON.stringify({
+    info: model.info(), dim: a.length,
+    norm: Math.sqrt(cos(a, a)).toFixed(4),      // L2-normalised => 1.0
+    near: cos(a, b).toFixed(4),                  // paraphrase => high
+    far:  cos(a, c).toFixed(4),                  // unrelated  => lower
+  });
+};
+</script>
