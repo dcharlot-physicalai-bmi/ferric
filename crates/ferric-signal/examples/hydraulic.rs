@@ -71,7 +71,7 @@
 
 use ferric_core::Context;
 use ferric_signal::{
-    build_words, compact, decoder_forward_var, forward_var, majority, mse, nb_probe,
+    build_words, chance, compact, decoder_forward_var, forward_var, majority, mse, nb_probe,
     permutation_control, shuffled, straight_through, train_captions, DecoderWeights, EncoderConfig,
     EncoderWeights, Fsq, HybridVocab, Patcher, RevIn, Sequencer, Span, Weights,
 };
@@ -473,10 +473,14 @@ fn main() {
     let mut control_worst = 0.0f64;
     for a in 0..LABELS.len() {
         let maj = majority(&per_axis[a], &train_idx, &held_idx);
+        // A result has to clear chance as well as majority: when the training classes tie, the
+        // majority baseline can name a class absent from the held-out set and read 0.0%. See the
+        // CWRU example, where that printed a star on a below-chance number.
+        let bar = maj.max(chance(&per_axis[a]));
         print!("  {:<13} {maj:>9.1}%", LABELS[a]);
         for (_, pc, _) in &arms {
             let acc = nb_probe(pc, &per_axis[a], &train_idx, &held_idx);
-            let mark = if acc > maj + 1e-9 { "*" } else { " " };
+            let mark = if acc > bar + 1e-9 { "*" } else { " " };
             print!(" {acc:>11.1}%{mark}");
         }
         // The control runs on the LAST arm's tokens — the best tokenizer available, so it is run

@@ -92,7 +92,7 @@ pub mod train;
 pub mod vocab;
 
 pub use bench::{
-    best_dct_baseline, chance, dct_baseline, dct_baseline_with, majority, nb_probe,
+    best_dct_baseline, chance, dct_baseline, dct_baseline_with, majority, nb_confusion, nb_probe,
     permutation_control, quantized_level, shuffled, ValueCode, VALUE_CODES,
 };
 pub use caption::{build_words, compact, train_captions, CaptionError, SeedResult};

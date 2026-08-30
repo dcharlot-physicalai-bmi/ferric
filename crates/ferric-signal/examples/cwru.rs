@@ -506,12 +506,43 @@ fn main() {
         let maj = majority(labels, &train, &held);
         let acc = nb_probe(&docs, labels, &train, &held);
         let ctl = permutation_control(&docs, labels, &train, &held, 20, 0xC0FF_EE);
-        let mark = if acc > maj + 1e-9 { "*" } else { " " };
+        // ⛔ THE STAR ONCE FIRED ON A BELOW-CHANCE NUMBER. `majority` is the accuracy of
+        // predicting the training set's most common class, and when the training classes tie, the
+        // class it picks can be one that does not occur in the held-out set at all — a 0.0%
+        // baseline that anything clears. The 48 kHz part split hit exactly that and printed
+        // `4.2%*` for a five-class problem whose chance rate is 16.7%. A result has to clear BOTH.
+        let bar = maj.max(chance(labels));
+        let mark = if acc > bar + 1e-9 { "*" } else { " " };
         println!("  {name:<10} {n_cls:>8} {:>9.1}% {maj:>9.1}% {acc:>11.1}%{mark} {ctl:>+9.1}pt",
                  chance(labels));
     }
     println!("\n  `control` is the same probe with the window-to-label assignment permuted, worst of");
     println!("  twenty, each against its own majority. Read it before the probe.");
+
+
+    // Per-class recall on the held-out set. AN AGGREGATE ABOVE MAJORITY CAN BE ONE EFFECT OR
+    // SEVERAL, and the aggregate cannot tell you which: a five-class figure well clear of majority
+    // is equally consistent with separating every class and with separating two coarse ones while
+    // guessing the rest. Those are different claims about what the tokens carry.
+    if let Some((cls, m)) = ferric_signal::nb_confusion(&docs, &per_axis[0], &train, &held) {
+        println!("\n  FAULT, CLASS BY CLASS  rows true, columns predicted, held-out windows\n");
+        print!("  {:<10}", "");
+        for c in &cls {
+            print!(" {:>8}", FAULTS[*c as usize]);
+        }
+        println!("  {:>8}", "recall");
+        for (t, row) in m.iter().enumerate() {
+            let n: usize = row.iter().sum();
+            if n == 0 {
+                continue;
+            }
+            print!("  {:<10}", FAULTS[cls[t] as usize]);
+            for v in row {
+                print!(" {v:>8}");
+            }
+            println!("  {:>7.1}%", row[t] as f64 / n as f64 * 100.0);
+        }
+    }
 
     if !args.iter().any(|a| a == "--train") {
         println!("\n  Pass --train to run signal-to-text on these conditions.\n");

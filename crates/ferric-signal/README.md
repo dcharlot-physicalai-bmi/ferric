@@ -476,6 +476,65 @@ effectively n = 11, not 440. And a null under a naive-Bayes counting probe on fr
 null for the representation: a trained classifier, or fine-tuning, might find what counting cannot.
 What is refuted is the specific published claim, which was about these tokens read this way.
 
+And one limit that the next section removes: a null on one corpus is not a null on the method. The
+same split run on the rotating corpus recovers inner- versus outer-race defect on an unseen seeded
+bearing at 88.9% and 93.3%.
+
+**And the rotating corpus, given the same test, passes it.** The `--split part` idea applies there
+too: hold out severity rank 1 of every fault — `BPFI_10`, `BPFO_10`, `Misalign_03`,
+`Unbalance_1169` — at all three torques, so the seeded bearings behind the held-out BPFI and BPFO
+recordings are physically absent from training and no operating point is being asked about.
+
+| axis | probe | majority | control |
+|---|---|---|---|
+| fault | **73.1%** | 25.0% | +2.2 |
+| torque | 46.9% | 33.3% | +8.3 |
+
+Higher than the 65.6% the torque split gave, against a lower baseline. And the per-class breakdown
+says the aggregate is not one uniform effect — it says something better:
+
+| true \ predicted | BPFI | BPFO | Misalign | Normal | Unbalance | recall |
+|---|---|---|---|---|---|---|
+| BPFI | **80** | 10 | 0 | 0 | 0 | 88.9% |
+| BPFO | 0 | **84** | 1 | 0 | 5 | 93.3% |
+| Misalign | 0 | 0 | **10** | 0 | 80 | 11.1% |
+| Unbalance | 0 | 0 | 1 | 0 | **89** | 98.9% |
+
+**The two classes that survive are exactly the two where the held-out part is a bearing the
+tokenizer has never seen.** Inner-race versus outer-race defect — the fine discrimination, the one
+that lives in sideband structure — is recovered at 88.9% and 93.3% across an unseen seeded bearing,
+and the two are essentially never confused with each other. The class that collapses is
+misalignment, read as unbalance 80 times out of 90, which is physically reasonable: both put energy
+at one and two times shaft rate, and what separates them is a phase relationship between channels
+that a per-channel bag of codes throws away by construction.
+
+So the null is not a fact about bearing faults, or about frozen tokens, or about counting probes.
+**Two corpora, the same split, opposite answers.**
+
+**The obvious explanation is bandwidth, and it is wrong.** The rotating corpus samples at 25.6 kHz
+and the CWRU runs above at 12 kHz, whose 6 kHz Nyquist may simply not reach the resonance band a
+defect signature rides on. CWRU can answer that itself: the same rig, the same seeded bearings and
+the same conditions are also published at 48 kHz. Duration-matched — 51,200-sample windows and
+512-sample patches, so both runs see 1.07 s in 10.7 ms pieces — and split the same way:
+
+| rate | Nyquist | fault | chance | IR recall | B recall | OR@6 recall |
+|---|---|---|---|---|---|---|
+| 12 kHz | 6 kHz | 28.9% | 20.0% | 2.5% | 71.9% | 5.6% |
+| 48 kHz | 24 kHz | 4.2% | 16.7% | 6.2% | 6.2% | 0.0% |
+
+Four times the resolved bandwidth does not recover it; it is worse. The 12 kHz arm's 28.9% is
+mostly one class — predict `B` and be right 71.9% of the time — and the 48 kHz arm is below chance
+on all three. **Bandwidth is refuted as the difference between the two corpora, and no replacement
+explanation is offered here** beyond the observation that this crate can separate a defect on an
+unseen bearing in one rig and not in another.
+
+**That 48 kHz run also found a reporting defect, and it is the more transferable finding.** It first
+printed `4.2%*` — starred, meaning above baseline — for a five-class problem whose chance rate is
+16.7%. `majority` is the accuracy of predicting the training set's most common class, and when the
+training classes tie, the class it picks can be one that never occurs in the held-out set: a 0.0%
+baseline that anything clears. **A star fired on a below-chance number.** The rule is now that a
+result must clear `max(majority, chance)`, applied in all three examples.
+
 **A third corpus, three times the recordings, and a much weaker signal.** The three refutations
 above point at labelled *recordings* as the binding constraint — windows from one recording are not
 independent of each other, recordings are — so `examples/cwru` ingests the CWRU bearing set, whose

@@ -127,7 +127,14 @@ fn main() {
     let per_file: usize = flag(&args, "--windows").and_then(|v| v.parse().ok()).unwrap_or(20);
     let window: usize = flag(&args, "--window").and_then(|v| v.parse().ok()).unwrap_or(25_600);
     let patch: usize = flag(&args, "--patch").and_then(|v| v.parse().ok()).unwrap_or(256);
-    let by_torque = flag(&args, "--split").as_deref() == Some("torque");
+    // `torque` holds out an operating point; `part` holds out the physical condition itself.
+    // See the CWRU example for why the second one had to exist: a split that changes only the
+    // operating point leaves the same defective component on both sides of it.
+    let split = flag(&args, "--split").unwrap_or_else(|| "time".to_string());
+    if !matches!(split.as_str(), "time" | "torque" | "part") {
+        eprintln!("error: --split must be one of time, torque, part");
+        std::process::exit(2);
+    }
 
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
         Ok(d) => d
@@ -272,19 +279,31 @@ fn main() {
              codes_seen.len() as f64 / q.codebook_size() as f64 * 100.0);
 
     // ---- split ----
-    let (train, held): (Vec<usize>, Vec<usize>) = if by_torque {
-        (0..docs.len()).partition(|&i| conds[doc_file[i]].torque != 4)
-    } else {
-        // The last third of every recording, by window position within that recording.
-        let cut = per_file * 2 / 3;
-        (0..docs.len()).partition(|&i| doc_pos[i] < cut)
+    let (train, held): (Vec<usize>, Vec<usize>) = match split.as_str() {
+        "torque" => (0..docs.len()).partition(|&i| conds[doc_file[i]].torque != 4),
+        // Rank 1 of every fault: BPFI_10, BPFO_10, Misalign_03, Unbalance_1169. The seeded
+        // bearings behind BPFI and BPFO are then physically absent from training, and every torque
+        // appears on both sides, so nothing about the operating point is being asked.
+        "part" => (0..docs.len()).partition(|&i| ranks[doc_file[i]] != 1),
+        _ => {
+            // The last third of every recording, by window position within that recording.
+            let cut = per_file * 2 / 3;
+            (0..docs.len()).partition(|&i| doc_pos[i] < cut)
+        }
     };
-    println!("  split `{}`: {} train / {} held out",
-             if by_torque { "torque" } else { "time" }, train.len(), held.len());
-    if by_torque {
-        println!("  held-out recordings were never seen; training contains no 4 Nm at all");
-    } else {
-        println!("  train and held-out windows come from the SAME recordings");
+    println!("  split `{split}`: {} train / {} held out", train.len(), held.len());
+    match split.as_str() {
+        "torque" => {
+            println!("  held-out recordings were never seen; training contains no 4 Nm at all");
+            println!("  ⚠ the SAME PHYSICAL CONDITION is in both halves at the other two torques");
+        }
+        "part" => {
+            println!("  held out is severity rank 1 of every fault, at all three torques");
+            println!("  the BPFI and BPFO bearings held out are absent from training entirely");
+            println!("  ⚠ misalignment and unbalance change a SETTING, not a part: for those two");
+            println!("    classes this is an unseen severity rather than an unseen component");
+        }
+        _ => println!("  train and held-out windows come from the SAME recordings"),
     }
 
     // ---- the instruments ----
@@ -315,7 +334,13 @@ fn main() {
         let acc = nb_probe(&docs, labels, &train, &held);
         let ctl = permutation_control(&docs, labels, &train, &held, 20, 0xC0FF_EE);
         controls.push(ctl);
-        let mark = if acc > maj + 1e-9 { "*" } else { " " };
+        // ⛔ THE STAR ONCE FIRED ON A BELOW-CHANCE NUMBER. `majority` is the accuracy of
+        // predicting the training set's most common class, and when the training classes tie, the
+        // class it picks can be one that does not occur in the held-out set at all — a 0.0%
+        // baseline that anything clears. The 48 kHz part split hit exactly that and printed
+        // `4.2%*` for a five-class problem whose chance rate is 16.7%. A result has to clear BOTH.
+        let bar = maj.max(chance(labels));
+        let mark = if acc > bar + 1e-9 { "*" } else { " " };
         println!("  {name:<10} {n_cls:>8} {:>9.1}% {maj:>9.1}% {acc:>11.1}%{mark}", chance(labels));
     }
     println!("\n  {:<10} {:>12}", "axis", "control");
@@ -330,6 +355,31 @@ fn main() {
     println!("\n  `control` is the same probe on the same tokens with the window-to-label assignment");
     println!("  permuted, worst of twenty, each against its own majority. Read it before the probe:");
     println!("  an effect the size of its control is not an effect.");
+
+    // Per-class recall on the held-out set. AN AGGREGATE ABOVE MAJORITY CAN BE ONE EFFECT OR
+    // SEVERAL, and the aggregate cannot tell you which: a five-class figure well clear of majority
+    // is equally consistent with separating every class and with separating two coarse ones while
+    // guessing the rest. Those are different claims about what the tokens carry.
+    if let Some((cls, m)) = ferric_signal::nb_confusion(&docs, &per_axis[0], &train, &held) {
+        println!("\n  FAULT, CLASS BY CLASS  rows true, columns predicted, held-out windows\n");
+        print!("  {:<10}", "");
+        for c in &cls {
+            print!(" {:>8}", FAULTS[*c as usize]);
+        }
+        println!("  {:>8}", "recall");
+        for (t, row) in m.iter().enumerate() {
+            let n: usize = row.iter().sum();
+            if n == 0 {
+                continue;
+            }
+            print!("  {:<10}", FAULTS[cls[t] as usize]);
+            for v in row {
+                print!(" {v:>8}");
+            }
+            println!("  {:>7.1}%", row[t] as f64 / n as f64 * 100.0);
+        }
+    }
+
     println!("\n  The tokenizer is UNTRAINED. RevIn normalises every channel of every window, so");
     println!("  absolute amplitude is gone by construction and what is read is shape.");
 

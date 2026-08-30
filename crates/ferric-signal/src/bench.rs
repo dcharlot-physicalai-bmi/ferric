@@ -83,9 +83,33 @@ pub fn chance(labels: &[i32]) -> f64 {
 /// Laplace smoothing over the vocabulary observed in training. Held-out tokens never seen in
 /// training contribute the smoothed floor to every class, which is the right behaviour: they carry
 /// no evidence either way.
+/// Accuracy of the counting probe on the held-out set. See [`nb_confusion`] for the same fit with
+/// its per-class breakdown, which is what decides whether one aggregate number is one effect.
 pub fn nb_probe(docs: &[Vec<Vec<u32>>], labels: &[i32], train: &[usize], held: &[usize]) -> f64 {
+    let Some((_, m)) = nb_confusion(docs, labels, train, held) else { return f64::NAN };
+    let right: usize = (0..m.len()).map(|k| m[k][k]).sum();
+    let n: usize = m.iter().flatten().sum();
+    if n == 0 { return f64::NAN; }
+    right as f64 / n as f64 * 100.0
+}
+
+/// The same probe, returning the class list and the confusion matrix `m[true][predicted]`.
+///
+/// **An aggregate accuracy can be one effect or several, and the two are not distinguishable from
+/// the aggregate.** A five-class figure well above majority is compatible with the probe separating
+/// every class, and equally with it separating two coarse ones and guessing the rest — which is a
+/// different claim about what the representation carries. This is here because that question came
+/// up the moment two corpora disagreed about whether a fault survives an unseen part.
+///
+/// `None` when either side of the split is empty.
+pub fn nb_confusion(
+    docs: &[Vec<Vec<u32>>],
+    labels: &[i32],
+    train: &[usize],
+    held: &[usize],
+) -> Option<(Vec<i32>, Vec<Vec<usize>>)> {
     if held.is_empty() || train.is_empty() {
-        return f64::NAN;
+        return None;
     }
     let feat = |run: usize, tok: u32| -> u64 { (run as u64) << 32 | tok as u64 };
     let classes: Vec<i32> = {
@@ -109,7 +133,10 @@ pub fn nb_probe(docs: &[Vec<Vec<u32>>], labels: &[i32], train: &[usize], held: &
     }
     let v = vocab.len() as f64;
     let alpha = 1.0f64;
-    let mut right = 0usize;
+    // Rows are true classes, columns predicted. A held-out label absent from training has no row
+    // and is skipped rather than silently counted as an error against a class that cannot be
+    // predicted; the examples guard that case before calling in.
+    let mut conf = vec![vec![0usize; classes.len()]; classes.len()];
     for &i in held {
         let mut best = (f64::NEG_INFINITY, 0usize);
         for k in 0..classes.len() {
@@ -125,11 +152,11 @@ pub fn nb_probe(docs: &[Vec<Vec<u32>>], labels: &[i32], train: &[usize], held: &
                 best = (lp, k);
             }
         }
-        if classes[best.1] == labels[i] {
-            right += 1;
+        if let Some(t) = classes.iter().position(|&v| v == labels[i]) {
+            conf[t][best.1] += 1;
         }
     }
-    right as f64 / held.len() as f64 * 100.0
+    Some((classes, conf))
 }
 
 /// How far above its own majority baseline the probe gets when the example-to-label assignment is
@@ -618,5 +645,51 @@ mod tests {
     fn a_flat_patch_is_handled_rather_than_dividing_by_nothing() {
         let mse = dct_baseline(&vec![0.7f32; 128]);
         assert!(mse.is_finite() && mse >= 0.0, "flat patch gave {mse}");
+    }
+
+    /// A per-class breakdown that disagrees with the aggregate it explains is worse than none.
+    #[test]
+    fn the_confusion_matrix_reproduces_the_probe_it_breaks_down() {
+        // Two classes, two runs of tokens, deliberately separable but not perfectly.
+        let docs: Vec<Vec<Vec<u32>>> = vec![
+            vec![vec![1, 1, 1, 2], vec![9]],
+            vec![vec![1, 1, 2, 2], vec![9]],
+            vec![vec![3, 3, 3, 4], vec![8]],
+            vec![vec![3, 3, 4, 4], vec![8]],
+            vec![vec![1, 1, 1, 3], vec![9]],
+            vec![vec![3, 3, 3, 1], vec![8]],
+        ];
+        let labels = vec![0, 0, 1, 1, 0, 1];
+        let train = vec![0usize, 1, 2, 3];
+        let held = vec![4usize, 5];
+        let acc = nb_probe(&docs, &labels, &train, &held);
+        let (cls, m) = nb_confusion(&docs, &labels, &train, &held).expect("non-empty split");
+        assert_eq!(cls, vec![0, 1]);
+        let right: usize = (0..cls.len()).map(|k| m[k][k]).sum();
+        let total: usize = m.iter().flatten().sum();
+        assert_eq!(total, held.len(), "every held-out document lands in exactly one cell");
+        assert!(
+            (acc - right as f64 / total as f64 * 100.0).abs() < 1e-9,
+            "aggregate {acc} does not match the breakdown {right}/{total}"
+        );
+    }
+
+    /// A held-out class the training set never saw has no column to be predicted into, so it must
+    /// not be silently scored against classes that could never win it.
+    #[test]
+    fn a_held_out_class_absent_from_training_is_left_out_of_the_matrix() {
+        let docs: Vec<Vec<Vec<u32>>> =
+            vec![vec![vec![1, 1]], vec![vec![2, 2]], vec![vec![3, 3]]];
+        let labels = vec![0, 0, 7];
+        let (cls, m) = nb_confusion(&docs, &labels, &[0, 1], &[2]).expect("non-empty split");
+        assert_eq!(cls, vec![0], "class 7 is not a training class");
+        assert_eq!(m.iter().flatten().sum::<usize>(), 0, "and it is not scored");
+    }
+
+    #[test]
+    fn an_empty_side_has_no_matrix_rather_than_an_empty_one() {
+        let docs: Vec<Vec<Vec<u32>>> = vec![vec![vec![1]]];
+        assert!(nb_confusion(&docs, &[0], &[0], &[]).is_none());
+        assert!(nb_confusion(&docs, &[0], &[], &[0]).is_none());
     }
 }
