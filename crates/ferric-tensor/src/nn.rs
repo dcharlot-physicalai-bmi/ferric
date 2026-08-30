@@ -332,6 +332,15 @@ fn offset_causal_mask(like: &Tensor, tq: usize, tkv: usize) -> Tensor {
     Tensor::from_vec(&like.ctx_arc(), &m, &[tq, tkv])
 }
 
+/// A `[t, t]` causal mask broadcast to `[heads, t, t]`, additive (`0` visible, `−1e30` hidden).
+///
+/// The per-head shape exists because attention scores are `[heads, T, S]` and adding a `[T, T]` mask
+/// to them relies on broadcasting rules that differ between op sets. Materialising the head axis
+/// makes the alignment a shape the compiler checks rather than a convention the reader has to trust.
+pub fn causal_mask_hw(like: &Tensor, heads: usize, t: usize) -> Tensor {
+    causal_mask(like, t).reshape(&[1, t, t]).broadcast_to(&[heads, t, t]).contiguous()
+}
+
 fn causal_mask(like: &Tensor, t: usize) -> Tensor {
     let mut m = vec![0.0f32; t * t];
     for i in 0..t {
@@ -549,6 +558,18 @@ pub fn causal_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n
 /// query block is taken to sit at the end, at offset `s - t`.
 pub fn causal_attention_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
                               qk_dim: usize, v_dim: usize, softcap: f32) -> Tensor {
+    attend_split(q, k, v, n_heads, qk_dim, v_dim, None, softcap)
+}
+
+/// [`causal_attention_split`] with a per-head learnable sink, `[n_heads]`. See
+/// [`softmax_with_sinks`] for what a sink does and what must not be done to it.
+pub fn causal_attention_split_sinks(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
+                                    qk_dim: usize, v_dim: usize, sinks: &Tensor, softcap: f32) -> Tensor {
+    attend_split(q, k, v, n_heads, qk_dim, v_dim, Some(sinks), softcap)
+}
+
+fn attend_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
+                qk_dim: usize, v_dim: usize, sinks: Option<&Tensor>, softcap: f32) -> Tensor {
     let t = q.shape[0];
     let s = k.shape[0];
     assert_eq!(q.shape[1], n_heads * qk_dim, "q width must be n_heads * qk_dim");
@@ -567,7 +588,8 @@ pub fn causal_attention_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize
         for j in (off + i + 1)..s { m[i * s + j] = -1e30; }
     }
     let mask = Tensor::from_vec(&q.ctx_arc(), &m, &[t, s]);
-    let probs = scores.add(&mask).softmax(2);
+    let masked = scores.add(&mask);
+    let probs = match sinks { None => masked.softmax(2), Some(sk) => softmax_with_sinks(&masked, sk) };
     probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, n_heads * v_dim])
 }
 

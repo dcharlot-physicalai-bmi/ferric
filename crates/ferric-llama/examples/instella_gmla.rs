@@ -14,7 +14,7 @@
 //! Weights + I/O + intermediates come from `~/.cache/ferric/instella_ref/gmla.safetensors`.
 //!   cargo run -p ferric-llama --example instella_gmla --release
 use ferric_core::{max_abs_diff, Context};
-use ferric_llama::mla::{CachePolicy, Mla, MlaConfig, MlaWeights};
+use ferric_llama::mla::{CachePolicy, KvUp, Mla, MlaConfig, MlaWeights, QProj};
 use ferric_load::safetensors;
 use ferric_tensor::Tensor;
 use std::collections::HashMap;
@@ -44,12 +44,13 @@ async fn run() {
     let mla = Mla::new(
         cfg,
         MlaWeights {
-            q_proj: g("q_proj.weight"),
+            q: QProj::Whole(g("q_proj.weight")),
             kv_a_proj_with_mqa: g("kv_a_proj_with_mqa.weight"),
             kv_a_layernorm: g("kv_a_layernorm.weight"),
-            kv_b_proj: g("kv_b_proj.weight"),
+            kv_up: KvUp::Fused(g("kv_b_proj.weight")),
             o_proj: g("o_proj.weight"),
             gate_proj: Some(g("gate_proj.weight")),
+            sinks: None,
         },
     );
 
