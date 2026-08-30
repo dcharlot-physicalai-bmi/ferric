@@ -869,9 +869,12 @@ impl Tensor {
                     let Some(segs) = bo.as_mut() else { return false };
                     if fresh {
                         if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
-                            segs.push(Seg::Wgsl(self.ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+                            segs.push(Seg::Wgsl(self.ctx.device.create_command_encoder(&Default::default()), Vec::new(), None));
                         }
-                        let Some(Seg::Wgsl(enc, _)) = segs.last_mut() else { unreachable!() };
+                        let Some(Seg::Wgsl(enc, _, pass)) = segs.last_mut() else { unreachable!() };
+                        // ⚠ `clear_buffer` is an ENCODER command and is illegal while a compute pass
+                        // is open. The batched dispatch path now leaves one open, so close it here.
+                        drop(pass.take());
                         enc.clear_buffer(&out, 0, None);
                     }
                     if !matches!(segs.last_mut(), Some(Seg::External(_))) {
@@ -943,6 +946,33 @@ impl Tensor {
     /// Input gradient of [`Self::conv2d`]: `self` is the output gradient `[n, ho, wo, o]`, `w` the
     /// forward weights `[kh, kw, c, o]`, `in_hw` the forward input's spatial dims. Returns
     /// `[n, h, w, c]` — the stride-aware transposed convolution, portable WGSL.
+
+    /// Depthwise 2D convolution — `[n,h,w,C]` activations against `[kh,kw,1,C]` weights, output
+    /// channel `o` reading input channel `o` only.
+    ///
+    /// `conv2d` cannot serve this: it asserts `activations.c == weights.c_in`, and a depthwise stage
+    /// stores `c_in = 1` while the activations carry C. That assert is what kept parakeet's
+    /// `dw_striding` subsampling stack on the CPU, where it measured 38-65% of total encode time.
+    pub fn depthwise_conv2d(&self, w: &Tensor, stride: (usize, usize), pad: (usize, usize)) -> Tensor {
+        let x = self.contiguous();
+        let wc = w.contiguous();
+        assert_eq!(x.rank(), 4, "depthwise_conv2d activations must be [n,h,w,c]");
+        assert_eq!(wc.rank(), 4, "depthwise_conv2d weights must be [kh,kw,1,c]");
+        let (n, h, wd, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+        let (kh, kw, cin, cout) = (wc.shape[0], wc.shape[1], wc.shape[2], wc.shape[3]);
+        assert_eq!(cin, 1, "depthwise weights must have c_in = 1, got {cin}");
+        assert_eq!(cout, c, "depthwise output channels {cout} must equal input channels {c}");
+        let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
+        let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
+        let out = empty(&self.ctx, n * ho * wo * c);
+        let (grid, rs) = groups2d(n * ho * wo * c);
+        run(&self.ctx, DEPTHWISE_CONV2D_WGSL, "depthwise_conv2d",
+            &[&x.buf, &wc.buf, &out, &u32buf(&self.ctx, &[n as u32, h as u32, wd as u32, c as u32,
+                kh as u32, kw as u32, ho as u32, wo as u32,
+                stride.0 as u32, stride.1 as u32, pad.0 as u32, pad.1 as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![n, ho, wo, c])
+    }
+
     pub fn conv2d_dx(&self, w: &Tensor, stride: (usize, usize), pad: (usize, usize), in_hw: (usize, usize)) -> Tensor {
         let g = self.contiguous();
         let wc = w.contiguous();
@@ -991,6 +1021,27 @@ impl Tensor {
         run(&self.ctx, GATHER_ROWS_WGSL, "gather_rows", &[c.buf.as_ref(), &idxbuf, &out, &u32buf(&self.ctx, &[idx.len() as u32, d as u32, grs])], ggrid);
         Tensor::from_parts(&self.ctx, out, vec![idx.len(), d])
     }
+    /// **Transformer-XL relative-position shift**, `[t, 2t-1] → [t, t]`.
+    ///
+    /// `out[i, j] = self[i, (t-1) - i + j]`, so row `i` reads relative offset `i - j`. Conformer /
+    /// Transformer-XL attention needs this between the position term and the softmax.
+    ///
+    /// It exists as a KERNEL because the obvious host-side loop costs a GPU→CPU readback PER HEAD
+    /// PER LAYER — 336 syncs for a 42-layer 8-head encoder, which is both the native latency
+    /// ceiling and an absolute blocker in wasm, where blocking on a readback is not possible at all.
+    /// Browser-native speech needs the whole forward pass to stay on-device.
+    pub fn rel_shift(&self) -> Tensor {
+        let c = self.contiguous();
+        assert_eq!(c.shape.len(), 2, "rel_shift wants [t, 2t-1]");
+        let (t, np) = (c.shape[0], c.shape[1]);
+        assert_eq!(np, 2 * t - 1, "rel_shift: [{t}, {np}] is not [t, 2t-1]");
+        let out = empty(&self.ctx, t * t);
+        let (grid, rs) = groups2d(t * t);
+        run(&self.ctx, REL_SHIFT_WGSL, "rel_shift",
+            &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &[t as u32, np as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![t, t])
+    }
+
     pub(crate) fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
 
     // ---- general reduction over arbitrary axes ----
@@ -1451,9 +1502,11 @@ fn metal4_gemm_route(
         if fresh {
             // the init-marking clear must be SUBMITTED before the external queue writes the buffer
             if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
-                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new(), None));
             }
-            let Some(Seg::Wgsl(enc, _)) = segs.last_mut() else { unreachable!() };
+            let Some(Seg::Wgsl(enc, _, pass)) = segs.last_mut() else { unreachable!() };
+            // ⚠ See above: encoder command, so the open compute pass must be closed first.
+            drop(pass.take());
             enc.clear_buffer(&out, 0, None);
         }
         if !matches!(segs.last_mut(), Some(Seg::External(_))) {
@@ -1504,13 +1557,56 @@ fn empty(ctx: &Context, n: usize) -> wgpu::Buffer {
 // (not available on the WebGPU baseline). Neither is a small change, and neither should be attempted
 // without an A/B like the one above.
 
+/// The per-dispatch info buffer, CONTENT-CACHED — the same treatment `unibuf` already gets, applied
+/// to the storage-usage variant that `run()` actually calls.
+///
+/// Measured at 31.6 ms per speech encode — **84% of all host time in `run()`** (pipeline 4%,
+/// bindgroup 11%, record 1%). The cache takes that to **0.7 ms, a 45x reduction**, and the encoder's
+/// repeated shapes across 42 layers make the content key hit constantly.
+///
+/// ⛔ **AND IT BUYS NOTHING END-TO-END. Keep it, but do not claim a speedup.** Speech encode moved
+/// 392 -> 378 ms (inside a 40% spread) and LLM decode 25.44 -> 25.88 ms/token — i.e. nothing, twice.
+/// Host time is only ~2.4% of a speech encode (8.9 ms of 378 ms) and it OVERLAPS GPU execution, so
+/// the dominant share of it was never on the critical path. This is the trap of optimising the
+/// largest term of a small quantity: the 84% was real and the 45x is real, and both are irrelevant.
+/// Kept because it is free, correctness-verified (WER and 163 tests unchanged) and cuts allocation
+/// churn — which may matter on a fabric where buffer creation is dearer. Toggle to re-measure:
+/// `FERRIC_NO_INFOBUF_CACHE=1`.
+///
+/// Safe to share without lifetime reasoning for the same reason `unibuf` is: these are READ-ONLY
+/// (`var<storage,read>`, usage STORAGE|COPY_SRC — nothing writes them), so two dispatches holding
+/// the same contents can hold the same buffer.
 fn u32buf(ctx: &Context, data: &[u32]) -> wgpu::Buffer {
     let _t = profclock::now();
     let _g = scopeguard_ns(_t, 3);
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    // Device-keyed too, so a buffer from one GPU is never handed to another.
+    let key = ((&ctx.device as *const wgpu::Device) as usize, h.finish());
+    let fresh = |ctx: &Context| ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("info"), contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    // Control arm, same discipline as the unibuf cache: an in-binary switch, because comparing
+    // across builds on a contended machine is how a win gets mistaken for a regression.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("FERRIC_NO_INFOBUF_CACHE").is_some()) {
+        return fresh(ctx);
+    }
+    INFOBUFS.with(|c| {
+        let mut m = c.borrow_mut();
+        // Bounded, so a workload with genuinely unique info per dispatch degrades to the old
+        // behaviour instead of growing without limit.
+        if m.len() > 4096 { m.clear(); }
+        m.entry(key).or_insert_with(|| fresh(ctx)).clone()
     })
+}
+
+thread_local! {
+    /// Content-keyed cache of the storage info buffers `run()` binds. See `u32buf`.
+    static INFOBUFS: std::cell::RefCell<std::collections::HashMap<(usize, u64), wgpu::Buffer>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 thread_local! {
     /// Content-keyed cache of uniform info buffers.
@@ -1630,7 +1726,10 @@ pub(crate) fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
 // kernel); assumes one device per thread, which holds for all Ferric usage. Every SOTA runtime
 // caches compiled kernels; this is the single biggest per-op overhead removed.
 thread_local! {
-    static PIPELINES: std::cell::RefCell<std::collections::HashMap<(usize, u64), wgpu::ComputePipeline>> =
+    // Pipeline AND its bind-group layout. The layout is cached because `get_bind_group_layout` is
+    // not a getter on every backend: on WebGPU it materialises a fresh JS object per call, and
+    // `run()` called it once per dispatch — 6303 times per speech encode.
+    static PIPELINES: std::cell::RefCell<std::collections::HashMap<(usize, u64), (wgpu::ComputePipeline, std::rc::Rc<wgpu::BindGroupLayout>)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     // Autotuner: shape-bucket → measured-fastest GEMM kernel for this device.
     static GEMM_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u32), Gemm>> =
@@ -1645,7 +1744,7 @@ fn gemm_bucket(m: usize, k: usize, n: usize) -> (u32, u32, u32) {
 fn gemm_choice(m: usize, k: usize, n: usize) -> Gemm {
     GEMM_CACHE.with(|c| c.borrow().get(&gemm_bucket(m, k, n)).copied()).unwrap_or(Gemm::Naive)
 }
-fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> wgpu::ComputePipeline {
+fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> (wgpu::ComputePipeline, std::rc::Rc<wgpu::BindGroupLayout>) {
     // key by (device, content-hash): caches dynamically-generated fusion shaders too, and stays
     // correct across multiple GPUs (a device-A pipeline is never reused on device B).
     use std::hash::{Hash, Hasher};
@@ -1657,10 +1756,12 @@ fn pipeline_for(ctx: &Context, wgsl: &str, label: &str) -> wgpu::ComputePipeline
             let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label), source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
             });
-            ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            let p = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label), layout: None, module: &module, entry_point: Some("main"),
                 compilation_options: Default::default(), cache: None,
-            })
+            });
+            let bgl = std::rc::Rc::new(p.get_bind_group_layout(0));
+            (p, bgl)
         }).clone()
     })
 }
@@ -1679,7 +1780,19 @@ thread_local! {
 }
 
 enum Seg {
-    Wgsl(wgpu::CommandEncoder, Vec<wgpu::BindGroup>),
+    /// An encoder, the bind groups its dispatches reference (kept alive until submit), and a
+    /// COMPUTE PASS held open across consecutive dispatches.
+    ///
+    /// ⚠ The open pass is the point. `begin_compute_pass` per dispatch costs ~18 us on Metal (a
+    /// fresh `MTLComputeCommandEncoder` each time) — measured in `examples/compute_pass_cost.rs`:
+    /// 1000 dispatches take 20.03 ms one-pass-each vs 1.99 ms in a single pass. At the ~6300
+    /// dispatches of one speech encode that is ~114 ms, and it is why native ran 2.2x slower than
+    /// the SAME kernels in Chrome, which issues the same 6319 dispatches in the same 61 submits.
+    ///
+    /// ⚠ The pass MUST be dropped before `encoder.finish()`. `flush_batch` does that explicitly;
+    /// `forget_lifetime` detaches the borrow so both can live in this struct, and it is then on us
+    /// to keep the order right — the compiler no longer checks it.
+    Wgsl(wgpu::CommandEncoder, Vec<wgpu::BindGroup>, Option<wgpu::ComputePass<'static>>),
     #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
     External(Vec<crate::metal4::ExtOp>),
 }
@@ -1704,6 +1817,20 @@ thread_local! {
 /// (pipeline_ns, bindgroup_ns, encode_ns, bufcreate_ns) since the last reset.
 pub fn host_ns() -> (u64, u64, u64, u64) { HOST_NS.with(|c| c.get()) }
 pub fn reset_host_ns() { HOST_NS.with(|c| c.set((0, 0, 0, 0))); }
+
+/// Whether consecutive batched dispatches share one compute pass. On by default — it is worth
+/// 1.6x on a speech encode (629 -> 392 ms) because `begin_compute_pass` costs ~18 us on Metal.
+/// `FERRIC_NO_PASS_REUSE=1` restores the old behaviour.
+fn pass_reuse() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    { true }   // no env on wasm; an env-var flag there silently pins to one arm
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("FERRIC_NO_PASS_REUSE").is_err())
+    }
+}
+
 fn add_ns(slot: usize, ns: u64) {
     HOST_NS.with(|c| { let mut v = c.get();
         match slot { 0 => v.0 += ns, 1 => v.1 += ns, 2 => v.2 += ns, _ => v.3 += ns }; c.set(v); });
@@ -1719,13 +1846,13 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         g
     );
     let _t = profclock::now();
-    let pipe = pipeline_for(ctx, wgsl, label);
+    let (pipe, bgl) = pipeline_for(ctx, wgsl, label);
     add_ns(0, profclock::elapsed_ns(&_t));
     let _t = profclock::now();
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label), layout: &pipe.get_bind_group_layout(0), entries: &entries,
+        label: Some(label), layout: &bgl, entries: &entries,
     });
     add_ns(1, profclock::elapsed_ns(&_t));
     DISPATCHES.with(|c| c.set(c.get() + 1));
@@ -1736,6 +1863,34 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
     if *TRACE.get_or_init(|| std::env::var_os("FERRIC_TRACE_KERNELS").is_some()) {
         eprintln!("KERNEL\t{label}");
     }
+    // Record into an ALREADY-OPEN pass when batching, opening one only if the segment has none.
+    // Pipeline and bind group are set per dispatch because consecutive ops differ in both; only the
+    // pass boundary is amortised.
+    let record_into = |slot: &mut Option<wgpu::ComputePass<'static>>,
+                       enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
+        let _t = profclock::now();
+        if slot.is_none() {
+            *slot = Some(enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("batch"), timestamp_writes: None }).forget_lifetime());
+        }
+        {
+            let pass = slot.as_mut().expect("just opened");
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(g.0, g.1, g.2);
+        }
+        // Escape hatch AND measurement arm: closing the pass after every dispatch reproduces the old
+        // one-pass-per-dispatch behaviour exactly, so the change can be re-measured, or switched off
+        // if the hand-maintained drop-order invariant ever misbehaves on a fabric.
+        //
+        // ⚠ `pass_reuse()` is a `OnceLock` read, so this canNOT be flipped mid-process — the two
+        // arms are separate launches. That is the weaker comparison, and comparing launches on a
+        // contended machine is what produced two wrong conclusions in the work that added this.
+        // Re-measure both arms back to back on a quiet machine before quoting a ratio.
+        if !pass_reuse() { drop(slot.take()); }
+        add_ns(2, profclock::elapsed_ns(&_t));
+    };
+    // Unbatched: one pass for the single dispatch, as before.
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let _t = profclock::now();
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
@@ -1751,10 +1906,10 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         let mut b = b.borrow_mut();
         if let Some(segs) = b.as_mut() {
             if !matches!(segs.last_mut(), Some(Seg::Wgsl(..))) {
-                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new()));
+                segs.push(Seg::Wgsl(ctx.device.create_command_encoder(&Default::default()), Vec::new(), None));
             }
-            let Some(Seg::Wgsl(enc, keep)) = segs.last_mut() else { unreachable!() };
-            record(enc, &bg);
+            let Some(Seg::Wgsl(enc, keep, pass)) = segs.last_mut() else { unreachable!() };
+            record_into(pass, enc, &bg);
             keep.push(bg);
             None
         } else {
@@ -1781,7 +1936,10 @@ pub(crate) fn flush_batch(ctx: &Context) {
     let Some(segs) = BATCH.with(|b| b.borrow_mut().take()) else { return };
     for seg in segs {
         match seg {
-            Seg::Wgsl(enc, _keep) => {
+            Seg::Wgsl(enc, _keep, pass) => {
+                // ⚠ ORDER. The pass borrows the encoder's recording state; `forget_lifetime` hid
+                // that from the compiler, so dropping it first is now a hand-maintained invariant.
+                drop(pass);
                 ctx.queue.submit([enc.finish()]);
                 SUBMITS.with(|c| c.set(c.get() + 1));
             }
@@ -1930,6 +2088,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         default: { r = v; }
     }
     out[i] = r;
+}
+"#;
+
+const REL_SHIFT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;    // [t, 2t-1]
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;  // [t, t]
+@group(0) @binding(2) var<storage,read>        info: array<u32>; // t, np, row_stride
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[2]; let t = info[0]; let np = info[1];
+    if (i >= t * t) { return; }
+    let r = i / t; let c = i % t;
+    // (t-1) - r + c is in [0, 2t-2] for r,c in [0,t), so it never leaves the row.
+    out[i] = x[r * np + (t - 1u - r + c)];
 }
 "#;
 
@@ -2496,6 +2668,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Input gradient of conv2d (the stride-aware transposed convolution): for each input element,
 // gather every output position whose window covered it. Same info table as the forward.
+
+// Depthwise 2D convolution: each output channel reads ONE input channel. Weights are [kh, kw, 1, C]
+// — the `[kh,kw,c_in,c_out]` layout with c_in == 1, which is exactly how a depthwise stage is stored
+// and exactly what `conv2d`'s `c == wc_c` assert rejects when the activations carry C channels.
+//
+// ⚠ The weight index is `(ky*kw + kx) * C + oc`, NOT `... * c_in * C`. With c_in == 1 those are the
+// same arithmetic, which is why the shared kernel LOOKED reusable; the difference is that here `oc`
+// selects the input channel too, so there is no reduction over c_in at all.
+const DEPTHWISE_CONV2D_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;   // [n, h, w, c]
+@group(0) @binding(1) var<storage,read>        wt: array<f32>;  // [kh, kw, 1, c]
+@group(0) @binding(2) var<storage,read_write>  out: array<f32>; // [n, ho, wo, c]
+@group(0) @binding(3) var<storage,read>        info: array<u32>; // n,h,w,c,kh,kw,ho,wo,sh,sw,ph,pw,rs
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * info[12];
+    let n = info[0]; let h = info[1]; let w = info[2]; let c = info[3];
+    let kh = info[4]; let kw = info[5]; let ho = info[6]; let wo = info[7];
+    if (i >= n * ho * wo * c) { return; }
+    let oc = i % c; let r1 = i / c;
+    let xo = r1 % wo; let r2 = r1 / wo;
+    let yo = r2 % ho; let b = r2 / ho;
+    var acc = 0.0;
+    for (var ky: u32 = 0u; ky < kh; ky = ky + 1u) {
+        let yi = i32(yo * info[8]) + i32(ky) - i32(info[10]);
+        if (yi < 0 || yi >= i32(h)) { continue; }
+        for (var kx: u32 = 0u; kx < kw; kx = kx + 1u) {
+            let xi = i32(xo * info[9]) + i32(kx) - i32(info[11]);
+            if (xi < 0 || xi >= i32(w)) { continue; }
+            acc = acc + x[((b * h + u32(yi)) * w + u32(xi)) * c + oc] * wt[(ky * kw + kx) * c + oc];
+        }
+    }
+    out[i] = acc;
+}
+"#;
+
 const CONV2D_DX_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        g: array<f32>;   // [n, ho, wo, o]
 @group(0) @binding(1) var<storage,read>        wt: array<f32>;  // [kh, kw, c, o]

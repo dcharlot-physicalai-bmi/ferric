@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ferric — speech recognition in a tab</title>
+<style>
+  :root { --bg:#faf9f7; --fg:#1a1a18; --dim:#6b6862; --line:#e2ded7; --accent:#b3541e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#e8e6e1; --dim:#96928a; --line:#2c2c33; --accent:#e0824a; }
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); margin: 0;
+         font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .4rem; letter-spacing: -.02em; }
+  .sub { color: var(--dim); margin: 0 0 2rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin: 1.5rem 0; }
+  button { font: inherit; font-weight: 550; padding: .55rem 1.1rem; border-radius: 7px;
+           border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #out { border: 1px solid var(--line); border-radius: 9px; padding: 1.1rem 1.25rem;
+         min-height: 5.5rem; font-size: 1.15rem; background: color-mix(in srgb, var(--fg) 3%, var(--bg)); }
+  #out.empty { color: var(--dim); font-size: 1rem; }
+  #status { color: var(--dim); font-size: .9rem; font-variant-numeric: tabular-nums; min-height: 1.5rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1.2rem; margin: 2rem 0 0;
+       padding-top: 1.2rem; border-top: 1px solid var(--line); font-size: .9rem; }
+  dt { color: var(--dim); } dd { margin: 0; font-variant-numeric: tabular-nums; }
+</style>
+<main>
+  <h1>Speech recognition, entirely in this tab</h1>
+  <p class="sub">NVIDIA Parakeet CTC 1.1B on WebGPU, through Ferric — a pure-Rust runtime compiled to
+     WebAssembly. The model is fetched once; no server sees your audio.</p>
+
+  <div class="row">
+    <button id="load" class="primary">Load model (1.18 GB)</button>
+    <button id="rec" disabled>Record</button>
+    <button id="sample" disabled>Transcribe sample</button>
+    <input type="file" id="file" accept="audio/*" disabled hidden>
+    <button id="pick" disabled>Choose a file…</button>
+  </div>
+
+  <div id="out" class="empty">Transcript appears here.</div>
+  <p id="status"></p>
+
+  <dl>
+    <dt>Runtime</dt><dd id="m-rt">—</dd>
+    <dt>Model</dt><dd id="m-model">—</dd>
+    <dt>Speed</dt><dd id="m-speed">—</dd>
+  </dl>
+</main>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const status = (s) => { $('status').textContent = s; };
+const show = (t) => { $('out').textContent = t || '(silence)'; $('out').classList.toggle('empty', !t); };
+let model = null, ctx = null, rec = null, chunks = [];
+
+// 16 kHz is REQUESTED here, not assumed downstream. Web Audio resamples on decode, and `transcribe`
+// rejects any other rate rather than producing a confident wrong transcript from misplaced filters.
+const audio = () => (ctx ||= new AudioContext({ sampleRate: 16000 }));
+
+$('load').onclick = async () => {
+  $('load').disabled = true;
+  try {
+    const m = await import('/pkg/ferric_web.js'); await m.default();
+    if (!navigator.gpu) { status('This browser has no WebGPU.'); return; }
+    status('downloading model…');
+    const t0 = performance.now();
+    const bytes = new Uint8Array(await (await fetch('/speech.gguf')).arrayBuffer());
+    status('loading onto the GPU…');
+    model = await m.FerricModel.load(bytes);
+    $('m-rt').textContent = model.info();
+    $('m-model').textContent = `parakeet-ctc-1.1b · ${(bytes.length / 1e9).toFixed(2)} GB`;
+    status(`ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    for (const b of ['rec', 'sample', 'pick']) $(b).disabled = false;
+  } catch (e) { status('load failed: ' + e); $('load').disabled = false; }
+};
+
+async function run(arrayBuffer, label) {
+  const buf = await audio().decodeAudioData(arrayBuffer);
+  status(`transcribing ${buf.duration.toFixed(1)} s…`);
+  const t0 = performance.now();
+  const text = await model.transcribe(buf.getChannelData(0), buf.sampleRate);
+  const s = (performance.now() - t0) / 1000;
+  show(text);
+  $('m-speed').textContent = `${s.toFixed(1)} s for ${buf.duration.toFixed(1)} s — ${(buf.duration / s).toFixed(1)}× realtime`;
+  status(label);
+}
+
+$('sample').onclick = async () => run(await (await fetch('/sample.wav')).arrayBuffer(), 'sample clip');
+$('pick').onclick = () => $('file').click();
+$('file').onchange = async (e) => { const f = e.target.files[0]; if (f) run(await f.arrayBuffer(), f.name); };
+
+// Headless entry for speech_test.mjs: same code path the buttons take, one call, returns the text.
+// Kept in the page rather than duplicated in the test, so the automated check exercises what a
+// visitor actually runs — a test against a parallel copy stops proving anything the moment they drift.
+window.runSpeech = async () => {
+  const m = await import('/pkg/ferric_web.js'); await m.default();
+  if (!navigator.gpu) return 'NO_WEBGPU';
+  model = await m.FerricModel.load(new Uint8Array(await (await fetch('/speech.gguf')).arrayBuffer()));
+  const buf = await audio().decodeAudioData(await (await fetch('/sample.wav')).arrayBuffer());
+  return await model.transcribe(buf.getChannelData(0), buf.sampleRate);
+};
+
+$('rec').onclick = async () => {
+  if (rec && rec.state === 'recording') { rec.stop(); return; }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  rec = new MediaRecorder(stream); chunks = [];
+  rec.ondataavailable = (e) => chunks.push(e.data);
+  rec.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    $('rec').textContent = 'Record'; $('rec').classList.remove('primary');
+    // decodeAudioData handles whatever container MediaRecorder chose (webm/opus on Chrome) and
+    // resamples to the AudioContext's 16 kHz, so no codec or resampler ships in the page.
+    await run(await new Blob(chunks).arrayBuffer(), 'from microphone');
+  };
+  rec.start(); $('rec').textContent = 'Stop'; $('rec').classList.add('primary');
+  status('recording — click Stop when done');
+};
+</script>

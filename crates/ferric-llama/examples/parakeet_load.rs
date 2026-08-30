@@ -18,9 +18,24 @@ async fn run() {
     // Every count is asserted, not printed and eyeballed: a loader that silently built 0 blocks
     // would otherwise "succeed".
     assert_eq!(m.blocks.len(), m.cfg.n_layers, "block count");
-    assert_eq!(m.pred.lstm.len(), m.cfg.pred_layers, "lstm layer count");
     assert!(!m.pre_conv.is_empty(), "no pre-encode convs");
-    assert_eq!(m.tokens.len(), m.cfg.vocab, "vocab");
-    println!("  all {} blocks, {} lstm layers, {} tokens — no missing tensor",
-             m.blocks.len(), m.pred.lstm.len(), m.tokens.len());
+    // ⚠ `vocab` COUNTS THE BLANK; the token table does not. A CTC head emits `vocab` logits where the
+    // last index is the blank — a control symbol with no piece string — so a 1025-wide head carries
+    // 1024 pieces. Asserting equality failed on every CTC file; asserting nothing would have let a
+    // genuinely truncated table through. Both accepted shapes are named instead.
+    assert!(m.tokens.len() == m.cfg.vocab || m.tokens.len() + 1 == m.cfg.vocab,
+            "token table is {} for a {}-wide head; expected {} (no blank piece) or {}",
+            m.tokens.len(), m.cfg.vocab, m.cfg.vocab - 1, m.cfg.vocab);
+    // ⚠ The decoder is OPTIONAL. A CTC export carries no predictor at all, so asserting on one
+    // unconditionally fails the whole family — `rnnt` is an Option precisely because half the
+    // shipped Parakeet files are CTC-only, and a file with NEITHER head is the real defect.
+    let lstms = match &m.rnnt {
+        Some((pred, _)) => {
+            assert_eq!(pred.lstm.len(), m.cfg.pred_layers, "lstm layer count");
+            pred.lstm.len()
+        }
+        None => { assert!(m.ctc_head.is_some(), "file has neither an RNN-T decoder nor a CTC head"); 0 }
+    };
+    println!("  all {} blocks, {lstms} lstm layers, {} tokens — no missing tensor",
+             m.blocks.len(), m.tokens.len());
 }

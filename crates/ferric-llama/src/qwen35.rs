@@ -311,8 +311,10 @@ impl MoeExperts {
 /// `GgufSource::raw_range` is lazy but borrows the source; a streaming cache outlives the loader
 /// that built it, so it needs its own handle. `tensor_file_range` hands over the path and the
 /// absolute offset, and this owns a `FileBacking` on it.
+#[cfg(not(target_arch = "wasm32"))]
 struct RangeBacking { f: ferric_tier::FileBacking, base: u64, len: u64 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ferric_tier::Backing for RangeBacking {
     fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ferric_tier::TierError> {
         let end = off + dst.len() as u64;
@@ -329,8 +331,10 @@ impl ferric_tier::Backing for RangeBacking {
 /// + o` addressing — and that interleaving exists nowhere on disk: gate and up are two separate
 /// tensors. So a per-expert read is two reads, and this is the only place that knows it. Reads must
 /// be whole experts; a partial one would silently straddle the seam between the two tensors.
+#[cfg(not(target_arch = "wasm32"))]
 struct PairBacking { g: RangeBacking, u: RangeBacking, g_per: usize, u_per: usize }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ferric_tier::Backing for PairBacking {
     fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ferric_tier::TierError> {
         let per = (self.g_per + self.u_per) as u64;
@@ -622,6 +626,15 @@ pub(crate) fn yarn_freq_scale(n_rot: usize, base: f32, factor: f32, orig_ctx: us
 /// Returns `Ok(None)` when the source cannot say where its tensors live on disk — an in-memory or
 /// converted source, for instance — so the caller falls back to the resident path rather than
 /// silently reading everything into a "streaming" cache, which is what the first version did.
+/// In the browser there is no file to range-read — a model arrives as bytes already in memory — so
+/// this takes the SAME `Ok(None)` path an in-memory source takes natively, and the caller loads
+/// experts resident. Gated rather than deleted: expert streaming is what lets native run a model
+/// larger than VRAM, and wasm32's 4 GB address space makes that moot, not merely unimplemented.
+#[cfg(target_arch = "wasm32")]
+fn try_streamed(_ctx: &Arc<Context>, _g: &impl GgufSource, _il: usize, _cfg: &Cfg, _c: usize, _dt: u32)
+    -> Result<Option<StreamedExperts>, String> { Ok(None) }
+
+#[cfg(not(target_arch = "wasm32"))]
 fn try_streamed(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, c: usize, dt: u32)
     -> Result<Option<StreamedExperts>, String>
 {
@@ -828,21 +841,34 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Re
 /// position is NOT the layer index — the caller reconstructs it from its own list of MoE layers.
 pub mod route_trace {
     use ferric_tensor::Tensor;
+    #[cfg(not(target_arch = "wasm32"))]
     use std::sync::{Mutex, OnceLock};
 
+    // ⚠ Native only. A wgpu `Buffer` on the web backend is `Rc<RefCell<..>>`-based and therefore
+    // neither Send nor Sync, so a `static Mutex<Vec<Tensor>>` cannot exist there. The browser has no
+    // env var to enable this with either — `enabled()` is false — so the trace is a native
+    // diagnostic by construction, not a feature the browser is missing.
+    #[cfg(not(target_arch = "wasm32"))]
     static SINK: OnceLock<Mutex<Vec<Tensor>>> = OnceLock::new();
+    #[cfg(not(target_arch = "wasm32"))]
     fn sink() -> &'static Mutex<Vec<Tensor>> { SINK.get_or_init(|| Mutex::new(Vec::new())) }
 
     /// Gated on `FERRIC_ROUTE_TRACE`, so the traced and untraced paths differ by one env read.
     pub fn enabled() -> bool { std::env::var("FERRIC_ROUTE_TRACE").is_ok() }
 
     /// Record one MoE layer's `[T, 2k]` selection tensor. Cheap: an `Arc` clone.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn record(t: Tensor) { if let Ok(mut g) = sink().lock() { g.push(t) } }
+    #[cfg(target_arch = "wasm32")]
+    pub fn record(_t: Tensor) {}
 
     /// Drain everything recorded so far, in call order.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take() -> Vec<Tensor> {
         sink().lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
     }
+    #[cfg(target_arch = "wasm32")]
+    pub fn take() -> Vec<Tensor> { Vec::new() }
 }
 
 impl Qwen35 {

@@ -44,8 +44,16 @@ jobs:
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
         # than asserted in a doc. ferric-kv in particular documents its scheduler tests as running
         # "on any target including wasm" — that only means something if wasm is actually compiled.
+        #
+        # ⚠ ferric-llama AND ferric-web ARE THE POINT, and they were the two missing from this list.
+        # The leaf crates all compiled, so this step passed green while `wasm-pack build
+        # crates/ferric-web` — the command that actually produces the browser bundle — had been
+        # failing outright: qwen35.rs used `ferric_tier::FileBacking`, which ferric-tier gates out of
+        # wasm, and a `static Mutex<Vec<Tensor>>` that cannot exist where wgpu's Buffer is Rc-based.
+        # A wasm gate that omits the browser crate is not a wasm gate. Keep this list ending in the
+        # two crates below, and prefer adding new crates ahead of them.
         run: |
-          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer; do
+          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer ferric-llama ferric-web; do
             echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
           done
 
@@ -140,8 +148,16 @@ jobs:
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
         # than asserted in a doc. ferric-kv in particular documents its scheduler tests as running
         # "on any target including wasm" — that only means something if wasm is actually compiled.
+        #
+        # ⚠ ferric-llama AND ferric-web ARE THE POINT, and they were the two missing from this list.
+        # The leaf crates all compiled, so this step passed green while `wasm-pack build
+        # crates/ferric-web` — the command that actually produces the browser bundle — had been
+        # failing outright: qwen35.rs used `ferric_tier::FileBacking`, which ferric-tier gates out of
+        # wasm, and a `static Mutex<Vec<Tensor>>` that cannot exist where wgpu's Buffer is Rc-based.
+        # A wasm gate that omits the browser crate is not a wasm gate. Keep this list ending in the
+        # two crates below, and prefer adding new crates ahead of them.
         run: |
-          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer; do
+          for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer ferric-llama ferric-web; do
             echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
           done
 

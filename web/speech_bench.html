@@ -1,0 +1,39 @@
+<!doctype html><meta charset="utf-8"><title>browser speech bench</title><pre id="log"></pre>
+<script type="module">
+// Loads the model ONCE, then transcribes N times — the browser twin of `parakeet_bench`.
+// Measuring per-invocation page loads would charge every utterance for a 1.18 GB fetch and GPU
+// upload, which is exactly the error that made the first native energy figure ~3x too high.
+window.RESULTS = null;
+window.runBench = async (iters) => {
+  const m = await import('/pkg/ferric_web.js'); await m.default();
+  if (!navigator.gpu) return 'NO_WEBGPU';
+  const t0 = performance.now();
+  const model = await m.FerricModel.load(new Uint8Array(await (await fetch('/speech.gguf')).arrayBuffer()));
+  const load_s = (performance.now() - t0) / 1000;
+  const ac = new AudioContext({ sampleRate: 16000 });
+  const buf = await ac.decodeAudioData(await (await fetch('/sample.wav')).arrayBuffer());
+  const pcm = buf.getChannelData(0);
+  // One warm-up outside the measured set: the first call compiles pipelines and allocates, which
+  // is a startup cost, not a per-utterance one.
+  await model.transcribe(pcm, buf.sampleRate);
+  const ms = [];
+  await new Promise(r => setTimeout(r, 1200));     // let the sampler settle on a warm idle
+  // ⚠ WALL-CLOCK BOUNDS FOR THE ENERGY WINDOW. Power must be integrated over the work interval and
+  // nothing else. A first version sampled from process start to process exit; the browser hung on
+  // close, so 3.7 s of transcription was averaged against 72 MINUTES of idle and the marginal came
+  // out at 0.08 J — a spectacular, entirely fictional number that the positive-sign assertion
+  // happily passed. A sign check catches sign errors, not window mismatch.
+  model.reset_op_counters();
+  const t_start = Date.now();
+  for (let i = 0; i < iters; i++) {
+    const t = performance.now();
+    await model.transcribe(pcm, buf.sampleRate);
+    ms.push(performance.now() - t);
+  }
+  const t_end = Date.now();
+  const [dispatches, submits] = model.op_counters();
+  window.RESULTS = { load_s, audio_s: buf.duration, ms, t_start, t_end,
+                     dispatches: dispatches / iters, submits: submits / iters };
+  return JSON.stringify(window.RESULTS);
+};
+</script>

@@ -45,6 +45,7 @@ builds fully offline from vendored source.
 | **Generates REAL text** — HF tokenizer + greedy decode | *"The capital of France is the capital of the country."* |
 | **Model families** — BitNet/PrismML (ternary), Liquid LFM2 (conv1d), EBM (Langevin), JEPA/V-JEPA2 | all validated |
 | **Runs a CURRENT flagship** — Qwen3.6-27B (2026 GDN-hybrid: 48 gated-delta-net + 16 full-attn, Q4_K_M) on the OpenAI server | coherent (*"…Tokyo … Senso-ji Temple"*) |
+| **Speech recognition** — NVIDIA Parakeet, Conformer encoder with both CTC and RNN-T decoders, native **and in a browser tab** | full LibriSpeech test-clean (2620 utts, 52,576 words): **2.07% WER** ctc-1.1b Q8_0, **1.77% WER** unified-0.6b f16. Browser transcript identical to native. Encode is fully on the GPU: 5.86 s of audio in **392 ms** (ctc-1.1b, 14.9x realtime). Browser costs FEWER joules than native (19.5 J vs 26.0 J per transcription) |
 | **Structured output** — in-runtime constrained JSON (schema: required/optional, int `min`/`max`, `maxLength`, typed/bounded arrays, enum), native + browser/WebGPU | schema-conformant on Qwen3.6-27B |
 
 ## Crates
@@ -57,6 +58,15 @@ builds fully offline from vendored source.
 
 ## Quickstart
 ```bash
+# Speech recognition, and the WER that backs the claim above. Downloads test-clean from OpenSLR;
+# scores CORPUS WER (total edits / total reference words) against the corpus's own .trans.txt files.
+cargo run -p ferric-llama --release --example librispeech_wer -- \
+    parakeet-ctc-1.1b.gguf /path/to/LibriSpeech/test-clean
+
+# The same model in a browser tab — WebGPU, no server in the inference path:
+#   ./web/build.sh && ln -sf /path/to/parakeet-ctc-1.1b.gguf web/speech.gguf && ./web/serve.sh
+#   then open http://localhost:8770/speech.html and record, or drop in a file
+
 # a full multi-layer transformer LM forward pass, on your GPU, vs a CPU reference
 cargo run --release -p ferric-core --example tiny_llm
 

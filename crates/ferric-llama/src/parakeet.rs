@@ -49,6 +49,21 @@ pub struct Cfg {
     pub subsampling_channels: usize,
     /// `xscaling`: multiply the pre-encode output by sqrt(d_model). Off for some variants.
     pub xscaling: bool,
+    /// `(left, right)` attention context for a **cache-aware streaming** encoder, when the file
+    /// declares `att_context_style = "chunked_limited"` with non-negative limits. `None` means
+    /// full-context offline attention, which is what every unlimited (-1/-1) file wants.
+    ///
+    /// Decoding such a model OFFLINE needs the mask but NOT the cache: with the whole utterance in
+    /// hand, the chunk structure is expressible as a single [T, T] additive mask. Streaming
+    /// *inference* — feeding audio incrementally — additionally needs the KV cache, still unbuilt.
+    pub att_ctx: Option<(usize, usize)>,
+    /// Right-hand context of the depthwise conv: `k/2` for the SYMMETRIC offline conformer, `0` for
+    /// the CAUSAL streaming one. Both run on the same causal kernel — symmetric right-pads by `k/2`
+    /// and shifts, causal does neither. Read from the file, never assumed.
+    pub conv_right: usize,
+    /// The conv module's normaliser. Offline parakeet ships BatchNorm (folded to affine at load);
+    /// the streaming encoder ships LayerNorm, which is a different op over a different axis.
+    pub conv_layernorm: bool,
     // ---- decoder ----
     pub pred_hidden: usize,
     pub pred_layers: usize,
@@ -161,25 +176,47 @@ impl Cfg {
         };
         let (cl, cr_att) = (ctx_of("stt.parakeet.encoder.att_context_left"),
                             ctx_of("stt.parakeet.encoder.att_context_right"));
+        let mut att_ctx: Option<(usize, usize)> = None;
+        let (mut conv_right, mut conv_layernorm) = (usize::MAX, false);   // MAX = "use k/2" below
         if cl >= 0 || cr_att >= 0 {
             let style = match md.get("stt.parakeet.encoder.att_context_style") {
                 Some(Meta::Str(v)) => v.clone(), _ => "chunked".into(),
             };
-            return Err(format!("parakeet variant limits attention context (style {style:?}, \
-                left {cl}, right {cr_att}); this runtime implements FULL-CONTEXT offline \
-                attention only. Streaming models need the chunk mask and cache — unimplemented"));
+            // Only the scheme whose mask rule was read from the reference is accepted. Any other
+            // limited style still refuses: a near-miss mask produces a fluent WRONG transcript, and
+            // that is precisely what this guard exists to prevent.
+            if style == "chunked_limited" && cl >= 0 && cr_att >= 0 {
+                att_ctx = Some((cl as usize, cr_att as usize));
+            } else {
+                return Err(format!("parakeet variant limits attention context (style {style:?}, \
+                    left {cl}, right {cr_att}); this runtime implements full-context attention and \
+                    the `chunked_limited` offline mask. Other limited styles are unimplemented"));
+            }
         }
             let cr = match md.get("stt.parakeet.encoder.conv_context_right") {
                 Some(Meta::U(v)) => *v as i64, Some(Meta::I(v)) => *v, _ => -1,
             };
             let ck = match md.get("stt.parakeet.encoder.conv_kernel") { Some(Meta::U(v)) => *v as i64, _ => 0 };
-            if cr >= 0 && ck > 0 && cr != ck / 2 {
+            // Two conv shapes are implemented: symmetric (right = k/2) and causal (right = 0).
+            // Anything between is a scheme nobody has written down here, so it still refuses.
+            if cr >= 0 && ck > 0 && cr != ck / 2 && cr != 0 {
                 return Err(format!("conv_context_right is {cr} for kernel {ck}: this runtime \
-                    implements the SYMMETRIC depthwise conv (right = k/2 = {}) only", ck / 2));
+                    implements the SYMMETRIC (right = k/2 = {}) and CAUSAL (right = 0) depthwise \
+                    convs only", ck / 2));
             }
-            if matches!(md.get("stt.parakeet.encoder.conv_norm_type"), Some(Meta::Str(v)) if v != "batch_norm") {
-                return Err("conv_norm_type is not batch_norm; this runtime folds BatchNorm's \
-                            running statistics and has no LayerNorm path in the conv module".into());
+            // ⚠ ONLY WHEN THE FILE DECLARES IT, and from `cr` itself — never derived from `ck`.
+            // `ck` is read under the `stt.parakeet.*` key, which an `asr`-naming file does not have,
+            // so it reads 0 there; `ck / 2` then silently selected the CAUSAL conv for the offline
+            // CTC model and took it from 0.0% to 100% WER. An absent key means "not declared", and
+            // the naming-aware fallback below is what knows the real kernel width.
+            if cr >= 0 { conv_right = cr as usize; }
+            match md.get("stt.parakeet.encoder.conv_norm_type") {
+                Some(Meta::Str(v)) if v == "layer_norm" => conv_layernorm = true,
+                Some(Meta::Str(v)) if v != "batch_norm" => {
+                    return Err(format!("conv_norm_type {v:?} in the conv module: this runtime \
+                                        implements batch_norm (folded) and layer_norm only"));
+                }
+                _ => {}
             }
             if md.get("stt.parakeet.prompt.field").is_some() {
                 return Err("prompt-conditioned (multilingual) parakeet: the decoder needs a \
@@ -203,7 +240,10 @@ impl Cfg {
         // asr.ctc.num_classes EXCLUDES the blank; the head emits num_classes + 1.
         let vocab = if ctc { u("asr.ctc.num_classes")? + 1 } else { u("stt.parakeet.predictor.vocab")? };
         Ok(Cfg {
-            naming, ctc, sample_rate, win_length, hop_length,
+            naming, ctc, sample_rate, win_length, hop_length, att_ctx, conv_layernorm,
+            conv_right: if conv_right == usize::MAX {
+                ua("stt.parakeet.encoder.conv_kernel", "asr.encoder.conv_kernel_size")? / 2
+            } else { conv_right },
             n_fft: ua("stt.frontend.n_fft", "asr.preprocessor.n_fft")?,
             num_mels: ua("stt.frontend.num_mels", "asr.preprocessor.features")?,
             f_min: f("stt.frontend.f_min", 0.0),
@@ -276,10 +316,6 @@ impl Norm {
     }
 }
 
-/// The conv module's BatchNorm. At inference it is affine — `running_*` are constants — so it is
-/// kept as four vectors and folded at forward time rather than needing a BatchNorm op.
-pub struct BatchNorm { pub w: Tensor, pub b: Tensor, pub mean: Tensor, pub var: Tensor }
-
 /// Relative-position multi-head attention (Transformer-XL style): `linear_pos` projects the
 /// positional encoding, and `pos_bias_u`/`pos_bias_v` are the learned content/position biases added
 /// to Q before the two score terms.
@@ -292,7 +328,17 @@ pub struct RelPosAttn {
 /// The Conformer convolution module: pointwise → GLU → depthwise (SYMMETRIC, not causal:
 /// `conv_context_left == conv_context_right == 4` for kernel 9) → batch-norm → SiLU → pointwise.
 pub struct ConvModule {
-    pub pw1: Linear, pub dw_w: Tensor, pub dw_b: Tensor, pub bn: BatchNorm, pub pw2: Linear,
+    pub pw1: Linear, pub dw_b: Tensor, pub pw2: Linear,
+    /// Depthwise weights already in the `[C, L]` order the kernel binds — hoisted out of the
+    /// forward pass, where re-reading them cost a readback per layer per call.
+    pub dw_w_ck: Tensor,
+    /// BatchNorm folded to an affine pair at LOAD time: `scale = w/sqrt(var+eps)` and
+    /// `shift = b - mean*scale`. Inference BatchNorm is constant, so it never needs its own op.
+    ///
+    /// For a LayerNorm conv module these are that norm's `weight`/`bias` instead, and `Cfg::
+    /// conv_layernorm` says which reading applies. The two are NOT interchangeable: BatchNorm's
+    /// affine is applied directly, LayerNorm first normalises each frame across channels.
+    pub bn_scale: Tensor, pub bn_shift: Tensor,
 }
 
 pub struct Block {
@@ -312,10 +358,49 @@ pub struct LstmLayer { pub wx: Tensor, pub wh: Tensor, pub b: Tensor }
 /// passed through the activation, and projected to the vocab.
 pub struct Joint { pub enc: Linear, pub pred: Linear, pub out: Linear }
 
+/// The RNN-T decoder's weights and encoder output, on the HOST. Read once per utterance; the decode
+/// that consumes them is sequential CPU work and touches the GPU not at all.
+pub struct RnntHost {
+    pub encv: Vec<f32>,
+    pub lw: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+    pub emb: Vec<f32>,
+    pub je: (Vec<f32>, Vec<f32>),
+    pub jp: (Vec<f32>, Vec<f32>),
+    pub jo: (Vec<f32>, Vec<f32>),
+}
+
+/// One stage of the pre-encode subsampling stack: `[kh, kw, c_in, c_out]` and its host-side weights.
+pub struct PreConv {
+    pub dims: Vec<usize>, pub w: Vec<f32>, pub b: Vec<f32>,
+    /// The same weights resident on the GPU: `[kh,kw,c_in,c_out]` and `[c_out]`. Uploaded once at
+    /// load — never per call, which is the mistake that deadlocked the browser. The host copies stay
+    /// so the CPU path remains available as a differential reference for the GPU one.
+    pub wt: Tensor, pub bt: Tensor,
+}
+
 pub struct Parakeet {
     pub ctx: Arc<Context>,
     pub cfg: Cfg,
-    pub pre_conv: Vec<(Tensor, Tensor)>,   // (weight [kh,kw,c,o], bias)
+    /// Collapse each encoder block's dispatches into one command buffer. ON by default: 2.3x on
+    /// Apple Silicon (9.8 s vs 22.4 s per encode, PAIRED — both arms measured back to back in one
+    /// process under identical load).
+    ///
+    /// ⚠ The pairing is the whole measurement. Comparing separate process launches said the
+    /// opposite, because wall-clock for one encode ranged 2.0–5.6 s run to run on a busy machine —
+    /// a spread far larger than the effect. Set `FERRIC_ASR_NOBATCH=1` to A/B it on another fabric.
+    ///
+    /// ⚠ AN ENV VAR IS NOT A TOGGLE IN THE BROWSER. `std::env::var` always returns `Err` on wasm32,
+    /// so reading the flag that way pinned this ON in a tab with no way to turn it off — the arm
+    /// that most needed measuring was the one that could not be measured. Set it directly instead.
+    pub batch_blocks: bool,
+    /// The subsampling stack's weights, held ON THE HOST because `pre_encode` is a CPU function.
+    ///
+    /// ⚠ These used to live as GPU `Tensor`s and be read back on every `encode()`. That is a
+    /// DEADLOCK in a browser, not a slow path: `pollster::block_on` waits on a buffer-mapping
+    /// future that can only complete when the JS event loop runs, and `block_on` is what stops it
+    /// running. The tab pinned forever, identically for 0.25 s and 5.86 s of audio, before a single
+    /// encoder block executed. Weights never change, so they are dequantised once, at load.
+    pub pre_conv: Vec<PreConv>,
     pub pre_out: Linear,
     pub blocks: Vec<Block>,
     /// RNN-T head. `None` on CTC files, which have no autoregressive decoder at all.
@@ -358,7 +443,22 @@ impl Parakeet {
             let t = g.tensor(&wn).expect("checked");
             let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
             let o = dims[3];
-            pre_conv.push((t1(&wn, &dims)?, t1z(&format!("{}.bias", cfg.naming.pre_conv(i)), &[o])?));
+            let bn = format!("{}.bias", cfg.naming.pre_conv(i));
+            let b = if g.tensor(&bn).is_some() { g.dequant(&bn)? } else { vec![0.0; o] };
+            let w = g.dequant(&wn)?;
+            // ⚠ TWO DIFFERENT LAYOUTS FOR THE SAME NUMBERS. The buffer is `[c_out][c_in][kh][kw]`
+            // (kw innermost) — which is what the CPU path indexes as `((o*cin + k)*kh + i)*kw + j`,
+            // and it is right because that path scores 0.0% WER. Ferric's `conv2d` and
+            // `depthwise_conv2d` both want `[kh][kw][c_in][c_out]` with c_out innermost.
+            //
+            // Handing the raw buffer over with `dims` attached declares a shape the data does not
+            // have: same element count, same rank, every index in range, no assert possible — and
+            // the differential check against the CPU path measured a RELATIVE error of 21x. Build it
+            // in memory order, then permute once, at load.
+            let mem = [dims[3], dims[2], dims[0], dims[1]];            // [c_out, c_in, kh, kw]
+            let wt = Tensor::from_vec(ctx, &w, &mem).permute(&[2, 3, 1, 0]).contiguous();
+            let bt = Tensor::from_vec(ctx, &b, &[o]);
+            pre_conv.push(PreConv { w, b, dims, wt, bt });
         }
         if pre_conv.is_empty() { return Err("no enc.pre_encode.conv.* tensors".into()); }
         let pre_out = Linear::load(ctx, g, cfg.naming.pre_out(), true)?;
@@ -382,19 +482,29 @@ impl Parakeet {
                     bias_v: t1(&b("attn.pos_bias_v"), &[cfg.n_heads, hd])?,
                 },
                 norm_conv: Norm::load(ctx, g, &b("norm_conv"), d)?,
-                conv: ConvModule {
-                    pw1: Linear::load(ctx, g, &b("conv.pointwise1.weight"), true)?,
-                    // [k, 1, d] as stored — kernel-major. Reshaping it to [d, k] here would have
-                    // the right element COUNT and the wrong order, which no assert would catch.
-                    dw_w: t1(&b("conv.depthwise.weight"), &[cfg.conv_kernel, 1, d])?,
-                    dw_b: t1z(&b("conv.depthwise.bias"), &[d])?,
-                    bn: BatchNorm {
-                        w: t1(&b("conv.bn.weight"), &[d])?,
-                        b: t1(&b("conv.bn.bias"), &[d])?,
-                        mean: t1(&b("conv.bn.running_mean"), &[d])?,
-                        var: t1(&b("conv.bn.running_var"), &[d])?,
-                    },
-                    pw2: Linear::load(ctx, g, &b("conv.pointwise2.weight"), true)?,
+                conv: {
+                    // Fold BatchNorm to an affine pair HERE, once, instead of reading four vectors
+                    // back per layer per forward. `y = (x-mean)/sqrt(var+eps)*w + b` is exactly
+                    // `x*scale + shift` with scale = w/sqrt(var+eps), shift = b - mean*scale.
+                    let (bw, bb) = (g.dequant(&b("conv.bn.weight"))?, g.dequant(&b("conv.bn.bias"))?);
+                    // A LayerNorm conv module ships weight/bias and NO running statistics — there is
+                    // nothing to fold, so they pass through as the norm's own parameters.
+                    let (scale, shift) = if cfg.conv_layernorm { (bw, bb) } else {
+                        let (bm, bv) = (g.dequant(&b("conv.bn.running_mean"))?, g.dequant(&b("conv.bn.running_var"))?);
+                        let scale: Vec<f32> = bw.iter().zip(&bv).map(|(w, v)| w / (v + 1e-5).sqrt()).collect();
+                        let shift: Vec<f32> = bb.iter().zip(bm.iter().zip(&scale)).map(|(b0, (m, s0))| b0 - m * s0).collect();
+                        (scale, shift)
+                    };
+                    // dw weights are stored [C, L] already (ne0 = 9 is INNERMOST); no transpose.
+                    let dwv = g.dequant(&b("conv.depthwise.weight"))?;
+                    ConvModule {
+                        pw1: Linear::load(ctx, g, &b("conv.pointwise1.weight"), true)?,
+                        dw_w_ck: Tensor::from_vec(ctx, &dwv, &[d, cfg.conv_kernel]),
+                        dw_b: t1z(&b("conv.depthwise.bias"), &[d])?,
+                        bn_scale: Tensor::from_vec(ctx, &scale, &[d]),
+                        bn_shift: Tensor::from_vec(ctx, &shift, &[d]),
+                        pw2: Linear::load(ctx, g, &b("conv.pointwise2.weight"), true)?,
+                    }
                 },
                 norm_ff2: Norm::load(ctx, g, &b("norm_ff2"), d)?,
                 ff2: (Linear::load(ctx, g, &b("ff2.linear1.weight"), true)?,
@@ -443,7 +553,8 @@ impl Parakeet {
         if tokens.len() != want {
             return Err(format!("{} tokens but the config implies {want}", tokens.len()));
         }
-        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, rnnt, ctc_head, fb, tokens })
+        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, rnnt, ctc_head, fb, tokens,
+                      batch_blocks: cfg!(target_arch = "wasm32") || std::env::var("FERRIC_ASR_NOBATCH").is_err() })
     }
 
     /// A load-time receipt. A schedule that silently collapsed shows up here rather than as a wrong
@@ -609,6 +720,51 @@ pub mod frontend {
     }
 }
 
+
+/// `pollster::block_on`, but it REFUSES on wasm instead of hanging.
+///
+/// A blocking readback in a browser is not a slow path, it is a deadlock: the buffer-mapping future
+/// completes only when the JS event loop runs, and `block_on` is what prevents it from running. The
+/// tab pins with no error, no progress and no console output, and it looks exactly like slow
+/// inference — which is how one such call in `pre_encode` survived long enough to burn an afternoon.
+/// Every readback below is either load-time or behind `FERRIC_ASR_DEBUG`; this makes a future one
+/// fail loudly at the first call rather than silently never returning.
+#[inline]
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = f;
+        panic!("parakeet: blocking GPU readback on wasm32 would deadlock the event loop — \
+                use transcribe_ctc_async, or hoist the value to load time");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pollster::block_on(f)
+}
+
+
+/// The `chunked_limited` additive mask as a flat `[T*T]` row-major buffer: `0.0` where a query may
+/// attend, `-1e30` where it may not.
+///
+/// A free function so it can be checked WITHOUT a checkpoint — no streaming model is available here
+/// to exercise this path end-to-end, so the mask rule is verified directly rather than taken on
+/// trust. See `examples/chunked_mask_check.rs`, which compares it against a transcription of
+/// `chunked_limited_mask_function` from `transformers/models/nemotron_asr_streaming` and separately
+/// asserts that rule differs from a sliding band — so the check cannot pass while blind to the one
+/// error it exists to catch.
+pub fn chunked_limited_mask(t: usize, left: usize, right: usize) -> Vec<f32> {
+    let chunk = right + 1;
+    let left_chunks = left / chunk;
+    let mut m = vec![0f32; t * t];
+    for q in 0..t {
+        let qc = q / chunk;
+        for kv in 0..t {
+            let d = qc as i64 - (kv / chunk) as i64;
+            if d < 0 || d > left_chunks as i64 { m[q * t + kv] = -1e30; }
+        }
+    }
+    m
+}
+
 // ============================================================================================
 // Encoder forward
 // ============================================================================================
@@ -625,17 +781,75 @@ impl Parakeet {
     /// channel-major (`c*n_freq + f`). The other order has the SAME element count and produces a
     /// different model — the class of bug that costs an afternoon, so it is named here as the first
     /// thing to suspect if the transcript is fluent nonsense.
+    /// Test hooks: both implementations are private, and the differential check in
+    /// `examples/pre_encode_ab.rs` needs to call them side by side. Exposed rather than duplicating
+    /// either one in the test, which would let the copy drift from what actually runs.
+    pub fn pre_encode_for_test(&self, mel: &[f32], frames: usize) -> (Vec<f32>, usize, usize) {
+        self.pre_encode(mel, frames)
+    }
+    pub fn pre_encode_gpu_for_test(&self, mel: &[f32], frames: usize) -> (Tensor, usize, usize) {
+        self.pre_encode_gpu(mel, frames)
+    }
+
+    /// **`pre_encode` on the GPU.** Returns `[T/8, C*F]`, the same tensor the CPU path flattens to.
+    ///
+    /// This is the last piece of the speech encoder that ran on the host, and it measured 38-65% of
+    /// total encode time — 255-299 ms of 739 ms at 80 mels, 439-527 ms of 738 ms at 128. It stayed
+    /// there because `conv2d` asserts `activations.c == weights.c_in`, which a depthwise stage
+    /// (`c_in = 1`) can never satisfy; `depthwise_conv2d` is that missing op.
+    ///
+    /// The stack is `[full] [dw, pw] [dw, pw]` with ReLU after the full conv and after each
+    /// pointwise — vec indices 0, 2, 4. ⚠ Those are positions in THIS vec, not GGUF name indices
+    /// (the file numbers them 0,2,3,5,6; the gaps were activations in the original Sequential).
+    fn pre_encode_gpu(&self, mel: &[f32], frames: usize) -> (Tensor, usize, usize) {
+        let c = &self.cfg;
+        let (mut h, mut w, mut ch) = (frames, c.num_mels, 1usize);
+        let mut cur = Tensor::from_vec(&self.ctx, mel, &[1, h, w, ch]);
+        for (idx, pc) in self.pre_conv.iter().enumerate() {
+            let (kh, kw, cin, cout) = (pc.dims[0], pc.dims[1], pc.dims[2], pc.dims[3]);
+            if kh == 1 && kw == 1 {
+                // Pointwise = a matmul over every (t,f) position.
+                //
+                // ⚠ `pc.wt` was ALREADY permuted to `[kh,kw,c_in,c_out]` at load, so a 1x1 stage is
+                // `[1,1,c_in,c_out]` — c_in-major, c_out innermost. That is exactly `[c_in, c_out]`,
+                // which plain `matmul` consumes. Reshaping it to `[c_out, c_in]` and calling
+                // `matmul_bt` (the layout the RAW file has, before the permute) transposes it: same
+                // element count, same output shape, wrong numbers.
+                let flat = cur.reshape(&[h * w, ch]);
+                let wt = pc.wt.reshape(&[cin, cout]);
+                cur = flat.matmul(&wt)
+                          .add(&pc.bt.reshape(&[1, cout]).broadcast_to(&[h * w, cout]))
+                          .reshape(&[1, h, w, cout]);
+                ch = cout;
+            } else {
+                // `c_in == 1` with multi-channel activations marks DEPTHWISE; `c_in == ch` is the
+                // ordinary full convolution (the first stage, 1 -> 256).
+                let (oh, ow) = ((h + 1) / 2, (w + 1) / 2);
+                cur = if cin == 1 && ch > 1 {
+                    cur.depthwise_conv2d(&pc.wt, (2, 2), (1, 1))
+                } else {
+                    cur.conv2d(&pc.wt, (2, 2), (1, 1))
+                }.add(&pc.bt.reshape(&[1, 1, 1, cout]).broadcast_to(&[1, oh, ow, cout]));
+                h = oh; w = ow; ch = cout;
+            }
+            if idx == 0 || idx == 2 || idx == 4 { cur = cur.relu(); }
+        }
+        // [1,h,w,ch] -> [h, ch*w], CHANNEL-MAJOR. NeMo does `transpose(1,2).reshape(b,t,-1)`, so the
+        // channel index is the OUTER one. The other order has the same element count.
+        let flat = cur.reshape(&[h, w, ch]).permute(&[0, 2, 1]).contiguous().reshape(&[h, ch * w]);
+        (flat, h, ch * w)
+    }
+
     fn pre_encode(&self, mel: &[f32], frames: usize) -> (Vec<f32>, usize, usize) {
         let c = &self.cfg;
         let (mut h, mut w, mut ch) = (frames, c.num_mels, 1usize);
         let mut cur = mel.to_vec();                      // [h][w][ch]
         let relu = |v: &mut Vec<f32>| v.iter_mut().for_each(|x| if *x < 0.0 { *x = 0.0 });
 
-        for (idx, (wt, bs)) in self.pre_conv.iter().enumerate() {
-            let wd = &wt.shape;                          // [kh, kw, c_in, c_out]
+        for (idx, pc) in self.pre_conv.iter().enumerate() {
+            let wd = &pc.dims;                           // [kh, kw, c_in, c_out]
             let (kh, kw, cin, cout) = (wd[0], wd[1], wd[2], wd[3]);
-            let wv = pollster::block_on(wt.to_vec());
-            let bv = pollster::block_on(bs.to_vec());
+            let (wv, bv) = (&pc.w, &pc.b);
             if kh == 1 && kw == 1 {
                 // Pointwise: a plain [in → out] matmul over every (t, f) position.
                 let mut out = vec![0f32; h * w * cout];
@@ -708,7 +922,7 @@ impl Parakeet {
     ///
     /// The **halves are not decoration** — Conformer's macaron FFNs each contribute 0.5·output to
     /// the residual, and using 1.0 doubles the FFN's influence on every one of 24 blocks.
-    fn block(&self, x: &Tensor, b: &Block, pos: &Tensor) -> Tensor {
+    fn block(&self, x: &Tensor, b: &Block, pos: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let d = self.cfg.d_model;
         // No scalar-multiply op on Tensor; `scalar` makes a [1] tensor to broadcast against.
         let half = |t: &Tensor| t.mul(&t.scalar(0.5).broadcast_to(&t.shape));
@@ -720,7 +934,7 @@ impl Parakeet {
 
         // ---- relative-position self-attention ----
         let h = b.norm_attn.apply(&x, Self::EPS);
-        let x = x.add(&self.rel_pos_attn(&h, &b.attn, pos));
+        let x = x.add(&self.rel_pos_attn(&h, &b.attn, pos, mask));
 
         // ---- convolution module ----
         let h = b.norm_conv.apply(&x, Self::EPS);
@@ -735,17 +949,17 @@ impl Parakeet {
         // weight rms while every other block tracks at ~1.2x. Either its pre-norm residual has
         // collapsed, or its bias cancels the scale — these need different fixes.
         if std::env::var("FERRIC_ASR_DEBUG").is_ok() && std::ptr::eq(b, self.blocks.last().unwrap()) {
-            let f = |t: &Tensor| { let v = pollster::block_on(t.to_vec());
+            let f = |t: &Tensor| { let v = block_on(t.to_vec());
                                    (v.iter().map(|z| z * z).sum::<f32>() / v.len() as f32).sqrt() };
-            let bb = pollster::block_on(b.norm_out.b.to_vec());
+            let bb = block_on(b.norm_out.b.to_vec());
             let br = (bb.iter().map(|z| z * z).sum::<f32>() / bb.len() as f32).sqrt();
             eprintln!("       [last] pre-norm residual rms={:.4}  norm_out bias rms={br:.4}", f(&x));
             // Two implementations of the same LayerNorm. If they agree, the op is right and the
             // 0.044 is what these weights genuinely produce — meaning my expectation (output ~
             // rms(w)) is what is wrong, because rms(w) is dominated by a few large entries while
             // most are small. If they disagree, the GPU op is wrong at this shape.
-            let xv = pollster::block_on(x.to_vec());
-            let wv = pollster::block_on(b.norm_out.w.to_vec());
+            let xv = block_on(x.to_vec());
+            let wv = block_on(b.norm_out.w.to_vec());
             let dd = self.cfg.d_model;
             let rows = xv.len() / dd;
             let mut acc = 0f64;
@@ -784,7 +998,30 @@ impl Parakeet {
     /// offset `i - j`. `u` and `v` are the learned content and position biases (`pos_bias_u/v`);
     /// folding them into one term, or dropping the shift, both yield finite scores and a model that
     /// attends to the wrong places.
-    fn rel_pos_attn(&self, x: &Tensor, a: &RelPosAttn, pos: &Tensor) -> Tensor {
+
+    /// The `chunked_limited` additive attention mask, `[T, T]`, or `None` for full context.
+    ///
+    /// ⚠ CHUNK-WISE, NOT A SLIDING WINDOW. Transcribed from the reference
+    /// (`transformers/models/nemotron_asr_streaming`, `chunked_limited_mask_function`):
+    /// ```text
+    /// chunk_size          = right + 1
+    /// left_context_chunks = left / chunk_size
+    /// allowed(q, kv)      = 0 <= (q/chunk_size - kv/chunk_size) <= left_context_chunks
+    /// ```
+    /// A sliding band `[i-left, i+right]` has the same flavour, the same shape and the same element
+    /// count — and is a different model. Within its own chunk a query sees the WHOLE chunk, future
+    /// frames included; that lookahead IS the right context. Guessing here would have produced a
+    /// fluent wrong transcript, so the rule was read rather than inferred.
+    ///
+    /// `-1e30` rather than `-inf`: softmax subtracts the row max first, and `-inf - -inf` is NaN.
+    /// Every row keeps its own chunk (`chunk_diff == 0` is always allowed), so no row is fully
+    /// masked — but a finite floor costs nothing and removes the failure mode entirely.
+    fn att_mask(&self, t: usize) -> Option<Tensor> {
+        let (left, right) = self.cfg.att_ctx?;
+        Some(Tensor::from_vec(&self.ctx, &chunked_limited_mask(t, left, right), &[t, t]))
+    }
+
+    fn rel_pos_attn(&self, x: &Tensor, a: &RelPosAttn, pos: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let (t, nh) = (x.shape[0], self.cfg.n_heads);
         let hd = self.cfg.d_model / nh;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -813,20 +1050,17 @@ impl Parakeet {
             let ac = qu_h.matmul_bt(&k_h);                 // [t, t]  content term
             let bd = qv_h.matmul_bt(&p_h);                 // [t, np] position term, unshifted
             // `rel_shift`: row i must read offset (i - j), which lives at column (T-1 + i - j).
-            let bdv = pollster::block_on(bd.to_vec());
-            let mut sh = vec![0f32; t * t];
-            for i in 0..t { for j in 0..t {
-                // ⭐ (T-1) - i + j, NOT (T-1) + i - j. Derived by unrolling the reference
-                // `_rel_shift` (pad(1,0) → view(-1,T) → drop row 0 → view(T,P) → slice to T):
-                // final[i,j] = bd[i, (T-1) - i + j]. The first version had the sign of the relative
-                // offset FLIPPED, so every head attended to the mirror of its intended distance —
-                // finite scores, plausible output, wrong model. Reading the code could not settle
-                // this; unrolling the reference's index arithmetic could.
-                sh[i * t + j] = bdv[i * np + (t - 1 - i + j)];
-            }}
-            let bd = Tensor::from_vec(&self.ctx, &sh, &[t, t]);
+            // ⭐ ON-DEVICE. This was a readback PER HEAD PER LAYER — 336 GPU→CPU syncs for a
+            // 42-layer 8-head encoder, the native latency ceiling and an absolute wasm blocker
+            // (a browser cannot block on a readback). `Tensor::rel_shift` does the same gather,
+            // `out[i,j] = bd[i, (T-1)-i+j]`, without leaving the device.
+            let bd = bd.rel_shift();
             let sum = ac.add(&bd);
-            let s = sum.mul(&sum.scalar(scale).broadcast_to(&sum.shape)).softmax(1);
+            let scaled = sum.mul(&sum.scalar(scale).broadcast_to(&sum.shape));
+            // The reference scales the position term and then fills -inf, so the mask lands on the
+            // SCALED logits — masking before the scale would multiply the floor by `scale`.
+            let scaled = match mask { Some(m) => scaled.add(m), None => scaled };
+            let s = scaled.softmax(1);
             heads.push(s.matmul(&v_h));                     // [t, hd]
         }
         let cat = heads.iter().skip(1).fold(heads[0].clone(), |a, b| a.cat(b, 1));
@@ -837,46 +1071,45 @@ impl Parakeet {
     fn conv_module(&self, x: &Tensor, c: &ConvModule) -> Tensor {
         let (t, d) = (x.shape[0], self.cfg.d_model);
         let k = self.cfg.conv_kernel;
-        // pointwise1 doubles the width for the GLU: half gates the other half.
+        // GLU on-device: the first half gates on the sigmoid of the second. `narrow` + `sigmoid` +
+        // `mul` are all GPU ops, so no readback — the host loop this replaces ran once per layer.
         let y = c.pw1.apply(x);                                     // [t, 2d]
-        let yv = pollster::block_on(y.to_vec());
-        let mut g = vec![0f32; t * d];
-        for i in 0..t { for j in 0..d {
-            let a = yv[i * 2 * d + j];
-            let b = yv[i * 2 * d + d + j];
-            g[i * d + j] = a * (1.0 / (1.0 + (-b).exp()));           // GLU: a ⊙ σ(b)
-        }}
-        let g = Tensor::from_vec(&self.ctx, &g, &[t, d]);
+        let g = y.narrow(1, 0, d).contiguous()
+                 .mul(&y.narrow(1, d, d).contiguous().sigmoid());   // [t, d]
 
-        // ⚠ SYMMETRIC, not causal. conv_context_left == conv_context_right == 4 for kernel 9, so the
-        // window is centred. Ferric only has a CAUSAL depthwise conv1d, and y_sym[t] = y_causal[t+4]
-        // once the signal is right-padded by 4 — so the existing kernel serves, with a shift.
-        let pad = k / 2;
-        let mut padded = pollster::block_on(g.to_vec());
-        padded.extend(std::iter::repeat(0.0).take(pad * d));
-        let gp = Tensor::from_vec(&self.ctx, &padded, &[t + pad, d]);
-        // ⚠ NO TRANSPOSE. GGUF dims [9, 1, 1024] list ne0 FIRST and ne0 is the INNERMOST axis, so
-        // the data is already w[c * 9 + k] — the [C, L] layout `depthwise_conv1d_causal` wants. The
-        // first version read it as [K][C] and transposed, scrambling every one of the 1024 kernels
-        // into a mix of nine different channels' taps. Same element count, same shapes, no assert
-        // could fire — the model just convolved with noise.
-        let dwv = pollster::block_on(c.dw_w.to_vec());
-        debug_assert_eq!(dwv.len(), d * k, "depthwise weight is {} floats, expected {}", dwv.len(), d * k);
-        let wk = Tensor::from_vec(&self.ctx, &dwv, &[d, k]);
-        let conv = gp.depthwise_conv1d_causal(&wk, k).narrow(0, pad, t).contiguous();
+        // ⚠ SYMMETRIC, not causal. conv_context_left == conv_context_right == k/2, so the window is
+        // centred. Ferric has only a CAUSAL depthwise conv1d, and y_sym[t] = y_causal[t+k/2] once
+        // the signal is right-padded — so the existing kernel serves, with a shift, and the pad is
+        // a `cat` with zeros rather than a host round-trip.
+        // Symmetric: right-pad by k/2 and drop the first k/2 outputs, so the causal kernel's window
+        // lands centred. Causal (streaming): the kernel is ALREADY what the model wants — no pad, no
+        // shift. Same kernel, two framings; the file says which.
+        let pad = self.cfg.conv_right;
+        let conv = if pad == 0 {
+            g.depthwise_conv1d_causal(&c.dw_w_ck, k)
+        } else {
+            let zeros = Tensor::from_vec(&self.ctx, &vec![0f32; pad * d], &[pad, d]);
+            g.cat(&zeros, 0).depthwise_conv1d_causal(&c.dw_w_ck, k).narrow(0, pad, t).contiguous()
+        };
 
-        // BatchNorm at inference is affine over the running statistics — no op needed.
-        let bnv = pollster::block_on(conv.to_vec());
-        let (mw, mb) = (pollster::block_on(c.bn.w.to_vec()), pollster::block_on(c.bn.b.to_vec()));
-        let (mm, mv) = (pollster::block_on(c.bn.mean.to_vec()), pollster::block_on(c.bn.var.to_vec()));
-        let dwb = pollster::block_on(c.dw_b.to_vec());
-        let mut o = vec![0f32; t * d];
-        for i in 0..t { for j in 0..d {
-            let z = bnv[i * d + j] + dwb[j];
-            let n = (z - mm[j]) / (mv[j] + 1e-5).sqrt() * mw[j] + mb[j];
-            o[i * d + j] = n * (1.0 / (1.0 + (-n).exp()));            // SiLU
-        }}
-        c.pw2.apply(&Tensor::from_vec(&self.ctx, &o, &[t, d]))
+        // BatchNorm at inference is affine over the running statistics, so it folds into ordinary
+        // broadcast arithmetic: ((x + dw_bias) - mean) * inv_std * weight + bias, then SiLU.
+        let row = |v: &Tensor| v.reshape(&[1, d]).broadcast_to(&[t, d]);
+        let z = conv.add(&row(&c.dw_b));
+        // ⚠ MULTIPLY THEN ADD. `(z + shift) * scale` has the same shapes, the same element count and
+        // the same op count as `z * scale + shift` — and scales the bias by inv_std. It produced a
+        // silent empty transcript, no assert, no NaN. Fold arithmetic is order-bearing.
+        //
+        // LayerNorm is NOT that affine with different numbers: it first centres and scales each
+        // frame across channels. Applying the folded-BatchNorm path to a LayerNorm checkpoint would
+        // run, and be wrong.
+        let n = if self.cfg.conv_layernorm {
+            Norm { w: c.bn_scale.clone(), b: c.bn_shift.clone() }.apply(&z, Self::EPS)
+        } else {
+            z.mul(&row(&c.bn_scale))         // inv_std * w
+             .add(&row(&c.bn_shift))         // b - mean * inv_std * w, precomputed at load
+        };
+        c.pw2.apply(&n.silu())
     }
 }
 
@@ -910,27 +1143,65 @@ impl Parakeet {
         let (mut mel, frames) = frontend::log_mel(pcm, &self.cfg);
         if frames == 0 { return Err("audio shorter than one analysis window".into()); }
         frontend::normalize_per_feature(&mut mel, frames, self.cfg.num_mels);
-        let (flat, t, width) = self.pre_encode(&mel, frames);
+        // ⚠ NATIVE ONLY. `Instant::now()` PANICS on wasm32 ("time not implemented on this
+        // platform") — it is not a no-op and not a zero. This probe, added to attribute encode time,
+        // is what broke browser speech while every native test stayed green: the tab panicked before
+        // the first conv. A diagnostic must not be able to take the product down on a platform it
+        // was never meant to run on.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _t_pre = std::time::Instant::now();
+        // GPU by default; `FERRIC_ASR_CPU_PRE=1` selects the host implementation it was ported from,
+        // which stays as the differential reference (`examples/pre_encode_ab.rs`).
+        let cpu_pre = cfg!(not(target_arch = "wasm32")) && std::env::var("FERRIC_ASR_CPU_PRE").is_ok();
+        let (x, t, width) = if cpu_pre {
+            let (flat, t, width) = self.pre_encode(&mel, frames);
+            (Tensor::from_vec(&self.ctx, &flat, &[t, width]), t, width)
+        } else {
+            self.pre_encode_gpu(&mel, frames)
+        };
+        // Attribute the encode: the subsampling stack used to run on the CPU and scale with
+        // num_mels, which was 38-65% of total encode time — 255-299 ms of 739 ms at 80 mels,
+        // 439-527 ms of 738 ms at 128. Kept as a probe so a regression back onto the host is visible.
+        #[cfg(not(target_arch = "wasm32"))]
+        let pre_ms = _t_pre.elapsed().as_secs_f64() * 1000.0;
         if t == 0 { return Err("audio too short to survive 8x subsampling".into()); }
-        let x = Tensor::from_vec(&self.ctx, &flat, &[t, width]);
+        let _ = width;
         let mut x = self.pre_out.apply(&x);
         if self.cfg.xscaling {
             let s = (self.cfg.d_model as f32).sqrt();
             x = x.mul(&x.scalar(s).broadcast_to(&x.shape));
         }
         let pos = self.rel_pos_encoding(t);
+        // Once per encode, not per layer: it depends only on T and the declared context.
+        let mask = self.att_mask(t);
         let dbg = std::env::var("FERRIC_ASR_DEBUG").is_ok();
-        let rms = |t: &Tensor| { let v = pollster::block_on(t.to_vec());
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var("FERRIC_ASR_TIME").is_ok() {
+            eprintln!("       pre_encode({}) {pre_ms:.0} ms for {frames} frames x {} mels -> t={t}",
+                      if cpu_pre { "CPU" } else { "GPU" }, self.cfg.num_mels);
+        }
+        let rms = |t: &Tensor| { let v = block_on(t.to_vec());
                                  (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt() };
         if dbg { eprintln!("       pre_encode out rms={:.4} (after xscaling)", rms(&x)); }
         for (i, b) in self.blocks.iter().enumerate() {
-            x = self.block(&x, b, &pos);
+            // ⭐ ONE COMMAND BUFFER PER BLOCK. `batch()` defers dispatches into a single submit, and
+            // `readback()` flushes it — so while the encoder read tensors back per head per layer,
+            // batching was a no-op by construction. Removing those readbacks is what made this
+            // possible; the two changes only pay off together.
+            //
+            // ⚠ PER BLOCK, NOT PER ENCODER. A batch retains every intermediate buffer until it
+            // flushes, and one wrapper around all 42 layers holds ~1 GB of [t, 2t-1] score matrices
+            // alone (8 heads x 42 layers x 2.7 MB) plus everything else. That exhausted the device
+            // and surfaced as `Buffer with 'staging' label is invalid` from the NEXT readback —
+            // an allocation failure reported at an unrelated call, several ops later.
+            x = if self.batch_blocks { ferric_tensor::batch(&self.ctx, || self.block(&x, b, &pos, mask.as_ref())) }
+                else { self.block(&x, b, &pos, mask.as_ref()) };
             // Where does the signal die? LayerNorm's eps floors any block whose residual variance
             // falls below ~1e-5, so a collapse shows as a step change here, not a gradual decay.
             if dbg {
                 // Print the block's OWN norm_out weight beside its output: LayerNorm output should
                 // track its weight, so the two diverging is the signature of an eps-floored input.
-                let w = pollster::block_on(b.norm_out.w.to_vec());
+                let w = block_on(b.norm_out.w.to_vec());
                 let wr = (w.iter().map(|z| z * z).sum::<f32>() / w.len() as f32).sqrt();
                 eprintln!("       block {i:>2} out rms={:.4}  norm_out w rms={wr:.4}", rms(&x));
             }
@@ -974,8 +1245,25 @@ impl Parakeet {
     /// globally would turn "little" into "litle".
     fn decode_ctc(&self, enc: &Tensor, head: &Linear) -> Result<String, String> {
         let logits = head.apply(enc);
-        let v = pollster::block_on(logits.to_vec());
-        let (t, nv) = (enc.shape[0], self.cfg.vocab);
+        let v = block_on(logits.to_vec());
+        self.collapse_ctc(&v, enc.shape[0])
+    }
+
+    /// The async half of the CTC path, for wasm — where `block_on` is not merely slow but illegal
+    /// on the main thread. The encoder itself no longer reads anything back, so this ONE await is
+    /// the entire GPU→CPU boundary of browser speech recognition.
+    pub async fn transcribe_ctc_async(&self, pcm: &[f32]) -> Result<String, String> {
+        let head = self.ctc_head.as_ref().ok_or("this model has no CTC head")?;
+        let enc = self.encode(pcm)?;
+        let v = head.apply(&enc).to_vec().await;
+        self.collapse_ctc(&v, enc.shape[0])
+    }
+
+    /// Greedy argmax + run collapse. Shared by the sync and async entry points so there is exactly
+    /// one implementation of the decode rule — two copies would be free to drift apart silently,
+    /// and only one of them is exercised by the native tests.
+    fn collapse_ctc(&self, v: &[f32], t: usize) -> Result<String, String> {
+        let nv = self.cfg.vocab;
         let mut out: Vec<u32> = Vec::new();
         let mut prev = u32::MAX;
         for i in 0..t {
@@ -990,25 +1278,49 @@ impl Parakeet {
     }
 
     fn decode_rnnt(&self, enc: &Tensor) -> Result<String, String> {
+        let host = block_on(self.rnnt_host(enc))?;
+        self.decode_rnnt_with(&host)
+    }
+
+    /// Every GPU→CPU read the RNN-T decoder needs, gathered in one place and AWAITED.
+    ///
+    /// The decode itself is host-side and sequential — an LSTM over emitted tokens — so the only
+    /// thing standing between it and a browser was `block_on`, which deadlocks the event loop it is
+    /// waiting on. Splitting the reads out makes the same decode reachable from an async caller
+    /// without duplicating a line of the decode rule.
+    async fn rnnt_host(&self, enc: &Tensor) -> Result<RnntHost, String> {
         let (pred_w, joint_w) = self.rnnt.as_ref().ok_or("no RNN-T head")?;
-        let (t, d) = (enc.shape[0], self.cfg.d_model);
-        let encv = pollster::block_on(enc.to_vec());
+        let encv = enc.to_vec().await;
+        let mut lw = Vec::with_capacity(pred_w.lstm.len());
+        for l in &pred_w.lstm {
+            lw.push((l.wx.to_vec().await, l.wh.to_vec().await, l.b.to_vec().await));
+        }
+        let jb = |b: &Option<Tensor>| b.as_ref().expect("joint layers carry biases").clone();
+        Ok(RnntHost {
+            encv,
+            lw,
+            emb: pred_w.embed.to_vec().await,
+            je: (joint_w.enc.w.to_vec().await, jb(&joint_w.enc.b).to_vec().await),
+            jp: (joint_w.pred.w.to_vec().await, jb(&joint_w.pred.b).to_vec().await),
+            jo: (joint_w.out.w.to_vec().await, jb(&joint_w.out.b).to_vec().await),
+        })
+    }
+
+    /// **RNN-T greedy decode in a browser.** One await for the weights, then the same host decode.
+    pub async fn transcribe_rnnt_async(&self, pcm: &[f32]) -> Result<String, String> {
+        if self.rnnt.is_none() { return Err("this model has no RNN-T decoder".into()); }
+        let enc = self.encode(pcm)?;
+        let host = self.rnnt_host(&enc).await?;
+        self.decode_rnnt_with(&host)
+    }
+
+    fn decode_rnnt_with(&self, host: &RnntHost) -> Result<String, String> {
+        let (pred_w, joint_w) = self.rnnt.as_ref().ok_or("no RNN-T head")?;
+        let d = self.cfg.d_model;
+        let RnntHost { encv, lw, emb, je: (je_w, je_b), jp: (jp_w, jp_b), jo: (jo_w, jo_b) } = host;
+        let t = encv.len() / d;
         let h = self.cfg.pred_hidden;
         let nl = pred_w.lstm.len();
-
-        // Predictor weights to host once — the LSTM is sequential and tiny beside the encoder.
-        let lw: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = pred_w.lstm.iter()
-            .map(|l| (pollster::block_on(l.wx.to_vec()),
-                      pollster::block_on(l.wh.to_vec()),
-                      pollster::block_on(l.b.to_vec())))
-            .collect();
-        let emb = pollster::block_on(pred_w.embed.to_vec());
-        let (je_w, je_b) = (pollster::block_on(joint_w.enc.w.to_vec()),
-                            pollster::block_on(joint_w.enc.b.as_ref().unwrap().to_vec()));
-        let (jp_w, jp_b) = (pollster::block_on(joint_w.pred.w.to_vec()),
-                            pollster::block_on(joint_w.pred.b.as_ref().unwrap().to_vec()));
-        let (jo_w, jo_b) = (pollster::block_on(joint_w.out.w.to_vec()),
-                            pollster::block_on(joint_w.out.b.as_ref().unwrap().to_vec()));
         let jh = self.cfg.joint_hidden;
 
         if std::env::var("FERRIC_ASR_DEBUG").is_ok() {
@@ -1016,7 +1328,7 @@ impl Parakeet {
             let nf = encv.iter().filter(|x| !x.is_finite()).count();
             // Is 0.044 the LayerNorm weight, or a collapsed encoder? The final norm's own scale
             // answers that: LN output rms ~= rms(weight), so if they match the encoder is behaving.
-            let lnw = pollster::block_on(self.blocks.last().unwrap().norm_out.w.to_vec());
+            let lnw = block_on(self.blocks.last().unwrap().norm_out.w.to_vec());
             let lnr = (lnw.iter().map(|x| x * x).sum::<f32>() / lnw.len() as f32).sqrt();
             // Does the encoder DISCRIMINATE across time? A collapsed encoder gives every frame the
             // same vector, which produces exactly this symptom: a constant prior, blank always.

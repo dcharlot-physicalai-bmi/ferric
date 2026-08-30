@@ -17,6 +17,10 @@ crates/ferric-onnx/testdata/proj/
 
 # ad-hoc headless test scripts (hardcoded local Chrome path)
 crates/ferric-web/*_test.mjs
+# ...except the wasm RUN gate. A build gate cannot replace it: `std::env::var` returns Err on wasm32
+# and `Instant::now()` panics — both compile clean, both broke browser speech. This one takes Chrome
+# from $CHROME rather than hardcoding it, so the reason for the blanket rule does not apply.
+!crates/ferric-web/speech_test.mjs
 crates/ferric-web/site/pkg/
 .phase0/
 

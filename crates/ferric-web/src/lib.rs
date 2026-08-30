@@ -418,6 +418,11 @@ enum WebRuntime {
     /// BERT encoders — bge, gte, MiniLM, e5 and the cross-encoder rerankers. Embedding-only: there
     /// is no LM head to generate from, and `generate` refuses rather than inventing one.
     Bert(ferric_llama::bert::Bert),
+    /// Conformer speech encoders (NVIDIA Parakeet / nemotron ASR). CTC head ONLY in the browser:
+    /// the RNN-T decoder reads its LSTM and joint weights back to the host and steps them there,
+    /// which needs blocking reads wasm cannot do on the main thread. CTC's whole GPU→CPU boundary
+    /// is one await, so it is the arm that ports; RNN-T refuses rather than silently degrading.
+    Parakeet(ferric_llama::parakeet::Parakeet),
 }
 
 #[wasm_bindgen]
@@ -477,8 +482,15 @@ impl FerricModel {
         console_error_panic_hook::set_once();
         let err = |e: String| jserr(&e);
         let g = parse(model).map_err(err)?;
+        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        // ⚠ Read the ARCH before the tokenizer. A speech checkpoint has no text tokenizer at all —
+        // its vocab lives under `asr.tokenizer.vocab` and belongs to the Parakeet runtime, which
+        // owns CTC detokenization itself. Demanding `tokenizer.ggml.tokens` up front rejected every
+        // speech file with "no tokens" before the arch was ever consulted.
+        let is_speech = matches!(arch.as_str(), "parakeet" | "asr");
         let toks: Vec<String> = match g.metadata().get("tokenizer.ggml.tokens") {
             Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
+            _ if is_speech => Vec::new(),
             _ => return Err(err("no tokens".into())),
         };
         let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
@@ -497,7 +509,9 @@ impl FerricModel {
         // these files is the `wordpiece` field built below; the Bpe here is an empty placeholder that
         // embed() never reaches, and generation is refused for encoders anyway.
         let is_wpm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "bert");
-        let (bpe, spm) = if is_wpm {
+        let (bpe, spm) = if is_wpm || is_speech {
+            // Speech: a placeholder no path reaches. `transcribe` detokenizes through Parakeet's own
+            // piece table, and `generate` refuses on this arch before any tokenizer is touched.
             (Bpe::new(vocab, &[]), None)
         } else if is_spm {
             let scores: Vec<f32> = match g.metadata().get("tokenizer.ggml.scores") {
@@ -583,11 +597,22 @@ impl FerricModel {
             }
         }
         let ctx = Arc::new(Context::new().await.map_err(err)?);
-        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
         let model = match arch.as_str() {
             "lfm2" => WebRuntime::Lfm2(ferric_llama::lfm2::Lfm2::load(&ctx, &g).map_err(err)?),
             "gemma4" => WebRuntime::Gemma4(ferric_llama::gemma4::Gemma4::load(&ctx, &g).map_err(err)?),
             "bert" => WebRuntime::Bert(ferric_llama::bert::Bert::load(&ctx, &g).map_err(err)?),
+            "parakeet" | "asr" => {
+                let m = ferric_llama::parakeet::Parakeet::load(&ctx, &g).map_err(err)?;
+                // Both decoders reach the browser now. RNN-T used to be refused here because its
+                // decode read LSTM + joint weights back with `block_on`, which deadlocks the event
+                // loop it waits on; those reads are awaited once up front instead. A file carrying
+                // NEITHER head is still a real defect and still refuses.
+                if m.ctc_head.is_none() && m.rnnt.is_none() {
+                    return Err(err("this speech file has neither a CTC head nor an RNN-T decoder"
+                                   .to_string()));
+                }
+                WebRuntime::Parakeet(m)
+            }
             // Everything the dense loader genuinely serves; it feature-detects within this family.
             "qwen2" | "qwen3" | "llama" | "phi3" | "gemma" | "gemma2" | "gemma3" | "" =>
                 WebRuntime::Dense(Qwen3::load(&ctx, &g).map_err(err)?),
@@ -606,7 +631,7 @@ impl FerricModel {
     pub fn info(&self) -> String {
         let kind = match &self.model {
             WebRuntime::Dense(_) => "dense", WebRuntime::Lfm2(_) => "lfm2", WebRuntime::Gemma4(_) => "gemma4",
-            WebRuntime::Bert(_) => "bert",
+            WebRuntime::Bert(_) => "bert", WebRuntime::Parakeet(_) => "speech",
         };
         format!("{} layers · {kind} · {:?}", self.n_layer(), self.ctx.backend)
     }
@@ -667,6 +692,55 @@ impl FerricModel {
 
     /// Embed `text` → an L2-normalized vector (last-token pooling), for on-device semantic search / RAG.
     /// Only meaningful on an embedding model (e.g. Qwen3-Embedding); returns a Float32Array to JS.
+    /// Turn per-block command-buffer batching on or off for a speech model, so the tab can A/B it.
+    /// Native reads an env var; wasm has none, which is exactly why this exists as a method.
+    pub fn set_batching(&mut self, on: bool) -> std::result::Result<(), JsValue> {
+        let WebRuntime::Parakeet(m) = &mut self.model else {
+            return Err(jserr("set_batching applies to speech models"));
+        };
+        m.batch_blocks = on;
+        Ok(())
+    }
+
+    /// Dispatches and queue submits since the last reset — the same counters the native benches
+    /// read. Exposed so a browser run and a native run can be compared on WORK DONE rather than on
+    /// wall time alone: equal counts point at per-dispatch cost, unequal ones at something
+    /// structural. Ferric measures the browser at 2.3x the native speed on identical kernels, and
+    /// that gap is not explicable without knowing whether both issued the same dispatches.
+    pub fn op_counters(&self) -> Vec<f64> {
+        let (d, s) = ferric_tensor::op_counters();
+        vec![d as f64, s as f64]
+    }
+
+    pub fn reset_op_counters(&self) { ferric_tensor::reset_op_counters(); }
+
+    /// **Speech recognition in a tab.** `pcm` is mono f32 at the model's sample rate (16 kHz) —
+    /// exactly what `AudioBuffer.getChannelData(0)` hands you after decoding through an
+    /// `AudioContext({sampleRate: 16000})`, so the caller needs no resampler and no server.
+    ///
+    /// The rate is CHECKED, not assumed. Web Audio will happily give you 44.1 or 48 kHz, and a
+    /// mel frontend fed the wrong rate does not fail — it produces a confident wrong transcript,
+    /// because every filter lands on the wrong frequency and the model still decodes something.
+    pub async fn transcribe(&self, pcm: Vec<f32>, sample_rate: u32) -> std::result::Result<String, JsValue> {
+        let WebRuntime::Parakeet(m) = &self.model else {
+            return Err(jserr("transcribe() needs a speech model (parakeet / asr)"));
+        };
+        if sample_rate as usize != m.cfg.sample_rate {
+            return Err(jserr(&format!(
+                "audio is {sample_rate} Hz, model wants {} Hz — decode through \
+                 new AudioContext({{sampleRate: {}}}) so the browser resamples for you",
+                m.cfg.sample_rate, m.cfg.sample_rate)));
+        }
+        // Prefer CTC when the file has one: a single await, no host-side sequential decode. RNN-T
+        // is the fallback rather than the default because its decode steps an LSTM per emitted
+        // token on the main thread — correct, and measurably slower.
+        if m.ctc_head.is_some() {
+            m.transcribe_ctc_async(&pcm).await.map_err(|e| jserr(&e))
+        } else {
+            m.transcribe_rnnt_async(&pcm).await.map_err(|e| jserr(&e))
+        }
+    }
+
     pub async fn embed(&self, text: String) -> std::result::Result<Vec<f32>, JsValue> {
         // Dense-only: the trained embedding checkpoints (Qwen3-Embedding) are dense, and LFM2 has no
         // LAST-pooling embedding reference to compare against. Refuse with a message rather than pool
@@ -840,6 +914,7 @@ impl FerricModel {
             WebRuntime::Lfm2(m) => m.cfg.n_vocab,
             WebRuntime::Gemma4(m) => m.cfg.n_vocab,
             WebRuntime::Bert(m) => m.cfg.n_vocab,
+            WebRuntime::Parakeet(m) => m.cfg.vocab,
         }
     }
     fn n_layer(&self) -> usize {
@@ -848,6 +923,7 @@ impl FerricModel {
             WebRuntime::Lfm2(m) => m.cfg.n_layer,
             WebRuntime::Gemma4(m) => m.cfg.n_layer,
             WebRuntime::Bert(m) => m.cfg.n_layer,
+            WebRuntime::Parakeet(m) => m.cfg.n_layers,
         }
     }
     /// The dense config, on the paths that are dense-only (embeddings, grouped-K). Panics on lfm2 by
@@ -925,6 +1001,7 @@ impl FerricModel {
             // Unreachable: refused above. Kept as an arm so ADDING a runtime is a compile error here
             // rather than a silent fallthrough — the property arch.rs exists to preserve.
             WebRuntime::Bert(_) => return Err(jserr("BERT encoders cannot generate")),
+            WebRuntime::Parakeet(_) => return Err(jserr("speech models transcribe audio; call transcribe()")),
         };
         let mut seq = ids.clone();
         let mut emitted = String::new();
