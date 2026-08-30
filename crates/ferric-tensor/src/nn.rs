@@ -56,6 +56,62 @@ pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv
     ctx.permute(&[1, 0, 2]).reshape(&[t, d])
 }
 
+/// **Softmax with a learnable attention sink.** `scores` is `[n_heads, T, S]`; `sinks` is one raw
+/// scalar per head, `[n_heads]`.
+///
+/// The sink is one extra logit that participates in the max and adds one term to the denominator,
+/// and then contributes no value vector. So each row's probabilities sum to strictly LESS than one:
+///
+/// ```text
+///   M   = max( max_j l_j , s_h )
+///   Z   = Σ_j exp(l_j − M) + exp(s_h − M)
+///   p_j = exp(l_j − M) / Z            with   Σ_j p_j = 1 − exp(s_h − M)/Z  <  1
+/// ```
+///
+/// ⚠ **Do not renormalise.** The missing mass is the mechanism: it is how a head declines to
+/// attend to anything, and restoring it to one deletes the feature while leaving every shape,
+/// every sum-to-one intuition and every downstream assert intact.
+///
+/// ⚠ **`s_h` is raw.** It is not multiplied by the attention scale, not masked, not position- or
+/// token-dependent, and never rotated. At the usual init of `0.0` this is exactly the classic
+/// "+1 in the denominator".
+///
+/// This is implemented as "append the sink as one more key column, softmax, discard that column",
+/// which is not an approximation of the definition above — it IS the definition, and it reuses the
+/// existing numerically-stable softmax rather than adding a second kernel that would then have to
+/// be kept bit-identical to the first on every fabric.
+pub fn softmax_with_sinks(scores: &Tensor, sinks: &Tensor) -> Tensor {
+    let (nh, t, s) = (scores.shape[0], scores.shape[1], scores.shape[2]);
+    assert_eq!(sinks.numel(), nh, "one sink per head: {} heads, {} sinks", nh, sinks.numel());
+    let col = sinks.reshape(&[nh, 1, 1]).broadcast_to(&[nh, t, 1]).contiguous();
+    scores.cat(&col, 2).softmax(2).narrow(2, 0, s).contiguous()
+}
+
+/// [`causal_attention`] with a per-head learnable sink. `sinks` is `[n_heads]`.
+///
+/// A head whose sink is large and positive shrinks its whole output toward zero; a large negative
+/// one recovers ordinary attention exactly. Both limits are checked in this module's tests, because
+/// "it produces plausible numbers" is what a wrong sink also does.
+pub fn causal_attention_sinks(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n_kv_heads: usize,
+                              sinks: &Tensor, softcap: f32) -> Tensor {
+    let t = q.shape[0];
+    let d = q.shape[1];
+    let dh = d / n_heads;
+    let g = n_heads / n_kv_heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let qh = q.reshape(&[t, n_heads, dh]).permute(&[1, 0, 2]).contiguous();
+    let kv_heads = |x: &Tensor| {
+        let hx = x.reshape(&[t, n_kv_heads, dh]).permute(&[1, 0, 2]).contiguous();
+        hx.reshape(&[n_kv_heads, 1, t, dh]).broadcast_to(&[n_kv_heads, g, t, dh]).reshape(&[n_heads, t, dh])
+    };
+    let (kh, vh) = (kv_heads(k), kv_heads(v));
+    let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap);
+    // The mask is added BEFORE the sink column is appended, so a masked-out key contributes nothing
+    // while the sink still does — which is what makes the first row's output well defined.
+    let probs = softmax_with_sinks(&scores.add(&causal_mask(q, t)), sinks);
+    probs.matmul(&vh).permute(&[1, 0, 2]).reshape(&[t, d])
+}
+
 /// Gemma-2 attention-logit softcapping (`cap·tanh(x/cap)` over the scores before softmax); identity
 /// when `cap == 0`.
 fn softcapped(scores: Tensor, cap: f32) -> Tensor { if cap > 0.0 { scores.softcap(cap) } else { scores } }
@@ -559,5 +615,122 @@ mod windowed_chunk_tests {
         let err = chunked.iter().zip(&whole).fold(0f32, |a, (&c, &w)| a.max((c - w).abs())) / scale;
         eprintln!("windowed chunked vs whole: rel max|Δ| {err:.3e} over {} values", whole.len());
         assert!(err < 1e-5, "chunked windowed attention differs from whole-history by {err:.3e}");
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use ferric_core::Context;
+    use std::sync::Arc;
+
+    macro_rules! ctx_or_skip {
+        () => { match pollster::block_on(Context::new()) { Ok(c) => Arc::new(c), Err(_) => { eprintln!("no GPU context — skipping"); return } } };
+    }
+    fn get(t: &Tensor) -> Vec<f32> { pollster::block_on(t.to_vec()) }
+
+    const NH: usize = 3;
+    const T: usize = 2;
+    const S: usize = 5;
+
+    fn logits(ctx: &Arc<Context>) -> (Tensor, Vec<f32>) {
+        let mut s = 12345u64;
+        let v: Vec<f32> = (0..NH * T * S).map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as f32 / (1u64 << 30) as f32) - 2.0
+        }).collect();
+        (Tensor::from_vec(ctx, &v, &[NH, T, S]), v)
+    }
+
+    /// The definition, checked term by term against host arithmetic — including that the row sums
+    /// to strictly less than one by exactly the sink's own share.
+    #[test]
+    fn sinked_softmax_matches_the_definition() {
+        let ctx = ctx_or_skip!();
+        let (sc, lv) = logits(&ctx);
+        let sv = [-1.5f32, 0.0, 2.25];
+        let p = get(&softmax_with_sinks(&sc, &Tensor::from_vec(&ctx, &sv, &[NH])));
+
+        for h in 0..NH {
+            for t in 0..T {
+                let l = &lv[(h * T + t) * S..(h * T + t) * S + S];
+                let m = l.iter().fold(sv[h], |a, &b| a.max(b));
+                let z: f32 = l.iter().map(|v| (v - m).exp()).sum::<f32>() + (sv[h] - m).exp();
+                let mut sum = 0.0;
+                for j in 0..S {
+                    let want = (l[j] - m).exp() / z;
+                    let got = p[(h * T + t) * S + j];
+                    assert!((got - want).abs() < 1e-6, "head {h} row {t} key {j}: {got} vs {want}");
+                    sum += got;
+                }
+                let deficit = (sv[h] - m).exp() / z;
+                assert!((1.0 - sum - deficit).abs() < 1e-6,
+                        "head {h} row {t}: rows must sum to 1 − sink share, got {sum} vs {}", 1.0 - deficit);
+                assert!(sum < 1.0, "a sinked row must never sum to one — that is the mechanism");
+            }
+        }
+        // A larger sink must take more mass. If this is flat, the sink is being ignored or
+        // renormalised away, and every per-element check above would still pass on a wrong impl
+        // that simply dropped the extra column before the softmax rather than after it.
+        let mass = |h: usize| 1.0 - (0..S).map(|j| p[h * T * S + j]).sum::<f32>();
+        assert!(mass(0) < mass(1) && mass(1) < mass(2),
+                "sink mass must increase with the sink: {:?}", (mass(0), mass(1), mass(2)));
+    }
+
+    /// A very negative sink is ordinary softmax, exactly. This is the control: if it does NOT
+    /// coincide, the sink is leaking into the numerator or the max.
+    #[test]
+    fn a_deeply_negative_sink_is_plain_softmax() {
+        let ctx = ctx_or_skip!();
+        let (sc, _) = logits(&ctx);
+        let plain = get(&sc.softmax(2));
+        let sunk = get(&softmax_with_sinks(&sc, &Tensor::from_vec(&ctx, &[-60.0; NH], &[NH])));
+        for (a, b) in plain.iter().zip(&sunk) {
+            assert!((a - b).abs() < 1e-6, "sink at −60 should vanish: {a} vs {b}");
+        }
+    }
+
+    /// At the shipped init of 0.0 this is the classic "+1 in the denominator".
+    #[test]
+    fn a_zero_sink_is_the_plus_one_denominator() {
+        let ctx = ctx_or_skip!();
+        let (sc, lv) = logits(&ctx);
+        let p = get(&softmax_with_sinks(&sc, &Tensor::from_vec(&ctx, &[0.0; NH], &[NH])));
+        for h in 0..NH { for t in 0..T {
+            let l = &lv[(h * T + t) * S..(h * T + t) * S + S];
+            let z: f32 = l.iter().map(|v| v.exp()).sum::<f32>() + 1.0;
+            for j in 0..S {
+                let want = l[j].exp() / z;
+                assert!((p[(h * T + t) * S + j] - want).abs() < 1e-6, "not the +1 denominator");
+            }
+        }}
+    }
+
+    /// A large positive sink shrinks a head's whole output toward zero — the head declining to
+    /// attend. With V bounded, the output norm must fall below the sink's own share of the mass.
+    #[test]
+    fn a_large_sink_shrinks_the_head_output() {
+        let ctx = ctx_or_skip!();
+        let (dh, nh) = (4usize, 2usize);
+        let n = T * nh * dh;
+        let q = Tensor::from_vec(&ctx, &vec![0.3f32; n], &[T, nh * dh]);
+        let k = Tensor::from_vec(&ctx, &vec![0.3f32; n], &[T, nh * dh]);
+        let v = Tensor::from_vec(&ctx, &vec![1.0f32; n], &[T, nh * dh]);
+        let open = get(&causal_attention_sinks(&q, &k, &v, nh, nh, &Tensor::from_vec(&ctx, &[-60.0; 2], &[2]), 0.0));
+        let shut = get(&causal_attention_sinks(&q, &k, &v, nh, nh, &Tensor::from_vec(&ctx, &[20.0; 2], &[2]), 0.0));
+        for x in &open { assert!((x - 1.0).abs() < 1e-4, "no sink over all-ones V must give 1.0, got {x}") }
+        for x in &shut { assert!(x.abs() < 1e-4, "a sink of +20 must shut the head, got {x}") }
+    }
+
+    /// The sink is per-head, so one head's sink must not touch another's row. A scalar broadcast
+    /// over all heads keeps every shape and would pass all the tests above if they used one value.
+    #[test]
+    fn sinks_are_per_head_not_shared() {
+        let ctx = ctx_or_skip!();
+        let (sc, _) = logits(&ctx);
+        let p = get(&softmax_with_sinks(&sc, &Tensor::from_vec(&ctx, &[-60.0, 0.0, 3.0], &[NH])));
+        let mass: Vec<f32> = (0..NH).map(|h| 1.0 - (0..S).map(|j| p[h * T * S + j]).sum::<f32>()).collect();
+        assert!(mass[0] < 1e-5, "head 0 has no sink and should keep all its mass, lost {}", mass[0]);
+        assert!(mass[2] > 0.5, "head 2's sink should take most of the mass, took {}", mass[2]);
     }
 }

@@ -4581,6 +4581,16 @@ mod format_reachability {
         (30, "BF16",  "not a block quant; widening to f32 is the whole conversion"),
         (35, "TQ2_0", "llama.cpp ternary: no packed kernel written (Q2_0/42 is the PrismML one that has one)"),
         (41, "Q1_0",  "PrismML 1-bit: no packed kernel written"),
+        (16, "IQ2_XXS", "grid-codebook quant: readable since the hyv4 ingest, no packed kernel. A \
+                         codebook format needs a 256-entry table in the shader, not just a shift and \
+                         a mask, so it is a different kernel-writing job from the K-quants"),
+        (18, "IQ3_XXS", "grid-codebook quant: as IQ2_XXS. Together these two carry ~160 of \
+                         Hy4-preview's 213.66 GiB, so they are where a packed kernel would pay"),
+        (43, "STQ1_0", "⚠ THE MOST EXPENSIVE ENTRY IN THIS TABLE. Dense-loading a 1.3125 bpw format \
+                        to f32 is 24.4x its on-disk footprint — the blowup is larger than the format's \
+                        entire reason for existing, and a model stored at 1.3 bits resident at 32 is \
+                        not a low-bit model. It is here rather than in PACKED because that is true \
+                        today, not because it should stay true"),
     ];
 
     /// Probe `type_size` rather than importing a list, so a format added to ferric-gguf shows up here
