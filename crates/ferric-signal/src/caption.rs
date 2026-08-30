@@ -457,3 +457,117 @@ mod tests {
         assert_eq!(size, 3, "two training codes plus one reserved id, and nothing for 3 or 4");
     }
 }
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn ctx() -> Option<Arc<Context>> {
+        match pollster::block_on(Context::new()) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                if std::env::var("FERRIC_NO_GPU").is_ok() {
+                    eprintln!("FERRIC_NO_GPU set; skipping deliberately ({e:?})");
+                    None
+                } else {
+                    panic!("no GPU context ({e:?}). Set FERRIC_NO_GPU=1 to waive this on purpose.");
+                }
+            }
+        }
+    }
+
+    /// THE FUNCTION A PUBLISHED REFUTATION RESTS ON. `--pool` was the third registered prediction
+    /// in this crate and it was refuted; if this does not do what the refutation says it does —
+    /// add the mean of the SIGNAL rows to the CAPTION rows and leave the signal rows alone — then
+    /// what was refuted is not what was claimed, and the conclusion drawn from it is unsupported.
+    ///
+    /// Asserted against arithmetic computed here rather than against the function's own output.
+    #[test]
+    fn pooling_adds_the_signal_mean_to_caption_rows_and_leaves_signal_rows_untouched() {
+        let Some(ctx) = ctx() else { return };
+        let (t, d, from) = (6usize, 3usize, 4usize);
+        // Rows 0..4 are the signal, 4..6 the caption. Distinct values so a wrong row is visible.
+        let raw: Vec<f32> = (0..t * d).map(|i| (i as f32) + 1.0).collect();
+        let emb = Var::leaf(Tensor::from_vec(&ctx, &raw, &[t, d]));
+        let out = pool_signal_into_caption(&ctx, &emb, from).unwrap();
+        let got = pollster::block_on(out.value().to_vec());
+
+        // The mean of the signal rows, computed independently of the function under test.
+        let mut mean = vec![0.0f32; d];
+        for r in 0..from {
+            for c in 0..d {
+                mean[c] += raw[r * d + c] / from as f32;
+            }
+        }
+        for r in 0..t {
+            for c in 0..d {
+                let want = raw[r * d + c] + if r >= from { mean[c] } else { 0.0 };
+                assert!(
+                    (got[r * d + c] - want).abs() < 1e-4,
+                    "row {r} col {c}: got {}, want {want}",
+                    got[r * d + c]
+                );
+            }
+        }
+    }
+
+    /// The sequence length must not change. A version that INSERTED a pooled token would shift
+    /// every caption position, so `target_from` would point somewhere else and each axis would be
+    /// scored against a different word — a comparison between two different questions rather than
+    /// a measurement of pooling.
+    #[test]
+    fn pooling_does_not_move_a_single_position() {
+        let Some(ctx) = ctx() else { return };
+        let (t, d) = (9usize, 4usize);
+        let raw: Vec<f32> = (0..t * d).map(|i| i as f32 * 0.5).collect();
+        let emb = Var::leaf(Tensor::from_vec(&ctx, &raw, &[t, d]));
+        let out = pool_signal_into_caption(&ctx, &emb, 5).unwrap();
+        assert_eq!(out.value().shape, vec![t, d]);
+    }
+
+    /// Degenerate splits are passed through rather than dividing by zero: no caption to pool into,
+    /// or no signal to pool from.
+    #[test]
+    fn pooling_is_a_no_op_when_there_is_nothing_to_pool() {
+        let Some(ctx) = ctx() else { return };
+        let (t, d) = (4usize, 2usize);
+        let raw: Vec<f32> = (0..t * d).map(|i| i as f32).collect();
+        let emb = Var::leaf(Tensor::from_vec(&ctx, &raw, &[t, d]));
+        for from in [0usize, t] {
+            let out = pool_signal_into_caption(&ctx, &emb, from).unwrap();
+            assert_eq!(pollster::block_on(out.value().to_vec()), raw, "target_from = {from}");
+        }
+    }
+
+    /// A gradient must reach the signal rows THROUGH the pooled path. If it did not, pooling would
+    /// be a forward-only decoration and the refutation would have tested nothing that trains.
+    #[test]
+    fn a_gradient_reaches_the_signal_rows_through_the_pooled_path() {
+        let Some(ctx) = ctx() else { return };
+        let (t, d, from) = (4usize, 2usize, 2usize);
+        let raw: Vec<f32> = (0..t * d).map(|i| i as f32 + 1.0).collect();
+        let leaf = Var::leaf(Tensor::from_vec(&ctx, &raw, &[t, d]));
+        let out = pool_signal_into_caption(&ctx, &leaf, from).unwrap();
+        // Sum only the CAPTION rows, so any gradient on a signal row arrived through the pool.
+        let mut mask = vec![0.0f32; t * d];
+        for r in from..t {
+            for c in 0..d {
+                mask[r * d + c] = 1.0;
+            }
+        }
+        let m = Var::leaf(Tensor::from_vec(&ctx, &mask, &[t, d]));
+        out.mul(&m).sum_all().backward();
+        let g = pollster::block_on(leaf.grad().expect("no gradient").to_vec());
+        // Each caption row contributes 1/from of itself to every signal row, and there are
+        // (t - from) caption rows, so a signal row's gradient is (t - from) / from.
+        let want = (t - from) as f32 / from as f32;
+        for r in 0..from {
+            for c in 0..d {
+                assert!(
+                    (g[r * d + c] - want).abs() < 1e-4,
+                    "signal row {r} col {c} got {}, want {want}",
+                    g[r * d + c]
+                );
+            }
+        }
+    }
+}
