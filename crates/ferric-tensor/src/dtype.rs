@@ -626,6 +626,74 @@ impl Q2_0Weights {
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 128) * 34 }
 }
 
+/// **STQ1_0** weights held packed on the GPU — Tencent's 1.3125-bpw ternary, the lowest-rate format
+/// Ferric runs.
+///
+/// This is the format's whole point. Dequantising a 1.3125 bpw tensor to f32 on load costs **24.4×
+/// its on-disk footprint**, which is more than the entire saving the format exists to deliver: a
+/// model stored at 1.3 bits and resident at 32 is not a low-bit model. Reading the packed bytes in
+/// the kernel is not an optimisation here, it is the reason to support the format at all.
+///
+/// The on-disk block is `qs[32] | sign[8] | f16 d` = 42 bytes, which is not a multiple of 4, so the
+/// same repack-on-upload trick as [`Q2_0Weights`] applies — three aligned arrays instead of one
+/// byte-addressed blob. And the same **output-major** layout, for the same measured reason: in a
+/// GEMV every weight word is read exactly once, so coalescing requires adjacent *threads* to read
+/// adjacent addresses, and adjacent threads own adjacent outputs.
+pub struct Stq1_0Weights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>,  // 8 u32 per block — 8 four-bit slot codes per word
+    signs: Arc<wgpu::Buffer>,  // 2 u32 per block — one bit per group of 4
+    scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
+    pub rows: usize, // out features
+    pub cols: usize, // in features (multiple of 256)
+}
+
+impl Stq1_0Weights {
+    /// Upload raw STQ1_0 block bytes exactly as they appear in the GGUF, for an `[out, in]` weight.
+    ///
+    /// ⚠ The scale is the LAST field of the block, not the first. Every other packed type here reads
+    /// `d` from `src[0..2]`; this one reads `src[40..42]`, and the obvious copy-paste produces a
+    /// plausible small float taken from eight packed slot codes.
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Stq1_0Weights {
+        assert_eq!(cols % 256, 0, "STQ1_0 cols must be a multiple of 256");
+        assert_eq!(bytes.len(), rows * (cols / 256) * 42, "unexpected STQ1_0 byte length");
+        let bpr = cols / 256; // blocks per output row
+        let nblk = rows * bpr;
+        let mut codes: Vec<u32> = vec![0; nblk * 8];
+        let mut signs: Vec<u32> = vec![0; nblk * 2];
+        let mut scales: Vec<u32> = vec![0; nblk.div_ceil(2)];
+        for b in 0..nblk {
+            let src = &bytes[b * 42..b * 42 + 42];
+            let (o, blk) = (b / bpr, b % bpr);
+            let si = blk * rows + o;
+            scales[si / 2] |= (u16::from_le_bytes([src[40], src[41]]) as u32) << (16 * (si % 2));
+            for w in 0..8 {
+                let c = &src[w * 4..w * 4 + 4];
+                codes[(blk * 8 + w) * rows + o] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+            for w in 0..2 {
+                let c = &src[32 + w * 4..32 + w * 4 + 4];
+                signs[(blk * 2 + w) * rows + o] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let mk = |label, data: &[u32]| {
+            Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label), contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            }))
+        };
+        Stq1_0Weights {
+            ctx: ctx.clone(),
+            codes: mk("stq1_0.codes", &codes),
+            signs: mk("stq1_0.signs", &signs),
+            scales: mk("stq1_0.scales", &scales),
+            rows, cols,
+        }
+    }
+    /// Resident bytes. Equal to the on-disk size — the repack rearranges, it does not expand.
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 42 }
+}
+
 /// **Q4_0** weights held packed on the GPU — the canonical llama.cpp 4-bit format (blocks of 32:
 /// `f16 scale` + 16 nibble-bytes; value = (nibble − 8)·scale). Most quantized GGUF models on Hugging
 /// Face ship in Q4-family formats, so a *native* packed matmul (dequant in-kernel, weights never
@@ -827,6 +895,7 @@ impl Q5_1Weights {
 /// One packed-quant weight shard that fits in a single GPU storage buffer.
 pub enum QShard {
     Q2_0(Q2_0Weights),
+    Stq1_0(Stq1_0Weights),
     Q4_0(Q4_0Weights),
     Q4_1(Q4_1Weights),
     Q5_0(Q5_0Weights),
@@ -866,8 +935,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -884,6 +953,7 @@ impl QShard {
             23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
             39 => QShard::Mxfp4(Mxfp4Weights::from_bytes(ctx, bytes, rows, cols)),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
+            43 => QShard::Stq1_0(Stq1_0Weights::from_bytes(ctx, bytes, rows, cols)),
             // Types with no native packed kernel take the dense fallback via `QMatrix::from_dense`
             // (the loader dequantizes them), so they never reach this packed-build path.
             other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
@@ -920,6 +990,7 @@ impl QMatrix {
             23 => Some((256, 136)),// IQ4_XS
             39 => Some((32, 17)),  // MXFP4
             42 => Some((128, 34)), // Q2_0
+            43 => Some((256, 42)), // STQ1_0
             _ => None,
         }
     }
@@ -1027,6 +1098,7 @@ impl Tensor {
         match w {
             // Opt-in NVIDIA tensor-core prefill (`FERRIC_COOP16`): a multi-row (prefill) Q2_0 matmul on
             // (matmul_q2_0 itself carries the opt-in coop16 prefill fast-path — see there.)
+            QShard::Stq1_0(w) => self.matmul_stq1_0(w),
             QShard::Q2_0(w) => self.matmul_q2_0(w),
             QShard::Q4_0(w) => self.matmul_q4_0(w),
             QShard::Q4_1(w) => self.matmul_q4_1(w),
@@ -2209,6 +2281,31 @@ impl Tensor {
 
     /// y = x·Wᵀ where W is PrismML Q2_0 ternary held PACKED on the GPU (dequantized per-block on the
     /// fly inside the kernel). x [rows, in] → [rows, out]. This is what makes a 27B ternary model fit.
+    /// **STQ1_0 GEMV, weights never expanded.** One thread per output element.
+    ///
+    /// Each 42-byte block covers 256 weights as 64 groups of four, and a group's four lanes are
+    /// **stride 16 apart inside a 64-weight chunk**, not adjacent — `x[c*64 + g%16 + p*16]`. That is
+    /// the format, not an implementation choice, and reading them contiguously would load exactly
+    /// the right 256 activations against exactly the right 256 weights in the wrong pairing.
+    ///
+    /// The codebook lives in `var<private>` rather than `const` because it is indexed by a runtime
+    /// value, which naga will not accept on a module-scope `const`.
+    pub fn matmul_stq1_0(&self, w: &Stq1_0Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let wg = n.div_ceil(64);
+        let gw = wg.min(32768);
+        let gh = wg.div_ceil(gw);
+        run(&self.ctx, MATMUL_STQ1_0_WGSL, "matmul_stq1_0",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.signs.as_ref(), w.scales.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
+            (gw as u32, gh as u32, 1));
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+
     pub fn matmul_q2_0(&self, w: &Q2_0Weights) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
@@ -4571,6 +4668,7 @@ mod format_reachability {
         (20, "IQ4_NL"), (23, "IQ4_XS"),
         (39, "MXFP4"),
         (42, "Q2_0"),
+        (43, "STQ1_0"),
     ];
 
     /// Types the loader decodes to f32 and runs dense, each with the reason. Must NOT be in
@@ -4586,11 +4684,6 @@ mod format_reachability {
                          a mask, so it is a different kernel-writing job from the K-quants"),
         (18, "IQ3_XXS", "grid-codebook quant: as IQ2_XXS. Together these two carry ~160 of \
                          Hy4-preview's 213.66 GiB, so they are where a packed kernel would pay"),
-        (43, "STQ1_0", "⚠ THE MOST EXPENSIVE ENTRY IN THIS TABLE. Dense-loading a 1.3125 bpw format \
-                        to f32 is 24.4x its on-disk footprint — the blowup is larger than the format's \
-                        entire reason for existing, and a model stored at 1.3 bits resident at 32 is \
-                        not a low-bit model. It is here rather than in PACKED because that is true \
-                        today, not because it should stay true"),
     ];
 
     /// Probe `type_size` rather than importing a list, so a format added to ferric-gguf shows up here
@@ -5045,5 +5138,170 @@ mod mxfp4_kernel_tests {
         eprintln!("MXFP4 resident: {packed} B ({:.5} B/elem) vs {dense} B f32 ({:.2}x) — through \
                    QMatrix::from_bytes, from live buffer sizes",
                   packed as f64 / (rows * cols) as f64, dense as f64 / packed as f64);
+    }
+}
+
+/// STQ1_0 GEMV. `codes`/`signs` are output-major so adjacent threads read adjacent words; the
+/// codebook maps `(sign << 4) | slot` to four 2-bit lanes, each decoding as `lane − 1`.
+const MATMUL_STQ1_0_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;   // [word][output], 8 words/block
+@group(0) @binding(2) var<storage,read>        signs:  array<u32>;   // [word][output], 2 words/block
+@group(0) @binding(3) var<storage,read>        scales: array<u32>;   // [block][output], f16 x2 per u32
+@group(0) @binding(4) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(5) var<uniform>             info:   vec4<u32>;    // rows, out, in, threads_per_grid_row
+
+var<private> CODEBOOK: array<u32, 32> = array<u32, 32>(
+    0xA9u, 0x89u, 0x29u, 0x09u, 0xA6u, 0x86u, 0x26u, 0x06u,
+    0x9Au, 0x92u, 0x1Au, 0x12u, 0x6Au, 0x62u, 0x4Au, 0x42u,
+    0x01u, 0x21u, 0x81u, 0xA1u, 0x04u, 0x24u, 0x84u, 0xA4u,
+    0x10u, 0x18u, 0x90u, 0x98u, 0x40u, 0x48u, 0x60u, 0x68u
+);
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let si = blk * o_dim + o;
+        let sw = unpack2x16float(scales[si >> 1u]);
+        let d = select(sw.y, sw.x, (si & 1u) == 0u);
+        let xbase = r * in_dim + blk * 256u;
+        var bacc = 0.0;
+        for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+            let word  = codes[(blk * 8u + w) * o_dim + o];
+            let sword = signs[(blk * 2u + (w >> 2u)) * o_dim + o];
+            for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+                let g     = w * 8u + i;
+                let slot  = (word >> (4u * i)) & 0x0Fu;
+                // ⚠ `w & 3u` is load-bearing, not cosmetic: one sign word covers four code words,
+                // so words 4..7 index bits 0..31 of the SECOND word. Writing `w * 8u + i` shifts by
+                // 32..63, which WGSL leaves undefined — Metal happens to mask it mod 32 and give the
+                // identical answer, so a mutation to that form passes every test on this machine and
+                // is a portability bug waiting for a backend that does not mask.
+                let sbit  = (sword >> ((w & 3u) * 8u + i)) & 1u;
+                let qpack = CODEBOOK[(sbit << 4u) | slot];
+                // ⚠ stride 16 inside the 64-weight chunk, not four adjacent weights.
+                let base  = xbase + (g >> 4u) * 64u + (g & 15u);
+                for (var p: u32 = 0u; p < 4u; p = p + 1u) {
+                    bacc = bacc + x[base + p * 16u] * f32(i32((qpack >> (2u * p)) & 3u) - 1);
+                }
+            }
+        }
+        acc = acc + bacc * d;   // one scale for the whole 256-block
+    }
+    out[idx] = acc;
+}
+"#;
+
+#[cfg(test)]
+mod stq1_0_kernel {
+    use super::*;
+    use ferric_gguf::quantize::quantize_stq1_0;
+
+    macro_rules! ctx_or_skip {
+        () => { match pollster::block_on(Context::new()) { Ok(c) => Arc::new(c), Err(_) => { eprintln!("no GPU context — skipping"); return } } };
+    }
+
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    /// The packed kernel must agree with dequantise-then-matmul to f32 round-off.
+    ///
+    /// Not a round-trip: `deq_raw` is the reader verified against Tencent's published weights at
+    /// 99.3% sign agreement, so this pins the kernel against an independently checked decoder. The
+    /// stride-16 grouping is the thing most likely to be wrong here, and it cannot hide — reading
+    /// the groups contiguously pairs the right 256 activations with the right 256 weights in the
+    /// wrong order, which changes every output.
+    #[test]
+    fn packed_matmul_matches_dequant_then_matmul() {
+        let ctx = ctx_or_skip!();
+        let (rows, cols, toks) = (17usize, 512usize, 3usize);
+
+        let mut seed = 4242u64;
+        let wf: Vec<f32> = (0..rows * cols).map(|_| lcg(&mut seed)).collect();
+        let mut bytes = Vec::new();
+        for r in 0..rows { quantize_stq1_0(&wf[r * cols..(r + 1) * cols], None, &mut bytes) }
+        assert_eq!(bytes.len(), rows * (cols / 256) * 42);
+
+        let xv: Vec<f32> = (0..toks * cols).map(|_| lcg(&mut seed)).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[toks, cols]);
+
+        let deq = ferric_gguf::deq_raw(&bytes, rows * cols, 43).unwrap();
+        let wdense = Tensor::from_vec(&ctx, &deq, &[rows, cols]);
+        let want = pollster::block_on(x.matmul_bt(&wdense).to_vec());
+
+        let packed = Stq1_0Weights::from_bytes(&ctx, &bytes, rows, cols);
+        let got = pollster::block_on(x.matmul_stq1_0(&packed).to_vec());
+
+        assert_eq!(got.len(), toks * rows);
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(scale > 1e-2, "reference is ~zero; this would pass on anything");
+        let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("STQ1_0 packed vs dense: max |Δ| = {worst:.3e} on outputs of magnitude {scale:.3e}");
+        assert!(worst < 1e-4 * scale, "packed kernel diverges by {worst}");
+    }
+
+    /// The reason the kernel exists. The packed weight must be resident at its on-disk size — the
+    /// repack rearranges bytes, it does not expand them — while the dense fallback holds f32.
+    #[test]
+    fn packed_residency_is_the_on_disk_size() {
+        let ctx = ctx_or_skip!();
+        let (rows, cols) = (8usize, 1024usize);
+        let mut seed = 7u64;
+        let wf: Vec<f32> = (0..rows * cols).map(|_| lcg(&mut seed)).collect();
+        let mut bytes = Vec::new();
+        for r in 0..rows { quantize_stq1_0(&wf[r * cols..(r + 1) * cols], None, &mut bytes) }
+
+        let m = QMatrix::from_bytes(&ctx, &bytes, 43, rows, cols).expect("STQ1_0 must load as a QMatrix");
+        assert!(matches!(m.shards[0], QShard::Stq1_0(_)),
+                "a QShard::Dense here means block_bytes(43) or QShard::build's arm stopped routing \
+                 it, and the weight is silently f32-resident at 24.4x the format's footprint — which \
+                 still produces correct numbers, so nothing else would notice");
+        let packed = m.nbytes();
+        assert_eq!(packed, bytes.len(), "resident {packed} B for a {} B tensor", bytes.len());
+        let bpw = packed as f64 * 8.0 / (rows * cols) as f64;
+        assert!((bpw - 1.3125).abs() < 1e-9, "1.3125 bits/weight is the whole point, got {bpw}");
+        eprintln!("STQ1_0 resident: {packed} B ({bpw} bits/weight) vs {} B f32 ({:.1}x)",
+                  rows * cols * 4, (rows * cols * 4) as f64 / packed as f64);
+    }
+
+    /// Every legal codebook entry must survive the shader's decode. A single mistyped hex digit in
+    /// the WGSL table would corrupt one pattern in thirty-two — rare enough that a random matmul
+    /// could miss it, so this drives all 32 through deliberately.
+    #[test]
+    fn every_codebook_pattern_reaches_the_kernel() {
+        let ctx = ctx_or_skip!();
+        let (rows, cols) = (32usize, 256usize);
+        // Row o uses slot (o % 16) and sign (o / 16) in every one of its 64 groups.
+        let mut bytes = vec![0u8; rows * 42];
+        for o in 0..rows {
+            let (slot, sign) = ((o % 16) as u8, (o / 16) as u8);
+            let blk = &mut bytes[o * 42..(o + 1) * 42];
+            for g in 0..64 {
+                blk[g / 2] |= slot << (4 * (g & 1));
+                blk[32 + g / 8] |= sign << (g % 8);
+            }
+            blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        }
+        let xv: Vec<f32> = (0..cols).map(|i| (i as f32 % 7.0) - 3.0).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[1, cols]);
+
+        let deq = ferric_gguf::deq_raw(&bytes, rows * cols, 43).unwrap();
+        let want = pollster::block_on(x.matmul_bt(&Tensor::from_vec(&ctx, &deq, &[rows, cols])).to_vec());
+        let packed = Stq1_0Weights::from_bytes(&ctx, &bytes, rows, cols);
+        let got = pollster::block_on(x.matmul_stq1_0(&packed).to_vec());
+        for o in 0..rows {
+            assert!((want[o] - got[o]).abs() < 1e-3,
+                    "codebook entry {} (slot {}, sign {}): {} vs {}", o, o % 16, o / 16, got[o], want[o]);
+        }
+        // The 32 patterns must not all give the same answer, or this proves nothing.
+        let spread = want.iter().fold(f32::MIN, |a, b| a.max(*b)) - want.iter().fold(f32::MAX, |a, b| a.min(*b));
+        assert!(spread > 1.0, "the 32 codebook patterns produced near-identical outputs ({spread})");
     }
 }
