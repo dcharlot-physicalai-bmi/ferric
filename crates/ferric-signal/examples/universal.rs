@@ -40,6 +40,31 @@
 //! this way cannot represent absolute level, so a channel that has drifted and one that has not are
 //! the same to it unless the drift shows up inside the window.
 //!
+//! ## ⚠ AND A COST THAT IS LARGER THAN IT LOOKS: ONE PATCH LENGTH CANNOT BE ONE DURATION
+//!
+//! A fixed sample count means the patch spans wildly different amounts of TIME across these
+//! corpora, and `examples/cwru` measures that this matters — matching a patch in duration rather
+//! than in samples more than doubled how well its tokens separated bearing faults.
+//!
+//! ```text
+//!   a 128-sample patch spans          for a common 10 ms patch you would need
+//!   hydraulic (100 Hz)  1280.00 ms      hydraulic      1.00 samples
+//!   CWRU (12 kHz)         10.67 ms      CWRU         120.00 samples
+//!   rotating (25.6 kHz)    5.00 ms      rotating     256.00 samples
+//!   wind (74 kHz)          1.73 ms      wind         740.05 samples
+//! ```
+//!
+//! **740x, and the fix is not available.** A single tokenizer has one patch-embedding matrix, so it
+//! has one patch length in samples; a common duration would need one sample per patch on the
+//! hydraulic corpus, which is a linear layer wearing a transformer's clothes. Resampling to a
+//! common rate does not rescue it either — a 100 Hz pressure channel has nothing above 50 Hz to
+//! resample up.
+//!
+//! So "universal" here has a rate range, and it is narrower than the four corpora it was trained
+//! on. `--patch` exists to explore the trade rather than to resolve it: no single value can be
+//! duration-comparable across 1 Hz and 74 kHz, and the arithmetic above is why, not an experiment
+//! that has yet to be run.
+//!
 //! ## Held out by RECORDING, not by window
 //!
 //! Windows from one recording are not independent of each other. The held-out set here is built
@@ -58,10 +83,18 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
-/// Samples per patch. A fixed sample count, not a fixed duration — see the module docs.
-const PATCH: usize = 128;
+/// Samples per patch. A fixed sample count, not a fixed duration — see the module docs, and
+/// `--patch` to vary it.
+static PATCH_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(128);
+#[allow(non_snake_case)]
+fn PATCH() -> usize {
+    PATCH_LEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Samples per window, so a window is 16 patches.
-const WINDOW: usize = PATCH * 16;
+#[allow(non_snake_case)]
+fn WINDOW() -> usize {
+    PATCH() * 16
+}
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -82,13 +115,13 @@ struct Corpus {
 /// Spread rather than taken from the start: a recording's first second is not representative of it,
 /// and every corpus here is ordered by something.
 fn windows_of(chan: &[f32], count: usize, patcher: &Patcher, out: &mut Vec<Vec<f32>>) {
-    if chan.len() < WINDOW || count == 0 {
+    if chan.len() < WINDOW() || count == 0 {
         return;
     }
-    let stride = if count > 1 { (chan.len() - WINDOW) / (count - 1) } else { 0 };
+    let stride = if count > 1 { (chan.len() - WINDOW()) / (count - 1) } else { 0 };
     for w in 0..count {
         let start = w * stride;
-        let raw = &chan[start..start + WINDOW];
+        let raw = &chan[start..start + WINDOW()];
         let Ok(rev) = RevIn::fit(raw, 1) else { continue };
         let Ok(norm) = rev.apply(raw) else { continue };
         let Ok(px) = patcher.patchify(&norm) else { continue };
@@ -103,7 +136,7 @@ fn mat_channels(path: &std::path::Path, want: usize) -> Vec<Vec<f32>> {
     let mut v: Vec<Vec<f32>> = m
         .channels()
         .into_iter()
-        .filter(|(_, s)| s.len() >= WINDOW)
+        .filter(|(_, s)| s.len() >= WINDOW())
         .map(|(_, s)| s.iter().map(|&x| x as f32).collect())
         .collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.len()));
@@ -259,8 +292,11 @@ fn main() {
     // keep a few hundred windows. Raised deliberately when the question is whether the vibration
     // corpora were starved rather than rate-limited.
     let max_files: usize = flag(&args, "--max-files").and_then(|v| v.parse().ok()).unwrap_or(40);
+    if let Some(p) = flag(&args, "--patch").and_then(|v| v.parse::<usize>().ok()) {
+        PATCH_LEN.store(p, std::sync::atomic::Ordering::Relaxed);
+    }
 
-    let patcher = Patcher::contiguous(PATCH).unwrap();
+    let patcher = Patcher::contiguous(PATCH()).unwrap();
     let lr: f32 = flag(&args, "--lr").and_then(|v| v.parse().ok()).unwrap_or(3e-4);
     let clip: f32 = flag(&args, "--clip").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let mut corpora: Vec<Corpus> = Vec::new();
@@ -276,7 +312,7 @@ fn main() {
     if let Some(d) = flag(&args, "--wind") {
         corpora.push(load_mat("wind", &d, per_file, 6, &patcher, max_files.min(10)));
     }
-    // EVERY WINDOW IS CHECKED BEFORE ANY OF IT IS TRAINED ON. A single non-finite sample anywhere
+    // EVERY WINDOW() IS CHECKED BEFORE ANY OF IT IS TRAINED ON. A single non-finite sample anywhere
     // in four corpora poisons the loss the first time its window is drawn, which surfaces as a
     // divergence hundreds of steps in and looks like an optimizer problem. Cheap to check, and it
     // separates "the data has a hole in it" from "the learning rate is too high" before either
@@ -299,11 +335,11 @@ fn main() {
     }
 
     let cfg = EncoderConfig {
-        patch_len: PATCH, d_model: 256, n_layers: 5, n_heads: 4, d_ff: 896, latent_dim: 5,
+        patch_len: PATCH(), d_model: 256, n_layers: 5, n_heads: 4, d_ff: 896, latent_dim: 5,
     };
     let params = cfg.params();
     println!("\nUNIVERSAL SENSOR TOKENIZER");
-    println!("  {} patch, {} window, {} patches per window", PATCH, WINDOW, WINDOW / PATCH);
+    println!("  {} patch, {} window, {} patches per window", PATCH(), WINDOW(), WINDOW() / PATCH());
     println!("  encoder {} + decoder {} = {} parameters, against the published 9.5M",
              params.total(), cfg.decoder_params(), params.total() + cfg.decoder_params());
     println!("\n  {:<12} {:>10} {:>10} {:>10} {:>10}",
@@ -324,7 +360,7 @@ fn main() {
                  "corpus", "windows", "MSE", "SNR", "strongest coder");
         println!("  {:-<12} {:->8} {:->12} {:->10}  {:->16}", "", "", "", "", "");
         for c in &corpora {
-            let (mse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
+            let (mse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH())));
             let (mut sum, mut sumsq, mut cnt) = (0.0f64, 0.0f64, 0usize);
             for b in &c.held {
                 for &v in b {
@@ -338,7 +374,7 @@ fn main() {
             let snr = 10.0 * (var / mse.max(1e-12)).log10();
             println!("  {:<12} {:>8} {mse:>12.5} {snr:>9.1}dB  {code:?}", c.name, c.held.len());
         }
-        println!("\n  15 bits per {PATCH}-sample patch: 7 to name the largest DCT coefficient,");
+        println!("\n  15 bits per {}-sample patch: 7 to name the largest DCT coefficient,", PATCH());
         println!("  8 to quantize it. The same 15 bits an FSQ code over 32,768 spends.\n");
         return;
     }
@@ -379,9 +415,9 @@ fn main() {
             let mut codes: HashSet<u32> = HashSet::new();
             let mut seqs: HashSet<Vec<u32>> = HashSet::new();
             for b in &c.held {
-                let t = b.len() / PATCH;
+                let t = b.len() / PATCH();
                 let lat = pollster::block_on(
-                    enc.forward(&ctx, &Tensor::from_vec(&ctx, b, &[t, PATCH])).unwrap().to_vec(),
+                    enc.forward(&ctx, &Tensor::from_vec(&ctx, b, &[t, PATCH()])).unwrap().to_vec(),
                 );
                 let seq: Vec<u32> = (0..t)
                     .map(|i| {
@@ -411,7 +447,7 @@ fn main() {
                     let mut codes = HashSet::new();
                     let (m, v) = recon(&ctx, cfg, &q, &enc, &dvars, &c.held, &mut codes);
                     let snr = 10.0 * (v / m.max(1e-12)).log10();
-                    let (bm, _) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
+                    let (bm, _) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH())));
                     let bsnr = 10.0 * (v / bm.max(1e-12)).log10();
                     println!("  {:<12} {:>8} {m:>12.5} {snr:>9.1}dB {bsnr:>11.1}dB",
                              c.name, c.held.len());
@@ -462,10 +498,10 @@ fn main() {
         let round = step / corpora.len();
         let idx = orders[ci][round % orders[ci].len()];
         let b = &corpora[ci].train[idx];
-        let t = b.len() / PATCH;
+        let t = b.len() / PATCH();
 
         let vars: Vec<Var> = weights.iter().cloned().map(Var::leaf).collect();
-        let x = Var::leaf(Tensor::from_vec(&ctx, b, &[t, PATCH]));
+        let x = Var::leaf(Tensor::from_vec(&ctx, b, &[t, PATCH()]));
         let z = forward_var(&ctx, cfg, &vars[..n_enc], &x).unwrap();
         let zq = straight_through(&ctx, &z, &q);
         let r = decoder_forward_var(&ctx, cfg, &vars[n_enc..], &zq).unwrap();
@@ -546,7 +582,7 @@ fn main() {
         // The baseline gets the SAME 15 bits per patch and no training, at whichever of the
         // matched-budget value coders is STRONGEST on this corpus — a baseline chosen to be weak
         // would flatter the model.
-        let (bmse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH)));
+        let (bmse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH())));
         let bsnr = 10.0 * (v / bmse.max(1e-12)).log10();
         println!("  {:<12} {:>8} {m:>12.5} {snr:>9.1}dB {bsnr:>11.1}dB {:>12}  {code:?}",
                  c.name, c.held.len(), codes.len());

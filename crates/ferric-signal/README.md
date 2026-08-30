@@ -442,10 +442,27 @@ sat *inside* a larger noise floor, and the honest reading was that the experimen
 them apart. At 960 the controls fall to ±1 and the answer is unambiguous. Raw accuracy said
 "duration-matching is better" in both runs; only one of them was entitled to.
 
-That has a direct consequence for the four-corpus tokenizer above, which uses **one fixed
-sample-count patch across corpora sampling from 1 Hz to 74 kHz** — a decision documented there as
-deliberate and, on this evidence, costing it most on exactly the vibration corpora where it does
-worst.
+That has a direct consequence for the four-corpus tokenizer above, and the consequence is
+structural rather than a tuning note. **One patch length cannot be one duration across these
+corpora, and no experiment is needed to say so:**
+
+| | a 128-sample patch spans | for a common 10 ms patch |
+|---|---|---|
+| hydraulic (100 Hz) | **1,280 ms** | 1.00 samples |
+| CWRU (12 kHz) | 10.67 ms | 120 samples |
+| rotating (25.6 kHz) | 5.00 ms | 256 samples |
+| wind (74 kHz) | **1.73 ms** | 740 samples |
+
+A 740× range in what a patch means. **And the fix is not available**: a single tokenizer has one
+patch-embedding matrix, so one patch length in samples, and a common duration would need one sample
+per patch on the hydraulic corpus — a linear layer wearing a transformer's clothes. Resampling to a
+common rate does not rescue it either, because a 100 Hz pressure channel has nothing above 50 Hz to
+resample up.
+
+So **"universal" has a rate range, and it is narrower than the four corpora the released checkpoint
+was trained on.** That is the most likely reason the two vibration corpora sit at 1.6 and 2.1 dB
+where hydraulic reaches 9.2, and it qualifies the checkpoint in a way the SNR table alone does not.
+`--patch` exists on that example to explore the trade, not to resolve it.
 
 Rate control costs something and the run prints it: at 12 kHz the healthy class does not exist at
 all, so `fault` becomes five kinds of defect with no negative case. `--rate all` restores the
