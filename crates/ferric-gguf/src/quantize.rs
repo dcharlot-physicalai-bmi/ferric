@@ -357,3 +357,408 @@ mod tests {
                           Q2_K grew x{q2:.2} against Q3_K's x{q3:.2}, so it is not following");
     }
 }
+
+// ─────────────────────────────────── STQ1_0 ───────────────────────────────────
+
+use crate::{STQ1_0_BLOCK_BYTES, STQ1_0_CODEBOOK};
+
+/// Pack one group of four ternary lanes into its `(slot, sign)` code pair.
+///
+/// The reverse map is DERIVED from [`STQ1_0_CODEBOOK`] by scanning it rather than transcribed as a
+/// second 256-entry table. Two tables that must agree are two chances to disagree, and a
+/// transcription error in the reverse map would show up only as a wrong weight — the encoder would
+/// still emit a legal, decodable block. Scanning 32 entries costs nothing here because the encoder
+/// is not on any hot path.
+///
+/// Returns `None` for a group that is not 3:4 — zero, two, three or four zeros have no encoding at
+/// all, so a caller that has not enforced the constraint finds out here rather than by silently
+/// writing a wrong pattern.
+fn stq1_0_pack_group(lanes: [i8; 4]) -> Option<(u8, u8)> {
+    let mut qpack = 0u8;
+    for (p, &l) in lanes.iter().enumerate() {
+        let code: u8 = if l == 0 { 1 } else if l < 0 { 0 } else { 2 };
+        qpack |= code << (2 * p);
+    }
+    let idx = STQ1_0_CODEBOOK.iter().position(|&c| c == qpack)?;
+    Some(((idx & 0x0F) as u8, (idx >> 4) as u8))
+}
+
+/// The four element indices group `g` covers inside a 256-weight super-block.
+///
+/// ⚠ Stride 16, not contiguous. See [`crate::STQ1_0_CODEBOOK`] — decoding or encoding these as
+/// four consecutive weights permutes the block without changing its length or its multiset, so
+/// nothing downstream can detect it.
+#[inline]
+fn stq1_0_group_idx(g: usize) -> [usize; 4] {
+    let base = (g / 16) * 64 + (g % 16);
+    [base, base + 16, base + 32, base + 48]
+}
+
+fn stq1_0_emit(sel: &[i8; 256], d: f32, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + STQ1_0_BLOCK_BYTES, 0);
+    let blk = &mut out[start..];
+    for g in 0..64 {
+        let ix = stq1_0_group_idx(g);
+        let lanes = [sel[ix[0]], sel[ix[1]], sel[ix[2]], sel[ix[3]]];
+        let (slot, sign) = stq1_0_pack_group(lanes)
+            .expect("STQ1_0 selection must be 3:4 — exactly one zero per stride-16 group");
+        blk[g / 2] |= slot << (4 * (g & 1));
+        blk[32 + g / 8] |= sign << (g % 8);
+    }
+    wr_f16(d, &mut blk[40..42]);
+}
+
+/// **STQ1_0, reference search** — `d = max|x|` over the super-block, zero the smallest-magnitude
+/// lane of each group.
+///
+/// Kept reachable so a test can measure what the least-squares search in [`quantize_stq1_0`] buys
+/// instead of asserting a number nobody checked. It is also the search that pins `d` to the block's
+/// largest outlier, which for post-training weights is close to the worst available choice: every
+/// surviving lane is reconstructed at ±max, so a block with one heavy tail drags all 192 of its
+/// non-zero weights out with it.
+pub fn quantize_stq1_0_amax(x: &[f32], out: &mut Vec<u8>) {
+    assert!(x.len() % 256 == 0, "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
+    for xb in x.chunks_exact(256) {
+        let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let mut sel = [0i8; 256];
+        for g in 0..64 {
+            let ix = stq1_0_group_idx(g);
+            let zero = ix.iter().copied().min_by(|&a, &b| xb[a].abs().total_cmp(&xb[b].abs())).unwrap();
+            for &j in &ix {
+                sel[j] = if j == zero { 0 } else if xb[j] < 0.0 { -1 } else { 1 };
+            }
+        }
+        stq1_0_emit(&sel, amax, out);
+    }
+}
+
+/// **STQ1_0, Ferric's search** — alternating exact minimisation of the weighted reconstruction
+/// error, over the scale and over which lane each group forfeits.
+///
+/// The objective is `Σ_j w_j (x_j − d·s_j)²` with `s ∈ {−1,0,+1}` and exactly one zero per
+/// stride-16 group. Both coordinates have closed forms, which is why this converges in three
+/// rounds rather than needing a search:
+///
+/// * **Which lane to zero.** Writing the group cost out, `Σ_j w_j(|x_j| − d)²` is the same
+///   whichever lane is dropped, so the choice reduces to minimising `w_p·(x_p² − (|x_p| − d)²)`
+///   alone. Note that this is NOT "zero the smallest weight": for `|x_p| > d/2` the term is
+///   positive and zeroing is a loss, so the comparison is against what the lane would have cost as
+///   `±d`, not against zero. The amax search gets this wrong whenever a group's smallest element is
+///   still large relative to `d`.
+/// * **The scale.** For a fixed selection, `d = Σ w_j s_j x_j / Σ w_j s_j²` — plain weighted least
+///   squares, and `s_j² ∈ {0,1}` so the denominator just counts the surviving lanes' weights.
+///
+/// `imatrix` is the per-element activation importance; when present it multiplies `w`. STQ1_0's
+/// rate is low enough that the importance weighting is doing most of the work, which is why the
+/// published Hy4 build ships an imatrix alongside it rather than treating one as optional.
+///
+/// Unlike a plain fixed-iteration loop this keeps the **best** iterate rather than the last:
+/// alternating minimisation on a discrete-continuous objective is monotone only per step, and a
+/// selection flip can raise the total. Returning the last one would make more rounds occasionally
+/// worse, which is the kind of regression a "more iterations is better" assumption hides.
+pub fn quantize_stq1_0(x: &[f32], imatrix: Option<&[f32]>, out: &mut Vec<u8>) {
+    quantize_stq1_0_iters(x, imatrix, out, 3)
+}
+
+/// `iters = 0` fits `d` once from the amax selection and stops — the ablation point for the doc
+/// comment above.
+pub fn quantize_stq1_0_iters(x: &[f32], imatrix: Option<&[f32]>, out: &mut Vec<u8>, iters: usize) {
+    assert!(x.len() % 256 == 0, "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
+    if let Some(im) = imatrix {
+        assert_eq!(im.len(), x.len(), "imatrix must have one importance per element");
+    }
+    for (bi, xb) in x.chunks_exact(256).enumerate() {
+        let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        if !(amax > 0.0) {
+            // ⚠ STQ1_0 cannot express an all-zero block through its SELECTION: the container
+            // forces three non-zero lanes into every group, so `[0; 256]` is not encodable at all
+            // and `stq1_0_emit` rightly refuses it. A zero block is expressed through the SCALE —
+            // any legal 3:4 pattern reconstructs to zero once `d = 0`. Formats with a free ternary
+            // alphabet have no such corner, which is why it is easy to walk into.
+            let mut sel = [1i8; 256];
+            for g in 0..64 { sel[stq1_0_group_idx(g)[0]] = 0 }
+            stq1_0_emit(&sel, 0.0, out);
+            continue;
+        }
+        let sumx2: f32 = xb.iter().map(|v| v * v).sum();
+        let sigma2 = 2.0 * sumx2 / 256.0;
+        let mut w = [0.0f32; 256];
+        for j in 0..256 {
+            let base = (sigma2 + xb[j] * xb[j]).sqrt();
+            w[j] = match imatrix { Some(im) => im[bi * 256 + j] * base, None => base };
+        }
+
+        let mut d = amax;
+        let mut sel = [0i8; 256];
+        let (mut best_d, mut best_sel, mut best_err) = (amax, [0i8; 256], f32::INFINITY);
+
+        for _ in 0..iters.max(1) {
+            for g in 0..64 {
+                let ix = stq1_0_group_idx(g);
+                let mut zero = ix[0];
+                let mut best = f32::INFINITY;
+                for &j in &ix {
+                    let ax = xb[j].abs();
+                    let cost = w[j] * (xb[j] * xb[j] - (ax - d) * (ax - d));
+                    if cost < best { best = cost; zero = j; }
+                }
+                for &j in &ix {
+                    sel[j] = if j == zero { 0 } else if xb[j] < 0.0 { -1 } else { 1 };
+                }
+            }
+
+            let (mut num, mut den) = (0.0f32, 0.0f32);
+            for j in 0..256 {
+                let q = sel[j] as f32;
+                num += w[j] * q * xb[j];
+                den += w[j] * q * q;
+            }
+            // A non-positive optimum would mean flipping every sign; the selection already carries
+            // the signs, so keep the previous scale rather than encoding a negative one.
+            let dnew = if den > 0.0 && num / den > 0.0 { num / den } else { d };
+
+            let err: f32 = (0..256).map(|j| {
+                let r = xb[j] - dnew * sel[j] as f32;
+                w[j] * r * r
+            }).sum();
+            if err < best_err { best_err = err; best_d = dnew; best_sel = sel; }
+
+            let converged = (dnew - d).abs() <= 1e-6 * d;
+            d = dnew;
+            if converged { break }
+        }
+
+        stq1_0_emit(&best_sel, best_d, out);
+    }
+}
+
+#[cfg(test)]
+mod stq1_0_tests {
+    use super::*;
+    use crate::{deq_raw, type_size, STQ1_0_CODEBOOK};
+
+    const STQ1_0: u32 = 43;
+
+    fn lanes_of(qpack: u8) -> [i32; 4] {
+        let mut l = [0i32; 4];
+        for p in 0..4 { l[p] = (((qpack >> (2 * p)) & 3) as i32) - 1 }
+        l
+    }
+
+    /// The codebook is the format. If it is wrong, everything below agrees with it and passes.
+    #[test]
+    fn codebook_is_exactly_the_3_of_4_ternary_patterns() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, &c) in STQ1_0_CODEBOOK.iter().enumerate() {
+            assert!(seen.insert(c), "codebook entry {i} = {c:#04x} is a duplicate");
+            let l = lanes_of(c);
+            assert!(l.iter().all(|v| (-1..=1).contains(v)), "entry {i}: lane code 3 is not a value");
+            assert_eq!(l.iter().filter(|&&v| v == 0).count(), 1,
+                       "entry {i} = {c:#04x} decodes to {l:?} — the format forces exactly one zero");
+        }
+        // The sign bit is a whole-group negation, so the two halves must mirror.
+        for slot in 0..16 {
+            let a = lanes_of(STQ1_0_CODEBOOK[slot]);
+            let b = lanes_of(STQ1_0_CODEBOOK[16 + slot]);
+            assert_eq!(a.map(|v| -v), b, "slot {slot}: sign=1 is not the negation of sign=0");
+        }
+        // Sign 0 is defined as "first non-zero lane is +1".
+        for slot in 0..16 {
+            let a = lanes_of(STQ1_0_CODEBOOK[slot]);
+            assert_eq!(*a.iter().find(|&&v| v != 0).unwrap(), 1, "slot {slot} breaks the sign convention");
+        }
+        // 4 zero positions x 8 sign patterns.
+        assert_eq!(seen.len(), 32);
+    }
+
+    #[test]
+    fn block_is_42_bytes_for_256_weights() {
+        assert_eq!(type_size(STQ1_0, 256).unwrap(), 42);
+        assert_eq!(type_size(STQ1_0, 4096).unwrap(), 42 * 16);
+        assert!((42.0_f64 * 8.0 / 256.0 - 1.3125).abs() < 1e-9, "1.3125 bpw is the whole point");
+    }
+
+    /// **Golden vector — the stride-16 grouping.** Hand-built from the spec, not from this crate's
+    /// encoder, so it is an interop check and not an idempotence check.
+    ///
+    /// Every group takes slot 0 / sign 0 = `0xA9` = lanes `(0, +1, +1, +1)`. Under the real
+    /// stride-16 layout that puts the zeros at the FIRST SIXTEEN elements of each 64-element chunk.
+    /// Under the plausible-but-wrong contiguous reading it would put a zero at every fourth
+    /// element. Both write 64 zeros and 192 ones into 256 slots, so only their positions separate
+    /// them — which is exactly why this needs a golden vector rather than a round-trip.
+    #[test]
+    fn golden_stride16_layout_not_contiguous() {
+        let mut blk = vec![0u8; 42];
+        blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        let got = deq_raw(&blk, 256, STQ1_0).unwrap();
+
+        let mut want = vec![1.0f32; 256];
+        for c in 0..4 { for i in 0..16 { want[c * 64 + i] = 0.0 } }
+        assert_eq!(got, want, "STQ1_0 groups are stride-16 within each 64-weight chunk");
+
+        let contiguous: Vec<f32> = (0..256).map(|i| if i % 4 == 0 { 0.0 } else { 1.0 }).collect();
+        assert_ne!(got, contiguous, "the test itself would not distinguish the two layouts");
+    }
+
+    /// **Golden vector — the scale lives at the END of the block.** Bytes 0..40 are codes; only
+    /// 40..42 are `d`. Reading the leading two bytes as the scale yields 0.0 here and a silently
+    /// rescaled tensor in general.
+    #[test]
+    fn golden_scale_is_the_last_field() {
+        let mut blk = vec![0u8; 42];
+        blk[40..42].copy_from_slice(&half::f16::from_f32(-2.5).to_le_bytes());
+        let got = deq_raw(&blk, 256, STQ1_0).unwrap();
+        assert_eq!(got[16], -2.5, "d was not read from bytes 40..42");
+        assert_eq!(got[0], 0.0);
+        let leading = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        assert_eq!(leading, 0.0, "guard: the wrong read must not coincidentally give -2.5");
+    }
+
+    /// **Golden vector — the zero position follows the slot, at stride 16.** Slot 12 zeroes lane 3,
+    /// which is element `+48`, not element `+3`.
+    #[test]
+    fn golden_slot_selects_the_stride16_lane() {
+        let mut blk = vec![0u8; 42];
+        blk[0] = 12; // group 0 -> slot 12 (low nibble); group 1 keeps slot 0 (high nibble)
+        blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        let got = deq_raw(&blk, 256, STQ1_0).unwrap();
+        assert_eq!(lanes_of(STQ1_0_CODEBOOK[12]), [1, 1, 1, 0], "slot 12 should zero lane 3");
+        assert_eq!((got[0], got[16], got[32], got[48]), (1.0, 1.0, 1.0, 0.0), "group 0 misplaced");
+        assert_eq!((got[1], got[17], got[33], got[49]), (0.0, 1.0, 1.0, 1.0), "group 1 disturbed");
+    }
+
+    /// The low nibble is the EVEN group. Getting this backwards swaps every adjacent pair of
+    /// groups — 256 correct values, 256 wrong positions.
+    #[test]
+    fn golden_low_nibble_is_the_even_group() {
+        let mut blk = vec![0u8; 42];
+        blk[0] = 0xC0; // high nibble = 12 -> group 1; low nibble = 0 -> group 0
+        blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        let got = deq_raw(&blk, 256, STQ1_0).unwrap();
+        assert_eq!(got[0], 0.0, "group 0 should still be slot 0 (zero at lane 0)");
+        assert_eq!(got[49], 0.0, "group 1 should be slot 12 (zero at lane 3 -> element 1+48)");
+    }
+
+    /// The sign byte is LSB-first: group `g` uses bit `g % 8` of byte `g / 8`.
+    #[test]
+    fn golden_sign_bit_order() {
+        let mut blk = vec![0u8; 42];
+        blk[32] = 0b0000_0010; // bit 1 -> group 1 only
+        blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        let got = deq_raw(&blk, 256, STQ1_0).unwrap();
+        assert_eq!(got[16], 1.0, "group 0 must stay sign=0");
+        assert_eq!(got[17], -1.0, "group 1 must be negated");
+    }
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    /// Every encoded group is 3:4 whatever the input — the container cannot express anything else,
+    /// so this is checking that the ENCODER never tries to.
+    #[test]
+    fn encoder_always_emits_exactly_one_zero_per_group() {
+        let mut seed = 7u64;
+        let x: Vec<f32> = (0..256 * 8).map(|_| lcg(&mut seed)).collect();
+        for (label, bytes) in [("amax", { let mut o = Vec::new(); quantize_stq1_0_amax(&x, &mut o); o }),
+                               ("ls",   { let mut o = Vec::new(); quantize_stq1_0(&x, None, &mut o); o })] {
+            let y = deq_raw(&bytes, x.len(), STQ1_0).unwrap();
+            for b in 0..8 {
+                for g in 0..64 {
+                    let ix = stq1_0_group_idx(g);
+                    let z = ix.iter().filter(|&&j| y[b * 256 + j] == 0.0).count();
+                    assert_eq!(z, 1, "{label}: block {b} group {g} has {z} zeros");
+                }
+            }
+        }
+    }
+
+    /// A block already on the `{−d, 0, +d}` grid with a legal 3:4 pattern must survive exactly.
+    #[test]
+    fn on_grid_values_round_trip_exactly() {
+        let d = 0.375f32;
+        let mut x = vec![0.0f32; 256];
+        let mut seed = 99u64;
+        for g in 0..64 {
+            let ix = stq1_0_group_idx(g);
+            let zero = (seed as usize) % 4;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            for (p, &j) in ix.iter().enumerate() {
+                x[j] = if p == zero { 0.0 } else if (seed >> (p + 3)) & 1 == 1 { d } else { -d };
+            }
+        }
+        let mut out = Vec::new();
+        quantize_stq1_0(&x, None, &mut out);
+        let y = deq_raw(&out, 256, STQ1_0).unwrap();
+        assert_eq!(y, x, "an on-grid 3:4 block must be reproduced exactly");
+    }
+
+    /// What the least-squares search actually buys over the reference `d = amax`. This asserts a
+    /// direction, and prints the size so a regression shows up as a number and not just a pass.
+    #[test]
+    fn least_squares_beats_amax_on_gaussian_weights() {
+        let mut seed = 12345u64;
+        // Box-Muller-ish: sum of uniforms is close enough to normal for a weight-like distribution,
+        // and a few heavy outliers are what make `d = amax` bad.
+        let x: Vec<f32> = (0..256 * 64).map(|i| {
+            let v: f32 = (0..6).map(|_| lcg(&mut seed)).sum::<f32>() / 6.0;
+            if i % 997 == 0 { v * 12.0 } else { v }
+        }).collect();
+
+        let err = |bytes: &[u8]| -> f32 {
+            let y = deq_raw(bytes, x.len(), STQ1_0).unwrap();
+            (x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / x.len() as f32).sqrt()
+        };
+        let mut a = Vec::new(); quantize_stq1_0_amax(&x, &mut a);
+        let mut l = Vec::new(); quantize_stq1_0(&x, None, &mut l);
+        let mut l0 = Vec::new(); quantize_stq1_0_iters(&x, None, &mut l0, 1);
+
+        let (ea, el, e0) = (err(&a), err(&l), err(&l0));
+        let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        eprintln!("STQ1_0 RMSE / signal RMS  amax {:.3}  ls(1) {:.3}  ls(3) {:.3}",
+                  ea / rms, e0 / rms, el / rms);
+        assert!(el < ea, "least squares ({el:.4}) should beat amax ({ea:.4})");
+        assert!(el <= e0 * 1.0001, "three rounds must not be worse than one — best-iterate is kept");
+    }
+
+    /// An importance matrix must lower the error *it* measures, or it is not being used.
+    ///
+    /// ⛔ This test first asserted that a high-importance lane stops being zeroed, and it failed at
+    /// 19/64 — because that premise is wrong. The cost of forfeiting lane `p` is
+    /// `w_p·(x_p² − (|x_p| − d)²)`, which is NEGATIVE whenever `|x_p| < d/2`: for a lane too small
+    /// to be worth rounding up to `±d`, zeroing is the better reconstruction, and importance makes
+    /// the encoder *more* eager to take it, not less. Importance protects lanes where zeroing
+    /// hurts; it does not protect small lanes, and asserting that it does was a claim about
+    /// magnitude dressed up as a claim about importance.
+    #[test]
+    fn imatrix_lowers_the_error_it_weights() {
+        let mut seed = 5u64;
+        let x: Vec<f32> = (0..256 * 16).map(|_| lcg(&mut seed)).collect();
+        let im: Vec<f32> = (0..x.len()).map(|j| if j % 64 < 16 { 1000.0 } else { 0.001 }).collect();
+
+        let mut flat = Vec::new(); quantize_stq1_0(&x, None, &mut flat);
+        let mut weighted = Vec::new(); quantize_stq1_0(&x, Some(&im), &mut weighted);
+        assert_ne!(flat, weighted, "the imatrix did not reach the encoder");
+
+        let werr = |bytes: &[u8]| -> f32 {
+            let y = deq_raw(bytes, x.len(), STQ1_0).unwrap();
+            x.iter().zip(&y).zip(&im).map(|((a, b), w)| w * (a - b) * (a - b)).sum()
+        };
+        let (ef, ew) = (werr(&flat), werr(&weighted));
+        eprintln!("STQ1_0 importance-weighted SSE  flat {ef:.4}  imatrix {ew:.4}  ({:.1}% lower)",
+                  100.0 * (ef - ew) / ef);
+        assert!(ew < ef, "imatrix-aware encoding ({ew:.4}) must beat flat ({ef:.4}) on weighted error");
+    }
+
+    /// An all-zero block has no scale to fit; it must still emit a legal block.
+    #[test]
+    fn all_zero_block_is_legal() {
+        let x = vec![0.0f32; 256];
+        let mut out = Vec::new();
+        quantize_stq1_0(&x, None, &mut out);
+        assert_eq!(out.len(), 42);
+        assert_eq!(deq_raw(&out, 256, STQ1_0).unwrap(), x);
+    }
+}

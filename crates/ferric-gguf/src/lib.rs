@@ -35,6 +35,7 @@ const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1
 const MXFP4: u32 = 39; // OCP Microscaling FP4: 32×E2M1 elements under one E8M0 shared exponent (GPT-OSS)
 const Q1_0: u32 = 41; // PrismML/mainline 1-bit: {−1,+1}·scale, group-128 (1.125 bpw)
 const Q2_0: u32 = 42; // PrismML ternary: {−1,0,+1}·scale, group-128 (2.125 bpw on disk)
+const STQ1_0: u32 = 43; // Tencent hyv4 ternary: {−1,0,+1}·d with ONE FORCED ZERO per 4 lanes (1.3125 bpw)
 
 #[derive(Debug, Clone)]
 pub enum Meta { U(u64), I(i64), F(f64), Bool(bool), Str(String), Arr(Vec<Meta>) }
@@ -519,6 +520,7 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         IQ4_NL => n / 32 * 18,
         IQ4_XS => n / 256 * 136,
         TQ2_0 => n / 256 * 66,
+        STQ1_0 => n / 256 * STQ1_0_BLOCK_BYTES,
         MXFP4 => n / 32 * 17,
         Q1_0 => n / 128 * 18,
         Q2_0 => n / 128 * 34,
@@ -547,6 +549,7 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         IQ4_NL => deq_iq4_nl(raw, n),
         IQ4_XS => deq_iq4_xs(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
+        STQ1_0 => deq_stq1_0(raw, n),
         MXFP4 => deq_mxfp4(raw, n),
         Q1_0 => deq_q1_0(raw, n),
         Q2_0 => deq_q2_0(raw, n),
@@ -1089,6 +1092,66 @@ fn deq_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
 
 /// TQ2_0 (llama.cpp ternary / BitNet): 256-value super-block = `qs[64]` (2-bit codes, 4 per byte) then
 /// `f16 d`. Value = d·(code−1), code ∈ {0,1,2} → {−1,0,+1}. Output order matches llama.cpp's layout.
+/// Bytes one STQ1_0 super-block occupies: `qs[32] + sign[8] + d` = 42 for 256 weights, which is
+/// 1.3125 bits per weight — the lowest-rate format Ferric reads.
+pub const STQ1_0_BLOCK_BYTES: usize = 42;
+
+/// The **STQ1_0 codebook**. Index is `(sign << 4) | slot`; the entry packs four 2-bit lanes, lane
+/// `p` in bits `2p..2p+2`, each decoding as `lane − 1` ∈ {−1, 0, +1}.
+///
+/// There are exactly 32 legal patterns because the format *forces* one zero into every group of
+/// four: 4 choices of which lane is zero × 2³ signs for the other three. `slot` (4 bits) carries
+/// the zero position and two of the three signs; `sign` (1 bit) carries the last one, and the
+/// second half of the table is the first half with every non-zero lane negated. Sign 0 is the half
+/// whose first non-zero lane is `+1`.
+///
+/// The 3:4 sparsity is therefore a **structural guarantee of the container**, not a property of
+/// the weights that happened to hold: no legal byte sequence can encode a group with zero, two or
+/// four zeros. That is what buys the rate — a free ternary group would need log₂(3⁴) ≈ 6.34 bits,
+/// and this spends 5.
+pub const STQ1_0_CODEBOOK: [u8; 32] = [
+    // sign = 0 — first non-zero lane is +1
+    0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06,
+    0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
+    // sign = 1 — every non-zero lane negated
+    0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4,
+    0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+];
+
+/// **STQ1_0** — the 1.3125-bpw ternary format introduced with Tencent's Hy4 (`hyv4`), where it
+/// carries `ffn_gate_exps` and `ffn_up_exps` on 29 of the 77 MoE layers.
+///
+/// Two details are not free choices, and both are the kind that produce fluent nonsense rather
+/// than an error, because neither changes a shape or an element count:
+///
+/// ⚠ **The scale is at the END of the block, not the start.** `qs[32] | sign[8] | d` — every other
+/// ggml block Ferric reads leads with `d`. Reading `blk[0..2]` as the scale gets a plausible small
+/// float (it is really eight packed slot codes) and every weight in the block comes out wrong by
+/// one shared factor, which an RMS check on a single tensor will not obviously fail.
+///
+/// ⚠ **A group is stride-16, not contiguous.** Group `g` covers `{c·64 + (g mod 16) + p·16}` for
+/// `p ∈ 0..4`, where `c = g / 16`. Decoding groups as four consecutive weights writes exactly the
+/// right 256 values into exactly the right 256 slots in the wrong ORDER — same count, same
+/// multiset, no assert can fire. It is the same shape of bug as reading a convolution's weight
+/// layout under the wrong permutation.
+fn deq_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(STQ1_0_BLOCK_BYTES).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[40..42]);
+        for g in 0..64 {
+            let slot = (blk[g / 2] >> (4 * (g & 1))) & 0x0F;
+            let sign = (blk[32 + g / 8] >> (g % 8)) & 1;
+            let qpack = STQ1_0_CODEBOOK[((sign as usize) << 4) | slot as usize];
+            let base = bi * 256 + (g / 16) * 64 + (g % 16);
+            for p in 0..4 {
+                let q = ((qpack >> (2 * p)) & 3) as i32;
+                out[base + p * 16] = d * (q - 1) as f32;
+            }
+        }
+    }
+    out
+}
+
 fn deq_tq2_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     for (bi, blk) in raw.chunks_exact(66).take(n / 256).enumerate() {
