@@ -400,23 +400,41 @@ inferred from a previous run.
 is what it was trained for; whether its tokens SEPARATE LABELS is a different question and the one
 that matters downstream. Same windows, same split, same probe and control — only the weights differ:
 
-| axis | untrained projection (2.4k params) | released checkpoint (4.79M) | majority |
-|---|---|---|---|
-| fault | 42.7%, control −0.3 | **53.6%**, control −1.8 | 25.0% |
-| diameter | 54.5%, control −1.8 | **63.2%**, control −3.1 | 41.7% |
+| axis | untrained projection (2.4k params) | never saw a bearing (4.79M) | released checkpoint (4.79M) | majority |
+|---|---|---|---|---|
+| fault | 42.7%, control −0.3 | **48.8%**, control −2.7 | **53.6%**, control −1.8 | 25.0% |
+| diameter | 54.5%, control −1.8 | **58.5%**, control −3.6 | **63.2%**, control −3.1 | 41.7% |
+| codes used | 21.9% | 35.0% | 48.1% | — |
 
-**+28.6 and +21.5 points over majority against controls near zero**, where the untrained projection
-gets +17.7 and +12.8. Code-space use goes from 21.9% to 48.1%. The training transfers to a
-downstream task and not only to the objective it was trained on.
+The released checkpoint is **+28.6 and +21.5 points over majority against controls near zero**,
+where the untrained projection gets +17.7 and +12.8. The training transfers to a downstream task
+and not only to the objective it was trained on.
 
-⚠ **This is not a transfer result, and the distinction matters.** CWRU was in the checkpoint's own
-training set, and the two runs split it differently — the tokenizer held out every fourth *file*
-while this probe holds out every 3 HP *recording*, so most of the probe's held-out recordings were
-signals the tokenizer had already fitted. It never saw a label, so this is not leakage of the
-answer; it is a representation fitted to those exact recordings, which is transduction. The claim
-supported is "a tokenizer trained on this corpus's signals separates its labels better than an
-untrained one" — not "it transfers to a corpus it has never seen." A leave-one-corpus-out
-checkpoint is training now to ask the second question properly.
+But the released checkpoint had CWRU in its own training set, and that arm alone cannot say whether
+the weights carry anything *across* corpora. The two runs even split CWRU differently — the
+tokenizer held out every fourth *file*, this probe holds out every 3 HP *recording* — so most of the
+probe's held-out recordings were signals the tokenizer had already fitted. No label ever reached it,
+so this is not leakage of the answer; it is a representation fitted to those exact recordings, which
+is transduction, and it is not the claim a reader takes from "53.6%".
+
+**So a fourth checkpoint was trained with CWRU excluded entirely** — hydraulic, rotating and wind,
+same architecture, same 24,000 steps, same recipe, so the only difference is that no bearing signal
+was ever presented to it. It is the middle column. It reaches **48.8% on fault and 58.5% on
+diameter**, closing 56% and 46% of the distance between the untrained projection and the checkpoint
+that trained on this very corpus, and it lights up 35.0% of the code space against the untrained
+21.9%.
+
+That is the actual test of the word *universal*, and it passes with a size attached: **about half
+of what the training buys survives the corpus change, and the other half is worth having the corpus
+for.** Half the downstream gain is corpus-general structure a bearing set inherits for free; half of
+it has to be paid for in bearing data. Both halves are real, and the honest headline is the pair —
+neither "it transfers" nor "you still need your own corpus" is the whole finding.
+
+One qualifier belongs on the word *bearing*. The transfer checkpoint never saw CWRU, but it did see
+the rotating-machinery corpus — accelerometers at 25.6 kHz on a motor with induced faults. It is
+naive about bearings, not about vibration. What crosses here is a domain gap between two vibration
+corpora at different rates on different machines, which is the gap a user actually faces; it is not
+evidence about a sensor modality the checkpoint has never encountered at all.
 
 **A third corpus, three times the recordings, and a much weaker signal.** The three refutations
 above point at labelled *recordings* as the binding constraint — windows from one recording are not
