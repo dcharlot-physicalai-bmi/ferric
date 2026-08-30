@@ -881,6 +881,108 @@ pub struct Gate {
     pub because: &'static str,
 }
 
+/// Swap traffic, sampled from the kernel's cumulative page counters.
+///
+/// **This replaces an occupancy gate that was wrong in both directions.** The earlier gate refused
+/// a measurement when `vm.swapusage` reported more than half the swap file in use. Two things are
+/// wrong with that. macOS grows the swap file on demand and sizes it to what is resident, so
+/// `used/total` sits near 1 on any machine that has ever swapped and near 0 on one that has not —
+/// it is close to a constant, not a discriminator. And the quantity it reports is *history*: pages
+/// belonging to idle applications, sitting on disk, moving nothing. A machine reading 18241M of
+/// 19456M with `Swapins` and `Swapouts` frozen to the digit across five seconds is doing no paging
+/// at all, and was being refused. Meanwhile a machine with a small, violently thrashing swap file
+/// would have passed.
+///
+/// The quantity the gate is actually about is DRAM traffic that belongs to no workload, and traffic
+/// is a rate. `Swapins + Swapouts` are cumulative page counts; their difference over a known
+/// interval is the paging bandwidth, which is what lands in `ram_power`.
+#[derive(Debug, Clone, Copy)]
+pub struct Paging {
+    /// Cumulative pages read back from swap since boot.
+    pub swapins: u64,
+    /// Cumulative pages written to swap since boot.
+    pub swapouts: u64,
+    /// Bytes per page, read from the `vm_stat` header rather than assumed.
+    pub page_bytes: u64,
+    at: Instant,
+}
+
+/// Paging traffic the gate treats as negligible, in bytes per second.
+///
+/// One mebibyte a second. Against a memory system moving tens of gigabytes a second this is under
+/// a hundredth of a percent of DRAM traffic and cannot move `ram_power` by anything a joules figure
+/// would resolve. The gate is not "no paging" because a cumulative counter can tick for reasons
+/// that have nothing to do with the block; it is "paging too small to appear in the answer".
+pub const PAGING_BUDGET_BPS: f64 = 1024.0 * 1024.0;
+
+impl Paging {
+    /// Sample the counters now. Fields are `NaN`-free but the sample is `None`-shaped on failure:
+    /// unreadable counters produce zeros, and [`Self::gate_since`] fails the gate rather than
+    /// passing it, because an unmeasurable machine is not a quiet one.
+    pub fn now() -> Self {
+        let out = std::process::Command::new("vm_stat")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let count = |k: &str| -> u64 {
+            out.lines()
+                .find(|l| l.trim_start().starts_with(k))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim().trim_end_matches('.'))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+        let page_bytes = out
+            .lines()
+            .next()
+            .and_then(|l| l.split("page size of").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Self { swapins: count("Swapins"), swapouts: count("Swapouts"), page_bytes, at: Instant::now() }
+    }
+
+    /// Pages moved to or from swap since `start`.
+    pub fn pages_since(&self, start: &Paging) -> u64 {
+        self.swapins.saturating_sub(start.swapins) + self.swapouts.saturating_sub(start.swapouts)
+    }
+
+    /// Paging bandwidth since `start`, in bytes per second.
+    pub fn bytes_per_second_since(&self, start: &Paging) -> f64 {
+        let secs = self.at.duration_since(start.at).as_secs_f64();
+        if secs <= 0.0 { return f64::INFINITY; }
+        self.pages_since(start) as f64 * self.page_bytes as f64 / secs
+    }
+
+    /// The gate, as a rate over the interval that just elapsed.
+    ///
+    /// Hold a [`Paging`] from before a measured block and call this after it, and the gate covers
+    /// the block itself rather than a moment beside it.
+    pub fn gate_since(&self, start: &Paging) -> Gate {
+        let readable = self.page_bytes > 0 && start.page_bytes > 0;
+        let bps = self.bytes_per_second_since(start);
+        let pages = self.pages_since(start);
+        let secs = self.at.duration_since(start.at).as_secs_f64();
+        Gate {
+            name: "paging traffic",
+            ok: readable && bps < PAGING_BUDGET_BPS,
+            detail: if readable {
+                format!(
+                    "{pages} pages in {secs:.2}s = {:.2} MiB/s, gate < {:.2} MiB/s",
+                    bps / (1024.0 * 1024.0),
+                    PAGING_BUDGET_BPS / (1024.0 * 1024.0)
+                )
+            } else {
+                "vm_stat counters unreadable".to_string()
+            },
+            because: "paging is DRAM traffic that belongs to no workload and lands in ram_power; \
+                      swap OCCUPANCY is history and does not measure it",
+        }
+    }
+}
+
 /// Whether this machine is in a state where a power difference means anything.
 ///
 /// **These are not caveats, they are admission criteria.** A joules-per-workload figure is a
@@ -919,23 +1021,12 @@ pub fn power_gates() -> Vec<Gate> {
         because: "a saturated machine measures its own contention, not the workload",
     });
 
-    // Swap. Paging is memory traffic that is not the workload's, and it moves DRAM power directly.
-    let su = read("sysctl", &["-n", "vm.swapusage"]);
-    let num = |k: &str| -> f64 {
-        su.split(k)
-            .nth(1)
-            .and_then(|r| r.trim().trim_start_matches('=').trim().split('M').next().map(str::trim).map(str::to_string))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(f64::NAN)
-    };
-    let (used, total) = (num("used"), num("total"));
-    let ratio = used / total;
-    gates.push(Gate {
-        name: "swap in use",
-        ok: ratio < 0.5,
-        detail: format!("{used:.0}M of {total:.0}M = {ratio:.2}, gate < 0.50"),
-        because: "paging is DRAM traffic that belongs to no workload and lands in ram_power",
-    });
+    // Paging. Paging is memory traffic that is not the workload's, and it moves DRAM power
+    // directly. What matters is the TRAFFIC during the block, not how much has ever been swapped:
+    // see `Paging` for why the occupancy form of this gate was wrong in both directions.
+    let before = Paging::now();
+    std::thread::sleep(Duration::from_millis(250));
+    gates.push(Paging::now().gate_since(&before));
 
     // Battery current. Plugged in is not the same as mains-powered: an adapter smaller than the
     // load leaves the battery financing the difference, and that term inverts sign the moment
@@ -1388,4 +1479,67 @@ mod boundary_tests {
         }
     }
 
+
+    // The paging gate is a RATE gate. These pin the two directions the occupancy form got wrong.
+
+    #[test]
+    fn paging_gate_passes_a_quiet_machine_however_much_is_already_swapped() {
+        // The counters are cumulative, so swap that happened before `start` is invisible to the
+        // delta by construction. A machine with 18 GiB resident in swap and no traffic passes.
+        let start = Paging::now();
+        std::thread::sleep(Duration::from_millis(120));
+        let end = Paging::now();
+        if end.page_bytes == 0 {
+            return; // no vm_stat on this platform; the gate fails closed, tested below.
+        }
+        let quiet = Paging { swapins: start.swapins, swapouts: start.swapouts, ..end };
+        assert!(quiet.gate_since(&start).ok, "zero delta must pass: {:?}", quiet.gate_since(&start).detail);
+    }
+
+    #[test]
+    fn paging_gate_fails_a_thrashing_machine_however_little_is_swapped() {
+        let start = Paging::now();
+        std::thread::sleep(Duration::from_millis(120));
+        let mut end = Paging::now();
+        if end.page_bytes == 0 { return; }
+        // 4096 pages in ~0.12 s is ~64 pages/ms: far over budget at any page size we would see.
+        end.swapouts = start.swapouts + 4096;
+        let g = end.gate_since(&start);
+        assert!(!g.ok, "heavy paging must fail: {}", g.detail);
+        assert!(g.detail.contains("MiB/s"), "the gate reports a rate, not an occupancy: {}", g.detail);
+    }
+
+    #[test]
+    fn paging_gate_fails_closed_when_the_counters_are_unreadable() {
+        let now = Instant::now();
+        let a = Paging { swapins: 0, swapouts: 0, page_bytes: 0, at: now };
+        let b = Paging { swapins: 0, swapouts: 0, page_bytes: 0, at: now + Duration::from_secs(1) };
+        assert!(!b.gate_since(&a).ok, "an unmeasurable machine is not a quiet one");
+    }
+
+    #[test]
+    fn paging_gate_fails_a_zero_width_interval() {
+        // No elapsed time is no evidence of quiet. Rate is infinite, not zero.
+        let now = Instant::now();
+        let a = Paging { swapins: 0, swapouts: 0, page_bytes: 16384, at: now };
+        let b = Paging { swapins: 0, swapouts: 0, page_bytes: 16384, at: now };
+        assert!(!b.gate_since(&a).ok, "a zero-width window cannot certify anything");
+    }
+
+    #[test]
+    fn paging_counters_survive_a_reset() {
+        let now = Instant::now();
+        let a = Paging { swapins: 900, swapouts: 900, page_bytes: 16384, at: now };
+        let b = Paging { swapins: 1, swapouts: 1, page_bytes: 16384, at: now + Duration::from_secs(1) };
+        assert_eq!(b.pages_since(&a), 0, "a counter that went backwards is not negative traffic");
+    }
+
+    #[test]
+    fn power_gates_no_longer_name_swap_occupancy() {
+        // The gate list is the crate's published admission criteria; this pins the replacement so a
+        // revert cannot happen quietly.
+        let names: Vec<&str> = power_gates().iter().map(|g| g.name).collect();
+        assert!(names.contains(&"paging traffic"), "{names:?}");
+        assert!(!names.contains(&"swap in use"), "occupancy gate is retracted: {names:?}");
+    }
 }
