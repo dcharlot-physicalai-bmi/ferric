@@ -1,7 +1,7 @@
 //! Ingest the CWRU bearing corpus, whose labels live in the HTML pages beside the data.
 //!
 //!   cargo run -p ferric-signal --example cwru --release -- --data <dir of .mat> --pages <dir of .html>
-//!       [--windows N] [--split time|load] [--train]
+//!       [--windows N] [--split time|load|bearing] [--tokenizer <file>] [--train]
 //!
 //! Not redistributed here. Point `--data` at your own copy of the `.mat` files and `--pages` at the
 //! four Case Western pages they came from; this review located a licence for neither, and widely
@@ -30,6 +30,34 @@
 //! and normal), fault diameter, and motor load. **Load is balanced 41/40/40/40**, which makes it the
 //! across-operating-point split — the same question the rotating corpus answers with 45 recordings.
 //!
+//! ## ⛔ The load split is not the generalization test it looks like
+//!
+//! `--split load` holds out every 3 HP recording, and that reads as an honest across-operating-point
+//! test. Two published critiques say it is not, and they are right.
+//!
+//! Hendriks, Dumond & Knox (*Mechanical Systems and Signal Processing* **169**, 2022, "Towards
+//! better benchmarking using the CWRU bearing fault dataset") identify the flaw directly: "the
+//! accepted procedure of constructing training and testing datasets with different operating
+//! conditions does not constitute a useful domain shift problem since the same physical bearings
+//! exist in both training and testing sets". They find the usual framework "allows CNNs to learn
+//! features related to specific bearings" and propose independent sets of bearings instead. Vieira,
+//! Bauler, Rosa & Silva (arXiv:2509.22267) arrive from the leakage side: "segment-wise and
+//! condition-wise splits introduce spurious correlations that inflate performance metrics", and
+//! recommend bearing-wise partitioning.
+//!
+//! This example was already free of the segment-wise form — whole recordings are held out, never
+//! windows from a recording that also trains — but a load split is the condition-wise form exactly.
+//! Each seeded bearing was run at all four loads, so the part that produced the held-out 3 HP
+//! recordings produced training recordings too.
+//!
+//! **The corpus contains its own remedy, and this example was throwing it away.** The condition
+//! code `IR007` names a drive-end seeded bearing on one page and a *fan-end* seeded bearing on
+//! another: two parts, two mountings, pooled into one label because only the fault name was kept.
+//! At 12 kHz that is 60 drive-end recordings and 45 fan-end, and **both ends carry all five fault
+//! classes**, so training on one end and testing on the other holds out the physical bearing and
+//! its mounting location while leaving the axis askable. That is `--split bearing`, and the
+//! difference between it and `--split load` is the size of the effect the critiques predict.
+//!
 //! ## Both accelerometers, or the recording is skipped
 //!
 //! Files vary in what they carry: 91 have drive-end, fan-end and base, 43 have drive-end and
@@ -57,6 +85,12 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 struct Condition {
     /// Sampling rate of the source page, in kHz. **Not a nuisance field.**
     rate: u32,
+    /// Which bearing carries the seeded defect: 0 drive end, 1 fan end, 2 neither (healthy).
+    ///
+    /// **This identifies the physical bearing, and until now it was thrown away.** `IR007` names a
+    /// drive-end bearing on one page and a fan-end bearing on another: two seeded parts, in two
+    /// mountings, pooled into one label. Keeping it is what makes a bearing-wise split possible.
+    end: usize,
     fault: usize,
     /// Thousandths of an inch; 0 for a healthy bearing.
     diameter: i32,
@@ -64,12 +98,14 @@ struct Condition {
     load: i32,
 }
 
+const ENDS: &[&str] = &["drive end", "fan end", "healthy"];
+
 /// `IR007_2`, `OR014@6_0`, `B021_1`, `Normal_3`.
-fn decode(code: &str, rate: u32) -> Option<Condition> {
+fn decode(code: &str, rate: u32, end: usize) -> Option<Condition> {
     let (head, load) = code.rsplit_once('_')?;
     let load: i32 = load.parse().ok()?;
     if head == "Normal" {
-        return Some(Condition { rate, fault: 0, diameter: 0, load });
+        return Some(Condition { rate, end: 2, fault: 0, diameter: 0, load });
     }
     // Outer-race codes carry the defect's clock position relative to the load zone, which is a
     // different condition rather than a detail: the same defect presents differently at 3, 6 and
@@ -89,7 +125,7 @@ fn decode(code: &str, rate: u32) -> Option<Condition> {
         ("OR", Some("12")) => "OR@12",
         _ => return None,
     };
-    Some(Condition { rate, fault: FAULTS.iter().position(|f| *f == name)?, diameter, load })
+    Some(Condition { rate, end, fault: FAULTS.iter().position(|f| *f == name)?, diameter, load })
 }
 
 /// Pull `(file number, condition code)` out of the corpus's own pages.
@@ -143,13 +179,19 @@ fn labels_from_pages(dir: &str) -> BTreeMap<u32, (String, String)> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(data), Some(pages)) = (flag(&args, "--data"), flag(&args, "--pages")) else {
-        eprintln!("usage: --data <dir of .mat> --pages <dir of .html> [--windows N] [--split time|load]");
+        eprintln!("usage: --data <dir of .mat> --pages <dir of .html> [--windows N] [--split time|load|bearing]");
         std::process::exit(2);
     };
     let per_file: usize = flag(&args, "--windows").and_then(|v| v.parse().ok()).unwrap_or(12);
     let window: usize = flag(&args, "--window").and_then(|v| v.parse().ok()).unwrap_or(4096);
     let patch: usize = flag(&args, "--patch").and_then(|v| v.parse().ok()).unwrap_or(256);
-    let by_load = flag(&args, "--split").as_deref() == Some("load");
+    // `time` splits windows inside a recording, `load` holds out an operating point, `bearing`
+    // holds out the physical part. See the module comment for why the third one had to exist.
+    let split = flag(&args, "--split").unwrap_or_else(|| "time".to_string());
+    if !matches!(split.as_str(), "time" | "load" | "bearing") {
+        eprintln!("error: --split must be one of time, load, bearing");
+        std::process::exit(2);
+    }
 
     let rate_filter: Option<u32> = match flag(&args, "--rate").as_deref() {
         Some("all") => None,
@@ -176,10 +218,14 @@ fn main() {
         let stem = p.file_stem().unwrap().to_string_lossy().to_string();
         let Ok(n) = stem.parse::<u32>() else { continue };
         match codes.get(&n) {
-            Some((code, page)) => match decode(code, if page.contains("48k") || page.contains("normal") { 48 } else { 12 }) {
-                Some(c) => records.push((p.clone(), c)),
-                None => undecoded.push((n, code.clone())),
-            },
+            Some((code, page)) => {
+                let rate = if page.contains("48k") || page.contains("normal") { 48 } else { 12 };
+                let end = if page.contains("fan-end") { 1 } else { 0 };
+                match decode(code, rate, end) {
+                    Some(c) => records.push((p.clone(), c)),
+                    None => undecoded.push((n, code.clone())),
+                }
+            }
             None => unlabelled.push(n),
         }
     }
@@ -242,6 +288,60 @@ fn main() {
             print!(" {:>7}", design.get(&(f, load)).copied().unwrap_or(0));
         }
         println!();
+    }
+
+    // ⛔ THE PHYSICAL BEARING IS A VARIABLE, AND IT WAS INVISIBLE HERE.
+    //
+    // Two published critiques land on exactly the split this example used to default to. Hendriks,
+    // Dumond & Knox (Mechanical Systems and Signal Processing 169, 2022, "Towards better
+    // benchmarking using the CWRU bearing fault dataset") find that "the accepted procedure of
+    // constructing training and testing datasets with different operating conditions does not
+    // constitute a useful domain shift problem since the same physical bearings exist in both
+    // training and testing sets", and propose splitting by independent sets of bearings instead.
+    // Vieira, Bauler, Rosa & Silva (arXiv:2509.22267) reach the same place from the leakage side:
+    // "segment-wise and condition-wise splits introduce spurious correlations that inflate
+    // performance metrics", and recommend bearing-wise partitioning.
+    //
+    // `--split load` is a condition-wise split. It holds out an operating point, and the bearing
+    // that produced the held-out recordings also produced training recordings at the other three
+    // loads. So this table, printed since the first version, was hiding the variable that matters.
+    //
+    // The remedy is in the corpus. `IR007` names a DRIVE-END seeded bearing on one page and a
+    // FAN-END seeded bearing on another — that is why every cell below reads as two sets of four
+    // loads — and both ends carry all five fault classes. Training on one end and testing on the
+    // other holds out the physical part AND its mounting: `--split bearing`.
+    let mut ends: BTreeMap<(usize, usize, i32), usize> = BTreeMap::new();
+    for (_, c) in &records {
+        *ends.entry((c.end, c.fault, c.diameter)).or_insert(0) += 1;
+    }
+    let diams: Vec<i32> = {
+        let mut d: Vec<i32> = ends.keys().map(|k| k.2).collect::<HashSet<_>>().into_iter().collect();
+        d.sort();
+        d
+    };
+    for e in 0..ENDS.len() {
+        let n: usize = ends.iter().filter(|(k, _)| k.0 == e).map(|(_, v)| v).sum();
+        if n == 0 {
+            continue;
+        }
+        println!("\n  {} — {n} recordings, by fault and defect diameter (thousandths of an inch)",
+                 ENDS[e]);
+        print!("  {:<10}", "");
+        for d in &diams {
+            print!(" {:>7}", format!("{d:03}\""));
+        }
+        println!();
+        for f in 0..FAULTS.len() {
+            let row: usize = diams.iter().map(|d| ends.get(&(e, f, *d)).copied().unwrap_or(0)).sum();
+            if row == 0 {
+                continue;
+            }
+            print!("  {:<10}", FAULTS[f]);
+            for d in &diams {
+                print!(" {:>7}", ends.get(&(e, f, *d)).copied().unwrap_or(0));
+            }
+            println!();
+        }
     }
 
     let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
@@ -351,18 +451,25 @@ fn main() {
              codes_seen.len() as f64 / q.codebook_size() as f64 * 100.0);
 
     // ---- split ----
-    let (train, held): (Vec<usize>, Vec<usize>) = if by_load {
-        (0..docs.len()).partition(|&i| records[doc_rec[i]].1.load != 3)
-    } else {
-        let cut = per_file * 2 / 3;
-        (0..docs.len()).partition(|&i| doc_pos[i] < cut)
+    let (train, held): (Vec<usize>, Vec<usize>) = match split.as_str() {
+        "load" => (0..docs.len()).partition(|&i| records[doc_rec[i]].1.load != 3),
+        "bearing" => (0..docs.len()).partition(|&i| records[doc_rec[i]].1.end != 1),
+        _ => {
+            let cut = per_file * 2 / 3;
+            (0..docs.len()).partition(|&i| doc_pos[i] < cut)
+        }
     };
-    println!("  split `{}`: {} train / {} held out",
-             if by_load { "load" } else { "time" }, train.len(), held.len());
-    if by_load {
-        println!("  held-out recordings were never seen; training contains no 3 HP at all");
-    } else {
-        println!("  train and held-out windows come from the SAME recordings");
+    println!("  split `{split}`: {} train / {} held out", train.len(), held.len());
+    match split.as_str() {
+        "load" => {
+            println!("  held-out recordings were never seen; training contains no 3 HP at all");
+            println!("  ⚠ the SAME PHYSICAL BEARINGS are in both halves — see the module comment");
+        }
+        "bearing" => {
+            println!("  train is every drive-end defect, held out is every fan-end defect");
+            println!("  NO physical bearing, and no mounting location, appears in both halves");
+        }
+        _ => println!("  train and held-out windows come from the SAME recordings"),
     }
 
     let per_axis: Vec<Vec<i32>> = vec![
