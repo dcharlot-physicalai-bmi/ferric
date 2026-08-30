@@ -462,7 +462,27 @@ resample up.
 So **"universal" has a rate range, and it is narrower than the four corpora the released checkpoint
 was trained on.** That is the most likely reason the two vibration corpora sit at 1.6 and 2.1 dB
 where hydraulic reaches 9.2, and it qualifies the checkpoint in a way the SNR table alone does not.
-`--patch` exists on that example to explore the trade, not to resolve it.
+
+**Specializing the training mixture does not help, which is what pins the explanation on the patch.**
+Dropping hydraulic and training on the three vibration corpora alone — same architecture, same patch
+length, same 24,000 steps, same held-out recordings, and each corpus now taking a third of the
+gradients instead of a quarter:
+
+| corpus | four corpora | vibration only | matched-bit baseline |
+|---|---|---|---|
+| CWRU | 1.6 dB | 1.7 dB | 1.6 dB |
+| rotating | 2.1 dB | 2.3 dB | 1.4 dB |
+| wind | 7.1 dB | 7.1 dB | 5.1 dB |
+
+Within a fifth of a decibel everywhere, on a setup with no seed replication — so not a difference
+this run can resolve, and nowhere near the improvement a mixture explanation predicts from a third
+more gradients per corpus. **The mixture was never the problem.** CWRU remains level with an
+untrained single DCT coefficient.
+
+That leaves the patch and the bit rate, and the patch is the one with a number attached: `examples/cwru`
+measures duration-matching more than doubling how well the same tokens separate faults. A specialized
+tokenizer buys nothing unless it also changes the patch length, which is the design the released
+checkpoint cannot express. `--patch` exists on that example to explore the trade, not to resolve it.
 
 Rate control costs something and the run prints it: at 12 kHz the healthy class does not exist at
 all, so `fault` becomes five kinds of defect with no negative case. `--rate all` restores the
