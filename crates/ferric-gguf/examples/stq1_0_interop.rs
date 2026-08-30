@@ -112,6 +112,19 @@ fn main() -> Result<(), String> {
     println!("  block scales: {} of {} finite and positive, median {:.5}",
              scales.len() - bad, scales.len(), { let mut s = scales.clone(); s.sort_by(f32::total_cmp); s[s.len() / 2] });
 
+    // The same oracle trick settles IQ2_XXS and IQ3_XXS, which carry far more of this file than
+    // STQ1_0 does: of the 213.66 GiB, IQ3_XXS is ~85 GiB and IQ2_XXS ~74 GiB against STQ1_0's ~28.
+    for (tag, ty, bpb) in [("iq2_xxs", 16u32, 66usize), ("iq3_xxs", 18, 98)] {
+        let (pa, pb) = (format!("{dir}/hy4_{tag}.bin"), format!("{dir}/hy4_{tag}.q4_k.bin"));
+        let (ra, rb) = match (std::fs::read(&pa), std::fs::read(&pb)) { (Ok(a), Ok(b)) => (a, b), _ => continue };
+        assert_eq!(ra.len(), N / 256 * bpb);
+        let (mine, orc) = (deq_raw(&ra, N, ty)?, deq_raw(&rb, N, 12)?);
+        let (sa, _) = sign_agreement(&mine, &orc);
+        let c = cosine(&mine, &orc);
+        println!("{:<26} {:>10.4} {:>13.1}%          {}", tag, c, 100.0 * sa, "(vs Q4_K)");
+        assert!(c > 0.8, "{tag} decode disagrees with the Q4_K oracle at cos {c:.4}");
+    }
+
     let c = cosine(&ferric, &oracle);
     println!("\n  {}", if c > 0.7 {
         format!("PASS — Ferric's decoder agrees with the Q4_K oracle at cos = {c:.4}")

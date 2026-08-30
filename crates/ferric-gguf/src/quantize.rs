@@ -762,3 +762,55 @@ mod stq1_0_tests {
         assert_eq!(deq_raw(&out, 256, STQ1_0).unwrap(), x);
     }
 }
+
+#[cfg(test)]
+mod iq_xxs_tests {
+    use crate::{type_size, IQ2XXS_GRID, IQ3XXS_GRID};
+
+    /// A transcribed codebook is where a silent wrong-number bug lives, and neither grid has any
+    /// internal redundancy to check against — except its alphabet. Every IQ2_XXS grid byte is one
+    /// of three magnitudes and every IQ3_XXS byte one of eight, so a mistyped hex digit almost
+    /// certainly lands outside. This is the cheapest available guard on 3 KB of constants.
+    #[test]
+    fn grid_bytes_stay_inside_their_alphabets() {
+        let a2 = [8u8, 25, 43];
+        for (i, v) in IQ2XXS_GRID.iter().enumerate() {
+            for b in v.to_le_bytes() {
+                assert!(a2.contains(&b), "IQ2XXS_GRID[{i}] = {v:#018x} has byte {b}, not in {a2:?}");
+            }
+        }
+        // 62 breaks the step-of-8 progression and is not a typo for 60.
+        let a3 = [4u8, 12, 20, 28, 36, 44, 52, 62];
+        for (i, v) in IQ3XXS_GRID.iter().enumerate() {
+            for b in v.to_le_bytes() {
+                assert!(a3.contains(&b), "IQ3XXS_GRID[{i}] = {v:#010x} has byte {b}, not in {a3:?}");
+            }
+        }
+        assert_eq!(IQ2XXS_GRID.len(), 256);
+        assert_eq!(IQ3XXS_GRID.len(), 256);
+        let d2 = IQ2XXS_GRID.iter().collect::<std::collections::HashSet<_>>().len();
+        let d3 = IQ3XXS_GRID.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!((d2, d3), (256, 256), "a duplicated codebook entry wastes an index and hides a typo");
+    }
+
+    /// The sign byte is a parity code, which is why Ferric derives it instead of carrying ggml's
+    /// 128-byte table. If that is wrong, every eighth weight of every group flips.
+    #[test]
+    fn derived_signs_are_the_even_parity_code() {
+        for i in 0u8..128 {
+            let v = super::super::ksigns_for_test(i);
+            assert_eq!(v & 0x7f, i, "low seven bits must be the index itself");
+            assert_eq!(v.count_ones() % 2, 0, "ksigns({i}) = {v:#04x} must have even population count");
+        }
+        let all: std::collections::HashSet<u8> = (0u8..128).map(super::super::ksigns_for_test).collect();
+        assert_eq!(all.len(), 128, "the code must be injective");
+    }
+
+    #[test]
+    fn block_sizes_are_the_published_rates() {
+        assert_eq!(type_size(16, 256).unwrap(), 66);   // 2.0625 bpw
+        assert_eq!(type_size(18, 256).unwrap(), 98);   // 3.0625 bpw
+        assert_eq!(type_size(16, 4096).unwrap(), 66 * 16);
+        assert_eq!(type_size(18, 4096).unwrap(), 98 * 16);
+    }
+}

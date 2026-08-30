@@ -13,6 +13,8 @@ use std::collections::HashMap;
 // ---- ggml tensor type codes we handle ----
 pub mod backed;
 pub mod imatrix;
+mod iq_grids;
+pub use iq_grids::{IQ2XXS_GRID, IQ3XXS_GRID};
 pub mod quantize;
 pub mod quantplan;
 
@@ -29,6 +31,8 @@ const Q3_K: u32 = 11; // 3-bit K-quant: 16 sub-blocks of 16, 6-bit scales packed
 const Q4_K: u32 = 12;
 const Q5_K: u32 = 13;
 const Q6_K: u32 = 14;
+const IQ2_XXS: u32 = 16; // 2.0625 bpw: 8-element grid codebook + 7-bit sign index, 4-bit sub-scale
+const IQ3_XXS: u32 = 18; // 3.0625 bpw: two 4-element grid lookups per 8, same sign/scale word
 const IQ4_NL: u32 = 20; // 4-bit non-linear codebook, group-32 (kvalues_iq4nl)
 const IQ4_XS: u32 = 23; // 4-bit non-linear codebook, 256-super-block w/ 6-bit sub-scales
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
@@ -517,6 +521,8 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q4_K => n / 256 * 144,
         Q5_K => n / 256 * 176,
         Q6_K => n / 256 * 210,
+        IQ2_XXS => n / 256 * 66,
+        IQ3_XXS => n / 256 * 98,
         IQ4_NL => n / 32 * 18,
         IQ4_XS => n / 256 * 136,
         TQ2_0 => n / 256 * 66,
@@ -546,6 +552,8 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q4_K => deq_q4_k(raw, n),
         Q5_K => deq_q5_k(raw, n),
         Q6_K => deq_q6_k(raw, n),
+        IQ2_XXS => deq_iq2_xxs(raw, n),
+        IQ3_XXS => deq_iq3_xxs(raw, n),
         IQ4_NL => deq_iq4_nl(raw, n),
         IQ4_XS => deq_iq4_xs(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
@@ -1092,6 +1100,93 @@ fn deq_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
 
 /// TQ2_0 (llama.cpp ternary / BitNet): 256-value super-block = `qs[64]` (2-bit codes, 4 per byte) then
 /// `f16 d`. Value = d·(code−1), code ∈ {0,1,2} → {−1,0,+1}. Output order matches llama.cpp's layout.
+/// `ksigns_iq2xs[i]` without the 128-byte table: the low seven bits are `i` itself, and the top bit
+/// is set to whatever makes the byte's population count even.
+///
+/// ggml carries this as a literal table; it is a parity code, so Ferric computes it. A derived
+/// constant cannot be mistyped, and the derivation is the documentation — the reader can see that
+/// the eighth sign is not free information but a checksum of the other seven.
+#[inline]
+fn ksigns(i: u8) -> u8 {
+    let low = i & 0x7f;
+    low | ((low.count_ones() as u8 & 1) << 7)
+}
+
+#[cfg(test)]
+pub(crate) fn ksigns_for_test(i: u8) -> u8 { ksigns(i) }
+
+/// **IQ2_XXS** — 2.0625 bpw. 66 bytes per 256 weights: an fp16 block scale and 32 `u16` of payload,
+/// read as eight 8-byte words, one per 32-weight group.
+///
+/// Each group's two `u32` carry four grid indices (the low word, one byte each) and one packed
+/// control word: seven bits of sign index per sub-block of 8, plus a 4-bit sub-scale in the top
+/// nibble. The reconstruction is `d · (0.5 + subscale) · 0.25 · grid[j] · sign`, and the grid byte
+/// is a magnitude only — every value in [`IQ2XXS_GRID`] is drawn from `{8, 25, 43}`, so the format
+/// spends its bits almost entirely on WHICH of 256 magnitude patterns and WHICH of 128 sign
+/// patterns, not on the magnitudes themselves.
+///
+/// ⚠ The sub-scale is `(aux >> 28)`, a 4-bit field, and it shares the same `u32` as the four 7-bit
+/// sign indices — 4·7 + 4 = 32 exactly, with no spare bit. Reading the scale from the other word
+/// gives a plausible small float and a quietly rescaled group.
+fn deq_iq2_xxs(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(66).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        for ib32 in 0..8 {
+            let q = &blk[2 + 8 * ib32..2 + 8 * ib32 + 8];
+            let lo = u32::from_le_bytes([q[0], q[1], q[2], q[3]]);
+            let hi = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+            let db = d * (0.5 + (hi >> 28) as f32) * 0.25;
+            for l in 0..4 {
+                let g = IQ2XXS_GRID[((lo >> (8 * l)) & 0xff) as usize].to_le_bytes();
+                let signs = ksigns(((hi >> (7 * l)) & 127) as u8);
+                for j in 0..8 {
+                    let s = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    out[bi * 256 + ib32 * 32 + l * 8 + j] = db * g[j] as f32 * s;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// **IQ3_XXS** — 3.0625 bpw. 98 bytes per 256 weights: an fp16 scale, then 64 bytes of grid indices
+/// followed by 32 bytes of packed sign-and-scale words.
+///
+/// ⚠ The two halves of `qs` are not interleaved — all 64 index bytes come first and the eight
+/// control words follow at offset `QK_K/4`. Reading them as one interleaved stream keeps the block
+/// size, the element count and the value distribution and destroys the pairing.
+///
+/// Each 32-weight group consumes eight index bytes and one control word. Unlike IQ2_XXS the grid
+/// entry is only FOUR bytes, so a sub-block of 8 takes two lookups — and the sign byte splits
+/// across them, bits 0..3 for the first and bits 4..7 for the second. The multiplier is `0.5`, not
+/// IQ2_XXS's `0.25`.
+fn deq_iq3_xxs(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for (bi, blk) in raw.chunks_exact(98).take(n / 256).enumerate() {
+        let d = rd_f16(&blk[0..2]);
+        let qs = &blk[2..2 + 64];
+        let sas = &blk[2 + 64..2 + 96];
+        for ib32 in 0..8 {
+            let aux = u32::from_le_bytes([sas[4 * ib32], sas[4 * ib32 + 1], sas[4 * ib32 + 2], sas[4 * ib32 + 3]]);
+            let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+            for l in 0..4 {
+                let signs = ksigns(((aux >> (7 * l)) & 127) as u8);
+                let g1 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize].to_le_bytes();
+                let g2 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize].to_le_bytes();
+                let base = bi * 256 + ib32 * 32 + l * 8;
+                for j in 0..4 {
+                    let s1 = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                    let s2 = if signs & (1 << (j + 4)) != 0 { -1.0 } else { 1.0 };
+                    out[base + j] = db * g1[j] as f32 * s1;
+                    out[base + j + 4] = db * g2[j] as f32 * s2;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Bytes one STQ1_0 super-block occupies: `qs[32] + sign[8] + d` = 42 for 256 weights, which is
 /// 1.3125 bits per weight — the lowest-rate format Ferric reads.
 pub const STQ1_0_BLOCK_BYTES: usize = 42;
