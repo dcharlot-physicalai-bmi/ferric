@@ -396,45 +396,85 @@ with a control of +4.9 and it is one. The same axis, the same tokens, and the an
 the held-out size: which is the whole reason the control is printed beside the figure and never
 inferred from a previous run.
 
-**Does the released tokenizer beat an untrained one at anything a user wants?** Reconstruction SNR
-is what it was trained for; whether its tokens SEPARATE LABELS is a different question and the one
-that matters downstream. Same windows, same split, same probe and control — only the weights differ:
+**⛔ RETRACTED: the CWRU fault numbers below were measured on a split that does not test
+generalization.** They are kept because the retraction is the finding. Read this whole section
+before quoting any figure in it.
+
+**What was published.** Reconstruction SNR is what the tokenizer was trained for; whether its tokens
+separate labels is the question a user actually has. Holding out every 3 HP recording — same
+windows, same probe, same control, only the weights differing — gave a clean ladder:
 
 | axis | untrained projection (2.4k params) | never saw a bearing (4.79M) | released checkpoint (4.79M) | majority |
 |---|---|---|---|---|
-| fault | 42.7%, control −0.3 | **48.8%**, control −2.7 | **53.6%**, control −1.8 | 25.0% |
-| diameter | 54.5%, control −1.8 | **58.5%**, control −3.6 | **63.2%**, control −3.1 | 41.7% |
+| fault | 42.7%, control −0.3 | 48.8%, control −2.7 | 53.6%, control −1.8 | 25.0% |
+| diameter | 54.5%, control −1.8 | 58.5%, control −3.6 | 63.2%, control −3.1 | 41.7% |
 | codes used | 21.9% | 35.0% | 48.1% | — |
 
-The released checkpoint is **+28.6 and +21.5 points over majority against controls near zero**,
-where the untrained projection gets +17.7 and +12.8. The training transfers to a downstream task
-and not only to the objective it was trained on.
+More training, more separation, and the checkpoint that had never seen a bearing landing neatly
+between. It was reported as "about half of what the training buys survives a corpus change".
 
-But the released checkpoint had CWRU in its own training set, and that arm alone cannot say whether
-the weights carry anything *across* corpora. The two runs even split CWRU differently — the
-tokenizer held out every fourth *file*, this probe holds out every 3 HP *recording* — so most of the
-probe's held-out recordings were signals the tokenizer had already fitted. No label ever reached it,
-so this is not leakage of the answer; it is a representation fitted to those exact recordings, which
-is transduction, and it is not the claim a reader takes from "53.6%".
+**Why it is void.** Two published critiques land on that split exactly. Hendriks, Dumond & Knox
+(*Mechanical Systems and Signal Processing* **169**, 2022) find that "the accepted procedure of
+constructing training and testing datasets with different operating conditions does not constitute a
+useful domain shift problem since the same physical bearings exist in both training and testing
+sets", and that the usual framework "allows CNNs to learn features related to specific bearings".
+Vieira, Bauler, Rosa & Silva (arXiv:2509.22267) reach it from the leakage side: "segment-wise and
+condition-wise splits introduce spurious correlations that inflate performance metrics".
 
-**So a fourth checkpoint was trained with CWRU excluded entirely** — hydraulic, rotating and wind,
-same architecture, same 24,000 steps, same recipe, so the only difference is that no bearing signal
-was ever presented to it. It is the middle column. It reaches **48.8% on fault and 58.5% on
-diameter**, closing 56% and 46% of the distance between the untrained projection and the checkpoint
-that trained on this very corpus, and it lights up 35.0% of the code space against the untrained
-21.9%.
+This crate was already clear of the segment-wise form — whole recordings are held out, never windows
+from a recording that also trains, which is why the corpus was ingested at all. A load split is the
+condition-wise form. Every seeded bearing was run at all four loads, so the part behind the held-out
+3 HP recordings produced training recordings too.
 
-That is the actual test of the word *universal*, and it passes with a size attached: **about half
-of what the training buys survives the corpus change, and the other half is worth having the corpus
-for.** Half the downstream gain is corpus-general structure a bearing set inherits for free; half of
-it has to be paid for in bearing data. Both halves are real, and the honest headline is the pair —
-neither "it transfers" nor "you still need your own corpus" is the whole finding.
+**The corpus contains the remedy, and this crate was discarding it.** `IR007` names a *drive-end*
+seeded bearing on one page and a *fan-end* seeded bearing on another — two parts, two mountings,
+pooled into one label because only the fault name was kept. Both ends carry all five fault classes.
+So two honest splits exist, and both were run against all three tokenizers:
 
-One qualifier belongs on the word *bearing*. The transfer checkpoint never saw CWRU, but it did see
-the rotating-machinery corpus — accelerometers at 25.6 kHz on a motor with induced faults. It is
-naive about bearings, not about vibration. What crosses here is a domain gap between two vibration
-corpora at different rates on different machines, which is the gap a user actually faces; it is not
-evidence about a sensor modality the checkpoint has never encountered at all.
+- `--split bearing` — train on all 60 drive-end recordings, test on all 45 fan-end. Different part
+  **and** different location relative to the accelerometers.
+- `--split part` — drive end only, train on 007/021/028 and hold out every 0.014" bearing. Different
+  part, **same** mounting and same transmission path. This one isolates bearing identity.
+
+**Fault type does not survive either of them, in any arm.**
+
+| split | tokenizer | fault | majority | control | load | majority | control |
+|---|---|---|---|---|---|---|---|
+| bearing | untrained | 20.3% | 26.7% | +1.1 | 30.9% | 24.4% | +1.6 |
+| bearing | never saw a bearing | 24.1% | 26.7% | −2.1 | 38.2% | 24.4% | +2.3 |
+| bearing | released | **7.7%** | 26.7% | −1.0 | 30.6% | 24.4% | +1.8 |
+| part | untrained | 28.9% | 36.4% | +2.0 | 39.1% | 18.2% | +4.5 |
+| part | never saw a bearing | 24.8% | 36.4% | +2.0 | **56.4%** | 18.2% | +2.7 |
+| part | released | **13.9%** | 36.4% | +3.9 | 45.7% | 18.2% | +5.5 |
+
+Six runs, two independent splits, three tokenizers, and **every fault figure is below its majority
+baseline**. The released checkpoint reaches 7.7% against a 20.0% chance rate — not weak but
+*anti*-correlated, a probe confidently applying a drive-end mapping to a part that does not obey it.
+The ladder inverts: on the honest splits the best checkpoint is the worst arm.
+
+`part` matters because it excludes the obvious objection. `bearing` changes the defect's location
+relative to the sensors as well as the part, and one could argue that is too hard a test. `part`
+changes only the seeded component — same end, same mounting, same transmission path — and the result
+is the same. **Change the physical bearing and the fault result is gone.** What the load split
+measured was largely which bearing was in the rig.
+
+**What does survive is the operating point.** Motor load is recoverable across unseen bearings in
+every arm, and by a margin far outside its control: 56.4% against an 18.2% majority and a 25.0%
+chance rate for the checkpoint that never saw a bearing, 2.3× chance, where a permuted assignment
+buys +2.7. That is a real effect and a physically unsurprising one — load moves shaft speed from
+1730 to 1797 RPM, a global periodicity that 15 bits per 128-sample patch can carry easily. A defect
+signature is sideband structure around that periodicity, it is specific to the part that has the
+defect, and it is what the code does not carry.
+
+So the honest statement about this tokenizer on bearings is: **its tokens generalize across parts for
+the machine's operating condition and not for its damage.** Both halves are worth knowing, and only
+one of them was published before.
+
+Two limits on the null itself. `part` holds out 11 recordings after one is skipped for a missing
+channel, so its held-out sample is thin, and windows within a recording are not independent —
+effectively n = 11, not 440. And a null under a naive-Bayes counting probe on frozen tokens is not a
+null for the representation: a trained classifier, or fine-tuning, might find what counting cannot.
+What is refuted is the specific published claim, which was about these tokens read this way.
 
 **A third corpus, three times the recordings, and a much weaker signal.** The three refutations
 above point at labelled *recordings* as the binding constraint — windows from one recording are not

@@ -188,8 +188,8 @@ fn main() {
     // `time` splits windows inside a recording, `load` holds out an operating point, `bearing`
     // holds out the physical part. See the module comment for why the third one had to exist.
     let split = flag(&args, "--split").unwrap_or_else(|| "time".to_string());
-    if !matches!(split.as_str(), "time" | "load" | "bearing") {
-        eprintln!("error: --split must be one of time, load, bearing");
+    if !matches!(split.as_str(), "time" | "load" | "bearing" | "part") {
+        eprintln!("error: --split must be one of time, load, bearing, part");
         std::process::exit(2);
     }
 
@@ -454,6 +454,12 @@ fn main() {
     let (train, held): (Vec<usize>, Vec<usize>) = match split.as_str() {
         "load" => (0..docs.len()).partition(|&i| records[doc_rec[i]].1.load != 3),
         "bearing" => (0..docs.len()).partition(|&i| records[doc_rec[i]].1.end != 1),
+        // `bearing` changes two things at once: the physical part AND where the defect sits
+        // relative to the accelerometers. `part` changes only the first. Drive end alone, holding
+        // out every 0.014" bearing: different seeded parts, same mounting, same transmission path.
+        "part" => (0..docs.len())
+            .filter(|&i| records[doc_rec[i]].1.end == 0)
+            .partition(|&i| records[doc_rec[i]].1.diameter != 14),
         _ => {
             let cut = per_file * 2 / 3;
             (0..docs.len()).partition(|&i| doc_pos[i] < cut)
@@ -468,6 +474,11 @@ fn main() {
         "bearing" => {
             println!("  train is every drive-end defect, held out is every fan-end defect");
             println!("  NO physical bearing, and no mounting location, appears in both halves");
+            println!("  ⚠ this changes the PART and the FAULT LOCATION together; `part` isolates the first");
+        }
+        "part" => {
+            println!("  drive end only: train is 007/021/028, held out is every 0.014\" bearing");
+            println!("  different seeded parts, SAME mounting and same transmission path");
         }
         _ => println!("  train and held-out windows come from the SAME recordings"),
     }
