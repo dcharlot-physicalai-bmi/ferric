@@ -1042,7 +1042,12 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![t, t])
     }
 
-    pub(crate) fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
+    /// The device context this tensor lives on.
+    ///
+    /// Public because a downstream crate that computes something on the host — a top-k selection, a
+    /// weight repacking — has to build the result tensor back on the same device, and threading a
+    /// context through every such call is ceremony around a value the tensor already holds.
+    pub fn ctx_arc(&self) -> Arc<Context> { self.ctx.clone() }
 
     // ---- general reduction over arbitrary axes ----
     fn reduce(&self, axes: &[usize], op: u32, keepdim: bool) -> Tensor {
