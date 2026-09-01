@@ -592,6 +592,18 @@ pub enum MacmonScope {
     /// `cpu + gpu + ane + ram`: the SoC and its memory, which is what the computation actually
     /// draws. Excludes display, peripherals and anything charging a battery.
     Soc,
+    /// `gpu + ram`: the accelerator and the memory it streams, and NOTHING host-side.
+    ///
+    /// A narrower boundary than [`MacmonScope::Soc`], and it exists because on a shared laptop the
+    /// SoC figure is often unusable: `cpu_power` swings tens of watts with whatever else is running,
+    /// while a GPU kernel's own draw sits at a fraction of a watt. Metering the accelerator rail is
+    /// then the difference between a measurement and a noise report.
+    ///
+    /// ⚠ It genuinely EXCLUDES the host cost of driving the kernel — command encoding, submission,
+    /// the driver. That is real work and it is not counted here, so an accelerator-scoped figure is
+    /// never a per-token or per-task figure. [`Boundary`] carries the exclusion so a `Saving` cannot
+    /// silently compare it against an SoC-scoped one.
+    Accelerator,
     /// `sys_power`: the whole machine at the wall. On a laptop this includes the display and, while
     /// plugged in, whatever current is going into the battery — which is not the computation and
     /// does not belong in a per-token figure.
@@ -684,6 +696,7 @@ impl Macmon {
                 let Some(mut sample) = parse_sample(&line) else { continue };
                 let w = match scope {
                     MacmonScope::Soc => sample.soc(),
+                    MacmonScope::Accelerator => sample.gpu + sample.ram,
                     MacmonScope::System => sample.sys,
                 };
                 let now = Instant::now();
@@ -697,6 +710,7 @@ impl Macmon {
                     let dt = now.duration_since(prev).as_secs_f64();
                     let prev_w = st.all.last().map(|s| match scope {
                         MacmonScope::Soc => s.soc(),
+            MacmonScope::Accelerator => s.gpu + s.ram,
                         MacmonScope::System => s.sys,
                     });
                     st.joules += match prev_w {
@@ -753,6 +767,7 @@ impl Macmon {
         let all = self.trace();
         let w = |s: &MacmonSample| match self.scope {
             MacmonScope::Soc => s.soc(),
+            MacmonScope::Accelerator => s.gpu + s.ram,
             MacmonScope::System => s.sys,
         };
         let before = all.iter().rposition(|s| s.t <= t0)?;
@@ -856,6 +871,7 @@ impl Meter for Macmon {
     fn source(&self) -> &'static str {
         match self.scope {
             MacmonScope::Soc => "macmon:soc",
+            MacmonScope::Accelerator => "macmon:gpu+ram",
             MacmonScope::System => "macmon:system",
         }
     }
@@ -864,6 +880,7 @@ impl Meter for Macmon {
             // The SoC is accelerator and host on the same die, with its memory. No facility term on
             // a laptop, and no provisioned-idle term because there is no fleet.
             MacmonScope::Soc => Boundary { accelerator: true, host: true, idle: false, facility: false },
+            MacmonScope::Accelerator => Boundary { accelerator: true, host: false, idle: false, facility: false },
             MacmonScope::System => Boundary::SYSTEM,
         }
     }
