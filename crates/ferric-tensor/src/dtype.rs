@@ -2442,6 +2442,13 @@ impl Tensor {
     }
 
     pub fn matmul_stq1_0(&self, w: &Stq1_0Weights) -> Tensor {
+        self.matmul_stq1_0_form(w, std::env::var("FERRIC_STQ1_SCALAR").is_ok())
+    }
+
+    /// The same matmul with the traversal order chosen explicitly, so the two forms can be compared
+    /// **inside one process**. A cross-launch comparison on a contended laptop has inverted a
+    /// conclusion in this tree before; an env var alone would have forced exactly that shape.
+    pub fn matmul_stq1_0_form(&self, w: &Stq1_0Weights, scalar: bool) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
@@ -2450,7 +2457,12 @@ impl Tensor {
         let wg = n.div_ceil(64);
         let gw = wg.min(32768);
         let gh = wg.div_ceil(gw);
-        run(&self.ctx, MATMUL_STQ1_0_WGSL, "matmul_stq1_0",
+        // `FERRIC_STQ1_SCALAR` selects the original scalar-load form. It is kept reachable so the
+        // vec4 rewrite can be A/B'd in one process rather than across two builds — a cross-launch
+        // comparison on a contended laptop has inverted a conclusion in this tree before.
+        let (src, label) = if scalar { (MATMUL_STQ1_0_WGSL, "matmul_stq1_0_scalar") }
+                           else { (MATMUL_STQ1_0_V4_WGSL, "matmul_stq1_0_v4") };
+        run(&self.ctx, src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.signs.as_ref(), w.scales.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
             (gw as u32, gh as u32, 1));
@@ -5291,6 +5303,82 @@ mod mxfp4_kernel_tests {
 
 /// STQ1_0 GEMV. `codes`/`signs` are output-major so adjacent threads read adjacent words; the
 /// codebook maps `(sign << 4) | slot` to four 2-bit lanes, each decoding as `lane − 1`.
+/// **STQ1_0 GEMV, vec4 activation form.** Same arithmetic as [`MATMUL_STQ1_0_WGSL`], different
+/// traversal order.
+///
+/// The scalar form walks groups and gathers each group's four lanes at stride 16, which costs four
+/// separate `x` loads per group — 256 scalar loads per 256-weight block, against 8 weight-word
+/// loads. Ferric's Q2_0 kernel already records the consequence: the ACTIVATION loads, not the
+/// weights, dominate the instruction stream, and a kernel that is issue-bound cannot spend the
+/// bandwidth its format saves.
+///
+/// The stride-16 layout looks like it forbids a vector load, and it does — in that direction. But
+/// invert the loop: inside a 64-weight chunk, holding the lane `p` fixed and stepping four
+/// consecutive groups walks four CONSECUTIVE activations. So `x` is read as `vec4<f32>` and the
+/// four weights are reduced with one `dot()`, at 64 vector loads per block instead of 256 scalar
+/// ones — and the four groups' slot codes are four adjacent nibbles of the same word, so the weight
+/// side gets cheaper too.
+const MATMUL_STQ1_0_V4_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        signs:  array<u32>;
+@group(0) @binding(3) var<storage,read>        scales: array<u32>;
+@group(0) @binding(4) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(5) var<uniform>             info:   vec4<u32>;
+
+var<private> CODEBOOK: array<u32, 32> = array<u32, 32>(
+    0xA9u, 0x89u, 0x29u, 0x09u, 0xA6u, 0x86u, 0x26u, 0x06u,
+    0x9Au, 0x92u, 0x1Au, 0x12u, 0x6Au, 0x62u, 0x4Au, 0x42u,
+    0x01u, 0x21u, 0x81u, 0xA1u, 0x04u, 0x24u, 0x84u, 0xA4u,
+    0x10u, 0x18u, 0x90u, 0x98u, 0x40u, 0x48u, 0x60u, 0x68u
+);
+
+fn lane(qpack: u32, p: u32) -> f32 { return f32(i32((qpack >> (2u * p)) & 3u) - 1); }
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let si = blk * o_dim + o;
+        let sw = unpack2x16float(scales[si >> 1u]);
+        let d = select(sw.y, sw.x, (si & 1u) == 0u);
+        let xbase = r * in_dim + blk * 256u;
+        var bacc = 0.0;
+        for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+            // One sign word covers two chunks; one code word covers eight groups, so a chunk's
+            // sixteen groups are exactly two words. Both are hoisted out of the k loop.
+            let sword = signs[(blk * 2u + (c >> 1u)) * o_dim + o];
+            let w0 = codes[(blk * 8u + c * 2u) * o_dim + o];
+            let w1 = codes[(blk * 8u + c * 2u + 1u) * o_dim + o];
+            for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+                let word = select(w1, w0, k < 2u);
+                let nib0 = 4u * (k & 1u);            // first of four adjacent nibbles
+                let sb0  = (c & 1u) * 16u + 4u * k;  // first of four adjacent sign bits
+                var qp: array<u32, 4>;
+                for (var t: u32 = 0u; t < 4u; t = t + 1u) {
+                    let slot = (word >> (4u * (nib0 + t))) & 0x0Fu;
+                    let sbit = (sword >> (sb0 + t)) & 1u;
+                    qp[t] = CODEBOOK[(sbit << 4u) | slot];
+                }
+                for (var p: u32 = 0u; p < 4u; p = p + 1u) {
+                    // Lane p of four consecutive groups IS four consecutive activations.
+                    let e0 = xbase + c * 64u + p * 16u + 4u * k;
+                    let xv = vec4<f32>(x[e0], x[e0 + 1u], x[e0 + 2u], x[e0 + 3u]);
+                    let wv = vec4<f32>(lane(qp[0], p), lane(qp[1], p), lane(qp[2], p), lane(qp[3], p));
+                    bacc = bacc + dot(xv, wv);
+                }
+            }
+        }
+        acc = acc + bacc * d;
+    }
+    out[idx] = acc;
+}
+"#;
+
 const MATMUL_STQ1_0_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<f32>;
 @group(0) @binding(1) var<storage,read>        codes:  array<u32>;   // [word][output], 8 words/block
@@ -5468,6 +5556,16 @@ fn ksigns(i: u32) -> u32 {
     let low = i & 0x7fu;
     return low | ((countOneBits(low) & 1u) << 7u);
 }
+/// The four bytes of a grid word as floats. One shift-and-mask vector instead of four scalars.
+fn bytes4(w: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(w & 0xffu, (w >> 8u) & 0xffu, (w >> 16u) & 0xffu, (w >> 24u) & 0xffu));
+}
+/// Four sign bits as ±1. `1 − 2b` is branchless where `select` per lane is not.
+fn signs4(sg: u32, base: u32) -> vec4<f32> {
+    let b = vec4<u32>((sg >> base) & 1u, (sg >> (base + 1u)) & 1u,
+                      (sg >> (base + 2u)) & 1u, (sg >> (base + 3u)) & 1u);
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0) - 2.0 * vec4<f32>(b);
+}
 "#;
 
 const MATMUL_IQ2_XXS_WGSL: &str = r#"
@@ -5503,12 +5601,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let g1 = grid[gi * 2u + 1u];
                 let sg = ksigns((hi >> (7u * l)) & 127u);
                 let xb = xbase + ib * 32u + l * 8u;
-                for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-                    let word = select(g1, g0, j < 4u);
-                    let mag  = f32((word >> (8u * (j & 3u))) & 0xffu);
-                    let s    = select(1.0, -1.0, ((sg >> j) & 1u) == 1u);
-                    sacc = sacc + x[xb + j] * mag * s;
-                }
+                // The eight activations behind one grid point are CONTIGUOUS, so this is a plain
+                // pair of vector loads. The scalar form issued eight separate ones, and on this
+                // kernel the activation loads — not the weight bytes — are what fills the
+                // instruction stream.
+                let x0 = vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                let x1 = vec4<f32>(x[xb + 4u], x[xb + 5u], x[xb + 6u], x[xb + 7u]);
+                sacc = sacc + dot(x0, bytes4(g0) * signs4(sg, 0u))
+                            + dot(x1, bytes4(g1) * signs4(sg, 4u));
             }
             acc = acc + sacc * db;
         }
@@ -5553,13 +5653,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let g2 = grid[i2];
                 let sg = ksigns((aux >> (7u * l)) & 127u);
                 let xb = xbase + ib * 32u + l * 8u;
-                for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-                    let m1 = f32((g1 >> (8u * j)) & 0xffu);
-                    let m2 = f32((g2 >> (8u * j)) & 0xffu);
-                    let s1 = select(1.0, -1.0, ((sg >> j) & 1u) == 1u);
-                    let s2 = select(1.0, -1.0, ((sg >> (j + 4u)) & 1u) == 1u);
-                    sacc = sacc + x[xb + j] * m1 * s1 + x[xb + j + 4u] * m2 * s2;
-                }
+                let x0 = vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                let x1 = vec4<f32>(x[xb + 4u], x[xb + 5u], x[xb + 6u], x[xb + 7u]);
+                sacc = sacc + dot(x0, bytes4(g1) * signs4(sg, 0u))
+                            + dot(x1, bytes4(g2) * signs4(sg, 4u));
             }
             acc = acc + sacc * db;
         }

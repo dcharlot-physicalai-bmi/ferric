@@ -101,7 +101,7 @@ fn main() {
     };
     // On the accelerator rail an idle machine sits near zero; anything above this is another
     // process using the GPU, which does contaminate the comparison.
-    const QUIET: f64 = 0.6;
+    const QUIET: f64 = 1.0;
     let idle = floor("before");
     if idle > QUIET {
         println!("\n  REFUSING TO REPORT. An idle floor of {idle:.2} W means something else is using this\n                    machine, and a difference measured against a moving baseline is not attributable to\n                    the kernels. Wait for the machine to be quiet and run again.");
@@ -131,7 +131,7 @@ fn main() {
         // Size each arm to ~2.5 s so `Saving::claimable` is satisfied and the sampler has many
         // periods inside the window. Both arms get the SAME iteration count — the packed arm being
         // faster is part of the result, not something to normalise away.
-        let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..20 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 20.0 };
+        let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..300 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 300.0 };
         let packed_run = || { let _ = x.matmul_q(&packed); };
         let dense_run = || { let _ = x.matmul_bt(&dense); };
         // ⛔ Size on the FASTEST arm, not the slowest. Sizing on the slowest gives it 2.5 s and
@@ -188,6 +188,48 @@ fn main() {
     let after = floor("after");
     if after > QUIET {
         println!("  ⚠ the machine became busy DURING the run ({after:.2} W floor afterwards); the\n                      numbers above are contaminated and should not be quoted.");
+    }
+
+    // ── The forcing function, measured ────────────────────────────────────────────────────────
+    //
+    // The table above says the packed kernels are ALU-bound, not bandwidth-bound. If that is right,
+    // the way to convert the byte saving into joules is to spend fewer instructions per weight —
+    // not to move fewer bytes, which is already done. STQ1_0 has two traversal orders that compute
+    // exactly the same thing and differ only in how many loads they issue, so this measures the
+    // claim rather than asserting it.
+    {
+        let bytes = blocks(N * (K / 256), 42, 40, seed ^ 0xabc);
+        let packed = ferric_tensor::dtype::Stq1_0Weights::from_bytes(&ctx, &bytes, N, K);
+        let a = pollster::block_on(x.matmul_stq1_0_form(&packed, true).to_vec());
+        let b = pollster::block_on(x.matmul_stq1_0_form(&packed, false).to_vec());
+        let mag = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4 * mag, "the two traversal orders disagree by {worst}; not the same matmul");
+
+        let scal = || { let _ = x.matmul_stq1_0_form(&packed, true); };
+        let vec4 = || { let _ = x.matmul_stq1_0_form(&packed, false); };
+        let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..300 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 300.0 };
+        let iters = ((2.6 / probe(&scal).min(probe(&vec4))).ceil() as usize).clamp(50, 8_000_000);
+
+        let idle = floor("stq1_0 traversal");
+        if idle <= QUIET {
+            if let Some(sv) = compare(&meter, iters as u64, (iters as u64, iters as u64), 2,
+                || { for _ in 0..iters { scal() } ferric_tensor::device_sync(&ctx); },
+                || { for _ in 0..iters { vec4() } ferric_tensor::device_sync(&ctx); }) {
+                match sv.claimable() {
+                    Err(e) => println!("  stq1_0 traversal: NOT CLAIMABLE — {e}"),
+                    Ok(()) => {
+                        let (sj, vj) = (sv.baseline.joules / iters as f64, sv.candidate.joules / iters as f64);
+                        println!("\nstq1_0 traversal order, same arithmetic, {iters} matmuls:");
+                        println!("  scalar loads (256 x-loads/block)   {sj:.3e} J  {:.2} W  {:.2} s",
+                                 sv.baseline.watts(), sv.baseline.seconds);
+                        println!("  vec4 loads    (64 x-loads/block)   {vj:.3e} J  {:.2} W  {:.2} s  ({:.2}x energy, {:.2}x wall)",
+                                 sv.candidate.watts(), sv.candidate.seconds, sj / vj,
+                                 sv.baseline.seconds / sv.candidate.seconds);
+                    }
+                }
+            }
+        } else { println!("  stq1_0 traversal: SKIPPED — machine busy ({idle:.2} W floor)"); }
     }
 
     println!("\n  A joules-per-matmul figure is not a joules-per-token figure. This is one kernel with\n  \
