@@ -644,6 +644,13 @@ pub struct Stq1_0Weights {
     codes: Arc<wgpu::Buffer>,  // 8 u32 per block — 8 four-bit slot codes per word
     signs: Arc<wgpu::Buffer>,  // 2 u32 per block — one bit per group of 4
     scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
+    /// The 32 codebook patterns pre-expanded to their four lane values, `[-1, 0, +1]` as f32.
+    ///
+    /// 512 bytes in a storage buffer rather than 32 words in `var<private>`. WGSL scopes `private`
+    /// PER INVOCATION, so a dynamically-indexed private array is per-thread state the compiler has
+    /// to keep somewhere — and pre-expanding the lanes also deletes the shift-mask-subtract the
+    /// shader would otherwise redo for every weight.
+    codebook: Arc<wgpu::Buffer>,
     pub rows: usize, // out features
     pub cols: usize, // in features (multiple of 256)
 }
@@ -682,11 +689,20 @@ impl Stq1_0Weights {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             }))
         };
+        // Four f32 lanes per codebook entry, in the same (sign << 4) | slot order the shader uses.
+        let cb: Vec<f32> = (0..32).flat_map(|i| {
+            let q = crate::dtype::STQ1_0_SHADER_CODEBOOK[i];
+            (0..4).map(move |p| ((q >> (2 * p)) & 3) as f32 - 1.0)
+        }).collect();
         Stq1_0Weights {
             ctx: ctx.clone(),
             codes: mk("stq1_0.codes", &codes),
             signs: mk("stq1_0.signs", &signs),
             scales: mk("stq1_0.scales", &scales),
+            codebook: Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("stq1_0.codebook"), contents: bytemuck::cast_slice(&cb),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            })),
             rows, cols,
         }
     }
@@ -2442,13 +2458,18 @@ impl Tensor {
     }
 
     pub fn matmul_stq1_0(&self, w: &Stq1_0Weights) -> Tensor {
-        self.matmul_stq1_0_form(w, std::env::var("FERRIC_STQ1_SCALAR").is_ok())
+        let f = match std::env::var("FERRIC_STQ1_FORM").as_deref() {
+            Ok("scalar") => Stq1Form::Scalar,
+            Ok("vec4") => Stq1Form::Vec4,
+            _ => Stq1Form::Vec4Table,
+        };
+        self.matmul_stq1_0_form(w, f)
     }
 
     /// The same matmul with the traversal order chosen explicitly, so the two forms can be compared
     /// **inside one process**. A cross-launch comparison on a contended laptop has inverted a
     /// conclusion in this tree before; an env var alone would have forced exactly that shape.
-    pub fn matmul_stq1_0_form(&self, w: &Stq1_0Weights, scalar: bool) -> Tensor {
+    pub fn matmul_stq1_0_form(&self, w: &Stq1_0Weights, form: Stq1Form) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
@@ -2460,12 +2481,20 @@ impl Tensor {
         // `FERRIC_STQ1_SCALAR` selects the original scalar-load form. It is kept reachable so the
         // vec4 rewrite can be A/B'd in one process rather than across two builds — a cross-launch
         // comparison on a contended laptop has inverted a conclusion in this tree before.
-        let (src, label) = if scalar { (MATMUL_STQ1_0_WGSL, "matmul_stq1_0_scalar") }
-                           else { (MATMUL_STQ1_0_V4_WGSL, "matmul_stq1_0_v4") };
-        run(&self.ctx, src, label,
-            &[x.buf.as_ref(), w.codes.as_ref(), w.signs.as_ref(), w.scales.as_ref(), &out,
-              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
-            (gw as u32, gh as u32, 1));
+        let info = unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32]);
+        match form {
+            Stq1Form::Vec4Table => run(&self.ctx, MATMUL_STQ1_0_V4T_WGSL, "matmul_stq1_0_v4t",
+                &[x.buf.as_ref(), w.codes.as_ref(), w.signs.as_ref(), w.scales.as_ref(),
+                  w.codebook.as_ref(), &out, &info],
+                (gw as u32, gh as u32, 1)),
+            f => {
+                let (src, label) = if matches!(f, Stq1Form::Scalar) { (MATMUL_STQ1_0_WGSL, "matmul_stq1_0_scalar") }
+                                   else { (MATMUL_STQ1_0_V4_WGSL, "matmul_stq1_0_v4") };
+                run(&self.ctx, src, label,
+                    &[x.buf.as_ref(), w.codes.as_ref(), w.signs.as_ref(), w.scales.as_ref(), &out, &info],
+                    (gw as u32, gh as u32, 1))
+            }
+        }
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
 
@@ -5764,3 +5793,76 @@ mod iq_kernel {
         }
     }
 }
+
+/// Which STQ1_0 traversal the kernel uses. Three forms compute the same matmul; they differ only in
+/// how many instructions they spend per weight, which is the whole question for a format whose
+/// bandwidth saving is already banked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stq1Form {
+    /// 256 scalar activation loads per block. The first working version.
+    Scalar,
+    /// 64 `vec4` loads and one `dot()` per four weights, with the codebook in `var<private>`.
+    Vec4,
+    /// As `Vec4`, but the codebook is a storage buffer of pre-expanded lane vectors and the four
+    /// groups' lanes are transposed with one `mat4x4` instead of sixteen shift-mask-subtracts.
+    Vec4Table,
+}
+
+/// The codebook as the shaders index it: `(sign << 4) | slot`.
+pub(crate) const STQ1_0_SHADER_CODEBOOK: [u32; 32] = [
+    0xA9, 0x89, 0x29, 0x09, 0xA6, 0x86, 0x26, 0x06,
+    0x9A, 0x92, 0x1A, 0x12, 0x6A, 0x62, 0x4A, 0x42,
+    0x01, 0x21, 0x81, 0xA1, 0x04, 0x24, 0x84, 0xA4,
+    0x10, 0x18, 0x90, 0x98, 0x40, 0x48, 0x60, 0x68,
+];
+
+const MATMUL_STQ1_0_V4T_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<f32>;
+@group(0) @binding(1) var<storage,read>        codes:  array<u32>;
+@group(0) @binding(2) var<storage,read>        signs:  array<u32>;
+@group(0) @binding(3) var<storage,read>        scales: array<u32>;
+@group(0) @binding(4) var<storage,read>        cb:     array<vec4<f32>>;  // 32 entries, lanes pre-expanded
+@group(0) @binding(5) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(6) var<uniform>             info:   vec4<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nblk = in_dim / 256u;
+    var acc = 0.0;
+    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+        let si = blk * o_dim + o;
+        let sw = unpack2x16float(scales[si >> 1u]);
+        let d = select(sw.y, sw.x, (si & 1u) == 0u);
+        let xbase = r * in_dim + blk * 256u;
+        var bacc = 0.0;
+        for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+            let sword = signs[(blk * 2u + (c >> 1u)) * o_dim + o];
+            let w0 = codes[(blk * 8u + c * 2u) * o_dim + o];
+            let w1 = codes[(blk * 8u + c * 2u + 1u) * o_dim + o];
+            for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+                let word = select(w1, w0, k < 2u);
+                let nib0 = 4u * (k & 1u);
+                let sb0  = (c & 1u) * 16u + 4u * k;
+                // Four groups' lane vectors, straight out of the table — no shifting per lane.
+                let c0 = cb[(((sword >> sb0) & 1u) << 4u) | ((word >> (4u * nib0)) & 0x0Fu)];
+                let c1 = cb[(((sword >> (sb0 + 1u)) & 1u) << 4u) | ((word >> (4u * (nib0 + 1u))) & 0x0Fu)];
+                let c2 = cb[(((sword >> (sb0 + 2u)) & 1u) << 4u) | ((word >> (4u * (nib0 + 2u))) & 0x0Fu)];
+                let c3 = cb[(((sword >> (sb0 + 3u)) & 1u) << 4u) | ((word >> (4u * (nib0 + 3u))) & 0x0Fu)];
+                // Columns are the four groups; after the transpose row p is lane p of each group,
+                // which is exactly the vector the four consecutive activations pair with.
+                let mt = transpose(mat4x4<f32>(c0, c1, c2, c3));
+                let base = xbase + c * 64u + 4u * k;
+                for (var p: u32 = 0u; p < 4u; p = p + 1u) {
+                    let e0 = base + p * 16u;
+                    bacc = bacc + dot(vec4<f32>(x[e0], x[e0 + 1u], x[e0 + 2u], x[e0 + 3u]), mt[p]);
+                }
+            }
+        }
+        acc = acc + bacc * d;
+    }
+    out[idx] = acc;
+}
+"#;

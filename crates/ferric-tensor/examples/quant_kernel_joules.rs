@@ -109,7 +109,38 @@ fn main() {
     }
     println!();
 
-    println!("boundary: {} — the accelerator rail only, host dispatch NOT counted\n", meter.source());
+    println!("boundary: {} — the accelerator rail only, host dispatch NOT counted", meter.source());
+
+    // ── Throughput calibration ────────────────────────────────────────────────────────────────
+    //
+    // ⛔ An idle-floor gate cannot see THROTTLING. A machine that has run its battery flat is
+    // perfectly quiet — every floor reading below stayed under a watt — and runs its GPU at a third
+    // of its usual clock. One such run reported the dense arm at 40 GB/s against the 145 GB/s it
+    // reaches normally, and every ratio built on it was wrong by more than the effect being
+    // measured. Silence is not the same as readiness.
+    //
+    // The detector is a known-good workload, not a quieter idle window. The dense f32 matmul is
+    // stable and well characterised, so it doubles as a calibration arm: if it is not hitting its
+    // usual rate, this machine is not in a state where anything else measured on it is comparable.
+    //
+    // The floor is set from the observed healthy band, not guessed: five clean runs put the dense
+    // arm at 143.6, 144.9, 148.0, 151.0 and 151.2 GB/s — a spread of ±3%. A throttled machine read
+    // 40 GB/s, and a half-recovered one 101.7, which the first version of this gate let through at a
+    // floor of 100. 130 sits well below anything healthy and well above anything throttled.
+    const DENSE_GBS_FLOOR: f64 = 130.0;
+    {
+        let w = Tensor::from_vec(&ctx, &vec![0.01f32; N * K], &[N, K]);
+        let t = Instant::now();
+        for _ in 0..400 { let _ = x.matmul_bt(&w); }
+        ferric_tensor::device_sync(&ctx);
+        let gbs = (N * K * 4 * 400) as f64 / t.elapsed().as_secs_f64() / 1e9;
+        println!("calibration: dense f32 matmul at {gbs:.1} GB/s");
+        if gbs < DENSE_GBS_FLOOR {
+            println!("\n  REFUSING TO REPORT. The dense reference reaches {gbs:.1} GB/s against the\n                        {DENSE_GBS_FLOOR:.0} GB/s this machine does when it is not throttled. Check the battery\n                        (a flat one throttles hard and stays perfectly quiet while doing it) and the\n                        thermal state, then run again.");
+            return;
+        }
+    }
+    println!();
     println!("{:<9} {:>10} {:>9} {:>8} {:>9} {:>9} {:>8} {:>9}",
              "format", "resident", "bpw", "iters", "J/matmul", "W", "GB/s", "vs dense");
 
@@ -200,14 +231,14 @@ fn main() {
     {
         let bytes = blocks(N * (K / 256), 42, 40, seed ^ 0xabc);
         let packed = ferric_tensor::dtype::Stq1_0Weights::from_bytes(&ctx, &bytes, N, K);
-        let a = pollster::block_on(x.matmul_stq1_0_form(&packed, true).to_vec());
-        let b = pollster::block_on(x.matmul_stq1_0_form(&packed, false).to_vec());
+        let a = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4).to_vec());
+        let b = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table).to_vec());
         let mag = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let worst = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
         assert!(worst < 1e-4 * mag, "the two traversal orders disagree by {worst}; not the same matmul");
 
-        let scal = || { let _ = x.matmul_stq1_0_form(&packed, true); };
-        let vec4 = || { let _ = x.matmul_stq1_0_form(&packed, false); };
+        let scal = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4); };
+        let vec4 = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table); };
         let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..300 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 300.0 };
         let iters = ((2.6 / probe(&scal).min(probe(&vec4))).ceil() as usize).clamp(50, 8_000_000);
 
@@ -221,9 +252,9 @@ fn main() {
                     Ok(()) => {
                         let (sj, vj) = (sv.baseline.joules / iters as f64, sv.candidate.joules / iters as f64);
                         println!("\nstq1_0 traversal order, same arithmetic, {iters} matmuls:");
-                        println!("  scalar loads (256 x-loads/block)   {sj:.3e} J  {:.2} W  {:.2} s",
+                        println!("  vec4 + private codebook     {sj:.3e} J  {:.2} W  {:.2} s",
                                  sv.baseline.watts(), sv.baseline.seconds);
-                        println!("  vec4 loads    (64 x-loads/block)   {vj:.3e} J  {:.2} W  {:.2} s  ({:.2}x energy, {:.2}x wall)",
+                        println!("  vec4 + table + transpose    {vj:.3e} J  {:.2} W  {:.2} s  ({:.2}x energy, {:.2}x wall)",
                                  sv.candidate.watts(), sv.candidate.seconds, sj / vj,
                                  sv.baseline.seconds / sv.candidate.seconds);
                     }
