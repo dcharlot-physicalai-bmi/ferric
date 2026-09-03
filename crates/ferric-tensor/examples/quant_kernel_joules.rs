@@ -79,6 +79,35 @@ fn main() {
     let xv: Vec<f32> = (0..K).map(|_| lcg(&mut seed)).collect();
     let x = Tensor::from_vec(&ctx, &xv, &[1, K]); // decode shape: one token, the bandwidth-bound case
 
+    // ── Pre-flight: is macOS scanning the binary we just built? ───────────────────────────────
+    //
+    // ⛔ A `cargo build` immediately before a measurement CONTAMINATES IT. Every build emits a new
+    // unsigned executable, and macOS answers with Gatekeeper assessment (`syspolicyd`), malware
+    // scanning (`XprotectService`) and Spotlight indexing (`mds`) — a storm that ran at 90% CPU for
+    // minutes here and drove the GPU rail from 0.5 W to 31 W. Four consecutive runs were refused by
+    // the idle gate for a load this process created by existing.
+    //
+    // The idle floor already catches the consequence. This names the cause, because "wait for the
+    // machine to be quiet" is unactionable advice when the thing making it busy is the build you
+    // just ran, and the fix — build, wait, then measure — is not guessable from a wattage.
+    if let Ok(out) = std::process::Command::new("ps").args(["-Ao", "%cpu,comm", "-r"]).output() {
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let busy: Vec<&str> = txt.lines().filter_map(|l| {
+            let (c, name) = l.trim().split_once(char::is_whitespace)?;
+            let pct: f64 = c.parse().ok()?;
+            let short = name.rsplit('/').next()?;
+            (pct > 20.0 && matches!(short, "syspolicyd" | "XprotectService" | "mds" | "mdworker" | "mds_stores"))
+                .then_some(short)
+        }).collect();
+        if !busy.is_empty() {
+            println!("  REFUSING TO REPORT. macOS is scanning: {}.\n  \
+                      This is almost certainly Gatekeeper and Spotlight processing the binary that was\n  \
+                      just built. Wait for it to finish — minutes, not seconds — and run again WITHOUT\n  \
+                      rebuilding first.", busy.join(", "));
+            return;
+        }
+    }
+
     // Idle draw, measured in THIS process adjacent in time — never a remembered constant.
     //
     // ⛔ Idle is a FLOOR, not an average. The first version of this took one 3-second window and got
@@ -141,6 +170,53 @@ fn main() {
         }
     }
     println!();
+    // ⛔ This A/B runs FIRST, not last. It used to sit at the end of the file and was skipped on
+    // four consecutive runs because the machine had reliably picked up load by the time it was
+    // reached. A comparison scheduled where the environment is worst is a comparison that does not
+    // happen, and "skipped" reads the same as "no effect" in a log nobody re-runs.
+    // ── The forcing function, measured ────────────────────────────────────────────────────────
+    //
+    // The table above says the packed kernels are ALU-bound, not bandwidth-bound. If that is right,
+    // the way to convert the byte saving into joules is to spend fewer instructions per weight —
+    // not to move fewer bytes, which is already done. STQ1_0 has two traversal orders that compute
+    // exactly the same thing and differ only in how many loads they issue, so this measures the
+    // claim rather than asserting it.
+    {
+        let bytes = blocks(N * (K / 256), 42, 40, seed ^ 0xabc);
+        let packed = ferric_tensor::dtype::Stq1_0Weights::from_bytes(&ctx, &bytes, N, K);
+        let a = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4).to_vec());
+        let b = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table).to_vec());
+        let mag = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4 * mag, "the two traversal orders disagree by {worst}; not the same matmul");
+
+        let scal = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4); };
+        let vec4 = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table); };
+        let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..300 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 300.0 };
+        let iters = ((2.6 / probe(&scal).min(probe(&vec4))).ceil() as usize).clamp(50, 8_000_000);
+
+        let idle = floor("stq1_0 traversal");
+        if idle <= QUIET {
+            if let Some(sv) = compare(&meter, iters as u64, (iters as u64, iters as u64), 2,
+                || { for _ in 0..iters { scal() } ferric_tensor::device_sync(&ctx); },
+                || { for _ in 0..iters { vec4() } ferric_tensor::device_sync(&ctx); }) {
+                match sv.claimable() {
+                    Err(e) => println!("  stq1_0 traversal: NOT CLAIMABLE — {e}"),
+                    Ok(()) => {
+                        let (sj, vj) = (sv.baseline.joules / iters as f64, sv.candidate.joules / iters as f64);
+                        println!("\nstq1_0 traversal order, same arithmetic, {iters} matmuls:");
+                        println!("  vec4 + private codebook     {sj:.3e} J  {:.2} W  {:.2} s",
+                                 sv.baseline.watts(), sv.baseline.seconds);
+                        println!("  vec4 + table + transpose    {vj:.3e} J  {:.2} W  {:.2} s  ({:.2}x energy, {:.2}x wall)",
+                                 sv.candidate.watts(), sv.candidate.seconds, sj / vj,
+                                 sv.baseline.seconds / sv.candidate.seconds);
+                    }
+                }
+            }
+        } else { println!("  stq1_0 traversal: SKIPPED — machine busy ({idle:.2} W floor)"); }
+    }
+
+
     println!("{:<9} {:>10} {:>9} {:>8} {:>9} {:>9} {:>8} {:>9}",
              "format", "resident", "bpw", "iters", "J/matmul", "W", "GB/s", "vs dense");
 
@@ -219,48 +295,6 @@ fn main() {
     let after = floor("after");
     if after > QUIET {
         println!("  ⚠ the machine became busy DURING the run ({after:.2} W floor afterwards); the\n                      numbers above are contaminated and should not be quoted.");
-    }
-
-    // ── The forcing function, measured ────────────────────────────────────────────────────────
-    //
-    // The table above says the packed kernels are ALU-bound, not bandwidth-bound. If that is right,
-    // the way to convert the byte saving into joules is to spend fewer instructions per weight —
-    // not to move fewer bytes, which is already done. STQ1_0 has two traversal orders that compute
-    // exactly the same thing and differ only in how many loads they issue, so this measures the
-    // claim rather than asserting it.
-    {
-        let bytes = blocks(N * (K / 256), 42, 40, seed ^ 0xabc);
-        let packed = ferric_tensor::dtype::Stq1_0Weights::from_bytes(&ctx, &bytes, N, K);
-        let a = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4).to_vec());
-        let b = pollster::block_on(x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table).to_vec());
-        let mag = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let worst = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
-        assert!(worst < 1e-4 * mag, "the two traversal orders disagree by {worst}; not the same matmul");
-
-        let scal = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4); };
-        let vec4 = || { let _ = x.matmul_stq1_0_form(&packed, ferric_tensor::dtype::Stq1Form::Vec4Table); };
-        let probe = |f: &dyn Fn()| { let t = Instant::now(); for _ in 0..300 { f() } ferric_tensor::device_sync(&ctx); t.elapsed().as_secs_f64() / 300.0 };
-        let iters = ((2.6 / probe(&scal).min(probe(&vec4))).ceil() as usize).clamp(50, 8_000_000);
-
-        let idle = floor("stq1_0 traversal");
-        if idle <= QUIET {
-            if let Some(sv) = compare(&meter, iters as u64, (iters as u64, iters as u64), 2,
-                || { for _ in 0..iters { scal() } ferric_tensor::device_sync(&ctx); },
-                || { for _ in 0..iters { vec4() } ferric_tensor::device_sync(&ctx); }) {
-                match sv.claimable() {
-                    Err(e) => println!("  stq1_0 traversal: NOT CLAIMABLE — {e}"),
-                    Ok(()) => {
-                        let (sj, vj) = (sv.baseline.joules / iters as f64, sv.candidate.joules / iters as f64);
-                        println!("\nstq1_0 traversal order, same arithmetic, {iters} matmuls:");
-                        println!("  vec4 + private codebook     {sj:.3e} J  {:.2} W  {:.2} s",
-                                 sv.baseline.watts(), sv.baseline.seconds);
-                        println!("  vec4 + table + transpose    {vj:.3e} J  {:.2} W  {:.2} s  ({:.2}x energy, {:.2}x wall)",
-                                 sv.candidate.watts(), sv.candidate.seconds, sj / vj,
-                                 sv.baseline.seconds / sv.candidate.seconds);
-                    }
-                }
-            }
-        } else { println!("  stq1_0 traversal: SKIPPED — machine busy ({idle:.2} W floor)"); }
     }
 
     println!("\n  A joules-per-matmul figure is not a joules-per-token figure. This is one kernel with\n  \
