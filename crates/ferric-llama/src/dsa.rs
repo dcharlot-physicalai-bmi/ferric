@@ -569,3 +569,112 @@ mod tests {
         assert!(IndexSchedule::new(vec![]).is_err());
     }
 }
+
+// ─────────────────────────────── proofs ───────────────────────────────
+//
+// The schedule is pure combinatorics on a bit-vector, which is exactly what a bounded model check
+// is for. The tests above pin the shipped 78-layer pattern; these hold for EVERY pattern up to the
+// bound, so a checkpoint with a different `is_full` layout is covered before it exists.
+//
+// What is NOT here: the indexer forward. It is floating point, and Kani models f32 arithmetic
+// poorly enough that a proof over it would be a proof about the solver's f32 model rather than
+// about the kernel. The runtime tests carry that, with `T != M` throughout.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const N: usize = 12;
+
+    fn any_schedule() -> IndexSchedule {
+        let mut v = Vec::with_capacity(N);
+        let mut i = 0;
+        while i < N { v.push(kani::any::<bool>()); i += 1 }
+        v[0] = true; // the constructor's precondition; its refusal is proved separately
+        IndexSchedule::new(v).unwrap()
+    }
+
+    /// **Every layer reuses a preceding full layer, and only a full layer reuses itself.**
+    ///
+    /// `source(il) <= il` is causality: a layer cannot attend under a selection that has not been
+    /// computed yet. `is_full(source(il))` is that it reuses a REAL selection, not a layer that
+    /// itself only borrowed one. And `source(il) == il <=> is_full(il)` is the definition — the
+    /// most recent preceding full layer is you exactly when you are full.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn every_layer_reuses_a_real_preceding_selection() {
+        let s = any_schedule();
+        let il: usize = kani::any();
+        kani::assume(il < N);
+        let src = s.source(il);
+        assert!(src <= il, "layer {il} looks forward to {src}");
+        assert!(s.is_full(src), "layer {il} sources from non-full layer {src}");
+        assert!((src == il) == s.is_full(il), "self-sourcing must coincide with being full");
+    }
+
+    /// **The source is the MOST RECENT preceding full layer — nothing full sits between it and you.**
+    ///
+    /// This is the clause the shipped pattern turns on: layers 0 and 1 are both full and adjacent,
+    /// so layer 2 must take layer 1, not layer 0. "Some preceding full layer" would admit 0.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn the_source_is_the_most_recent_full_layer() {
+        let s = any_schedule();
+        let il: usize = kani::any();
+        let mid: usize = kani::any();
+        kani::assume(il < N && mid < N);
+        let src = s.source(il);
+        if src < mid && mid <= il {
+            assert!(!s.is_full(mid), "layer {il} sources {src} but full layer {mid} is more recent");
+        }
+    }
+
+    /// **Sources never go backwards.** A later layer's source is at least as recent as an earlier
+    /// layer's. This is what makes the index cache a ring that only ever advances.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn sources_are_monotone() {
+        let s = any_schedule();
+        let a: usize = kani::any();
+        let b: usize = kani::any();
+        kani::assume(a < N && b < N && a <= b);
+        assert!(s.source(a) <= s.source(b), "source went backwards between layers {a} and {b}");
+    }
+
+    /// **A first layer that is not full is refused at construction**, for every vector of any length
+    /// up to the bound — not just the 8-long one the test uses.
+    ///
+    /// The vector is a fixed `N` long with symbolic contents. A symbolic LENGTH is a symbolic
+    /// allocation, and CBMC spent minutes on it without converging; the property is about element
+    /// zero, and the length bought nothing.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn a_non_full_first_layer_is_refused() {
+        let mut v = Vec::with_capacity(N);
+        let mut i = 0;
+        while i < N { v.push(kani::any::<bool>()); i += 1 }
+        let first_full = v[0];
+        let r = IndexSchedule::new(v);
+        assert!(r.is_ok() == first_full, "construction must succeed exactly when layer 0 is full");
+    }
+
+    /// **The live cache count is the number of self-sourcing layers.**
+    ///
+    /// `live_cache_layers()` is what an allocator would reserve; a layer writes an indexer key
+    /// exactly when it is its own source. Counting the two independently and demanding they agree
+    /// is the partition property without the `Vec<Vec<usize>>` that `groups()` builds -- which,
+    /// under symbolic input, is a nested symbolic allocation CBMC did not converge on. `groups()`
+    /// itself is pinned on the shipped pattern by the runtime test.
+    #[kani::proof]
+    #[kani::unwind(14)]
+    fn live_cache_count_is_the_number_of_self_sourcing_layers() {
+        let s = any_schedule();
+        let mut self_sourcing = 0;
+        let mut il = 0;
+        while il < N {
+            if s.source(il) == il { self_sourcing += 1 }
+            il += 1;
+        }
+        assert!(s.live_cache_layers() == self_sourcing, "cache slots must equal self-sourcing layers");
+        assert!(self_sourcing >= 1, "layer 0 is full, so at least one layer sources itself");
+    }
+}

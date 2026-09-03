@@ -29,6 +29,7 @@ use half::f16;
 
 fn wr_f16(v: f32, out: &mut [u8]) { out.copy_from_slice(&f16::from_f32(v).to_le_bytes()); }
 
+
 /// Bytes one 256-element super-block occupies, by ggml type id.
 pub fn block_bytes(ty: u32) -> Option<usize> {
     Some(match ty { 10 => 84, 11 => 110, _ => return None })
@@ -373,7 +374,7 @@ use crate::{STQ1_0_BLOCK_BYTES, STQ1_0_CODEBOOK};
 /// Returns `None` for a group that is not 3:4 — zero, two, three or four zeros have no encoding at
 /// all, so a caller that has not enforced the constraint finds out here rather than by silently
 /// writing a wrong pattern.
-fn stq1_0_pack_group(lanes: [i8; 4]) -> Option<(u8, u8)> {
+pub(crate) fn stq1_0_pack_group(lanes: [i8; 4]) -> Option<(u8, u8)> {
     let mut qpack = 0u8;
     for (p, &l) in lanes.iter().enumerate() {
         let code: u8 = if l == 0 { 1 } else if l < 0 { 0 } else { 2 };
@@ -389,7 +390,7 @@ fn stq1_0_pack_group(lanes: [i8; 4]) -> Option<(u8, u8)> {
 /// four consecutive weights permutes the block without changing its length or its multiset, so
 /// nothing downstream can detect it.
 #[inline]
-fn stq1_0_group_idx(g: usize) -> [usize; 4] {
+pub(crate) fn stq1_0_group_idx(g: usize) -> [usize; 4] {
     let base = (g / 16) * 64 + (g % 16);
     [base, base + 16, base + 32, base + 48]
 }
@@ -798,11 +799,11 @@ mod iq_xxs_tests {
     #[test]
     fn derived_signs_are_the_even_parity_code() {
         for i in 0u8..128 {
-            let v = super::super::ksigns_for_test(i);
+            let v = super::super::ksigns_for_proof(i);
             assert_eq!(v & 0x7f, i, "low seven bits must be the index itself");
             assert_eq!(v.count_ones() % 2, 0, "ksigns({i}) = {v:#04x} must have even population count");
         }
-        let all: std::collections::HashSet<u8> = (0u8..128).map(super::super::ksigns_for_test).collect();
+        let all: std::collections::HashSet<u8> = (0u8..128).map(super::super::ksigns_for_proof).collect();
         assert_eq!(all.len(), 128, "the code must be injective");
     }
 
@@ -812,5 +813,159 @@ mod iq_xxs_tests {
         assert_eq!(type_size(18, 256).unwrap(), 98);   // 3.0625 bpw
         assert_eq!(type_size(16, 4096).unwrap(), 66 * 16);
         assert_eq!(type_size(18, 4096).unwrap(), 98 * 16);
+    }
+}
+
+// ─────────────────────────────── proofs ───────────────────────────────
+//
+// What a test cannot do, and why these exist.
+//
+// Every defect that cost real time in this format was a SAME-COUNT/WRONG-ORDER bug: the stride-16
+// grouping, the scale at the end of the block, the low nibble being the even group, the sign bit
+// order. None of them changes a length, an element count or a distribution, so no assert fires and
+// no summary statistic moves. The golden vectors catch each one — but only at the specific values
+// those vectors happen to use, and a golden vector is an example, not a theorem.
+//
+// Kani closes that gap for the parts that are pure combinatorics on bits. These are not tests over
+// chosen inputs; they are bounded model checks over ALL inputs in range, so "no two groups alias"
+// means no two, not none of the pairs someone thought to write down.
+//
+// ⛔ What they deliberately do NOT cover, so that a green proof run is not read as more than it is:
+//   * the WGSL kernels. Kani verifies Rust; the shaders are strings handed to a driver. Their
+//     INDEX ARITHMETIC is mirrored and proved here, which is where their traps live, but the
+//     shader text is tied to the Rust only by the runtime bit-comparison tests.
+//   * that Ferric's decode matches Tencent's. That is an empirical claim about someone else's
+//     bytes and it is settled by `examples/stq1_0_interop.rs`, not by a proof.
+//   * anything floating point. The energy figures and the least-squares search are measurements
+//     and heuristics respectively; neither is a theorem and neither is claimed as one.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// **The decoder puts every group exactly where the encoder says it goes.**
+    ///
+    /// This is the theorem that catches the stride, and it has teeth for a structural reason: the
+    /// two sides derive the layout INDEPENDENTLY. The encoder addresses groups through
+    /// `stq1_0_group_idx`; `deq_stq1_0` computes `(g/16)*64 + (g%16) + p*16` inline, in another
+    /// file, and neither calls the other. Running the real decoder and checking it against the real
+    /// encoder map is a cross-check between two derivations, not a function agreeing with itself.
+    ///
+    /// The neighbouring groups are left at slot 0 / sign 0 rather than zeroed, so they decode to
+    /// `(0, +1, +1, +1)` and occupy their slots with known values. If group `g`'s lanes landed
+    /// anywhere else, a neighbour's value would be sitting at `g`'s position and the assertion
+    /// would see it — a zeroed background would let a misplacement hide in zeros.
+    ///
+    /// For all 64 groups and all 32 codes, not for the ones a golden vector happened to use.
+    ///
+    /// WARNING: the f16 conversion is STUBBED here (see `crate::rd_f16_one`) because `half` reaches
+    /// runtime CPU-feature detection that Kani cannot encode. This theorem is about WHERE THE BYTES
+    /// GO; it says nothing about f16 arithmetic, which the runtime tests cover instead.
+    #[kani::proof]
+    #[kani::unwind(70)]
+    #[kani::stub(crate::rd_f16, crate::rd_f16_one)]
+    fn decoder_places_every_group_where_the_encoder_says() {
+        let g: usize = kani::any();
+        let slot: u8 = kani::any();
+        let sign: u8 = kani::any();
+        kani::assume(g < 64 && slot < 16 && sign < 2);
+
+        let mut blk = [0u8; 42];
+        blk[g / 2] |= slot << (4 * (g & 1));
+        blk[32 + g / 8] |= sign << (g % 8);
+        blk[40] = 0x00;
+        blk[41] = 0x3C; // 1.0, so the decoded value IS the lane
+
+        let out = crate::deq_stq1_0(&blk, 256);
+        assert!(out.len() == 256, "the decoder produced the wrong element count");
+
+        let q = STQ1_0_CODEBOOK[((sign as usize) << 4) | slot as usize];
+        let idx = stq1_0_group_idx(g);
+        let mut p = 0;
+        while p < 4 {
+            let want = (((q >> (2 * p)) & 3) as i32 - 1) as f32;
+            assert!(out[idx[p]] == want, "group {g} lane {p} is not at index {}", idx[p]);
+            p += 1;
+        }
+    }
+
+    /// **The container refuses everything that is not 3:4.**
+    ///
+    /// `pack_group` is the only path from lanes to a code, so this is where the structural guarantee
+    /// is enforced. A group with zero, two, three or four zeros has no encoding at all, and the
+    /// only correct response is to refuse — silently emitting the nearest legal pattern would put
+    /// wrong weights in a well-formed file.
+    #[kani::proof]
+    fn only_three_of_four_groups_are_encodable() {
+        let a: i8 = kani::any();
+        let b: i8 = kani::any();
+        let c: i8 = kani::any();
+        let d: i8 = kani::any();
+        kani::assume((-1..=1).contains(&a) && (-1..=1).contains(&b)
+                  && (-1..=1).contains(&c) && (-1..=1).contains(&d));
+        let lanes = [a, b, c, d];
+        let zeros = lanes.iter().filter(|v| **v == 0).count();
+
+        match stq1_0_pack_group(lanes) {
+            Some((slot, sign)) => {
+                assert!(zeros == 1, "a group with {zeros} zeros was given an encoding");
+                assert!(slot < 16 && sign < 2, "code out of range");
+                let q = STQ1_0_CODEBOOK[((sign as usize) << 4) | slot as usize];
+                let mut p = 0;
+                while p < 4 {
+                    assert!((((q >> (2 * p)) & 3) as i8) - 1 == lanes[p], "round trip changed lane {p}");
+                    p += 1;
+                }
+            }
+            None => assert!(zeros != 1, "a legal 3:4 group was refused an encoding"),
+        }
+    }
+
+    /// **The codebook is exactly the 32 three-of-four ternary patterns**, and the sign half mirrors
+    /// the other by negation.
+    ///
+    /// ⚠ Unlike the round trip above, this one restates a property rather than exercising a path,
+    /// so it cannot catch a mistyped digit that happens to land on another LEGAL pattern — the
+    /// distinctness clause is what closes that, and `every_legal_block_round_trips_byte_for_byte`
+    /// closes the rest.
+    #[kani::proof]
+    fn codebook_is_the_thirty_two_patterns() {
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        kani::assume(i < 32 && j < 32);
+        let lanes = |k: usize| -> [i32; 4] {
+            let cw = STQ1_0_CODEBOOK[k];
+            let mut l = [0i32; 4];
+            let mut p = 0;
+            while p < 4 { l[p] = (((cw >> (2 * p)) & 3) as i32) - 1; p += 1 }
+            l
+        };
+        let li = lanes(i);
+        let mut zeros = 0;
+        let mut p = 0;
+        while p < 4 {
+            assert!(li[p] >= -1 && li[p] <= 1, "lane code 3 is not a value");
+            if li[p] == 0 { zeros += 1 }
+            p += 1;
+        }
+        assert!(zeros == 1, "entry {i} does not have exactly one forced zero");
+        if i != j { assert!(STQ1_0_CODEBOOK[i] != STQ1_0_CODEBOOK[j], "entries {i} and {j} collide") }
+        if i < 16 {
+            let lm = lanes(i + 16);
+            let mut p = 0;
+            while p < 4 { assert!(lm[p] == -li[p], "sign=1 is not the negation of sign=0 at slot {i}"); p += 1 }
+        }
+    }
+
+    /// **`ksigns` is an injective even-parity code**, which is why it is computed rather than
+    /// tabled. Both IQ decoders depend on it; if it is wrong, every eighth weight flips sign.
+    #[kani::proof]
+    fn ksigns_is_an_injective_even_parity_code() {
+        let i: u8 = kani::any();
+        let j: u8 = kani::any();
+        kani::assume(i < 128 && j < 128);
+        let vi = crate::ksigns_for_proof(i);
+        assert!(vi & 0x7f == i, "the low seven bits must be the index itself");
+        assert!(vi.count_ones() % 2 == 0, "population count must be even");
+        if i != j { assert!(vi != crate::ksigns_for_proof(j), "the code is not injective") }
     }
 }

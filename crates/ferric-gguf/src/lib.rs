@@ -781,7 +781,25 @@ fn read_at(f: &mut std::fs::File, off: u64, buf: &mut [u8]) -> Result<(), String
     f.read_exact(buf).map_err(|e| e.to_string())
 }
 
-fn rd_f16(b: &[u8]) -> f32 { f16::from_le_bytes([b[0], b[1]]).to_f32() }
+pub(crate) fn rd_f16(b: &[u8]) -> f32 { f16::from_le_bytes([b[0], b[1]]).to_f32() }
+
+/// Proof-only replacement for [`rd_f16`]: 1.0 for the bit pattern of 1.0, and 0.0 for ANY other
+/// two bytes.
+///
+/// It exists because `half` reaches runtime CPU-feature detection on aarch64, and that path uses
+/// C string literals which Kani cannot encode -- so without a stub the model checker fails on the
+/// sysctl name of a NEON probe rather than on anything about this format.
+///
+/// WARNING: the first version of this stub returned 1.0 unconditionally, and a mutation that read
+/// the scale from the FRONT of the block instead of the back sailed through every proof -- the stub
+/// had erased the very property being tested. Deciding on the bytes fixes that: a decoder that
+/// reads the wrong offset is handed payload bytes, gets a zero scale, and every lane collapses to
+/// zero where the placement theorems expect +-1.
+///
+/// It still narrows the claim, and that is the point of saying so: f16 ARITHMETIC is not verified
+/// here. Which two bytes are read, and where each decoded value lands, are.
+#[cfg(kani)]
+pub(crate) fn rd_f16_one(b: &[u8]) -> f32 { if b[0] == 0x00 && b[1] == 0x3C { 1.0 } else { 0.0 } }
 
 /// Q8_0: blocks of 32 → [f16 scale, i8 qs[32]] (34 bytes). x = qs·scale.
 fn deq_q8_0(raw: &[u8], n: usize) -> Vec<f32> {
@@ -1112,8 +1130,8 @@ fn ksigns(i: u8) -> u8 {
     low | ((low.count_ones() as u8 & 1) << 7)
 }
 
-#[cfg(test)]
-pub(crate) fn ksigns_for_test(i: u8) -> u8 { ksigns(i) }
+#[cfg(any(test, kani))]
+pub(crate) fn ksigns_for_proof(i: u8) -> u8 { ksigns(i) }
 
 /// **IQ2_XXS** — 2.0625 bpw. 66 bytes per 256 weights: an fp16 block scale and 32 `u16` of payload,
 /// read as eight 8-byte words, one per 32-weight group.
@@ -1229,7 +1247,7 @@ pub const STQ1_0_CODEBOOK: [u8; 32] = [
 /// right 256 values into exactly the right 256 slots in the wrong ORDER — same count, same
 /// multiset, no assert can fire. It is the same shape of bug as reading a convolution's weight
 /// layout under the wrong permutation.
-fn deq_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
+pub(crate) fn deq_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     for (bi, blk) in raw.chunks_exact(STQ1_0_BLOCK_BYTES).take(n / 256).enumerate() {
         let d = rd_f16(&blk[40..42]);
@@ -1870,5 +1888,94 @@ mod mxfp4_tests {
         // relies on.
         check_declared_strides(&tensors, 16, 32)
             .expect("a header probe must still parse: its buffer ends before the tensors begin");
+    }
+}
+
+// ─────────────────────────── IQ2_XXS / IQ3_XXS placement proofs ───────────────────────────
+//
+// The IQ decoders' traps were both about WHICH WORD a field is read from: the IQ2 sub-scale shares
+// its word with four 7-bit sign indices (4·7 + 4 = 32, no spare bit), and the IQ3 block's two halves
+// are NOT interleaved — 64 index bytes, then 8 control words. Both are index arithmetic, so both
+// are provable for every position rather than for the ones a golden vector used.
+//
+// The f16 scale is STUBBED to 1.0 here for the same reason as the STQ1_0 proofs (see
+// `rd_f16_one`): these theorems are about where bytes go, not about f16 arithmetic.
+#[cfg(kani)]
+mod iq_proofs {
+    use super::*;
+
+    /// **IQ3_XXS reads its control words from the SECOND region, not interleaved with the first.**
+    ///
+    /// Put a symbolic sub-scale nibble into control word `ib` (at byte offset `2 + 64 + 4·ib`) and
+    /// nothing else; every weight of group `ib` must scale by `(0.5 + nib)·0.5` and no other group
+    /// may move. Reading the halves as one interleaved stream keeps the block size and the value
+    /// distribution and breaks exactly this pairing.
+    #[kani::proof]
+    // 258: the assertion below walks all 256 positions. A bound that is too small is reported as
+    // an unwinding-assertion FAILURE, not as a truncated success -- 10 here failed both harnesses
+    // on their first run, which is the behaviour that makes a bounded check trustworthy.
+    #[kani::unwind(258)]
+    #[kani::stub(crate::rd_f16, crate::rd_f16_one)]
+    fn iq3_control_words_live_after_the_index_bytes() {
+        let ib: usize = kani::any();
+        let nib: u32 = kani::any();
+        kani::assume(ib < 8 && nib < 16);
+
+        let mut blk = [0u8; 98];
+        blk[0] = 0x00; blk[1] = 0x3C; // d = 1.0 (stubbed anyway)
+        // Every index byte is 0 -> grid point 0. Control words all 0 except group ib's sub-scale.
+        let off = 2 + 64 + 4 * ib;
+        blk[off + 3] = (nib << 4) as u8; // top nibble of the little-endian u32 = bits 28..31
+
+        let out = deq_iq3_xxs(&blk, 256);
+        let g0 = IQ3XXS_GRID[0].to_le_bytes();
+        let db_on = (0.5 + nib as f32) * 0.5;
+        let db_off = 0.5 * 0.5;
+
+        let mut j = 0;
+        while j < 256 {
+            let grp = j / 32;
+            let want_mag = g0[j % 4] as f32; // both grid points in a sub-block are index 0
+            let scale = if grp == ib { db_on } else { db_off };
+            // sign index 0 -> ksigns(0) = 0 -> every sign positive
+            assert!(out[j] == want_mag * scale, "position {j} scaled by the wrong group's word");
+            j += 1;
+        }
+    }
+
+    /// **IQ2_XXS reads its sub-scale from the SIGN word, not the index word.**
+    ///
+    /// The two words of a group are `lo` (four grid indices) and `hi` (four sign indices plus the
+    /// sub-scale in bits 28..31). A symbolic sub-scale placed in `hi` must scale group `ib`; the
+    /// same bits placed in `lo` are a grid index and must NOT act as a scale.
+    #[kani::proof]
+    // 258: the assertion below walks all 256 positions. A bound that is too small is reported as
+    // an unwinding-assertion FAILURE, not as a truncated success -- 10 here failed both harnesses
+    // on their first run, which is the behaviour that makes a bounded check trustworthy.
+    #[kani::unwind(258)]
+    #[kani::stub(crate::rd_f16, crate::rd_f16_one)]
+    fn iq2_subscale_is_in_the_sign_word() {
+        let ib: usize = kani::any();
+        let nib: u32 = kani::any();
+        kani::assume(ib < 8 && nib < 16);
+
+        let mut blk = [0u8; 66];
+        blk[0] = 0x00; blk[1] = 0x3C;
+        // hi word of group ib is at byte 2 + 8*ib + 4; its top nibble is byte +3, bits 4..7.
+        blk[2 + 8 * ib + 4 + 3] = (nib << 4) as u8;
+
+        let out = deq_iq2_xxs(&blk, 256);
+        let g0 = IQ2XXS_GRID[0].to_le_bytes();
+        let db_on = (0.5 + nib as f32) * 0.25;
+        let db_off = 0.5 * 0.25;
+
+        let mut j = 0;
+        while j < 256 {
+            let grp = j / 32;
+            let want_mag = g0[j % 8] as f32;
+            let scale = if grp == ib { db_on } else { db_off };
+            assert!(out[j] == want_mag * scale, "position {j} scaled by the wrong word");
+            j += 1;
+        }
     }
 }
