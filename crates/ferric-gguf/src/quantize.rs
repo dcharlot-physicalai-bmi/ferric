@@ -888,6 +888,58 @@ mod proofs {
         }
     }
 
+    /// **The vectorised shader's traversal addresses every (group, lane) exactly where the decoder
+    /// does.** This is the proof for the 1.62x energy win, which until now rested on "packed and
+    /// dense agree on random weights".
+    ///
+    /// `MATMUL_STQ1_0_V4_WGSL` inverts the loop: for chunk `c`, quad `k`, member `t` and lane `p`
+    /// it reads code word `c*2 + (k>>1)` at nibble `4*(k&1) + t`, sign word `c>>1` at bit
+    /// `(c&1)*16 + 4k + t`, and pairs the result with activation `c*64 + p*16 + 4k + t`. Kani
+    /// cannot read WGSL, so `v4_addressing` is that arithmetic transcribed into Rust -- six lines,
+    /// reviewable against the shader by eye -- and this harness is the cross-check between it and
+    /// the REAL decoder's own inline derivation. The code for group `c*16 + 4k + t` is placed using
+    /// the MIRROR's word/nibble/bit; the block is decoded by `deq_stq1_0`; the value must surface at
+    /// the MIRROR's element. If any of the five expressions were wrong, the decoder would either
+    /// read a different group (slot 0, so lanes (0,+1,+1,+1)) or the value would land elsewhere,
+    /// and over all 4x4x4x4 positions and all 32 codes a symbolic `slot` finds the lane that
+    /// disagrees.
+    ///
+    /// What remains unproved is that the shader TEXT matches these six lines. That is a
+    /// transcription, and it is tied by `dtype::stq1_0_kernel::every_group_position_reaches_the_kernel`,
+    /// which runs the real GPU kernel over every (group, code) pair.
+    #[kani::proof]
+    #[kani::unwind(70)]
+    #[kani::stub(crate::rd_f16, crate::rd_f16_one)]
+    fn vec4_traversal_addresses_every_lane_where_the_decoder_does() {
+        let c: usize = kani::any();
+        let k: usize = kani::any();
+        let t: usize = kani::any();
+        let p: usize = kani::any();
+        let slot: u8 = kani::any();
+        let sign: u8 = kani::any();
+        kani::assume(c < 4 && k < 4 && t < 4 && p < 4 && slot < 16 && sign < 2);
+
+        // --- the mirror: MATMUL_STQ1_0_V4_WGSL lines `sword`, `w0/w1/word`, `nib0`, `sb0`, `e0` ---
+        let code_word = c * 2 + (k >> 1);          // w0 when k < 2, w1 otherwise
+        let nibble    = 4 * (k & 1) + t;           // nib0 + t
+        let sign_word = c >> 1;
+        let sign_bit  = (c & 1) * 16 + 4 * k + t;  // sb0 + t
+        let elem      = c * 64 + p * 16 + 4 * k + t; // e0 + t, paired with qp[t] lane p
+
+        // Place the code through the mirror's coordinates. The repacked u32 words are
+        // little-endian views of qs[4w..4w+4], so nibble n of word w is byte 4w + n/2, half n&1.
+        let mut blk = [0u8; 42];
+        blk[code_word * 4 + nibble / 2] |= slot << (4 * (nibble & 1));
+        blk[32 + sign_word * 4 + sign_bit / 8] |= sign << (sign_bit % 8);
+        blk[40] = 0x00;
+        blk[41] = 0x3C;
+
+        let out = crate::deq_stq1_0(&blk, 256);
+        let q = STQ1_0_CODEBOOK[((sign as usize) << 4) | slot as usize];
+        let want = (((q >> (2 * p)) & 3) as i32 - 1) as f32;
+        assert!(out[elem] == want, "vec4 traversal (c={c},k={k},t={t},p={p}) disagrees with the decoder at {elem}");
+    }
+
     /// **The container refuses everything that is not 3:4.**
     ///
     /// `pack_group` is the only path from lanes to a code, so this is where the structural guarantee

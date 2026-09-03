@@ -5536,6 +5536,61 @@ mod stq1_0_kernel {
                   rows * cols * 4, (rows * cols * 4) as f64 / packed as f64);
     }
 
+    /// **Every (group position, code) pair, through the real kernel, in every traversal form.**
+    ///
+    /// `every_codebook_pattern_reaches_the_kernel` gives every group of a row the SAME slot, so a
+    /// kernel that decoded group g but wrote its lanes to group g' position would still match the
+    /// reference: every group looks identical. This fixture breaks that symmetry -- row o carries
+    /// code o/64 in group o%64 alone, everything else at slot 0 -- against a position-distinct
+    /// activation ramp, so a misplaced group changes the dot. 64 x 32 = 2048 rows.
+    ///
+    /// This is also what ties the WGSL text to the Kani proof
+    /// `vec4_traversal_addresses_every_lane_where_the_decoder_does`: that proves a Rust mirror of
+    /// the shader's addressing; this runs the shader itself over the same exhaustive set.
+    #[test]
+    fn every_group_position_reaches_the_kernel() {
+        let ctx = ctx_or_skip!();
+        let (rows, cols) = (64 * 32, 256usize);
+        let mut bytes = vec![0u8; rows * 42];
+        for o in 0..rows {
+            let (g, code) = (o % 64, o / 64);
+            let (slot, sign) = ((code % 16) as u8, (code / 16) as u8);
+            let blk = &mut bytes[o * 42..(o + 1) * 42];
+            blk[g / 2] |= slot << (4 * (g & 1));
+            blk[32 + g / 8] |= sign << (g % 8);
+            blk[40..42].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        }
+        // Position-distinct and mixed-sign, so no two positions contribute the same product.
+        let xv: Vec<f32> = (0..cols).map(|i| ((i * 37) % 97) as f32 - 48.0).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[1, cols]);
+        let deq = ferric_gguf::deq_raw(&bytes, rows * cols, 43).unwrap();
+        let want = pollster::block_on(x.matmul_bt(&Tensor::from_vec(&ctx, &deq, &[rows, cols])).to_vec());
+        let packed = Stq1_0Weights::from_bytes(&ctx, &bytes, rows, cols);
+        // EXACT, not within a tolerance. Activations are integers in [-48, 48], weights are
+        // {-1, 0, +1} and d is exactly 1.0, so every product and every partial sum is an integer
+        // below 2^24 -- representable exactly in f32 whatever order the GPU accumulates in. A
+        // tolerance here would be doing no work while looking like it was; and a non-exact result
+        // would mean a non-integer path somewhere, which is worth failing on.
+        for form in [Stq1Form::Scalar, Stq1Form::Vec4, Stq1Form::Vec4Table] {
+            let got = pollster::block_on(x.matmul_stq1_0_form(&packed, form).to_vec());
+            for o in 0..rows {
+                assert!(want[o] == got[o],
+                        "{form:?}: group {} code {} (slot {}, sign {}): {} vs {}",
+                        o % 64, o / 64, (o / 64) % 16, (o / 64) / 16, got[o], want[o]);
+            }
+        }
+        // The fixture must let a misplaced group SHOW. Rows 0..64 carry code 0 in their group,
+        // which is the background pattern, so they are the all-slot-0 block; every later row
+        // differs from its code-0 twin in exactly one group. If that change does not move the dot,
+        // a kernel writing the group's lanes to the wrong positions could match the reference.
+        // (A first version of this guard demanded 1024 globally distinct sums out of ~289 possible
+        // values -- sums of three +-1 terms over [-48,48] -- and failed by pigeonhole while every
+        // row had in fact passed. The property is per-row, not global.)
+        let unmoved = (64..rows).filter(|&o| want[o] == want[o % 64]).count();
+        assert!(unmoved * 20 < rows, "{unmoved} of {rows} rows have a dot unchanged by their group's \
+                 code; the activation ramp does not separate positions");
+    }
+
     /// Every legal codebook entry must survive the shader's decode. A single mistyped hex digit in
     /// the WGSL table would corrupt one pattern in thirty-two — rare enough that a random matmul
     /// could miss it, so this drives all 32 through deliberately.
@@ -5866,3 +5921,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out[idx] = acc;
 }
 "#;
+
+/// Every quant shader must parse and validate under naga with no GPU present.
+///
+/// Pipeline creation validates shaders too -- but only on the machine that has a device, on the
+/// backend it has. A shader that Metal accepts and Vulkan or the browser's WGSL front-end rejects
+/// is invisible here until someone runs it there. naga's validator is the shared front-end, so
+/// running it in an ordinary test catches the class of "compiles on my laptop" breakage in CI on a
+/// runner with no GPU at all.
+///
+/// This validates STRUCTURE (types, bindings, bounds, undefined behaviour the validator can see)
+/// and says nothing about what the shader computes; the kernel tests above carry that.
+#[cfg(test)]
+mod shader_valid {
+    use super::*;
+    use wgpu::naga;
+
+    fn check(label: &str, src: &str) {
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("{label}: WGSL does not parse: {}", e.emit_to_string(src)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{label}: WGSL does not validate: {e:?}"));
+    }
+
+    #[test]
+    fn every_quant_shader_validates_without_a_gpu() {
+        check("stq1_0 scalar", MATMUL_STQ1_0_WGSL);
+        check("stq1_0 vec4", MATMUL_STQ1_0_V4_WGSL);
+        check("stq1_0 vec4+table", MATMUL_STQ1_0_V4T_WGSL);
+        check("iq2_xxs", &matmul_iq2_xxs_wgsl());
+        check("iq3_xxs", &matmul_iq3_xxs_wgsl());
+    }
+}
