@@ -639,6 +639,17 @@ mod absorbed_tests {
         // That is the useful architectural statement, and it is the opposite of the intuition that
         // sent me here: a port of absorbed MLA should spend its precision on the VALUE contraction,
         // not the score one.
+        //
+        // ⛔ SCOPE, ADDED AFTER THIS WAS OVER-APPLIED. `A` is a DERIVATIVE: measured by perturbing a
+        // weight by 1e-4..1e-2 and reading the slope, so it describes the response to a SMALL
+        // perturbation and to nothing else. `examples/hyv4_real_block.rs` used it to predict that
+        // TRANSPOSING `k_b` on real weights would be ~500x less visible than transposing `v_b`; the
+        // measured factor was 2.3. A transposition is not a small perturbation -- it is a different
+        // matrix, not a nearby one -- so extrapolating a local linearisation to it was a category
+        // error. The guidance above is about ROUNDING, which is what it was measured on.
+        //
+        // Secondarily, `A` is operating-point specific: it was measured on random weights at H=3,
+        // d=8. Real trained attention is sharper, and a sharper softmax attenuates score error less.
         let absorbed = Mla::new(c, weights(&ctx, KvUp::absorb(&ctx, &kv_b, &c), None));
         let b = pollster::block_on(absorbed.forward(&hs, &cos, &sin).to_vec());
         let observed = base.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / base_mag;
