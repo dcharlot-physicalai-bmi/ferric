@@ -227,7 +227,10 @@ mod tests {
         let mut s = seed;
         (0..n).map(|_| {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let u = ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+            // ⛔ `>> 33` gave [-1, 0), and cubing preserves sign, so "heavy-tailed" weights were
+            // ALL NEGATIVE until 2026-09-04 -- one-sided, which is exactly the case an affine
+            // quantizer's signed-dmin path exists for. Now [-1, 1).
+            let u = ((s >> 32) as f32 / (1u64 << 31) as f32) - 1.0;
             u * u * u * 0.4 // cubed: most mass near zero, occasional outlier
         }).collect()
     }
@@ -654,7 +657,8 @@ mod stq1_0_tests {
 
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        // ⛔ `>> 33` gave [-1, 0) until 2026-09-04. See dsa.rs::rnd for the full finding.
+        ((*seed >> 32) as f32 / (1u64 << 31) as f32) - 1.0
     }
 
     /// Every encoded group is 3:4 whatever the input — the container cannot express anything else,
@@ -674,6 +678,17 @@ mod stq1_0_tests {
                 }
             }
         }
+    }
+
+    /// ⛔ The generator is two-signed. Until 2026-09-04 it was one-signed -- a `>> 33` where `>> 32`
+    /// was meant -- and every test in this module ran on inputs of a single sign. A fixture is a
+    /// claim about coverage and needs a guard like any other claim.
+    #[test]
+    fn the_fixture_generator_is_two_signed() {
+        let v: Vec<f32> = { let mut s = 777u64; (0..4096).map(|_| lcg(&mut s)).collect() };
+        let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
+        assert!(mx > 0.5 && mn < -0.5, "generator does not span both signs: max {mx}, min {mn}");
+        assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
     }
 
     /// A block already on the `{−d, 0, +d}` grid with a legal 3:4 pattern must survive exactly.

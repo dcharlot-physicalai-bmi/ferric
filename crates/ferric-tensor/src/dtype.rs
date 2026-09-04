@@ -5473,7 +5473,20 @@ mod stq1_0_kernel {
 
     fn lcg(s: &mut u64) -> f32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((*s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        // ⛔ `>> 33` gave [-1, 0) until 2026-09-04: every weight and activation in these kernel
+        // tests was negative, so a ternary format's sign path was barely exercised. See dsa.rs::rnd.
+        ((*s >> 32) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    /// ⛔ The generator is two-signed. Until 2026-09-04 it was one-signed -- a `>> 33` where `>> 32`
+    /// was meant -- and every test in this module ran on inputs of a single sign. A fixture is a
+    /// claim about coverage and needs a guard like any other claim.
+    #[test]
+    fn the_fixture_generator_is_two_signed() {
+        let v: Vec<f32> = { let mut s = 777u64; (0..4096).map(|_| lcg(&mut s)).collect() };
+        let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
+        assert!(mx > 0.5 && mn < -0.5, "generator does not span both signs: max {mx}, min {mn}");
+        assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
     }
 
     /// The packed kernel must agree with dequantise-then-matmul to f32 round-off.
@@ -5798,7 +5811,7 @@ mod iq_kernel {
     }
     fn acts(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed;
-        (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0 }).collect()
+        (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 32) as f32 / (1u64 << 31) as f32) - 1.0 }).collect()
     }
 
     /// Both packed kernels against dequantise-then-matmul. `deq_raw` is the decoder verified on

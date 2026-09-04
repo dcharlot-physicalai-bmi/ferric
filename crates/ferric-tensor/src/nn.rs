@@ -659,9 +659,24 @@ mod sink_tests {
         let mut s = 12345u64;
         let v: Vec<f32> = (0..NH * T * S).map(|_| {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((s >> 33) as f32 / (1u64 << 30) as f32) - 2.0
+            // ⛔ `>> 33` gave [-2, 0) until 2026-09-04. With every logit negative and sinks at
+            // 0.0 or +2.25, the SINK ALWAYS WON THE MAX -- so `M = max(max_j l_j, s_h)` was only
+            // ever exercised on one of its two branches, in the tests for the feature whose whole
+            // point is that the sink competes in that max. Now [-2, 2).
+            ((s >> 32) as f32 / (1u64 << 30) as f32) - 2.0
         }).collect();
         (Tensor::from_vec(ctx, &v, &[NH, T, S]), v)
+    }
+
+    /// ⛔ The generator is two-signed. Until 2026-09-04 it was one-signed -- a `>> 33` where `>> 32`
+    /// was meant -- and every test in this module ran on inputs of a single sign. A fixture is a
+    /// claim about coverage and needs a guard like any other claim.
+    #[test]
+    fn the_fixture_generator_is_two_signed() {
+        let v: Vec<f32> = { let ctx = ctx_or_skip!(); logits(&ctx).1 };
+        let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
+        assert!(mx > 0.5 && mn < -0.5, "generator does not span both signs: max {mx}, min {mn}");
+        assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
     }
 
     /// The definition, checked term by term against host arithmetic — including that the row sums
