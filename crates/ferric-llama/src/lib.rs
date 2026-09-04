@@ -94,6 +94,7 @@ pub mod dsa;
 #[cfg(test)]
 mod exact;
 pub mod hc;
+pub mod hyv4;
 pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 pub mod parakeet;       // NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T decoder
 pub mod unipc;

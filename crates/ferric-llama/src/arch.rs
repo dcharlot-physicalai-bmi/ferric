@@ -88,6 +88,17 @@ pub enum Status {
     /// The hard components exist as verified library code, but no GGUF loader wires them to this
     /// architecture's metadata and tensor names.
     Parts,
+    /// A complete loader and forward exist and run end to end on a SYNTHETIC checkpoint, but no
+    /// real one has ever been loaded — because none fits on the machine that wrote the code.
+    ///
+    /// This is a real category, not a hedge. A synthetic model proves the WIRING: that the tensor
+    /// names resolve, the shapes agree end to end, the block schedule composes. It cannot prove
+    /// fidelity, because the same conventions used to write the file are used to read it back. So
+    /// this is strictly more than [`Status::Parts`] and strictly less than [`Status::Loads`], and
+    /// collapsing it into either would misreport what is known.
+    ///
+    /// Not [`Status::runnable`]: a server must not serve a model whose output nobody has seen.
+    Untried,
 }
 
 impl Status {
@@ -96,6 +107,7 @@ impl Status {
             Status::Verified => "verified",
             Status::Loads => "loads",
             Status::Parts => "parts",
+            Status::Untried => "untried",
         }
     }
     /// Whether a user may point the server at this and trust what comes out.
@@ -212,6 +224,22 @@ pub const REGISTRY: &[Arch] = &[
                   llama-eval-callback (attn_norm/q/kv_cmpr/k_pe all match); generates correct text on \
                   factual and code prompts. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants refused \
                   at load" },
+
+    Arch { name: "hyv4", runtime: Runtime::DeepSeek2, status: Status::Untried,
+           note: "Tencent Hy4, 770B/49B, and SUPPORTED BY NO UPSTREAM RUNTIME — llama.cpp does not \
+                  have this architecture; the published GGUFs ship two out-of-tree patches. Not a \
+                  port: an independent implementation from the format. crate::hyv4 wires \
+                  hyper-connections (4 residual streams, a rank-4 factorised DenseNet over sublayer \
+                  outputs), gated MLA with a learnable per-head sink, absorbed MLA + Q-LoRA (both of \
+                  which deepseek2 refuses), the DSA lightning indexer with its 21-of-78 index-sharing \
+                  schedule, and DeepSeekMoE with a clamped SwiGLU. Components verified individually: \
+                  the HC closed form and both absorption folds exactly over GF(2^61-1), the schedule \
+                  by bounded model checking for every is_full pattern, STQ1_0/IQ2_XXS/IQ3_XXS by Kani \
+                  plus an interop check against Tencent's own published weights. ⛔ NO REAL \
+                  CHECKPOINT HAS BEEN LOADED: the smallest is 213.66 GiB against ~47 GB free here, so \
+                  the forward is exercised only by examples/hyv4_synthetic.rs. That proves the wiring \
+                  and cannot prove fidelity. The runtime field is a placeholder; resolve() refuses \
+                  this string because Untried is not runnable" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -333,6 +361,18 @@ pub fn coverage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyv4_is_registered_but_refused_until_a_real_checkpoint_loads() {
+        let a = REGISTRY.iter().find(|a| a.name == "hyv4").expect("hyv4 must be registered");
+        assert_eq!(a.status, Status::Untried);
+        assert!(!a.status.runnable(), "Untried must not be runnable: a server must not serve a \
+                                       model whose output nobody has seen");
+        assert!(resolve("hyv4").is_err(), "resolve must refuse hyv4: {:?}", resolve("hyv4").map(|_| ()));
+        // And the note must carry the bound, so nobody reads the row as a capability claim.
+        assert!(a.note.contains("NO REAL CHECKPOINT HAS BEEN LOADED"),
+                "the row must state that no real checkpoint has been loaded");
+    }
 
     #[test]
     fn an_unknown_architecture_is_refused_not_defaulted() {

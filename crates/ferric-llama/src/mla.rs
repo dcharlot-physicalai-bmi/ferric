@@ -221,10 +221,28 @@ impl Mla {
     ///
     /// Returns `[seq, hidden]`.
     pub fn forward(&self, hs: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
+        self.forward_masked(hs, cos, sin, None)
+    }
+
+    /// [`Mla::forward`] with an extra additive attention mask, `[n_heads, seq, seq]`, added to the
+    /// scores alongside the causal mask.
+    ///
+    /// This is how DeepSeek Sparse Attention reaches the attention: its indexer selects a top-k set
+    /// of positions per query and everything outside it is `−inf`. The mask is ADDITIVE and applies
+    /// on top of causality, never instead of it — a sparse mask that replaced the causal one would
+    /// let a query see the future wherever the indexer happened to rank it highly.
+    ///
+    /// Only the absorbed path takes it. The fused path is the verified Instella route and has no
+    /// caller that needs sparsity; wiring a mask into it would add an untested branch to the one
+    /// arm that currently has a reference behind it.
+    pub fn forward_masked(&self, hs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let (q_nope, q_rot, latent, k_rot) = self.project(hs, cos, sin);
         let ao = match &self.w.kv_up {
-            KvUp::Fused(kv_b) => self.attend_fused(&q_nope, &q_rot, &latent, &k_rot, kv_b),
-            KvUp::Absorbed { k_b, v_b } => self.attend_absorbed(&q_nope, &q_rot, &latent, &k_rot, k_b, v_b),
+            KvUp::Fused(kv_b) => {
+                assert!(mask.is_none(), "the fused path takes no sparse mask; use the absorbed one");
+                self.attend_fused(&q_nope, &q_rot, &latent, &k_rot, kv_b)
+            }
+            KvUp::Absorbed { k_b, v_b } => self.attend_absorbed(&q_nope, &q_rot, &latent, &k_rot, k_b, v_b, mask),
         };
 
         // --- optional gate, then output projection ---
@@ -316,7 +334,7 @@ impl Mla {
     /// checkpoint gives, which is set by `qk_head_dim`. Deriving `1/sqrt(width of the dot)` here is
     /// the natural thing to write and is a different model.
     fn attend_absorbed(&self, q_pass: &Tensor, q_rot: &Tensor, latent: &Tensor, k_rot: &Tensor,
-                       k_b: &Tensor, v_b: &Tensor) -> Tensor {
+                       k_b: &Tensor, v_b: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let c = &self.cfg;
         let (h, rope, vh, kvl) = (c.n_heads, c.qk_rope_dim, c.v_head_dim, c.kv_lora_rank);
         let s = q_pass.shape[0];
@@ -332,6 +350,8 @@ impl Mla {
 
         let scores = q_all.matmul(&k_all.transpose(2, 1)).mul(&q_all.scalar(c.scaling));
         let masked = scores.add(&nn::causal_mask_hw(&scores, h, s));
+        // Sparse on top of causal, never instead of it.
+        let masked = match mask { Some(m) => masked.add(m), None => masked };
         let probs = match &self.w.sinks {
             None => masked.softmax(2),
             Some(sk) => nn::softmax_with_sinks(&masked, sk),
