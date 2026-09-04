@@ -8,221 +8,237 @@
 //! checks both against the oracle, and demonstrates the training pattern (repeated same-shape calls
 //! hitting the shape cache).
 
-use ferric_core::Context;
-use ferric_tensor::{device_sync, Tensor};
-use std::sync::Arc;
-use std::time::Instant;
+// ⛔ `ferric_tensor::metal4` is `#[cfg(all(target_os = "macos", ...))]`, so this example could never
+// compile off macOS -- and `cargo test --workspace` builds examples. That made the Linux CI job fail
+// at "Test workspace" before it ran a single test, so the whole workspace went untested there while
+// the macOS job stayed the only real signal. The body moves behind the same cfg the module carries,
+// and `main` stays portable so the target still builds.
+#[cfg(target_os = "macos")]
+mod macos_only {
+    use ferric_core::Context;
+    use ferric_tensor::{device_sync, Tensor};
+    use std::sync::Arc;
+    use std::time::Instant;
 
-fn r#gen(n: usize, salt: usize) -> Vec<f32> {
-    (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
-}
+    fn r#gen(n: usize, salt: usize) -> Vec<f32> {
+        (0..n).map(|i| 0.01 * (((i + salt) % 13) as f32 - 6.0)).collect()
+    }
 
-/// fp16-input CPU oracle (the tensor units' contract: fp16 operands, fp32 accumulate).
-fn cpu_ref_f16(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect() };
-    let (af, bf) = (q(a), q(b));
-    let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            c[i * n + j] = (0..k).map(|l| af[i * k + l] * bf[l * n + j]).sum();
+    /// fp16-input CPU oracle (the tensor units' contract: fp16 operands, fp32 accumulate).
+    fn cpu_ref_f16(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let q = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect() };
+        let (af, bf) = (q(a), q(b));
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                c[i * n + j] = (0..k).map(|l| af[i * k + l] * bf[l * n + j]).sum();
+            }
         }
-    }
-    c
-}
-
-fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
-}
-
-fn main() {
-    let ctx = Arc::new(pollster::block_on(Context::new()).expect("a GPU context"));
-    println!("adapter: {} ({:?})", ctx.adapter_name, ctx.backend);
-
-    let time_matmul = |a: &Tensor, b: &Tensor, reps: usize| {
-        let _ = pollster::block_on(a.matmul(b).to_vec()); // warm (kernel/pipeline/shape caches)
-        let t0 = Instant::now();
-        let mut last = None;
-        for _ in 0..reps {
-            last = Some(a.matmul(b));
-        }
-        let out = last.unwrap();
-        let res = pollster::block_on(out.to_vec());
-        (t0.elapsed().as_secs_f64() / reps as f64, res)
-    };
-
-    println!("\n=== portable WGSL vs resident Metal-4 tensor units (same tensors, same call) ===");
-    println!("  {:>5}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "N", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
-    for &nn in &[512usize, 1024, 2048] {
-        let (av, bv) = (r#gen(nn * nn, 1), r#gen(nn * nn, 7));
-        let a = Tensor::from_vec(&ctx, &av, &[nn, nn]);
-        let b = Tensor::from_vec(&ctx, &bv, &[nn, nn]);
-        let flops = 2.0 * (nn as f64).powi(3);
-
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("FERRIC_METAL4") };
-        let (t_wgsl, r_wgsl) = time_matmul(&a, &b, 3);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
-        let (t_m4, r_m4) = time_matmul(&a, &b, 3);
-
-        // verify: ≤1024 against the fp16 CPU oracle; 2048 against the WGSL f32 result (fp16 tol)
-        let err = if nn <= 1024 {
-            let oracle = cpu_ref_f16(&av, &bv, nn, nn, nn);
-            max_abs_diff(&r_m4, &oracle)
-        } else {
-            max_abs_diff(&r_m4, &r_wgsl)
-        };
-        let tol = if nn <= 1024 { 1e-3 } else { 1e-1 };
-        assert!(err < tol, "resident result off at N={nn}: err {err}");
-        println!(
-            "  {:>5}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
-            nn,
-            t_wgsl * 1e3,
-            flops / t_wgsl / 1e9,
-            t_m4 * 1e3,
-            flops / t_m4 / 1e9,
-            t_wgsl / t_m4
-        );
-        assert!(t_m4 < t_wgsl, "tensor units should beat WGSL at N={nn}");
+        c
     }
 
-    // the training pattern: same shape over and over → every call after the first reuses the cache
-    println!("\n=== cache-reuse cadence (training pattern, N=1024, 20 back-to-back calls) ===");
-    let nn = 1024;
-    let a = Tensor::from_vec(&ctx, &r#gen(nn * nn, 3), &[nn, nn]);
-    let b = Tensor::from_vec(&ctx, &r#gen(nn * nn, 9), &[nn, nn]);
-    let _ = pollster::block_on(a.matmul(&b).to_vec());
-    let t0 = Instant::now();
-    for _ in 0..20 {
-        let _ = a.matmul(&b);
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
     }
-    device_sync(&ctx);
-    let per = t0.elapsed().as_secs_f64() / 20.0;
-    println!("  {:.3} ms/call  ({:.1} GFLOP/s sustained)", per * 1e3, 2.0 * (nn as f64).powi(3) / per / 1e9);
 
-    // the inference hot path: y = silu(x·Wᵀ), W in the HF [out,in] layout (a llama-class FFN
-    // projection) — NT on the tensor units, activation fused into the unpad epilogue
-    println!("\n=== linear layers (x·Wᵀ, HF layout — the ferric-llama hot path) ===");
-    println!("  {:>22}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
-    for &(rows, inn, out_f) in &[(32usize, 2048usize, 8192usize), (64, 4096, 4096)] {
-        let x = Tensor::from_vec(&ctx, &r#gen(rows * inn, 1), &[rows, inn]);
-        let w = Tensor::from_vec(&ctx, &r#gen(out_f * inn, 7), &[out_f, inn]);
-        let flops = 2.0 * (rows * inn * out_f) as f64;
+    pub fn main() {
+        let ctx = Arc::new(pollster::block_on(Context::new()).expect("a GPU context"));
+        println!("adapter: {} ({:?})", ctx.adapter_name, ctx.backend);
 
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("FERRIC_METAL4") };
-        let time_bt = |reps: usize| {
-            let _ = pollster::block_on(x.matmul_bt_act(&w, 2).to_vec());
+        let time_matmul = |a: &Tensor, b: &Tensor, reps: usize| {
+            let _ = pollster::block_on(a.matmul(b).to_vec()); // warm (kernel/pipeline/shape caches)
             let t0 = Instant::now();
             let mut last = None;
             for _ in 0..reps {
-                last = Some(x.matmul_bt_act(&w, 2));
+                last = Some(a.matmul(b));
             }
-            let res = pollster::block_on(last.unwrap().to_vec());
+            let out = last.unwrap();
+            let res = pollster::block_on(out.to_vec());
             (t0.elapsed().as_secs_f64() / reps as f64, res)
         };
-        let (t_wgsl, r_wgsl) = time_bt(3);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
-        let (t_m4, r_m4) = time_bt(3);
-        let err = max_abs_diff(&r_m4, &r_wgsl);
-        assert!(err < 5e-2, "resident linear off at {rows}x{inn}x{out_f}: err {err}");
-        assert!(t_m4 < t_wgsl, "tensor units should beat WGSL at {rows}x{inn}x{out_f}");
-        println!(
-            "  {:>22}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
-            format!("[{rows},{inn}]·[{out_f},{inn}]ᵀ"),
-            t_wgsl * 1e3,
-            flops / t_wgsl / 1e9,
-            t_m4 * 1e3,
-            flops / t_m4 / 1e9,
-            t_wgsl / t_m4
-        );
-    }
 
-    // quantized prefill — Bonsai-27B's real FFN shape, packed Q2_0 ternary. Decode (1 token) stays
-    // on the fused scalar kernel (bandwidth-optimal on packed bytes); prefill routes dequant-once →
-    // tensor-unit GEMM. The 32-row threshold in matmul_q2_0 is what this section justifies (1.3x there, 9x at 512).
-    println!("\n=== Q2_0 ternary prefill (Bonsai ffn_gate/up shape: 5120→17408) ===");
-    println!("  {:>5}  {:>11}  {:>10}  {:>10}  {:>10}  {:>9}", "toks", "fused (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
-    {
-        let (inn, out_f) = (5120usize, 17408usize);
-        let wsrc: Vec<f32> = (0..out_f * inn).map(|i| ((i % 3) as f32 - 1.0) * 0.02).collect();
-        let mut packed = Vec::with_capacity(out_f * (inn / 128) * 34);
-        for r in 0..out_f {
-            packed.extend(ferric_gguf::quant_q2_0(&wsrc[r * inn..(r + 1) * inn]));
-        }
-        let qw = ferric_tensor::Q2_0Weights::from_bytes(&ctx, &packed, out_f, inn);
-        for toks in [32usize, 128, 512] {
-            let x = Tensor::from_vec(&ctx, &r#gen(toks * inn, 5), &[toks, inn]);
-            let flops = 2.0 * (toks * inn * out_f) as f64;
+        println!("\n=== portable WGSL vs resident Metal-4 tensor units (same tensors, same call) ===");
+        println!("  {:>5}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "N", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+        for &nn in &[512usize, 1024, 2048] {
+            let (av, bv) = (r#gen(nn * nn, 1), r#gen(nn * nn, 7));
+            let a = Tensor::from_vec(&ctx, &av, &[nn, nn]);
+            let b = Tensor::from_vec(&ctx, &bv, &[nn, nn]);
+            let flops = 2.0 * (nn as f64).powi(3);
+
             // FIXME: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::remove_var("FERRIC_METAL4") };
-            let time_q = |reps: usize| {
-                let _ = pollster::block_on(x.matmul_q2_0(&qw).to_vec());
+            let (t_wgsl, r_wgsl) = time_matmul(&a, &b, 3);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_METAL4", "1") };
+            let (t_m4, r_m4) = time_matmul(&a, &b, 3);
+
+            // verify: ≤1024 against the fp16 CPU oracle; 2048 against the WGSL f32 result (fp16 tol)
+            let err = if nn <= 1024 {
+                let oracle = cpu_ref_f16(&av, &bv, nn, nn, nn);
+                max_abs_diff(&r_m4, &oracle)
+            } else {
+                max_abs_diff(&r_m4, &r_wgsl)
+            };
+            let tol = if nn <= 1024 { 1e-3 } else { 1e-1 };
+            assert!(err < tol, "resident result off at N={nn}: err {err}");
+            println!(
+                "  {:>5}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
+                nn,
+                t_wgsl * 1e3,
+                flops / t_wgsl / 1e9,
+                t_m4 * 1e3,
+                flops / t_m4 / 1e9,
+                t_wgsl / t_m4
+            );
+            assert!(t_m4 < t_wgsl, "tensor units should beat WGSL at N={nn}");
+        }
+
+        // the training pattern: same shape over and over → every call after the first reuses the cache
+        println!("\n=== cache-reuse cadence (training pattern, N=1024, 20 back-to-back calls) ===");
+        let nn = 1024;
+        let a = Tensor::from_vec(&ctx, &r#gen(nn * nn, 3), &[nn, nn]);
+        let b = Tensor::from_vec(&ctx, &r#gen(nn * nn, 9), &[nn, nn]);
+        let _ = pollster::block_on(a.matmul(&b).to_vec());
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            let _ = a.matmul(&b);
+        }
+        device_sync(&ctx);
+        let per = t0.elapsed().as_secs_f64() / 20.0;
+        println!("  {:.3} ms/call  ({:.1} GFLOP/s sustained)", per * 1e3, 2.0 * (nn as f64).powi(3) / per / 1e9);
+
+        // the inference hot path: y = silu(x·Wᵀ), W in the HF [out,in] layout (a llama-class FFN
+        // projection) — NT on the tensor units, activation fused into the unpad epilogue
+        println!("\n=== linear layers (x·Wᵀ, HF layout — the ferric-llama hot path) ===");
+        println!("  {:>22}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+        for &(rows, inn, out_f) in &[(32usize, 2048usize, 8192usize), (64, 4096, 4096)] {
+            let x = Tensor::from_vec(&ctx, &r#gen(rows * inn, 1), &[rows, inn]);
+            let w = Tensor::from_vec(&ctx, &r#gen(out_f * inn, 7), &[out_f, inn]);
+            let flops = 2.0 * (rows * inn * out_f) as f64;
+
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("FERRIC_METAL4") };
+            let time_bt = |reps: usize| {
+                let _ = pollster::block_on(x.matmul_bt_act(&w, 2).to_vec());
                 let t0 = Instant::now();
                 let mut last = None;
                 for _ in 0..reps {
-                    last = Some(x.matmul_q2_0(&qw));
+                    last = Some(x.matmul_bt_act(&w, 2));
                 }
                 let res = pollster::block_on(last.unwrap().to_vec());
                 (t0.elapsed().as_secs_f64() / reps as f64, res)
             };
-            let (t_fused, r_fused) = time_q(3);
+            let (t_wgsl, r_wgsl) = time_bt(3);
             // FIXME: Audit that the environment access only happens in single-threaded code.
             unsafe { std::env::set_var("FERRIC_METAL4", "1") };
-            let (t_m4, r_m4) = time_q(3);
-            // fp16-contract tolerance, relative to the result scale
-            let scale = r_fused.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let err = max_abs_diff(&r_m4, &r_fused);
-            assert!(err < (1e-2 * scale).max(1e-3), "Q2_0 metal4 off at {toks} toks: err {err} (scale {scale})");
+            let (t_m4, r_m4) = time_bt(3);
+            let err = max_abs_diff(&r_m4, &r_wgsl);
+            assert!(err < 5e-2, "resident linear off at {rows}x{inn}x{out_f}: err {err}");
+            assert!(t_m4 < t_wgsl, "tensor units should beat WGSL at {rows}x{inn}x{out_f}");
             println!(
-                "  {:>5}  {:>11.3}  {:>10.1}  {:>10.3}  {:>10.1}  {:>8.1}x",
-                toks,
-                t_fused * 1e3,
-                flops / t_fused / 1e9,
+                "  {:>22}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
+                format!("[{rows},{inn}]·[{out_f},{inn}]ᵀ"),
+                t_wgsl * 1e3,
+                flops / t_wgsl / 1e9,
                 t_m4 * 1e3,
                 flops / t_m4 / 1e9,
-                t_fused / t_m4
+                t_wgsl / t_m4
             );
         }
-    }
 
-    // conv layers — CNN-class shapes on the conv tensor units (dequantless: f32 in, fp16 contract)
-    println!("\n=== conv2d (NHWC, 3x3, same-pad — CNN backbone shapes) ===");
-    println!("  {:>26}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
-    for &(n, hw, c, o) in &[(1usize, 64usize, 64usize, 128usize), (8, 32, 128, 128)] {
-        let x = Tensor::from_vec(&ctx, &r#gen(n * hw * hw * c, 1), &[n, hw, hw, c]);
-        let w = Tensor::from_vec(&ctx, &r#gen(3 * 3 * c * o, 7), &[3, 3, c, o]);
-        let flops = 2.0 * (n * hw * hw * o * 3 * 3 * c) as f64;
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("FERRIC_METAL4") };
-        let time_conv = |reps: usize| {
-            let _ = pollster::block_on(x.conv2d(&w, (1, 1), (1, 1)).to_vec());
-            let t0 = Instant::now();
-            let mut last = None;
-            for _ in 0..reps {
-                last = Some(x.conv2d(&w, (1, 1), (1, 1)));
+        // quantized prefill — Bonsai-27B's real FFN shape, packed Q2_0 ternary. Decode (1 token) stays
+        // on the fused scalar kernel (bandwidth-optimal on packed bytes); prefill routes dequant-once →
+        // tensor-unit GEMM. The 32-row threshold in matmul_q2_0 is what this section justifies (1.3x there, 9x at 512).
+        println!("\n=== Q2_0 ternary prefill (Bonsai ffn_gate/up shape: 5120→17408) ===");
+        println!("  {:>5}  {:>11}  {:>10}  {:>10}  {:>10}  {:>9}", "toks", "fused (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+        {
+            let (inn, out_f) = (5120usize, 17408usize);
+            let wsrc: Vec<f32> = (0..out_f * inn).map(|i| ((i % 3) as f32 - 1.0) * 0.02).collect();
+            let mut packed = Vec::with_capacity(out_f * (inn / 128) * 34);
+            for r in 0..out_f {
+                packed.extend(ferric_gguf::quant_q2_0(&wsrc[r * inn..(r + 1) * inn]));
             }
-            let res = pollster::block_on(last.unwrap().to_vec());
-            (t0.elapsed().as_secs_f64() / reps as f64, res)
-        };
-        let (t_wgsl, r_wgsl) = time_conv(3);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("FERRIC_METAL4", "1") };
-        let (t_m4, r_m4) = time_conv(3);
-        let scale = r_wgsl.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let err = max_abs_diff(&r_m4, &r_wgsl);
-        assert!(err < (1e-2 * scale).max(1e-3), "resident conv off at {n}x{hw}x{c}->{o}: err {err} (scale {scale})");
-        println!(
-            "  {:>26}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
-            format!("[{n},{hw},{hw},{c}]→{o}"),
-            t_wgsl * 1e3,
-            flops / t_wgsl / 1e9,
-            t_m4 * 1e3,
-            flops / t_m4 / 1e9,
-            t_wgsl / t_m4
-        );
-    }
+            let qw = ferric_tensor::Q2_0Weights::from_bytes(&ctx, &packed, out_f, inn);
+            for toks in [32usize, 128, 512] {
+                let x = Tensor::from_vec(&ctx, &r#gen(toks * inn, 5), &[toks, inn]);
+                let flops = 2.0 * (toks * inn * out_f) as f64;
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::remove_var("FERRIC_METAL4") };
+                let time_q = |reps: usize| {
+                    let _ = pollster::block_on(x.matmul_q2_0(&qw).to_vec());
+                    let t0 = Instant::now();
+                    let mut last = None;
+                    for _ in 0..reps {
+                        last = Some(x.matmul_q2_0(&qw));
+                    }
+                    let res = pollster::block_on(last.unwrap().to_vec());
+                    (t0.elapsed().as_secs_f64() / reps as f64, res)
+                };
+                let (t_fused, r_fused) = time_q(3);
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::set_var("FERRIC_METAL4", "1") };
+                let (t_m4, r_m4) = time_q(3);
+                // fp16-contract tolerance, relative to the result scale
+                let scale = r_fused.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let err = max_abs_diff(&r_m4, &r_fused);
+                assert!(err < (1e-2 * scale).max(1e-3), "Q2_0 metal4 off at {toks} toks: err {err} (scale {scale})");
+                println!(
+                    "  {:>5}  {:>11.3}  {:>10.1}  {:>10.3}  {:>10.1}  {:>8.1}x",
+                    toks,
+                    t_fused * 1e3,
+                    flops / t_fused / 1e9,
+                    t_m4 * 1e3,
+                    flops / t_m4 / 1e9,
+                    t_fused / t_m4
+                );
+            }
+        }
 
-    println!("\n✅ resident tensor-unit path: correct vs the fp16 oracle, faster than WGSL, zero host copies");
+        // conv layers — CNN-class shapes on the conv tensor units (dequantless: f32 in, fp16 contract)
+        println!("\n=== conv2d (NHWC, 3x3, same-pad — CNN backbone shapes) ===");
+        println!("  {:>26}  {:>10}  {:>10}  {:>9}  {:>10}  {:>9}", "shape", "wgsl (ms)", "GFLOP/s", "m4 (ms)", "GFLOP/s", "speedup");
+        for &(n, hw, c, o) in &[(1usize, 64usize, 64usize, 128usize), (8, 32, 128, 128)] {
+            let x = Tensor::from_vec(&ctx, &r#gen(n * hw * hw * c, 1), &[n, hw, hw, c]);
+            let w = Tensor::from_vec(&ctx, &r#gen(3 * 3 * c * o, 7), &[3, 3, c, o]);
+            let flops = 2.0 * (n * hw * hw * o * 3 * 3 * c) as f64;
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("FERRIC_METAL4") };
+            let time_conv = |reps: usize| {
+                let _ = pollster::block_on(x.conv2d(&w, (1, 1), (1, 1)).to_vec());
+                let t0 = Instant::now();
+                let mut last = None;
+                for _ in 0..reps {
+                    last = Some(x.conv2d(&w, (1, 1), (1, 1)));
+                }
+                let res = pollster::block_on(last.unwrap().to_vec());
+                (t0.elapsed().as_secs_f64() / reps as f64, res)
+            };
+            let (t_wgsl, r_wgsl) = time_conv(3);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("FERRIC_METAL4", "1") };
+            let (t_m4, r_m4) = time_conv(3);
+            let scale = r_wgsl.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let err = max_abs_diff(&r_m4, &r_wgsl);
+            assert!(err < (1e-2 * scale).max(1e-3), "resident conv off at {n}x{hw}x{c}->{o}: err {err} (scale {scale})");
+            println!(
+                "  {:>26}  {:>10.3}  {:>10.1}  {:>9.3}  {:>10.1}  {:>8.1}x",
+                format!("[{n},{hw},{hw},{c}]→{o}"),
+                t_wgsl * 1e3,
+                flops / t_wgsl / 1e9,
+                t_m4 * 1e3,
+                flops / t_m4 / 1e9,
+                t_wgsl / t_m4
+            );
+        }
+
+        println!("\n✅ resident tensor-unit path: correct vs the fp16 oracle, faster than WGSL, zero host copies");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() { macos_only::main() }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("metal4_resident: nothing to run -- it exercises the resident Metal 4 tensor-unit GEMM path, which exists only on macOS.");
 }
