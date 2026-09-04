@@ -89,7 +89,7 @@ fn build(top_k: u32) -> Vec<u8> {
         .kv_u32("hyv4.attention.indexer.top_k", top_k)
         // Layer 0 full, layer 1 sharing — the smallest schedule that exercises BOTH branches of the
         // index reuse. A model where every layer were full would never test the sharing path.
-        .kv_arr_u32("hyv4.attention.indexer.is_full", &[1, 0])
+        .kv_arr_i32("hyv4.attention.indexer.is_full", &[1, 0])   // I32, as Tencent's file stores it
         .kv_str("tokenizer.ggml.model", "gpt2")
         .kv_str("tokenizer.ggml.pre", "hyv4");
 

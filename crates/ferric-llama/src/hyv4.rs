@@ -90,28 +90,46 @@ impl Cfg {
             _ => return Err("no general.architecture".into()),
         };
         if arch != "hyv4" { return Err(format!("not a hyv4 checkpoint: architecture is '{arch}'")) }
+        // ⛔ ACCEPT BOTH SIGNAGES. GGUF's numeric KV tags distinguish signed from unsigned, and a
+        // writer picks whichever it likes for a count that is never negative. Tencent's file stores
+        // `indexer.is_full` as **I32**; reading only `Meta::U` silently produced an all-false
+        // schedule, which `IndexSchedule::new` then refused — this loader rejected the real
+        // checkpoint outright. The synthetic test could not catch it because that file was written
+        // with `kv_arr_u32`: the same convention on both sides, cancelling.
         let u = |k: &str| -> Result<usize, String> {
             match md.get(&format!("hyv4.{k}")) {
                 Some(Meta::U(v)) => Ok(*v as usize),
-                _ => Err(format!("hyv4.{k} missing or not an integer")),
+                Some(Meta::I(v)) if *v >= 0 => Ok(*v as usize),
+                _ => Err(format!("hyv4.{k} missing or not a non-negative integer")),
             }
         };
         let f = |k: &str| -> Result<f32, String> {
             match md.get(&format!("hyv4.{k}")) {
                 Some(Meta::F(v)) => Ok(*v as f32),
-                _ => Err(format!("hyv4.{k} missing or not a float")),
+                Some(Meta::U(v)) => Ok(*v as f32),
+                Some(Meta::I(v)) => Ok(*v as f32),
+                _ => Err(format!("hyv4.{k} missing or not a number")),
             }
         };
         let arr_f = |k: &str| -> Result<Vec<f32>, String> {
             match md.get(&format!("hyv4.{k}")) {
-                Some(Meta::Arr(v)) => Ok(v.iter().map(|m| match m { Meta::F(x) => *x as f32, _ => 0.0 }).collect()),
+                Some(Meta::Arr(v)) => v.iter().map(|m| match m {
+                    Meta::F(x) => Ok(*x as f32), Meta::U(x) => Ok(*x as f32), Meta::I(x) => Ok(*x as f32),
+                    _ => Err(format!("hyv4.{k} has a non-numeric element")),
+                }).collect(),
                 _ => Err(format!("hyv4.{k} missing or not an array")),
             }
         };
         let arr_b = |k: &str| -> Result<Vec<bool>, String> {
             match md.get(&format!("hyv4.{k}")) {
-                Some(Meta::Arr(v)) => Ok(v.iter().map(|m| match m {
-                    Meta::U(x) => *x != 0, Meta::Bool(b) => *b, _ => false }).collect()),
+                Some(Meta::Arr(v)) => v.iter().map(|m| match m {
+                    Meta::U(x) => Ok(*x != 0),
+                    Meta::I(x) => Ok(*x != 0),
+                    Meta::Bool(b) => Ok(*b),
+                    // Never default to false here: an unreadable flag that reads as "not full"
+                    // produces a schedule that is wrong rather than a load that fails.
+                    _ => Err(format!("hyv4.{k} has an element that is not a flag")),
+                }).collect(),
                 _ => Err(format!("hyv4.{k} missing or not an array")),
             }
         };
@@ -144,10 +162,11 @@ impl Cfg {
             n_expert_shared: u("expert_shared_count").unwrap_or(1),
             expert_ff: u("expert_feed_forward_length")?,
             routed_scale: f("expert_weights_scale").unwrap_or(1.0),
-            expert_norm: matches!(md.get("hyv4.expert_weights_norm"), Some(Meta::Bool(true))),
+            expert_norm: match md.get("hyv4.expert_weights_norm") {
+                Some(Meta::Bool(b)) => *b, Some(Meta::U(v)) => *v != 0, Some(Meta::I(v)) => *v != 0, _ => false },
             // Gating function 2 is sigmoid; anything else here is softmax, and the two differ by
             // more than a nonlinearity — sigmoid gating does not normalise across experts.
-            sigmoid_gate: matches!(md.get("hyv4.expert_gating_func"), Some(Meta::U(2))),
+            sigmoid_gate: matches!(md.get("hyv4.expert_gating_func"), Some(Meta::U(2)) | Some(Meta::I(2))),
             swiglu_clamp,
             hc: u("hyper_connection.count")?,
             hc_eps: f("hyper_connection.epsilon").unwrap_or(1e-6),
@@ -207,6 +226,85 @@ pub struct Hyv4 {
 }
 
 impl Hyv4 {
+    /// Every tensor this loader will ask for, with the dims it expects, in **GGUF `ne` order**
+    /// (`ne0` fastest — a `[out, in]` matrix appears as `[in, out]`).
+    ///
+    /// This is the loader's own expectations, not a second copy of them: `load` resolves the same
+    /// names, and `examples/hyv4_validate.rs` checks this table against a real published header. A
+    /// shape stated here and read differently there is the transposition class of bug, and it is
+    /// the one thing about a format that a synthetic checkpoint can never catch — writing and
+    /// reading with the same wrong convention cancels.
+    pub fn expected_tensors(cfg: &Cfg, schedule: &IndexSchedule) -> Vec<(String, Vec<u64>)> {
+        let (d, h) = (cfg.d as u64, cfg.n_head as u64);
+        let (qk, vh) = (cfg.qk_head as u64, cfg.v_head as u64);
+        let (ql, kvl, rope) = (cfg.q_lora_rank as u64, cfg.kv_lora_rank as u64, cfg.qk_rope as u64);
+        let (hc, nope) = (cfg.hc as u64, cfg.qk_nope() as u64);
+        let (ne, eff, ff) = (cfg.n_expert as u64, cfg.expert_ff as u64, cfg.n_ff as u64);
+        let mut v: Vec<(String, Vec<u64>)> = vec![
+            ("token_embd.weight".into(), vec![d, cfg.n_vocab as u64]),
+            ("output.weight".into(), vec![d, cfg.n_vocab as u64]),
+            ("output_norm.weight".into(), vec![d]),
+            ("output_hc_fn.weight".into(), vec![hc * d, hc]),
+            ("output_hc_base.weight".into(), vec![hc]),
+            ("output_hc_scale.weight".into(), vec![1]),
+        ];
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            v.extend([
+                (b("attn_norm.weight"), vec![d]),
+                (b("ffn_norm.weight"), vec![d]),
+                (b("attn_q_a.weight"), vec![d, ql]),
+                (b("attn_q_a_norm.weight"), vec![ql]),
+                (b("attn_q_b.weight"), vec![ql, h * qk]),
+                (b("attn_kv_a_mqa.weight"), vec![d, kvl + rope]),
+                (b("attn_kv_a_norm.weight"), vec![kvl]),
+                (b("attn_k_b.weight"), vec![nope, kvl, h]),
+                (b("attn_v_b.weight"), vec![kvl, vh, h]),
+                (b("attn_gate.weight"), vec![d, h * vh]),
+                (b("attn_output.weight"), vec![h * vh, d]),
+                (b("attn_sinks.weight"), vec![h]),
+                (b("hc_attn_fn.weight"), vec![hc * d, 2 * hc]),
+                (b("hc_attn_base.weight"), vec![2 * hc]),
+                (b("hc_attn_scale.weight"), vec![2]),
+                (b("hc_ffn_fn.weight"), vec![hc * d, 2 * hc]),
+                (b("hc_ffn_base.weight"), vec![2 * hc]),
+                (b("hc_ffn_scale.weight"), vec![2]),
+            ]);
+            if schedule.is_full(il) {
+                let (ih, idk) = (cfg.idx_heads as u64, cfg.idx_head_dim as u64);
+                v.extend([
+                    (b("indexer.attn_q_b.weight"), vec![ql, ih * idk]),
+                    (b("indexer.attn_k.weight"), vec![d, idk]),
+                    (b("indexer.k_norm.weight"), vec![idk]),
+                    (b("indexer.k_norm.bias"), vec![idk]),
+                    (b("indexer.proj.weight"), vec![d, ih]),
+                ]);
+            }
+            if il < cfg.dense_lead {
+                v.extend([
+                    (b("ffn_gate.weight"), vec![d, ff]),
+                    (b("ffn_up.weight"), vec![d, ff]),
+                    (b("ffn_down.weight"), vec![ff, d]),
+                ]);
+            } else {
+                v.extend([
+                    (b("ffn_gate_inp.weight"), vec![d, ne]),
+                    // Optional in `load` (a checkpoint may route without a selection bias) but
+                    // present on every MoE block of the published file, so it belongs here: a
+                    // tensor the loader reads and the table omits shows up as "never read".
+                    (b("exp_probs_b.bias"), vec![ne]),
+                    (b("ffn_gate_exps.weight"), vec![d, eff, ne]),
+                    (b("ffn_up_exps.weight"), vec![d, eff, ne]),
+                    (b("ffn_down_exps.weight"), vec![eff, d, ne]),
+                    (b("ffn_gate_shexp.weight"), vec![d, eff]),
+                    (b("ffn_up_shexp.weight"), vec![d, eff]),
+                    (b("ffn_down_shexp.weight"), vec![eff, d]),
+                ]);
+            }
+        }
+        v
+    }
+
     /// The tensor names this architecture requires, as they appear in the published checkpoints.
     ///
     /// Listed because a missing tensor should fail at load with a name, not at the first forward
