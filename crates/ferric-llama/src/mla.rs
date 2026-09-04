@@ -489,7 +489,8 @@ mod absorbed_tests {
         let mut s = seed;
         let v: Vec<f32> = (0..n).map(|_| {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 0.5
+            // ⛔ `>> 33` here gave [-0.5, 0) -- every input negative -- until 2026-09-04. See dsa.rs::rnd.
+            (((s >> 32) as f32 / (1u64 << 31) as f32) - 1.0) * 0.5
         }).collect();
         Tensor::from_vec(ctx, &v, shape)
     }
@@ -504,6 +505,18 @@ mod absorbed_tests {
             gate_proj: None,
             sinks,
         }
+    }
+
+    /// ⛔ The generator is two-signed and spans its range. Until 2026-09-04 it was uniform in
+    /// [-1, 0) -- a `>> 33` where `>> 32` was meant -- and every test in this module ran on
+    /// negative-only inputs without anything noticing. A fixture needs a guard like any other claim.
+    #[test]
+    fn the_fixture_generator_is_two_signed() {
+        let ctx = ctx_or_skip!();
+        let v = pollster::block_on(rnd(&ctx, &[64, 16], 777).to_vec());
+        let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
+        assert!(mx > 0.25 && mn < -0.25, "generator does not span both signs: max {mx}, min {mn}");
+        assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
     }
 
     /// **Absorption is exact, so each path is the other's oracle.**

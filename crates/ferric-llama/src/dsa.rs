@@ -262,12 +262,20 @@ mod tests {
         () => { match pollster::block_on(Context::new()) { Ok(c) => Arc::new(c), Err(_) => { eprintln!("no GPU context — skipping"); return } } };
     }
 
+    /// Uniform in [-1, 1).
+    ///
+    /// ⛔ This read `(s >> 33) / 2^31 - 1.0` until 2026-09-04, which is uniform in [-1, 0): a
+    /// 31-bit value over 2^31 is in [0, 1). Every "random" input to every test in this module was
+    /// NEGATIVE, so `cur·proj` was a sum of positive products and no head weight was ever negative,
+    /// no score was ever negative, and a mutation adding a ReLU on the output was invisible -- a
+    /// probe over 109 seeds could not find a negative score because none was possible. The tests
+    /// that passed were exercising half the input space their comments claimed.
     fn rnd(ctx: &Arc<Context>, shape: &[usize], seed: u64) -> (Tensor, Vec<f32>) {
         let n: usize = shape.iter().product();
         let mut s = seed;
         let v: Vec<f32> = (0..n).map(|_| {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            ((s >> 32) as f32 / (1u64 << 31) as f32) - 1.0
         }).collect();
         (Tensor::from_vec(ctx, &v, shape), v)
     }
@@ -285,49 +293,156 @@ mod tests {
 
     /// The scoring function, term by term, against host arithmetic — with `T != M`, so a head
     /// weight read by key position instead of query position cannot survive.
+    ///
+    /// ## The tolerance is DERIVED, not chosen
+    ///
+    /// This used to accept `2e-5 · max(|want|, 1)` — about 340 ulps, picked to pass. The score is a
+    /// polynomial in the GPU's own `q`, `iw` and `k` (read back and used as given, so no error from
+    /// producing them enters), and every f32 operation on that path has a known bound against its
+    /// OPERAND SCALE — the magnitudes that went into it, not the result (dividing by the result
+    /// reports tens of ulps on a correct GPU whenever terms cancel; see `exact.rs`):
+    ///
+    /// * the dot over `DK` terms: `|fl(Σ q·k) − Σ q·k| ≤ DK·ε·Σ|q_d k_d|` (the standard `γ_n` bound);
+    /// * ReLU is 1-Lipschitz — it adds no error and cannot amplify the dot's;
+    /// * one product by `iw`, then a `H`-term sum: `≤ (1 + H−1)·ε·Σ_h|iw_h·relu_h|`.
+    ///
+    /// So `|err| ≤ ε·[DK·Σ_h |iw_h|·Σ_d|q_hd k_d|  +  H·Σ_h |iw_h·relu_h|]`, safety factor 2, with
+    /// one rigorous refinement: a head whose exact dot is negative by MORE than its own dot-error
+    /// bound has `relu(fl(dot)) = relu(dot) = 0` exactly and contributes no error at all, so it is
+    /// not charged. The host reference is f64, whose rounding is 2²⁹ below f32's.
+    ///
+    /// ## What this derivation can and cannot see — the opposite result from `hc.rs`
+    ///
+    /// Measured, the GPU sits at 0.69 ulps of the result; the derived bound is ~190 ulps of it, and
+    /// the old hand-picked 2e-5 was ~340. So the old tolerance here was roughly right, where the
+    /// hyper-connection test's was 200x loose. The gap between 0.69 and 115 is not slack to be
+    /// tightened away: `γ_n` is a worst case, and on a random-sign dot the operand scale `Σ|q·k|`
+    /// exceeds `|Σ q·k|` by ~√n while the count charges n roundings, so a rigorous order-independent
+    /// bound on an 8-term dot is inherently ~√n·n loose. A sharper bound would need the kernel's
+    /// accumulation order, which differs across fabrics and is exactly the wrong thing to depend on.
+    /// The derivation's value on this path is that the bound now SCALES correctly with the operand
+    /// magnitudes — `max(|want|, 1)` did not — not that it is tight. The observed/bound floor is
+    /// therefore 2e-3 rather than 1e-2, which still fails a bound that is >500x loose, e.g. one with
+    /// a wrong units factor; and the subtle mutation this test can honestly claim to catch is a
+    /// 512-ulp injection, not an 8-ulp one.
     #[test]
     fn the_score_matches_the_definition() {
         let ctx = ctx_or_skip!();
         let ix = indexer(&ctx);
         let (qr, _) = rnd(&ctx, &[T, LQ], 10);
         let (cur, _) = rnd(&ctx, &[T, HID], 11);
-        let (keys, _) = rnd(&ctx, &[M, DK], 12);
+        let (_, mut kv) = rnd(&ctx, &[M, DK], 12);
         let (cos, _) = rnd(&ctx, &[T.max(M), R], 13);
         let (sin, _) = rnd(&ctx, &[T.max(M), R], 14);
 
-        let q = get(&ix.queries(&qr, &cos, &sin));   // [T, H, DK]
+        let q = get(&ix.queries(&qr, &cos, &sin));   // [T, H, DK], the GPU's own, taken as given
         let iw = get(&ix.head_weights(&cur));        // [T, H]
-        let kv = get(&keys);
+
+        // ⛔ Construct a NEGATIVE score, by design rather than by seed. A negative score needs a head
+        // with a negative weight whose dot is positive while every other head's dot is negative --
+        // a structural condition no amount of seed-hunting reliably meets (a probe over 109 `cur`
+        // seeds found none). So: take the most negative weight (t*, h*), and search on the host for
+        // a key in the cone {q_h*·k > 0, q_h·k < 0 for h != h*} -- four half-spaces in 8-D, feasible
+        // in a handful of random tries -- and make it key row 0. The score at (t*, 0) is then
+        // iw_h*·(q_h*·k) < 0 by construction, and the guard at the end checks the construction
+        // rather than hoping. Without this, a mutation adding a ReLU on the OUTPUT was invisible.
+        let (tstar, hstar) = (0..T * H).map(|i| (i / H, i % H))
+            .min_by(|a, b| iw[a.0 * H + a.1].partial_cmp(&iw[b.0 * H + b.1]).unwrap()).unwrap();
+        assert!(iw[tstar * H + hstar] < 0.0, "no negative head weight on this draw; the construction needs one");
+        let qh = |h: usize| &q[(tstar * H + h) * DK..(tstar * H + h + 1) * DK];
+        let mut seed = 0xc0ffee_u64;
+        let mut found = None;
+        for _ in 0..10_000 {
+            let k: Vec<f32> = (0..DK).map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 32) as f32 / (1u64 << 31) as f32) - 1.0
+            }).collect();
+            let dot = |h: usize| qh(h).iter().zip(&k).map(|(a, b)| a * b).sum::<f32>();
+            if dot(hstar) > 1e-2 && (0..H).filter(|&h| h != hstar).all(|h| dot(h) < -1e-2) { found = Some(k); break }
+        }
+        let k = found.expect("no key in the cone within 10000 tries; the cone should be feasible");
+        kv[..DK].copy_from_slice(&k);
+        let keys = Tensor::from_vec(&ctx, &kv, &[M, DK]);
+
         let sc = get(&ix.scores(&qr, &cur, &keys, &cos, &sin));
         assert_eq!(sc.len(), T * M);
 
-        // Three readings of "where does the ReLU go", computed on the host from the same q, iw and
-        // keys. Only the first is the format; the other two are the plausible misreadings, and the
-        // guards below fail if this particular draw cannot tell them apart — otherwise the
-        // comparison would be about the random numbers rather than about the code.
-        let mut on_dot = vec![0.0f32; T * M];
-        let mut on_score = vec![0.0f32; T * M];
-        let mut no_relu = vec![0.0f32; T * M];
+        // Three readings of "where does the ReLU go", in f64 from the same q, iw and keys. Only
+        // the first is the format; the other two are the plausible misreadings, and the guards
+        // below fail if this particular draw cannot tell them apart — otherwise the comparison
+        // would be about the random numbers rather than about the code.
+        const EPS: f64 = f32::EPSILON as f64;
+        const SAFETY: f64 = 2.0;
+        let mut on_dot = vec![0.0f64; T * M];
+        let mut on_score = vec![0.0f64; T * M];
+        let mut no_relu = vec![0.0f64; T * M];
+        let mut bound = vec![0.0f64; T * M];
         for t in 0..T {
             for j in 0..M {
-                let (mut a, mut c) = (0.0f32, 0.0f32);
+                let (mut a, mut c) = (0.0f64, 0.0f64);
+                let (mut s_dot_w, mut s_terms) = (0.0f64, 0.0f64); // Σ_h|iw_h|·Σ_d|q k|, Σ_h|iw_h relu_h|
                 for h in 0..H {
-                    let dot: f32 = (0..DK).map(|d| q[(t * H + h) * DK + d] * kv[j * DK + d]).sum();
-                    a += iw[t * H + h] * dot.max(0.0);
-                    c += iw[t * H + h] * dot;
+                    let (mut dot, mut s_dot) = (0.0f64, 0.0f64);
+                    for d in 0..DK {
+                        let term = q[(t * H + h) * DK + d] as f64 * kv[j * DK + d] as f64;
+                        dot += term; s_dot += term.abs();
+                    }
+                    let w = iw[t * H + h] as f64;
+                    let relu = dot.max(0.0);
+                    a += w * relu;
+                    c += w * dot;
+                    // ReLU refinement: if the exact dot is negative by more than the dot's own f32
+                    // error bound, the rounded dot is negative too, both ReLUs are exactly 0, and
+                    // this head propagates no error. Charging it would be an over-count.
+                    let dot_err_bound = DK as f64 * EPS * s_dot;
+                    if dot > -dot_err_bound { s_dot_w += w.abs() * s_dot }
+                    s_terms += (w * relu).abs();
                 }
                 on_dot[t * M + j] = a;
                 on_score[t * M + j] = c.max(0.0);
                 no_relu[t * M + j] = c;
+                bound[t * M + j] = SAFETY * EPS * (DK as f64 * s_dot_w + H as f64 * s_terms);
             }
         }
+        let mut worst_ratio = 0.0f64;
+        let (mut max_err, mut max_b, mut max_want) = (0.0f64, 0.0f64, 0.0f64);
         for t in 0..T { for j in 0..M {
-            let (got, want) = (sc[t * M + j], on_dot[t * M + j]);
-            assert!((got - want).abs() < 2e-5 * want.abs().max(1.0), "score[{t},{j}]: {got} vs {want}");
+            let (got, want, b) = (sc[t * M + j] as f64, on_dot[t * M + j], bound[t * M + j]);
+            let err = (got - want).abs();
+            assert!(err <= b, "score[{t},{j}]: {got} vs {want}, error {err:.3e} exceeds derived bound {b:.3e}");
+            if b > 0.0 { worst_ratio = worst_ratio.max(err / b) }
+            max_err = max_err.max(err); max_b = max_b.max(b); max_want = max_want.max(want.abs());
         }}
-        let sep = |o: &[f32]| on_dot.iter().zip(o).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        eprintln!("dsa score vs f64 definition: worst observed/bound {worst_ratio:.3}");
+        eprintln!("  DIAG max|err| {max_err:.3e}  max bound {max_b:.3e}  max|want| {max_want:.3e}  \
+                   -> observed ≈ {:.2} ulps of max|want|, bound ≈ {:.0} ulps of max|want|",
+                  max_err / (EPS * max_want.max(1e-30)), max_b / (EPS * max_want.max(1e-30)));
+        assert!(worst_ratio > 2e-3, "derived bound is >500x looser than observed ({worst_ratio:.4}); it is not doing work");
+        assert!(worst_ratio > 0.0, "zero error is not plausible for f32; the comparison is vacuous");
+
+        let sep = |o: &[f64]| on_dot.iter().zip(o).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
         assert!(sep(&on_score) > 1e-3, "this draw cannot distinguish ReLU-on-dot from ReLU-on-score");
         assert!(sep(&no_relu) > 1e-3, "this draw cannot distinguish ReLU-on-dot from no ReLU at all");
+        // ⛔ A fourth misreading the two guards above do NOT cover: a ReLU on the output IN ADDITION
+        // to the per-head one. It changes nothing unless the correct score is negative, which needs
+        // a negative head weight on a head whose dot is positive. A mutation adding exactly that
+        // survived this test, because on the original draw no score was negative and the extra
+        // clamp was a no-op. The draw is now REQUIRED to contain one, so the test fails loudly on
+        // any seed that cannot express the bug instead of passing quietly.
+        let negatives = on_dot.iter().filter(|v| **v < -1e-3).count();
+        assert!(negatives >= 1, "no score is negative on this draw; an output ReLU would be invisible — change a seed");
+    }
+
+    /// ⛔ The generator is two-signed and spans its range. Until 2026-09-04 it was uniform in
+    /// [-1, 0) -- a `>> 33` where `>> 32` was meant -- and every test in this module ran on
+    /// negative-only inputs without anything noticing. A fixture needs a guard like any other claim.
+    #[test]
+    fn the_fixture_generator_is_two_signed() {
+        let ctx = ctx_or_skip!();
+        let v = rnd(&ctx, &[64, 16], 777).1;
+        let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
+        assert!(mx > 0.5 && mn < -0.5, "generator does not span both signs: max {mx}, min {mn}");
+        assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
     }
 
     /// The scale is `1/sqrt(head_dim · n_heads)`, folded into the weights after the ReLU. That fold
