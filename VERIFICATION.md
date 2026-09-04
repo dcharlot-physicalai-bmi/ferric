@@ -16,7 +16,10 @@ claim is, and the last section says plainly what nothing here covers.
 
 Run by `scripts/proofs.sh` (needs `-Z stubbing`; per-crate timeout; the verdict is read off the
 `Complete - N … 0 failures` summary line, because piping through `grep` matched that line whether it
-said 0 failures or 2). CI job `proofs`, pinned to 0.67.0 — **has not yet run in CI**.
+said 0 failures or 2). CI job `proofs`, pinned to 0.67.0 — **first ran in CI on 2026-09-04** (run 33906791929), and
+the log was read rather than the green tick trusted: 12 `VERIFICATION:- SUCCESSFUL` lines and two
+`Complete - N … 0 failures` summaries (7 gguf + 5 llama), matching the local harness count exactly.
+A job that skips silently and a job that verifies produce the same coloured tick.
 
 | harness | claim |
 |---|---|
@@ -190,7 +193,28 @@ Three rounds of that found the checks themselves were wrong:
 - **The energy figures' sensitivity to input sign.** They were measured on all-negative activations
   (same defect as §6). Both arms always saw identical data, so every ratio is a valid differential —
   but whether the ratios shift on two-signed input is **unmeasured, not unchanged**.
-- **The CI proofs job.** Written and pinned; never run.
+- **~~The CI proofs job.~~** Now run — see §1.
+- **~~Linux test execution.~~** Also now run, and it paid for itself immediately.
+  `examples/m4prof.rs` imported the macOS-only `metal4` module unguarded, so `cargo test
+  --workspace` died at compile and the software-GPU job had **never run a test** — red and unread
+  since 2026-07-22, which made the macOS job silently the whole of CI. Unblocked in `f9e3746`:
+  **566 s, all tests pass** (Metal's own `Test workspace` takes 898 s, so lavapipe is not the slow
+  part). The very next step then found a real portability defect and a real cost defect:
+  - `examples/flash.rs` **panicked** — `causal_attention` materialises `[nh,T,T]`, which at
+    T=3000/nh=8 is 288,000,000 bytes against lavapipe's `max_storage_buffer_binding_size` of
+    134,217,728. `Context::new` requests `adapter.limits()`, so Metal grants far more and that case
+    had only ever run because of the hardware under it. **The baseline that cannot allocate is the
+    exact condition flash attention exists to remove**, so the fix compares at the largest head
+    count that fits (T unchanged, so the 2048-key chunk boundary is still crossed) and then runs
+    flash at the full head count where the baseline cannot run at all.
+  - `examples/bench.rs` ran **113 minutes** — 96% of the whole step. llvmpipe sustains ~2 GFLOP/s,
+    so a fixed 30 iterations of a 137-GFLOP matmul across three kernels is nearly two hours, to
+    report throughput that means nothing on a CPU. `iters` is now derived from a measured single
+    iteration against a wall-clock budget, and the sample count is **printed** (`n=30` … `n=1`), so
+    a one-sample figure cannot be mistaken for a thirty-sample one. The equality check is untouched.
+  ⚠ The constrained flash branch would otherwise have shipped never having executed on any machine
+  its author could see — the same trap that put the panic there. `FERRIC_MAX_BINDING` forces it on
+  any device; run at lavapipe's exact 134217728 it takes the small path and still proves equality.
 
 ---
 
