@@ -17,6 +17,7 @@ mod iq_grids;
 pub use iq_grids::{IQ2XXS_GRID, IQ3XXS_GRID};
 pub mod quantize;
 pub mod quantplan;
+pub mod write;
 
 const F32: u32 = 0;
 const F16T: u32 = 1;
@@ -506,7 +507,24 @@ impl GgufSource for Gguf {
 }
 
 /// On-disk byte size of `n` elements stored as ggml type `ty`.
+///
+/// ⛔ **A partial block is an ERROR, not zero bytes.** Every arm below divides before it
+/// multiplies, so `n` smaller than one block truncated to `0` and this function answered
+/// `Ok(0)` — for a 16-element Q8_0 tensor, for a 128-element Q4_K one. A caller sizing a slice
+/// from that gets an empty slice and no complaint: `deepseek2::fuse_gate_up` derives its expert
+/// row stride this way, and a narrow expert would have fused zero bytes per expert and produced a
+/// slab of the right total length made entirely of nothing.
+///
+/// Found by a GGUF *writer* checking its own inputs against this function and noticing it would
+/// accept an empty `Vec` for a 16-element Q8_0 tensor. Nothing in the reader had reason to pass a
+/// partial block, which is exactly why it went unnoticed — the truncation was only ever reachable
+/// from code that did not exist yet.
 pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
+    let blk = block_elems(ty);
+    if blk > 1 && n % blk != 0 {
+        return Err(format!("ggml type {ty} stores {blk} elements per block; {n} is not a multiple \
+                            of that, so it has no on-disk size"));
+    }
     Ok(match ty {
         F32 => n * 4,
         F16T => n * 2,
@@ -534,6 +552,19 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         F8_E4M3_B128 => n / 128 * F8_E4M3_B128_BYTES,
         other => return Err(format!("unsupported ggml type {other}")),
     })
+}
+
+/// Elements per block for a ggml type, or 1 for the unquantized ones.
+///
+/// Kept beside [`type_size`] and asserted against it, so a new format cannot add a stride to one
+/// and not the other.
+pub fn block_elems(ty: u32) -> usize {
+    match ty {
+        F32 | F16T | BF16T => 1,
+        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | IQ4_NL | MXFP4 => 32,
+        Q1_0 | Q2_0 | F8_E4M3_B128 => 128,
+        _ => 256,
+    }
 }
 
 /// Dequantize `n` elements of ggml type `ty` out of a raw byte slice.
@@ -1977,5 +2008,42 @@ mod iq_proofs {
             assert!(out[j] == want_mag * scale, "position {j} scaled by the wrong word");
             j += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod block_size_tests {
+    use super::*;
+
+    /// `block_elems` and `type_size` must agree, or a partial block slips past one of them.
+    /// Derived by probing rather than by a second hand-written table: the smallest `n` with a
+    /// non-zero size IS the block size, whatever the arms say.
+    #[test]
+    fn the_block_table_agrees_with_the_sizes() {
+        for ty in 0u32..=64 {
+            if type_size(ty, 4096).is_err() { continue }
+            let blk = block_elems(ty);
+            assert!(type_size(ty, blk).is_ok(), "type {ty}: one block of {blk} must have a size");
+            assert!(type_size(ty, blk).unwrap() > 0, "type {ty}: one block sized 0");
+            if blk > 1 {
+                assert!(type_size(ty, blk - 1).is_err(),
+                        "type {ty}: {} elements is a partial block and must be refused", blk - 1);
+            }
+        }
+    }
+
+    /// The regression itself, in the shape the writer found it: a partial block used to answer
+    /// `Ok(0)`, which sizes an empty slice and reports success.
+    #[test]
+    fn a_partial_block_is_an_error_not_zero_bytes() {
+        assert_eq!(type_size(8, 16), Err(type_size(8, 16).unwrap_err()));   // Q8_0, half a block
+        assert!(type_size(8, 16).is_err(), "16 elements of Q8_0 is half a block");
+        assert!(type_size(12, 128).is_err(), "128 elements of Q4_K is half a block");
+        assert!(type_size(43, 128).is_err(), "128 elements of STQ1_0 is half a block");
+        assert_eq!(type_size(8, 32).unwrap(), 34);
+        assert_eq!(type_size(12, 256).unwrap(), 144);
+        assert_eq!(type_size(43, 256).unwrap(), 42);
+        // Unquantized types have no block, so any count is fine.
+        assert_eq!(type_size(0, 7).unwrap(), 28);
     }
 }
