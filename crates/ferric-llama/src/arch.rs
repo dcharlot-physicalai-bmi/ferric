@@ -235,11 +235,16 @@ pub const REGISTRY: &[Arch] = &[
                   schedule, and DeepSeekMoE with a clamped SwiGLU. Components verified individually: \
                   the HC closed form and both absorption folds exactly over GF(2^61-1), the schedule \
                   by bounded model checking for every is_full pattern, STQ1_0/IQ2_XXS/IQ3_XXS by Kani \
-                  plus an interop check against Tencent's own published weights. ⛔ NO REAL \
-                  CHECKPOINT HAS BEEN LOADED: the smallest is 213.66 GiB against ~47 GB free here, so \
-                  the forward is exercised only by examples/hyv4_synthetic.rs. That proves the wiring \
-                  and cannot prove fidelity. The runtime field is a placeholder; resolve() refuses \
-                  this string because Untried is not runnable" },
+                  plus an interop check against Tencent's own published weights. REAL WEIGHTS DO \
+                  RUN, in slices: examples/hyv4_real_block.rs range-reads block 0's real attention, \
+                  and examples/hyv4_real_moe.rs runs block 1 ENTIRE -- attention and 4 of its 256 \
+                  experts -- from BOTH published builds at once, agreeing at cos 0.96671 between \
+                  IQ2_XXS/IQ3_XXS and Q4_K/Q6_K against a measured no-routed-path floor of 0.29180. \
+                  ⛔ THAT IS NOT FIDELITY: no reference implementation builds here (the full \
+                  checkpoint is 213.66 GiB against ~47 GB free), both cross-quant arms run the SAME \
+                  forward, and a wrong-but-consistent formula agrees with itself. Nothing exercises \
+                  256-way routing, a block past 1, or generation. The runtime field is a placeholder; \
+                  resolve() refuses this string because Untried is not runnable" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -363,15 +368,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hyv4_is_registered_but_refused_until_a_real_checkpoint_loads() {
+    fn hyv4_is_registered_but_refused_until_its_arithmetic_has_an_oracle() {
         let a = REGISTRY.iter().find(|a| a.name == "hyv4").expect("hyv4 must be registered");
         assert_eq!(a.status, Status::Untried);
         assert!(!a.status.runnable(), "Untried must not be runnable: a server must not serve a \
                                        model whose output nobody has seen");
         assert!(resolve("hyv4").is_err(), "resolve must refuse hyv4: {:?}", resolve("hyv4").map(|_| ()));
-        // And the note must carry the bound, so nobody reads the row as a capability claim.
-        assert!(a.note.contains("NO REAL CHECKPOINT HAS BEEN LOADED"),
-                "the row must state that no real checkpoint has been loaded");
+        // ⭐ This assertion previously demanded the note say "NO REAL CHECKPOINT HAS BEEN LOADED",
+        // and it FAILED the moment that stopped being true -- which is the guard working, not
+        // breaking. Real weights now run in slices. What still has no oracle is the arithmetic, so
+        // that is what the row must keep saying, and this is what pins it there.
+        assert!(a.note.contains("THAT IS NOT FIDELITY"),
+                "the row must still name the bound that remains: real weights running is not \
+                 evidence that the numbers are Tencent's numbers");
+        assert!(a.note.contains("hyv4_real_moe.rs") && a.note.contains("hyv4_real_block.rs"),
+                "the row must name the runs that back its real-weights claim, so the claim is \
+                 checkable rather than assertable");
     }
 
     #[test]

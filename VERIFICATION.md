@@ -64,6 +64,27 @@ builds only from `vendor/`, and u64 residues mod a Mersenne prime never overflow
 | `packed_matmul_matches_dequant_then_matmul` | packed kernel against a decoder verified on Tencent's published weights |
 | `packed_iq_matmuls_match_dequant_then_matmul` | same, IQ2_XXS and IQ3_XXS |
 | `stq1_0_interop` (example) | Ferric's decode against the *same weights published at a second quant level* — cos 0.8416, 99.3% sign agreement, with both wrong-layout controls at chance |
+| `hyv4_real_moe` (example) | Tencent's **block 1 entire** — real attention *and* real experts — run from **both published builds** and compared: IQ2_XXS/IQ3_XXS against Q4_K/Q6_K, cos **0.96671**, against a measured no-routed-path floor of 0.29180 |
+| `hyv4_real_block` (example) | block 0's real attention, hyper-connection and indexer weights, with both wrong-orientation controls |
+
+The cross-quant check is the strongest thing available without a reference implementation, and
+its shape is worth stating plainly: the two builds are the *same trained tensors* rounded by two
+quantisers into formats decoded by two different code paths, so neither arm can borrow the other's
+bug. What it therefore reaches is exactly what the builds do not share — **their formats**. A bug
+applied to both arms is invisible to it by construction (expert order reversed in the loader, the
+routed scale applied before the renormalisation rather than after); those stay with the synthetic
+golden hash.
+
+⚠ **Ordering the arms was not enough, and mutation is what showed it.** Gating on
+`real > controls` survives a broken decoder, because a shader bug moves every arm of that build
+together: three of four IQ2/IQ3 shader mutations kept the ordering while the real cosine fell to
+0.832, 0.341 and 0.686. The gate is now an absolute floor placed between the pristine 0.96671 and
+the closest mutation at 0.83199 — from the measured ladder, not chosen to pass.
+
+⚠ **And the first mutation round was aimed at dead code.** Mutating `deq_iq2_xxs`/`deq_iq3_xxs` in
+`ferric-gguf` left every cosine unchanged to five decimals: the loader sends expert slabs down the
+**packed** path, so what real weights run is the WGSL, not the CPU decoder. A row of identical
+verdicts is not a weak test — it is a test pointed at nothing.
 
 `every_group_position` exists because the older test gave every group of a row the *same* slot, so a
 kernel writing group g's lanes to group g′'s position still matched. Breaking that symmetry is what
@@ -129,9 +150,9 @@ requires. A test that cannot catch it is not weak — it is reporting the archit
 ## 6. Mutation testing — every claim above
 
 Every proof and every bound was mutation-tested; a check that cannot fail is worth nothing.
-Round tallies: **10/10, 6/6, 6/6, 6/6, 4/4 + 6/6 + 4/4, 3/3**.
+Round tallies: **10/10, 6/6, 6/6, 6/6, 4/4 + 6/6 + 4/4, 3/3, 4/4**.
 
-Two rounds of that found the checks themselves were wrong:
+Three rounds of that found the checks themselves were wrong:
 
 - **The first Kani proofs were vacuous — 1 of 4 caught.** `stride16_map_is_a_bijection` proved the
   map injective and in range; a *contiguous* map is also injective and in range. Another re-derived
@@ -144,6 +165,8 @@ Two rounds of that found the checks themselves were wrong:
   won the max** — in the tests for the feature whose point is that it competes in that max. One
   published number moved: the synthetic STQ1_0 least-squares-vs-amax ratio was **8.7×, is 6.7×**.
   Every module now has a `the_fixture_generator_is_two_signed` test, checked to fail on the old one.
+- **A whole mutation round landed on code the test never runs** — see §3. Four verdicts identical to
+  five decimal places, which reads like robustness and is the opposite.
 
 ---
 
@@ -156,9 +179,14 @@ Two rounds of that found the checks themselves were wrong:
   quant shader with no GPU, but **structure only** — never semantics.
 - **The indexer score's floating point.** ReLU is not a polynomial, so the GF(p) method does not
   reach it. Runtime tests only.
-- **Anything about running Hy4.** The smallest checkpoint is 213.66 GiB against ~47 GB free. No
-  component here has been exercised on the real weights, and there is no `hyv4` arch row for that
-  reason.
+- **That hyv4's *arithmetic* is Tencent's arithmetic.** No reference implementation builds on this
+  machine and the smallest checkpoint is 213.66 GiB against ~47 GB free, so nothing here compares
+  this forward against theirs. Both cross-quant arms run the *same* forward code; a
+  wrong-but-consistent formula agrees with itself. The formula is covered by the Kani harnesses,
+  the GF(p) identities and the synthetic golden hash — not by any real-weights run.
+- **Any block but 0 and 1, and any routing wider than 4 experts.** `hyv4_real_moe` slices 4 experts
+  of the published 256 and runs top-2. Nothing exercises 256-way routing, an expert past index 3, or
+  generation of any kind. The `hyv4` arch row stays `Untried` and `resolve` still refuses the string.
 - **The energy figures' sensitivity to input sign.** They were measured on all-negative activations
   (same defect as §6). Both arms always saw identical data, so every ratio is a valid differential —
   but whether the ratios shift on two-signed input is **unmeasured, not unchanged**.
