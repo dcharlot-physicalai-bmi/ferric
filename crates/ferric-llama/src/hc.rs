@@ -235,7 +235,26 @@ mod tests {
     /// This is a real oracle rather than a self-consistency check: the right-hand sides are computed
     /// on the host from `p` and `q` alone and never touch [`Hc::reduce`] or [`Hc::post`]. A swapped
     /// `(res + out)·q`, a `1/hc` in the reduce, a renormalised `p`, or a `q` recomputed after the
-    /// sublayer all break it while leaving every shape intact.
+    /// sublayer all break it while leaving every shape intact. The identity itself is proved exactly
+    /// over GF(2⁶¹−1) in `exact.rs`; this test is about the GPU's f32 arithmetic against it.
+    ///
+    /// ## The tolerance is DERIVED, not chosen
+    ///
+    /// This used to accept `2e-4 · max(|want|, 1)` — about 1700 ulps of room, picked to pass. The
+    /// bound now comes from counting roundings against each element's OPERAND SCALE, the quantity
+    /// forward error is actually proportional to (dividing by `|want|` instead reports tens of ulps
+    /// on a correct GPU the moment two terms cancel — see `exact.rs`):
+    ///
+    /// * state after `m` write-backs: each is `fl(H + fl(q·out))`, two roundings, each ≤ ½ ulp of
+    ///   a magnitude bounded by `S_H = |emb| + Σ_l |q_l·out_l|`, so `|err_H| ≤ m·ε·S_H`;
+    /// * the reduce: four products and three adds (≤ 3.5 ulps of `Σᵢ|pᵢHᵢ|`) on top of the
+    ///   propagated state error, so `|err_x| ≤ (m + 4)·ε·S_x` with `S_x = Σᵢ pᵢ·S_H,ᵢ`.
+    ///
+    /// The host reference is computed in f64, whose own rounding is 2²⁹ times below f32's and is
+    /// ignored. The GPU's gates are read back and used as given, so no gate error enters. A safety
+    /// factor of 2 is applied, and the worst observed/bound ratio is printed; a FLOOR on that ratio
+    /// fails the test if the bound ever becomes loose enough to do no work — the old 2e-4 would have
+    /// failed it by a factor of ten.
     #[test]
     fn closed_form_matches_the_recursion() {
         let ctx = ctx_or_skip!();
@@ -249,27 +268,42 @@ mod tests {
             assert_eq!(h0[(t * HC + i) * D + e], emb[t * D + e], "stream {i} is not a copy of emb");
         }}}
 
+        const EPS: f64 = f32::EPSILON as f64;
+        const SAFETY: f64 = 2.0;
         let mut outs: Vec<Vec<f32>> = Vec::new();   // out⁽ˡ⁾ per sublayer
         let mut qs: Vec<Vec<f32>> = Vec::new();     // q⁽ˡ⁾ per sublayer, [T, hc]
+        let (mut worst_x, mut worst_h) = (0.0f64, 0.0f64); // observed / bound
 
         for l in 0..6 {
             let g = gate(&ctx, 100 + l as u64);
             let (p, q) = hcm.gates(&h, &g);
             let (pv, qv) = (get(&p), get(&q));
             let x = get(&hcm.reduce(&h, &p));
+            let m = outs.len(); // write-backs applied so far
 
-            // x⁽ᵐ⁾ = (Σᵢ pᵢ)·emb + Σ_{l<m} ⟨p, q⁽ˡ⁾⟩·out⁽ˡ⁾
+            // x⁽ᵐ⁾ = (Σᵢ pᵢ)·emb + Σ_{l<m} ⟨p, q⁽ˡ⁾⟩·out⁽ˡ⁾, in f64, with per-element operand scale
             for t in 0..T {
-                let psum: f32 = (0..HC).map(|i| pv[t * HC + i]).sum();
+                let psum: f64 = (0..HC).map(|i| pv[t * HC + i] as f64).sum();
                 for e in 0..D {
-                    let mut want = psum * emb[t * D + e];
-                    for (o, qq) in outs.iter().zip(&qs) {
-                        let dot: f32 = (0..HC).map(|i| pv[t * HC + i] * qq[t * HC + i]).sum();
-                        want += dot * o[t * D + e];
+                    let mut want = psum * emb[t * D + e] as f64;
+                    let mut s_x = 0.0f64;                        // Σᵢ pᵢ·S_H,ᵢ
+                    for i in 0..HC {
+                        let mut s_h = (emb[t * D + e] as f64).abs();
+                        for (o, qq) in outs.iter().zip(&qs) { s_h += (qq[t * HC + i] as f64 * o[t * D + e] as f64).abs() }
+                        s_x += pv[t * HC + i] as f64 * s_h;
                     }
-                    let got = x[t * D + e];
-                    assert!((got - want).abs() <= 2e-4 * want.abs().max(1.0),
-                            "sublayer {l} token {t} elem {e}: reduce gave {got}, closed form {want}");
+                    for (o, qq) in outs.iter().zip(&qs) {
+                        let dot: f64 = (0..HC).map(|i| pv[t * HC + i] as f64 * qq[t * HC + i] as f64).sum();
+                        want += dot * o[t * D + e] as f64;
+                    }
+                    let got = x[t * D + e] as f64;
+                    let bound = SAFETY * (m as f64 + 4.0) * EPS * s_x;
+                    let err = (got - want).abs();
+                    assert!(err <= bound,
+                            "sublayer {l} token {t} elem {e}: reduce gave {got}, closed form {want}, \
+                             error {err:.3e} exceeds derived bound {bound:.3e} ({:.1} ulps of the operand scale)",
+                            err / (EPS * s_x));
+                    if bound > 0.0 { worst_x = worst_x.max(err / bound) }
                 }
             }
 
@@ -278,17 +312,33 @@ mod tests {
             h = hcm.post(&out_t, &h, &q);
             outs.push(out);
             qs.push(qv);
+            let m = outs.len();
 
             // H⁽ᵐ⁾ᵢ = emb + Σ_{l≤m} q⁽ˡ⁾ᵢ·out⁽ˡ⁾
             let hv = get(&h);
             for t in 0..T { for i in 0..HC { for e in 0..D {
-                let mut want = emb[t * D + e];
-                for (o, qq) in outs.iter().zip(&qs) { want += qq[t * HC + i] * o[t * D + e] }
-                let got = hv[(t * HC + i) * D + e];
-                assert!((got - want).abs() <= 2e-4 * want.abs().max(1.0),
-                        "after sublayer {l}, stream {i} token {t} elem {e}: {got} vs {want}");
+                let mut want = emb[t * D + e] as f64;
+                let mut s_h = (emb[t * D + e] as f64).abs();
+                for (o, qq) in outs.iter().zip(&qs) {
+                    let term = qq[t * HC + i] as f64 * o[t * D + e] as f64;
+                    want += term; s_h += term.abs();
+                }
+                let got = hv[(t * HC + i) * D + e] as f64;
+                let bound = SAFETY * (m as f64) * EPS * s_h;
+                let err = (got - want).abs();
+                assert!(err <= bound,
+                        "after sublayer {l}, stream {i} token {t} elem {e}: {got} vs {want}, \
+                         error {err:.3e} exceeds derived bound {bound:.3e} ({:.1} ulps of the operand scale)",
+                        err / (EPS * s_h));
+                if bound > 0.0 { worst_h = worst_h.max(err / bound) }
             }}}
         }
+        eprintln!("hc closed form vs GPU over 6 sublayers: worst observed/bound  reduce {worst_x:.3}  state {worst_h:.3}");
+        // Guard the guard. If the bound were loose enough that the observed error never came within
+        // 1% of it, the assertion above would be decorative. The old 2e-4 lands near 6e-4 here.
+        assert!(worst_x > 0.01 && worst_h > 0.01,
+                "derived bound is >100x looser than observed ({worst_x:.4}, {worst_h:.4}); it is not doing work");
+        assert!(worst_x > 0.0 && worst_h > 0.0, "zero error is not plausible for f32; the comparison is vacuous");
     }
 
     /// After exactly ONE sublayer every stream has moved by a scalar multiple of the same vector,
