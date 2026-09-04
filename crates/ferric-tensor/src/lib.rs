@@ -1728,9 +1728,16 @@ pub(crate) fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
 }
 
 // Compile each WGSL kernel's pipeline ONCE and reuse it — recompiling every dispatch (as before)
-// dominated runtime for real workloads. Keyed by the kernel's &'static str address (stable per
-// kernel); assumes one device per thread, which holds for all Ferric usage. Every SOTA runtime
-// caches compiled kernels; this is the single biggest per-op overhead removed.
+// dominated runtime for real workloads. Every SOTA runtime caches compiled kernels; this is the
+// single biggest per-op overhead removed.
+//
+// ⚠ This comment used to say the key was "the kernel's &'static str address (stable per kernel);
+// assumes one device per thread". BOTH halves are stale and the first one is dangerous: read
+// literally it says a heap-allocated shader string is unsafe to pass, because a freed String's
+// address can be reused and hand back a pipeline built from different WGSL. `pipeline_for` in fact
+// keys on `(device pointer, CONTENT HASH of the wgsl)`, so a generated `String` is fine and
+// multiple devices on one thread are fine. A stale comment about a cache key reads exactly like a
+// live hazard — this one cost a wrong bug report before anyone read the function it describes.
 thread_local! {
     // Pipeline AND its bind-group layout. The layout is cached because `get_bind_group_layout` is
     // not a getter on every backend: on WebGPU it materialises a fresh JS object per call, and

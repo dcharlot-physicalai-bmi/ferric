@@ -236,7 +236,16 @@ Three rounds of that found the checks themselves were wrong:
     resource alive, and **debug-only**, so it fires in CI and never in a release build. Fixed in
     `forks/wgpu-core/src/snatch.rs` with `try_with`: a destructor must not panic. Mutation-tested —
     forcing the guarded body to panic aborts a normal run, so the recursion check still executes.
-  ⭐ Final state: **0 of 42 failing, constrained and unconstrained.**
+  ⭐ **Confirmed on the real fabric, not inferred from the local sweep** — run 33927133667 on
+  `3b049d6` is the first fully green CI run: software GPU ✓, real Metal ✓, proofs ✓. 58 examples
+  executed on llvmpipe; `bandwidth` clamped and said so (3.9 GB/s scalar, 5.3 vec4 — against 292 on
+  Metal, which is what a CPU rasterizer should look like); `flash` took the constrained path at
+  nh=2 and nh=1; `bench` chose n=4/1/1/1; and Q4_K/Q5_K/Q6_K validated exact
+  (max|Δ|/scale ≈ 1e-6) **for the first time ever in CI**. The validation step went 7054 s → 968 s
+  → 1218 s and now passes; `Test workspace` is 575 s.
+  ⚠ The local sweep clamped Metal's limit — it could not cover anything depending on llvmpipe's
+  *behaviour* rather than its reported limits. The `LockTrace` abort in particular was only ever
+  reproduced on Metal. That gap is what this CI run closed.
 
 ---
 
