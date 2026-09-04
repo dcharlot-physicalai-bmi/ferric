@@ -5,10 +5,10 @@ fn q5k_block(seed:u32)->Vec<u8>{let mut b=vec![0u8;176];
  b[0..2].copy_from_slice(&f16::from_f32(0.05+0.01*((seed%7)as f32)).to_le_bytes());
  b[2..4].copy_from_slice(&f16::from_f32(0.02+0.005*((seed%5)as f32)).to_le_bytes());
  let sc=|j:u32|((seed.wrapping_mul(2654435761).wrapping_add(j*40503))%64)as u8;
- let mn=|j:u32|((seed.wrapping_mul(40503).wrapping_add(j*2654435761))%64)as u8;
+ let mn=|j:u32|((seed.wrapping_mul(40503).wrapping_add(j.wrapping_mul(2654435761)))%64)as u8;
  for j in 0..8u32{if j<4{b[4+j as usize]|=sc(j)&63;b[4+(j+4)as usize]|=mn(j)&63;}
   else{let(a,m)=(sc(j),mn(j));b[4+(j+4)as usize]|=(a&0x0F)|((m&0x0F)<<4);b[4+(j-4)as usize]|=(a>>4)<<6;b[4+j as usize]|=(m>>4)<<6;}}
- for i in 0..32u32{b[16+i as usize]=((seed.wrapping_add(i*2246822519))%256)as u8;}
+ for i in 0..32u32{b[16+i as usize]=((seed.wrapping_add(i.wrapping_mul(2246822519)))%256)as u8;}
  for i in 0..128u32{b[48+i as usize]=((seed.wrapping_mul(97).wrapping_add(i*40503))%256)as u8;} b}
 fn main(){pollster::block_on(run());}
 async fn run(){let ctx=Arc::new(Context::new().await.unwrap());

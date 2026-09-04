@@ -2,7 +2,7 @@
 use ferric_core::Context; use ferric_gguf::deq_raw; use ferric_tensor::{Q6_KWeights, Tensor};
 use std::sync::Arc; use std::time::Instant; use half::f16;
 fn q6k_block(seed:u32)->Vec<u8>{let mut b=vec![0u8;210];
- for i in 0..128u32{b[i as usize]=((seed.wrapping_add(i*2246822519))%256)as u8;}
+ for i in 0..128u32{b[i as usize]=((seed.wrapping_add(i.wrapping_mul(2246822519)))%256)as u8;}
  for i in 0..64u32{b[128+i as usize]=((seed.wrapping_mul(40503).wrapping_add(i*97))%256)as u8;}
  for i in 0..16u32{b[192+i as usize]=(((seed.wrapping_add(i*7))%64)as i32-32)as i8 as u8;}
  b[208..210].copy_from_slice(&f16::from_f32(0.04+0.01*((seed%6)as f32)).to_le_bytes()); b}

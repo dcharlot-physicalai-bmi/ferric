@@ -43,7 +43,7 @@ fn mppi(mdl: &Dyn, horizon: usize, steps: usize, dt: f32) -> (f32, bool) {
         for i in 0..n {
             let (mut sh, mut so) = (th, om); let mut cst = 0.0f32;
             for h in 0..horizon {
-                let e = sigma * nrm(h32(t as u32 * 2654435761 ^ (i as u32) << 8 ^ h as u32));
+                let e = sigma * nrm(h32((t as u32).wrapping_mul(2654435761) ^ (i as u32) << 8 ^ h as u32));
                 eps[i][h] = e; let a = (nom[h] + e).clamp(-UMAX, UMAX);
                 let (nth, nom_) = mdl.step(sh, so, a, dt); sh = nth; so = nom_;
                 cst += wrap(sh - PI).powi(2) + 0.05 * so * so + 0.02 * a * a;

@@ -6,16 +6,10 @@ fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.02 + s).sin
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
-    // ⭐ TEST HOOK, and it is not optional discipline: the constrained branch below is taken only on
-    // devices whose `max_storage_buffer_binding_size` is small (lavapipe and the WebGPU baseline
-    // report 128 MiB; Metal reports far more). Without a way to force it, that branch would ship
-    // having never executed anywhere its author could see — which is how the panic it replaces got
-    // shipped in the first place. Run `FERRIC_MAX_BINDING=134217728 cargo run --example flash` to
-    // take the small-device path on any machine.
-    let max_binding = match std::env::var("FERRIC_MAX_BINDING").ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(v) => { println!("(FERRIC_MAX_BINDING={v} — forcing the constrained path)"); v }
-        None => ctx.max_binding,
-    };
+    // The constrained branch below is taken only where `max_storage_buffer_binding_size` is small
+    // (lavapipe and the WebGPU baseline: 128 MiB; Metal: far more). `FERRIC_MAX_BINDING` in
+    // ferric-core forces that on any device, so this path is reachable here and not only in CI —
+    // which is how the panic it replaces got shipped.
     let mut ok = true;
     // T=3000 and 5000 cross the 2048-key chunk boundary — validates the online-softmax combination.
     for (t, nh, nkv, dh) in [(64usize,16usize,8usize,128usize),(512,16,8,128),(1024,16,16,64),(3000,8,8,64),(5000,4,4,64)] {
@@ -35,13 +29,13 @@ async fn run() {
         let g = nh / nkv;                       // GQA group size; nh_fit must stay a multiple of it
         let per_head = (t * t * 4) as u64;
         let nh_fit = (1..=nh).rev().find(|c| c % g == 0 && nh % c == 0
-                                             && (*c as u64) * per_head <= max_binding);
+                                             && (*c as u64) * per_head <= ctx.max_binding);
         let (qc, kc, vc, nhc, nkvc) = match nh_fit {
             Some(c) if c < nh => {
                 let (d2, kd2) = (c * dh, (c / g) * dh);
                 println!("   ↳ T={t} nh={nh}: composed needs {:.0}MB of scores > this device's {:.0}MB \
                           binding limit; comparing at nh={c} instead, then running flash at nh={nh}",
-                         (nh as u64 * per_head) as f64 / 1e6, max_binding as f64 / 1e6);
+                         (nh as u64 * per_head) as f64 / 1e6, ctx.max_binding as f64 / 1e6);
                 (Tensor::from_vec(&ctx, &seq(t * d2, 1.0), &[t, d2]),
                  Tensor::from_vec(&ctx, &seq(t * kd2, 2.0), &[t, kd2]),
                  Tensor::from_vec(&ctx, &seq(t * kd2, 3.0), &[t, kd2]), c, c / g)
@@ -49,7 +43,7 @@ async fn run() {
             Some(_) => (q.clone(), k.clone(), v.clone(), nh, nkv),
             None => {
                 println!("❌ T={t} nh={nh}: not even ONE head's scores ({:.0}MB) fit the {:.0}MB limit", 
-                         per_head as f64 / 1e6, max_binding as f64 / 1e6);
+                         per_head as f64 / 1e6, ctx.max_binding as f64 / 1e6);
                 ok = false; continue;
             }
         };

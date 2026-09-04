@@ -126,29 +126,47 @@ mod trace {
     }
 
     impl LockTrace {
+        // ⛔ `try_with`, NOT `take`/`set`: THIS RUNS FROM DESTRUCTORS AND A PANIC THERE ABORTS.
+        // `LocalKey::take`/`set` panic once the thread-local has been destroyed. Dropping any wgpu
+        // resource reaches `Buffer::unmap` -> `SnatchLock::read` -> here, and resources routinely
+        // outlive this TLS: Ferric caches `wgpu::Buffer` in its own `thread_local!` (INFOBUFS,
+        // UNIBUFS), and the destruction ORDER between two crates' thread-locals is unspecified. When
+        // this one goes first, the panic lands inside a `Drop`, which is a `fatal runtime error:
+        // thread local panicked on drop` and an ABORT — after the program has printed its complete,
+        // correct output. `examples/bandwidth` did exactly that in CI: exit 134 with every number
+        // right. It is latent in ANY program exiting with a cached wgpu resource still alive, and
+        // it is debug-only, because this whole module is `cfg(debug_assertions)` — so it fires in CI
+        // and never in a release build anyone benchmarks.
+        //
+        // The recursion check is a debug aid. Skipping it when the TLS is already gone costs a
+        // diagnostic that could not have fired anyway; panicking costs the entire run.
         #[track_caller]
         pub(super) fn enter(purpose: &'static str) {
-            let new = LockTrace {
-                purpose,
-                caller: Location::caller(),
-                backtrace: Backtrace::capture(),
-            };
+            let caller = Location::caller();
+            let _ = SNATCH_LOCK_TRACE.try_with(|slot| {
+                let new = LockTrace {
+                    purpose,
+                    caller,
+                    backtrace: Backtrace::capture(),
+                };
 
-            if let Some(prev) = SNATCH_LOCK_TRACE.take() {
-                let current = thread::current();
-                let name = current.name().unwrap_or("<unnamed>");
-                panic!(
-                    "thread '{name}' attempted to acquire a snatch lock recursively.\n\
-                 - Currently trying to acquire {new}\n\
-                 - Previously acquired {prev}",
-                );
-            } else {
-                SNATCH_LOCK_TRACE.set(Some(new));
-            }
+                if let Some(prev) = slot.take() {
+                    let current = thread::current();
+                    let name = current.name().unwrap_or("<unnamed>");
+                    panic!(
+                        "thread '{name}' attempted to acquire a snatch lock recursively.\n\
+                     - Currently trying to acquire {new}\n\
+                     - Previously acquired {prev}",
+                    );
+                } else {
+                    slot.set(Some(new));
+                }
+            });
         }
 
         pub(super) fn exit() {
-            SNATCH_LOCK_TRACE.take();
+            // Same reason as `enter`: reached from `Drop`, so it must not panic on a dead TLS.
+            let _ = SNATCH_LOCK_TRACE.try_with(|slot| slot.take());
         }
     }
 

@@ -213,8 +213,30 @@ Three rounds of that found the checks themselves were wrong:
     iteration against a wall-clock budget, and the sample count is **printed** (`n=30` … `n=1`), so
     a one-sample figure cannot be mistaken for a thirty-sample one. The equality check is untouched.
   ⚠ The constrained flash branch would otherwise have shipped never having executed on any machine
-  its author could see — the same trap that put the panic there. `FERRIC_MAX_BINDING` forces it on
-  any device; run at lavapipe's exact 134217728 it takes the small path and still proves equality.
+  its author could see — the same trap that put the panic there. **`FERRIC_MAX_BINDING` now lives in
+  `ferric-core`**, clamping `max_storage_buffer_binding_size` in `required_limits` so *any* code path
+  meets the constrained fabric locally. Clamping that one limit isolates the variable exactly, rather
+  than swapping in a downlevel profile that would move unrelated ones.
+- **Fixing these one CI round-trip at a time was the wrong loop.** With the hook, one local sweep of
+  all **42** example commands the Linux job runs found every remaining failure at once — seven, of
+  which only one was the binding limit:
+  - `bandwidth` asked for a 512 MiB binding. Its premise is *"buffer >> last-level cache"*, not the
+    literal 512 MiB, so it now clamps to what the device will bind **and says so** — a bandwidth
+    figure from a smaller buffer is a different measurement and must not print as the same one.
+  - `q4_k` `q5_k` `q6_k` `coop_q4_k` `coop_q5_k` `coop_q6_k` failed **identically with and without the
+    clamp** — the control mattered — on `attempt to multiply with overflow`: an unwrapped
+    `j * 2654435761` inside a seeded hash whose every other operation is `wrapping_*`. Release
+    already wrapped, so `wrapping_mul` changes no value; it makes **debug agree with release**, and
+    debug is what CI runs. 17 sites across 9 files. These had never run in CI anywhere.
+  - `bandwidth` then aborted at **exit 134 after printing correct output**: dropping a `wgpu::Buffer`
+    reaches `SnatchLock::read` → `LockTrace::enter`, which calls `LocalKey::take`/`set` on
+    wgpu-core's own thread-local — and those **panic once it is destroyed**. Ferric caches
+    `wgpu::Buffer` in its own `thread_local!`, destruction order between two crates' TLS is
+    unspecified, and a panic in a `Drop` aborts. Latent in *any* program exiting with a cached wgpu
+    resource alive, and **debug-only**, so it fires in CI and never in a release build. Fixed in
+    `forks/wgpu-core/src/snatch.rs` with `try_with`: a destructor must not panic. Mutation-tested —
+    forcing the guarded body to panic aborts a normal run, so the recursion check still executes.
+  ⭐ Final state: **0 of 42 failing, constrained and unconstrained.**
 
 ---
 

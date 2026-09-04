@@ -18,7 +18,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
     b.extend_from_slice(&f16::from_f32(dmin).to_le_bytes());
     // 12 scale bytes: 8 six-bit (scale,min) pairs, packed exactly as llama.cpp expects.
     let sc = |j: u32| ((seed.wrapping_mul(2654435761).wrapping_add(j * 40503)) % 64) as u8; // 0..63
-    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j * 2654435761)) % 64) as u8;
+    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j.wrapping_mul(2654435761))) % 64) as u8;
     let mut s = [0u8; 12];
     for j in 0..8u32 {
         if j < 4 {
@@ -32,7 +32,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
         }
     }
     b.extend_from_slice(&s);
-    for i in 0..128u32 { b.push((((seed.wrapping_add(i * 2246822519)) % 256) as u8) & 0xff); } // 128 quant bytes
+    for i in 0..128u32 { b.push((((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8) & 0xff); } // 128 quant bytes
     b
 }
 

@@ -14,7 +14,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
     b.extend_from_slice(&f16::from_f32(d).to_le_bytes());
     b.extend_from_slice(&f16::from_f32(dmin).to_le_bytes());
     let sc = |j: u32| ((seed.wrapping_mul(2654435761).wrapping_add(j * 40503)) % 64) as u8;
-    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j * 2654435761)) % 64) as u8;
+    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j.wrapping_mul(2654435761))) % 64) as u8;
     let mut s = [0u8; 12];
     for j in 0..8u32 {
         if j < 4 { s[j as usize] |= sc(j) & 63; s[(j + 4) as usize] |= mn(j) & 63; }
@@ -26,7 +26,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
         }
     }
     b.extend_from_slice(&s);
-    for i in 0..128u32 { b.push((((seed.wrapping_add(i * 2246822519)) % 256) as u8) & 0xff); }
+    for i in 0..128u32 { b.push((((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8) & 0xff); }
     b
 }
 fn q5k_block(seed: u32) -> Vec<u8> {
@@ -34,7 +34,7 @@ fn q5k_block(seed: u32) -> Vec<u8> {
     b[0..2].copy_from_slice(&f16::from_f32(0.05 + 0.01 * ((seed % 7) as f32)).to_le_bytes());
     b[2..4].copy_from_slice(&f16::from_f32(0.02 + 0.005 * ((seed % 5) as f32)).to_le_bytes());
     let sc = |j: u32| ((seed.wrapping_mul(2654435761).wrapping_add(j * 40503)) % 64) as u8;
-    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j * 2654435761)) % 64) as u8;
+    let mn = |j: u32| ((seed.wrapping_mul(40503).wrapping_add(j.wrapping_mul(2654435761))) % 64) as u8;
     for j in 0..8u32 {
         if j < 4 { b[4 + j as usize] |= sc(j) & 63; b[4 + (j + 4) as usize] |= mn(j) & 63; }
         else {
@@ -44,13 +44,13 @@ fn q5k_block(seed: u32) -> Vec<u8> {
             b[4 + j as usize] |= (mnv >> 4) << 6;
         }
     }
-    for i in 0..32u32 { b[16 + i as usize] = ((seed.wrapping_add(i * 2246822519)) % 256) as u8; }
+    for i in 0..32u32 { b[16 + i as usize] = ((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8; }
     for i in 0..128u32 { b[48 + i as usize] = ((seed.wrapping_mul(97).wrapping_add(i * 40503)) % 256) as u8; }
     b
 }
 fn q6k_block(seed: u32) -> Vec<u8> {
     let mut b = vec![0u8; 210];
-    for i in 0..128u32 { b[i as usize] = ((seed.wrapping_add(i * 2246822519)) % 256) as u8; }
+    for i in 0..128u32 { b[i as usize] = ((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8; }
     for i in 0..64u32 { b[128 + i as usize] = ((seed.wrapping_mul(40503).wrapping_add(i * 97)) % 256) as u8; }
     for i in 0..16u32 { b[192 + i as usize] = (((seed.wrapping_add(i * 7)) % 64) as i32 - 32) as i8 as u8; }
     b[208..210].copy_from_slice(&f16::from_f32(0.04 + 0.01 * ((seed % 6) as f32)).to_le_bytes());

@@ -122,7 +122,22 @@ impl Context {
         let subgroups = af.contains(wgpu::Features::SUBGROUP);
         let coop_matrix = af.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
         let shader_f16 = af.contains(wgpu::Features::SHADER_F16);
-        let max_binding = adapter.limits().max_storage_buffer_binding_size as u64;
+        // ⭐ FERRIC_MAX_BINDING reproduces a CONSTRAINED FABRIC ON ANY MACHINE.
+        // Native asks for `adapter.limits()` below so big models get big buffers. The cost of that
+        // is invisible and it bit hard: nothing on a developer's Metal box fails when a path
+        // outgrows the 134,217,728-byte (128 MiB) `max_storage_buffer_binding_size` that lavapipe
+        // AND the WebGPU baseline enforce — and "run everywhere, browser first" makes that the
+        // target which must pass FIRST. `examples/flash.rs` sized a 288,000,000-byte score buffer,
+        // ran green on every machine anyone here owns, and panicked the first time CI executed it
+        // on a software rasterizer. Clamping only this one limit isolates the variable exactly,
+        // rather than swapping in a whole downlevel profile that would also change unrelated ones.
+        //     FERRIC_MAX_BINDING=134217728 cargo run -p ferric-tensor --example flash
+        let requested = std::env::var("FERRIC_MAX_BINDING").ok().and_then(|v| v.parse::<u64>().ok());
+        let mut limits = adapter.limits();
+        if let Some(cap) = requested {
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.min(cap);
+        }
+        let max_binding = limits.max_storage_buffer_binding_size as u64;
         let mut want = wgpu::Features::empty();
         if subgroups { want |= wgpu::Features::SUBGROUP; }
         if coop_matrix { want |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX; }
@@ -140,7 +155,9 @@ impl Context {
                 required_features: want,
                 // request the adapter's real limits: native gets big buffers (big models); in a
                 // browser this resolves to the WebGPU baseline, so cross-fabric portability holds.
-                required_limits: adapter.limits(),
+                // `limits` is that, with FERRIC_MAX_BINDING optionally clamping the binding size so
+                // the constrained fabric can be reproduced here — see above.
+                required_limits: limits,
                 experimental_features: experimental,
                 memory_hints: wgpu::MemoryHints::Performance,
                 ..Default::default()

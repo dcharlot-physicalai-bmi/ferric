@@ -17,8 +17,20 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     println!("Ferric · WGSL compute read-bandwidth probe (cold, buffer >> cache)\n");
+    // ⛔ The premise here is "buffer >> last-level cache", NOT the literal 512 MiB — and asking for
+    // 512 MiB as a single storage binding panicked in `Device::create_bind_group` the first time CI
+    // ran this on Linux: lavapipe and the WebGPU baseline cap a binding at 128 MiB. Clamp to what
+    // the device will actually bind and SAY SO, because a bandwidth number measured on a smaller
+    // buffer is a different measurement and must not be reported as if it were the same one.
+    let want_mb = 512usize;
+    let bytes = ((ctx.max_binding as usize) & !0xFFF).min(want_mb << 20);
+    if bytes < want_mb << 20 {
+        println!("  (this device binds at most {} MiB of storage; probing there rather than {want_mb} MiB.\n\
+                   Still far beyond any last-level cache, so the cold-DRAM-stream premise holds.)\n",
+                 bytes >> 20);
+    }
     println!("  {:<26} {:>10} {:>11} {:>12}", "variant", "bytes", "time", "GB/s");
-    for mb in [512usize] {
+    for mb in [bytes >> 20] {
         for (name, per_thread) in [("scalar u32, wg64", 1u32), ("vec4<u32>, wg64", 4),
                                     ("scalar u32, wg128", 128), ("scalar u32, wg256", 256),
                                     ("scalar u32, wg512", 512), ("scalar u32, wg1024", 1024)] {

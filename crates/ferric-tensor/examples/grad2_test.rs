@@ -64,5 +64,5 @@ async fn run() {
         if last < first * 0.2 { "✅ 2nd-order training works" } else { "⚠ did not converge" });
 }
 
-fn randn(n: usize, s: u32) -> Vec<f32> { (0..n).map(|i| { let a = ((i as u32 * 2654435761 ^ s) % 9973 + 1) as f32 / 9973.0; let b = ((i as u32 * 40503 ^ s) % 9973 + 1) as f32 / 9973.0; ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * 0.4 }).collect() }
+fn randn(n: usize, s: u32) -> Vec<f32> { (0..n).map(|i| { let a = (((i as u32).wrapping_mul(2654435761) ^ s) % 9973 + 1) as f32 / 9973.0; let b = ((i as u32 * 40503 ^ s) % 9973 + 1) as f32 / 9973.0; ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * 0.4 }).collect() }
 fn rnd(v: &[f32]) -> Vec<f32> { v.iter().map(|x| (x * 100.0).round() / 100.0).collect() }
