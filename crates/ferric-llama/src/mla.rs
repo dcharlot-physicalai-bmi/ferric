@@ -555,6 +555,94 @@ mod absorbed_tests {
         assert!(worst < 2e-5 * scale.max(1.0), "absorbed path diverges from fused by {worst}");
     }
 
+    /// **How much score error does this attention amplify into its output? Measured, not assumed.**
+    ///
+    /// `absorbed_and_fused_agree` gates at 2e-5, which is empirical. Deriving a rigorous bound the
+    /// way `hc.rs` does is not straightforward here: the two paths differ *before* a softmax, and a
+    /// softmax's response to score error is a perturbation bound, not a rounding count. Composing
+    /// worst cases through it — a `γ_n` on each dot, then a `2·max|δ|` relative bound on every
+    /// probability, then another `γ_n` on the output — lands far above the observed error, so
+    /// asserting it would be decorative and would say nothing the gate does not already say.
+    ///
+    /// What is worth having instead is the middle term as a MEASUREMENT: the amplification factor
+    /// `A = |Δout| / |Δscore|` at this operating point. It is a real property of the attention, it
+    /// is what any port needs in order to know how much score error it may spend, and it converts
+    /// the empirical gate into a statement with a mechanism behind it — the two paths' scores differ
+    /// by `δ`, the attention multiplies that by `A`, and `A·δ` must account for what is observed.
+    ///
+    /// The perturbation is applied to the latent, which feeds the scores in BOTH arms, and the
+    /// response is measured on the real forward. A is reported over several perturbation sizes; if
+    /// it is not roughly constant across them, the response is not linear and the number would be
+    /// meaningless, so that is asserted rather than assumed.
+    #[test]
+    fn the_attention_amplifies_score_error_by_a_measured_factor() {
+        let ctx = ctx_or_skip!();
+        let c = cfg();
+        let kv_b = rnd(&ctx, &[H * (NOPE + VH), KVL], 45);
+        let (hs, cos, sin) = (rnd(&ctx, &[T, HID], 46), rnd(&ctx, &[T, ROPE], 47), rnd(&ctx, &[T, ROPE], 48));
+        let base_w = weights(&ctx, KvUp::Fused(kv_b.clone()), None);
+        let base = pollster::block_on(Mla::new(c, base_w).forward(&hs, &cos, &sin).to_vec());
+        let base_mag = base.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+        // Perturb the KV projection by a known relative amount: it moves the latent, hence every
+        // score, by that fraction. Larger than f32 rounding on purpose — the point is to measure
+        // the response slope where it is cleanly resolvable, then read A off it.
+        let kv_a = pollster::block_on(rnd(&ctx, &[KVL + ROPE, HID], 2).to_vec());
+        let mut amps = Vec::new();
+        for &rel in &[1e-4f32, 1e-3, 1e-2] {
+            let bumped: Vec<f32> = kv_a.iter().map(|v| v * (1.0 + rel)).collect();
+            let mut w = weights(&ctx, KvUp::Fused(kv_b.clone()), None);
+            w.kv_a_proj_with_mqa = Tensor::from_vec(&ctx, &bumped, &[KVL + ROPE, HID]);
+            let out = pollster::block_on(Mla::new(c, w).forward(&hs, &cos, &sin).to_vec());
+            let d_out = base.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            amps.push((rel, d_out / base_mag / rel)); // relative-out per relative-in
+        }
+        for (rel, a) in &amps { eprintln!("  perturbation {rel:.0e} -> amplification {a:.3}") }
+
+        let (lo, hi) = amps.iter().fold((f32::MAX, f32::MIN), |(l, h), (_, a)| (l.min(*a), h.max(*a)));
+        assert!(hi / lo < 3.0, "amplification is not roughly constant across perturbation sizes \
+                                ({lo:.3}..{hi:.3}); the response is not linear and A is meaningless");
+        assert!(hi > 1e-3, "amplification is ~0; the perturbation does not reach the output and this \
+                            measures nothing");
+
+        // ⛔ A ≈ 0.002: this attention ATTENUATES score error by roughly 500x. That single number
+        // corrects the model I started with. The two paths differ in two places, not one:
+        //
+        //   the KEY fold, before the softmax   q·(W_K c) vs (W_Kᵀ q)·c   -- attenuated by A
+        //   the VALUE fold, AFTER it           Σ_j P_j(W_V c_j) vs W_V(Σ_j P_j c_j)  -- NOT attenuated
+        //
+        // and the first version of this test charged only the first. It failed, correctly: the
+        // observed difference is about 5x what the score term alone accounts for. The softmax
+        // suppresses score error so hard that the difference is dominated by the value fold, which
+        // sits downstream of it and is multiplied by nothing.
+        //
+        // That is the useful architectural statement, and it is the opposite of the intuition that
+        // sent me here: a port of absorbed MLA should spend its precision on the VALUE contraction,
+        // not the score one.
+        let absorbed = Mla::new(c, weights(&ctx, KvUp::absorb(&ctx, &kv_b, &c), None));
+        let b = pollster::block_on(absorbed.forward(&hs, &cos, &sin).to_vec());
+        let observed = base.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / base_mag;
+
+        let score_ulps = 8.0 * (KVL + NOPE) as f32;          // the dots the two paths take differently
+        let from_scores = hi * score_ulps * f32::EPSILON;    // attenuated by the measured A
+        let value_ulps = (T + KVL + VH) as f32;              // the reorderings of the value contraction
+        let from_values = value_ulps * f32::EPSILON;         // downstream of the softmax: A does not apply
+        let explained = from_scores + from_values;
+        eprintln!("absorbed vs fused: observed {observed:.3e} relative");
+        eprintln!("  from scores  A={hi:.4} x {score_ulps:.0} ulps = {from_scores:.3e}  ({:.0}% of the total)",
+                  100.0 * from_scores / explained);
+        eprintln!("  from values  {value_ulps:.0} ulps, unattenuated = {from_values:.3e}  ({:.0}%)",
+                  100.0 * from_values / explained);
+        assert!(observed <= explained,
+                "the two paths differ by {observed:.3e}, more than the score term ({from_scores:.3e}) \
+                 plus the value term ({from_values:.3e}) accounts for");
+        // And the split must be the one claimed: if the score term dominated, the sentence above
+        // about where to spend precision would be wrong.
+        assert!(from_values > from_scores,
+                "the value term no longer dominates ({from_values:.3e} vs {from_scores:.3e}); the \
+                 conclusion in this comment is stale");
+    }
+
     /// The same equivalence must survive a sink, since the sink changes the softmax that sits between
     /// the two folds. If absorption were only valid for a normalised softmax this would catch it.
     #[test]
