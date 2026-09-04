@@ -58,13 +58,36 @@ pub enum Pre {
     Gpt2,
     /// Qwen2/Qwen3, and anything else declaring `qwen2`.
     Qwen2,
+    /// Tencent Hy4 (`hyv4`), and the deepseek3-llm / hunyuan-dense family it shares a regex with.
+    ///
+    /// Structurally unlike the other two: **no digit rule and no contraction rule**. Its six
+    /// alternatives, leftmost-first:
+    ///
+    /// ```text
+    /// [ASCII punct][A-Za-z]+          <- one chunk: `.cfg` and `-Reyes` stay whole
+    /// [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+    ///  ?[\p{P}\p{S}]+[\r\n]*
+    /// \s*[\r\n]+
+    /// \s+(?!\S)
+    /// \s+
+    /// ```
+    ///
+    /// The first alternative is the distinctive one and it is why this cannot be approximated by
+    /// GPT-2: leading punctuation binds to the letters after it, so `foo.bar` is `foo` + `.bar`
+    /// where GPT-2 gives `foo` + `.` + `bar`, and the merges reachable inside those chunks differ.
+    Hyv4,
 }
 
 impl Pre {
     /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
     /// tree did unconditionally before this existed.
     pub fn from_gguf(pre: Option<&str>) -> Pre {
-        match pre { Some("qwen2") => Pre::Qwen2, _ => Pre::Gpt2 }
+        match pre {
+            Some("qwen2") => Pre::Qwen2,
+            // llama.cpp maps deepseek3-llm and hunyuan-dense to the identical regex string.
+            Some("hyv4") | Some("deepseek3-llm") | Some("hunyuan-dense") => Pre::Hyv4,
+            _ => Pre::Gpt2,
+        }
     }
 }
 
@@ -238,7 +261,112 @@ impl Spm {
 /// runs (last space joins the next word), punctuation runs, digits individual.
 fn pretokenize(text: &str) -> Vec<String> { pretokenize_with(text, Pre::Gpt2) }
 
+/// The `hyv4` / deepseek3-llm / hunyuan-dense splitter: six alternatives, leftmost-first.
+///
+/// ⚠ **`\p{P}` and `\p{S}` are approximated together** as "not whitespace, not alphabetic, not
+/// numeric". The regex only ever uses them as the union `[\p{P}\p{S}]`, so merging them is exact
+/// for that class; what the approximation costs is that a numeric-category character which is
+/// really punctuation (or vice versa) lands on the wrong side. Rust's `char` exposes no Unicode
+/// general category and this crate takes no new dependency, so the alternative is a table of
+/// several thousand ranges for a distinction the regex never draws.
+///
+/// ⛔ **Not verified against llama.cpp's output.** Their splitter is hand-coded precisely because
+/// `std::regex` mis-splits runs like `",~"`, and their fork is not built here. The tests below
+/// check the properties the regex states, not agreement with a reference — a different claim, and
+/// the weaker one.
+/// Whether any of the six alternatives matches starting exactly at `j`. Used only to find the end
+/// of an unmatched run, so it mirrors the conditions above rather than re-deriving them.
+fn matched_here(cs: &[char], j: usize) -> bool {
+    let n = cs.len();
+    if j >= n { return true }
+    let c = cs[j];
+    let is_l = |c: char| c.is_alphabetic();
+    let is_ps = |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric();
+    if c.is_whitespace() || is_ps(c) || is_l(c) { return true }
+    // a lead char followed by a letter still matches alternative 2
+    j + 1 < n && is_l(cs[j + 1]) && c != '\r' && c != '\n'
+}
+
+fn pretokenize_hyv4(text: &str) -> Vec<String> {
+    const CR: char = '\r';
+    const LF: char = '\n';
+    let cs: Vec<char> = text.chars().collect();
+    let n = cs.len();
+    let is_l = |c: char| c.is_alphabetic();
+    let is_m = |c: char| c.is_alphabetic() && !c.is_uppercase() && !c.is_lowercase(); // combining-ish
+    let is_ps = |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric();
+    let is_ascii_punct = |c: char| c.is_ascii_punctuation();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = cs[i];
+        let take = |a: usize, b: usize| -> String { cs[a..b].iter().collect() };
+
+        // 1. [ASCII punct][A-Za-z]+
+        if is_ascii_punct(c) && i + 1 < n && cs[i + 1].is_ascii_alphabetic() {
+            let mut j = i + 1;
+            while j < n && cs[j].is_ascii_alphabetic() { j += 1 }
+            out.push(take(i, j)); i = j; continue;
+        }
+        // 2. An optional single lead char, then a run of letters/marks. The lead class excludes
+        //    CR, LF, letters, punctuation and symbols -- so a space or a digit may lead, and
+        //    punctuation may not (alternative 1 already claimed the punctuation-then-letters case).
+        {
+            let lead = c != CR && c != LF && !is_l(c) && !is_ps(c);
+            let start = if lead { i + 1 } else { i };
+            if start < n && (is_l(cs[start]) || is_m(cs[start])) {
+                let mut j = start;
+                while j < n && (is_l(cs[j]) || is_m(cs[j])) { j += 1 }
+                out.push(take(i, j)); i = j; continue;
+            }
+        }
+        // 3. an optional single space, then a run of punctuation/symbols, then any trailing
+        //    newlines.
+        {
+            let start = if c == ' ' && i + 1 < n && is_ps(cs[i + 1]) { i + 1 } else { i };
+            if start < n && is_ps(cs[start]) {
+                let mut j = start;
+                while j < n && is_ps(cs[j]) { j += 1 }
+                while j < n && (cs[j] == CR || cs[j] == LF) { j += 1 }
+                out.push(take(i, j)); i = j; continue;
+            }
+        }
+        // 4. a whitespace run that reaches a newline, newlines included.
+        if c.is_whitespace() {
+            let mut j = i;
+            while j < n && cs[j].is_whitespace() && cs[j] != CR && cs[j] != LF { j += 1 }
+            if j < n && (cs[j] == CR || cs[j] == LF) {
+                while j < n && (cs[j] == CR || cs[j] == LF) { j += 1 }
+                out.push(take(i, j)); i = j; continue;
+            }
+            // 5 and 6 collapse here: a whitespace run either ends the text (5) or is followed by a
+            // non-space (6). Both emit the run; the lookahead distinguishes nothing about the output.
+            let mut j = i;
+            while j < n && cs[j].is_whitespace() { j += 1 }
+            out.push(take(i, j)); i = j; continue;
+        }
+
+        // ⛔ UNMATCHED TEXT IS ONE CHUNK, NOT ONE CHUNK PER CHARACTER.
+        //
+        // The six alternatives are NOT exhaustive: a bare digit run matches none of them -- digits
+        // are excluded from the punctuation/symbol class, and alternative 2 requires letters after
+        // its optional lead. `unicode_regex_split` emits the text between matches as a single
+        // chunk, so `abc123` is `abc` + `123`. Emitting per character gave `abc` + `1` + `2` + `3`,
+        // which is a different token stream: merges run only WITHIN a chunk, so splitting a number
+        // makes every multi-digit merge in the vocabulary unreachable.
+        //
+        // Found by a test whose expectation was right for the wrong reason -- it asserted `123`
+        // stays whole because there is no digit rule, and the bug was that there is no unmatched
+        // rule either.
+        let mut j = i;
+        while j < n && !matched_here(&cs, j) { j += 1 }
+        out.push(take(i, j)); i = j;
+    }
+    out
+}
+
 fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
+    if pre == Pre::Hyv4 { return pretokenize_hyv4(text) }
     // Digits step: isolate each digit; group consecutive non-digits.
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
@@ -352,6 +480,61 @@ mod pre_tests {
         assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "unknown values keep the old behaviour");
         assert_eq!(Pre::from_gguf(None), Pre::Gpt2, "a file with no key is what the tree assumed for all");
     }
+    /// The distinctive rule: leading ASCII punctuation binds to the letters after it. This is what
+    /// separates the family from GPT-2, and it decides which merges are reachable at all, since
+    /// merges only run WITHIN a chunk.
+    #[test]
+    fn hyv4_binds_leading_punctuation_to_the_letters_after_it() {
+        assert_eq!(pretokenize_with("foo.bar", Pre::Hyv4), vec!["foo", ".bar"]);
+        assert_eq!(pretokenize_with("Halvorsen-Reyes", Pre::Hyv4), vec!["Halvorsen", "-Reyes"]);
+        // GPT-2 splits the punctuation off on its own; that difference is the point.
+        assert_eq!(pretokenize_with("foo.bar", Pre::Gpt2), vec!["foo", ".", "bar"]);
+    }
+
+    /// Punctuation NOT followed by letters falls to the punctuation-run rule, and adjacent runs
+    /// stay together -- the case llama.cpp hand-codes because `std::regex` mis-splits it.
+    #[test]
+    fn hyv4_keeps_adjacent_punctuation_runs_together() {
+        // `,~b` is NOT one chunk: alternative 1 needs [A-Za-z] immediately after the punctuation,
+        // and `~` intervenes, so the punctuation-run rule claims `,~` and `b` starts a new chunk.
+        // My first expectation here was wrong; the code was right.
+        assert_eq!(pretokenize_with("a,~b", Pre::Hyv4), vec!["a", ",~", "b"]);
+        assert_eq!(pretokenize_with("a ,~ b", Pre::Hyv4), vec!["a", " ,~", " b"]);
+    }
+
+    /// No digit rule and no contraction rule -- both present in GPT-2 and Qwen2, both absent here.
+    /// A digit may LEAD a letter run (it is not excluded from alternative 2's lead class).
+    #[test]
+    fn hyv4_has_no_digit_or_contraction_rule() {
+        assert_eq!(pretokenize_with("abc123", Pre::Hyv4), vec!["abc", "123"]);
+        assert_ne!(pretokenize_with("123", Pre::Hyv4), vec!["1", "2", "3"]);
+        // GPT-2 isolates every digit; this must not.
+        assert_eq!(pretokenize_with("123", Pre::Gpt2), vec!["1", "2", "3"]);
+        // `'s` is one chunk under GPT-2's contraction rule and punctuation+letters here -- same
+        // string, different rule, and the distinction shows on a contraction GPT-2 does not list.
+        assert_eq!(pretokenize_with("it'zz", Pre::Hyv4), vec!["it", "'zz"]);
+    }
+
+    /// Every input is reconstructible: the splitter partitions, it never drops or duplicates.
+    /// Checked over a spread of shapes because a fall-through that ate a character would otherwise
+    /// only show as a quietly wrong token stream.
+    #[test]
+    fn hyv4_partitions_its_input_exactly() {
+        for t in ["", "a", " ", "\n", "\r\n\r\n", "foo.bar baz", "a,~b", "  trailing   ",
+                  "mixed 123 ok!!\nnext", "\u{4f60}\u{597d}, world", "-Reyes'quote", "\t\tx"] {
+            let parts = pretokenize_with(t, Pre::Hyv4);
+            assert_eq!(parts.concat(), *t, "hyv4 split of {t:?} does not reconstruct: {parts:?}");
+        }
+    }
+
+    #[test]
+    fn hyv4_is_selected_by_its_own_name_and_its_regex_family() {
+        assert_eq!(Pre::from_gguf(Some("hyv4")), Pre::Hyv4);
+        assert_eq!(Pre::from_gguf(Some("deepseek3-llm")), Pre::Hyv4);
+        assert_eq!(Pre::from_gguf(Some("hunyuan-dense")), Pre::Hyv4);
+        assert_eq!(Pre::from_gguf(Some("something-else")), Pre::Gpt2);
+    }
+
 }
 
 /// **WordPiece** — the BERT family's tokenizer (`tokenizer.ggml.model == "bert"`).
