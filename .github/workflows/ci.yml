@@ -12,6 +12,17 @@ env:
 
 jobs:
   build-and-validate:
+    # ⏱ A HANG-CATCHER, NOT A PERFORMANCE GATE. GitHub's default is 6 hours, and this repo has
+    # already burned nearly two of them on one step: `bench` ran 113 minutes on lavapipe (~2 GFLOP/s
+    # against a hardcoded 30 iterations of a 137-GFLOP matmul) and looked identical to a hang, because
+    # the job had died at compile since 2026-07-22 and no one had ever seen it finish. There was no
+    # duration to bound it against; there is now. Measured on the first fully green run (33927133667):
+    # software GPU 34.2 min, real Metal 15.2 min, proofs 7.1 min. These sit at ~2.5-3x that, so
+    # ordinary variance never trips them while a hang costs minutes.
+    # ⚠ ONE green sample each for the whole-job numbers. `Test workspace` is stable across three runs
+    # (566/579/575 s); the validation step has a single green observation (1218 s). Raise a bound if
+    # a legitimate run approaches it — do not tighten one toward an observation.
+    timeout-minutes: 90
     name: build + validate (software GPU)
     runs-on: ubuntu-latest
     steps:
@@ -127,6 +138,7 @@ jobs:
           cargo run -p ferric-tensor --example fabric
 
   macos-metal:
+    timeout-minutes: 45
     name: build + validate (real Metal)
     runs-on: macos-latest
     steps:
@@ -185,6 +197,7 @@ jobs:
         run: cargo run -p ferric-tensor --example ebm_cert_verify
 
   proofs:
+    timeout-minutes: 30
     # Bounded model checks (Kani/CBMC). These hold for ALL inputs in range, not for chosen values.
     # Separate job so a slow solver never delays the build gate, and so a proof regression is
     # named as one rather than buried in a test log. What they do and do not cover is at the top of
