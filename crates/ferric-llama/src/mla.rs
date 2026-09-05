@@ -101,6 +101,53 @@ impl CachePolicy {
     }
 }
 
+/// Cached decode state for one MLA block, under [`CachePolicy::Latent`].
+///
+/// Holds exactly what that policy defines: the normed latent and the one shared RoPE key per
+/// position, `kv_lora_rank + qk_rope_dim` floats — not per-head keys and values. Per-head K/V are
+/// re-derived by absorption at every step, which is the whole point of the policy and the reason
+/// this is the smaller cache by a large factor.
+///
+/// ⛔ **Only `Latent` is implemented, and `Expanded` is REFUSED rather than silently substituted.**
+/// They are a genuine memory/compute trade, and `CachePolicy`'s own documentation says a decode path
+/// that quietly picks one has picked a context-length ceiling for its caller. Handing back a latent
+/// cache under the expanded name would do exactly that.
+pub struct MlaCache {
+    policy: CachePolicy,
+    /// `[n_past, kv_lora_rank]`, normed — the same tensor `project` returns.
+    latent: Option<Tensor>,
+    /// `[n_past, qk_rope_dim]`, already rotated at its own absolute position.
+    k_rot: Option<Tensor>,
+}
+
+impl MlaCache {
+    pub fn new(policy: CachePolicy) -> Result<MlaCache, String> {
+        match policy {
+            CachePolicy::Latent => Ok(MlaCache { policy, latent: None, k_rot: None }),
+            CachePolicy::Expanded => Err(
+                "MlaCache: CachePolicy::Expanded is not implemented. It is a real alternative with a \
+                 different memory/compute trade, not a synonym — returning a Latent cache under its \
+                 name would pick a context-length ceiling on the caller's behalf.".into()),
+        }
+    }
+    pub fn policy(&self) -> CachePolicy { self.policy }
+    /// Positions already cached.
+    pub fn len(&self) -> usize { self.latent.as_ref().map_or(0, |t| t.shape[0]) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn clear(&mut self) { self.latent = None; self.k_rot = None; }
+    /// Floats resident right now, across both tensors.
+    pub fn floats(&self, cfg: &MlaConfig) -> usize { self.len() * cfg.latent_cache_floats() }
+
+    /// Append this step's positions and return the full history to attend over.
+    fn append(&mut self, latent: &Tensor, k_rot: &Tensor) -> (Tensor, Tensor) {
+        let l = match self.latent.take() { Some(p) => p.cat(latent, 0), None => latent.clone() };
+        let r = match self.k_rot.take() { Some(p) => p.cat(k_rot, 0), None => k_rot.clone() };
+        self.latent = Some(l.clone());
+        self.k_rot = Some(r.clone());
+        (l, r)
+    }
+}
+
 /// How the query is produced. Checkpoints differ, and the difference is not a flag on one code path:
 /// the low-rank form has a norm in the middle, so it cannot be folded into a single matrix.
 pub enum QProj {
@@ -245,12 +292,47 @@ impl Mla {
             KvUp::Absorbed { k_b, v_b } => self.attend_absorbed(&q_nope, &q_rot, &latent, &k_rot, k_b, v_b, mask),
         };
 
-        // --- optional gate, then output projection ---
+        self.gate_and_project(&ao, hs)
+    }
+
+    /// The gate and output projection, shared by prefill and decode so they cannot drift apart.
+    fn gate_and_project(&self, ao: &Tensor, hs: &Tensor) -> Tensor {
+        // ⚠ The gate reads the LAYER INPUT, not the attention output, and it is per-token — so it
+        // needs no cache and decode passes only the new rows.
         let ao = match &self.w.gate_proj {
             Some(g) => ao.mul(&hs.matmul_bt(g).sigmoid()),
-            None => ao,
+            None => ao.clone(),
         };
         ao.matmul_bt(&self.w.o_proj)
+    }
+
+    /// **Cached incremental decode.** `hs` is the new tokens only; `cos`/`sin` are the RoPE table
+    /// rows for *their* absolute positions, not for the whole sequence.
+    ///
+    /// The oracle is `cached_decode_equals_a_full_re_run`: feeding tokens one at a time must equal
+    /// `forward_masked` over the whole sequence. That is an equivalence, so by the rule this module
+    /// already states, it is blind to anything in the shared prologue — but the prologue here is the
+    /// *prefill path itself*, which is pinned to AMD's real module at 5.96e-7 by
+    /// `examples/instella_gmla.rs`. Prefill is verified against a reference; decode is verified
+    /// against prefill. That composition is why this can exist now when the module's header said it
+    /// should not: the objection was that decode would be "unverified code wearing a verified
+    /// module's name", and this is the oracle that answers it.
+    ///
+    /// ⛔ Absorbed only. Cached decode on the fused path would mean expanding the whole history to
+    /// per-head K/V every step — the cost the latent policy exists to avoid — and generalising
+    /// `attend_fused` would add an untested branch to the one arm that has a reference behind it.
+    /// Use [`KvUp::absorb`] to convert a fused checkpoint.
+    pub fn decode(&self, hs: &Tensor, cos: &Tensor, sin: &Tensor, cache: &mut MlaCache,
+                  mask: Option<&Tensor>) -> Tensor {
+        let (k_b, v_b) = match &self.w.kv_up {
+            KvUp::Absorbed { k_b, v_b } => (k_b, v_b),
+            KvUp::Fused(_) => panic!(
+                "MLA cached decode requires the absorbed path; convert with KvUp::absorb"),
+        };
+        let (q_nope, q_rot, latent, k_rot) = self.project(hs, cos, sin);
+        let (lat_all, krot_all) = cache.append(&latent, &k_rot);
+        let ao = self.attend_absorbed(&q_nope, &q_rot, &lat_all, &krot_all, k_b, v_b, mask);
+        self.gate_and_project(&ao, hs)
     }
 
     /// Everything both paths share: the query, the compressed latent, and the one shared RoPE key.
@@ -338,6 +420,12 @@ impl Mla {
         let c = &self.cfg;
         let (h, rope, vh, kvl) = (c.n_heads, c.qk_rope_dim, c.v_head_dim, c.kv_lora_rank);
         let s = q_pass.shape[0];
+        // ⭐ The KEY HISTORY may be longer than the query block: that is exactly decode, `s` new
+        // queries against `t = n_past + s` cached positions. Prefill is the square case `t == s`,
+        // and `offset_causal_mask_hw` reduces to `causal_mask_hw` there, so the verified prefill
+        // numerics are untouched — the offset is zero.
+        let t = latent.shape[0];
+        debug_assert!(t >= s, "key history {t} shorter than the {s} queries attending over it");
         let cw = kvl + rope; // the width the score is actually taken over
 
         // q_abs[h,t,r] = Σ_e k_b[h,r,e] · q_nope[h,t,e]
@@ -346,10 +434,10 @@ impl Mla {
         let q_all = q_abs.cat(&q_rot.permute(&[1, 0, 2]).contiguous(), 2); // [h, s, cw]
 
         // One KV "head": the latent row plus the shared RoPE key, broadcast across query heads.
-        let k_all = latent.cat(k_rot, 1).reshape(&[1, s, cw]).broadcast_to(&[h, s, cw]).contiguous();
+        let k_all = latent.cat(k_rot, 1).reshape(&[1, t, cw]).broadcast_to(&[h, t, cw]).contiguous();
 
         let scores = q_all.matmul(&k_all.transpose(2, 1)).mul(&q_all.scalar(c.scaling));
-        let masked = scores.add(&nn::causal_mask_hw(&scores, h, s));
+        let masked = scores.add(&nn::offset_causal_mask_hw(&scores, h, s, t));
         // Sparse on top of causal, never instead of it.
         let masked = match mask { Some(m) => masked.add(m), None => masked };
         let probs = match &self.w.sinks {
@@ -358,7 +446,7 @@ impl Mla {
         };
 
         // Attend in the latent, THEN decompress once: o[h,t,v] = Σ_r v_b[h,v,r] · o_lat[h,t,r]
-        let lat = latent.reshape(&[1, s, kvl]).broadcast_to(&[h, s, kvl]).contiguous();
+        let lat = latent.reshape(&[1, t, kvl]).broadcast_to(&[h, t, kvl]).contiguous();
         let o_lat = probs.matmul(&lat);                                   // [h, s, kvl]
         let o = o_lat.matmul(&v_b.transpose(2, 1).contiguous());          // [h, s, vh]
         o.permute(&[1, 0, 2]).contiguous().reshape(&[s, h * vh])
@@ -537,6 +625,119 @@ mod absorbed_tests {
         let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
         assert!(mx > 0.25 && mn < -0.25, "generator does not span both signs: max {mx}, min {mn}");
         assert!(v.iter().filter(|x| **x > 0.0).count() * 4 > v.len(), "fewer than a quarter of the draws are positive");
+    }
+
+    /// **Cached decode must equal a full re-run — the oracle that lets decode exist at all.**
+    ///
+    /// Tokens fed one at a time through `decode`, against `forward_masked` over the whole sequence.
+    /// Every cache bug this path can have shows here: a history that is not appended in order, a
+    /// mask whose offset is wrong so a query sees the future or loses its own position, a RoPE table
+    /// row taken at the block-relative index instead of the absolute one, or a latent cached before
+    /// its norm.
+    ///
+    /// The comparison is EXACT in structure but not bit-exact in value, and the reason is worth
+    /// stating: the two arms reduce over the key axis in different block shapes (`T` keys at once
+    /// versus `1..=T` growing), so float addition order differs. The tolerance is against the
+    /// OPERAND scale, not the result, for the reason `hc.rs` gives.
+    #[test]
+    fn cached_decode_equals_a_full_re_run() {
+        let ctx = ctx_or_skip!();
+        let c = cfg();
+        let kv_b = rnd(&ctx, &[H * (NOPE + VH), KVL], 5);
+        for (label, sinks) in [("no sink", None), ("with sink", Some(rnd(&ctx, &[H], 42)))] {
+            let m = Mla::new(c, weights(&ctx, KvUp::absorb(&ctx, &kv_b, &c), sinks));
+            let (hs, cos, sin) = (rnd(&ctx, &[T, HID], 6), rnd(&ctx, &[T, ROPE], 7), rnd(&ctx, &[T, ROPE], 8));
+
+            let full = pollster::block_on(m.forward_masked(&hs, &cos, &sin, None).to_vec());
+
+            let mut cache = MlaCache::new(CachePolicy::Latent).expect("latent cache");
+            let mut inc: Vec<f32> = Vec::with_capacity(T * H * VH);
+            for t in 0..T {
+                let row = |x: &Tensor| x.narrow(0, t, 1).contiguous();
+                let step = m.decode(&row(&hs), &row(&cos), &row(&sin), &mut cache, None);
+                inc.extend(pollster::block_on(step.to_vec()));
+                assert_eq!(cache.len(), t + 1, "cache did not grow by exactly one position");
+            }
+            assert_eq!(inc.len(), full.len());
+
+            let scale = full.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(scale > 1e-3, "reference output is ~zero; this comparison would pass on anything");
+            let worst = full.iter().zip(&inc).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            eprintln!("cached decode vs full re-run ({label}): max |Δ| = {worst:.3e} on magnitude {scale:.3e}");
+            assert!(worst < 2e-5 * scale.max(1.0), "{label}: decode diverges from prefill by {worst}");
+            assert_eq!(cache.floats(&c), T * c.latent_cache_floats());
+        }
+    }
+
+    /// **Block decode: 1+2+2 must equal the whole 5.** This is the test that actually exercises the
+    /// rectangular mask, and writing it is how I found that the single-token oracle above does not.
+    ///
+    /// ⛔ At `tq == 1` the offset mask is a NO-OP: row 0 spans `(off+1)..tkv`, which is empty when
+    /// `off == tkv-1`. So stepping one token at a time can never see a wrong offset — every query
+    /// legitimately sees the entire history. Only `tq > 1` makes intra-block causality matter, and
+    /// then a wrong offset lets a query see its successor or hides its own position, and equality
+    /// with the full run breaks. An uneven split is deliberate: equal chunks make `off` a multiple
+    /// of the chunk size, which several wrong formulas also satisfy.
+    ///
+    /// (A first version of this instead permuted the cached history and required the LAST token's
+    /// output to change. It does not change, by 1.9e-8 — and that is correct, not a bug: each cached
+    /// position carries its own RoPE, and a query that sees the whole history sums over the same set
+    /// of keys whatever order they sit in. Cache slot order is only observable THROUGH THE MASK.)
+    #[test]
+    fn block_decode_in_uneven_chunks_equals_the_whole() {
+        let ctx = ctx_or_skip!();
+        let c = cfg();
+        let kv_b = rnd(&ctx, &[H * (NOPE + VH), KVL], 5);
+        let m = Mla::new(c, weights(&ctx, KvUp::absorb(&ctx, &kv_b, &c), None));
+        let (hs, cos, sin) = (rnd(&ctx, &[T, HID], 6), rnd(&ctx, &[T, ROPE], 7), rnd(&ctx, &[T, ROPE], 8));
+        let full = pollster::block_on(m.forward_masked(&hs, &cos, &sin, None).to_vec());
+
+        for chunks in [vec![1usize, 2, 2], vec![2, 1, 2], vec![3, 2], vec![5]] {
+            assert_eq!(chunks.iter().sum::<usize>(), T);
+            let mut cache = MlaCache::new(CachePolicy::Latent).unwrap();
+            let (mut inc, mut at) = (Vec::new(), 0usize);
+            for n in &chunks {
+                let blk = |x: &Tensor| x.narrow(0, at, *n).contiguous();
+                let step = m.decode(&blk(&hs), &blk(&cos), &blk(&sin), &mut cache, None);
+                inc.extend(pollster::block_on(step.to_vec()));
+                at += n;
+            }
+            let scale = full.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let worst = full.iter().zip(&inc).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            eprintln!("chunks {chunks:?}: max |Δ| vs whole = {worst:.3e} on magnitude {scale:.3e}");
+            assert!(worst < 2e-5 * scale.max(1.0), "chunks {chunks:?} diverge from the whole by {worst}");
+        }
+    }
+
+    /// The mask itself, asserted directly rather than only through an equality: row `i` of a
+    /// `[tq, tkv]` block sees keys up to `(tkv − tq) + i` and no further.
+    #[test]
+    fn the_offset_mask_hides_exactly_the_future() {
+        let ctx = ctx_or_skip!();
+        let like = rnd(&ctx, &[1], 1);
+        let (tq, tkv) = (2usize, 5usize);
+        let m = pollster::block_on(ferric_tensor::nn::offset_causal_mask_hw(&like, H, tq, tkv).to_vec());
+        assert_eq!(m.len(), H * tq * tkv);
+        let off = tkv - tq;
+        for h in 0..H { for i in 0..tq { for j in 0..tkv {
+            let v = m[(h * tq + i) * tkv + j];
+            if j <= off + i { assert_eq!(v, 0.0, "head {h} row {i} key {j} must be visible"); }
+            else { assert!(v < -1e29, "head {h} row {i} key {j} must be hidden, got {v}"); }
+        }}}
+    }
+
+    /// `CachePolicy::Expanded` must REFUSE, not quietly hand back a latent cache under its name.
+    #[test]
+    fn the_unimplemented_cache_policy_is_refused_rather_than_substituted() {
+        // `expect_err` would need MlaCache: Debug, and deriving that would drag Debug onto Tensor.
+        let e = match MlaCache::new(CachePolicy::Expanded) {
+            Err(e) => e,
+            Ok(_) => panic!("CachePolicy::Expanded constructed a cache — it must refuse"),
+        };
+        assert!(e.contains("not implemented"), "the refusal must say what is missing: {e}");
+        let ok = MlaCache::new(CachePolicy::Latent).ok().expect("Latent must construct");
+        assert_eq!(ok.policy(), CachePolicy::Latent);
+        assert!(ok.is_empty() && ok.len() == 0, "a fresh cache must be empty");
     }
 
     /// **Absorption is exact, so each path is the other's oracle.**

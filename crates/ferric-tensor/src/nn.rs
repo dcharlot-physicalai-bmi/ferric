@@ -320,6 +320,15 @@ pub fn chunked_attention(
     ctx.permute(&[1, 0, 2]).reshape(&[tq, d])
 }
 
+/// `offset_causal_mask` broadcast to `[heads, tq, tkv]`, the shape attention scores actually have.
+///
+/// The rectangular case IS decode: `tq` new queries against `tkv = n_past + tq` cached keys. When
+/// `tq == tkv` this is elementwise identical to [`causal_mask_hw`] (the offset is zero), so a caller
+/// can use one function for prefill and decode without the prefill numerics changing.
+pub fn offset_causal_mask_hw(like: &Tensor, heads: usize, tq: usize, tkv: usize) -> Tensor {
+    offset_causal_mask(like, tq, tkv).reshape(&[1, tq, tkv]).broadcast_to(&[heads, tq, tkv]).contiguous()
+}
+
 /// Mask for [`chunked_attention`]: row `i` may see keys up to `(t_kv − t_q) + i`.
 fn offset_causal_mask(like: &Tensor, tq: usize, tkv: usize) -> Tensor {
     let off = tkv - tq;
