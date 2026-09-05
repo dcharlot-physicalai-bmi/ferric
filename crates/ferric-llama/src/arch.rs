@@ -56,6 +56,14 @@ pub enum Runtime {
     /// [`crate::parakeet`] — Conformer encoder + RNN-T decoder. SPEECH: waveform in, text out.
     /// Not a generative text runtime; `ferric-serve` refuses it the way it refuses `Bert`.
     Parakeet,
+    /// [`crate::hyv4`] — hyper-connections, gated MLA with a learnable sink, the DSA lightning
+    /// indexer, and DeepSeekMoE with a clamped SwiGLU.
+    ///
+    /// ⛔ This row previously named `DeepSeek2` as a PLACEHOLDER, and that was a live mis-dispatch
+    /// waiting on one edit: `ferric-serve` matches on this field, so promoting hyv4's status would
+    /// have loaded a hyv4 checkpoint AS A DEEPSEEK2 MODEL — the exact "fluent, confident, wrong
+    /// text" failure the registry exists to prevent. Only `Status::Untried` stood in the way.
+    Hyv4,
 }
 
 impl Runtime {
@@ -70,6 +78,7 @@ impl Runtime {
             Runtime::Gemma4 => "gemma4",
             Runtime::DeepSeek2 => "deepseek2",
             Runtime::Cosmos => "cosmos",
+            Runtime::Hyv4 => "hyv4",
         }
     }
 }
@@ -225,7 +234,7 @@ pub const REGISTRY: &[Arch] = &[
                   factual and code prompts. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants refused \
                   at load" },
 
-    Arch { name: "hyv4", runtime: Runtime::DeepSeek2, status: Status::Untried,
+    Arch { name: "hyv4", runtime: Runtime::Hyv4, status: Status::Untried,
            note: "Tencent Hy4, 770B/49B, and SUPPORTED BY NO UPSTREAM RUNTIME — llama.cpp does not \
                   have this architecture; the published GGUFs ship two out-of-tree patches. Not a \
                   port: an independent implementation from the format. crate::hyv4 wires \
@@ -243,8 +252,11 @@ pub const REGISTRY: &[Arch] = &[
                   ⛔ THAT IS NOT FIDELITY: no reference implementation builds here (the full \
                   checkpoint is 213.66 GiB against ~47 GB free), both cross-quant arms run the SAME \
                   forward, and a wrong-but-consistent formula agrees with itself. Nothing exercises \
-                  256-way routing, a block past 1, or generation. The runtime field is a placeholder; \
-                  resolve() refuses this string because Untried is not runnable" },
+                  256-way routing or a block past 1. Cached decode DOES exist (Hyv4Cache + \
+                  Hyv4::decode) and is pinned to the full forward on every split of a sequence, dense \
+                  and sparse. The runtime field is now Runtime::Hyv4 -- it named DeepSeek2 as a \
+                  placeholder, which would have mis-dispatched the moment this row was promoted; \
+                  resolve() still refuses this string because Untried is not runnable" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -468,7 +480,8 @@ mod tests {
         for a in REGISTRY {
             let generates_text = match a.runtime {
                 Runtime::Dense | Runtime::Hybrid | Runtime::Lfm2 | Runtime::Gemma4
-                    | Runtime::DeepSeek2 | Runtime::NemotronH | Runtime::Cosmos => true,
+                    | Runtime::DeepSeek2 | Runtime::NemotronH | Runtime::Cosmos
+                    | Runtime::Hyv4 => true,
                 // Encoder: embeddings and cross-encoder scores, no LM head.
                 Runtime::Bert => false,
                 // Speech: takes a WAVEFORM, not tokens.

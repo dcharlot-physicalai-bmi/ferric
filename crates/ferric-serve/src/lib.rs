@@ -40,12 +40,12 @@ use ferric_tensor::Tensor;
 /// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
 /// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
 /// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
-pub(crate) enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2), NemotronH(ferric_llama::nemotron_h::NemotronH) }
-pub(crate) enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache), NemotronH(ferric_llama::nemotron_h::Cache) }
+pub(crate) enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2), NemotronH(ferric_llama::nemotron_h::NemotronH), Hyv4(ferric_llama::hyv4::Hyv4) }
+pub(crate) enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache), NemotronH(ferric_llama::nemotron_h::Cache), Hyv4(ferric_llama::hyv4::Hyv4Cache) }
 impl Model {
-    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab, Model::DeepSeek2(m) => m.cfg.n_vocab, Model::NemotronH(m) => m.cfg.n_vocab } }
-    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer, Model::DeepSeek2(m) => m.cfg.n_layer, Model::NemotronH(m) => m.cfg.n_layer } }
-    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d, Model::DeepSeek2(m) => m.cfg.d, Model::NemotronH(m) => m.cfg.d } }
+    fn n_vocab(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_vocab, Model::Hybrid(m) => m.cfg.n_vocab, Model::Lfm2(m) => m.cfg.n_vocab, Model::Gemma4(m) => m.cfg.n_vocab, Model::DeepSeek2(m) => m.cfg.n_vocab, Model::NemotronH(m) => m.cfg.n_vocab, Model::Hyv4(m) => m.cfg.n_vocab } }
+    fn n_layer(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_layer, Model::Hybrid(m) => m.cfg.n_layer, Model::Lfm2(m) => m.cfg.n_layer, Model::Gemma4(m) => m.cfg.n_layer, Model::DeepSeek2(m) => m.cfg.n_layer, Model::NemotronH(m) => m.cfg.n_layer, Model::Hyv4(m) => m.cfg.n_layer } }
+    fn n_embd(&self) -> usize { match self { Model::Dense(m) => m.cfg.n_embd, Model::Hybrid(m) => m.cfg.n_embd, Model::Lfm2(m) => m.cfg.d, Model::Gemma4(m) => m.cfg.d, Model::DeepSeek2(m) => m.cfg.d, Model::NemotronH(m) => m.cfg.d, Model::Hyv4(m) => m.cfg.d } }
     /// **Which runtimes `Engine::load` can build a generative `Model` from.**
     ///
     /// The dispatch consults this before matching, so "the registry says supported" and "the server
@@ -60,7 +60,7 @@ impl Model {
     pub(crate) fn dispatchable(r: ferric_llama::arch::Runtime) -> Result<(), &'static str> {
         use ferric_llama::arch::Runtime as R;
         match r {
-            R::Dense | R::Hybrid | R::Lfm2 | R::Gemma4 | R::DeepSeek2 | R::NemotronH => Ok(()),
+            R::Dense | R::Hybrid | R::Lfm2 | R::Gemma4 | R::DeepSeek2 | R::NemotronH | R::Hyv4 => Ok(()),
             R::Bert => Err("a BERT encoder: no KV cache and no LM head, so it cannot serve chat or \
                             completions. Point FERRIC_RERANK_MODEL at it instead"),
             R::Cosmos => Err("loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
@@ -80,6 +80,10 @@ impl Model {
             // The only runtime whose cache needs the GPU context; it carries its own, hence
             // `new_cache` on the model rather than `Cache::new` here.
             Model::NemotronH(m) => ModelCache::NemotronH(m.new_cache()),
+            // Fallible because `CachePolicy::Expanded` is refused rather than substituted; `Latent`
+            // is what `Hyv4Cache::new` asks for, so this cannot fail in practice and says so if it does.
+            Model::Hyv4(m) => ModelCache::Hyv4(ferric_llama::hyv4::Hyv4Cache::new(m)
+                .unwrap_or_else(|e| panic!("hyv4 cache: {e}"))),
         }
     }
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
@@ -93,6 +97,7 @@ impl Model {
             // input error rather than a bug; the server has no way to recover, so it names it.
             (Model::NemotronH(m), ModelCache::NemotronH(c)) =>
                 m.forward_cached(tokens, c).unwrap_or_else(|e| panic!("nemotron_h forward: {e}")),
+            (Model::Hyv4(m), ModelCache::Hyv4(c)) => m.decode(tokens, c),
             _ => unreachable!("model/cache kind mismatch"),
         }
     }
@@ -133,6 +138,10 @@ impl Model {
             // state and a conv window, so a batched path is a real port plus its own proof — not a
             // loop — and until both exist this must stay false.
             Model::NemotronH(_) => false,
+            // Same position as NemotronH and for a sharper reason: hyv4's decode threads ONE
+            // Hyv4Cache, and its DSA indexer selects per sequence from a per-sequence key cache. A
+            // batched path is a real port plus its own proof, not a loop.
+            Model::Hyv4(_) => false,
         }
     }
 
@@ -157,6 +166,7 @@ impl Model {
             // Unreachable via the scheduler, which consults `supports_batching` first; this arm is
             // what makes adding a runtime a compile error rather than a silent wrong answer.
             Model::NemotronH(_) => unreachable!("nemotron_h has no batched path; supports_batching is false"),
+            Model::Hyv4(_) => unreachable!("hyv4 has no batched path; supports_batching is false"),
         }
     }
 
@@ -187,6 +197,12 @@ impl Model {
             // every embedding from this model wrong while looking like a vector.
             Model::NemotronH(_) => panic!(
                 "nemotron_h cannot produce embeddings: no pre-head hidden-state path exists. It \
+                 serves chat and completions; point the embedding endpoint at another model"),
+            // Same refusal, same reason: `decode` returns logits and no pre-head hidden state is
+            // exposed. Returning the logits would make every embedding wrong while looking like a
+            // vector, which is the failure this arm exists to prevent.
+            Model::Hyv4(_) => panic!(
+                "hyv4 cannot produce embeddings: no pre-head hidden-state path is exposed. It \
                  serves chat and completions; point the embedding endpoint at another model"),
         }
     }
@@ -351,6 +367,9 @@ impl Engine {
             // Both refusals are already delivered by the `dispatchable` check above, so these arms
             // cannot be reached. They stay because the exhaustive match is what turns "someone added
             // a Runtime" into a compile error rather than a fallthrough.
+            ferric_llama::arch::Runtime::Hyv4 =>
+                Model::Hyv4(ferric_llama::hyv4::Hyv4::load(&ctx, &g)
+                    .unwrap_or_else(|e| panic!("load hyv4: {e}"))),
             ferric_llama::arch::Runtime::Bert =>
                 unreachable!("Bert is refused by Model::dispatchable before this match"),
         };

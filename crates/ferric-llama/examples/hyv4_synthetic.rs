@@ -192,22 +192,6 @@ fn main() {
     assert!(tok0 < 1e-5, "the first token's logits moved under a tighter top_k ({tok0:.2e}); it has \
                           one visible position, so the mask is not respecting causality");
 
-    // ── the regression lock ───────────────────────────────────────────────────────────────────
-    //
-    // ⚠ This hash is SELF-REFERENTIAL: it was generated from this code, so it cannot say the
-    // forward is correct against Tencent's model. What it does is pin what this code computes, so
-    // a later edit cannot silently change it. Without it the assertions above pass under a stale
-    // residual, a router bias carried into the weight, or the stream collapse replaced by "take
-    // stream 0" -- all four were mutation-tested and all four survived until this line existed.
-    let h = fnv(&dense);
-    const GOLDEN: u64 = 0x29142d075f1beadc;
-    if GOLDEN == 0 {
-        println!("  logits hash {h:#018x}  <- paste into GOLDEN to lock this in");
-    } else {
-        assert_eq!(h, GOLDEN, "the forward's output changed; if that was intended, update GOLDEN \
-                               and say in the commit what moved and why");
-    }
-
     // ── Cached decode must equal a full re-run ──────────────────────────────────────────────────
     //
     // The whole graph, not just MLA: hyper-connections, the DSA indexer with its per-full-layer key
@@ -255,6 +239,42 @@ fn main() {
         assert!(moved_pos > 1e-4, "the same token at position 0 and 1 gave identical logits \
                                    ({moved_pos:.2e}); RoPE is restarting at each block or the cache is not read");
         println!("  same token at position 0 vs 1 moves logits by {moved_pos:.4}");
+    }
+
+    // ── the regression lock, PER FABRIC ───────────────────────────────────────────────────────
+    //
+    // ⚠ This hash is SELF-REFERENTIAL: it was generated from this code, so it cannot say the
+    // forward is correct against Tencent's model. What it does is pin what this code computes, so
+    // a later edit cannot silently change it. Without it the assertions above pass under a stale
+    // residual, a router bias carried into the weight, or the stream collapse replaced by "take
+    // stream 0" -- all four were mutation-tested and all four survived until this line existed.
+    //
+    // ⛔ AND IT IS FABRIC-SPECIFIC, WHICH IS NOT A BUG. Kernel selection is capability-dependent, so
+    // the same model on the same bytes reduces in a different order on a different backend and the
+    // bit-hash differs. A single constant here made the FIRST CI run on lavapipe fail with a
+    // perfectly healthy model. One hash per backend records that difference instead of hiding it;
+    // an unknown backend reports rather than asserting, because a lock nobody has recorded is not
+    // evidence about that fabric.
+    //
+    // ⭐ The checks ABOVE this point are all self-comparisons within one run — decode against
+    // prefill, top_k 64 against top_k 2 — so they are fabric-independent and now run FIRST. They
+    // used to sit after this lock, which meant a hash mismatch on a new backend hid every portable
+    // check behind it. Order the portable evidence before the fabric-specific lock.
+    let h = fnv(&dense);
+    const GOLDEN: &[(&str, u64)] = &[
+        ("Metal",  0x29142d075f1beadc),
+        // ⚠ ONE observation, from CI run 33999082940. A software rasterizer should be
+        // deterministic, but if this entry ever flakes the honest response is to DELETE IT — a lock
+        // that is loosened until it stops failing is not a lock — and keep the portable checks above.
+        ("Vulkan", 0xf690016066e7574b),
+    ];
+    let backend = format!("{:?}", ctx.backend);
+    match GOLDEN.iter().find(|(b, _)| *b == backend) {
+        Some((_, want)) => assert_eq!(h, *want,
+            "the forward's output changed on {backend}; if that was intended, update GOLDEN for \
+             this backend and say in the commit what moved and why"),
+        None => println!("  logits hash {h:#018x} on {backend} — no lock recorded for this backend; \
+                          add ({backend:?}, {h:#018x}) to GOLDEN to lock it in"),
     }
 
     println!("forward ran: logits {shape:?}, all finite");
