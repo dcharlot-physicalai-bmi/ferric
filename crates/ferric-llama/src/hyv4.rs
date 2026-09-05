@@ -39,7 +39,7 @@
 
 use crate::dsa::{Indexer, IndexSchedule, IndexerCfg, IndexerWeights};
 use crate::hc::{Hc, HcConfig, HcGate, HcHead};
-use crate::mla::{KvUp, Mla, MlaConfig, MlaWeights, QProj};
+use crate::mla::{CachePolicy, KvUp, Mla, MlaCache, MlaConfig, MlaWeights, QProj};
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::{dtype::QMatrix, Tensor};
@@ -223,6 +223,39 @@ pub struct Hyv4 {
     output_norm: Tensor,
     output: QMatrix,
     schedule: IndexSchedule,
+}
+
+/// Decode state for a whole hyv4 model: one [`MlaCache`] per layer, plus the indexer's key cache.
+///
+/// ⭐ **The index cache is allocated per FULL layer, not per layer.** Only the 21 `is_full` layers of
+/// 78 ever write an indexer key; the rest reuse a preceding layer's selection through
+/// [`IndexSchedule::source`]. Reserving one slot per block would be 20.9 GiB per sequence at the
+/// published 1M context against 5.63 GiB — the sharing schedule is not a micro-optimisation, it is
+/// most of the cache.
+pub struct Hyv4Cache {
+    mla: Vec<MlaCache>,
+    /// Indexed by layer; `Some` only where the schedule says that layer owns an indexer.
+    index_keys: Vec<Option<Tensor>>,
+    n_past: usize,
+}
+
+impl Hyv4Cache {
+    /// Sized from the model's own schedule, so it cannot disagree with it.
+    pub fn new(m: &Hyv4) -> Result<Hyv4Cache, String> {
+        let mla = (0..m.cfg.n_layer)
+            .map(|_| MlaCache::new(CachePolicy::Latent))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Hyv4Cache {
+            mla,
+            index_keys: (0..m.cfg.n_layer).map(|il| if m.schedule.is_full(il) { Some(Tensor::from_vec(&m.ctx, &[], &[0, m.cfg.idx_head_dim])) } else { None }).collect(),
+            n_past: 0,
+        })
+    }
+    /// Positions already consumed.
+    pub fn len(&self) -> usize { self.n_past }
+    pub fn is_empty(&self) -> bool { self.n_past == 0 }
+    /// How many layers actually hold an index cache — the schedule's own count, checked.
+    pub fn index_slots(&self) -> usize { self.index_keys.iter().filter(|k| k.is_some()).count() }
 }
 
 impl Hyv4 {
@@ -663,6 +696,71 @@ impl Hyv4 {
         y.matmul_q(&self.output)
     }
 
+    /// **Cached incremental decode.** `tokens` are the NEW tokens; everything before them comes from
+    /// `cache`. Returns logits for the new tokens only, `[tokens.len(), n_vocab]`.
+    ///
+    /// The oracle is `decode_equals_forward`: any split of a sequence into decode blocks must equal
+    /// `forward` over the whole thing. That composes with `mla.rs`'s own chain — prefill is pinned
+    /// to AMD's real module, decode is pinned to prefill — so nothing here rests on a reference this
+    /// machine does not have.
+    ///
+    /// Three things move between prefill and decode, and each is a way to keep every shape and be
+    /// wrong:
+    /// 1. **RoPE is taken at ABSOLUTE positions** (`rope_tables_at`), not at the block's own 0..n.
+    /// 2. **The indexer scores new queries against the WHOLE key cache**, and `top_k_mask` is given
+    ///    the query's absolute offset so it selects from `0..=n_past+i` rather than `0..=i`.
+    /// 3. **The selection mask is `[n_head, t_new, m_total]`**, rectangular — square is the prefill
+    ///    special case.
+    pub fn decode(&self, tokens: &[u32], cache: &mut Hyv4Cache) -> Tensor {
+        let cfg = &self.cfg;
+        let t = tokens.len();
+        assert!(t > 0, "decode called with no tokens");
+        assert_eq!(cache.mla.len(), cfg.n_layer, "cache was built for a different model");
+        let n_past = cache.n_past;
+
+        let emb = self.tok_embd.gather_rows(&tokens.to_vec());
+        let (cos, sin) = self.rope_tables_at(n_past, t);
+
+        let mut h = self.hc.replicate(&emb);
+        let mut last_mask: Option<Tensor> = None;
+
+        for il in 0..cfg.n_layer {
+            let blk = &self.blocks[il];
+
+            let res = h.clone();
+            let (x, q) = self.hc.pre(&h, &blk.hc_attn);
+            let cur = x.rmsnorm(&blk.attn_norm, cfg.eps);
+
+            if let Some(ix) = &blk.indexer {
+                let qr = cur.matmul_bt(match &blk.mla.w.q { QProj::LowRank { a, .. } => a, QProj::Whole(w) => w })
+                    .rmsnorm(match &blk.mla.w.q { QProj::LowRank { a_norm, .. } => a_norm, QProj::Whole(_) => &blk.attn_norm }, cfg.eps);
+                // Append this block's keys, then score against the WHOLE history.
+                let fresh = ix.keys(&cur, &cos, &sin);
+                let slot = cache.index_keys[il].as_ref().expect("schedule says this layer owns an indexer");
+                let all = if slot.shape[0] == 0 { fresh } else { slot.cat(&fresh, 0) };
+                let m_total = all.shape[0];
+                let scores = ix.scores(&qr, &cur, &all, &cos, &sin);
+                let m = crate::dsa::top_k_mask(&scores, cfg.idx_top_k, n_past);
+                last_mask = Some(m.reshape(&[1, t, m_total]).broadcast_to(&[cfg.n_head, t, m_total]).contiguous());
+                cache.index_keys[il] = Some(all);
+            }
+            assert!(last_mask.is_some(), "layer {il} has no selection; is_full[0] must be true");
+
+            let a = blk.mla.decode(&cur, &cos, &sin, &mut cache.mla[il], last_mask.as_ref());
+            h = self.hc.post(&a, &res, &q);
+
+            let res = h.clone();
+            let (x, q) = self.hc.pre(&h, &blk.hc_ffn);
+            let cur = x.rmsnorm(&blk.ffn_norm, cfg.eps);
+            let f = self.ffn(&cur, blk, il);
+            h = self.hc.post(&f, &res, &q);
+        }
+
+        cache.n_past += t;
+        let y = self.hc.collapse(&h, &self.head).rmsnorm(&self.output_norm, cfg.eps);
+        y.matmul_q(&self.output)
+    }
+
     /// Which layers own an indexer, and therefore how many index-cache slots to reserve.
     ///
     /// A naive allocator reserves one per block. Only the `is_full` layers ever write a key — 21 of
@@ -672,15 +770,25 @@ impl Hyv4 {
 
     /// Doubled cos/sin tables for the `qk_rope`-wide rotation. hyv4 writes no `rope.scaling.*`, so
     /// there is no YaRN term and no `mscale` folded into the attention scale.
-    fn rope_tables(&self, seq: usize) -> (Tensor, Tensor) {
+    fn rope_tables(&self, seq: usize) -> (Tensor, Tensor) { self.rope_tables_at(0, seq) }
+
+    /// The same tables for ABSOLUTE positions `start..start+seq`.
+    ///
+    /// ⚠ Decode's whole positional correctness is here. A block of new tokens is rotated at its real
+    /// position in the sequence, not at its offset within the block — using `rope_tables(seq)` for a
+    /// decode step would restart every block at position 0, keep every shape, and silently make the
+    /// model position-blind beyond the first block.
+    fn rope_tables_at(&self, start: usize, seq: usize) -> (Tensor, Tensor) {
         let r = self.cfg.qk_rope;
         let (mut c, mut s) = (vec![0.0f32; seq * r], vec![0.0f32; seq * r]);
-        for p in 0..seq {
+        for row in 0..seq {
+            let p = start + row;
+            let p_idx = row;
             for i in 0..r / 2 {
                 let th = p as f32 * (self.cfg.rope_base as f64).powf(-2.0 * i as f64 / r as f64) as f32;
                 let (ct, st) = (th.cos(), th.sin());
-                c[p * r + i] = ct; c[p * r + i + r / 2] = ct;
-                s[p * r + i] = st; s[p * r + i + r / 2] = st;
+                c[p_idx * r + i] = ct; c[p_idx * r + i + r / 2] = ct;
+                s[p_idx * r + i] = st; s[p_idx * r + i + r / 2] = st;
             }
         }
         (Tensor::from_vec(&self.ctx, &c, &[seq, r]), Tensor::from_vec(&self.ctx, &s, &[seq, r]))

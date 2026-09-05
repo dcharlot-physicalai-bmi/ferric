@@ -23,7 +23,7 @@
 use ferric_core::Context;
 use ferric_gguf::write::GgufWriter;
 
-use ferric_llama::hyv4::Hyv4;
+use ferric_llama::hyv4::{Hyv4, Hyv4Cache};
 use std::sync::Arc;
 
 const HC: usize = 4;
@@ -206,6 +206,55 @@ fn main() {
     } else {
         assert_eq!(h, GOLDEN, "the forward's output changed; if that was intended, update GOLDEN \
                                and say in the commit what moved and why");
+    }
+
+    // ── Cached decode must equal a full re-run ──────────────────────────────────────────────────
+    //
+    // The whole graph, not just MLA: hyper-connections, the DSA indexer with its per-full-layer key
+    // cache and the schedule that shares it, the clamped-SwiGLU MoE, and absolute-position RoPE. Any
+    // split into decode blocks must reproduce `forward` over the whole sequence.
+    //
+    // ⛔ Uneven splits on purpose, and 1+1+1+1+1 is NOT sufficient on its own: at t=1 the offset
+    // causal mask is a no-op (see mla.rs), so single stepping cannot see a wrong offset. Only blocks
+    // with t > 1 make intra-block causality observable.
+    //
+    // ⛔ AND IT MUST RUN SPARSE. At top_k=64 every visible position is selected, so the DSA mask is
+    // all zeros and its COLUMN ORDER is unobservable — mutating the index cache to prepend instead
+    // of append survived the dense-only version of this check. Under top_k=2 the mask actually
+    // selects, and a cache whose column j is not position j changes the answer.
+    for (top_k, reference) in [(64u32, &dense), (2, &sparse)] {
+        let g = ferric_gguf::parse(build(top_k)).expect("parse");
+        let model = Hyv4::load(&ctx, &g).expect("load");
+        let tokens: Vec<u32> = vec![3, 11, 7, 29, 1];
+        let scale = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(scale > 1e-3, "reference logits are ~zero; this comparison would pass on anything");
+
+        for split in [vec![1usize, 1, 1, 1, 1], vec![1, 2, 2], vec![2, 1, 2], vec![3, 2], vec![5]] {
+            let mut cache = Hyv4Cache::new(&model).expect("cache");
+            assert_eq!(cache.index_slots(), model.index_schedule().live_cache_layers(),
+                       "the cache reserved a different number of index slots than the schedule names");
+            let (mut got, mut at) = (Vec::new(), 0usize);
+            for n in &split {
+                let out = model.decode(&tokens[at..at + n], &mut cache);
+                got.extend(pollster::block_on(out.to_vec()));
+                at += n;
+            }
+            assert_eq!(cache.len(), tokens.len(), "cache length disagrees with what was fed");
+            let worst = reference.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("  top_k {top_k:>2} decode split {split:?}: max |Δ| vs full forward = {worst:.3e}");
+            assert!(worst < 2e-5 * scale.max(1.0),
+                    "top_k {top_k} decode split {split:?} diverges from the full forward by {worst}");
+        }
+        if top_k != 64 { continue }
+        // The positional check the equality above would miss if RoPE restarted per block: feeding
+        // the SAME token at two different positions must give different logits.
+        let mut c2 = Hyv4Cache::new(&model).expect("cache");
+        let a0 = pollster::block_on(model.decode(&[7], &mut c2).to_vec());
+        let a1 = pollster::block_on(model.decode(&[7], &mut c2).to_vec());
+        let moved_pos = a0.iter().zip(&a1).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(moved_pos > 1e-4, "the same token at position 0 and 1 gave identical logits \
+                                   ({moved_pos:.2e}); RoPE is restarting at each block or the cache is not read");
+        println!("  same token at position 0 vs 1 moves logits by {moved_pos:.4}");
     }
 
     println!("forward ran: logits {shape:?}, all finite");

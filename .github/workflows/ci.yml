@@ -88,6 +88,12 @@ jobs:
           cargo run -p ferric-llama --example run_llama
           cargo run -p ferric-llama --example run_llama_unified
           cargo run -p ferric-llama --example run_llama_quant
+          # hyv4's whole graph on a synthetic checkpoint: hyper-connections, the DSA indexer and its
+          # sharing schedule, clamped-SwiGLU MoE, and CACHED DECODE against a full re-run. Run on
+          # BOTH fabrics for the reason the Metal job already states about chunked_attn — a
+          # mask-offset bug that appears on one backend and not the other is exactly what a
+          # single-backend CI cannot see, and decode is a mask-offset feature.
+          cargo run -p ferric-llama --example hyv4_synthetic
 
       - name: Validate — general tensor runtime + autograd training
         run: |
@@ -190,6 +196,7 @@ jobs:
           # Metal here, because a mask-offset bug that only appears on one fabric is exactly the kind
           # of thing a single-backend CI cannot see.
           cargo run -p ferric-tensor --example chunked_attn
+          cargo run -p ferric-llama --example hyv4_synthetic
 
       # Certificates and the tier policy are pure arithmetic and must agree everywhere. If a result here
       # differs from the Linux job, something is platform-dependent that must not be.
