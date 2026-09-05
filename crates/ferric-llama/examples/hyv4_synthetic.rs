@@ -261,20 +261,25 @@ fn main() {
     // used to sit after this lock, which meant a hash mismatch on a new backend hid every portable
     // check behind it. Order the portable evidence before the fabric-specific lock.
     let h = fnv(&dense);
+    // Keyed by ADAPTER, matched by PREFIX. Backend is too coarse and CI proved it: the macOS runner
+    // is an "Apple Paravirtual device" on the SAME Metal backend as this laptop's "Apple M5 Max" and
+    // hashes to a third value. Prefix because llvmpipe carries an LLVM version that moves with the
+    // runner image ("llvmpipe (LLVM 20.1.2, 256 bits)"), and a lock that breaks on an unrelated
+    // image bump teaches people to ignore it.
     const GOLDEN: &[(&str, u64)] = &[
-        ("Metal",  0x29142d075f1beadc),
-        // ⚠ ONE observation, from CI run 33999082940. A software rasterizer should be
-        // deterministic, but if this entry ever flakes the honest response is to DELETE IT — a lock
-        // that is loosened until it stops failing is not a lock — and keep the portable checks above.
-        ("Vulkan", 0xf690016066e7574b),
+        ("Apple M5 Max",             0x29142d075f1beadc),
+        ("Apple Paravirtual device", 0x13cfd14821cf04d5),  // GitHub macOS runner, run 33999082940
+        // ⚠ ONE observation each. If an entry ever flakes the honest response is to DELETE IT — a
+        // lock loosened until it stops failing is not a lock — and rely on the portable checks above.
+        ("llvmpipe",                 0xf690016066e7574b),  // GitHub ubuntu runner (lavapipe)
     ];
-    let backend = format!("{:?}", ctx.backend);
-    match GOLDEN.iter().find(|(b, _)| *b == backend) {
-        Some((_, want)) => assert_eq!(h, *want,
-            "the forward's output changed on {backend}; if that was intended, update GOLDEN for \
-             this backend and say in the commit what moved and why"),
-        None => println!("  logits hash {h:#018x} on {backend} — no lock recorded for this backend; \
-                          add ({backend:?}, {h:#018x}) to GOLDEN to lock it in"),
+    let adapter = &ctx.adapter_name;
+    match GOLDEN.iter().find(|(a, _)| adapter.starts_with(a)) {
+        Some((a, want)) => assert_eq!(h, *want,
+            "the forward's output changed on {a:?}; if that was intended, update GOLDEN for this \
+             adapter and say in the commit what moved and why"),
+        None => println!("  logits hash {h:#018x} on {adapter:?} — no lock recorded for this adapter; \
+                          add ({adapter:?}, {h:#018x}) to GOLDEN to lock it in"),
     }
 
     println!("forward ran: logits {shape:?}, all finite");
