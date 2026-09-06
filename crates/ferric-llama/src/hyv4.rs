@@ -351,7 +351,10 @@ impl std::ops::Deref for BlockRef<'_> {
 /// can match while a permutation hides underneath, which is why the head values are printed too.
 fn dump(tag: &str, il: i64, t: &Tensor) {
     let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
-    if want.parse::<i64>().ok() != Some(il) { return }
+    // `FERRIC_DUMP=all` prints EVERY block, which is what a bisect over 78 of them actually wants:
+    // one run yields the whole curve, and the first block whose sum departs from the reference's is
+    // the answer. At ~250 s per run on the real checkpoint, one-block-at-a-time is not a search.
+    if want != "all" && want.parse::<i64>().ok() != Some(il) { return }
     let v = pollster::block_on(t.to_vec());
     let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
     for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
@@ -895,7 +898,9 @@ impl Hyv4 {
             let (x, q) = self.hc.pre(&h, &blk.hc_ffn);
             let cur = x.rmsnorm(&blk.ffn_norm, cfg.eps);
             let f = self.ffn(&cur, blk, il);
+            dump("ffn_out", il as i64, &f);
             h = self.hc.post(&f, &res, &q);
+            dump("l_out", il as i64, &h);
         }
 
         let y = self.hc.collapse(&h, &self.head).rmsnorm(&self.output_norm, cfg.eps);
@@ -965,7 +970,9 @@ impl Hyv4 {
             let (x, q) = self.hc.pre(&h, &blk.hc_ffn);
             let cur = x.rmsnorm(&blk.ffn_norm, cfg.eps);
             let f = self.ffn(&cur, blk, il);
+            dump("ffn_out", il as i64, &f);
             h = self.hc.post(&f, &res, &q);
+            dump("l_out", il as i64, &h);
         }
 
         cache.n_past += t;
