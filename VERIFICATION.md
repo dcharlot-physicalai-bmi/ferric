@@ -250,11 +250,14 @@ Three rounds of that found the checks themselves were wrong:
   the GF(p) identities and the synthetic golden hash — not by any real-weights run.
 - **Any block but 0 and 1, and any routing wider than 4 experts.** `hyv4_real_moe` slices 4 experts
   of the published 256 and runs top-2. Nothing exercises 256-way routing or an expert past index 3.
-- **Batched decode for hyv4, and sampling.** `Hyv4::decode` threads ONE cache and the DSA indexer
-  selects per sequence from a per-sequence key cache, so `supports_batching` is `false` and
-  `forward_batch` is `unreachable!` behind it — a batched path is a real port plus its own proof, not
-  a loop. `forward_hidden` refuses outright: hyv4 exposes no pre-head hidden state, and returning
-  logits would make every embedding wrong while looking like a vector.
+- **~~Batched decode for hyv4.~~** Done — `Hyv4::decode_batch`, verified token-identical to solo
+  decode at n = 2/3/4 on sequences of **different lengths**, which is the discriminating case:
+  borrowing sequence 0's `n_past` gives every row the right answer when every row is at the same
+  position. Three mutations caught (rope from sequence 0, top-k offset from sequence 0, `n_past`
+  never advancing). `supports_batching` is now `true`. **Sampling is still not covered** — nothing
+  here drives a generation loop.
+- **Embeddings from hyv4.** `forward_hidden` refuses outright: hyv4 exposes no pre-head hidden
+  state, and returning logits would make every embedding wrong while looking like a vector.
 - **Serving it at all.** `hyv4` is now a first-class `Runtime::Hyv4` wired through `ferric-serve`
   (it previously named `Runtime::DeepSeek2` as a placeholder — one status edit away from loading a
   hyv4 checkpoint *as a DeepSeek2 model*). The row still carries `Status::Untried` and `resolve`

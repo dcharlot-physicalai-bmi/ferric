@@ -761,6 +761,82 @@ impl Hyv4 {
         y.matmul_q(&self.output)
     }
 
+    /// **Batched decode**: advance N independent sequences by one token each, in one pass.
+    ///
+    /// `tokens[i]` is the next token for `caches[i]`. Returns `[N, n_vocab]`; row `i` is sequence `i`.
+    ///
+    /// ⭐ For SINGLE-TOKEN decode, N sequences look exactly like a T=N sequence to everything except
+    /// attention — the embedding, both hyper-connection gates, every norm, the router and the MoE are
+    /// all per-token and batch for free across the N rows. Attention is the one place where sequence
+    /// `i` must not see sequence `j`, so it loops, exactly as `deepseek2::attn_batch` does: each
+    /// sequence has its own MLA cache, its own indexer key cache, and its own `n_past`, so its own
+    /// RoPE position and its own top-k selection.
+    ///
+    /// ⛔ `n_past` is bumped AFTER every layer, never inside the loop. Each layer reads it to place
+    /// RoPE and to offset the selection, so advancing it early ropes layer 1 one step ahead of layer
+    /// 0 — a per-layer position skew that keeps every shape and produces fluent, wrong output.
+    /// `deepseek2` carries the same warning about `c.pos` for the same reason.
+    ///
+    /// The bar this must meet is `examples/hyv4_batched_decode.rs`: every sequence's logits identical
+    /// to driving it alone through [`Self::decode`]. A batched path that crosses sequences produces
+    /// finite logits and fluent text with nothing to catch it.
+    pub fn decode_batch(&self, tokens: &[u32], caches: &mut [&mut Hyv4Cache]) -> Tensor {
+        let cfg = &self.cfg;
+        let n = tokens.len();
+        assert_eq!(n, caches.len(), "one token per sequence");
+        assert!(n > 0, "decode_batch needs at least one sequence");
+        for c in caches.iter() {
+            assert_eq!(c.mla.len(), cfg.n_layer, "a cache was built for a different model");
+        }
+
+        // Per-sequence RoPE: each row sits at its own absolute position.
+        let rope: Vec<(Tensor, Tensor)> = caches.iter().map(|c| self.rope_tables_at(c.n_past, 1)).collect();
+        let emb = self.tok_embd.gather_rows(&tokens.to_vec());
+        let mut h = self.hc.replicate(&emb);
+        // One carried selection PER SEQUENCE — the schedule is per layer, the selection is per stream.
+        let mut last_mask: Vec<Option<Tensor>> = vec![None; n];
+
+        for il in 0..cfg.n_layer {
+            let blk = &self.blocks[il];
+
+            let res = h.clone();
+            let (x, q) = self.hc.pre(&h, &blk.hc_attn);
+            let cur = x.rmsnorm(&blk.attn_norm, cfg.eps);
+
+            let mut rows: Vec<Tensor> = Vec::with_capacity(n);
+            for i in 0..n {
+                let row = cur.narrow(0, i, 1).contiguous();
+                let (cos, sin) = (&rope[i].0, &rope[i].1);
+                if let Some(ix) = &blk.indexer {
+                    let qr = row.matmul_bt(match &blk.mla.w.q { QProj::LowRank { a, .. } => a, QProj::Whole(w) => w })
+                        .rmsnorm(match &blk.mla.w.q { QProj::LowRank { a_norm, .. } => a_norm, QProj::Whole(_) => &blk.attn_norm }, cfg.eps);
+                    let fresh = ix.keys(&row, cos, sin);
+                    let slot = caches[i].index_keys[il].as_ref().expect("schedule says this layer owns an indexer");
+                    let all = if slot.shape[0] == 0 { fresh } else { slot.cat(&fresh, 0) };
+                    let m_total = all.shape[0];
+                    let scores = ix.scores(&qr, &row, &all, cos, sin);
+                    let m = crate::dsa::top_k_mask(&scores, cfg.idx_top_k, caches[i].n_past);
+                    last_mask[i] = Some(m.reshape(&[1, 1, m_total]).broadcast_to(&[cfg.n_head, 1, m_total]).contiguous());
+                    caches[i].index_keys[il] = Some(all);
+                }
+                assert!(last_mask[i].is_some(), "layer {il} has no selection; is_full[0] must be true");
+                rows.push(blk.mla.decode(&row, cos, sin, &mut caches[i].mla[il], last_mask[i].as_ref()));
+            }
+            let a = rows.iter().skip(1).fold(rows[0].clone(), |acc, t| acc.cat(t, 0));
+            h = self.hc.post(&a, &res, &q);
+
+            let res = h.clone();
+            let (x, q) = self.hc.pre(&h, &blk.hc_ffn);
+            let cur = x.rmsnorm(&blk.ffn_norm, cfg.eps);
+            let f = self.ffn(&cur, blk, il);
+            h = self.hc.post(&f, &res, &q);
+        }
+
+        for c in caches.iter_mut() { c.n_past += 1; }
+        let y = self.hc.collapse(&h, &self.head).rmsnorm(&self.output_norm, cfg.eps);
+        y.matmul_q(&self.output)
+    }
+
     /// Which layers own an indexer, and therefore how many index-cache slots to reserve.
     ///
     /// A naive allocator reserves one per block. Only the `is_full` layers ever write a key — 21 of

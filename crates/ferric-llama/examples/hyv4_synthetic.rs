@@ -241,6 +241,66 @@ fn main() {
         println!("  same token at position 0 vs 1 moves logits by {moved_pos:.4}");
     }
 
+    // ── Batched decode must equal solo decode, sequence by sequence ─────────────────────────────
+    //
+    // ⛔ THE SEQUENCES HAVE DIFFERENT LENGTHS ON PURPOSE. Equal-length sequences hide the whole
+    // class of bug this exists for: using sequence 0's `n_past` for everyone gives every row the
+    // right answer when every row is at the same position. Priming to 1, 3 and 2 tokens makes the
+    // per-sequence RoPE position, the per-sequence top-k offset and the per-sequence cache length
+    // all distinct, so borrowing any of them across streams shows up immediately.
+    //
+    // Both arms prime identically and solo; only the steps after that differ, so any divergence is
+    // attributable to batching and nothing else.
+    {
+        let g = ferric_gguf::parse(build(64)).expect("parse");
+        let m = Hyv4::load(&ctx, &g).expect("load");
+        // n = 2, 3 and 4, matching the bar the other batched runtimes in this repo were held to.
+        let all_primes: [&[u32]; 4] = [&[3], &[11, 7, 29], &[1, 19], &[2, 5, 8, 13]];
+        let all_steps: [[u32; 2]; 4] = [[5, 23], [2, 31], [17, 9], [21, 6]];
+        for n in [2usize, 3, 4] {
+            let primes = &all_primes[..n];
+            let steps = &all_steps[..n];
+            let prime = |cs: &mut Vec<Hyv4Cache>| {
+                for (i, p) in primes.iter().enumerate() { let _ = m.decode(p, &mut cs[i]); }
+            };
+            let mut solo: Vec<Hyv4Cache> = (0..n).map(|_| Hyv4Cache::new(&m).expect("cache")).collect();
+            let mut batched: Vec<Hyv4Cache> = (0..n).map(|_| Hyv4Cache::new(&m).expect("cache")).collect();
+            prime(&mut solo);
+            prime(&mut batched);
+            for (i, c) in solo.iter().enumerate() {
+                assert_eq!(c.len(), primes[i].len(), "priming did not advance sequence {i} as expected");
+            }
+
+            for step in 0..2 {
+                let want: Vec<Vec<f32>> = (0..n)
+                    .map(|i| pollster::block_on(m.decode(&[steps[i][step]], &mut solo[i]).to_vec()))
+                    .collect();
+                let toks: Vec<u32> = (0..n).map(|i| steps[i][step]).collect();
+                let got = {
+                    let mut refs: Vec<&mut Hyv4Cache> = batched.iter_mut().collect();
+                    pollster::block_on(m.decode_batch(&toks, &mut refs).to_vec())
+                };
+                assert_eq!(got.len(), n * VOCAB, "decode_batch must return one row per sequence");
+                let mut worst_any = 0.0f32;
+                for i in 0..n {
+                    let row = &got[i * VOCAB..(i + 1) * VOCAB];
+                    let scale = want[i].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    assert!(scale > 1e-3, "solo logits for sequence {i} are ~zero; nothing would fail here");
+                    let worst = want[i].iter().zip(row).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    worst_any = worst_any.max(worst);
+                    assert!(worst < 2e-5 * scale.max(1.0),
+                            "n={n}: batched sequence {i} diverges from solo decode by {worst} at step {step}");
+                }
+                println!("  n={n} batch step {step}: max |Δ| vs solo across {n} sequences = {worst_any:.3e}");
+            }
+            for i in 0..n {
+                assert_eq!(solo[i].len(), batched[i].len(),
+                           "n={n} sequence {i}: solo and batched caches disagree on length");
+                assert_eq!(solo[i].len(), primes[i].len() + 2, "n={n} sequence {i} did not advance by two steps");
+            }
+        }
+    }
+
     // ── the regression lock, PER FABRIC ───────────────────────────────────────────────────────
     //
     // ⚠ This hash is SELF-REFERENTIAL: it was generated from this code, so it cannot say the

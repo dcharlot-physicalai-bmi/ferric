@@ -138,10 +138,13 @@ impl Model {
             // state and a conv window, so a batched path is a real port plus its own proof — not a
             // loop — and until both exist this must stay false.
             Model::NemotronH(_) => false,
-            // Same position as NemotronH and for a sharper reason: hyv4's decode threads ONE
-            // Hyv4Cache, and its DSA indexer selects per sequence from a per-sequence key cache. A
-            // batched path is a real port plus its own proof, not a loop.
-            Model::Hyv4(_) => false,
+            // Ported AND verified token-identical to solo decode at n = 2/3/4, on sequences of
+            // DIFFERENT lengths — equal lengths hide the whole class of bug, since borrowing
+            // sequence 0's n_past gives every row the right answer when every row is at the same
+            // position. `examples/hyv4_synthetic.rs` carries the proof and runs in CI on three
+            // adapters; three mutations (rope from sequence 0, top-k offset from sequence 0, n_past
+            // never advancing) are all caught by it.
+            Model::Hyv4(_) => true,
         }
     }
 
@@ -166,7 +169,12 @@ impl Model {
             // Unreachable via the scheduler, which consults `supports_batching` first; this arm is
             // what makes adding a runtime a compile error rather than a silent wrong answer.
             Model::NemotronH(_) => unreachable!("nemotron_h has no batched path; supports_batching is false"),
-            Model::Hyv4(_) => unreachable!("hyv4 has no batched path; supports_batching is false"),
+            Model::Hyv4(m) => {
+                let mut cs: Vec<_> = caches.iter_mut()
+                    .map(|c| match &mut **c { ModelCache::Hyv4(x) => x, _ => unreachable!("model/cache kind mismatch") })
+                    .collect();
+                m.decode_batch(tokens, &mut cs)
+            }
         }
     }
 
@@ -1434,7 +1442,11 @@ mod batching_support {
         // ⚠ THE TRAILING `(` IS LOAD-BEARING. Without it the needle is a PREFIX of any renamed
         // method, so `forward_batch_RENAMED` still "contains" it and the check silently passes. That
         // exact mutation defeated the first version of this test.
-        const NEEDLE: &str = "pub fn forward_batch(";
+        // ⚠ PER-RUNTIME needle. It was a single `pub fn forward_batch(` for every row, and that
+        // silently stopped covering anything the moment a runtime named its batched entry point
+        // differently: hyv4's is `pub fn decode_batch(`, because its solo entry point is `decode`,
+        // not `forward`. A guard whose needle cannot match a runtime it is checking reports success
+        // about a method it never looked for.
 
         // ⚠ Read ONLY the body of `supports_batching`, never the whole file. The first version of this
         // test searched all of `lib.rs` for arm literals it also declared as `const` two lines above —
@@ -1452,24 +1464,32 @@ mod batching_support {
         // Proof the slice is the function and not the whole file: the consts below live outside it.
         assert!(!body.contains("const NEEDLE"), "the extracted body swallowed this test's own source");
 
-        // Every runtime is now batchable, so the refusing arm is empty and the interesting invariant
-        // is different from what it was an hour ago: it is no longer "which list is it in" but "does
-        // every variant appear in SOME arm, and does each one back its claim with a real method".
+        // ⚠ Not every runtime is batchable — `Model::NemotronH(_) => false` — so the invariant is
+        // "does every variant appear in SOME arm, and does each one that claims `true` back the
+        // claim with a real method". (This comment previously said the refusing arm was empty; it
+        // has not been since nemotron_h landed.)
         const BLANKET_ARM: &str = "Model::Lfm2(_) | Model::Gemma4(_) | Model::DeepSeek2(_) => true";
         assert!(body.contains(BLANKET_ARM),
                 "Model::supports_batching's arms changed shape; this guard reads them literally, so \
                  update both together rather than letting the guard go quiet.\nbody was:\n{body}");
 
-        // (runtime source, its Model variant, does it consult its OWN batching_supported predicate)
-        for (name, src, variant, asks_runtime) in [
-            ("qwen3",     include_str!("../../ferric-llama/src/qwen3.rs"),     "Model::Dense",     true),
-            ("qwen35",    include_str!("../../ferric-llama/src/qwen35.rs"),    "Model::Hybrid",    true),
-            ("lfm2",      include_str!("../../ferric-llama/src/lfm2.rs"),      "Model::Lfm2",      false),
-            ("gemma4",    include_str!("../../ferric-llama/src/gemma4.rs"),    "Model::Gemma4",    false),
-            ("deepseek2", include_str!("../../ferric-llama/src/deepseek2.rs"), "Model::DeepSeek2", false),
+        // (runtime source, its Model variant, its batched entry point, does it consult its OWN
+        //  batching_supported predicate)
+        for (name, src, variant, needle, asks_runtime) in [
+            ("qwen3",     include_str!("../../ferric-llama/src/qwen3.rs"),     "Model::Dense",     "pub fn forward_batch(", true),
+            ("qwen35",    include_str!("../../ferric-llama/src/qwen35.rs"),    "Model::Hybrid",    "pub fn forward_batch(", true),
+            ("lfm2",      include_str!("../../ferric-llama/src/lfm2.rs"),      "Model::Lfm2",      "pub fn forward_batch(", false),
+            ("gemma4",    include_str!("../../ferric-llama/src/gemma4.rs"),    "Model::Gemma4",    "pub fn forward_batch(", false),
+            ("deepseek2", include_str!("../../ferric-llama/src/deepseek2.rs"), "Model::DeepSeek2", "pub fn forward_batch(", false),
+            ("hyv4",      include_str!("../../ferric-llama/src/hyv4.rs"),      "Model::Hyv4",      "pub fn decode_batch(",  false),
         ] {
-            assert!(src.contains(NEEDLE),
-                    "{name} is claimed batchable by Model::supports_batching but has no {NEEDLE} — \
+            // ⚠ HONEST LABEL, verified by running the mutation: this is SUBSUMED BY THE COMPILER
+            // for every row whose dispatch arm calls the method — renaming `decode_batch` fails with
+            // `error[E0599]: no method named decode_batch`, so the mutation never reaches here. What
+            // it still catches is the case the compiler cannot see: a variant that claims `true` in
+            // supports_batching while its forward_batch arm is `unreachable!` and calls nothing.
+            assert!(src.contains(needle),
+                    "{name} is claimed batchable by Model::supports_batching but has no {needle} — \
                      either the method was removed or the claim is wrong");
             assert!(body.contains(variant),
                     "{variant} appears in no arm of Model::supports_batching — a runtime must never \
