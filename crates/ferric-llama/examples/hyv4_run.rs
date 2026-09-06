@@ -82,11 +82,23 @@ fn main() {
     let ids = tok.encode(&prompt);
     println!("prompt {prompt:?} -> {} tokens {:?}", ids.len(), &ids[..ids.len().min(12)]);
 
+    // ⭐ The comparable quantity. llama.cpp's eval-callback prints `result_output` as first-three,
+    // last-three and a SUM over the row; the sum is sensitive to every element, so it is what
+    // `scripts/hyv4_vs_reference.sh` gates on. Printing it here is what makes a real-weights
+    // comparison against Tencent's implementation possible at all — the synthetic checkpoint is the
+    // only thing that has ever been compared.
     let mut cache = Hyv4Cache::new(&m).expect("cache");
     let mut out: Vec<u32> = Vec::new();
     let t2 = Instant::now();
     let mut logits = pollster::block_on(m.decode(&ids, &mut cache).to_vec());
     let prefill = t2.elapsed().as_secs_f64();
+    {
+        let row = &logits[logits.len() - m.cfg.n_vocab..];
+        let (mn, mx) = row.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        println!("prefill last-row logits: sum {:.6}  min {mn:.6}  max {mx:.6}  first3 {:?}",
+                 row.iter().map(|v| *v as f64).sum::<f64>(),
+                 &row[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
+    }
     for i in 0..n_gen {
         let row = &logits[logits.len() - m.cfg.n_vocab..];
         let next = row.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
@@ -99,7 +111,13 @@ fn main() {
         println!("\ntier: {} block rebuilds, {:.2} GiB resident for block weights",
                  st.rebuilds(), st.resident_bytes() as f64 / 1073741824.0);
     }
-    println!("\nprefill {} tokens in {prefill:.2}s; {n_gen} tokens in {:.2}s ({:.2} tok/s)",
-             ids.len(), total - prefill, (n_gen - 1) as f64 / (total - prefill).max(1e-9));
+    // ⚠ Report the unit that carries information at THIS speed. A streamed 770B rebuilds 78 blocks
+    // per token, so "0.00 tok/s" is what tok/s degenerates to and says nothing; seconds per token
+    // is the number a reader can act on. Print both only when tok/s is actually legible.
+    let decode_s = total - prefill;
+    let per_tok = decode_s / (n_gen.saturating_sub(1)).max(1) as f64;
+    println!("\nprefill {} tokens in {prefill:.2}s ({:.2}s/token); {} generated in {decode_s:.2}s ({per_tok:.1}s/token{})",
+             ids.len(), prefill / ids.len().max(1) as f64, n_gen.saturating_sub(1),
+             if per_tok < 1.0 { format!(", {:.2} tok/s", 1.0 / per_tok) } else { String::new() });
     println!("\n{}{}", prompt, tok.decode(&out));
 }
