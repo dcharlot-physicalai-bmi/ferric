@@ -1,0 +1,84 @@
+//! **Run a real Hy4-preview checkpoint.** Greedy generation from a prompt, straight through
+//! `Hyv4::load` and `Hyv4::decode`.
+//!
+//! Everything else in this repo that touches hyv4 runs on a synthetic checkpoint or on a few
+//! range-read blocks. This is the whole model: 78 blocks, 256 experts, 213.66 GiB.
+//!
+//! ⭐ `GgufFile` reads each tensor on demand rather than holding the file, so peak HOST memory is
+//! one tensor — `ferric_gguf::parse` takes a `Vec<u8>` and would need the whole 213.66 GiB in RAM
+//! *before* any of it reached the GPU. On a 256 GiB machine that is the difference between running
+//! and thrashing.
+//!
+//! ⚠ It bypasses `arch::resolve`, which refuses `hyv4` because the row is `Status::Untried`. That
+//! refusal is correct — a server must not serve a model whose output nobody has seen — and this
+//! example is how somebody sees it. What it prints is evidence for changing that row, not a claim
+//! that the row is already wrong.
+//!
+//! ```text
+//! cargo run --release -p ferric-llama --example hyv4_run -- <model.gguf> "prompt" [n_tokens]
+//! ```
+
+use ferric_core::Context;
+use ferric_gguf::{GgufFile, Meta};
+use ferric_llama::hyv4::{Hyv4, Hyv4Cache};
+use std::sync::Arc;
+use std::time::Instant;
+
+fn main() {
+    let mut a = std::env::args().skip(1);
+    let path = match a.next() { Some(p) => p, None => { eprintln!("usage: hyv4_run <model.gguf> [prompt] [n]"); return } };
+    let prompt = a.next().unwrap_or_else(|| "The capital of France is".to_string());
+    let n_gen: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(24);
+
+    let t0 = Instant::now();
+    let g = match GgufFile::open(&path) { Ok(g) => g, Err(e) => { eprintln!("open {path}: {e}"); return } };
+    println!("opened {path} in {:.1}s — {} shard(s)", t0.elapsed().as_secs_f64(), g.shard_count());
+
+    let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU context"); return };
+    let ctx = Arc::new(ctx);
+    println!("adapter: {} [{:?}]  max binding {:.1} GiB",
+             ctx.adapter_name, ctx.backend, ctx.max_binding as f64 / 1073741824.0);
+
+    let t1 = Instant::now();
+    let m = match Hyv4::load(&ctx, &g) { Ok(m) => m, Err(e) => { eprintln!("LOAD FAILED: {e}"); std::process::exit(1) } };
+    println!("loaded {} blocks, d={}, {} experts, vocab {} in {:.1}s",
+             m.cfg.n_layer, m.cfg.d, m.cfg.n_expert, m.cfg.n_vocab, t1.elapsed().as_secs_f64());
+
+    // The tokenizer travels in the checkpoint. ⚠ `tokenizer.ggml.pre` is a SEPARATE question from
+    // `tokenizer.ggml.model`: hyv4 declares model=gpt2 and pre=hyv4, and reading only the first
+    // gives it GPT-2's splitting rule — the exact bug ferric-serve documents for the Qwen family.
+    let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
+        Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
+        _ => { eprintln!("checkpoint has no tokenizer.ggml.tokens"); return }
+    };
+    let vocab: std::collections::HashMap<String, u32> =
+        tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+    let merges: Vec<(String, String)> = match g.metadata.get("tokenizer.ggml.merges") {
+        Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m {
+            s.split_once(' ').map(|(x, y)| (x.to_string(), y.to_string())) } else { None }).collect(),
+        _ => Vec::new(),
+    };
+    let pre = ferric_tokenizer::Pre::from_gguf(
+        match g.metadata.get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None });
+    println!("tokenizer: {} tokens, {} merges, pre={:?}", tokens.len(), merges.len(), pre);
+    let tok = ferric_tokenizer::Bpe::new_with_pre(vocab, &merges, pre);
+    let ids = tok.encode(&prompt);
+    println!("prompt {prompt:?} -> {} tokens {:?}", ids.len(), &ids[..ids.len().min(12)]);
+
+    let mut cache = Hyv4Cache::new(&m).expect("cache");
+    let mut out: Vec<u32> = Vec::new();
+    let t2 = Instant::now();
+    let mut logits = pollster::block_on(m.decode(&ids, &mut cache).to_vec());
+    let prefill = t2.elapsed().as_secs_f64();
+    for i in 0..n_gen {
+        let row = &logits[logits.len() - m.cfg.n_vocab..];
+        let next = row.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
+        out.push(next);
+        if i + 1 == n_gen { break }
+        logits = pollster::block_on(m.decode(&[next], &mut cache).to_vec());
+    }
+    let total = t2.elapsed().as_secs_f64();
+    println!("\nprefill {} tokens in {prefill:.2}s; {n_gen} tokens in {:.2}s ({:.2} tok/s)",
+             ids.len(), total - prefill, (n_gen - 1) as f64 / (total - prefill).max(1e-9));
+    println!("\n{}{}", prompt, tok.decode(&out));
+}
