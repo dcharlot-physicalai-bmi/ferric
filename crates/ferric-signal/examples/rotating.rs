@@ -388,7 +388,17 @@ fn main() {
     // SEVERAL, and the aggregate cannot tell you which: a five-class figure well clear of majority
     // is equally consistent with separating every class and with separating two coarse ones while
     // guessing the rest. Those are different claims about what the tokens carry.
-    if let Some((cls, m)) = ferric_signal::nb_confusion(&docs, &per_axis[0], &train, &held) {
+    // ⛔ AND ONLY WHEN THE AXIS WAS ASKABLE. `nb_confusion` builds its rows from the TRAINING
+    // classes, so on a split whose held-out set contains a class training never saw it will happily
+    // print a breakdown of the classes that overlap — beside a table that just reported the axis
+    // `not askable`. Two answers to one question, one of them not the reported one.
+    let fault_askable = {
+        let tr: HashSet<i32> = train.iter().map(|&i| per_axis[0][i]).collect();
+        held.iter().all(|&i| tr.contains(&per_axis[0][i]))
+    };
+    if let (true, Some((cls, m))) =
+        (fault_askable, ferric_signal::nb_confusion(&docs, &per_axis[0], &train, &held))
+    {
         println!("\n  FAULT, CLASS BY CLASS  rows true, columns predicted, held-out windows\n");
         print!("  {:<10}", "");
         for c in &cls {

@@ -518,6 +518,36 @@ that a per-channel bag of codes throws away by construction.
 So the null is not a fact about bearing faults, or about frozen tokens, or about counting probes.
 **Two corpora, the same split, opposite answers.**
 
+**⚠ But that 90% has a condition on it, and a registered prediction found it by being wrong.** The
+held-out severity above is rank 1 — the middle of a three-level fault, so the unseen defect is
+*bracketed* by the training set. `--holdout` moves it. If the two corpora differ because rotating's
+seeded defects are physically larger and therefore louder, holding out the *smallest* severity
+should be much worse and holding out the largest should not be. That was the prediction, and it is
+refuted:
+
+| held-out rank | fault | majority | control | BPFI recall | BPFO recall |
+|---|---|---|---|---|---|
+| 0 — smallest, extrapolate down | *not askable* | — | — | 14.4% | 46.7% |
+| **1 — middle, interpolate** | **73.1%** | 25.0% | +2.2 | **88.9%** | **93.3%** |
+| 2 — largest, extrapolate up | 38.1% | 25.0% | +0.0 | 30.0% | 16.7% |
+
+**Both extrapolation directions collapse, and the largest defects collapse hardest.** Magnitude is
+not the variable; *bracketing* is. The tokens carry a severity-dependent signature that the probe
+interpolates within and cannot extend beyond, so the honest form of the earlier claim is: **inner-
+versus outer-race defect on an unseen seeded bearing is recovered at ~90% when the unseen defect's
+size falls inside the range that was trained on**, and at 17–47% when it does not.
+
+Rank 0 is reported `not askable` rather than scored because `Normal` has one severity and lands
+entirely in the held-out set — its recalls above come from the four classes that do overlap and are
+shown for the comparison, not as an accuracy. **That inconsistency was itself a defect**: the
+per-class breakdown was built from the *training* classes and would print beside a table that had
+just declared the axis unaskable, two answers to one question with only one of them reported. It is
+now printed only when the axis is askable.
+
+And this does not rescue CWRU. Its `part` split holds out 0.014" while training on 0.007", 0.021"
+and 0.028" — bracketed, the condition that works here — and it still fails. Bracketing is necessary
+and it is not sufficient.
+
 **The obvious explanation is bandwidth, and it is wrong.** The rotating corpus samples at 25.6 kHz
 and the CWRU runs above at 12 kHz, whose 6 kHz Nyquist may simply not reach the resonance band a
 defect signature rides on. CWRU can answer that itself: the same rig, the same seeded bearings and
