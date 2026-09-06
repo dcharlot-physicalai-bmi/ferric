@@ -760,6 +760,40 @@ impl Hyv4 {
         clamp(gate).silu().mul(&clamp(up))
     }
 
+    /// **Routing forced from an external file**, for comparing expert ARITHMETIC across
+    /// implementations without the argsort in the way.
+    ///
+    /// ⛔ WHY THIS EXISTS. Expert selection is a top-k argsort over 256 near-tied logits, so it is
+    /// discontinuous: an accumulated 1e-3 flips which expert ranks eighth, and from that point two
+    /// implementations compute DIFFERENT FUNCTIONS and no downstream number is comparable. Against
+    /// Tencent's own implementation on the real weights, blocks 0–28 agree to ~3e-6 per element and
+    /// block 29 selects one different expert on two of five tokens — after which the comparison is
+    /// meaningless rather than failing. Forcing the same selection into both is what makes blocks
+    /// 29–77 testable at all.
+    ///
+    /// Format: one line per (block, token), `block token e0 e1 … e{k-1}`. The WEIGHTS stay Ferric's
+    /// own — the point is to hold the selection fixed and compare everything else, not to import the
+    /// reference's arithmetic and compare it with itself.
+    fn forced_routing() -> Option<&'static std::collections::HashMap<(usize, usize), Vec<usize>>> {
+        use std::sync::OnceLock;
+        static TABLE: OnceLock<Option<std::collections::HashMap<(usize, usize), Vec<usize>>>> = OnceLock::new();
+        TABLE.get_or_init(|| {
+            let path = std::env::var("FERRIC_FORCE_ROUTING").ok()?;
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("FERRIC_FORCE_ROUTING={path}: {e}"));
+            let mut m = std::collections::HashMap::new();
+            for (ln, line) in text.lines().enumerate() {
+                let v: Vec<usize> = line.split_whitespace()
+                    .map(|t| t.parse().unwrap_or_else(|_| panic!("{path}:{}: not an integer: {t:?}", ln + 1)))
+                    .collect();
+                assert!(v.len() > 2, "{path}:{}: want `block token e0 …`", ln + 1);
+                m.insert((v[0], v[1]), v[2..].to_vec());
+            }
+            eprintln!("forced routing: {} (block, token) entries from {path}", m.len());
+            Some(m)
+        }).as_ref()
+    }
+
     /// Pick this token's experts and their combining weights.
     ///
     /// The order is the whole content of the function, and every step of it is a same-shape trap:
@@ -773,7 +807,7 @@ impl Hyv4 {
     /// 3. **Renormalise over the chosen k** if `expert_weights_norm`, not over all experts.
     /// 4. **Scale last** by `expert_weights_scale` (2.827). Scaling before the renormalisation
     ///    cancels it out entirely, which is the failure that looks like nothing happening.
-    fn route(&self, logits: &[f32], bias: Option<&[f32]>) -> Vec<(usize, f32)> {
+    fn route(&self, logits: &[f32], bias: Option<&[f32]>, il: usize, tok: usize) -> Vec<(usize, f32)> {
         let cfg = &self.cfg;
         let gated: Vec<f32> = if cfg.sigmoid_gate {
             logits.iter().map(|z| 1.0 / (1.0 + (-z).exp())).collect()
@@ -783,10 +817,18 @@ impl Hyv4 {
             let s: f32 = e.iter().sum();
             e.iter().map(|v| v / s).collect()
         };
-        let mut order: Vec<usize> = (0..cfg.n_expert).collect();
-        let key = |i: usize| gated[i] + bias.map_or(0.0, |b| b[i]);
-        order.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
-        order.truncate(cfg.n_expert_used);
+        let mut order: Vec<usize> = match Self::forced_routing().and_then(|m| m.get(&(il, tok))) {
+            // Selection imposed from outside; everything after this line is unchanged, so the
+            // weights and the expert arithmetic remain entirely Ferric's.
+            Some(sel) => sel.clone(),
+            None => {
+                let mut order: Vec<usize> = (0..cfg.n_expert).collect();
+                let key = |i: usize| gated[i] + bias.map_or(0.0, |b| b[i]);
+                order.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+                order.truncate(cfg.n_expert_used);
+                order
+            }
+        };
 
         // The WEIGHT is the unbiased gate value, whatever the bias did to the ordering.
         let mut w: Vec<f32> = order.iter().map(|&i| gated[i]).collect();
@@ -822,7 +864,7 @@ impl Hyv4 {
                 let dump_moe = std::env::var("FERRIC_DUMP_MOE").ok()
                     .and_then(|v| v.parse::<usize>().ok()) == Some(il);
                 for tok in 0..t {
-                    let sel = self.route(&logits[tok * cfg.n_expert..(tok + 1) * cfg.n_expert], bias.as_deref());
+                    let sel = self.route(&logits[tok * cfg.n_expert..(tok + 1) * cfg.n_expert], bias.as_deref(), il, tok);
                     // ⚠ Expert selection is a top-k ARGSORT over 256 near-tied logits, so it is
                     // DISCONTINUOUS in its input: a perturbation far below any tolerance can flip
                     // which expert ranks kth, and a different expert is not a small change. When two
