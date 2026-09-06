@@ -893,6 +893,12 @@ impl Hyv4 {
                     };
                 }
                 let shared = self.swiglu_clamped(&f.matmul_q(sh_gate), &f.matmul_q(sh_up), limit).matmul_q(sh_down);
+                // ⚠ SPLIT, because `ffn_out` is routed + shared and the reference names them
+                // separately (`ffn_moe_out` and `ffn_shexp`). Comparing a total against a part is
+                // how a factor of 2.12 appeared where there was none — the reference's
+                // `ffn_moe_out-29` is routed ONLY.
+                dump("routed", il as i64, &routed);
+                dump("shexp", il as i64, &shared);
                 routed.add(&shared)
             }
         }
