@@ -135,6 +135,10 @@ fn main() {
         eprintln!("error: --split must be one of time, torque, part");
         std::process::exit(2);
     }
+    // Which severity rank `--split part` holds out. 1 is the middle of a three-level fault, so the
+    // held-out defect is BRACKETED by the training set; 0 and 2 extrapolate down and up. Every
+    // fault has ranks 0..2, so all three choices hold out four classes and are comparable.
+    let holdout: i32 = flag(&args, "--holdout").and_then(|v| v.parse().ok()).unwrap_or(1);
 
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
         Ok(d) => d
@@ -308,7 +312,7 @@ fn main() {
         // Rank 1 of every fault: BPFI_10, BPFO_10, Misalign_03, Unbalance_1169. The seeded
         // bearings behind BPFI and BPFO are then physically absent from training, and every torque
         // appears on both sides, so nothing about the operating point is being asked.
-        "part" => (0..docs.len()).partition(|&i| ranks[doc_file[i]] != 1),
+        "part" => (0..docs.len()).partition(|&i| ranks[doc_file[i]] != holdout),
         _ => {
             // The last third of every recording, by window position within that recording.
             let cut = per_file * 2 / 3;
@@ -322,7 +326,7 @@ fn main() {
             println!("  ⚠ the SAME PHYSICAL CONDITION is in both halves at the other two torques");
         }
         "part" => {
-            println!("  held out is severity rank 1 of every fault, at all three torques");
+            println!("  held out is severity rank {holdout} of every fault, at all three torques");
             println!("  the BPFI and BPFO bearings held out are absent from training entirely");
             println!("  ⚠ misalignment and unbalance change a SETTING, not a part: for those two");
             println!("    classes this is an unseen severity rather than an unseen component");

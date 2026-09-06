@@ -389,13 +389,20 @@ mod tests {
         assert!(!a.status.runnable(), "Untried must not be runnable: a server must not serve a \
                                        model whose output nobody has seen");
         assert!(resolve("hyv4").is_err(), "resolve must refuse hyv4: {:?}", resolve("hyv4").map(|_| ()));
-        // ⭐ This assertion previously demanded the note say "NO REAL CHECKPOINT HAS BEEN LOADED",
-        // and it FAILED the moment that stopped being true -- which is the guard working, not
-        // breaking. Real weights now run in slices. What still has no oracle is the arithmetic, so
-        // that is what the row must keep saying, and this is what pins it there.
-        assert!(a.note.contains("THAT IS NOT FIDELITY"),
-                "the row must still name the bound that remains: real weights running is not \
-                 evidence that the numbers are Tencent's numbers");
+        // ⭐ THIS ASSERTION HAS NOW FAILED TWICE, AND BOTH TIMES THAT WAS THE POINT. It first
+        // demanded "NO REAL CHECKPOINT HAS BEEN LOADED", which stopped being true when real weights
+        // ran in slices. It then demanded "THAT IS NOT FIDELITY", which stopped being true when
+        // AngelSlim's llama.cpp built and Ferric's forward matched it. Each failure was the row's
+        // bound moving, not the guard breaking, and each time the fix is to repoint it at what is
+        // STILL true rather than to soften the note until it passes.
+        //
+        // What is still true: the reference agreement is on a SYNTHETIC checkpoint. Nothing has
+        // compared this forward to Tencent's on the real weights.
+        assert!(a.note.contains("SYNTHETIC checkpoint"),
+                "the row must name the bound that remains: the reference agreement is on a \
+                 synthetic checkpoint, not on Tencent's real weights");
+        assert!(a.note.contains("hyv4_vs_reference.sh"),
+                "the row claims a reference comparison; it must name the script that performs it");
         assert!(a.note.contains("hyv4_real_moe.rs") && a.note.contains("hyv4_real_block.rs"),
                 "the row must name the runs that back its real-weights claim, so the claim is \
                  checkable rather than assertable");
