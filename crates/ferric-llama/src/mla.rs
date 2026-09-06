@@ -366,6 +366,22 @@ impl Mla {
         self.gate_and_project(&ao, hs)
     }
 
+    /// Env-gated dump of the three tensors `project` produces, for bisecting against llama.cpp's
+    /// `llama-eval-callback`, whose hyv4 graph names them `kv_cmpr-N`, `q_pe-N` and `k_pe-N`.
+    /// Set `FERRIC_DUMP_MLA=1`. Off by default and free when off.
+    ///
+    /// ⚠ ggml prints shapes reversed: Ferric's latent `[s, kv_lora]` is their `{kv_lora, s}`. The
+    /// VALUES are what is being compared, in the order they are stored.
+    fn dump_mla(tag: &str, t: &Tensor) {
+        if std::env::var("FERRIC_DUMP_MLA").is_err() { return }
+        let v = pollster::block_on(t.to_vec());
+        let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+        for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
+        let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.4}")).collect();
+        println!("      mla {tag:<10} {:?} n={} sum {sum:+.4} min {mn:+.4} max {mx:+.4}  {}",
+                 t.shape, v.len(), head.join(" "));
+    }
+
     /// Everything both paths share: the query, the compressed latent, and the one shared RoPE key.
     ///
     /// Returns `(q_nope [s,h,nope], q_rot [s,h,rope], latent [s,kv_lora] (normed), k_rot [s,rope])`.
@@ -396,6 +412,9 @@ impl Mla {
         let k_rot = self
             .deinterleave(&ckv.narrow(1, kvl, rope).contiguous(), s)
             .apply_rope_costable(cos, sin, 1, rope);
+        Self::dump_mla("kv_cmpr", &latent);
+        Self::dump_mla("q_pe", &q_rot);
+        Self::dump_mla("k_pe", &k_rot);
         (q_pass, q_rot, latent, k_rot)
     }
 
