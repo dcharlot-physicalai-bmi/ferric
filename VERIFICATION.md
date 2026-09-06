@@ -179,13 +179,23 @@ said it did not have.
 ⛔ **At block 29 the two implementations SELECT DIFFERENT EXPERTS**, and only at the margin:
 
 ```
-tok 2   ref  156 192 187 …  40 83  93     ferric  156 192 193 187 185 40 16 83
-tok 4   ref  156  87 185 …  94 51 224     ferric  156  87 185 193 242 224 94 17
+tok 1  ref 156 193 185 200 93 186  83 103   ferric 156 193 185 200 93 186 103 83   same set
+tok 2  ref 156 192 187 193 185  40 83  93   ferric 156 192 193 187 185  40  16 83   93 → 16
+tok 3  ref 156  61 185 193 107  57 112 104  ferric 156  61 185 193 107  57 112 104  identical
+tok 4  ref 156  87 185 193 242  94  51 224  ferric 156  87 185 193 242 224  94  17   51 → 17
 ```
 
-The top-ranked experts agree exactly; the reference takes 93 and 51 where Ferric takes 16 and 17, at
-ranks 7–8. **The router itself is correct** — its output agrees to ~0.003 absolute on values of ~3.5
-(sum −3316.96 against −3308.44). A wrong gate disagrees at the top, not only at the tail.
+**Three of five tokens select identically** (one differing only in tie ORDER, which changes nothing —
+the weight travels with the expert). The other two differ by **exactly one expert, at rank 8**, the
+lowest-weighted of the eight. **The router itself is correct**: its output agrees to ~0.003 absolute
+on values of ~3.5 (sum −3316.96 against −3308.44). A wrong gate disagrees at the top, not only at the
+tail, and not on only two tokens out of five.
+
+⚠ Reading those rows at all required patching the reference. `common_debug_print_tensor` hardcodes
+`n = 3`, which elides the middle of every row — fine for eyeballing an activation, useless for a
+tensor **whose values are the answer**: at `n = 3` two of the eight expert ids print as `...`. The
+first version of this comparison was made against six-of-eight and drew the same conclusion, which
+was luck rather than method. `LLAMA_DEBUG_N` now sets it.
 
 ⭐ **Selection is an ARGSORT, which is discontinuous.** Router logits span −5.18 to +2.44 across 256
 experts, so ranks near the top-8 cut are separated by hundredths, and a difference of 0.003 flips
@@ -201,6 +211,11 @@ argsort makes fragile by construction. An end-to-end logit comparison is the wro
 **What would settle block 29 onward**: force identical routing in both (feed the reference's expert
 choice into Ferric) and compare the expert arithmetic alone. Until then, blocks 0–28 are verified
 against Tencent's implementation on real weights and blocks 29–77 are **untested, not wrong**.
+
+⚠ **The reference itself only runs this model on CPU.** Its Metal backend crashes in
+`ggml_metal_op_mul_mat_id` on hyv4's MoE — so the comparison is Ferric-on-Metal against
+llama.cpp-on-CPU, and some of the ~3e-6 baseline difference is that. Ferric runs the same expert
+matmul on Metal without incident.
 
 ---
 

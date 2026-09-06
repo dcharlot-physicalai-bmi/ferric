@@ -338,8 +338,17 @@ pub fn open_with(
     overlap: bool,
 ) -> Result<LayerStream, String> {
     let file = GgufFile::open(path)?;
-    let (header, _) = ferric_gguf::backed::header_probe(
-        &*backing, u64::MAX, 1 << 20, 64 << 20)
+    // ⛔ `total` is the FILE SIZE, not a sentinel. Passing u64::MAX disables both things it exists
+    // for: capping the probe buffer, and the "whole file read without a valid header" exit. On a
+    // file SHORTER than the 1 MiB initial probe the loop then grows toward `max`, zero-filling and
+    // re-parsing each round — measured at nineteen minutes on a 100 KB checkpoint, parked in
+    // `_xzm_malloc_large_huge`, when hyv4's streaming path copied this line verbatim.
+    //
+    // It is latent HERE only because qwen3 streams checkpoints far larger than the probe, so the
+    // bug is unreachable for every input this path has ever had. That is exactly the kind of wrong
+    // argument that survives: correct-looking, never exercised, and copied onward.
+    let total = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("{path}: {e}"))?;
+    let (header, _) = ferric_gguf::backed::header_probe(&*backing, total, 1 << 20, 64 << 20)
         .or_else(|_| std::fs::read(path).map(|b| { let n = b.len(); (b, n) }).map_err(|e| e.to_string()))?;
     let src = GgufBacked::new(header, Arc::clone(&backing))?;
     // Same reason as `layer_runs`: one `Backing` cannot address a multi-part checkpoint.
