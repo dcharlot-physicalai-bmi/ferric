@@ -211,6 +211,8 @@ fn main() {
 
     // ---- tokenize ----
     let mut docs: Vec<Vec<Vec<u32>>> = Vec::new();
+    // (recording length, window stride) per recording, for the overlap report below.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut doc_file: Vec<usize> = Vec::new();
     let mut doc_pos: Vec<usize> = Vec::new();
     let mut codes_seen: HashSet<u32> = HashSet::new();
@@ -245,6 +247,7 @@ fn main() {
             std::process::exit(1);
         }
         let stride = if per_file > 1 { (len - window) / (per_file - 1) } else { 0 };
+        spans.push((len, stride));
         for w in 0..per_file {
             let start = w * stride;
             let mut runs = Vec::with_capacity(n_chan);
@@ -277,6 +280,27 @@ fn main() {
     println!("\n  {} windows, {} channels each, {} of {} codes visited ({:.1}%)",
              docs.len(), n_chan, codes_seen.len(), q.codebook_size(),
              codes_seen.len() as f64 / q.codebook_size() as f64 * 100.0);
+
+    // ⛔ WINDOW COUNT IS NOT SAMPLE COUNT WHEN THE WINDOWS OVERLAP. Ask for more windows than a
+    // recording holds and the stride falls below the window length and they overlap silently,
+    // while the run keeps printing a window count as though each were an independent draw. This
+    // corpus does not overlap — 1,536,000 samples per recording against thirty 25,600-sample
+    // windows — and CWRU does, by 78%, which is one measured difference between two corpora that
+    // answer the same question differently. Printed either way so the comparison is on the page.
+    {
+        let mut v = spans.clone();
+        v.sort_unstable();
+        if let Some(&(len, stride)) = v.get(v.len() / 2) {
+            let fit = len / window;
+            println!("  median recording {len} samples; stride {stride}, window {window}");
+            if stride < window {
+                println!("  ⚠ WINDOWS OVERLAP BY {:.0}% — {per_file} requested, {fit} fit end to end",
+                         (1.0 - stride as f64 / window as f64) * 100.0);
+            } else {
+                println!("  windows do not overlap: {per_file} requested, {fit} fit end to end");
+            }
+        }
+    }
 
     // ---- split ----
     let (train, held): (Vec<usize>, Vec<usize>) = match split.as_str() {

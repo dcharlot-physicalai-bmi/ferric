@@ -14,7 +14,9 @@
 //!
 //! ## Why two files, and not one
 //!
-//! There is still no reference implementation on this machine. But this model is published at two
+//! ⚠ Written when there was no reference implementation here. There is one now --
+//! `scripts/hyv4_vs_reference.sh` -- but it runs on a SYNTHETIC checkpoint, so this cross-quant
+//! check remains the only thing that pins the REAL weights. This model is published at two
 //! quantisations, and that is a free oracle: the same trained tensor, rounded twice by two
 //! different quantisers into two formats decoded by two different code paths. Neither arm can
 //! borrow the other's bug. Agreement between them is evidence about the *weights and the wiring*,

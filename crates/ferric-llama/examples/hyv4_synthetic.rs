@@ -93,6 +93,26 @@ fn build(top_k: u32) -> Vec<u8> {
         .kv_str("tokenizer.ggml.model", "gpt2")
         .kv_str("tokenizer.ggml.pre", "hyv4");
 
+    // ⭐ A MINIMAL BPE VOCAB, so this file is readable by ANOTHER IMPLEMENTATION and not just by the
+    // code that wrote it. llama.cpp refuses a gpt2-model checkpoint with "cannot find tokenizer
+    // merges in model file" before it will build a graph, and an oracle needs ONE file both sides
+    // load — not two builders that agree with themselves. Ferric's own loader ignores these keys;
+    // they exist purely so the reference can get as far as the forward pass.
+    // SINGLE-CHARACTER tokens, so ordinary text actually tokenizes: a BPE whose vocabulary is
+    // "t0".."t39" cannot segment anything, and the reference loads fine and then reports "there are
+    // not input tokens to process" — a model that loads but cannot be given input is not an oracle.
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789+-*/";
+    assert_eq!(ALPHABET.len(), VOCAB, "the alphabet must supply exactly one token per vocab slot");
+    let tokens: Vec<String> = ALPHABET.iter().map(|c| (*c as char).to_string()).collect();
+    let merges: Vec<String> = (0..VOCAB - 1)
+        .map(|i| format!("{} {}", tokens[i], tokens[i + 1])).collect();
+    let ttype: Vec<i32> = vec![1; VOCAB];   // 1 = LLAMA_TOKEN_TYPE_NORMAL
+    w.kv_arr_str("tokenizer.ggml.tokens", &tokens)
+        .kv_arr_str("tokenizer.ggml.merges", &merges)
+        .kv_arr_i32("tokenizer.ggml.token_type", &ttype)
+        .kv_u32("tokenizer.ggml.bos_token_id", 0)
+        .kv_u32("tokenizer.ggml.eos_token_id", (VOCAB - 1) as u32);
+
     w.tensor_f32("token_embd.weight", &[D as u64, VOCAB as u64], &rnd(VOCAB * D))
         .tensor_f32("output.weight", &[D as u64, VOCAB as u64], &rnd(VOCAB * D))
         .tensor_f32("output_norm.weight", &[D as u64], &vec![1.0; D])
@@ -151,6 +171,29 @@ fn build(top_k: u32) -> Vec<u8> {
 }
 
 fn main() {
+    // `hyv4_synthetic <path>` writes the checkpoint and exits, so the SAME bytes can be handed to
+    // another implementation. That is the point: an oracle needs one file, not two builders.
+    // `hyv4_synthetic --logits 3,11,7` prints the LAST row's logits and their sum, which is the
+    // shape llama.cpp's eval-callback reports (`result_output` is one row: the last position).
+    if std::env::args().nth(1).as_deref() == Some("--logits") {
+        let ids: Vec<u32> = std::env::args().nth(2).expect("--logits <csv ids>")
+            .split(',').map(|t| t.trim().parse().expect("token id")).collect();
+        let ctx = Arc::new(pollster::block_on(Context::new()).expect("gpu"));
+        let g = ferric_gguf::parse(build(64)).expect("parse");
+        let m = Hyv4::load(&ctx, &g).expect("load");
+        let l = pollster::block_on(m.forward(&ids).to_vec());
+        let last = &l[(ids.len() - 1) * VOCAB..];
+        println!("ferric last-row logits for {ids:?}:");
+        for (i, v) in last.iter().enumerate() { print!("{v:>12.6}{}", if i % 8 == 7 { "\n" } else { "" }); }
+        println!("sum = {:.6}", last.iter().sum::<f32>());
+        return;
+    }
+    if let Some(out) = std::env::args().nth(1) {
+        let bytes = build(64);
+        std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("write {out}: {e}"));
+        println!("wrote {} bytes to {out}", bytes.len());
+        return;
+    }
     let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU context"); return };
     let ctx = Arc::new(ctx);
 

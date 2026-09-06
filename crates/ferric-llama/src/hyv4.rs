@@ -30,7 +30,7 @@
 //! interop check against Tencent's own published weights. See `VERIFICATION.md`.
 //!
 //! ⛔ **What is NOT verified is this file against the real model.** The smallest published
-//! checkpoint is 213.66 GiB and this machine has ~47 GB free, so nothing here has ever seen the
+//! checkpoint is 213.66 GiB, so nothing in this file's own tests has ever seen the
 //! trained weights. The test in `examples/hyv4_synthetic.rs` writes a tiny checkpoint and runs a
 //! forward pass through it, which proves the WIRING — that the pieces compose, the tensor names
 //! resolve, the shapes agree end to end. It cannot prove fidelity to Tencent's model, because the

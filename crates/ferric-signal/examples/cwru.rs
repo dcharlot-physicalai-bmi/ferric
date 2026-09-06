@@ -391,6 +391,8 @@ fn main() {
     let mut doc_rec: Vec<usize> = Vec::new();
     let mut doc_pos: Vec<usize> = Vec::new();
     let mut codes_seen: HashSet<u32> = HashSet::new();
+    // (recording length, window stride) per recording, for the overlap report below.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut skipped_channels = 0usize;
 
     for (ri, (path, _)) in records.iter().enumerate() {
@@ -415,6 +417,7 @@ fn main() {
             continue;
         }
         let stride = if per_file > 1 { (len - window) / (per_file - 1) } else { 0 };
+        spans.push((len, stride));
         for w in 0..per_file {
             let start = w * stride;
             let mut runs = Vec::with_capacity(2);
@@ -441,6 +444,35 @@ fn main() {
         }
         if ri % 25 == 0 {
             println!("    tokenized {}/{} recordings", ri + 1, records.len());
+        }
+    }
+
+
+    let span = {
+        let mut v = spans.clone();
+        v.sort_unstable();
+        v.get(v.len() / 2).copied()
+    };
+    // ⛔ WINDOW COUNT IS NOT SAMPLE COUNT WHEN THE WINDOWS OVERLAP, and this line was missing.
+    //
+    // `stride = (len - window) / (per_file - 1)` spreads the requested windows across whatever the
+    // recording holds. Ask for more than fit and the stride falls below the window length and they
+    // overlap — silently, while the run goes on printing a window count as though each were an
+    // independent draw. CWRU recordings are about 121,000 samples (10.1 s at 12 kHz), so forty
+    // 12,800-sample windows overlap by 78% and every sample appears in about 4.6 of them. The
+    // rotating corpus is 1,536,000 samples and its thirty windows do not overlap at all, which is
+    // one measured difference between two corpora that answer the same question differently.
+    if let Some((len, stride)) = span {
+        let fit = len / window;
+        let over = if stride >= window { 0.0 } else { (1.0 - stride as f64 / window as f64) * 100.0 };
+        println!("  median recording {len} samples; stride {stride}, window {window}");
+        if over > 0.0 {
+            println!("  ⚠ WINDOWS OVERLAP BY {over:.0}% — {per_file} requested, {fit} fit end to end,");
+            println!("    so each sample appears in about {:.1} of them and the window count above",
+                     window as f64 / stride.max(1) as f64);
+            println!("    is NOT a count of independent draws");
+        } else {
+            println!("  windows do not overlap: {per_file} requested, {fit} fit end to end");
         }
     }
 

@@ -105,6 +105,51 @@ like it did.
 
 ---
 
+## 3c. Reference comparison — the only hyv4 check that is not a self-comparison
+
+Every other hyv4 check in this repo compares Ferric to Ferric: decode against prefill, batched
+against solo, one quantisation against another, a golden hash against its own earlier self. **All of
+them are satisfied by a wrong-but-consistent implementation.** This one is not.
+
+`llama.cpp`'s `src/models/hyv4.cpp` is Tencent's own graph, written by other people from the same
+spec. `scripts/hyv4_vs_reference.sh` runs it and Ferric **over the same file** — the synthetic
+checkpoint Ferric's own GGUF writer emits:
+
+| prompt | reference | ferric | Δ (sum of 40 logits) |
+|---|---|---|---|
+| `dlh` (3,11,7) | −0.168091 | −0.168631 | 0.000540 |
+| `a` (0) | −2.257787 | −2.258252 | 0.000465 |
+| `mzq` (12,25,16) | 3.444252 | 3.443293 | 0.000959 |
+| `abcde` (0,1,2,3,4) | 3.468959 | 3.468463 | 0.000496 |
+| `k9x` (10,35,23) | 5.219286 | 5.219245 | **0.000041** |
+| `zzz` (25,25,25) | 3.215248 | 3.214783 | 0.000465 |
+| `q7` (16,33) | 1.244925 | 1.244365 | 0.000560 |
+
+~1e-5 per element — a NEON CPU and a Metal GPU reducing in different orders. The six individual
+values `eval-callback` prints for `dlh` match Ferric's to every digit shown.
+
+⛔ **"No reference implementation builds on this machine" was repeated for an entire session and was
+simply never tested.** The patches apply cleanly at llama.cpp `0cea36222` and build CPU-only in
+minutes; the CUDA half of patch 0002 is additive, and STQ1_0 has a CPU path. **Retest a blocker
+before quoting it** — the same session also carried "~47 GB free" when the machine had 302 GB.
+
+Two gaps in Ferric's own checkpoint had to close before the file was readable by anyone else, and
+both are worth knowing:
+
+- llama.cpp refuses a `gpt2`-model GGUF with **no `tokenizer.ggml.merges`**, before it will build a
+  graph. Ferric's loader ignores those keys, so nothing here had ever needed them.
+- A vocabulary of `t0`…`t39` **cannot segment any text**. The model then loads perfectly and reports
+  *"there are not input tokens to process"*. A model that loads but cannot be given input is not an
+  oracle. Single-character tokens fixed it.
+
+⚠ **What this does NOT establish.** It is a *synthetic* checkpoint at d=32 with short prompts. It
+does not cover the real weights, 256-way routing, a block past 1, long context, or a `top_k` that
+actually selects — the synthetic config admits every position. The gate is `5e-3` on the logit sum
+against observed `4.1e-5 … 9.6e-4`; that is one observation set, so widen it only with a reason and
+never to make a failure go away.
+
+---
+
 ## 4. Derived rounding bounds — and one that is honestly loose
 
 Not chosen numbers. Count the roundings, bound each against the **operand scale** Σ|terms| — the
@@ -243,11 +288,10 @@ Three rounds of that found the checks themselves were wrong:
   quant shader with no GPU, but **structure only** — never semantics.
 - **The indexer score's floating point.** ReLU is not a polynomial, so the GF(p) method does not
   reach it. Runtime tests only.
-- **That hyv4's *arithmetic* is Tencent's arithmetic.** No reference implementation builds on this
-  machine and the smallest checkpoint is 213.66 GiB against ~47 GB free, so nothing here compares
-  this forward against theirs. Both cross-quant arms run the *same* forward code; a
-  wrong-but-consistent formula agrees with itself. The formula is covered by the Kani harnesses,
-  the GF(p) identities and the synthetic golden hash — not by any real-weights run.
+- **~~That hyv4's *arithmetic* is Tencent's arithmetic.~~** Now checked against Tencent's own
+  implementation — see §3c. What remains uncovered is that it matches on the **real weights**: the
+  reference comparison runs on a synthetic checkpoint with short prompts, and nothing yet exercises
+  256-way routing, a block past 1, or long context against the reference.
 - **Any block but 0 and 1, and any routing wider than 4 experts.** `hyv4_real_moe` slices 4 experts
   of the published 256 and runs top-2. Nothing exercises 256-way routing or an expert past index 3.
 - **~~Batched decode for hyv4.~~** Done — `Hyv4::decode_batch`, verified token-identical to solo

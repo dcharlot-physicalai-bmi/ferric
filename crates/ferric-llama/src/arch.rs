@@ -249,9 +249,12 @@ pub const REGISTRY: &[Arch] = &[
                   and examples/hyv4_real_moe.rs runs block 1 ENTIRE -- attention and 4 of its 256 \
                   experts -- from BOTH published builds at once, agreeing at cos 0.96671 between \
                   IQ2_XXS/IQ3_XXS and Q4_K/Q6_K against a measured no-routed-path floor of 0.29180. \
-                  ⛔ THAT IS NOT FIDELITY: no reference implementation builds here (the full \
-                  checkpoint is 213.66 GiB against ~47 GB free), both cross-quant arms run the SAME \
-                  forward, and a wrong-but-consistent formula agrees with itself. Nothing exercises \
+                  ⭐ AND THE FORWARD MATCHES A REFERENCE: AngelSlim's llama.cpp patches apply \
+                  cleanly at 0cea36222 and build CPU-only, so scripts/hyv4_vs_reference.sh runs \
+                  Tencent's own hyv4.cpp and Ferric over THE SAME file -- 7 prompts, agreement to \
+                  f32 accumulation noise. The first hyv4 check here that is not a self-comparison. \
+                  ⛔ NOT full fidelity: that runs on a SYNTHETIC checkpoint with short prompts, the \
+                  cross-quant arms above run the SAME forward as each other, and nothing exercises \
                   256-way routing or a block past 1. Cached decode DOES exist (Hyv4Cache + \
                   Hyv4::decode) and is pinned to the full forward on every split of a sequence, dense \
                   and sparse. The runtime field is now Runtime::Hyv4 -- it named DeepSeek2 as a \
