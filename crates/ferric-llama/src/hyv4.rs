@@ -808,8 +808,20 @@ impl Hyv4 {
                 let t = f.shape[0];
                 let logits = pollster::block_on(f.matmul_q(router).to_vec());
                 let mut routed = Tensor::from_vec(&self.ctx, &vec![0.0f32; t * cfg.d], &[t, cfg.d]);
+                let dump_moe = std::env::var("FERRIC_DUMP_MOE").ok()
+                    .and_then(|v| v.parse::<usize>().ok()) == Some(il);
                 for tok in 0..t {
                     let sel = self.route(&logits[tok * cfg.n_expert..(tok + 1) * cfg.n_expert], bias.as_deref());
+                    // ⚠ Expert selection is a top-k ARGSORT over 256 near-tied logits, so it is
+                    // DISCONTINUOUS in its input: a perturbation far below any tolerance can flip
+                    // which expert ranks kth, and a different expert is not a small change. When two
+                    // implementations of a 78-layer MoE disagree, the first question is whether they
+                    // even chose the same experts — comparing activations assumes they did.
+                    if dump_moe {
+                        let ids: Vec<usize> = sel.iter().map(|(e, _)| *e).collect();
+                        let ws: Vec<String> = sel.iter().map(|(_, w)| format!("{w:.4}")).collect();
+                        println!("  moe[{il}] tok {tok}: experts {ids:?}\n            weights {ws:?}");
+                    }
                     let row = f.narrow(0, tok, 1).contiguous();
                     let mut acc = Tensor::from_vec(&self.ctx, &vec![0.0f32; cfg.d], &[1, cfg.d]);
                     for (e, w) in sel {
