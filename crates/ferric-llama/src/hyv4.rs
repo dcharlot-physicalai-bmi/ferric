@@ -339,6 +339,27 @@ impl std::ops::Deref for BlockRef<'_> {
     }
 }
 
+/// Env-gated tensor dump for bisecting against llama.cpp's `llama-eval-callback`, whose
+/// `common_debug_cb_eval` lines carry comparable names (`embd`, `hc_init`, `attn_norm-N`,
+/// `attn_out-N`, `ffn_out-N`). Set `FERRIC_DUMP=<block index>`; `FERRIC_DUMP=-1` dumps
+/// pre-block tensors only, which is enough to localise an embedding or tokenizer difference
+/// without paying for a 78-block forward.
+///
+/// ⚠ Prints the SUM as well as the head values. Ferric agrees with Tencent's implementation on a
+/// synthetic checkpoint and DISAGREES on the real weights (sum -208343.8 against -377666.7 on the
+/// same five tokens), so what is wanted is the first stage where they part — and a mean or a range
+/// can match while a permutation hides underneath, which is why the head values are printed too.
+fn dump(tag: &str, il: i64, t: &Tensor) {
+    let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
+    if want.parse::<i64>().ok() != Some(il) { return }
+    let v = pollster::block_on(t.to_vec());
+    let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+    for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
+    let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.5}")).collect();
+    println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.4} min {mn:+.5} max {mx:+.5}\n               {}",
+             t.shape, v.len(), head.join(" "));
+}
+
 /// Build one hyv4 block from a weight source.
 ///
 /// **Extracted from `Hyv4::load` unchanged**, for the reason `qwen3::build_layer` gives: every
@@ -831,9 +852,11 @@ impl Hyv4 {
         let t = tokens.len();
         let rows: Vec<u32> = tokens.to_vec();
         let emb = self.tok_embd.gather_rows(&rows);
+        dump("embd", -1, &emb);
         let (cos, sin) = self.rope_tables(t);
 
         let mut h = self.hc.replicate(&emb);
+        dump("hc_init", -1, &h);
         // The selection is graph-local: recomputed at every full layer, reused by the layers after
         // it. It is NOT cached across forward passes -- both the query and the key set move.
         let mut last_mask: Option<Tensor> = None;
@@ -844,7 +867,9 @@ impl Hyv4 {
 
             let res = h.clone();
             let (x, q) = self.hc.pre(&h, &blk.hc_attn);
+            dump("hc_pre", il as i64, &x);
             let cur = x.rmsnorm(&blk.attn_norm, cfg.eps);
+            dump("attn_norm", il as i64, &cur);
 
             debug_assert_eq!(blk.indexer.is_some(), self.schedule.is_full(il),
                              "block {il}: indexer presence disagrees with the schedule");
@@ -863,6 +888,7 @@ impl Hyv4 {
             assert!(last_mask.is_some(), "layer {il} has no selection; is_full[0] must be true");
 
             let a = blk.mla.forward_masked(&cur, &cos, &sin, last_mask.as_ref());
+            dump("attn_out", il as i64, &a);
             h = self.hc.post(&a, &res, &q);
 
             let res = h.clone();
