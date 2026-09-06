@@ -29,6 +29,9 @@ fn main() {
     let path = match a.next() { Some(p) => p, None => { eprintln!("usage: hyv4_run <model.gguf> [prompt] [n]"); return } };
     let prompt = a.next().unwrap_or_else(|| "The capital of France is".to_string());
     let n_gen: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(24);
+    // Fourth arg: a streaming budget in GiB for BLOCK weights. Without it the model is loaded
+    // resident, which for Hy4-preview needs more than a 256 GiB machine has.
+    let budget_gib: Option<f64> = a.next().and_then(|s| s.parse().ok());
 
     let t0 = Instant::now();
     let g = match GgufFile::open(&path) { Ok(g) => g, Err(e) => { eprintln!("open {path}: {e}"); return } };
@@ -40,9 +43,23 @@ fn main() {
              ctx.adapter_name, ctx.backend, ctx.max_binding as f64 / 1073741824.0);
 
     let t1 = Instant::now();
-    let m = match Hyv4::load(&ctx, &g) { Ok(m) => m, Err(e) => { eprintln!("LOAD FAILED: {e}"); std::process::exit(1) } };
-    println!("loaded {} blocks, d={}, {} experts, vocab {} in {:.1}s",
-             m.cfg.n_layer, m.cfg.d, m.cfg.n_expert, m.cfg.n_vocab, t1.elapsed().as_secs_f64());
+    let m = match budget_gib {
+        Some(gib) => {
+            let b = (gib * 1073741824.0) as u64;
+            println!("streaming: {gib:.1} GiB budget for block weights");
+            match Hyv4::load_streaming(&ctx, &path, b) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("STREAMING LOAD FAILED: {e}"); std::process::exit(1) }
+            }
+        }
+        None => match Hyv4::load(&ctx, &g) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("LOAD FAILED: {e}"); std::process::exit(1) }
+        },
+    };
+    println!("loaded {} blocks, d={}, {} experts, vocab {} in {:.1}s{}",
+             m.cfg.n_layer, m.cfg.d, m.cfg.n_expert, m.cfg.n_vocab, t1.elapsed().as_secs_f64(),
+             if m.stream().is_some() { " (streamed)" } else { " (resident)" });
 
     // The tokenizer travels in the checkpoint. ⚠ `tokenizer.ggml.pre` is a SEPARATE question from
     // `tokenizer.ggml.model`: hyv4 declares model=gpt2 and pre=hyv4, and reading only the first
@@ -78,6 +95,10 @@ fn main() {
         logits = pollster::block_on(m.decode(&[next], &mut cache).to_vec());
     }
     let total = t2.elapsed().as_secs_f64();
+    if let Some(st) = m.stream() {
+        println!("\ntier: {} block rebuilds, {:.2} GiB resident for block weights",
+                 st.rebuilds(), st.resident_bytes() as f64 / 1073741824.0);
+    }
     println!("\nprefill {} tokens in {prefill:.2}s; {n_gen} tokens in {:.2}s ({:.2} tok/s)",
              ids.len(), total - prefill, (n_gen - 1) as f64 / (total - prefill).max(1e-9));
     println!("\n{}{}", prompt, tok.decode(&out));
