@@ -21,7 +21,7 @@
 //! decode path would be unverified code wearing a verified module's name. It is a deliberate omission,
 //! not an oversight — see [`CachePolicy`] for the design decision it will have to make first.
 
-use ferric_tensor::{nn, Tensor};
+use ferric_tensor::{dtype::QMatrix, nn, Tensor};
 
 /// Shapes and constants for one MLA block.
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +148,37 @@ impl MlaCache {
     }
 }
 
+/// How a plain 2-D projection is stored.
+///
+/// **Variants, not a flag.** `Dense` is the form verified layer-exact against AMD's real module;
+/// `Packed` is what makes a 770B fit in memory. Both compute `y = x·Wᵀ` — `matmul_bt` and `matmul_q`
+/// have identical semantics — so the choice is storage, not arithmetic.
+///
+/// ⛔ THE REASON THIS EXISTS, MEASURED. `attn_gate` and `attn_output` are 100.7M elements each on
+/// Hy4-preview. Held as f32 that is 805 MB per block, **62 GiB across 77 blocks**, against ~15 GiB
+/// for the same tensors on disk. Loading them dense put the model at **276.7 GiB resident against
+/// 256 GiB of RAM**, and the kernel killed it (SIGKILL, exit 137). Packed, the same model is
+/// ~214 GiB and fits. `hyv4.rs` predicted this in a comment long before anyone ran it: "on the 770B
+/// that is a real memory cost and the right fix is a packed MLA path".
+pub enum Proj {
+    Dense(Tensor),
+    Packed(QMatrix),
+}
+
+impl Proj {
+    /// `y = x·Wᵀ`, whichever way the weight is stored.
+    pub fn apply(&self, x: &Tensor) -> Tensor {
+        match self {
+            Proj::Dense(w) => x.matmul_bt(w),
+            Proj::Packed(w) => x.matmul_q(w),
+        }
+    }
+    /// Bytes this projection occupies. `Dense` is 4 per element by construction.
+    pub fn nbytes(&self) -> usize {
+        match self { Proj::Dense(t) => t.shape.iter().product::<usize>() * 4, Proj::Packed(q) => q.nbytes() }
+    }
+}
+
 /// How the query is produced. Checkpoints differ, and the difference is not a flag on one code path:
 /// the low-rank form has a norm in the middle, so it cannot be folded into a single matrix.
 pub enum QProj {
@@ -234,7 +265,7 @@ pub struct MlaWeights {
     /// How the latent becomes K and V. See [`KvUp`].
     pub kv_up: KvUp,
     /// `[hidden, n_heads * v_head_dim]`.
-    pub o_proj: Tensor,
+    pub o_proj: Proj,
     /// One learnable softmax sink per head, `[n_heads]`, raw. `None` is ordinary attention, and that
     /// is the path verified against AMD's module — a `Some` here takes a different softmax.
     pub sinks: Option<Tensor>,
@@ -242,7 +273,7 @@ pub struct MlaWeights {
     ///
     /// The order matters and differs between architectures — Kimi's KDA norms first and then gates, MLA
     /// gates without a norm. Sharing one code path between them is wrong.
-    pub gate_proj: Option<Tensor>,
+    pub gate_proj: Option<Proj>,
 }
 
 /// One MLA block.
@@ -300,10 +331,10 @@ impl Mla {
         // ⚠ The gate reads the LAYER INPUT, not the attention output, and it is per-token — so it
         // needs no cache and decode passes only the new rows.
         let ao = match &self.w.gate_proj {
-            Some(g) => ao.mul(&hs.matmul_bt(g).sigmoid()),
+            Some(g) => ao.mul(&g.apply(hs).sigmoid()),
             None => ao.clone(),
         };
-        ao.matmul_bt(&self.w.o_proj)
+        self.w.o_proj.apply(&ao)
     }
 
     /// **Cached incremental decode.** `hs` is the new tokens only; `cos`/`sin` are the RoPE table
@@ -609,7 +640,7 @@ mod absorbed_tests {
             kv_a_proj_with_mqa: rnd(ctx, &[KVL + ROPE, HID], 2),
             kv_a_layernorm: rnd(ctx, &[KVL], 3),
             kv_up,
-            o_proj: rnd(ctx, &[HID, H * VH], 4),
+            o_proj: Proj::Dense(rnd(ctx, &[HID, H * VH], 4)),
             gate_proj: None,
             sinks,
         }

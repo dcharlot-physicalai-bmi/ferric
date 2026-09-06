@@ -30,3 +30,8 @@ crates/ferric-web/site/pkg/
 # Transient audit probes written by analysis agents; promoted deliberately if they earn it.
 crates/*/examples/_audit_*.rs
 crates/*/examples/*_offset_probe.rs
+
+# Reference implementation for scripts/hyv4_vs_reference.sh: AngelSlim's llama.cpp patches
+# applied at 0cea36222. Rebuildable from the script's header; not vendored because it is a
+# verification tool, not a dependency.
+.reference/

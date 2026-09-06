@@ -39,7 +39,7 @@
 
 use crate::dsa::{Indexer, IndexSchedule, IndexerCfg, IndexerWeights};
 use crate::hc::{Hc, HcConfig, HcGate, HcHead};
-use crate::mla::{CachePolicy, KvUp, Mla, MlaCache, MlaConfig, MlaWeights, QProj};
+use crate::mla::{CachePolicy, KvUp, Mla, MlaCache, MlaConfig, MlaWeights, Proj, QProj};
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::{dtype::QMatrix, Tensor};
@@ -449,8 +449,11 @@ impl Hyv4 {
                         k_b: ft3(&b("attn_k_b.weight"), cfg.qk_nope(), cfg.kv_lora_rank, cfg.n_head)?,
                         v_b: ft3(&b("attn_v_b.weight"), cfg.kv_lora_rank, cfg.v_head, cfg.n_head)?,
                     },
-                    o_proj: ft(&b("attn_output.weight"), &[d, cfg.n_head * cfg.v_head])?,
-                    gate_proj: Some(ft(&b("attn_gate.weight"), &[cfg.n_head * cfg.v_head, d])?),
+                    // ⭐ PACKED, not dense. These two are 100.7M elements each; as f32 they were
+                    // 62 GiB across the stack and put the 770B at 276.7 GiB against 256 GiB of RAM.
+                    // `matmul_q` and `matmul_bt` are both y = x·Wᵀ, so this is storage only.
+                    o_proj: Proj::Packed(qm(&b("attn_output.weight"))?),
+                    gate_proj: Some(Proj::Packed(qm(&b("attn_gate.weight"))?)),
                     sinks: Some(ft(&b("attn_sinks.weight"), &[cfg.n_head])?),
                 },
             );

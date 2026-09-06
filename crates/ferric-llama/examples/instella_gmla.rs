@@ -48,8 +48,8 @@ async fn run() {
             kv_a_proj_with_mqa: g("kv_a_proj_with_mqa.weight"),
             kv_a_layernorm: g("kv_a_layernorm.weight"),
             kv_up: KvUp::Fused(g("kv_b_proj.weight")),
-            o_proj: g("o_proj.weight"),
-            gate_proj: Some(g("gate_proj.weight")),
+            o_proj: ferric_llama::mla::Proj::Dense(g("o_proj.weight")),
+            gate_proj: Some(ferric_llama::mla::Proj::Dense(g("gate_proj.weight"))),
             sinks: None,
         },
     );
