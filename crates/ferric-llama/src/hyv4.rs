@@ -844,8 +844,14 @@ impl Hyv4 {
         let cfg = &self.cfg;
         let limit = cfg.swiglu_clamp[il];
         match &blk.ffn {
+            // ⛔ NOT CLAMPED. The clamp is a ROUTED-EXPERT rule. llama.cpp's hyv4 says so where it
+            // reads the key: "routed-expert SwiGLU logits clamp (shared/dense experts are NOT
+            // clamped, so swiglu_clamp_shexp is intentionally left at its 0 default)". Clamping here
+            // is the IDENTITY while activations stay inside ±limit, which is why it survived every
+            // test in this repo: it only bites once something exceeds 10, and nothing did until
+            // block 29 of the real checkpoint.
             Ffn::Dense { gate, up, down } =>
-                self.swiglu_clamped(&f.matmul_q(gate), &f.matmul_q(up), limit).matmul_q(down),
+                f.matmul_q(gate).silu().mul(&f.matmul_q(up)).matmul_q(down),
             Ffn::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let t = f.shape[0];
                 let logits = pollster::block_on(f.matmul_q(router).to_vec());
@@ -892,7 +898,12 @@ impl Hyv4 {
                         (Some(b), Some(a)) => b.cat(&acc, 0).cat(&a, 0),
                     };
                 }
-                let shared = self.swiglu_clamped(&f.matmul_q(sh_gate), &f.matmul_q(sh_up), limit).matmul_q(sh_down);
+                // ⛔ The SHARED expert is NOT clamped either — same rule, same source. Measured on
+                // Tencent's real weights at block 29, where the shared expert's output is -849.87
+                // against +19.9 and +11.4 at its neighbours: clamping it gave -337.78, a factor of
+                // 2.5 too small, and that single term is what moved the whole model off the
+                // reference from block 29 onward.
+                let shared = f.matmul_q(sh_gate).silu().mul(&f.matmul_q(sh_up)).matmul_q(sh_down);
                 // ⚠ SPLIT, because `ffn_out` is routed + shared and the reference names them
                 // separately (`ffn_moe_out` and `ffn_shexp`). Comparing a total against a part is
                 // how a factor of 2.12 appeared where there was none — the reference's
