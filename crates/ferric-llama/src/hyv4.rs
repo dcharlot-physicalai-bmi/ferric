@@ -361,6 +361,17 @@ fn dump(tag: &str, il: i64, t: &Tensor) {
     let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.5}")).collect();
     println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.4} min {mn:+.5} max {mx:+.5}\n               {}",
              t.shape, v.len(), head.join(" "));
+    // ⚠ THE LAST ROW, SEPARATELY. llama.cpp's eval-callback prints head tensors for the LAST TOKEN
+    // only ({6144, 1}), while these are [seq, d]. Comparing a 5-token sum against a 1-token sum is
+    // the same error as comparing `ffn_out` against `ffn_moe_out` — a plausible number that is not
+    // the same quantity.
+    if t.shape.len() == 2 && t.shape[0] > 1 {
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+        let last = &v[(rows - 1) * cols..];
+        let s: f64 = last.iter().map(|x| *x as f64).sum();
+        let h: Vec<String> = last.iter().take(3).map(|x| format!("{x:+.5}")).collect();
+        println!("               last row: sum {s:+.6}  {}", h.join(" "));
+    }
 }
 
 /// Build one hyv4 block from a weight source.
