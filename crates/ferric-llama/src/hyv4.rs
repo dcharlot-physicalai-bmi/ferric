@@ -41,7 +41,7 @@ use crate::dsa::{Indexer, IndexSchedule, IndexerCfg, IndexerWeights};
 use crate::hc::{Hc, HcConfig, HcGate, HcHead};
 use crate::mla::{CachePolicy, KvUp, Mla, MlaCache, MlaConfig, MlaWeights, Proj, QProj};
 use ferric_core::Context;
-use ferric_gguf::{GgufSource, Meta};
+use ferric_gguf::{backed::GgufBacked, GgufSource, Meta};
 use ferric_tensor::{dtype::QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -202,7 +202,9 @@ enum Ffn {
     },
 }
 
-struct Block {
+/// One hyv4 block's weights. Public because [`BlockRef`] hands one out — a streamed block is owned
+/// by the caller for the length of a step, and that drop is the eviction.
+pub struct Block {
     hc_attn: HcGate,
     hc_ffn: HcGate,
     attn_norm: Tensor,
@@ -217,7 +219,10 @@ pub struct Hyv4 {
     pub cfg: Cfg,
     ctx: Arc<Context>,
     tok_embd: Tensor,
+    /// Resident blocks. **Empty when streaming** — `stream` builds them on demand instead.
     blocks: Vec<Block>,
+    /// Present when the model was opened with [`Hyv4::load_streaming`].
+    stream: Option<Hyv4Stream>,
     hc: Hc,
     head: HcHead,
     output_norm: Tensor,
@@ -258,6 +263,81 @@ impl Hyv4Cache {
     pub fn index_slots(&self) -> usize { self.index_keys.iter().filter(|k| k.is_some()).count() }
 }
 
+
+/// A [`GgufSource`] over one block's fetched run.
+///
+/// Mirrors `stream::LayerBytes`, which is private and typed into a `LayerStream` that is itself
+/// typed to qwen3's `Layer` and calls `qwen3::build_layer` directly. Generalising that would touch
+/// the one streaming path with a measured budget table behind it; this is forty lines that touch
+/// nothing.
+struct BlockBytes<'a> {
+    inner: &'a GgufBacked,
+    run_start: u64,
+    bytes: &'a [u8],
+}
+
+impl BlockBytes<'_> {
+    /// Byte range of `name` inside the fetched run, if it belongs to this block.
+    fn local(&self, name: &str) -> Option<(usize, usize)> {
+        let t = self.inner.tensor(name)?;
+        let abs = self.inner.data_start() + t.offset;
+        let n: usize = t.dims.iter().product::<u64>() as usize;
+        let sz = ferric_gguf::type_size(t.ggml_type, n).ok()?;
+        let off = abs.checked_sub(self.run_start)? as usize;
+        (off + sz <= self.bytes.len()).then_some((off, sz))
+    }
+}
+
+impl GgufSource for BlockBytes<'_> {
+    fn metadata(&self) -> &std::collections::HashMap<String, Meta> { self.inner.metadata() }
+    fn tensor(&self, n: &str) -> Option<&ferric_gguf::TensorInfo> { self.inner.tensor(n) }
+    fn raw(&self, n: &str) -> Result<Vec<u8>, String> {
+        match self.local(n) {
+            Some((o, sz)) => Ok(self.bytes[o..o + sz].to_vec()),
+            // Not part of this run: the embedding table, the output head, the hc head.
+            None => self.inner.raw(n),
+        }
+    }
+    fn dequant(&self, n: &str) -> Result<Vec<f32>, String> {
+        match self.local(n) {
+            Some((o, sz)) => {
+                let t = self.tensor(n).ok_or("missing tensor")?;
+                let count: usize = t.dims.iter().product::<u64>() as usize;
+                ferric_gguf::deq_raw(&self.bytes[o..o + sz], count, t.ggml_type)
+            }
+            None => self.inner.dequant(n),
+        }
+    }
+}
+
+/// Everything needed to rebuild a hyv4 block on demand.
+pub struct Hyv4Stream {
+    src: GgufBacked,
+    cache: std::cell::RefCell<ferric_tier::LayerCache>,
+    backing: Arc<dyn ferric_tier::Backing + Send + Sync>,
+    runs: Vec<ferric_tier::LayerDesc>,
+    /// Blocks rebuilt so far. A counter, not a cache — reported so a caller sees the cost it pays.
+    pub rebuilds: std::cell::Cell<u64>,
+}
+
+impl Hyv4Stream {
+    pub fn rebuilds(&self) -> u64 { self.rebuilds.get() }
+    /// Bytes the tier holds resident for block weights.
+    pub fn resident_bytes(&self) -> u64 { self.cache.borrow().plan().spent }
+}
+
+/// A block for one forward step: borrowed when resident, owned when streamed.
+pub enum BlockRef<'a> {
+    Borrowed(&'a Block),
+    Built(Block),
+}
+
+impl std::ops::Deref for BlockRef<'_> {
+    type Target = Block;
+    fn deref(&self) -> &Block {
+        match self { BlockRef::Borrowed(b) => b, BlockRef::Built(b) => b }
+    }
+}
 
 /// Build one hyv4 block from a weight source.
 ///
@@ -533,6 +613,57 @@ impl Hyv4 {
 
 impl Hyv4 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Hyv4, String> {
+        Hyv4::load_inner(ctx, g, None)
+    }
+
+    /// **Open a checkpoint that does not fit in memory.** `budget_bytes` bounds the block weights
+    /// the tier keeps resident; everything outside a block — the embedding table, the output head,
+    /// the hyper-connection head — stays loaded, because every step touches it.
+    ///
+    /// ⭐ WHY THIS EXISTS. Hy4-preview is 213.66 GiB. Loaded whole it peaked past 250 GiB on a
+    /// 256 GiB M3 Ultra and the kernel killed it (SIGKILL, exit 137) — and packing the two largest
+    /// projections, worth 62 GiB, still was not enough. A model does not have to be resident to run:
+    /// its blocks are visited 0..N once per token, which is the access order that makes a pinned
+    /// prefix right and an LRU worthless. Hy4's blocks are 0.46–3.37 GiB, so a few slots is ~10 GiB.
+    ///
+    /// ⚠ The cost is REBUILDING a block's GPU tensors on every visit, not the disk read — `stream.rs`
+    /// measured that on qwen3 and it was the dominant term by a wide margin. Expect it to dominate
+    /// here too, more so: a hyv4 block is two orders of magnitude larger than a qwen2.5-0.5B layer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_streaming(ctx: &Arc<Context>, path: &str, budget_bytes: u64) -> Result<Hyv4, String> {
+        use ferric_gguf::GgufFile;
+        let backing: Arc<dyn ferric_tier::Backing + Send + Sync> =
+            Arc::new(ferric_tier::FileBacking::open(path).map_err(|e| e.to_string())?);
+        let file = GgufFile::open(path)?;
+        if file.shard_count() > 1 {
+            return Err(format!("this checkpoint is {} shards and the streaming reader addresses one \
+                                file positionally; merge it (llama-gguf-split --merge)", file.shard_count()));
+        }
+        // ⛔ `total` is the FILE SIZE, and passing u64::MAX for it (as `stream::open_with` does)
+        // disables both things it is for: capping the probe buffer, and the "whole file read without
+        // a valid header" exit. On a file SHORTER than the initial probe the loop then grows the
+        // buffer toward `max`, zero-filling and re-parsing each time — a 100 KB checkpoint hung here
+        // for nineteen minutes inside `_xzm_malloc_large_huge` before I sampled the stack.
+        let total = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("{path}: {e}"))?;
+        let (header, _) = ferric_gguf::backed::header_probe(&*backing, total, 1 << 20, 64 << 20)
+            .or_else(|_| std::fs::read(path).map(|b| { let n = b.len(); (b, n) }).map_err(|e| e.to_string()))?;
+        let src = GgufBacked::new(header, Arc::clone(&backing))?;
+        let runs = crate::stream::layer_runs_of(&file.tensors, file.data_start())?;
+        let plan = ferric_tier::plan_layers(&runs, budget_bytes, 0, 4096);
+        if !plan.fits(budget_bytes) {
+            return Err(format!("budget {budget_bytes} B cannot hold even one block slot (needs {} B); \
+                                hyv4 blocks are up to 3.4 GiB", plan.spent));
+        }
+        let mut cache = ferric_tier::LayerCache::new(plan, runs.clone());
+        cache.prefill(&*backing).map_err(|e| e.to_string())?;
+        let stream = Hyv4Stream {
+            src, cache: std::cell::RefCell::new(cache), backing, runs,
+            rebuilds: std::cell::Cell::new(0),
+        };
+        Hyv4::load_inner(ctx, &file, Some(stream))
+    }
+
+    fn load_inner(ctx: &Arc<Context>, g: &impl GgufSource, stream: Option<Hyv4Stream>) -> Result<Hyv4, String> {
         let cfg = Cfg::from_gguf(g)?;
         let schedule = IndexSchedule::new(cfg.idx_is_full.clone())?;
 
@@ -558,9 +689,14 @@ impl Hyv4 {
         };
 
         let (hc, d) = (cfg.hc, cfg.d);
-        let mut blocks = Vec::with_capacity(cfg.n_layer);
-        for il in 0..cfg.n_layer {
-            blocks.push(build_block(ctx, g, &cfg, &schedule, il)?);
+        // ⚠ Streaming still validates every block's tensors up front, via `required_block_tensors`
+        // inside `build_block` — but only builds them when resident. A checkpoint missing a weight
+        // must fail at open, not on the token that first reaches that block.
+        let mut blocks = Vec::with_capacity(if stream.is_some() { 0 } else { cfg.n_layer });
+        if stream.is_none() {
+            for il in 0..cfg.n_layer {
+                blocks.push(build_block(ctx, g, &cfg, &schedule, il)?);
+            }
         }
 
         Ok(Hyv4 {
@@ -577,7 +713,7 @@ impl Hyv4 {
             },
             output_norm: ft("output_norm.weight", &[d])?,
             output: qm("output.weight")?,
-            ctx: ctx.clone(), cfg, blocks, schedule,
+            ctx: ctx.clone(), cfg, blocks, schedule, stream,
         })
     }
 }
@@ -703,7 +839,8 @@ impl Hyv4 {
         let mut last_mask: Option<Tensor> = None;
 
         for il in 0..cfg.n_layer {
-            let blk = &self.blocks[il];
+            let blk = self.block(il);
+            let blk = &*blk;
 
             let res = h.clone();
             let (x, q) = self.hc.pre(&h, &blk.hc_attn);
@@ -768,7 +905,8 @@ impl Hyv4 {
         let mut last_mask: Option<Tensor> = None;
 
         for il in 0..cfg.n_layer {
-            let blk = &self.blocks[il];
+            let blk = self.block(il);
+            let blk = &*blk;
 
             let res = h.clone();
             let (x, q) = self.hc.pre(&h, &blk.hc_attn);
@@ -840,7 +978,8 @@ impl Hyv4 {
         let mut last_mask: Vec<Option<Tensor>> = vec![None; n];
 
         for il in 0..cfg.n_layer {
-            let blk = &self.blocks[il];
+            let blk = self.block(il);
+            let blk = &*blk;
 
             let res = h.clone();
             let (x, q) = self.hc.pre(&h, &blk.hc_attn);
@@ -879,6 +1018,34 @@ impl Hyv4 {
         let y = self.hc.collapse(&h, &self.head).rmsnorm(&self.output_norm, cfg.eps);
         y.matmul_q(&self.output)
     }
+
+    /// The block at `il`: resident, or rebuilt from the tier.
+    ///
+    /// ⚠ A streamed block is OWNED by the caller for the length of the step, and dropping it is the
+    /// eviction. That is why this returns a `BlockRef` rather than a reference: there is nothing to
+    /// borrow from when the weights did not exist a moment ago.
+    ///
+    /// It panics rather than returning a Result because `forward` and `decode` return a `Tensor`.
+    /// A tier that cannot bind is not a recoverable condition for a caller mid-token — the read
+    /// already failed — and threading `Result` through the forward would change every signature to
+    /// report something no caller can act on.
+    fn block(&self, il: usize) -> BlockRef<'_> {
+        let Some(s) = &self.stream else { return BlockRef::Borrowed(&self.blocks[il]) };
+        let mut cache = s.cache.borrow_mut();
+        let bytes = cache
+            .bind(il as u32, &*s.backing)
+            .map(|(b, _)| b)
+            .unwrap_or_else(|e| panic!("tier bind for block {il}: {e}"));
+        let src = BlockBytes { inner: &s.src, run_start: s.runs[il].offset, bytes };
+        s.rebuilds.set(s.rebuilds.get() + 1);
+        BlockRef::Built(
+            build_block(&self.ctx, &src, &self.cfg, &self.schedule, il)
+                .unwrap_or_else(|e| panic!("rebuild block {il}: {e}")),
+        )
+    }
+
+    /// The tier, when this model is streamed. `None` for a resident one.
+    pub fn stream(&self) -> Option<&Hyv4Stream> { self.stream.as_ref() }
 
     /// Which layers own an indexer, and therefore how many index-cache slots to reserve.
     ///

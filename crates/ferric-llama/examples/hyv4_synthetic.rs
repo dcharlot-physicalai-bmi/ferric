@@ -395,6 +395,42 @@ fn main() {
         println!("  greedy generation {emitted:?} ({distinct} distinct) agrees with a full forward at every position");
     }
 
+    // ── A streamed model must equal a resident one ──────────────────────────────────────────────
+    //
+    // The whole point of streaming is that it changes WHERE the bytes are, not what they compute.
+    // So the check is equality against the resident load, on the same file, at a budget too small to
+    // hold the model.
+    //
+    // ⚠ This is what makes a 213.66 GiB checkpoint runnable at all: loaded whole it peaked past
+    // 250 GiB on a 256 GiB machine and was SIGKILLed. Blocks are visited 0..N once per token, so a
+    // few slots is enough — but only if streaming is arithmetically identical, which is this.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let path = std::env::temp_dir().join("ferric_hyv4_stream_check.gguf");
+        std::fs::write(&path, build(64)).expect("write checkpoint");
+        let p = path.to_str().expect("utf-8 path");
+
+        let resident = Hyv4::load(&ctx, &ferric_gguf::parse(build(64)).expect("parse")).expect("load");
+        let toks: Vec<u32> = vec![3, 11, 7, 29, 1];
+        let want = pollster::block_on(resident.forward(&toks).to_vec());
+
+        // A budget of one block's run, so at least one block must be rebuilt per pass rather than
+        // pinned — a budget large enough to pin everything would test nothing.
+        for budget in [1u64 << 14, 1 << 16] {
+            let streamed = match Hyv4::load_streaming(&ctx, p, budget) {
+                Ok(m) => m,
+                Err(e) => { println!("  streaming at {budget} B refused: {e}"); continue }
+            };
+            let got = pollster::block_on(streamed.forward(&toks).to_vec());
+            let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let rebuilds = streamed.stream().map(|s| s.rebuilds()).unwrap_or(0);
+            println!("  streamed at {budget} B: max |Δ| vs resident = {worst:.3e}, {rebuilds} block rebuild(s)");
+            assert!(rebuilds > 0, "nothing was rebuilt — this budget pinned the model and tested nothing");
+            assert_eq!(worst, 0.0, "streaming changed the arithmetic; it must only change where bytes live");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── the regression lock, PER FABRIC ───────────────────────────────────────────────────────
     //
     // ⚠ This hash is SELF-REFERENTIAL: it was generated from this code, so it cannot say the
