@@ -535,6 +535,34 @@ on all three. **Bandwidth is refuted as the difference between the two corpora, 
 explanation is offered here** beyond the observation that this crate can separate a defect on an
 unseen bearing in one rig and not in another.
 
+**The second explanation is window independence, and it is also wrong — but it exposed a defect
+in the harness.** Windows are spread across a recording by `stride = (len − window) / (n − 1)`.
+Ask for more than fit and the stride falls below the window length and they overlap **silently**,
+while the run goes on printing a window count as though each were an independent draw. The two
+corpora are not alike here at all:
+
+| corpus | median recording | window | stride | overlap | fit end to end |
+|---|---|---|---|---|---|
+| CWRU (12 kHz) | 121,701 samples (10.1 s) | 12,800 | 13,612 → **2,781** at 40 windows | **78%** | 9 |
+| rotating | 3,072,000 samples (120 s) | 25,600 | 105,048 | none | 120 |
+
+So CWRU's 3,720 windows were about 800 independent ones and its 440 held-out were about 100, while
+every rotating window is independent — a 4.6× difference in effective sample size that no line of
+output mentioned. Both examples now print the median recording length, the stride, how many windows
+fit end to end, and a warning when they overlap.
+
+Re-run at nine non-overlapping windows, which is what the recording actually holds:
+
+| tokenizer | fault | majority | control | load | majority | control |
+|---|---|---|---|---|---|---|
+| untrained | 25.3% | 36.4% | +6.1 | 34.3% | 18.2% | +12.1 |
+| released | 11.1% | 36.4% | +4.0 | 48.5% | 18.2% | +10.1 |
+
+**Still null, and the controls grew to +6.1 and +12.1** on a held-out set of 99 windows — the
+control behaving exactly as a control should when the sample shrinks. Overlap was not hiding an
+effect. Two candidate explanations for the CWRU–rotating disagreement are now measured and refuted,
+and the disagreement stands.
+
 **That 48 kHz run also found a reporting defect, and it is the more transferable finding.** It first
 printed `4.2%*` — starred, meaning above baseline — for a five-class problem whose chance rate is
 16.7%. `majority` is the accuracy of predicting the training set's most common class, and when the
