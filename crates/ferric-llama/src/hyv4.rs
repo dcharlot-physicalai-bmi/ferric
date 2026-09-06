@@ -1058,7 +1058,14 @@ impl Hyv4 {
         }
 
         cache.n_past += t;
-        let y = self.hc.collapse(&h, &self.head).rmsnorm(&self.output_norm, cfg.eps);
+        // The head: collapse the 4 hyper-connection streams, norm, project. Blocks agree to ~1e-5
+        // through block 77 while the final logits differ by ~2%, so the residual is HERE, and these
+        // two dumps are what separate the collapse from the norm from the output matmul. The
+        // reference names them `hc_collapse`/`norm`/`result_norm` and `result_output`.
+        let collapsed = self.hc.collapse(&h, &self.head);
+        dump("collapse", -2, &collapsed);
+        let y = collapsed.rmsnorm(&self.output_norm, cfg.eps);
+        dump("result_norm", -2, &y);
         y.matmul_q(&self.output)
     }
 
