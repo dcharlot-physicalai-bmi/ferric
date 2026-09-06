@@ -301,6 +301,57 @@ fn main() {
         }
     }
 
+    // ── Greedy generation must agree with a fresh full forward of what it produced ──────────────
+    //
+    // The last composition nothing exercised: decode -> argmax -> FEED THE TOKEN BACK. Every piece
+    // under it is already pinned, but the loop that a server actually runs was not, and its failure
+    // mode is silent — a cache that drifts one position produces perfectly plausible tokens.
+    //
+    // The check is self-referential in the useful direction: generate greedily through the cache,
+    // then run `forward` over the sequence that produced, and require the argmax at each position to
+    // be the token generation emitted there. Cache drift breaks it; a correct loop cannot.
+    //
+    // ⚠ HONEST LABEL: this is a COMPOSITION check, largely SUBSUMED by the decode oracle above. It
+    // drives the same machinery, and the splits run first, so every library mutation I could
+    // construct (rope from the wrong position, index cache prepended, n_past not advancing) is
+    // caught there before this is reached. What it independently pins is the loop's SHAPE — which
+    // row of a multi-token decode predicts the next token, and that feeding that token back lands it
+    // at the right position — an interface property the splits do not state. Do not read it as
+    // independent evidence about the arithmetic.
+    {
+        let g = ferric_gguf::parse(build(64)).expect("parse");
+        let m = Hyv4::load(&ctx, &g).expect("load");
+        let prompt: Vec<u32> = vec![3, 11, 7];
+        let k = 4usize;
+        let argmax = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+
+        let mut cache = Hyv4Cache::new(&m).expect("cache");
+        let first = pollster::block_on(m.decode(&prompt, &mut cache).to_vec());
+        let mut emitted = vec![argmax(&first[(prompt.len() - 1) * VOCAB..])];
+        for _ in 1..k {
+            let last = *emitted.last().unwrap();
+            let l = pollster::block_on(m.decode(&[last], &mut cache).to_vec());
+            emitted.push(argmax(&l));
+        }
+        assert_eq!(cache.len(), prompt.len() + k - 1, "the cache advanced by the wrong number of steps");
+
+        // ⛔ A degenerate model that emits one token forever would satisfy the agreement below
+        // trivially. Require the run to actually vary before trusting it.
+        let distinct = emitted.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert!(distinct >= 2, "greedy generation emitted {distinct} distinct token(s) {emitted:?}; \
+                                this comparison cannot discriminate on a constant sequence");
+
+        let mut seq = prompt.clone();
+        seq.extend(&emitted[..k - 1]);
+        let full = pollster::block_on(m.forward(&seq).to_vec());
+        for (j, t) in emitted.iter().enumerate() {
+            let pos = prompt.len() - 1 + j;
+            let got = argmax(&full[pos * VOCAB..(pos + 1) * VOCAB]);
+            assert_eq!(got, *t, "position {pos}: a full forward predicts {got}, generation emitted {t}");
+        }
+        println!("  greedy generation {emitted:?} ({distinct} distinct) agrees with a full forward at every position");
+    }
+
     // ── the regression lock, PER FABRIC ───────────────────────────────────────────────────────
     //
     // ⚠ This hash is SELF-REFERENTIAL: it was generated from this code, so it cannot say the

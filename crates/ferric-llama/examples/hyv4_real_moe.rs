@@ -279,6 +279,37 @@ fn main() {
     }
     println!();
 
+    // Batched decode on the same real weights. `hyv4_synthetic` already pins batched == solo at
+    // n = 2/3/4 on three adapters; this is the trained-weight regime for the newest code path, and
+    // it keeps the sequences at DIFFERENT lengths for the same reason — equal lengths give every row
+    // the right answer even if it read sequence 0's n_past.
+    {
+        let g = ferric_gguf::parse(build(&stq, Ctl::Real, 2)).expect("parse");
+        let m = Hyv4::load(&ctx, &g).expect("load");
+        let primes: [&[u32]; 3] = [&[1], &[2, 3, 4], &[5, 6]];
+        let steps: [u32; 3] = [7, 0, 3];
+        let mut solo: Vec<Hyv4Cache> = (0..3).map(|_| Hyv4Cache::new(&m).expect("cache")).collect();
+        let mut batched: Vec<Hyv4Cache> = (0..3).map(|_| Hyv4Cache::new(&m).expect("cache")).collect();
+        for i in 0..3 { let _ = m.decode(primes[i], &mut solo[i]); let _ = m.decode(primes[i], &mut batched[i]); }
+        let want: Vec<Vec<f32>> = (0..3)
+            .map(|i| pollster::block_on(m.decode(&[steps[i]], &mut solo[i]).to_vec())).collect();
+        let got = {
+            let mut refs: Vec<&mut Hyv4Cache> = batched.iter_mut().collect();
+            pollster::block_on(m.decode_batch(&steps, &mut refs).to_vec())
+        };
+        for i in 0..3 {
+            let row = &got[i * VOCAB..(i + 1) * VOCAB];
+            let scale = want[i].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(scale > 1e-3, "solo logits for sequence {i} are ~zero");
+            let worst = want[i].iter().zip(row).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("  real weights, batched seq {i} (n_past {}): max |Δ| vs solo = {worst:.3e}",
+                     primes[i].len());
+            assert!(worst < 2e-5 * scale.max(1.0),
+                    "real weights: batched sequence {i} diverges from solo by {worst}");
+        }
+    }
+    println!();
+
     println!("  every cosine is against the UNALTERED Q4_K_M arm, which shares no bytes with any of these\n");
     println!("    {:<44} cos {:>8.5}   RMS {:.5}", "STQ1_0, published bytes", c_real, rms(&real_stq));
     println!("    {:<44} cos {:>8.5}   RMS {:.5}", "routed scale 0 (the floor: no routed path)", c_none, rms(&no_routed));

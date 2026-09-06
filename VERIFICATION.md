@@ -254,8 +254,15 @@ Three rounds of that found the checks themselves were wrong:
   decode at n = 2/3/4 on sequences of **different lengths**, which is the discriminating case:
   borrowing sequence 0's `n_past` gives every row the right answer when every row is at the same
   position. Three mutations caught (rope from sequence 0, top-k offset from sequence 0, `n_past`
-  never advancing). `supports_batching` is now `true`. **Sampling is still not covered** — nothing
-  here drives a generation loop.
+  never advancing). `supports_batching` is now `true`, and the same equality holds on **Tencent's
+  real weights** at three different sequence lengths under sparse selection.
+- **~~A generation loop.~~** `hyv4_synthetic` now drives greedy decode → argmax → feed-back and
+  requires a fresh `forward` over the produced sequence to predict the same token at every position.
+  ⚠ Labelled in the source as a COMPOSITION check, largely subsumed by the decode oracle: it drives
+  the same machinery and the splits run first, so every library mutation constructible against it is
+  caught there. What it independently pins is the loop's **shape** — which row of a multi-token
+  decode predicts the next token, and that feeding it back lands at the right position. **Sampling
+  beyond greedy is still not covered** here; `ferric-serve` owns temperature and top-p.
 - **Embeddings from hyv4.** `forward_hidden` refuses outright: hyv4 exposes no pre-head hidden
   state, and returning logits would make every embedding wrong while looking like a vector.
 - **Serving it at all.** `hyv4` is now a first-class `Runtime::Hyv4` wired through `ferric-serve`
