@@ -34,7 +34,7 @@
 
 use ferric_core::Context;
 use ferric_gguf::write::GgufWriter;
-use ferric_llama::hyv4::Hyv4;
+use ferric_llama::hyv4::{Hyv4, Hyv4Cache};
 use std::sync::Arc;
 
 const D: usize = 6144;
@@ -81,7 +81,7 @@ enum Ctl {
     RouterShift,
 }
 
-fn build(a: &Arm, ctl: Ctl) -> Vec<u8> {
+fn build(a: &Arm, ctl: Ctl, top_k: u32) -> Vec<u8> {
     let mut seed = 0x51ee_7a11u64;
     let mut rnd = |n: usize| -> Vec<f32> {
         (0..n).map(|_| {
@@ -110,7 +110,7 @@ fn build(a: &Arm, ctl: Ctl) -> Vec<u8> {
         .kv_f32("hyv4.hyper_connection.epsilon", 1e-6).kv_f32("hyv4.hyper_connection.magnitude", 2.0)
         .kv_u32("hyv4.attention.indexer.head_count", 32)
         .kv_u32("hyv4.attention.indexer.key_length", 128)
-        .kv_u32("hyv4.attention.indexer.top_k", 2048)
+        .kv_u32("hyv4.attention.indexer.top_k", top_k)
         // is_full[1] is 1 in the published schedule, so a single full layer is faithful to this block.
         .kv_arr_i32("hyv4.attention.indexer.is_full", &[1])
         .kv_str("tokenizer.ggml.model", "gpt2").kv_str("tokenizer.ggml.pre", "hyv4");
@@ -172,7 +172,7 @@ fn build(a: &Arm, ctl: Ctl) -> Vec<u8> {
 }
 
 fn run(ctx: &Arc<Context>, a: &Arm, ctl: Ctl) -> Vec<f32> {
-    let g = ferric_gguf::parse(build(a, ctl)).expect("parse");
+    let g = ferric_gguf::parse(build(a, ctl, 2048)).expect("parse");
     let m = match Hyv4::load(ctx, &g) {
         Ok(m) => m,
         Err(e) => { eprintln!("LOAD FAILED ({}): {e}", a.name); std::process::exit(1) }
@@ -237,6 +237,47 @@ fn main() {
     let c_none = cos(&no_routed, &ref_q4k);
     let c_half = cos(&half, &ref_q4k);
     let c_shift = cos(&shift, &ref_q4k);
+
+    // ── Cached decode against the full forward, ON REAL TRAINED WEIGHTS ─────────────────────────
+    //
+    // `hyv4_synthetic` already pins decode == prefill, and does it on three adapters. What it cannot
+    // reach is the NUMERICAL REGIME: random d=32 weights give a diffuse softmax, while trained
+    // attention is far sharper and its value distributions are structured rather than uniform. Both
+    // of this session's real oracle failures were a regime the check could not express -- `tq == 1`
+    // made the offset mask a no-op, `top_k = 64` made the DSA mask all zeros -- so running decode
+    // where the arithmetic actually differs is the natural next probe, not more tokens.
+    //
+    // ⚠ Real WEIGHTS, synthetic ACTIVATIONS. The embedding and output head here are random (they are
+    // not under test), so this is not real inference and the attention is not as peaked as it would
+    // be on real token embeddings. It is a different regime from the synthetic example, not the
+    // model's own.
+    //
+    // ⛔ AND IT MUST RUN SPARSE. The published top_k is 2048 against 8 positions here, so the DSA
+    // mask admits everything and its COLUMN ORDER is unobservable — the same blind spot that let an
+    // index-cache prepend survive in `hyv4_synthetic` until that example was run at top_k=2. A
+    // real-weights check inherits the blind spot unless it changes the regime too.
+    for (a, top_k) in [(&stq, 2048u32), (&stq, 2), (&q4k, 2048), (&q4k, 2)] {
+        let g = ferric_gguf::parse(build(a, Ctl::Real, top_k)).expect("parse");
+        let m = Hyv4::load(&ctx, &g).expect("load");
+        let toks: Vec<u32> = (0..8).collect();
+        let full = pollster::block_on(m.forward(&toks).to_vec());
+        let scale = full.iter().fold(0.0f32, |x, v| x.max(v.abs()));
+        assert!(scale > 1e-3, "reference logits are ~zero; this comparison would pass on anything");
+        for split in [vec![1usize; 8], vec![1, 3, 4], vec![3, 1, 4], vec![5, 3], vec![8]] {
+            let mut cache = Hyv4Cache::new(&m).expect("cache");
+            let (mut got, mut at) = (Vec::new(), 0usize);
+            for n in &split {
+                got.extend(pollster::block_on(m.decode(&toks[at..at + n], &mut cache).to_vec()));
+                at += n;
+            }
+            let worst = full.iter().zip(&got).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("  {:<14} top_k {top_k:>4} decode {split:?}: max |Δ| vs full = {worst:.3e}",
+                     a.name, worst = worst);
+            assert!(worst < 2e-5 * scale.max(1.0),
+                    "{} top_k {top_k}: decode {split:?} diverges from the full forward by {worst}", a.name);
+        }
+    }
+    println!();
 
     println!("  every cosine is against the UNALTERED Q4_K_M arm, which shares no bytes with any of these\n");
     println!("    {:<44} cos {:>8.5}   RMS {:.5}", "STQ1_0, published bytes", c_real, rms(&real_stq));
