@@ -290,13 +290,29 @@ pub fn layer_runs_of(tensors: &[TensorInfo], data_start: u64) -> Result<Vec<Laye
         v.sort_unstable();
         let lo = v[0].0;
         let hi = v.iter().map(|(o, s)| o + s).max().unwrap();
-        let own: u64 = v.iter().map(|(_, s)| *s).sum();
-        if hi - lo != own {
-            return Err(format!(
-                "layer {il} is not one contiguous run: spans {} bytes but owns {own} \
-                 ({} bytes belong to other tensors)", hi - lo, hi - lo - own));
+        // ⛔ THE INVARIANT IS "NO FOREIGN TENSOR IN THE SPAN", NOT "NO PADDING IN THE SPAN".
+        // This compared `hi - lo` against the SUM of tensor sizes, which excludes GGUF's alignment
+        // padding — so every checkpoint whose tensors are padded to `general.alignment` was refused
+        // as "not one contiguous run", with a message blaming tensors that were not there. Hy4 is
+        // one: all 78 of its blocks carry 24-byte pads (alignment 32, the default), zero foreign
+        // tensors, and streaming was impossible for it purely because of this test.
+        //
+        // Reading the pad is harmless: `LayerBytes` addresses tensors by absolute offset inside the
+        // run, so the padding is skipped by construction. What would be unsafe is another layer's
+        // weights landing in the span, and that is what is checked now.
+        let prefix = format!("blk.{il}.");
+        for t in tensors {
+            if t.name.starts_with(&prefix) { continue }
+            let n: usize = t.dims.iter().product::<u64>() as usize;
+            let sz = ferric_gguf::type_size(t.ggml_type, n)? as u64;
+            let (o, e) = (base + t.offset, base + t.offset + sz);
+            if o < hi && e > lo {
+                return Err(format!(
+                    "layer {il}'s span [{lo}, {hi}) is not exclusively its own: {} overlaps it, so a \
+                     single read cannot serve this layer", t.name));
+            }
         }
-        out.push(LayerDesc { offset: lo, bytes: own });
+        out.push(LayerDesc { offset: lo, bytes: hi - lo });
     }
     Ok(out)
 }
@@ -369,4 +385,49 @@ pub fn open_with(
         rebuilds: std::cell::Cell::new(0),
         reuses: std::cell::Cell::new(0),
     })
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::layer_runs_of;
+    use ferric_gguf::TensorInfo;
+
+    /// f32 so a tensor's byte size is 4x its element count and the arithmetic is obvious.
+    fn t(name: &str, offset: u64, elems: u64) -> TensorInfo {
+        TensorInfo { name: name.into(), dims: vec![elems], ggml_type: 0, offset }
+    }
+
+    /// ⛔ THE REGRESSION THIS FIXES. `layer_runs_of` compared a layer's span against the SUM of its
+    /// tensor sizes, so GGUF's alignment padding read as "bytes belong to other tensors" and the
+    /// layer was refused. Every one of Hy4-preview's 78 blocks carries 24-byte pads (alignment 32,
+    /// the default) with zero foreign tensors, so streaming was impossible for it purely because of
+    /// this test — and the error message named tensors that were not there.
+    #[test]
+    fn alignment_padding_is_not_foreign_data() {
+        // two tensors, 32-byte aligned, with a 24-byte pad between them
+        let ts = vec![t("blk.0.a.weight", 0, 2), t("blk.0.b.weight", 32, 8)];
+        let runs = layer_runs_of(&ts, 0).expect("padding must not be mistaken for foreign data");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].offset, 0);
+        // the run is the SPAN, pad included — reading it is harmless, and short-reading it is not
+        assert_eq!(runs[0].bytes, 64, "the run must cover the pad, or the second tensor is truncated");
+    }
+
+    /// And the invariant that actually matters must still bite: another layer's weights inside the
+    /// span mean one read cannot serve this layer.
+    #[test]
+    fn a_foreign_tensor_inside_the_span_is_refused() {
+        let ts = vec![t("blk.0.a.weight", 0, 2), t("blk.1.x.weight", 16, 2), t("blk.0.b.weight", 32, 8)];
+        let e = layer_runs_of(&ts, 0).expect_err("a foreign tensor in the span must be refused");
+        assert!(e.contains("blk.1.x.weight"), "the error must name the tensor that overlaps: {e}");
+    }
+
+    /// An unpadded layer is unchanged by the fix — span and sum agree, so nothing moved for the
+    /// checkpoints that already worked.
+    #[test]
+    fn a_tightly_packed_layer_is_unchanged() {
+        let ts = vec![t("blk.0.a.weight", 0, 4), t("blk.0.b.weight", 16, 4)];
+        let runs = layer_runs_of(&ts, 0).expect("tight packing still works");
+        assert_eq!((runs[0].offset, runs[0].bytes), (0, 32));
+    }
 }
