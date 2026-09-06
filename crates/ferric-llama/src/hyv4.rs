@@ -258,6 +258,170 @@ impl Hyv4Cache {
     pub fn index_slots(&self) -> usize { self.index_keys.iter().filter(|k| k.is_some()).count() }
 }
 
+
+/// Build one hyv4 block from a weight source.
+///
+/// **Extracted from `Hyv4::load` unchanged**, for the reason `qwen3::build_layer` gives: every
+/// weight here goes through `GgufSource`, so a block can equally be built from bytes a tier has
+/// just fetched. That is the property that makes streaming a matter of swapping the source rather
+/// than rewriting the model — and streaming is what a 213.66 GiB checkpoint needs, because loading
+/// it whole peaks past 250 GiB and the kernel kills it on a 256 GiB machine.
+pub fn build_block(
+    ctx: &Arc<Context>,
+    g: &impl GgufSource,
+    cfg: &Cfg,
+    schedule: &IndexSchedule,
+    il: usize,
+) -> Result<Block, String> {
+    let qm = |name: &str| -> Result<QMatrix, String> {
+        let t = g.tensor(name).ok_or_else(|| format!("missing {name}"))?;
+        let (ty, rows, cols) = (t.ggml_type, t.dims[1] as usize, t.dims[0] as usize);
+        if QMatrix::block_bytes(ty).is_some() {
+            QMatrix::from_bytes(ctx, &g.raw(name)?, ty, rows, cols)
+        } else {
+            Ok(QMatrix::from_dense(ctx, &g.dequant(name)?, rows, cols))
+        }
+    };
+    let ft = |name: &str, shape: &[usize]| -> Result<Tensor, String> {
+        let v = g.dequant(name)?;
+        let want: usize = shape.iter().product();
+        if v.len() != want {
+            return Err(format!("{name}: {} elements for shape {shape:?} ({want})", v.len()));
+        }
+        Ok(Tensor::from_vec(ctx, &v, shape))
+    };
+    // ⚠ The MLA projections load DENSE, not as QMatrix: `MlaWeights` consumes `Tensor` and the
+    // absorbed path needs `matmul_bt`. On the 770B that is a real memory cost and the right fix
+    // is a packed MLA path; it is not a correctness issue and it is not what this file is for.
+    //
+    // ⚠ A 2-D GGUF weight is ne = [in, out]; Ferric wants [out, in]. A 3-D one is
+    // ne = [a, b, heads] and reverses whole. Getting this backwards is the transposition class
+    // of bug: right element count, wrong arrangement, fluent output.
+    let ft3 = |name: &str, a: usize, b: usize, h: usize| -> Result<Tensor, String> { ft(name, &[h, b, a]) };
+
+    let (hc, d) = (cfg.hc, cfg.d);
+        let b = |s: &str| format!("blk.{il}.{s}");
+        let dense = il < cfg.dense_lead;
+        for t in Hyv4::required_block_tensors(schedule.is_full(il), dense) {
+            if g.tensor(&b(t)).is_none() {
+                return Err(format!("block {il} is missing {t}; hyv4 requires it \
+                                    ({} layer, {} FFN)",
+                                   if schedule.is_full(il) { "indexer" } else { "shared-index" },
+                                   if dense { "dense" } else { "MoE" }));
+            }
+        }
+
+        let hcg = |half: &str| -> Result<HcGate, String> {
+            Ok(HcGate {
+                fn_w: ft(&b(&format!("hc_{half}_fn.weight")), &[2 * hc, hc * d])?,
+                base: ft(&b(&format!("hc_{half}_base.weight")), &[2 * hc])?,
+                scale: {
+                    let s = g.dequant(&b(&format!("hc_{half}_scale.weight")))?;
+                    if s.len() != 2 { return Err(format!("hc_{half}_scale has {} entries, want 2", s.len())) }
+                    [s[0], s[1]]
+                },
+            })
+        };
+
+        let mla = Mla::new(
+            MlaConfig {
+                n_heads: cfg.n_head,
+                qk_nope_dim: cfg.qk_nope(),
+                qk_rope_dim: cfg.qk_rope,
+                v_head_dim: cfg.v_head,
+                kv_lora_rank: cfg.kv_lora_rank,
+                // hyv4 writes no YaRN keys, so the scale is the plain 1/sqrt(qk_head) --
+                // over the FULL head width, not the 576-wide dot the absorbed path takes.
+                scaling: 1.0 / (cfg.qk_head as f32).sqrt(),
+                eps: cfg.eps,
+                rope_interleaved: true,
+            },
+            MlaWeights {
+                q: QProj::LowRank {
+                    a: ft(&b("attn_q_a.weight"), &[cfg.q_lora_rank, d])?,
+                    a_norm: ft(&b("attn_q_a_norm.weight"), &[cfg.q_lora_rank])?,
+                    b: ft(&b("attn_q_b.weight"), &[cfg.n_head * cfg.qk_head, cfg.q_lora_rank])?,
+                },
+                kv_a_proj_with_mqa: ft(&b("attn_kv_a_mqa.weight"), &[cfg.kv_lora_rank + cfg.qk_rope, d])?,
+                kv_a_layernorm: ft(&b("attn_kv_a_norm.weight"), &[cfg.kv_lora_rank])?,
+                kv_up: KvUp::Absorbed {
+                    k_b: ft3(&b("attn_k_b.weight"), cfg.qk_nope(), cfg.kv_lora_rank, cfg.n_head)?,
+                    v_b: ft3(&b("attn_v_b.weight"), cfg.kv_lora_rank, cfg.v_head, cfg.n_head)?,
+                },
+                // ⭐ PACKED, not dense. These two are 100.7M elements each; as f32 they were
+                // 62 GiB across the stack and put the 770B at 276.7 GiB against 256 GiB of RAM.
+                // `matmul_q` and `matmul_bt` are both y = x·Wᵀ, so this is storage only.
+                o_proj: Proj::Packed(qm(&b("attn_output.weight"))?),
+                gate_proj: Some(Proj::Packed(qm(&b("attn_gate.weight"))?)),
+                sinks: Some(ft(&b("attn_sinks.weight"), &[cfg.n_head])?),
+            },
+        );
+
+        let indexer = if schedule.is_full(il) {
+            Some(Indexer::new(
+                IndexerCfg {
+                    n_heads: cfg.idx_heads,
+                    head_dim: cfg.idx_head_dim,
+                    rope_dim: cfg.qk_rope,
+                    top_k: cfg.idx_top_k,
+                    eps: cfg.eps,
+                    rope_interleaved: true,
+                },
+                IndexerWeights {
+                    q_b: ft(&b("indexer.attn_q_b.weight"), &[cfg.idx_heads * cfg.idx_head_dim, cfg.q_lora_rank])?,
+                    k: ft(&b("indexer.attn_k.weight"), &[cfg.idx_head_dim, d])?,
+                    k_norm_w: ft(&b("indexer.k_norm.weight"), &[cfg.idx_head_dim])?,
+                    k_norm_b: ft(&b("indexer.k_norm.bias"), &[cfg.idx_head_dim])?,
+                    proj: ft(&b("indexer.proj.weight"), &[cfg.idx_heads, d])?,
+                },
+            ))
+        } else { None };
+
+        let ffn = if dense {
+            Ffn::Dense { gate: qm(&b("ffn_gate.weight"))?, up: qm(&b("ffn_up.weight"))?, down: qm(&b("ffn_down.weight"))? }
+        } else {
+            // Slice a stacked [n_expert, rows, cols] slab into one QMatrix per expert.
+            let slab = |name: &str| -> Result<Vec<QMatrix>, String> {
+                let t = g.tensor(name).ok_or_else(|| format!("missing {name}"))?;
+                let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+                let raw = g.raw(name)?;
+                let per = rows * ferric_gguf::type_size(t.ggml_type, cols)?;
+                if raw.len() != per * cfg.n_expert {
+                    return Err(format!("{name}: {} bytes for {} experts of {per}", raw.len(), cfg.n_expert));
+                }
+                (0..cfg.n_expert).map(|e| {
+                    let bytes = &raw[e * per..(e + 1) * per];
+                    if QMatrix::block_bytes(t.ggml_type).is_some() {
+                        QMatrix::from_bytes(ctx, bytes, t.ggml_type, rows, cols)
+                    } else {
+                        let v = ferric_gguf::deq_raw(bytes, rows * cols, t.ggml_type)?;
+                        Ok(QMatrix::from_dense(ctx, &v, rows, cols))
+                    }
+                }).collect()
+            };
+            Ffn::Moe {
+                router: qm(&b("ffn_gate_inp.weight"))?,
+                bias: match g.tensor(&b("exp_probs_b.bias")) {
+                    Some(_) => Some(g.dequant(&b("exp_probs_b.bias"))?),
+                    None => None,
+                },
+                gate: slab(&b("ffn_gate_exps.weight"))?,
+                up: slab(&b("ffn_up_exps.weight"))?,
+                down: slab(&b("ffn_down_exps.weight"))?,
+                sh_gate: qm(&b("ffn_gate_shexp.weight"))?,
+                sh_up: qm(&b("ffn_up_shexp.weight"))?,
+                sh_down: qm(&b("ffn_down_shexp.weight"))?,
+            }
+        };
+
+    Ok(Block {
+        hc_attn: hcg("attn")?, hc_ffn: hcg("ffn")?,
+        attn_norm: ft(&b("attn_norm.weight"), &[d])?,
+        ffn_norm: ft(&b("ffn_norm.weight"), &[d])?,
+        mla, indexer, ffn,
+    })
+}
+
 impl Hyv4 {
     /// Every tensor this loader will ask for, with the dims it expects, in **GGUF `ne` order**
     /// (`ne0` fastest — a `[out, in]` matrix appears as `[in, out]`).
@@ -372,6 +536,9 @@ impl Hyv4 {
         let cfg = Cfg::from_gguf(g)?;
         let schedule = IndexSchedule::new(cfg.idx_is_full.clone())?;
 
+        // The per-block weights now come from `build_block`, which any source can feed. These two
+        // remain here for the tensors that are NOT per block: the embedding table, the output head
+        // and the hyper-connection head, which a streamed model holds resident regardless.
         let qm = |name: &str| -> Result<QMatrix, String> {
             let t = g.tensor(name).ok_or_else(|| format!("missing {name}"))?;
             let (ty, rows, cols) = (t.ggml_type, t.dims[1] as usize, t.dims[0] as usize);
@@ -389,138 +556,11 @@ impl Hyv4 {
             }
             Ok(Tensor::from_vec(ctx, &v, shape))
         };
-        // ⚠ The MLA projections load DENSE, not as QMatrix: `MlaWeights` consumes `Tensor` and the
-        // absorbed path needs `matmul_bt`. On the 770B that is a real memory cost and the right fix
-        // is a packed MLA path; it is not a correctness issue and it is not what this file is for.
-        //
-        // ⚠ A 2-D GGUF weight is ne = [in, out]; Ferric wants [out, in]. A 3-D one is
-        // ne = [a, b, heads] and reverses whole. Getting this backwards is the transposition class
-        // of bug: right element count, wrong arrangement, fluent output.
-        let ft3 = |name: &str, a: usize, b: usize, h: usize| -> Result<Tensor, String> { ft(name, &[h, b, a]) };
 
         let (hc, d) = (cfg.hc, cfg.d);
         let mut blocks = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
-            let b = |s: &str| format!("blk.{il}.{s}");
-            let dense = il < cfg.dense_lead;
-            for t in Hyv4::required_block_tensors(schedule.is_full(il), dense) {
-                if g.tensor(&b(t)).is_none() {
-                    return Err(format!("block {il} is missing {t}; hyv4 requires it \
-                                        ({} layer, {} FFN)",
-                                       if schedule.is_full(il) { "indexer" } else { "shared-index" },
-                                       if dense { "dense" } else { "MoE" }));
-                }
-            }
-
-            let hcg = |half: &str| -> Result<HcGate, String> {
-                Ok(HcGate {
-                    fn_w: ft(&b(&format!("hc_{half}_fn.weight")), &[2 * hc, hc * d])?,
-                    base: ft(&b(&format!("hc_{half}_base.weight")), &[2 * hc])?,
-                    scale: {
-                        let s = g.dequant(&b(&format!("hc_{half}_scale.weight")))?;
-                        if s.len() != 2 { return Err(format!("hc_{half}_scale has {} entries, want 2", s.len())) }
-                        [s[0], s[1]]
-                    },
-                })
-            };
-
-            let mla = Mla::new(
-                MlaConfig {
-                    n_heads: cfg.n_head,
-                    qk_nope_dim: cfg.qk_nope(),
-                    qk_rope_dim: cfg.qk_rope,
-                    v_head_dim: cfg.v_head,
-                    kv_lora_rank: cfg.kv_lora_rank,
-                    // hyv4 writes no YaRN keys, so the scale is the plain 1/sqrt(qk_head) --
-                    // over the FULL head width, not the 576-wide dot the absorbed path takes.
-                    scaling: 1.0 / (cfg.qk_head as f32).sqrt(),
-                    eps: cfg.eps,
-                    rope_interleaved: true,
-                },
-                MlaWeights {
-                    q: QProj::LowRank {
-                        a: ft(&b("attn_q_a.weight"), &[cfg.q_lora_rank, d])?,
-                        a_norm: ft(&b("attn_q_a_norm.weight"), &[cfg.q_lora_rank])?,
-                        b: ft(&b("attn_q_b.weight"), &[cfg.n_head * cfg.qk_head, cfg.q_lora_rank])?,
-                    },
-                    kv_a_proj_with_mqa: ft(&b("attn_kv_a_mqa.weight"), &[cfg.kv_lora_rank + cfg.qk_rope, d])?,
-                    kv_a_layernorm: ft(&b("attn_kv_a_norm.weight"), &[cfg.kv_lora_rank])?,
-                    kv_up: KvUp::Absorbed {
-                        k_b: ft3(&b("attn_k_b.weight"), cfg.qk_nope(), cfg.kv_lora_rank, cfg.n_head)?,
-                        v_b: ft3(&b("attn_v_b.weight"), cfg.kv_lora_rank, cfg.v_head, cfg.n_head)?,
-                    },
-                    // ⭐ PACKED, not dense. These two are 100.7M elements each; as f32 they were
-                    // 62 GiB across the stack and put the 770B at 276.7 GiB against 256 GiB of RAM.
-                    // `matmul_q` and `matmul_bt` are both y = x·Wᵀ, so this is storage only.
-                    o_proj: Proj::Packed(qm(&b("attn_output.weight"))?),
-                    gate_proj: Some(Proj::Packed(qm(&b("attn_gate.weight"))?)),
-                    sinks: Some(ft(&b("attn_sinks.weight"), &[cfg.n_head])?),
-                },
-            );
-
-            let indexer = if schedule.is_full(il) {
-                Some(Indexer::new(
-                    IndexerCfg {
-                        n_heads: cfg.idx_heads,
-                        head_dim: cfg.idx_head_dim,
-                        rope_dim: cfg.qk_rope,
-                        top_k: cfg.idx_top_k,
-                        eps: cfg.eps,
-                        rope_interleaved: true,
-                    },
-                    IndexerWeights {
-                        q_b: ft(&b("indexer.attn_q_b.weight"), &[cfg.idx_heads * cfg.idx_head_dim, cfg.q_lora_rank])?,
-                        k: ft(&b("indexer.attn_k.weight"), &[cfg.idx_head_dim, d])?,
-                        k_norm_w: ft(&b("indexer.k_norm.weight"), &[cfg.idx_head_dim])?,
-                        k_norm_b: ft(&b("indexer.k_norm.bias"), &[cfg.idx_head_dim])?,
-                        proj: ft(&b("indexer.proj.weight"), &[cfg.idx_heads, d])?,
-                    },
-                ))
-            } else { None };
-
-            let ffn = if dense {
-                Ffn::Dense { gate: qm(&b("ffn_gate.weight"))?, up: qm(&b("ffn_up.weight"))?, down: qm(&b("ffn_down.weight"))? }
-            } else {
-                // Slice a stacked [n_expert, rows, cols] slab into one QMatrix per expert.
-                let slab = |name: &str| -> Result<Vec<QMatrix>, String> {
-                    let t = g.tensor(name).ok_or_else(|| format!("missing {name}"))?;
-                    let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
-                    let raw = g.raw(name)?;
-                    let per = rows * ferric_gguf::type_size(t.ggml_type, cols)?;
-                    if raw.len() != per * cfg.n_expert {
-                        return Err(format!("{name}: {} bytes for {} experts of {per}", raw.len(), cfg.n_expert));
-                    }
-                    (0..cfg.n_expert).map(|e| {
-                        let bytes = &raw[e * per..(e + 1) * per];
-                        if QMatrix::block_bytes(t.ggml_type).is_some() {
-                            QMatrix::from_bytes(ctx, bytes, t.ggml_type, rows, cols)
-                        } else {
-                            let v = ferric_gguf::deq_raw(bytes, rows * cols, t.ggml_type)?;
-                            Ok(QMatrix::from_dense(ctx, &v, rows, cols))
-                        }
-                    }).collect()
-                };
-                Ffn::Moe {
-                    router: qm(&b("ffn_gate_inp.weight"))?,
-                    bias: match g.tensor(&b("exp_probs_b.bias")) {
-                        Some(_) => Some(g.dequant(&b("exp_probs_b.bias"))?),
-                        None => None,
-                    },
-                    gate: slab(&b("ffn_gate_exps.weight"))?,
-                    up: slab(&b("ffn_up_exps.weight"))?,
-                    down: slab(&b("ffn_down_exps.weight"))?,
-                    sh_gate: qm(&b("ffn_gate_shexp.weight"))?,
-                    sh_up: qm(&b("ffn_up_shexp.weight"))?,
-                    sh_down: qm(&b("ffn_down_shexp.weight"))?,
-                }
-            };
-
-            blocks.push(Block {
-                hc_attn: hcg("attn")?, hc_ffn: hcg("ffn")?,
-                attn_norm: ft(&b("attn_norm.weight"), &[d])?,
-                ffn_norm: ft(&b("ffn_norm.weight"), &[d])?,
-                mla, indexer, ffn,
-            });
+            blocks.push(build_block(ctx, g, &cfg, &schedule, il)?);
         }
 
         Ok(Hyv4 {
