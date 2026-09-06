@@ -925,9 +925,11 @@ impl Hyv4 {
         let n_past = cache.n_past;
 
         let emb = self.tok_embd.gather_rows(&tokens.to_vec());
+        dump("embd", -1, &emb);
         let (cos, sin) = self.rope_tables_at(n_past, t);
 
         let mut h = self.hc.replicate(&emb);
+        dump("hc_init", -1, &h);
         let mut last_mask: Option<Tensor> = None;
 
         for il in 0..cfg.n_layer {
@@ -936,7 +938,9 @@ impl Hyv4 {
 
             let res = h.clone();
             let (x, q) = self.hc.pre(&h, &blk.hc_attn);
+            dump("hc_pre", il as i64, &x);
             let cur = x.rmsnorm(&blk.attn_norm, cfg.eps);
+            dump("attn_norm", il as i64, &cur);
 
             if let Some(ix) = &blk.indexer {
                 let qr = cur.matmul_bt(match &blk.mla.w.q { QProj::LowRank { a, .. } => a, QProj::Whole(w) => w })
@@ -954,6 +958,7 @@ impl Hyv4 {
             assert!(last_mask.is_some(), "layer {il} has no selection; is_full[0] must be true");
 
             let a = blk.mla.decode(&cur, &cos, &sin, &mut cache.mla[il], last_mask.as_ref());
+            dump("attn_out", il as i64, &a);
             h = self.hc.post(&a, &res, &q);
 
             let res = h.clone();
