@@ -1,14 +1,19 @@
 # What is verified in Ferric's low-bit and attention paths, and what is not
 
-Generated 2026-09-04 from the tree, not from memory. Counts are live:
-**12 Kani harnesses**, **248 tests** (51 `ferric-gguf`, 83 `ferric-tensor`, 114 `ferric-llama`),
-wasm32 clean on all three.
+Generated 2026-09-05 from the tree, not from memory. Counts are live:
+**12 Kani harnesses**, **286 tests** (63 `ferric-gguf`, 83 `ferric-tensor`, 119 `ferric-llama`,
+13 `ferric-tokenizer`, 8 `ferric-serve`), wasm32 clean on all four library crates.
 
 This document exists because "verified" is not one thing. A bounded model check, an exhaustive GPU
-differential, a probabilistic proof over a finite field, a derived rounding bound and a measured
-amplification factor make five different claims of five different strengths, and a reader deciding
-whether to trust a number needs to know which one they are holding. Every row below says what the
-claim is, and the last section says plainly what nothing here covers.
+differential, a probabilistic proof over a finite field, an equivalence chain, a derived rounding
+bound and a measured amplification factor make six different claims of six different strengths, and
+a reader deciding whether to trust a number needs to know which one they are holding. Every row
+below says what the claim is, and the last section says plainly what nothing here covers.
+
+⚠ These counts go stale, and stale counts in a document about verification are the exact failure it
+warns about. Two claims in this file were false when the session that wrote them ended — the CI
+proofs job "has not yet run", and a registry note asserting no real checkpoint had loaded — and both
+were caught by a test, not by re-reading. Regenerate rather than trusting the numbers above.
 
 ---
 
@@ -150,10 +155,66 @@ requires. A test that cannot catch it is not weak — it is reporting the archit
 
 ---
 
+## 5b. Equivalence chains — decode against prefill, prefill against a reference
+
+`mla.rs` declined to implement cached decode for a stated reason: *"a decode path would be
+unverified code wearing a verified module's name."* That was right for the oracles available then.
+What answers it is a **chain**, not a new reference:
+
+```
+AMD's real Instella module  ──maxΔ 5.96e-7──▶  MLA prefill  ──exact──▶  MLA cached decode
+                             (instella_gmla)                (incremental == full re-run)
+```
+
+Every link is checkable here. The same shape then extends to the whole hyv4 graph — hyper-connections,
+the DSA indexer and its per-full-layer key cache, clamped-SwiGLU MoE, absolute-position RoPE — where
+any split of a sequence into decode blocks must reproduce `forward` over the whole thing.
+
+| check | regime |
+|---|---|
+| `cached_decode_equals_a_full_re_run` | single-token, with and without an attention sink |
+| `block_decode_in_uneven_chunks_equals_the_whole` | 1+2+2, 2+1+2, 3+2, 5 |
+| `the_offset_mask_hides_exactly_the_future` | the mask asserted directly, not only through an equality |
+| `hyv4_synthetic` (example, **in CI**) | whole graph, 5 splits × `top_k` {64, 2}, on **three adapters** |
+| `hyv4_real_moe` (example, local) | whole graph on **Tencent's real weights**, both quantisations, `top_k` {2048, 2} |
+
+⚠ **Two oracle holes were found here, and neither was a shortage of test data.** Both were a
+*configuration that could not express the bug*:
+
+- **At `tq == 1` the offset causal mask is a no-op** — row 0 spans `(off+1)..tkv`, empty when
+  `off == tkv-1`. Single-token decode therefore cannot detect a wrong offset: every query
+  legitimately sees everything. Only blocks with `tq > 1` make intra-block causality observable, and
+  the splits are **uneven** because equal chunks make `off` a multiple of the chunk size, which
+  several wrong formulas also satisfy.
+- **At `top_k = 64` the DSA mask is all zeros**, so its column order is unobservable and an
+  index-cache that prepends instead of appending survives. Only `top_k = 2` selects. The real-weights
+  example inherited this exact blind spot (published `top_k` is 2048 against 8 positions) until it
+  was run at `top_k = 2` as well.
+
+⭐ **Changing the REGIME is what found both.** More tokens would have found neither. The two axes now
+covered independently are hardware (three adapters, two backends) and numerics (random vs trained
+weights, dense vs sparse selection).
+
+⛔ **A bit-hash is a local regression lock, never a portability claim — and it is per ADAPTER, not
+per backend.** The same synthetic checkpoint hashes three different ways:
+`Apple M5 Max 0x29142d075f1beadc`, `Apple Paravirtual device 0x13cfd14821cf04d5` (**also Metal**),
+`llvmpipe 0xf690016066e7574b`. Kernel selection reads capabilities, and a paravirtualised GPU does
+not advertise what an M5 Max does. Every *reported quantity* agrees to four decimals across all
+three (0.2993, 0.4989, 0.00e0) — only the hash, which amplifies one bit into a different number,
+separates them. The lock is keyed by adapter and prefix-matched; an unrecorded adapter reports
+rather than asserts.
+
+⭐ **Order the portable evidence before any absolute lock.** The hash originally sat *ahead* of these
+equivalences, so the first CI run on a new fabric died on a fabric-specific value without ever
+running the checks that hold everywhere — while the session notes already claimed decode was verified
+"on both fabrics". Self-comparisons first.
+
+---
+
 ## 6. Mutation testing — every claim above
 
 Every proof and every bound was mutation-tested; a check that cannot fail is worth nothing.
-Round tallies: **10/10, 6/6, 6/6, 6/6, 4/4 + 6/6 + 4/4, 3/3, 4/4**.
+Round tallies: **10/10, 6/6, 6/6, 6/6, 4/4 + 6/6 + 4/4, 3/3, 4/4, 4/4, 4/4, 2/2**.
 
 Three rounds of that found the checks themselves were wrong:
 
@@ -188,8 +249,16 @@ Three rounds of that found the checks themselves were wrong:
   wrong-but-consistent formula agrees with itself. The formula is covered by the Kani harnesses,
   the GF(p) identities and the synthetic golden hash — not by any real-weights run.
 - **Any block but 0 and 1, and any routing wider than 4 experts.** `hyv4_real_moe` slices 4 experts
-  of the published 256 and runs top-2. Nothing exercises 256-way routing, an expert past index 3, or
-  generation of any kind. The `hyv4` arch row stays `Untried` and `resolve` still refuses the string.
+  of the published 256 and runs top-2. Nothing exercises 256-way routing or an expert past index 3.
+- **Batched decode for hyv4, and sampling.** `Hyv4::decode` threads ONE cache and the DSA indexer
+  selects per sequence from a per-sequence key cache, so `supports_batching` is `false` and
+  `forward_batch` is `unreachable!` behind it — a batched path is a real port plus its own proof, not
+  a loop. `forward_hidden` refuses outright: hyv4 exposes no pre-head hidden state, and returning
+  logits would make every embedding wrong while looking like a vector.
+- **Serving it at all.** `hyv4` is now a first-class `Runtime::Hyv4` wired through `ferric-serve`
+  (it previously named `Runtime::DeepSeek2` as a placeholder — one status edit away from loading a
+  hyv4 checkpoint *as a DeepSeek2 model*). The row still carries `Status::Untried` and `resolve`
+  still refuses the string, so nothing can reach that dispatch.
 - **The energy figures' sensitivity to input sign.** They were measured on all-negative activations
   (same defect as §6). Both arms always saw identical data, so every ratio is a valid differential —
   but whether the ratios shift on two-signed input is **unmeasured, not unchanged**.
