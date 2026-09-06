@@ -150,6 +150,60 @@ never to make a failure go away.
 
 ---
 
+## 3d. The real weights — and why an end-to-end comparison cannot settle a deep MoE
+
+§3c compares Ferric to Tencent's implementation on a **synthetic** checkpoint. Run on the **real**
+213.66 GiB weights, the same five tokens (`802 8778 299 12749 341`, verified identical in both logs),
+Metal on both sides, the final logits differ enormously:
+
+| | sum over 120832 logits |
+|---|---|
+| Ferric | −208343.84 |
+| reference | −377666.72 |
+
+**That is not evidence of a defect.** Bisecting per block says why.
+
+| block | per-element difference |
+|---|---|
+| 0 – 24 | ~3e-6 … 3e-5 (noise) |
+| 29 | ratio 1.91 |
+| 34 | **sign flip** |
+| 35 – 77 | ~1.8 (saturated) |
+
+Everything up to block 28 agrees: `embd`, `hc_init`, `attn_norm`, `kv_cmpr`, `q_pe`, `k_pe`,
+`attn_out`, `l_out` — tokenizer, embedding dequantisation, hyper-connections, MLA projections, RoPE,
+the DSA indexer with top-k selection, attention, the gate, the output projection, **and 28 blocks of
+256-expert MoE over the quantised expert formats**. That is the real-weights fidelity evidence §3c
+said it did not have.
+
+⛔ **At block 29 the two implementations SELECT DIFFERENT EXPERTS**, and only at the margin:
+
+```
+tok 2   ref  156 192 187 …  40 83  93     ferric  156 192 193 187 185 40 16 83
+tok 4   ref  156  87 185 …  94 51 224     ferric  156  87 185 193 242 224 94 17
+```
+
+The top-ranked experts agree exactly; the reference takes 93 and 51 where Ferric takes 16 and 17, at
+ranks 7–8. **The router itself is correct** — its output agrees to ~0.003 absolute on values of ~3.5
+(sum −3316.96 against −3308.44). A wrong gate disagrees at the top, not only at the tail.
+
+⭐ **Selection is an ARGSORT, which is discontinuous.** Router logits span −5.18 to +2.44 across 256
+experts, so ranks near the top-8 cut are separated by hundredths, and a difference of 0.003 flips
+one. After that the two implementations are computing **different functions**, and every downstream
+number is incomparable by construction. The −208343 vs −377666 gap is what two *correct*
+implementations look like once routing has diverged and compounded through 49 more layers.
+
+⚠ **This indicts the method, not just the model.** Comparing activations through an MoE assumes the
+two agree on routing — an assumption that went unchecked for the whole investigation, and which the
+argsort makes fragile by construction. An end-to-end logit comparison is the wrong instrument for a
+78-layer, 256-expert model.
+
+**What would settle block 29 onward**: force identical routing in both (feed the reference's expert
+choice into Ferric) and compare the expert arithmetic alone. Until then, blocks 0–28 are verified
+against Tencent's implementation on real weights and blocks 29–77 are **untested, not wrong**.
+
+---
+
 ## 4. Derived rounding bounds — and one that is honestly loose
 
 Not chosen numbers. Count the roundings, bound each against the **operand scale** Σ|terms| — the
@@ -288,10 +342,11 @@ Three rounds of that found the checks themselves were wrong:
   quant shader with no GPU, but **structure only** — never semantics.
 - **The indexer score's floating point.** ReLU is not a polynomial, so the GF(p) method does not
   reach it. Runtime tests only.
-- **~~That hyv4's *arithmetic* is Tencent's arithmetic.~~** Now checked against Tencent's own
-  implementation — see §3c. What remains uncovered is that it matches on the **real weights**: the
-  reference comparison runs on a synthetic checkpoint with short prompts, and nothing yet exercises
-  256-way routing, a block past 1, or long context against the reference.
+- **~~That hyv4's *arithmetic* is Tencent's arithmetic.~~** Checked on a synthetic checkpoint (§3c)
+  **and on the real 213.66 GiB weights for blocks 0–28** (§3d), which does exercise 256-way routing
+  and the quantised expert formats. **Blocks 29–77 are untested, not wrong**: expert selection
+  diverges there on marginal experts, after which the two implementations compute different
+  functions and cannot be compared end to end. Settling them needs routing forced identical.
 - **Any block but 0 and 1, and any routing wider than 4 experts.** `hyv4_real_moe` slices 4 experts
   of the published 256 and runs top-2. Nothing exercises 256-way routing or an expert past index 3.
 - **~~Batched decode for hyv4.~~** Done — `Hyv4::decode_batch`, verified token-identical to solo
