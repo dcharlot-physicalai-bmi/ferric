@@ -807,6 +807,17 @@ impl Hyv4 {
             Ffn::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let t = f.shape[0];
                 let logits = pollster::block_on(f.matmul_q(router).to_vec());
+                // The ROUTER OUTPUT, before any selection. This is the decisive quantity when two
+                // implementations pick different experts: if these agree to noise, the disagreement
+                // is tie-breaking among near-equal logits (two correct implementations, one
+                // discontinuous choice); if they differ materially, the gate itself is wrong.
+                if std::env::var("FERRIC_DUMP_MOE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(il) {
+                    let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
+                    for &x in &logits { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
+                    let head: Vec<String> = logits.iter().take(6).map(|x| format!("{x:+.4}")).collect();
+                    println!("  moe[{il}] router logits n={} sum {sum:+.4} min {mn:+.4} max {mx:+.4}  {}",
+                             logits.len(), head.join(" "));
+                }
                 let mut routed = Tensor::from_vec(&self.ctx, &vec![0.0f32; t * cfg.d], &[t, cfg.d]);
                 let dump_moe = std::env::var("FERRIC_DUMP_MOE").ok()
                     .and_then(|v| v.parse::<usize>().ok()) == Some(il);
