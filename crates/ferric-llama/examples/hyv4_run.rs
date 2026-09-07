@@ -26,7 +26,10 @@ use std::time::Instant;
 
 fn main() {
     let mut a = std::env::args().skip(1);
-    let path = match a.next() { Some(p) => p, None => { eprintln!("usage: hyv4_run <model.gguf> [prompt] [n]"); return } };
+    let path = match a.next() { Some(p) => p, None => { eprintln!("usage: hyv4_run <model.gguf> [prompt] [n_gen] [budget_gib]\n\
+        \x20 budget_gib: stream block weights under this many GiB. OMIT IT AND THE MODEL LOADS\n\
+        \x20 RESIDENT, which for Hy4-preview needs more RAM than a 256 GiB machine has — the\n\
+        \x20 process is then killed by the OS with NO message at all."); return } };
     let prompt = a.next().unwrap_or_else(|| "The capital of France is".to_string());
     let n_gen: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(24);
     // Fourth arg: a streaming budget in GiB for BLOCK weights. Without it the model is loaded
@@ -52,10 +55,20 @@ fn main() {
                 Err(e) => { eprintln!("STREAMING LOAD FAILED: {e}"); std::process::exit(1) }
             }
         }
-        None => match Hyv4::load(&ctx, &g) {
-            Ok(m) => m,
-            Err(e) => { eprintln!("LOAD FAILED: {e}"); std::process::exit(1) }
-        },
+        None => {
+            // ⚠ SAY SO BEFORE TRYING. A resident load of a 213.66 GiB checkpoint is killed by the
+            // OS, not by this program: no panic, no error, no exit code — the run simply stops
+            // after the adapter line and the log ends mid-sentence. That is indistinguishable
+            // from a hang or a crash unless something announced the attempt first.
+            let gib = std::fs::metadata(&path).map(|m| m.len() as f64 / 1073741824.0).unwrap_or(0.0);
+            println!("resident load of {gib:.1} GiB (no budget given). If this run stops right \
+                      here with no error, the OS killed it — pass a budget in GiB as the 4th \
+                      argument to stream instead.");
+            match Hyv4::load(&ctx, &g) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("LOAD FAILED: {e}"); std::process::exit(1) }
+            }
+        }
     };
     println!("loaded {} blocks, d={}, {} experts, vocab {} in {:.1}s{}",
              m.cfg.n_layer, m.cfg.d, m.cfg.n_expert, m.cfg.n_vocab, t1.elapsed().as_secs_f64(),
