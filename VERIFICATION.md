@@ -266,7 +266,7 @@ occupy.
 the dataflow, **not a strict error-propagation budget**. The ratios say where disagreement grows,
 not how much each op contributes in isolation.
 
-### Three explanations for the ~1e-3, all tested, all refuted
+### Four explanations for the ~1e-3, all tested, all refuted
 
 1. **The low-bit expert kernels.** Block 0's FFN is entirely Q6_K and agrees ~10x better than every
    later block, whose routed experts are IQ2_XXS (2.06 bpw) / IQ3_XXS (3.06 bpw) / STQ1_0 (1.31
@@ -287,9 +287,9 @@ not how much each op contributes in isolation.
    refutation, not a vacuous test. ⚠ That run also picked a different `n_ctx` (260608 vs 256), so it
    was not a pure single-variable change; the bit-identical attention holds regardless.
 
-The DSA lightning indexer contributes but does not explain it either: the 21 blocks that run its
-top-k selection disagree by 1.32e-03 against the other 57 blocks' 8.13e-04 — a factor of 1.6, on a
-baseline that is already there without any sparse selection.
+4. **The DSA lightning indexer's top-k.** It contributes, and does not explain it: the 21 blocks
+   that run the sparse selection disagree by 1.32e-03 against the other 57 blocks' 8.13e-04 — a
+   factor of 1.6, on a baseline that is already there without any sparse selection at all.
 
 ### Ferric's own routing, without the crutch
 
@@ -372,27 +372,58 @@ hyper-connections, MLA projections, RoPE, the DSA indexer, attention, the gate, 
 projection, the 256-expert MoE over three quantised expert formats, and the shared expert are all
 inside that.
 
-⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. Everything measured is
+⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. Much of what is measured is
 consistent with it — bounded, flat with depth, roughly sign-balanced (Ferric larger on 40 of 78
 blocks for `attn_out`), and inside a block it accumulates as a smooth taper across five large
 reductions with no step at any one of them. Four candidate mechanisms have been tested and refuted
 (low-bpw kernels, dense-vs-MoE, the reference's KV dtype, the DSA top-k) and the per-stage bisect
-leaves no room inside attention for a single bug. **But "every mechanism I thought to test is
-refuted" is not "it is numerics."** No experiment here has measured the fabric contribution
-directly — that would need the same Ferric build on a second adapter, which this machine does not
-have. It is unexplained, and the honest word for it is unexplained.
+leaves no room inside attention for a single bug.
+
+⚠ **One measurement now cuts the other way, and it should be said plainly.** Two different
+execution paths inside Ferric — batched prefill against cached single-row decode — agree to
+**7.3e-07**, ~4000x tighter than the 2.87e-03 against llama.cpp. So the loose phrase this document
+reached for early ("two summation orders") is not sufficient: changing the reduction structure
+inside Ferric moves the answer by a thousandth of the residual. What remains available is the part
+that is genuinely *not* reduction order — llama.cpp on CPU runs different quantised dot products,
+a different flash-attention blocking, and its own intermediate precisions. That is a bigger
+difference than summation order and could well account for it, but nothing here has measured it.
+
+**"Every mechanism I thought to test is refuted" is not "it is numerics."** No experiment here has
+measured the fabric contribution directly — that needs the same Ferric build on a second adapter,
+which this machine does not have. It is unexplained, and the honest word for it is unexplained.
 
 ⛔ **Not claimed**: that any *generation* matches token for token. The agreement above is ONE
 prompt and ONE token, at a winning margin of 0.104 where the reference's is 0.581 — a fifth of the
 headroom. Each further token is another chance for a near-tie to break the other way, and §3d's
 own history is that near-ties do exactly that.
 
-⚠ **Decode against the reference is still open.** Ferric's cached decode is pinned to its own
-prefill by `cached_decode_equals_a_full_re_run` and `block_decode_in_uneven_chunks_equals_the_whole`
-(§5b), but those run on the SYNTHETIC checkpoint; on the real weights the cached path has never been
-compared with anything. `hyv4_run` now accepts `ids:...` and prints each decode step's logits so
-that `prefill(p + [t])` against `prefill(p)` then `decode(t)` is a one-line diff — the measurement,
-not yet the result.
+✅ **Decode now has a real-weights oracle, and it needed no reference.** Ferric's cached decode was
+pinned to its own prefill by `cached_decode_equals_a_full_re_run` and
+`block_decode_in_uneven_chunks_equals_the_whole` (§5b) — on the SYNTHETIC checkpoint. On the real
+weights the cached path had never been compared with anything. It does not need llama.cpp for that:
+`prefill(p + [t])` and `prefill(p)` then `decode(t)` must compute the same logits, and both are
+Ferric.
+
+Tokens `802 8778 299 12749 341` then `220` (`hyv4_run` takes `ids:...` to bypass the tokenizer —
+220 is whitespace, and whitespace is exactly where a re-tokenise would not give the ids back):
+
+| | `sum_abs` | argmax | top 5 |
+|---|---|---|---|
+| prefill(5) then **decode**(220) | 388001.892025 | **2390** | 2390:19.1859 4942:17.7827 1146:16.1940 3330:15.8114 804:15.2878 |
+| **prefill**(all 6) | 388002.173486 | **2390** | 2390:19.1859 4942:17.7827 1146:16.1940 3330:15.8115 804:15.2878 |
+
+**7.25e-07 relative**, same token, same five candidates in the same order. Composed with the
+prefill-vs-reference agreement above, decode reaches Tencent's implementation transitively — which
+is §5b's chain, now with its first link measured on real weights instead of synthetic ones.
+
+⭐ **The interesting part is the RATIO.** Two genuinely different execution paths — a batched
+6-token prefill, and a single-row query attending over a 6-entry cache — agree to **7.3e-07**, while
+Ferric against llama.cpp agrees to 2.87e-03. That is **~4000x**. Reduction-order variation *within*
+Ferric's own kernels is three orders of magnitude smaller than the cross-implementation residual, so
+"different summation order" does not by itself account for the ~1e-3. ⚠ Both arms here run the same
+Metal kernels, so this bounds path variation, **not** fabric variation — it does not measure what a
+second adapter would. But it does say the residual is specific to the comparison with llama.cpp
+rather than a general looseness in Ferric's accumulation.
 
 ---
 
@@ -468,6 +499,11 @@ any split of a sequence into decode blocks must reproduce `forward` over the who
 | `the_offset_mask_hides_exactly_the_future` | the mask asserted directly, not only through an equality |
 | `hyv4_synthetic` (example, **in CI**) | whole graph, 5 splits × `top_k` {64, 2}, on **three adapters** |
 | `hyv4_real_moe` (example, local) | whole graph on **Tencent's real weights**, both quantisations, `top_k` {2048, 2} |
+| `hyv4_run -- ids:…` (manual, §3d) | **the whole 78-block 770B model**: `prefill(p+[t])` vs `prefill(p)` then `decode(t)`, agreeing to **7.25e-07** |
+
+⭐ The last row is the one that took longest to get and matters most: every other decode check in
+this table runs on a synthetic checkpoint or a 4-expert slice. Until it existed, "decode equals
+prefill" was a claim about a model with 32 hidden units.
 
 ⚠ **Two oracle holes were found here, and neither was a shortage of test data.** Both were a
 *configuration that could not express the bug*:
