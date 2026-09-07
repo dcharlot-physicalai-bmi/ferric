@@ -186,6 +186,9 @@ fn main() {
         println!("ferric last-row logits for {ids:?}:");
         for (i, v) in last.iter().enumerate() { print!("{v:>12.6}{}", if i % 8 == 7 { "\n" } else { "" }); }
         println!("sum = {:.6}", last.iter().sum::<f32>());
+        // ⚠ `sum` CANCELS. Two logit vectors whose sums agree can differ per element; on the real
+        // checkpoint l_out sums matched to 8.4e-6 while values were 1e-3 apart. Gate on this one.
+        println!("sum_abs = {:.6}", last.iter().map(|v| v.abs()).sum::<f32>());
         return;
     }
     if let Some(out) = std::env::args().nth(1) {

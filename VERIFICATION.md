@@ -115,18 +115,26 @@ them are satisfied by a wrong-but-consistent implementation.** This one is not.
 spec. `scripts/hyv4_vs_reference.sh` runs it and Ferric **over the same file** — the synthetic
 checkpoint Ferric's own GGUF writer emits:
 
-| prompt | reference | ferric | Δ (sum of 40 logits) |
+| prompt | reference `sum_abs` | ferric `sum_abs` | relative Δ |
 |---|---|---|---|
-| `dlh` (3,11,7) | −0.168091 | −0.168631 | 0.000540 |
-| `a` (0) | −2.257787 | −2.258252 | 0.000465 |
-| `mzq` (12,25,16) | 3.444252 | 3.443293 | 0.000959 |
-| `abcde` (0,1,2,3,4) | 3.468959 | 3.468463 | 0.000496 |
-| `k9x` (10,35,23) | 5.219286 | 5.219245 | **0.000041** |
-| `zzz` (25,25,25) | 3.215248 | 3.214783 | 0.000465 |
-| `q7` (16,33) | 1.244925 | 1.244365 | 0.000560 |
+| `dlh` (3,11,7) | 21.410659 | 21.410664 | 2.3e-07 |
+| `a` (0) | 20.593453 | 20.593319 | 6.5e-06 |
+| `mzq` (12,25,16) | 18.677007 | 18.675997 | **5.4e-05** |
+| `abcde` (0,1,2,3,4) | 19.971650 | 19.971348 | 1.5e-05 |
+| `k9x` (10,35,23) | 25.421876 | 25.421875 | 3.9e-08 |
+| `zzz` (25,25,25) | 21.914916 | 21.915052 | 6.2e-06 |
+| `q7` (16,33) | 22.550225 | 22.549913 | 1.4e-05 |
 
-~1e-5 per element — a NEON CPU and a Metal GPU reducing in different orders. The six individual
-values `eval-callback` prints for `dlh` match Ferric's to every digit shown.
+A NEON CPU and a Metal GPU reducing in different orders. The six individual values `eval-callback`
+prints for `dlh` match Ferric's to every digit shown.
+
+⛔ **The gate is on `sum_abs`, not `sum`.** It used to compare the signed sum of the 40 logits, and
+that quantity CANCELS: on the real checkpoint (§3d) per-block sums agreed to 8.4e-6 while the values
+behind them were ~1e-3 apart per element. The same seven prompts under the old metric read
+`4.1e-5 … 9.6e-4` — an order of magnitude *worse*-looking than the truth, and blind to the failure
+mode it was supposed to catch. Both sides now emit `sum_abs`, and both are parsed **by field name**;
+the old parse read a fixed line offset, which would have silently repointed at a different number
+the moment either dump grew a line.
 
 ⛔ **"No reference implementation builds on this machine" was repeated for an entire session and was
 simply never tested.** The patches apply cleanly at llama.cpp `0cea36222` and build CPU-only in
@@ -144,78 +152,135 @@ both are worth knowing:
 
 ⚠ **What this does NOT establish.** It is a *synthetic* checkpoint at d=32 with short prompts. It
 does not cover the real weights, 256-way routing, a block past 1, long context, or a `top_k` that
-actually selects — the synthetic config admits every position. The gate is `5e-3` on the logit sum
-against observed `4.1e-5 … 9.6e-4`; that is one observation set, so widen it only with a reason and
-never to make a failure go away.
+actually selects — the synthetic config admits every position. The gate is `2e-4` **relative on
+`sum_abs`** against the observed ladder `3.9e-8 … 5.4e-5` (~4x the worst), which is ~25x tighter than
+the metric it replaced. That is one observation set on one adapter, and two Metal adapters are known
+to disagree on the golden hash, so widen it only with a new measured ladder and never to make a
+failure go away.
+
+⚠ **It also cannot see the clamp defect of §3d.** The synthetic checkpoint's activations never leave
+±10, where hyv4's SwiGLU clamp is the identity, so this comparison is bit-identical with that bug
+present and with it fixed. A gate whose fixture never crosses a rule's threshold does not test the
+rule.
 
 ---
 
-## 3d. The real weights — and why an end-to-end comparison cannot settle a deep MoE
+## 3d. The real weights — one real defect, and a residual that is not one
 
-§3c compares Ferric to Tencent's implementation on a **synthetic** checkpoint. Run on the **real**
-213.66 GiB weights, the same five tokens (`802 8778 299 12749 341`, verified identical in both logs),
-Metal on both sides, the final logits differ enormously:
+§3c compares Ferric to Tencent's implementation on a **synthetic** checkpoint. This section is the
+same comparison on the **real** 213.66 GiB `Hy4-preview-STQ1_0.gguf`, five tokens
+(`802 8778 299 12749 341` — "The capital of France is", verified identical in both logs, `embd` sum
+−7.720856 on both sides).
 
-| | sum over 120832 logits |
-|---|---|
-| Ferric | −208343.84 |
-| reference | −377666.72 |
+⚠ **Ferric runs on Metal; the reference runs on CPU.** llama.cpp's Metal backend crashes in
+`ggml_metal_op_mul_mat_id` on hyv4's MoE, so CPU is the only reference path that exists. Every
+number below is Ferric-on-Metal (M3 Ultra) against llama.cpp-on-NEON, and some part of the residual
+is that and not either implementation being wrong.
 
-**That is not evidence of a defect.** Bisecting per block says why.
+### The defect: the SwiGLU clamp is a ROUTED-expert rule
 
-| block | per-element difference |
-|---|---|
-| 0 – 24 | ~3e-6 … 3e-5 (noise) |
-| 29 | ratio 1.91 |
-| 34 | **sign flip** |
-| 35 – 77 | ~1.8 (saturated) |
+hyv4 clamps the SwiGLU logits of its **routed** experts. Ferric applied that clamp to the **shared**
+expert and the **dense** FFN as well. llama.cpp's own loader says so where it reads the key:
+*"routed-expert SwiGLU logits clamp (shared/dense experts are NOT clamped, so `swiglu_clamp_shexp`
+is intentionally left at its 0 default)"*.
 
-Everything up to block 28 agrees: `embd`, `hc_init`, `attn_norm`, `kv_cmpr`, `q_pe`, `k_pe`,
-`attn_out`, `l_out` — tokenizer, embedding dequantisation, hyper-connections, MLA projections, RoPE,
-the DSA indexer with top-k selection, attention, the gate, the output projection, **and 28 blocks of
-256-expert MoE over the quantised expert formats**. That is the real-weights fidelity evidence §3c
-said it did not have.
+| block 29, `ffn` split | Ferric (before) | reference |
+|---|---|---|
+| routed (8 of 256 experts) | −287.39 | −294.79 |
+| shared expert | −337.78 | **−849.87** |
 
-⛔ **At block 29 the two implementations SELECT DIFFERENT EXPERTS**, and only at the margin:
+The routed half was already right; the shared half was 2.5x small. After the fix: shexp −857.93,
+`ffn_out` −1145.32 against the reference's −1144.68.
 
-```
-tok 1  ref 156 193 185 200 93 186  83 103   ferric 156 193 185 200 93 186 103 83   same set
-tok 2  ref 156 192 187 193 185  40 83  93   ferric 156 192 193 187 185  40  16 83   93 → 16
-tok 3  ref 156  61 185 193 107  57 112 104  ferric 156  61 185 193 107  57 112 104  identical
-tok 4  ref 156  87 185 193 242  94  51 224  ferric 156  87 185 193 242 224  94  17   51 → 17
-```
+⛔ **No test in this repo could have caught it.** The clamp is the IDENTITY while activations stay
+inside ±10, and nothing in the synthetic checkpoint ever exceeds it — the synthetic comparison is
+bit-identical with the bug present and with it fixed. It first bites at block 29 of the real
+weights. A rule that only applies above a threshold needs a fixture that crosses the threshold.
 
-**Three of five tokens select identically** (one differing only in tie ORDER, which changes nothing —
-the weight travels with the expert). The other two differ by **exactly one expert, at rank 8**, the
-lowest-weighted of the eight. **The router itself is correct**: its output agrees to ~0.003 absolute
-on values of ~3.5 (sum −3316.96 against −3308.44). A wrong gate disagrees at the top, not only at the
-tail, and not on only two tokens out of five.
+### The retracted explanation
 
-⚠ Reading those rows at all required patching the reference. `common_debug_print_tensor` hardcodes
-`n = 3`, which elides the middle of every row — fine for eyeballing an activation, useless for a
-tensor **whose values are the answer**: at `n = 3` two of the eight expert ids print as `...`. The
-first version of this comparison was made against six-of-eight and drew the same conclusion, which
-was luck rather than method. `LLAMA_DEBUG_N` now sets it.
+An earlier version of this section attributed the block-29 divergence to the two implementations
+**selecting different experts** — the top-8 argsort over 256 near-tied router logits is
+discontinuous, so a 0.003 difference flips rank 8. That reasoning was sound and the observation was
+real (two of five tokens differed by exactly one expert, at rank 8), but it was **not the cause**.
+Forcing the reference's own 385-entry routing table into Ferric via `FERRIC_FORCE_ROUTING` did not
+close the gap. Selection divergence was a true fact that explained nothing, and it cost the
+investigation a detour. The instrument that settled it — splitting `ffn_out` into routed and shared
+— should have come first, because it is the split that separates the two candidate causes.
 
-⭐ **Selection is an ARGSORT, which is discontinuous.** Router logits span −5.18 to +2.44 across 256
-experts, so ranks near the top-8 cut are separated by hundredths, and a difference of 0.003 flips
-one. After that the two implementations are computing **different functions**, and every downstream
-number is incomparable by construction. The −208343 vs −377666 gap is what two *correct*
-implementations look like once routing has diverged and compounded through 49 more layers.
+### The instrument was also wrong: `sum` cancels
 
-⚠ **This indicts the method, not just the model.** Comparing activations through an MoE assumes the
-two agree on routing — an assumption that went unchecked for the whole investigation, and which the
-argsort makes fragile by construction. An end-to-end logit comparison is the wrong instrument for a
-78-layer, 256-expert model.
+Per-block agreement was originally read off the **sum** of each activation, and the sums agreed to
+~8.4e-6. They were flattering the comparison: `result_norm`'s last row was −63.405 against −55.541,
+a ~1e-3 per-element difference under a sum that matched to five decimals, because the errors
+offset. Both sides now report `sum_abs`, which cannot cancel
+(`common_debug_print_tensor` in the reference, `dump()` in `hyv4.rs`). **Every number below is
+`sum_abs`.** §3c's gate was moved onto it too.
 
-**What would settle block 29 onward**: force identical routing in both (feed the reference's expert
-choice into Ferric) and compare the expert arithmetic alone. Until then, blocks 0–28 are verified
-against Tencent's implementation on real weights and blocks 29–77 are **untested, not wrong**.
+### What agreement actually is, all 78 blocks
 
-⚠ **The reference itself only runs this model on CPU.** Its Metal backend crashes in
-`ggml_metal_op_mul_mat_id` on hyv4's MoE — so the comparison is Ferric-on-Metal against
-llama.cpp-on-CPU, and some of the ~3e-6 baseline difference is that. Ferric runs the same expert
-matmul on Metal without incident.
+With the clamp fixed and routing forced identical, relative `sum_abs` difference per block:
+
+| tensor | mean | block 0 | worst |
+|---|---|---|---|
+| `attn_norm` (attention input) | **7.08e-05** | 6.7e-07 | 3.5e-04 (b67) |
+| `attn_out` | **9.49e-04** | 2.3e-04 | 8.7e-03 (b77) |
+| `routed` (8 of 256 experts) | 1.54e-03 | — | 1.3e-02 (b77) |
+| `shexp` (shared expert) | 1.15e-03 | — | 1.2e-02 (b77) |
+| `ffn_out` | 1.35e-03 | 4.5e-05 | 1.1e-02 (b77) |
+| `l_out` (block output) | 8.74e-04 | 1.0e-04 | 2.4e-03 (b77) |
+
+⭐ **The curve is FLAT, not stepped.** `l_out` runs 2.3e-03 at block 1, ~8e-04 through the middle,
+2.4e-03 at block 77 — it does not grow with depth and has no step anywhere. A second defect of the
+clamp's kind would appear as a step, the way block 29 did. There is no such step.
+
+⭐ **The residual is born in ATTENTION.** The input to attention agrees 13x better than its output
+(7.08e-05 → 9.49e-04). The FFN roughly carries that forward rather than adding to it.
+
+### Three explanations for the ~1e-3, all tested, all refuted
+
+1. **The low-bit expert kernels.** Block 0's FFN is entirely Q6_K and agrees ~10x better than every
+   later block, whose routed experts are IQ2_XXS (2.06 bpw) / IQ3_XXS (3.06 bpw) / STQ1_0 (1.31
+   bpw). Tempting — and wrong. The **shared** expert is Q6_K and sits inside the same MoE blocks:
+   it disagrees by 1.15e-03 against the routed experts' 1.54e-03. A 6.5-bit path and a 2-bit path
+   fed the same input disagree by the same amount, so the low-bpw kernels are not the source; both
+   inherit the error from their common input. (`packed_iq_matmuls_match_dequant_then_matmul` in
+   `ferric-tensor` independently pins both kernels against dequantise-then-matmul at 1e-4.)
+2. **Dense-vs-MoE.** `leading_dense_block_count` is **1**, so block 0 differs from every other block
+   in two ways at once — dense-vs-MoE and Q6_K-vs-low-bpw — and the two are perfectly confounded.
+   The routed/shared split above is what breaks the confound; neither survives it.
+3. **The reference's KV cache dtype.** llama.cpp defaults `-ctk`/`-ctv` to **f16**, whose relative
+   spacing (2⁻¹⁰ ≈ 9.8e-04) sits almost exactly on the measured `attn_out` gap of 9.49e-04 — while
+   Ferric's `MlaCache` holds f32. A striking fit, and false: re-running the reference with
+   `-ctk f32 -ctv f32` leaves `attn_out` **bit-identical** at every block (verified by hand:
+   block 0 `sum_abs` 2950.567254, block 77 442536.124366, both runs). The flag was not inert — the
+   stored `cache_k_l0` changed from `(f16)` to `(f32)` and 22,694 log lines differ — so this is a
+   refutation, not a vacuous test. ⚠ That run also picked a different `n_ctx` (260608 vs 256), so it
+   was not a pure single-variable change; the bit-identical attention holds regardless.
+
+The DSA lightning indexer contributes but does not explain it either: the 21 blocks that run its
+top-k selection disagree by 1.32e-03 against the other 57 blocks' 8.13e-04 — a factor of 1.6, on a
+baseline that is already there without any sparse selection.
+
+### What is claimed, and what is not
+
+✅ **Claimed**: on the real checkpoint, with routing forced identical, Ferric and Tencent's
+implementation agree to **~1e-3 relative on activation magnitude at every one of the 78 blocks**,
+flat with depth, with no step that would indicate a second defect. The tokenizer, embedding
+dequantisation, hyper-connections, MLA projections, RoPE, the DSA indexer, attention, the gate, the
+output projection, the 256-expert MoE over three quantised expert formats, and the shared expert are
+all inside that.
+
+⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. It is bounded, flat, and roughly
+sign-balanced (Ferric larger on 40 of 78 blocks for `attn_out`), which is what fabric-difference
+noise looks like — but "looks like noise" is not a measurement, and no experiment here has isolated
+it. It is localised to attention and it is unexplained.
+
+⛔ **Not claimed**: anything about unforced routing. Every number in this section is measured with
+`FERRIC_FORCE_ROUTING` pinning the reference's expert *ids* (weights and expert arithmetic remain
+Ferric's). Whether Ferric's own argsort now agrees naturally, post-clamp-fix, is **not tested here**.
+
+⛔ **Not claimed**: anything past five tokens, or any decode step. This is one prefill.
 
 ---
 

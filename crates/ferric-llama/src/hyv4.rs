@@ -781,10 +781,15 @@ impl Hyv4 {
     /// ⛔ WHY THIS EXISTS. Expert selection is a top-k argsort over 256 near-tied logits, so it is
     /// discontinuous: an accumulated 1e-3 flips which expert ranks eighth, and from that point two
     /// implementations compute DIFFERENT FUNCTIONS and no downstream number is comparable. Against
-    /// Tencent's own implementation on the real weights, blocks 0–28 agree to ~3e-6 per element and
-    /// block 29 selects one different expert on two of five tokens — after which the comparison is
-    /// meaningless rather than failing. Forcing the same selection into both is what makes blocks
-    /// 29–77 testable at all.
+    /// Tencent's own implementation on the real weights, block 29 selects one different expert on
+    /// two of five tokens. Holding selection fixed is what makes the rest of the stack comparable
+    /// at all, and every per-block number in VERIFICATION.md §3d is measured with it.
+    ///
+    /// ⚠ IT DID NOT EXPLAIN THE DIVERGENCE IT WAS BUILT FOR. Forcing the reference's own 385-entry
+    /// table into Ferric left the block-29 gap exactly where it was; the cause was the SwiGLU clamp
+    /// being applied to the SHARED expert, which is a routed-expert rule (see `ffn`). Selection
+    /// divergence was a true observation that explained nothing — a reminder that the discontinuity
+    /// makes a comparison FRAGILE, not that it is the cause of any particular disagreement.
     ///
     /// Format: one line per (block, token), `block token e0 e1 … e{k-1}`. The WEIGHTS stay Ferric's
     /// own — the point is to hold the selection fixed and compare everything else, not to import the
