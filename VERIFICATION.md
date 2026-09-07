@@ -262,23 +262,54 @@ The DSA lightning indexer contributes but does not explain it either: the 21 blo
 top-k selection disagree by 1.32e-03 against the other 57 blocks' 8.13e-04 — a factor of 1.6, on a
 baseline that is already there without any sparse selection.
 
+### Ferric's own routing, without the crutch
+
+Every per-block number above is measured with `FERRIC_FORCE_ROUTING` pinning the reference's expert
+*ids* (weights and expert arithmetic stay Ferric's). Run without it, on Ferric's own argsort:
+
+| tensor | forced routing | Ferric's own routing |
+|---|---|---|
+| `attn_norm` | 7.08e-05 | 2.01e-04 |
+| `attn_out` | 9.49e-04 | 2.44e-03 |
+| `ffn_out` | 1.35e-03 | 3.12e-03 |
+| `l_out` | 8.74e-04 | 1.09e-03 |
+
+✅ Agreement degrades by ~2.5x and **stays the same order of magnitude through all 78 blocks**. It
+does not blow up, which is the thing worth knowing: Ferric tracks Tencent's implementation on its
+own expert selection. Some of that 2.5x is not error at all — a different expert at rank 8 is a
+genuinely different function, so the argsort is *supposed* to produce divergence there.
+
+End-to-end, the last row's 120832 logits:
+
+| | `sum` | `sum_abs` | relative Δ on `sum_abs` |
+|---|---|---|---|
+| reference | −377666.72 | 421398.64 | — |
+| Ferric, own routing | −376036.64 | 420188.58 | **2.87e-03** |
+| Ferric, forced routing | −385843.10 | 429466.50 | 1.91e-02 |
+
+⭐ **Forced routing agrees better at every block and worse end-to-end — by 6.7x.** Both metrics rank
+it the same way, so this is not a cancellation artifact; it is real. Pinning the reference's expert
+ids while the combining weights stay Ferric's builds a **hybrid that is neither implementation**,
+and being closer at each intermediate step does not make the output closer.
+
+⛔ **So forced routing is a diagnostic instrument, not a fidelity result.** It exists to make
+intermediate activations comparable across the argsort discontinuity, which is the only reason the
+per-block table above can be read at all. It must not be quoted as "Ferric agrees this well" — the
+honest end-to-end number is the unforced one, 2.87e-03.
+
 ### What is claimed, and what is not
 
-✅ **Claimed**: on the real checkpoint, with routing forced identical, Ferric and Tencent's
-implementation agree to **~1e-3 relative on activation magnitude at every one of the 78 blocks**,
-flat with depth, with no step that would indicate a second defect. The tokenizer, embedding
-dequantisation, hyper-connections, MLA projections, RoPE, the DSA indexer, attention, the gate, the
-output projection, the 256-expert MoE over three quantised expert formats, and the shared expert are
-all inside that.
+✅ **Claimed**: on the real checkpoint, Ferric and Tencent's implementation agree to
+**~1e-3 relative on activation magnitude at every one of the 78 blocks** with routing forced,
+and **2.87e-03 end-to-end on Ferric's own routing** — flat with depth, with no step that would
+indicate a second defect. The tokenizer, embedding dequantisation, hyper-connections, MLA
+projections, RoPE, the DSA indexer, attention, the gate, the output projection, the 256-expert
+MoE over three quantised expert formats, and the shared expert are all inside that.
 
-⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. It is bounded, flat, and roughly
-sign-balanced (Ferric larger on 40 of 78 blocks for `attn_out`), which is what fabric-difference
-noise looks like — but "looks like noise" is not a measurement, and no experiment here has isolated
-it. It is localised to attention and it is unexplained.
-
-⛔ **Not claimed**: anything about unforced routing. Every number in this section is measured with
-`FERRIC_FORCE_ROUTING` pinning the reference's expert *ids* (weights and expert arithmetic remain
-Ferric's). Whether Ferric's own argsort now agrees naturally, post-clamp-fix, is **not tested here**.
+⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. It is bounded, flat, and
+roughly sign-balanced (Ferric larger on 40 of 78 blocks for `attn_out`), which is what
+fabric-difference noise looks like — but "looks like noise" is not a measurement, and no
+experiment here has isolated it. It is localised to attention and it is unexplained.
 
 ⛔ **Not claimed**: anything past five tokens, or any decode step. This is one prefill.
 

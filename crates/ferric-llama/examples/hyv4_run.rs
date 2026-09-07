@@ -108,8 +108,20 @@ fn main() {
     {
         let row = &logits[logits.len() - m.cfg.n_vocab..];
         let (mn, mx) = row.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-        println!("prefill last-row logits: sum {:.6}  min {mn:.6}  max {mx:.6}  first3 {:?}",
+        // `sum_abs` is printed because the signed sum CANCELS and cannot see a per-element error
+        // (VERIFICATION.md §3d). Here they happen to agree: against Tencent's reference the two
+        // routings rank the same on both, own routing 2.9e-3 and forced 1.9e-2 on sum_abs.
+        //
+        // ⛔ NEITHER NUMBER SUMMARISES FIDELITY, and the reason is worth knowing. Forced routing
+        // agrees with the reference BETTER at every one of the 78 blocks (l_out 8.7e-4 against
+        // 1.1e-3) and yet lands ~6.7x FURTHER away in the final logits — on both metrics, so this
+        // is not a cancellation artifact. Pinning the reference's expert IDS while the weights stay
+        // Ferric's builds a hybrid that is neither implementation, and being closer at each
+        // intermediate step does not make the output closer. An end-to-end logit comparison and a
+        // per-block comparison answer different questions; quote whichever you actually measured.
+        println!("prefill last-row logits: sum {:.6}  sum_abs {:.6}  min {mn:.6}  max {mx:.6}  first3 {:?}",
                  row.iter().map(|v| *v as f64).sum::<f64>(),
+                 row.iter().map(|v| v.abs() as f64).sum::<f64>(),
                  &row[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
     }
     for i in 0..n_gen {
