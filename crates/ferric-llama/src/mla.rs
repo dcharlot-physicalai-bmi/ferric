@@ -46,6 +46,16 @@ pub struct MlaConfig {
     pub rope_interleaved: bool,
 }
 
+/// Which block the MLA module's dumps should be labelled with. MLA is shared by several
+/// architectures and takes no layer index, so the caller stamps it; `-3` means "nobody said".
+static DUMP_BLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-3);
+
+/// Label subsequent MLA dumps with this block index. Diagnostics only — it costs one relaxed
+/// store per block and nothing reads it unless `FERRIC_DUMP` is set.
+pub(crate) fn set_dump_block(il: i64) {
+    DUMP_BLOCK.store(il, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl MlaConfig {
     /// Full query/key head width.
     pub fn qk_head_dim(&self) -> usize { self.qk_nope_dim + self.qk_rope_dim }
@@ -328,12 +338,24 @@ impl Mla {
 
     /// The gate and output projection, shared by prefill and decode so they cannot drift apart.
     fn gate_and_project(&self, ao: &Tensor, hs: &Tensor) -> Tensor {
+        // ⭐ THE TWO POINTS THAT SPLIT ATTENTION FROM ITS EPILOGUE. Against the reference these are
+        // `attn_kqv-N` (the attention core's output, after the value up-projection) and
+        // `attn_gated-N` (after the elementwise gate, before o_proj).
+        //
+        // They exist because attention's input agrees with Tencent's implementation 13x better than
+        // its output (7.08e-05 vs 9.49e-04 on the real 770B weights), and without these points that
+        // 13x is one opaque step that a bug could hide anywhere inside. With them it resolves into a
+        // TAPER — kv_cmpr 3.1x, rope ~2.1x, the attention core 1.6x, the gate 1.2x, o_proj 1.006x —
+        // which is accumulation across five large reductions, not a defect in any one of them.
+        // A wrong gate would spike here; it does not. See VERIFICATION.md §3d.
+        Self::dump_mla("attn_kqv", ao);
         // ⚠ The gate reads the LAYER INPUT, not the attention output, and it is per-token — so it
         // needs no cache and decode passes only the new rows.
         let ao = match &self.w.gate_proj {
             Some(g) => ao.mul(&g.apply(hs).sigmoid()),
             None => ao.clone(),
         };
+        Self::dump_mla("attn_gated", &ao);
         self.w.o_proj.apply(&ao)
     }
 
@@ -373,13 +395,7 @@ impl Mla {
     /// ⚠ ggml prints shapes reversed: Ferric's latent `[s, kv_lora]` is their `{kv_lora, s}`. The
     /// VALUES are what is being compared, in the order they are stored.
     fn dump_mla(tag: &str, t: &Tensor) {
-        if std::env::var("FERRIC_DUMP_MLA").is_err() { return }
-        let v = pollster::block_on(t.to_vec());
-        let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
-        for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
-        let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.4}")).collect();
-        println!("      mla {tag:<10} {:?} n={} sum {sum:+.4} min {mn:+.4} max {mx:+.4}  {}",
-                 t.shape, v.len(), head.join(" "));
+        crate::hyv4::dump(tag, DUMP_BLOCK.load(std::sync::atomic::Ordering::Relaxed), t)
     }
 
     /// Everything both paths share: the query, the compressed latent, and the one shared RoPE key.

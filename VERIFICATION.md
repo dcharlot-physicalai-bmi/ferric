@@ -234,8 +234,37 @@ With the clamp fixed and routing forced identical, relative `sum_abs` difference
 2.4e-03 at block 77 — it does not grow with depth and has no step anywhere. A second defect of the
 clamp's kind would appear as a step, the way block 29 did. There is no such step.
 
-⭐ **The residual is born in ATTENTION.** The input to attention agrees 13x better than its output
-(7.08e-05 → 9.49e-04). The FFN roughly carries that forward rather than adding to it.
+### Inside attention: no step there either
+
+The input to attention agrees 13x better than its output (7.08e-05 → 9.49e-04), which reads like
+localisation. It is not. Dumping the five stages between them — `kv_cmpr`, `q_pe`/`k_pe`,
+`attn_kqv` (the attention core's output), `attn_gated`, `attn_out` — shows **the 13x is a
+composition, not a jump**:
+
+| stage | mean relative Δ | x previous |
+|---|---|---|
+| `attn_norm` (the input) | 7.08e-05 | — |
+| `kv_cmpr` | 2.19e-04 | **3.1x** |
+| `q_pe` / `k_pe` | 4.47e-04 / 4.97e-04 | ~2.1x |
+| `attn_kqv` (attention core out) | 8.00e-04 | 1.6x |
+| `attn_gated` | 9.43e-04 | 1.2x |
+| `attn_out` | 9.49e-04 | 1.006x |
+
+⛔ **"The residual is born in attention" was too strong, and this table is the correction.** The
+largest single increment is the **first projection** — one 6144→576 matmul plus an RMS norm, 3.1x —
+not the attention core, and not the gate. Growth then *tapers*: the output projection adds 0.6%.
+Every stage is a matmul or a normalisation reducing over thousands of terms, and each one grows the
+disagreement a little, which is what two different summation orders (NEON vs Metal) do.
+
+⭐ **A monotone taper with no step is the signature of accumulation, not of a defect.** A wrong gate
+would spike at `attn_gated`; a wrong RoPE at `q_pe`; a wrong mask or softmax at `attn_kqv`. None of
+them does. This does not *prove* the residual is only fabric numerics — see the "not claimed" note
+below, which still stands — but it removes every mechanism inside attention that a single bug could
+occupy.
+
+⚠ These are different tensors of different shapes, so the table is a sequence of measurements along
+the dataflow, **not a strict error-propagation budget**. The ratios say where disagreement grows,
+not how much each op contributes in isolation.
 
 ### Three explanations for the ~1e-3, all tested, all refuted
 
@@ -306,10 +335,15 @@ indicate a second defect. The tokenizer, embedding dequantisation, hyper-connect
 projections, RoPE, the DSA indexer, attention, the gate, the output projection, the 256-expert
 MoE over three quantised expert formats, and the shared expert are all inside that.
 
-⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. It is bounded, flat, and
-roughly sign-balanced (Ferric larger on 40 of 78 blocks for `attn_out`), which is what
-fabric-difference noise looks like — but "looks like noise" is not a measurement, and no
-experiment here has isolated it. It is localised to attention and it is unexplained.
+⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. Everything measured is
+consistent with it — bounded, flat with depth, roughly sign-balanced (Ferric larger on 40 of 78
+blocks for `attn_out`), and inside a block it accumulates as a smooth taper across five large
+reductions with no step at any one of them. Four candidate mechanisms have been tested and refuted
+(low-bpw kernels, dense-vs-MoE, the reference's KV dtype, the DSA top-k) and the per-stage bisect
+leaves no room inside attention for a single bug. **But "every mechanism I thought to test is
+refuted" is not "it is numerics."** No experiment here has measured the fabric contribution
+directly — that would need the same Ferric build on a second adapter, which this machine does not
+have. It is unexplained, and the honest word for it is unexplained.
 
 ⛔ **Not claimed**: anything past five tokens, or any decode step. This is one prefill.
 

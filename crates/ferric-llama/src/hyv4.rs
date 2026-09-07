@@ -349,7 +349,7 @@ impl std::ops::Deref for BlockRef<'_> {
 /// synthetic checkpoint and DISAGREES on the real weights (sum -208343.8 against -377666.7 on the
 /// same five tokens), so what is wanted is the first stage where they part — and a mean or a range
 /// can match while a permutation hides underneath, which is why the head values are printed too.
-fn dump(tag: &str, il: i64, t: &Tensor) {
+pub(crate) fn dump(tag: &str, il: i64, t: &Tensor) {
     let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
     // `FERRIC_DUMP=all` prints EVERY block, which is what a bisect over 78 of them actually wants:
     // one run yields the whole curve, and the first block whose sum departs from the reference's is
@@ -992,6 +992,10 @@ impl Hyv4 {
             }
             assert!(last_mask.is_some(), "layer {il} has no selection; is_full[0] must be true");
 
+            // The MLA module has no block index of its own; stamp it so its internal dumps
+            // (kv_cmpr / q_pe / k_pe / attn_kqv / attn_gated) carry the same `[il]` prefix as
+            // every other dump and line up with the reference's `<name>-N` tensors.
+            crate::mla::set_dump_block(il as i64);
             let a = blk.mla.forward_masked(&cur, &cos, &sin, last_mask.as_ref());
             dump("attn_out", il as i64, &a);
             h = self.hc.post(&a, &res, &q);
@@ -1064,6 +1068,7 @@ impl Hyv4 {
             }
             assert!(last_mask.is_some(), "layer {il} has no selection; is_full[0] must be true");
 
+            crate::mla::set_dump_block(il as i64);
             let a = blk.mla.decode(&cur, &cos, &sin, &mut cache.mla[il], last_mask.as_ref());
             dump("attn_out", il as i64, &a);
             h = self.hc.post(&a, &res, &q);
@@ -1149,6 +1154,7 @@ impl Hyv4 {
                     caches[i].index_keys[il] = Some(all);
                 }
                 assert!(last_mask[i].is_some(), "layer {il} has no selection; is_full[0] must be true");
+                crate::mla::set_dump_block(il as i64);
                 rows.push(blk.mla.decode(&row, cos, sin, &mut caches[i].mla[il], last_mask[i].as_ref()));
             }
             let a = rows.iter().skip(1).fold(rows[0].clone(), |acc, t| acc.cat(t, 0));
