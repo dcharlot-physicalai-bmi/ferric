@@ -356,10 +356,14 @@ fn dump(tag: &str, il: i64, t: &Tensor) {
     // the answer. At ~250 s per run on the real checkpoint, one-block-at-a-time is not a search.
     if want != "all" && want.parse::<i64>().ok() != Some(il) { return }
     let v = pollster::block_on(t.to_vec());
-    let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
-    for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64 }
+    let (mut mn, mut mx, mut sum, mut sum_abs) = (f32::MAX, f32::MIN, 0f64, 0f64);
+    for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64; sum_abs += (x as f64).abs() }
     let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.5}")).collect();
-    println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.4} min {mn:+.5} max {mx:+.5}\n               {}",
+    // ⚠ `sum` CANCELS. Two tensors whose sums agree to 1e-5 can differ by 1e-3 per element, and this
+    // comparison was flattered by exactly that: hyv4's per-block l_out sums matched to 8.4e-6 while
+    // `result_norm` was 1e-3 out per element. `sum_abs` does not cancel, so it is the number that
+    // says whether the VALUES agree rather than whether their errors offset.
+    println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.4} sum_abs {sum_abs:.4} min {mn:+.5} max {mx:+.5}\n               {}",
              t.shape, v.len(), head.join(" "));
     // ⚠ THE LAST ROW, SEPARATELY. llama.cpp's eval-callback prints head tensors for the LAST TOKEN
     // only ({6144, 1}), while these are [seq, d]. Comparing a 5-token sum against a 1-token sum is
