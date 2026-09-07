@@ -326,14 +326,51 @@ intermediate activations comparable across the argsort discontinuity, which is t
 per-block table above can be read at all. It must not be quoted as "Ferric agrees this well" — the
 honest end-to-end number is the unforced one, 2.87e-03.
 
+### ⭐ The greedy pick agrees on the real checkpoint
+
+Every number above compares magnitudes. None of them says the two implementations would emit the
+**same token**, which is the only thing a reader of the model's output ever sees. Greedy decoding is
+an argmax over the whole 120832-wide logit row, and `eval-callback` prints six of those values, so
+the pick was invisible to every check here until the reference was taught to report it
+(`common_debug_print_argmax`, alongside `sum_abs`).
+
+Prompt `802 8778 299 12749 341` ("The capital of France is"), both on the real 213.66 GiB weights:
+
+| | argmax | top 5 (id:logit) |
+|---|---|---|
+| reference (CPU) | **220** | 220:16.7211  30558:16.1404  198:15.4033  17707:15.3452  31966:15.0235 |
+| Ferric (Metal) | **220** | 220:16.5710  30558:16.4668  17707:15.7264  198:15.5334  31966:15.3985 |
+
+✅ **Same token, and the same five candidates.** Two implementations, two fabrics, one 770B
+checkpoint at 1.3–3.1 bits per weight.
+
+⚠ **Two things in that table are worth more than the agreement.** First, **ranks 3 and 4 are
+swapped** — the reference separates 198 from 17707 by 0.058, and a disagreement smaller than that
+reorders them. This is the argsort discontinuity of §3d's retracted section, appearing again at the
+output layer instead of in expert selection: near-ties reorder, and no tolerance prevents it.
+Second, **Ferric's winning margin is 0.104 where the reference's is 0.581** — 5.6x smaller. The
+pick agrees, but it is *closer to flipping* in Ferric than in the reference, because Ferric puts
+30558 higher (16.4668 vs 16.1404) and 220 lower (16.5710 vs 16.7211). Individual top logits differ
+by up to ~2%, well above the 2.87e-03 aggregate, which is what an aggregate over 120832 values
+hides about its own outliers.
+
+⛔ So this is **one prompt, one token, and a margin that is not comfortable**. It is evidence that
+the graph is right, not a guarantee that any given generation will match token for token.
+
+`scripts/hyv4_vs_reference.sh` now gates the pick as well as `sum_abs`, exactly (no tolerance), on
+all seven synthetic prompts. Mutation-verified: shifting Ferric's pick by one fails all seven while
+every `sum_abs` stays green — the two checks are independent, and the magnitude one cannot see a
+wrong decision.
+
 ### What is claimed, and what is not
 
 ✅ **Claimed**: on the real checkpoint, Ferric and Tencent's implementation agree to
 **~1e-3 relative on activation magnitude at every one of the 78 blocks** with routing forced,
-and **2.87e-03 end-to-end on Ferric's own routing** — flat with depth, with no step that would
-indicate a second defect. The tokenizer, embedding dequantisation, hyper-connections, MLA
-projections, RoPE, the DSA indexer, attention, the gate, the output projection, the 256-expert
-MoE over three quantised expert formats, and the shared expert are all inside that.
+**2.87e-03 end-to-end on Ferric's own routing**, and **emit the same greedy token** — flat with
+depth, with no step that would indicate a second defect. The tokenizer, embedding dequantisation,
+hyper-connections, MLA projections, RoPE, the DSA indexer, attention, the gate, the output
+projection, the 256-expert MoE over three quantised expert formats, and the shared expert are all
+inside that.
 
 ⛔ **Not claimed**: that the ~1e-3 is *only* CPU-vs-Metal numerics. Everything measured is
 consistent with it — bounded, flat with depth, roughly sign-balanced (Ferric larger on 40 of 78
@@ -345,7 +382,17 @@ refuted" is not "it is numerics."** No experiment here has measured the fabric c
 directly — that would need the same Ferric build on a second adapter, which this machine does not
 have. It is unexplained, and the honest word for it is unexplained.
 
-⛔ **Not claimed**: anything past five tokens, or any decode step. This is one prefill.
+⛔ **Not claimed**: that any *generation* matches token for token. The agreement above is ONE
+prompt and ONE token, at a winning margin of 0.104 where the reference's is 0.581 — a fifth of the
+headroom. Each further token is another chance for a near-tie to break the other way, and §3d's
+own history is that near-ties do exactly that.
+
+⚠ **Decode against the reference is still open.** Ferric's cached decode is pinned to its own
+prefill by `cached_decode_equals_a_full_re_run` and `block_decode_in_uneven_chunks_equals_the_whole`
+(§5b), but those run on the SYNTHETIC checkpoint; on the real weights the cached path has never been
+compared with anything. `hyv4_run` now accepts `ids:...` and prints each decode step's logits so
+that `prefill(p + [t])` against `prefill(p)` then `decode(t)` is a one-line diff — the measurement,
+not yet the result.
 
 ---
 

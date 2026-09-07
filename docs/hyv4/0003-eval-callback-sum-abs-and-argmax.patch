@@ -1,0 +1,91 @@
+diff --git a/common/debug.cpp b/common/debug.cpp
+index 102c6924d..3b042476e 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -3,7 +3,9 @@
+ #include "common.h"
+ #include "log.h"
+ 
++#include <algorithm>
+ #include <cmath>
++#include <cstring>
+ #include <regex>
+ #include <string>
+ #include <vector>
+@@ -76,15 +78,46 @@ static float common_ggml_get_float_value(const uint8_t * data,
+ 
+ #define INDENT "    "
+ 
++// ⭐ WHICH TOKEN WOULD THIS PICK? `eval-callback` prints a tensor's head and tail, which is enough to
++// compare activations and useless for comparing a DECISION: greedy decoding is an argmax over the
++// whole 120832-wide logit row, and the winner is almost never in the six values printed. Comparing
++// two implementations' generated text through `llama-cli` instead drags in conversation mode and the
++// model's chat template, which changes the input tokens and makes the comparison meaningless.
++// This prints the argmax and the top 5 of the LAST row, which is exactly the greedy choice.
++static void common_debug_print_argmax(const uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb) {
++    const int64_t nv = ne[0];
++    const int64_t last = ne[1] > 0 ? ne[1] - 1 : 0;
++    std::vector<std::pair<float, int64_t>> v;
++    v.reserve((size_t) nv);
++    for (int64_t i0 = 0; i0 < nv; i0++) {
++        v.emplace_back(common_ggml_get_float_value(data, type, nb, i0, last, 0, 0), i0);
++    }
++    std::partial_sort(v.begin(), v.begin() + std::min<int64_t>(5, nv), v.end(),
++                      [](const auto & a, const auto & b) { return a.first > b.first; });
++    LOG(INDENT "argmax = %lld  (last row of %lld)\n", (long long) v[0].second, (long long) ne[1]);
++    LOG(INDENT "top5 =");
++    for (int64_t k = 0; k < std::min<int64_t>(5, nv); k++) {
++        LOG(" %lld:%.4f", (long long) v[k].second, v[k].first);
++    }
++    LOG("\n");
++}
++
++
+ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
+     GGML_ASSERT(n > 0);
+     float sum = 0;
++    // ⚠ `sum` CANCELS, and a cancelled quantity flatters a comparison. Two tensors whose sums agree
++    // to 1e-5 can differ by 1e-3 per element — measured: hyv4's l_out sums matched to 8.4e-6 while
++    // result_norm was 1e-3 out per element. `sum_abs` does not cancel, so it is the one that says
++    // whether the VALUES agree rather than whether their errors happened to offset.
++    double sum_abs = 0;
+     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
+         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
+             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
+                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
+                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
+                     sum += v;
++                    sum_abs += fabsf(v);
+                 }
+             }
+         }
+@@ -120,6 +153,7 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
+         }
+         LOG(INDENT "]\n");
+         LOG(INDENT "sum = %f\n", sum);
++        LOG(INDENT "sum_abs = %f\n", sum_abs);
+     }
+ 
+     if (abort_on_nan) {
+@@ -183,7 +217,20 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+ 
+     if (!ggml_is_quantized(t->type) && matches_filter) {
+         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
+-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
++        // LLAMA_DEBUG_N: how many leading/trailing values per row to print. Hardcoded 3 elides the
++        // middle of every row, which is fine for eyeballing an activation and useless for a tensor
++        // whose VALUES ARE THE ANSWER -- ffn_moe_topk is 8 expert ids per token, and at n=3 two of
++        // them are replaced by "...". Comparing two MoE implementations needs all eight.
++        static const int64_t n_show = [] {
++            const char * e = getenv("LLAMA_DEBUG_N");
++            return e ? std::max(1L, strtol(e, nullptr, 10)) : 3L;
++        }();
++        common_debug_print_tensor(data, t->type, t->ne, t->nb, n_show, pimpl->abort_on_nan);
++        // The graph's output. Its argmax IS the greedy next token, which is the only thing that can
++        // be compared token-for-token against another runtime's generation.
++        if (strcmp(t->name, "result_output") == 0) {
++            common_debug_print_argmax(data, t->type, t->ne, t->nb);
++        }
+     }
+ 
+     return true;

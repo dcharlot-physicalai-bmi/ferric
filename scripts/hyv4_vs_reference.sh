@@ -11,6 +11,17 @@
 # and was simply untested: the patches apply cleanly at llama.cpp 0cea36222 and build CPU-only in
 # a few minutes. Retest a blocker before quoting it.
 #
+# ⛔ THREE PATCHES, NOT TWO. AngelSlim's 0001-hyv4-architecture and 0002-stq1_0-quant-and-cuda make
+# the reference *run* hyv4; docs/hyv4/0003-eval-callback-sum-abs-and-argmax.patch makes it *report
+# what this gate compares*. Without the third, eval-callback prints neither `sum_abs` nor `argmax`
+# and every prompt here fails to parse. That patch lives in this repo because `.reference/` is
+# gitignored: an earlier commit said it had added sum_abs "to Ferric's dump and to the reference's"
+# and committed only Ferric's half, so the reference side existed on exactly one machine. A gate
+# whose oracle cannot be rebuilt is a gate that runs once.
+#
+#   cd .reference/llama.cpp && git apply ../../docs/hyv4/0003-eval-callback-sum-abs-and-argmax.patch
+#   cmake --build build --target llama-eval-callback -j
+#
 #   scripts/hyv4_vs_reference.sh <path-to-llama.cpp-build>
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -24,6 +35,21 @@ cargo run --release -q -p ferric-llama --example hyv4_synthetic -- "$GGUF" >/dev
 
 # The alphabet the synthetic checkpoint's vocabulary uses, so a prompt maps to known ids.
 ALPHA='abcdefghijklmnopqrstuvwxyz0123456789+-*/'
+
+# ⭐ ASK THE ORACLE WHETHER IT CAN ANSWER, BEFORE READING SEVEN ANSWERS FROM IT. A reference built
+# without patch 0003 prints no `sum_abs` and no `argmax`; the per-prompt parse then yields empty
+# strings, every row reads FAIL, and nothing on screen says why. Refusing here, once, with the
+# command that fixes it, is the difference between a diagnosable gate and a mystery.
+probe=$("$EC" -m "$GGUF" -p "a" -n 1 -c 64 --no-escape 2>/dev/null | /usr/bin/grep -A 12 "result_output = ")
+for field in sum_abs argmax; do
+  printf '%s\n' "$probe" | /usr/bin/grep -qE "^[[:space:]]*$field = " || {
+    echo "⛔ the reference at $EC does not report '$field'."
+    echo "   This gate compares it. Apply the third patch and rebuild:"
+    echo "     cd .reference/llama.cpp && git apply ../../docs/hyv4/0003-eval-callback-sum-abs-and-argmax.patch"
+    echo "     cmake --build build --target llama-eval-callback -j"
+    exit 2
+  }
+done
 
 # ⛔ THE GATE IS ON `sum_abs`, NOT `sum`. A sum CANCELS, and a cancelled quantity flatters a
 # comparison: on the real 770B checkpoint the per-block `l_out` sums agreed to 8.4e-6 while the
@@ -42,18 +68,27 @@ ALPHA='abcdefghijklmnopqrstuvwxyz0123456789+-*/'
 # do differ (two Metal adapters disagree on the golden hash), so the headroom is deliberate —
 # widen it only with a new measured ladder, never to make a red build go green.
 TOL_REL=2e-4
+#
+# ⭐ AND THE GREEDY PICK MUST MATCH EXACTLY. sum_abs says the magnitudes agree; it does not say the
+# two implementations would emit the same token, and the token is what anyone actually sees. Greedy
+# decoding is an argmax over the whole 40-wide (120832-wide on the real model) logit row, and the
+# winner is rarely among the six values eval-callback prints — so this was invisible until both
+# sides were taught to report it (`common_debug_print_argmax` in the patched reference).
+# This is a DECISION test, not a magnitude test, and it is exact: no tolerance.
 fail=0
-printf '%-18s %13s %13s %11s %11s\n' prompt ref_sum_abs fer_sum_abs rel_delta sum_delta
+printf '%-18s %13s %13s %11s %8s %8s\n' prompt ref_sum_abs fer_sum_abs rel_delta ref_pick fer_pick
 for P in dlh a mzq abcde k9x zzz q7; do
   ids=$(python3 -c "print(','.join(str('$ALPHA'.index(c)) for c in '$P'))") || { echo "bad prompt $P"; exit 2; }
 
   rblock=$("$EC" -m "$GGUF" -p "$P" -n 1 -c 64 --no-escape 2>/dev/null | /usr/bin/grep -A 12 "result_output = ")
   ref_sum=$(printf '%s\n' "$rblock" | awk '/^[[:space:]]*sum = /     {print $3; exit}')
   ref_abs=$(printf '%s\n' "$rblock" | awk '/^[[:space:]]*sum_abs = / {print $3; exit}')
+  ref_arg=$(printf '%s\n' "$rblock" | awk '/^[[:space:]]*argmax = /  {print $3; exit}')
 
   fblock=$(cargo run --release -q -p ferric-llama --example hyv4_synthetic -- --logits "$ids" 2>/dev/null)
   fer_sum=$(printf '%s\n' "$fblock" | awk '/^sum = /     {print $3; exit}')
   fer_abs=$(printf '%s\n' "$fblock" | awk '/^sum_abs = / {print $3; exit}')
+  fer_arg=$(printf '%s\n' "$fblock" | awk '/^argmax = /  {print $3; exit}')
 
   read -r rel sd ok < <(python3 -c "
 ra,fa,rs,fs='$ref_abs','$fer_abs','$ref_sum','$fer_sum'
@@ -63,13 +98,21 @@ try:
     else:
         rel=abs(fa-ra)/abs(ra); print(f'{rel:.3e}', f'{abs(fs-rs):.6f}', 'ok' if rel < $TOL_REL else 'FAIL')
 except Exception: print('nan','nan','FAIL')")
-  printf '%-18s %13s %13s %11s %11s %s\n' "$P ($ids)" "${ref_abs:-?}" "${fer_abs:-?}" "$rel" "$sd" \
-         "$([ "$ok" = ok ] || echo '  <-- FAIL')"
-  [ "$ok" = ok ] || fail=$((fail+1))
+  # An unparsed argmax is a FAILURE, not a skip: an empty variable must never compare equal.
+  pick=FAIL
+  [ -n "$ref_arg" ] && [ -n "$fer_arg" ] && [ "$ref_arg" = "$fer_arg" ] && pick=ok
+  note=""
+  [ "$ok"   = ok ] || note="  <-- sum_abs FAIL"
+  [ "$pick" = ok ] && [ "$ok" = ok ] || true
+  [ "$pick" = ok ] || note="$note  <-- PICK DIFFERS"
+  printf '%-18s %13s %13s %11s %8s %8s%s\n' "$P ($ids)" "${ref_abs:-?}" "${fer_abs:-?}" "$rel" \
+         "${ref_arg:-?}" "${fer_arg:-?}" "$note"
+  [ "$ok" = ok ] && [ "$pick" = ok ] || fail=$((fail+1))
 done
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "✓ Ferric agrees with Tencent's reference on every prompt, on the same file."
+  echo "✓ Ferric agrees with Tencent's reference on every prompt, on the same file —"
+  echo "  both in magnitude (sum_abs) and in the GREEDY TOKEN each would emit."
   echo "  This is fidelity evidence, not self-consistency. What it does NOT cover: the REAL"
   echo "  weights, sequences past a few tokens, 256-way routing, and the sparse DSA path at a"
   echo "  top_k that actually selects — the synthetic checkpoint admits everything."

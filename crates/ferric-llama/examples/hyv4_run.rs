@@ -92,7 +92,15 @@ fn main() {
         match g.metadata.get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None });
     println!("tokenizer: {} tokens, {} merges, pre={:?}", tokens.len(), merges.len(), pre);
     let tok = ferric_tokenizer::Bpe::new_with_pre(vocab, &merges, pre);
-    let ids = tok.encode(&prompt);
+    // ⭐ `ids:802,8778,...` FEEDS TOKEN IDS DIRECTLY, bypassing the tokenizer. Comparing a decode
+    // step against a prefill of the same sequence requires the two runs to start from IDENTICAL
+    // ids, and re-tokenising a string that ends in a generated token is not guaranteed to give
+    // them back — token 220 is whitespace, and whitespace is exactly where BPE merges differ.
+    // Making the ids explicit removes the tokenizer from a comparison that is not about it.
+    let ids = match prompt.strip_prefix("ids:") {
+        Some(csv) => csv.split(',').map(|t| t.trim().parse().expect("token id")).collect::<Vec<u32>>(),
+        None => tok.encode(&prompt),
+    };
     println!("prompt {prompt:?} -> {} tokens {:?}", ids.len(), &ids[..ids.len().min(12)]);
 
     // ⭐ The comparable quantity. llama.cpp's eval-callback prints `result_output` as first-three,
@@ -123,6 +131,14 @@ fn main() {
                  row.iter().map(|v| *v as f64).sum::<f64>(),
                  row.iter().map(|v| v.abs() as f64).sum::<f64>(),
                  &row[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
+        // ⭐ THE PICK, in the same form the patched reference prints it
+        // (`common_debug_print_argmax`). Aggregates of a 120832-wide logit row can agree while the
+        // two implementations would emit different tokens, and the token is the whole product.
+        let mut idx: Vec<usize> = (0..row.len()).collect();
+        idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+        println!("argmax = {}", idx[0]);
+        println!("top5 ={}", idx.iter().take(5)
+                 .map(|&i| format!(" {i}:{:.4}", row[i])).collect::<String>());
     }
     for i in 0..n_gen {
         let row = &logits[logits.len() - m.cfg.n_vocab..];
@@ -130,6 +146,18 @@ fn main() {
         out.push(next);
         if i + 1 == n_gen { break }
         logits = pollster::block_on(m.decode(&[next], &mut cache).to_vec());
+        // ⚠ EACH DECODE STEP'S LOGITS, in the same form as the prefill line above. `decode` is
+        // verified against `forward` by unit tests, but those run on a SYNTHETIC checkpoint —
+        // on the real weights the cached path had never been compared with anything. Printing
+        // this makes `prefill(p + [t])` vs `prefill(p) then decode(t)` a one-line diff.
+        {
+            let r = &logits[logits.len() - m.cfg.n_vocab..];
+            let mut ix: Vec<usize> = (0..r.len()).collect();
+            ix.sort_by(|&a, &b| r[b].total_cmp(&r[a]));
+            println!("decode step {i} (after token {next}): sum_abs {:.6}  argmax = {}  top5 ={}",
+                     r.iter().map(|v| v.abs() as f64).sum::<f64>(), ix[0],
+                     ix.iter().take(5).map(|&j| format!(" {j}:{:.4}", r[j])).collect::<String>());
+        }
     }
     let total = t2.elapsed().as_secs_f64();
     if let Some(st) = m.stream() {
@@ -144,5 +172,10 @@ fn main() {
     println!("\nprefill {} tokens in {prefill:.2}s ({:.2}s/token); {} generated in {decode_s:.2}s ({per_tok:.1}s/token{})",
              ids.len(), prefill / ids.len().max(1) as f64, n_gen.saturating_sub(1),
              if per_tok < 1.0 { format!(", {:.2} tok/s", 1.0 / per_tok) } else { String::new() });
+    // ⚠ PRINT THE IDS, not only the text. Comparing generation against another implementation on
+    // detokenised strings hides exactly the differences worth seeing: a different token that
+    // detokenises to the same characters, and a whitespace convention that differs between
+    // tokenisers. The ids are what the two models actually chose.
+    println!("\ngenerated ids {out:?}");
     println!("\n{}{}", prompt, tok.decode(&out));
 }

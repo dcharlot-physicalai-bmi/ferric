@@ -189,6 +189,16 @@ fn main() {
         // ⚠ `sum` CANCELS. Two logit vectors whose sums agree can differ per element; on the real
         // checkpoint l_out sums matched to 8.4e-6 while values were 1e-3 apart. Gate on this one.
         println!("sum_abs = {:.6}", last.iter().map(|v| v.abs()).sum::<f32>());
+        // ⭐ THE ARGMAX IS THE DECISION. Two implementations can agree on every aggregate of a logit
+        // row and still pick different tokens, and the token is what a user sees — greedy decoding
+        // is an argmax over the whole row, and the winner is rarely among the values printed.
+        // `common_debug_print_argmax` in the patched reference reports the same thing, so the gate
+        // can require the PICK to match exactly rather than only the magnitudes to be close.
+        let mut idx: Vec<usize> = (0..last.len()).collect();
+        idx.sort_by(|&a, &b| last[b].total_cmp(&last[a]));
+        println!("argmax = {}", idx[0]);
+        println!("top5 ={}", idx.iter().take(5)
+                 .map(|&i| format!(" {i}:{:.4}", last[i])).collect::<String>());
         return;
     }
     if let Some(out) = std::env::args().nth(1) {
