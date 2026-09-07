@@ -77,8 +77,12 @@ async fn run() {
         println!("top-8 (id, logit):");
         for &i in idx.iter().take(8) { println!("  {i:>6}  {:+.5}  {:?}", row[i], detok(&[i as u32])); }
         let sum: f64 = row.iter().map(|&x| x as f64).sum();
+        // ⛔ `sum` CANCELS, so it is not the number to compare two implementations on — see
+        // VERIFICATION.md §3d, where per-block sums agreed to 8.4e-6 while the values behind them
+        // were ~1e-3 apart. `sum_abs` is what the patched llama.cpp reference prints beside it.
+        let sum_abs: f64 = row.iter().map(|&x| (x as f64).abs()).sum();
         println!("probe[0,100,1000,10000]: {:+.5} {:+.5} {:+.5} {:+.5}", row[0], row[100], row[1000], row[10000]);
-        println!("argmax={} sum={:.3}", idx[0], sum);
+        println!("argmax={} sum={:.3} sum_abs={:.6}", idx[0], sum, sum_abs);
         return;
     }
 

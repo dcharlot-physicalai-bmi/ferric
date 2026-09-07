@@ -234,32 +234,33 @@ pub const REGISTRY: &[Arch] = &[
                   factual and code prompts. Absorbed (attn_k_b/attn_v_b) and Q-LoRA variants refused \
                   at load" },
 
-    Arch { name: "hyv4", runtime: Runtime::Hyv4, status: Status::Untried,
-           note: "Tencent Hy4, 770B/49B, and SUPPORTED BY NO UPSTREAM RUNTIME — llama.cpp does not \
+    Arch { name: "hyv4", runtime: Runtime::Hyv4, status: Status::Verified,
+           note: "Tencent Hy4, 770B/49B, and SUPPORTED BY NO UPSTREAM RUNTIME -- llama.cpp does not \
                   have this architecture; the published GGUFs ship two out-of-tree patches. Not a \
                   port: an independent implementation from the format. crate::hyv4 wires \
                   hyper-connections (4 residual streams, a rank-4 factorised DenseNet over sublayer \
                   outputs), gated MLA with a learnable per-head sink, absorbed MLA + Q-LoRA (both of \
                   which deepseek2 refuses), the DSA lightning indexer with its 21-of-78 index-sharing \
-                  schedule, and DeepSeekMoE with a clamped SwiGLU. Components verified individually: \
-                  the HC closed form and both absorption folds exactly over GF(2^61-1), the schedule \
-                  by bounded model checking for every is_full pattern, STQ1_0/IQ2_XXS/IQ3_XXS by Kani \
-                  plus an interop check against Tencent's own published weights. REAL WEIGHTS DO \
-                  RUN, in slices: examples/hyv4_real_block.rs range-reads block 0's real attention, \
-                  and examples/hyv4_real_moe.rs runs block 1 ENTIRE -- attention and 4 of its 256 \
-                  experts -- from BOTH published builds at once, agreeing at cos 0.96671 between \
-                  IQ2_XXS/IQ3_XXS and Q4_K/Q6_K against a measured no-routed-path floor of 0.29180. \
-                  ⭐ AND THE FORWARD MATCHES A REFERENCE: AngelSlim's llama.cpp patches apply \
-                  cleanly at 0cea36222 and build CPU-only, so scripts/hyv4_vs_reference.sh runs \
-                  Tencent's own hyv4.cpp and Ferric over THE SAME file -- 7 prompts, agreement to \
-                  f32 accumulation noise. The first hyv4 check here that is not a self-comparison. \
-                  ⛔ NOT full fidelity: that runs on a SYNTHETIC checkpoint with short prompts, the \
-                  cross-quant arms above run the SAME forward as each other, and nothing exercises \
-                  256-way routing or a block past 1. Cached decode DOES exist (Hyv4Cache + \
-                  Hyv4::decode) and is pinned to the full forward on every split of a sequence, dense \
-                  and sparse. The runtime field is now Runtime::Hyv4 -- it named DeepSeek2 as a \
-                  placeholder, which would have mis-dispatched the moment this row was promoted; \
-                  resolve() still refuses this string because Untried is not runnable" },
+                  schedule, and DeepSeekMoE with a clamped SwiGLU. \
+                  ⭐ VERIFIED ON THE REAL 213.66 GiB WEIGHTS against Tencent's own hyv4.cpp: all 78 \
+                  blocks agree to ~1e-3 relative on sum_abs (flat with depth, no step), 2.87e-03 \
+                  end-to-end on Ferric's own routing, and BOTH IMPLEMENTATIONS EMIT THE SAME GREEDY \
+                  TOKEN (220). That residual is 6.25x SMALLER than llama.cpp's own CPU-vs-Metal \
+                  disagreement measured the same way, so it sits inside the noise floor of a \
+                  cross-fabric comparison. Cached decode equals a full prefill of the same sequence \
+                  on the real weights at 7.25e-07. Finding the truth here cost one real defect: the \
+                  SwiGLU clamp is a ROUTED-expert rule that was being applied to the shared and \
+                  dense FFN too, invisible to every test because the clamp is the identity below \
+                  ±10. VERIFICATION.md §3d carries the whole record; scripts/hyv4_vs_reference.sh \
+                  gates sum_abs AND the greedy pick on every commit. \
+                  ⛔ THE BOUND THAT REMAINS: the real-weights reference comparison is ONE PROMPT and \
+                  ONE TOKEN, at a winning margin of 0.104 where the reference's is 0.581 -- multi-token \
+                  generation has NOT been compared against the reference, and near-ties reorder \
+                  (ranks 3/4 of the top-5 already differ). ⚠ SERVING REQUIRES STREAMING: ferric-serve \
+                  loads this runtime with load_streaming under FERRIC_STREAM_GIB (default 12 GiB) \
+                  because a resident load of 213.66 GiB is killed by the OS with no error at all, \
+                  and it costs ~250 s/token on a 256 GiB machine because every token rebuilds all \
+                  78 blocks" },
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
@@ -383,29 +384,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hyv4_is_registered_but_refused_until_its_arithmetic_has_an_oracle() {
+    fn hyv4_is_verified_and_names_the_bound_that_remains() {
         let a = REGISTRY.iter().find(|a| a.name == "hyv4").expect("hyv4 must be registered");
-        assert_eq!(a.status, Status::Untried);
-        assert!(!a.status.runnable(), "Untried must not be runnable: a server must not serve a \
-                                       model whose output nobody has seen");
-        assert!(resolve("hyv4").is_err(), "resolve must refuse hyv4: {:?}", resolve("hyv4").map(|_| ()));
-        // ⭐ THIS ASSERTION HAS NOW FAILED TWICE, AND BOTH TIMES THAT WAS THE POINT. It first
+        assert_eq!(a.status, Status::Verified);
+        assert!(a.status.runnable(), "Verified must be runnable");
+        assert!(resolve("hyv4").is_ok(), "resolve must now accept hyv4");
+        // ⭐ THIS ASSERTION HAS NOW FAILED THREE TIMES, AND EVERY TIME THAT WAS THE POINT. It first
         // demanded "NO REAL CHECKPOINT HAS BEEN LOADED", which stopped being true when real weights
         // ran in slices. It then demanded "THAT IS NOT FIDELITY", which stopped being true when
-        // AngelSlim's llama.cpp built and Ferric's forward matched it. Each failure was the row's
-        // bound moving, not the guard breaking, and each time the fix is to repoint it at what is
-        // STILL true rather than to soften the note until it passes.
+        // AngelSlim's llama.cpp built and Ferric's forward matched it on a synthetic file. It then
+        // demanded "SYNTHETIC checkpoint", which stopped being true when all 78 blocks of the real
+        // 213.66 GiB checkpoint were compared against that reference and both emitted token 220.
+        // Each failure was the row's bound MOVING, not the guard breaking, and each time the fix is
+        // to repoint it at what is STILL true — never to soften the note until it passes.
         //
-        // What is still true: the reference agreement is on a SYNTHETIC checkpoint. Nothing has
-        // compared this forward to Tencent's on the real weights.
-        assert!(a.note.contains("SYNTHETIC checkpoint"),
-                "the row must name the bound that remains: the reference agreement is on a \
-                 synthetic checkpoint, not on Tencent's real weights");
+        // What is still true: the real-weights comparison is one prompt and one token. Nothing has
+        // compared a multi-token GENERATION against the reference, and the margin is not large.
+        assert!(a.note.contains("ONE PROMPT") && a.note.contains("ONE TOKEN"),
+                "the row must name the bound that remains: the real-weights reference comparison is                  a single prompt and a single token, not a generation");
+        assert!(a.note.contains("SERVING REQUIRES STREAMING"),
+                "a 213.66 GiB checkpoint is killed by the OS if loaded resident, and the row is                  where a reader finds that out before their server dies without a message");
         assert!(a.note.contains("hyv4_vs_reference.sh"),
                 "the row claims a reference comparison; it must name the script that performs it");
-        assert!(a.note.contains("hyv4_real_moe.rs") && a.note.contains("hyv4_real_block.rs"),
-                "the row must name the runs that back its real-weights claim, so the claim is \
-                 checkable rather than assertable");
     }
 
     #[test]

@@ -375,9 +375,18 @@ impl Engine {
             // Both refusals are already delivered by the `dispatchable` check above, so these arms
             // cannot be reached. They stay because the exhaustive match is what turns "someone added
             // a Runtime" into a compile error rather than a fallthrough.
-            ferric_llama::arch::Runtime::Hyv4 =>
-                Model::Hyv4(ferric_llama::hyv4::Hyv4::load(&ctx, &g)
-                    .unwrap_or_else(|e| panic!("load hyv4: {e}"))),
+            // ⛔ STREAMED, NOT RESIDENT. hyv4's published checkpoint is 213.66 GiB; a resident load
+            // of that is killed by the OS with no panic, no error and no exit code — the process
+            // simply stops. `Hyv4::load` would do exactly that here. `load_streaming` keeps only a
+            // budget of block weights live and rebuilds the rest per token, which is what makes the
+            // model runnable on a machine that cannot hold it.
+            ferric_llama::arch::Runtime::Hyv4 => {
+                let gib: f64 = std::env::var("FERRIC_STREAM_GIB").ok()
+                    .and_then(|s| s.parse().ok()).unwrap_or(12.0);
+                Model::Hyv4(ferric_llama::hyv4::Hyv4::load_streaming(
+                        &ctx, path, (gib * 1073741824.0) as u64)
+                    .unwrap_or_else(|e| panic!("load hyv4 (streaming, {gib:.1} GiB budget): {e}")))
+            }
             ferric_llama::arch::Runtime::Bert =>
                 unreachable!("Bert is refused by Model::dispatchable before this match"),
         };
