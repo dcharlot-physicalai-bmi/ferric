@@ -42,16 +42,25 @@ async fn run() {
     println!("ceiling: examples/bandwidth reports 385-475 GB/s scalar on this class of device");
     println!("llama.cpp streams weights at ~326 GB/s decoding\n");
 
-    // ⭐ SWEEP THE INNER DIMENSION. The split-K kernel strides blocks across 64 lanes
-    // (`for blk = t; blk < nblk; blk += 64u`), so a format with 256-value blocks has only
-    // in/256 blocks to share among 64 threads: at in=2048 that is 8 blocks and 56 IDLE LANES.
-    // Q8_0's 32-value blocks give 64 blocks at the same width — full occupancy. If that is the
-    // story, every 256-value format should climb toward Q8_0's rate as `in` reaches 16384.
-    for (inn, out) in [(2048usize, 8192usize), (8192, 8192), (16384, 8192)] {
-    println!("\n=== in_dim = {inn} (k-quant blocks per row = {}, of 64 lanes) ===", inn / 256);
+    // ⭐⭐ REAL DECODE SHAPES, BOTH KERNELS. An earlier version of this benchmark swept only the
+    // inner dimension at a FIXED out=8192 and concluded the `flat` kernel was 1.5-2.2x faster than
+    // `splitk` for k-quants. End to end on the actual models `flat` is 4-9% SLOWER — because
+    // out=8192 flattered it. `flat` runs one thread per OUTPUT, so its parallelism IS `out`; a real
+    // model also has `ffn_down` at out=2048 with in=8192, where `flat` starves and `splitk` wins 3x.
+    // A benchmark whose shape is not the workload's shape answers a question nobody asked.
+    //
+    // Set FERRIC_Q2_0_KERNEL=flat|splitk to force one; the table below is read as "which wins here".
+    for (inn, out, who) in [
+        (1024usize, 3072usize, "qwen3-0.6b ffn_gate_up"),
+        (3072, 1024, "qwen3-0.6b ffn_down"),
+        (1024, 4096, "qwen3-0.6b qkv"),
+        (2048, 8192, "llama3.2-1b ffn_gate_up"),
+        (8192, 2048, "llama3.2-1b ffn_down"),
+        (2048, 3072, "llama3.2-1b qkv"),
+    ] {
+    println!("\n=== {who}: in={inn} out={out}  (k-quant blocks/row = {}, of 64 lanes) ===",
+             inn / 256);
     let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
-    let out = if inn > 2048 { 2048 } else { out };   // keep the weight ~the same size across the sweep
-
     println!("{:>10}  {:>6}  {:>10}  {:>9}  {:>9}  {:>7}", "format", "bpw", "MiB", "ms/call", "GB/s", "% ceil");
     for (ty, name) in [(12u32, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"), (8, "Q8_0"),
                        (43, "STQ1_0"), (16, "IQ2_XXS"), (18, "IQ3_XXS"), (42, "Q2_0")] {

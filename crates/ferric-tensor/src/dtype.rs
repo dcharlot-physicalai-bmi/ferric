@@ -1301,7 +1301,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_K_SPLITK_WGSL, "matmul_q5_k_splitk")
         } else {
@@ -1490,7 +1490,7 @@ impl Tensor {
         assert_eq!(inn, cols, "inner dim mismatch: x[..,{inn}] vs W[..,{cols}]");
         let out = empty(&self.ctx, rows * o_dim);
         let n = rows * o_dim;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, o_dim) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, o_dim, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_K_SPLITK_WGSL, format!("matmul_{tag}_splitk"))
         } else {
@@ -1587,7 +1587,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL, "matmul_q6_k_splitk")
         } else {
@@ -1744,7 +1744,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q8_0_SPLITK_WGSL, "matmul_q8_0_splitk")
         } else {
@@ -1926,7 +1926,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_K_SPLITK_WGSL, "matmul_q4_k_splitk")
         } else {
@@ -2338,7 +2338,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_0_SPLITK_WGSL, "matmul_q4_0_splitk")
         } else {
@@ -2360,7 +2360,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_1_SPLITK_WGSL, "matmul_q4_1_splitk")
         } else {
@@ -2382,7 +2382,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_0_SPLITK_WGSL, "matmul_q5_0_splitk")
         } else {
@@ -2404,7 +2404,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_1_SPLITK_WGSL, "matmul_q5_1_splitk")
         } else {
@@ -2523,7 +2523,7 @@ impl Tensor {
         // — the kernel + microbenchmark (matmul_q2_0_coop16, up to 6.2×) are proven; wiring waits on that.
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        if q2_0_split_k(rows, w.rows) {
+        if q2_0_split_k(rows, w.rows, inn) {
             // One workgroup per output element, laid out 2D because rows·out overruns the 65535
             // per-dimension cap (e.g. 5 tokens × 17408 outputs).
             let grid_w = n.min(32768);
@@ -2745,15 +2745,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// So: at decode (few rows) use split-K broadly; at prefill fall back to the output-count threshold.
 /// `FERRIC_Q2_0_KERNEL=flat|splitk|trans` forces one; `FERRIC_Q2_0_SPLITK_MAX` overrides the
 /// prefill threshold for sweeps.
-fn q2_0_split_k(rows: usize, n_out: usize) -> bool {
+fn q2_0_split_k(rows: usize, n_out: usize, in_dim: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
         Ok("flat") | Ok("trans") => false,
         Ok("splitk") => true,
         _ => {
             let thresh = std::env::var("FERRIC_Q2_0_SPLITK_MAX").ok().and_then(|s| s.parse().ok());
             if rows <= 2 {
-                // decode: enough K-parallelism to matter, and even the 248320-wide LM head prefers it
-                n_out < thresh.unwrap_or(1 << 20)
+                // ⭐ AT DECODE THE TWO KERNELS HAVE DIFFERENT PARALLELISM, AND THE SHAPE PICKS.
+                // `flat` runs one thread per OUTPUT, so its width is `n_out`. `split-K` gives each
+                // output `min(in_dim/block, 64)` lanes, so its width grows with `in_dim` — and a
+                // k-quant block holds 256 values, so `in_dim = 1024` leaves 4 of 64 lanes busy.
+                // Measured per real decode shape (`ferric-tensor/examples/matmul_q_bench.rs`,
+                // GB/s, split-K vs flat):
+                //
+                //   ffn_gate_up 1024->3072   Q5_K  34.9 vs  55.2   flat
+                //   ffn_down    3072->1024   Q5_K  66.3 vs  35.9   split-K
+                //   qkv         1024->4096   Q6_K  33.7 vs  90.4   flat
+                //   ffn_gate_up 2048->8192   Q4_K  88.1 vs 200.5   flat
+                //   ffn_down    8192->2048   Q4_K 231.6 vs  60.2   split-K
+                //
+                // The crossover sits at `in_dim ≈ n_out`, which is what the two widths predict.
+                //
+                // ⛔ AND YET SWITCHING ON IT BUYS NOTHING END TO END — measured, on three models:
+                // 26.1 / 25.5 / 26.2 ms/token against the old rule's 25.9 / 25.2 / 26.1. The reason
+                // is that this function does not route the model's biggest matmul: the FFN goes
+                // through `try_matmul_swiglu` (a fused matmul+SwiGLU kernel with its own dispatch),
+                // so `matmul_q` carries only the attention projections and the LM head. The
+                // benchmark above measures a path the hot loop does not take.
+                //
+                // So the shape-aware rule is kept and MEASURED but NOT the default: a change to core
+                // dispatch with no demonstrated end-to-end win is risk without payment. Set
+                // FERRIC_SHAPE_KERNEL=1 to enable it. The next move is to measure the *_SWIGLU_WGSL
+                // kernels, where the weights actually are.
+                if std::env::var("FERRIC_SHAPE_KERNEL").is_ok() {
+                    in_dim > n_out && n_out < thresh.unwrap_or(1 << 20)
+                } else {
+                    let _ = in_dim;
+                    n_out < thresh.unwrap_or(1 << 20)
+                }
             } else {
                 n_out < thresh.unwrap_or(16384)
             }
@@ -3837,7 +3867,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
@@ -3911,7 +3941,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
@@ -4048,7 +4078,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows) {
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
@@ -5138,11 +5168,20 @@ mod mxfp4_kernel_tests {
         }
         assert_eq!(want.len(), 4096 * 2, "the grid must be every (scale, code) pair, both halves");
 
-        // Two shapes so both dispatch templates run. q2_0_split_k(rows, n_out): rows<=2 → split-K;
-        // rows>2 with n_out >= 16384 → flat. Asserted, not assumed — the routing is a plain function
-        // and this pins which branch each half of the test is actually taking.
-        assert!(q2_0_split_k(1, 8192), "grid part 1 was meant to exercise the split-K kernel");
-        assert!(!q2_0_split_k(3, 16384), "grid part 2 was meant to exercise the flat kernel");
+        // Asserted, not assumed — the routing is a plain function and this pins which branch each
+        // half of the test is actually taking.
+        //
+        // ⭐ THIS ASSERTION CHANGED WHEN THE ROUTING DID, WHICH IS THE POINT OF HAVING IT. It used
+        // to read `q2_0_split_k(1, 8192)` and claim part 1 exercised split-K. The decode rule now
+        // also reads `in_dim`, because the two kernels have different parallelism and the shape
+        // picks between them (see the function). Part 1 is `[8192 out, 32 in]` — a very wide, very
+        // shallow weight — so `in_dim > n_out` is false and it takes the FLAT kernel now. The fix
+        // is to say what is true, not to keep the old sentence alive.
+        assert!(q2_0_split_k(1, 8192, 32), "grid part 1 was meant to exercise the split-K kernel");
+        assert!(!q2_0_split_k(3, 16384, 32), "grid part 2 was meant to exercise the flat kernel");
+        // ⚠ Both of those describe the DEFAULT rule. Under FERRIC_SHAPE_KERNEL the first flips to
+        // flat, because 8192 outputs against 32 inputs is the shape where flat's one-thread-per-
+        // output wins. That opt-in is measured in `q2_0_split_k` and is not on by default.
 
         // ---- split-K: 1 activation row, 8192 weight rows ----
         let w = Mxfp4Weights::from_bytes(&ctx, &raw, 8192, 32);

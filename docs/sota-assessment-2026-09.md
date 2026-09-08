@@ -153,6 +153,42 @@ bandwidth and never dispatch overhead — it is occupancy.**
 elements to one workgroup (`out_local = t / nblk`, `blk = t % nblk`) and reduce per group, or split
 each block's 8 sub-blocks across lanes. The inner loop is untouched.
 
+### ⛔ The obvious fix was tried and DID NOT WORK — and why is the useful part
+
+Ferric already ships the alternative kernel shape: `flat`, one thread per **output**, walking all of
+K (`FERRIC_Q2_0_KERNEL=flat`). Per shape it wins exactly where the occupancy argument predicts, and
+loses exactly where it predicts (GB/s, split-K vs flat, real decode shapes):
+
+| shape | in vs out | split-K | flat | winner |
+|---|---|---|---|---|
+| `ffn_gate_up` 1024→3072 (Q5_K) | out > in | 34.9 | **55.2** | flat |
+| `ffn_down` 3072→1024 (Q5_K) | in > out | **66.3** | 35.9 | split-K |
+| `qkv` 1024→4096 (Q6_K) | out > in | 33.7 | **90.4** | flat |
+| `ffn_gate_up` 2048→8192 (Q4_K) | out > in | 88.1 | **200.5** | flat |
+| `ffn_down` 8192→2048 (Q4_K) | in > out | **231.6** | 60.2 | split-K |
+
+The crossover is `in_dim ≈ n_out`, which is what the two kernels' widths predict: flat's parallelism
+is `n_out`, split-K's is `min(in/256, 64)` lanes per output. The shipped rule ignores `in_dim`
+entirely and takes split-K for every decode — the wrong half of that table on `gate_up` and `qkv`.
+
+**So the rule was implemented. End to end it bought nothing**: 26.1 / 25.5 / 26.2 ms/token against
+the old rule's 25.9 / 25.2 / 26.1 on the same three models.
+
+⭐ **The reason is the finding.** `matmul_q` does not route the model's largest matmul. The FFN goes
+through `try_matmul_swiglu` — a fused matmul+SwiGLU kernel with its own dispatch — so `matmul_q`
+carries only the attention projections and the LM head. **The benchmark measures a path the hot loop
+does not take.** Forcing `flat` globally is likewise a regression (4–9% slower end to end), because
+it starves on `ffn_down`.
+
+The shape-aware rule is therefore kept, measured, and **off by default** behind `FERRIC_SHAPE_KERNEL=1`:
+a change to core dispatch with no demonstrated end-to-end win is risk without payment. The live target
+is the `MATMUL_Q*_SWIGLU_WGSL` family, which no benchmark in this repo has yet touched.
+
+⚠ **Fourth instrument in this document to answer a question nobody asked** — after the syncing
+profiler, the syncing microbenchmark, and the cold-cache run. The pattern is consistent enough to
+state as a rule: **a kernel benchmark is only evidence if the model actually dispatches that kernel,
+at that shape.** Check the call graph before trusting the curve.
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.
