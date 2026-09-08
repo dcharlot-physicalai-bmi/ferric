@@ -207,22 +207,58 @@ two runs.
 two extra ops per layer). So read it as a large effect in a clear direction rather than a coefficient.
 It agrees with the per-format table above, where Q8_0 measures 3–4x Q5_K's rate at decode width.
 
-### ⛔ A regression guard that fires, and nothing runs it
+### ⛔→✅ A guard that fired into an empty room, and the production bug behind it
 
-`crates/ferric-llama/examples/dispatch_budget.rs` carries a deliberate regression guard on dispatch
-count. **It currently fails**: 13.1 dispatches/layer/token against its `<= 12.5` bound, deterministic
-across runs (314 dispatches, 49 submits, 24 layers). The count grew from the 12.1 recorded when the
-guard was written, and **when that happened is not established**.
+`examples/dispatch_budget.rs` carries a regression guard on dispatch count. **It was failing** —
+13.1 dispatches/layer/token against its `<= 12.5` bound — and nobody knew, because an example is not
+a test: `cargo test --workspace` does not run examples and CI runs only `ebm_cert_verify`.
 
-It went unnoticed because it is an **example, not a test** — `cargo test --workspace` does not run it,
-and CI runs only `ebm_cert_verify`. So a guard that was written precisely to catch this has been
-failing into an empty room.
+Finding the cause needed an instrument that did not exist. A dispatch *total* says a budget moved;
+only a **per-kernel census** says which kernel moved it. `FERRIC_CENSUS=1` now reports dispatches
+keyed by the label already passed to `run()`:
 
-⛔ **Deliberately NOT re-baselined to 13.1.** Moving the bound to whatever the code does today is how
-a regression guard becomes decoration; the standing rule in this repo is to repoint a guard at what is
-still true, not to soften it until it passes. The count is real, the growth is unexplained, and the
-honest state is *failing*. Two things are owed: find the change that added a dispatch per layer, and
-wire this example into a battery so the next one is caught the day it lands.
+    matmul_q8_0_splitk  101.00     kv_write2  25.00     <- the K/V fusion IS active
+    rmsnorm              51.04     rope       25.00
+    binary               50.00     fattn      24.00
+
+It disproved the obvious hypothesis on sight. 314 is exactly the pre-fusion count from the commit
+that fused K/V appends, so that fusion looked like the regression — but `kv_write2` fires 25/token
+and is fine. The anomaly is `rmsnorm` at **51/token where 24 layers need ~25**.
+
+**The cause**, `qwen3.rs:982`:
+
+```rust
+dump("attn_norm", il, &x.rmsnorm(&l.attn_norm, self.cfg.eps));
+```
+
+Rust evaluates arguments before the callee runs. So a full RMSNorm **GPU dispatch executed on every
+layer of every token in production** and was discarded the moment `dump` read `FERRIC_DUMP` and
+returned. ⭐ **A diagnostic that costs a dispatch when disabled is not disabled.**
+
+Fixed structurally rather than at the call site — `dump_with(tag, il, || …)` takes a closure, so the
+work cannot be evaluated unless the dump is on (`qwen3.rs` and `deepseek2.rs`, which has its own
+`dump` and two sites of the same shape):
+
+| | before | after |
+|---|---|---|
+| `rmsnorm` dispatches/token | 51.04 | **26.04** |
+| total dispatches/token | 314 | **290** |
+| submits/token | 49 | **25** |
+| guard | 13.1 FAIL | **12.1 PASS** |
+
+290 is exactly the number the K/V-fusion commit recorded. Submits halved too — the stray norm sat
+outside the batch region and forced its own queue submission.
+
+⚠ **No speed number is claimed.** Attempts read 31.2 / 34.5 / 22.3 ms/token where this model measures
+13.2 on a quiet machine; load average was 23.7 from this session's own builds. The fix stands on the
+counters, which are host-side and exact, and on the guard.
+
+✅ **And the guard is now wired**: `scripts/perf_guards.sh` runs the guards that live in examples,
+building before running (a stale example binary made the library fix look like a no-op once already),
+skipping loudly when a checkpoint is absent, and failing the battery on a non-zero exit.
+Mutation-verified: tightening the bound to 11.0 fails the battery with exit 1. CI cannot hold these
+checkpoints, so this is a **local** battery — under the standing rule that the local battery is a
+superset of the CI jobs, not a subset.
 
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
