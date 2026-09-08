@@ -70,12 +70,44 @@ Measured directly instead, without a readback in the timed loop
 5.5% of the step** (llama3.2: 0.64 ms, 2.4%). The category profile said 52% and 62%. **The attention
 core is not the bottleneck, and the ranked plan below was rewritten because of it.**
 
-⛔ **So where the other ~94% goes is NOT YET ESTABLISHED.** Five explanations are now falsified —
-host-side preparation, bandwidth, dispatch count, submit count, and the attention kernel. That is a
-real narrowing and it is also an admission: this document cannot presently say what makes Ferric
-9.6x slower than llama.cpp, only what does not. The next instrument needs per-op GPU timing that
-does not sync to attribute (timestamp queries), because every attribution method here so far has
-either synced (distorting the answer) or aggregated (hiding it).
+### What the gap actually decomposes into
+
+The clean experiment is a **controlled pair**: two checkpoints of the *same architecture* — identical
+graph, identical 478 dispatches/token — differing only in quantisation, so the only variable is bytes.
+
+| | weight bytes | ms/token (warm) |
+|---|---|---|
+| qwen3-0.6b-**q5km** | 424 MB | 25.70 |
+| qwen3-0.6b-**q4km** | 378 MB | 25.05 |
+
+Δ46 MB → Δ0.65 ms, so the **marginal cost of weight bytes is 71 GB/s effective**. Against the
+measured WGSL read ceiling (385–475 GB/s) that is 5.4–6.7x, and against llama.cpp's ~326 GB/s
+streaming rate it is **4.6x**. Splitting each model's step by that rate:
+
+| model | total | bytes term | remainder | remainder ÷ dispatches |
+|---|---|---|---|---|
+| qwen3-0.6b-q5km | 25.70 ms | 5.99 (23%) | 19.71 | 41.2 µs |
+| qwen3-0.6b-q4km | 25.05 ms | 5.34 (21%) | 19.71 | 41.2 µs |
+| llama3.2-1b-q6k | 26.10 ms | 13.76 (53%) | 12.34 | 69.3 µs |
+
+⭐ **Two terms, and neither alone closes the gap.** The bytes term *by itself* — 6.0 ms — is already
+**2.2x llama.cpp's entire 2.7 ms step**. The remainder is 12–20 ms/token on top of that.
+
+⭐ **The remainder's per-dispatch figure is corroborated three independent ways**: derived here by
+subtraction (41.2 and 69.3 µs), measured as the launch floor of the fused attention kernel
+(~40 µs, `fattn_bench` above), and published for wgpu-native on Metal (**71.1 µs**, arXiv 2604.02344,
+the worst of four backends measured — Safari's Metal is 31.7 µs and Dawn's Vulkan 23.8 µs).
+
+⚠ **But it does NOT scale linearly with dispatch count**, and that matters: 2.7x the dispatches
+(478 vs 178) buys only 1.6x the remainder. So dispatch count is part of it and not all of it — which
+is exactly consistent with this repo's earlier finding that cutting 29% of dispatches moved wall time
+by 0.00 ms. Both observations are true; the remainder has a per-dispatch component and a per-token
+component, and this experiment cannot separate them.
+
+⛔ **Still not established**: what the per-token component *is*. Five candidate mechanisms are dead
+(host-side preparation, total bytes, dispatch count alone, submit count, the attention kernel), and
+the two live terms are now measured rather than guessed — but the remainder's floor needs per-op GPU
+timing that does not sync to attribute.
 
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
@@ -133,21 +165,27 @@ EAGLE-series), NPU table-lookup low-bit inference (T-MAN), CPU-GPU cooperative e
 
 Ordered by measured impact per unit of work, not by novelty.
 
-1. **Build a non-syncing profiler** (WebGPU timestamp queries). Every attribution attempt in this
-   document either synced per boundary — distorting the split badly enough to produce a retracted
-   52% claim — or aggregated to a whole step. Until per-op GPU time can be read without a barrier,
-   the 9.6x gap cannot be assigned, and every optimisation after this is a guess. **This is now #1
-   precisely because the old #1 was wrong.**
-2. **A real flash-attention/GQA WGSL kernel** (online softmax, tiled) for PREFILL and long context,
+1. **The quantised matmul kernels — 71 GB/s against a 385–475 GB/s ceiling.** This is now measured
+   with a controlled pair, not inferred: it is a 4.6x gap against llama.cpp's streaming rate, and the
+   bytes term alone already exceeds llama.cpp's whole step by 2.2x. `matmul_q4_k_splitk` /
+   `matmul_q5_k_splitk` / `matmul_q6_k_splitk` are where the work is.
+2. **Cut the per-token remainder** (12–20 ms). Its per-dispatch figure (41–69 µs) matches published
+   wgpu-native-on-Metal cost, which is the **worst of four backends measured** — Safari's Metal is
+   2.2x cheaper and Dawn's Vulkan 3x. Some of this is wgpu's, not Ferric's, and that is worth knowing
+   before optimising around it.
+3. **Build a non-syncing profiler** (timestamp queries) to separate the remainder's per-dispatch and
+   per-token halves. Every attribution attempt here either synced per boundary — distorting the split
+   badly enough to produce a retracted 52% claim — or aggregated to a whole step.
+4. **A real flash-attention/GQA WGSL kernel** (online softmax, tiled) for PREFILL and long context,
    where the measured curve above does start to scale. Not for short-context decode: the fused
    kernel already costs 5.5% there and fusing it further cannot buy back 9.6x.
-3. **Per-shape/per-device kernel autotuning** (roadmap #6). Measured elsewhere at +41%; matters more
+5. **Per-shape/per-device kernel autotuning** (roadmap #6). Measured elsewhere at +41%; matters more
    for Ferric than anyone because WebGPU spans the widest hardware range.
-4. **Close the browser performance gap** to WebLLM. The correctness story is already better; the
+6. **Close the browser performance gap** to WebLLM. The correctness story is already better; the
    throughput story is 7x worse per parameter, and browser-first is the stated thesis.
-5. **Latest-model cadence.** `qwen4exp` (Qwen3.8-Flash-Next) and Nemotron-3-Puzzle-75B-A9B landed
+7. **Latest-model cadence.** `qwen4exp` (Qwen3.8-Flash-Next) and Nemotron-3-Puzzle-75B-A9B landed
    upstream on 2026-09-04. The standing rule is support within 30 days.
-6. **Promote `Loads` → `Verified`.** Fifteen architectures generate coherent text and have never been
+8. **Promote `Loads` → `Verified`.** Fifteen architectures generate coherent text and have never been
    diffed against a reference. `scripts/hyv4_vs_reference.sh` is now a reusable shape: same file,
    both implementations, gate `sum_abs` **and** the greedy pick.
 
