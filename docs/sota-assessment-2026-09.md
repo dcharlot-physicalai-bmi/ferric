@@ -189,6 +189,41 @@ profiler, the syncing microbenchmark, and the cold-cache run. The pattern is con
 state as a rule: **a kernel benchmark is only evidence if the model actually dispatches that kernel,
 at that shape.** Check the call graph before trusting the curve.
 
+### ⭐⭐ END-TO-END CONFIRMATION: 52% more bytes, 2x faster
+
+Everything above is microbenchmarks. Two *whole models*, same family, same machine, same harness:
+
+| model | quant | weight bytes | ms/token | effective |
+|---|---|---|---|---|
+| qwen2.5-0.5b-instruct | **Q8_0** | 644 MiB | **13.2** | 48.8 GB/s |
+| qwen3-0.6b | **Q5_K** | 424 MiB | **26.1** | 16.2 GB/s |
+
+⭐ **The bigger model is twice as fast.** 52% more weight bytes to move, half the time to move them.
+No microbenchmark, no profiler, no synthetic shape — two real checkpoints through the ordinary decode
+path. Ferric's decode is **not bandwidth-bound**, and the k-quant kernels are what separates these
+two runs.
+
+⚠ Not perfectly controlled: different architectures (24 vs 28 layers; qwen3 adds QK-norm, which is
+two extra ops per layer). So read it as a large effect in a clear direction rather than a coefficient.
+It agrees with the per-format table above, where Q8_0 measures 3–4x Q5_K's rate at decode width.
+
+### ⛔ A regression guard that fires, and nothing runs it
+
+`crates/ferric-llama/examples/dispatch_budget.rs` carries a deliberate regression guard on dispatch
+count. **It currently fails**: 13.1 dispatches/layer/token against its `<= 12.5` bound, deterministic
+across runs (314 dispatches, 49 submits, 24 layers). The count grew from the 12.1 recorded when the
+guard was written, and **when that happened is not established**.
+
+It went unnoticed because it is an **example, not a test** — `cargo test --workspace` does not run it,
+and CI runs only `ebm_cert_verify`. So a guard that was written precisely to catch this has been
+failing into an empty room.
+
+⛔ **Deliberately NOT re-baselined to 13.1.** Moving the bound to whatever the code does today is how
+a regression guard becomes decoration; the standing rule in this repo is to repoint a guard at what is
+still true, not to soften it until it passes. The count is real, the growth is unexplained, and the
+honest state is *failing*. Two things are owed: find the change that added a dispatch per layer, and
+wire this example into a battery so the next one is caught the day it lands.
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.
