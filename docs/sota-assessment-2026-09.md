@@ -33,9 +33,11 @@ Same model, same machine, both on Metal:
 | | tok/s | ms/token |
 |---|---|---|
 | llama.cpp (`llama-bench` tg24, 3 reps) | **369.25 ± 7.44** | 2.7 |
-| Ferric (warm, 24 tokens) | **38.5** | 26 |
+| Ferric (warm, 24 tokens) | **45.0** | 22.2 |
 
-**9.6x.** Four explanations are ruled out by measurement, not argument:
+**8.2x** — down from 9.6x, because a debug line that ran an RMSNorm per layer per token in production
+was removed while writing this document (see the dispatch-guard section below). The gap was 9.6x when
+this was first measured and every ratio quoted before that fix is 1.29x too pessimistic. Four explanations are ruled out by measurement, not argument:
 
 | hypothesis | verdict | evidence |
 |---|---|---|
@@ -249,9 +251,22 @@ work cannot be evaluated unless the dump is on (`qwen3.rs` and `deepseek2.rs`, w
 290 is exactly the number the K/V-fusion commit recorded. Submits halved too — the stray norm sat
 outside the batch region and forced its own queue submission.
 
-⚠ **No speed number is claimed.** Attempts read 31.2 / 34.5 / 22.3 ms/token where this model measures
-13.2 on a quiet machine; load average was 23.7 from this session's own builds. The fix stands on the
-counters, which are host-side and exact, and on the guard.
+✅ **And it is worth 1.29x.** A controlled A/B on one settled machine, minutes apart — the eager form
+restored, measured, then reverted to HEAD (working tree verified clean):
+
+| | ms/token |
+|---|---|
+| before (eager argument) | 13.3, 13.3, 13.2 |
+| after (`dump_with`) | 10.3, 10.4, 10.2 |
+
+**13.25 → 10.30, 22% faster, from one debug line.** The other two models move with it, since
+`apply_layer` serves qwen2/qwen3/llama alike: qwen3-0.6b-q5km 26.1 → **22.2**, llama3.2-1b-q6k
+26.2 → **21.8** (those two compare across the session rather than back-to-back, so read them as
+consistent with the A/B rather than as independently rigorous).
+
+⚠ Earlier attempts at this number read 31.2 / 34.5 / 22.3 ms/token — at load average 23.7, from this
+session's own builds. They were discarded rather than published. The counters carried the result until
+the machine was quiet enough to measure, and the A/B is what licensed the claim.
 
 ✅ **And the guard is now wired**: `scripts/perf_guards.sh` runs the guards that live in examples,
 building before running (a stale example binary made the library fix look like a no-op once already),
