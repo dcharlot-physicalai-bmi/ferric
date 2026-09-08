@@ -1301,9 +1301,13 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        let (lanes, opw) = splitk_lanes(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_K_SPLITK_WGSL, "matmul_q5_k_splitk")
+            // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
+            // covers ceil(n / opw) workgroups rather than one per output.
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q5_K_SPLITK_WGSL, "matmul_q5_k_splitk")
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q5_K_FLAT_WGSL, "matmul_q5_k_flat")
@@ -1311,7 +1315,10 @@ impl Tensor {
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q5_k_coop(w);
         }
-        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER);
+        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
@@ -1490,14 +1497,21 @@ impl Tensor {
         assert_eq!(inn, cols, "inner dim mismatch: x[..,{inn}] vs W[..,{cols}]");
         let out = empty(&self.ctx, rows * o_dim);
         let n = rows * o_dim;
+        // Q2_K/Q3_K share the Q6_K split-K template, so they need the same lane split — without
+        // this the `__L__`/`__OPW__` placeholders would reach the shader compiler verbatim.
+        let (lanes, opw) = splitk_lanes(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, o_dim, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_K_SPLITK_WGSL, format!("matmul_{tag}_splitk"))
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_K_SPLITK_WGSL, format!("matmul_{tag}_splitk"))
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_K_FLAT_WGSL, format!("matmul_{tag}_flat"))
         };
-        let src = wgsl.replace("__HELPERS__", helpers).replace("__BODY__", body);
+        let src = wgsl.replace("__HELPERS__", helpers).replace("__BODY__", body)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, &label,
             &[x.buf.as_ref(), codes.as_ref(), aux.as_ref(), &out,
@@ -1587,9 +1601,13 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        let (lanes, opw) = splitk_lanes(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL, "matmul_q6_k_splitk")
+            // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
+            // covers ceil(n / opw) workgroups rather than one per output.
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL, "matmul_q6_k_splitk")
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL, "matmul_q6_k_flat")
@@ -1597,7 +1615,10 @@ impl Tensor {
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q6_k_coop(w);
         }
-        let src = wgsl.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY);
+        let src = wgsl.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
@@ -1926,9 +1947,13 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        let (lanes, opw) = splitk_lanes(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_K_SPLITK_WGSL, "matmul_q4_k_splitk")
+            // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
+            // covers ceil(n / opw) workgroups rather than one per output.
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q4_K_SPLITK_WGSL, "matmul_q4_k_splitk")
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q4_K_FLAT_WGSL, "matmul_q4_k_flat")
@@ -1961,7 +1986,10 @@ impl Tensor {
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q4_k_coop(w);
         }
-        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER);
+        let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
@@ -2745,6 +2773,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// So: at decode (few rows) use split-K broadly; at prefill fall back to the output-count threshold.
 /// `FERRIC_Q2_0_KERNEL=flat|splitk|trans` forces one; `FERRIC_Q2_0_SPLITK_MAX` overrides the
 /// prefill threshold for sweeps.
+/// **Lanes per output, and outputs per workgroup, for the split-K quant matmuls.**
+///
+/// ⛔ THE BUG THIS FIXES. The split-K kernels strided WHOLE BLOCKS across a fixed 64-lane
+/// workgroup (`for blk = t; blk < nblk; blk += 64u`). A k-quant block holds **256 values**, so a
+/// decode matmul with `in_dim = 1024` has `nblk = 4` — **four lanes worked and sixty idled**.
+/// Q8_0's 32-value blocks give `nblk = 64` at the same width, which is the entire reason Q8_0
+/// alone reached llama.cpp's streaming rate (295–352 GB/s, 69–82% of the read ceiling) while every
+/// k-quant sat at 9–25%. Measured at IDENTICAL weight bytes, Q4_K went 48 → 186 GB/s as `nblk`
+/// went 8 → 32; the arithmetic never changed.
+///
+/// So give each output `L = largest power of two <= min(nblk, 64)` lanes and pack `64 / L` outputs
+/// into the workgroup. Every lane works, the per-output reduction shrinks to `log2(L)` steps, and
+/// the coalesced block-major reads that split-K was written for are untouched — unlike the `flat`
+/// kernel, which fills lanes by running one thread per output and then starves whenever `out` is
+/// small (measured 3.8x worse on `ffn_down`).
+///
+/// `nblk >= 64` returns `(64, 1)`, which is byte-for-byte the old behaviour.
+fn splitk_lanes(nblk: usize) -> (u32, u32) {
+    let mut l = 1usize;
+    while l * 2 <= nblk.min(64) { l *= 2; }
+    (l as u32, (64 / l) as u32)
+}
+
 fn q2_0_split_k(rows: usize, n_out: usize, in_dim: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
         Ok("flat") | Ok("trans") => false,
@@ -2951,11 +3002,18 @@ __HELPERS__
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let rows = info.x; let o_dim = info.y; let in_dim = info.z;
-    let idx = wg.x + wg.y * info.w; let t = lid.x;
-    if (idx < rows * o_dim) {
+    let t = lid.x;
+    // One output is served by __L__ lanes; __OPW__ outputs share this workgroup.
+    let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * o_dim;
+    var acc = 0.0;
+    // ⚠ The bounds test may NOT wrap the barriers below: `idx` now varies within the workgroup, so
+    // a guard around them would put `workgroupBarrier()` in non-uniform control flow, which is
+    // undefined. Guard the WORK, barrier unconditionally, guard the STORE.
+    if (idx < n_all) {
         let o = idx % o_dim; let r = idx / o_dim; let nblk = in_dim / 256u;
-        var acc = 0.0;
-        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+        for (var blk: u32 = bl; blk < nblk; blk = blk + __L__u) {
             let bi = o * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
             let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
             let xbb = r * in_dim + blk * 256u;
@@ -2963,11 +3021,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 __INNER__
             }
         }
-        partial[t] = acc;
-        workgroupBarrier();
-        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
-        if (t == 0u) { out[idx] = partial[0]; }
     }
+    partial[t] = acc;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) { if (bl < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+    if (bl == 0u && idx < n_all) { out[idx] = partial[t]; }
 }
 "#;
 
@@ -3634,12 +3692,19 @@ __HELPERS__
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let rows = info.x; let o_dim = info.y; let in_dim = info.z;
-    let idx = wg.x + wg.y * info.w; let t = lid.x;
-    if (idx < rows * o_dim) {
+    let t = lid.x;
+    // One output is served by __L__ lanes; __OPW__ outputs share this workgroup.
+    let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * o_dim;
+    var acc = 0.0;
+    // ⚠ The bounds test may NOT wrap the barriers below: `idx` now varies within the workgroup, so
+    // a guard around them would put `workgroupBarrier()` in non-uniform control flow, which is
+    // undefined. Guard the WORK, barrier unconditionally, guard the STORE.
+    if (idx < n_all) {
         let o = idx % o_dim; let r = idx / o_dim;
         let nblk = in_dim / 256u;
-        var acc = 0.0;
-        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+        for (var blk: u32 = bl; blk < nblk; blk = blk + __L__u) {
             let bi = o * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
             let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
             let xbb = r * in_dim + blk * 256u;
@@ -3647,11 +3712,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 __INNER__
             }
         }
-        partial[t] = acc;
-        workgroupBarrier();
-        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
-        if (t == 0u) { out[idx] = partial[0]; }
     }
+    partial[t] = acc;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) { if (bl < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+    if (bl == 0u && idx < n_all) { out[idx] = partial[t]; }
 }
 "#;
 
@@ -3867,14 +3932,20 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        // Shares the Q6_K split-K template, so it needs the same lane split.
+        let (lanes, opw) = splitk_lanes(inn / 256);
         let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
         };
-        let src = wgsl.replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_XS_BODY);
+        let src = wgsl.replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_XS_BODY)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_iq4_xs",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -3941,9 +4012,12 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        // Shares the Q6_K split-K template, so it needs the same lane split.
+        let (lanes, opw) = splitk_lanes(inn / 32);
         let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
@@ -3955,7 +4029,10 @@ impl Tensor {
         debug_assert_eq!(wgsl.matches("in_dim / 256u").count(), 1,
             "IQ4_NL rewrites the template's block stride and expects exactly one site");
         let src = wgsl.replace("in_dim / 256u", "in_dim / 32u")
-            .replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_NL_BODY);
+            .replace("__HELPERS__", IQ4_XS_HELPERS).replace("__BODY__", IQ4_NL_BODY)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_iq4_nl",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -4078,9 +4155,12 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        // Shares the Q6_K split-K template, so it needs the same lane split.
+        let (lanes, opw) = splitk_lanes(inn / 32);
         let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
-            let gw = n.min(32768);
-            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
         } else {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
@@ -4091,7 +4171,10 @@ impl Tensor {
         debug_assert_eq!(wgsl.matches("in_dim / 256u").count(), 1,
             "MXFP4 rewrites the template's block stride and expects exactly one site");
         let src = wgsl.replace("in_dim / 256u", "in_dim / 32u")
-            .replace("__HELPERS__", MXFP4_HELPERS).replace("__BODY__", MXFP4_BODY);
+            .replace("__HELPERS__", MXFP4_HELPERS).replace("__BODY__", MXFP4_BODY)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_mxfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -4131,19 +4214,26 @@ __HELPERS__
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let rows = info.x; let o_dim = info.y; let in_dim = info.z;
-    let idx = wg.x + wg.y * info.w; let t = lid.x;
-    if (idx < rows * o_dim) {
+    let t = lid.x;
+    // One output is served by __L__ lanes; __OPW__ outputs share this workgroup.
+    let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * o_dim;
+    var acc = 0.0;
+    // ⚠ The bounds test may NOT wrap the barriers below: `idx` now varies within the workgroup, so
+    // a guard around them would put `workgroupBarrier()` in non-uniform control flow, which is
+    // undefined. Guard the WORK, barrier unconditionally, guard the STORE.
+    if (idx < n_all) {
         let o = idx % o_dim; let r = idx / o_dim; let nblk = in_dim / 256u;
-        var acc = 0.0;
-        for (var blk: u32 = t; blk < nblk; blk = blk + 64u) {
+        for (var blk: u32 = bl; blk < nblk; blk = blk + __L__u) {
             let bi = o * nblk + blk;
 __BODY__
         }
-        partial[t] = acc;
-        workgroupBarrier();
-        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
-        if (t == 0u) { out[idx] = partial[0]; }
     }
+    partial[t] = acc;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) { if (bl < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+    if (bl == 0u && idx < n_all) { out[idx] = partial[t]; }
 }
 "#;
 
