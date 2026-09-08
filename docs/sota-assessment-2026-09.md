@@ -44,18 +44,38 @@ Same model, same machine, both on Metal:
 | dispatch-count-bound | **false** | 478 vs 178 dispatches/token — 2.7x, same time |
 | submit-count-bound | **false** | 57 vs 33 submits/token — 1.7x, same time |
 
-⭐ **What the profiler says instead: attention is 52% of a decode step.**
+⚠ **A fifth hypothesis was raised and then RETRACTED — by the instrument that raised it.** The
+category profiler reported `attn` at 52% (qwen3) and 62% (llama3.2) of a decode step, which looked
+like the answer and was written into the first version of this document. It is not sound. `prof()`
+calls `device_sync()` at **every category boundary** — two per layer — and the profiled run costs
++25% (qwen3) and **+52%** (llama3.2) over the unprofiled one. The model with *more* sync overhead is
+exactly the one reporting the *higher* attention share:
 
-    attn     252.3 ms   52.0%
-    ffn      175.0 ms   36.1%
-    lm_head   50.3 ms   10.4%
-    embed      7.4 ms    1.5%
+| | profiled | unprofiled | syncs/token | added ms per sync |
+|---|---|---|---|---|
+| qwen3-0.6b | 32.3 ms | 25.9 ms | 56 | 0.114 |
+| llama3.2-1b | 39.8 ms | 26.2 ms | 32 | 0.425 |
 
-At a ~17-token context the attention FLOPs are negligible, so 52% is **per-op overhead in the
-attention path**, not arithmetic. That also explains the model-size independence above: a fixed
-per-layer dispatch pattern over a short sequence costs the same whatever the weights weigh. Ferric
-issues **478 dispatches/token across 28 layers — 17 per layer**, where a fused implementation needs
-a handful.
+Measured directly instead, without a readback in the timed loop
+(`crates/ferric-tensor/examples/fattn_bench.rs`), the fused decode-attention kernel costs:
+
+| S (cache length) | ms/call | MFLOP | GFLOP/s |
+|---|---|---|---|
+| 17 | 0.051 | 0.14 | 2.7 |
+| 128 | 0.042 | 1.05 | 24.7 |
+| 512 | 0.057 | 4.19 | 73.9 |
+| 2048 | 0.090 | 16.78 | 186.0 |
+
+⭐ **Flat to S=128 — a ~0.04 ms launch floor**, then it scales. At 28 layers that is **1.43 ms/token,
+5.5% of the step** (llama3.2: 0.64 ms, 2.4%). The category profile said 52% and 62%. **The attention
+core is not the bottleneck, and the ranked plan below was rewritten because of it.**
+
+⛔ **So where the other ~94% goes is NOT YET ESTABLISHED.** Five explanations are now falsified —
+host-side preparation, bandwidth, dispatch count, submit count, and the attention kernel. That is a
+real narrowing and it is also an admission: this document cannot presently say what makes Ferric
+9.6x slower than llama.cpp, only what does not. The next instrument needs per-op GPU timing that
+does not sync to attribute (timestamp queries), because every attribution method here so far has
+either synced (distorting the answer) or aggregated (hiding it).
 
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
@@ -113,11 +133,14 @@ EAGLE-series), NPU table-lookup low-bit inference (T-MAN), CPU-GPU cooperative e
 
 Ordered by measured impact per unit of work, not by novelty.
 
-1. **Fuse the decode attention path.** It is 52% of a decode step at a context where its FLOPs round
-   to zero. This is the single biggest lever in the runtime and it is roadmap item #3, still
-   unchecked. Target: 17 dispatches/layer → single digits.
-2. **A real flash-attention/GQA WGSL kernel** (online softmax, tiled), which is the same work item
-   and also unlocks long context, where the current path will degrade fastest.
+1. **Build a non-syncing profiler** (WebGPU timestamp queries). Every attribution attempt in this
+   document either synced per boundary — distorting the split badly enough to produce a retracted
+   52% claim — or aggregated to a whole step. Until per-op GPU time can be read without a barrier,
+   the 9.6x gap cannot be assigned, and every optimisation after this is a guess. **This is now #1
+   precisely because the old #1 was wrong.**
+2. **A real flash-attention/GQA WGSL kernel** (online softmax, tiled) for PREFILL and long context,
+   where the measured curve above does start to scale. Not for short-context decode: the fused
+   kernel already costs 5.5% there and fusing it further cannot buy back 9.6x.
 3. **Per-shape/per-device kernel autotuning** (roadmap #6). Measured elsewhere at +41%; matters more
    for Ferric than anyone because WebGPU spans the widest hardware range.
 4. **Close the browser performance gap** to WebLLM. The correctness story is already better; the
