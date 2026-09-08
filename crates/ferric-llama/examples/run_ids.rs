@@ -103,6 +103,18 @@ async fn run() {
         // old "submit" label conflated queue submission with per-dispatch info-buffer creation and
         // hid the single largest host cost behind a name that suggested nothing could be done.
         println!("  pass recording  {:>8.2} ms   submit+infobuf {:>5.2} ms", rec_ns as f64 / 1e6, sub_ns as f64 / 1e6);
+        // FERRIC_CENSUS=1 names the kernels behind the count. A total says a budget moved; only this
+        // says WHICH kernel moved it, which is the question the moment a dispatch guard regresses.
+        let mut census = ferric_tensor::op_census();
+        if !census.is_empty() {
+            let toks = out.len().max(1) as f64;
+            census.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("\n  per-kernel dispatches (per token):");
+            for (k, n) in census.iter().take(24) {
+                println!("    {:<34} {:>7.2}", k, *n as f64 / toks);
+            }
+            println!();
+        }
         println!("  {disp} dispatches in {subs} submits ({:.0} dispatches/token)",
                  disp as f64 / out.len().max(1) as f64);
     }

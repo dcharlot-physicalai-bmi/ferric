@@ -20,9 +20,26 @@ use std::sync::Arc;
 
 /// Env-gated dump matching `llama-eval-callback`'s tensor names, for bisecting a divergence against
 /// the reference one tensor at a time. `FERRIC_DUMP=<block index>`.
+/// Whether a dump for layer `il` is wanted. Cheap: an env lookup and a parse, no GPU work.
+pub(crate) fn dump_on(il: usize) -> bool {
+    std::env::var("FERRIC_DUMP").ok().and_then(|w| w.parse::<usize>().ok()) == Some(il)
+}
+
+/// ⛔ FOR A TENSOR THAT MUST BE **COMPUTED** IN ORDER TO BE DUMPED. Rust evaluates arguments before
+/// the callee runs, so `dump("attn_norm", il, &x.rmsnorm(..))` performs a full RMSNorm **GPU
+/// dispatch on every layer of every token in production** and then throws the result away when the
+/// env var is unset. That is exactly what happened here: it put decode at 314 dispatches/token
+/// against the 290 recorded after the K/V-append fusion — 1 extra per layer, 24 per token on a
+/// 24-layer model — and `examples/dispatch_budget.rs` caught it, in an example nothing runs.
+///
+/// A diagnostic that costs a dispatch when disabled is not disabled. Pass the work as a closure.
+pub(crate) fn dump_with(tag: &str, il: usize, f: impl FnOnce() -> Tensor) {
+    if !dump_on(il) { return }
+    dump(tag, il, &f());
+}
+
 pub(crate) fn dump(tag: &str, il: usize, t: &Tensor) {
-    let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
-    if want.parse::<usize>().ok() != Some(il) { return }
+    if !dump_on(il) { return }
     let v = pollster::block_on(t.to_vec());
     let sum: f64 = v.iter().map(|&x| x as f64).sum();
     println!("  [{il}] {tag:<12} {:?} n={} sum {sum:+.6}", t.shape, v.len());
@@ -979,7 +996,7 @@ impl Qwen3 {
     fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize) -> Tensor {
         use ferric_tensor::{batch, prof};
         dump("inpL", il, x);
-        dump("attn_norm", il, &x.rmsnorm(&l.attn_norm, self.cfg.eps));
+        dump_with("attn_norm", il, || x.rmsnorm(&l.attn_norm, self.cfg.eps));
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
         let mut out;
         let xin = x;

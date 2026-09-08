@@ -1783,6 +1783,12 @@ thread_local! {
     // With batching those diverge — one submit can carry hundreds of dispatches.
     static DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // ⭐ WHICH kernels, not just how many. A per-token dispatch total says a budget was exceeded; it
+    // cannot say WHAT is issuing them, and that is the question when a count regresses. Keyed by the
+    // label already passed to `run`, so it costs nothing to maintain and cannot drift from reality.
+    // Off unless FERRIC_CENSUS is set — a HashMap insert per dispatch is not free.
+    static CENSUS: std::cell::RefCell<std::collections::BTreeMap<String, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     // When Some, ops record into an ordered SEGMENT LIST instead of executing immediately — the
     // op-DAG's linearized form. Wgsl segments hold a command encoder plus every bind group a
     // recorded pass references (dropping one mid-batch would free a buffer the encoder still
@@ -1812,6 +1818,12 @@ enum Seg {
 
 /// (dispatches, submits) issued so far on this thread.
 pub fn op_counters() -> (u64, u64) { (DISPATCHES.with(|c| c.get()), SUBMITS.with(|c| c.get())) }
+/// Dispatches issued per kernel LABEL since the last reset. Empty unless `FERRIC_CENSUS` is set.
+/// Answers "which kernel is issuing these?", which a total cannot.
+pub fn op_census() -> Vec<(String, u64)> {
+    CENSUS.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect())
+}
+pub fn reset_op_census() { CENSUS.with(|c| c.borrow_mut().clear()); }
 pub fn reset_op_counters() { DISPATCHES.with(|c| c.set(0)); SUBMITS.with(|c| c.set(0)); }
 
 /// Every backend caps workgroups-per-dimension; WebGPU's floor is 65,535 and wgpu enforces it.
@@ -1858,6 +1870,9 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
          into the y dimension and linearise in the shader via num_workgroups.",
         g
     );
+    if std::env::var("FERRIC_CENSUS").is_ok() {
+        CENSUS.with(|c| *c.borrow_mut().entry(label.to_string()).or_insert(0) += 1);
+    }
     let _t = profclock::now();
     let (pipe, bgl) = pipeline_for(ctx, wgsl, label);
     add_ns(0, profclock::elapsed_ns(&_t));

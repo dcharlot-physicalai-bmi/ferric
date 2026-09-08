@@ -62,9 +62,21 @@ use std::sync::Arc;
 /// Prints shape, first values and summary stats. Stats alone are not enough — two tensors can share a
 /// mean and a range and still be permuted relative to each other, which is exactly the failure mode
 /// that a summary statistic hides.
+fn dump_on(il: usize) -> bool {
+    std::env::var("FERRIC_DUMP").ok().and_then(|w| w.parse::<usize>().ok()) == Some(il)
+}
+
+/// ⛔ FOR A TENSOR THAT MUST BE COMPUTED TO BE DUMPED. Rust evaluates arguments before the callee
+/// runs, so `dump(tag, il, &x.some_op())` does the work on every layer of every token in production
+/// and discards it when the env var is unset. In `qwen3.rs` that cost a full RMSNorm dispatch per
+/// layer and put decode 24 dispatches/token over its regression bound. Pass a closure instead.
+fn dump_with(tag: &str, il: usize, f: impl FnOnce() -> Tensor) {
+    if !dump_on(il) { return }
+    dump(tag, il, &f());
+}
+
 fn dump(tag: &str, il: usize, t: &Tensor) {
-    let Ok(want) = std::env::var("FERRIC_DUMP") else { return };
-    if want.parse::<usize>().ok() != Some(il) { return }
+    if !dump_on(il) { return }
     let v = pollster::block_on(t.to_vec());
     let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0f64);
     for &x in &v { mn = mn.min(x); mx = mx.max(x); sum += x as f64; }
@@ -492,7 +504,7 @@ impl DeepSeek2 {
             .reshape(&[t, nh, rope]);
 
         // The compressed KV plus the SHARED rope vector: [t, r + rope].
-        dump("q", il, &q.reshape(&[t, nh * qk]));
+        dump_with("q", il, || q.reshape(&[t, nh * qk]));
         let kvp = h.matmul_q(&blk.kv_a_mqa);
         let kv_cmpr = kvp.narrow(1, 0, r).contiguous().rmsnorm(&blk.kv_a_norm, eps);
         let k_pe = self.rope_pe(&kvp.narrow(1, r, rope).contiguous(), 1, pos);
@@ -501,7 +513,7 @@ impl DeepSeek2 {
         dump("kv_cmpr", il, &kv_cmpr);
         dump("k_pe", il, &k_pe);
         let kv = kv_cmpr.matmul_q(&blk.kv_b).reshape(&[t, nh, nope + vh]);
-        dump("kv", il, &kv.reshape(&[t, nh * (nope + vh)]));
+        dump_with("kv", il, || kv.reshape(&[t, nh * (nope + vh)]));
         let k_nope = kv.narrow(2, 0, nope).contiguous();
         let v = kv.narrow(2, nope, vh).contiguous().reshape(&[t, nh * vh]);
 
