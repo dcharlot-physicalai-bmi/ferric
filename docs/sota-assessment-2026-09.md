@@ -70,44 +70,88 @@ Measured directly instead, without a readback in the timed loop
 5.5% of the step** (llama3.2: 0.64 ms, 2.4%). The category profile said 52% and 62%. **The attention
 core is not the bottleneck, and the ranked plan below was rewritten because of it.**
 
-### What the gap actually decomposes into
+### Where the gap is: the k-quant unpack path, measured per format
 
-The clean experiment is a **controlled pair**: two checkpoints of the *same architecture* — identical
-graph, identical 478 dispatches/token — differing only in quantisation, so the only variable is bytes.
+⚠ **First, a correction to this document's own previous answer.** It derived a "71 GB/s marginal
+bandwidth" from a controlled pair — qwen3-0.6b at q5km (424 MB, 25.70 ms) against q4km (378 MB,
+25.05 ms) — holding the architecture and dispatch count fixed so that *only bytes* varied. The graph
+was indeed fixed; **the kernel was not.** A q5km checkpoint runs the Q5_K matmul and a q4km one runs
+Q4_K, and those two kernels do not stream at the same rate. That pair varied two things, so its
+marginal figure is withdrawn.
 
-| | weight bytes | ms/token (warm) |
-|---|---|---|
-| qwen3-0.6b-**q5km** | 424 MB | 25.70 |
-| qwen3-0.6b-**q4km** | 378 MB | 25.05 |
+The direct measurement (`crates/ferric-tensor/examples/matmul_q_bench.rs`, an FFN-shaped decode GEMV
+`[1,2048]·[8192,2048]ᵀ`, three runs):
 
-Δ46 MB → Δ0.65 ms, so the **marginal cost of weight bytes is 71 GB/s effective**. Against the
-measured WGSL read ceiling (385–475 GB/s) that is 5.4–6.7x, and against llama.cpp's ~326 GB/s
-streaming rate it is **4.6x**. Splitting each model's step by that rate:
+| format | bpw | GB/s | % of read ceiling |
+|---|---|---|---|
+| **Q8_0** | 8.50 | **295–352** | **69–82%** |
+| IQ3_XXS | 3.06 | 110 | 25% |
+| Q5_K | 5.50 | 91–93 | 22% |
+| IQ2_XXS | 2.06 | 80 | 19% |
+| Q6_K | 6.56 | 71 | 16% |
+| **Q4_K** | 4.50 | **43–56** | **10–13%** |
+| STQ1_0 | 1.31 | 43 | 10% |
+| Q2_0 | 2.13 | 39 | 9% |
 
-| model | total | bytes term | remainder | remainder ÷ dispatches |
-|---|---|---|---|---|
-| qwen3-0.6b-q5km | 25.70 ms | 5.99 (23%) | 19.71 | 41.2 µs |
-| qwen3-0.6b-q4km | 25.05 ms | 5.34 (21%) | 19.71 | 41.2 µs |
-| llama3.2-1b-q6k | 26.10 ms | 13.76 (53%) | 12.34 | 69.3 µs |
+⭐⭐ **Q8_0 reaches 69–82% of the read ceiling — llama.cpp's own streaming rate is ~326 GB/s, and
+Q8_0 is in that band.** So there is **no structural WGSL penalty and no fabric excuse**: the same
+runtime, the same device, the same dispatch machinery moves weights at native speed when the unpack
+is trivial. Every k-quant and i-quant format sits at 9–25%. **The gap is the unpack path, and
+nothing else.**
 
-⭐ **Two terms, and neither alone closes the gap.** The bytes term *by itself* — 6.0 ms — is already
-**2.2x llama.cpp's entire 2.7 ms step**. The remainder is 12–20 ms/token on top of that.
+⭐ **Q4_K is the worst of the mainstream formats, and it is slower in ABSOLUTE terms than Q5_K and
+Q6_K while moving fewer bytes** — 43–56 GB/s against Q5_K's 91–93, stable across runs. A format that
+reads 18% fewer bytes and takes ~2x as long is not bandwidth-bound; its kernel is. **Q4_K_M is the
+most common quantisation on Hugging Face**, so this single kernel is the highest-leverage target in
+the runtime.
 
-⭐ **The remainder's per-dispatch figure is corroborated three independent ways**: derived here by
-subtraction (41.2 and 69.3 µs), measured as the launch floor of the fused attention kernel
-(~40 µs, `fattn_bench` above), and published for wgpu-native on Metal (**71.1 µs**, arXiv 2604.02344,
-the worst of four backends measured — Safari's Metal is 31.7 µs and Dawn's Vulkan 23.8 µs).
+⚠ Measured at one shape with synthetic blocks. It bounds the kernels, not any particular model: a
+real checkpoint mixes formats per tensor, which is precisely why the model-pair inference above was
+unsound.
 
-⚠ **But it does NOT scale linearly with dispatch count**, and that matters: 2.7x the dispatches
-(478 vs 178) buys only 1.6x the remainder. So dispatch count is part of it and not all of it — which
-is exactly consistent with this repo's earlier finding that cutting 29% of dispatches moved wall time
-by 0.00 ms. Both observations are true; the remainder has a per-dispatch component and a per-token
-component, and this experiment cannot separate them.
+### ⭐⭐ THE CAUSE: the split-K kernel leaves 88–94% of its lanes idle
 
-⛔ **Still not established**: what the per-token component *is*. Five candidate mechanisms are dead
-(host-side preparation, total bytes, dispatch count alone, submit count, the attention kernel), and
-the two live terms are now measured rather than guessed — but the remainder's floor needs per-op GPU
-timing that does not sync to attribute.
+The k-quant kernels stride whole blocks across a 64-lane workgroup:
+
+    @compute @workgroup_size(64)
+    for (var blk: u32 = t; blk < nblk; blk = blk + 64u) { ... }
+
+A k-quant block holds **256 values**, so a matmul with `in_dim = 2048` has `nblk = 8` — **8 lanes
+work and 56 idle.** Q8_0's blocks hold **32** values, so the same width gives it `nblk = 64`: full
+occupancy. That is the whole difference, and it is not about unpack arithmetic at all — Q5_K's inner
+loop does *strictly more* work than Q4_K's (an extra load plus four bit extractions) and runs faster.
+
+**Controlled test.** `in=2048,out=8192` against `in=8192,out=2048` — **identical weight bytes**
+(9.0 MiB for Q4_K), identical MAC count, only blocks-per-row differs:
+
+| in_dim | blocks/row | lanes busy | Q4_K | Q5_K | Q6_K | Q8_0 |
+|---|---|---|---|---|---|---|
+| 2048 | 8 | 12% | **48.2** | 88.3 | 71.1 | 333.3 |
+| 8192 | 32 | 50% | **186.1** | 235.6 | 144.9 | 419.1 |
+| 16384 | 64 | 100% | 243.1 | 211.1 | 112.1 | 708.4 |
+
+⭐ **Q4_K goes 48.2 → 186.1 GB/s, 3.9x, at the same bytes.** ⚠ Read the 16384 row with care: at that
+width the weight is cache-resident (Q8_0's 708 GB/s is *above* the DRAM read ceiling), so it shows
+the trend, not a streaming rate. The 2048→8192 pair is the honest one.
+
+**And real decode shapes are worse than the benchmark's:**
+
+| model | typical matmul `in` | blocks | lanes busy |
+|---|---|---|---|
+| qwen3-0.6b | 1024 | 4 | **6%** |
+| llama3.2-1b | 2048 | 8 | **12%** |
+| qwen3-8b | 4096 | 16 | 25% |
+
+⭐⭐ **This resolves every loose end in this section.** Why two models of very different size both
+decode at ~26 ms/token: the smaller one (d=1024, 6% lanes) is proportionally more crippled, cancelling
+its byte advantage — which is also why the earlier "controlled pair" produced a meaningless marginal
+bandwidth. Why Q8_0 alone reaches llama.cpp's rate: 32-value blocks fill the lanes. Why cutting 29%
+of dispatches changed nothing: the waste is *inside* the kernel, not at its launch. **It was never
+bandwidth and never dispatch overhead — it is occupancy.**
+
+**The fix** is a lane-assignment change, not new arithmetic: when `nblk < 64`, map several output
+elements to one workgroup (`out_local = t / nblk`, `blk = t % nblk`) and reduce per group, or split
+each block's 8 sub-blocks across lanes. The inner loop is untouched.
 
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
@@ -165,10 +209,10 @@ EAGLE-series), NPU table-lookup low-bit inference (T-MAN), CPU-GPU cooperative e
 
 Ordered by measured impact per unit of work, not by novelty.
 
-1. **The quantised matmul kernels — 71 GB/s against a 385–475 GB/s ceiling.** This is now measured
-   with a controlled pair, not inferred: it is a 4.6x gap against llama.cpp's streaming rate, and the
-   bytes term alone already exceeds llama.cpp's whole step by 2.2x. `matmul_q4_k_splitk` /
-   `matmul_q5_k_splitk` / `matmul_q6_k_splitk` are where the work is.
+1. **`matmul_q4_k` — 43–56 GB/s where Q8_0 does 295–352 on the same device.** Q4_K_M is the most
+   common quantisation in the ecosystem and its kernel is the slowest mainstream one Ferric has,
+   *slower in absolute terms than Q5_K while reading fewer bytes*. Q8_0 proves the ceiling is
+   reachable; this is unpack work, not fabric. Then Q6_K (71) and the i-quants.
 2. **Cut the per-token remainder** (12–20 ms). Its per-dispatch figure (41–69 µs) matches published
    wgpu-native-on-Metal cost, which is the **worst of four backends measured** — Safari's Metal is
    2.2x cheaper and Dawn's Vulkan 3x. Some of this is wgpu's, not Ferric's, and that is worth knowing
