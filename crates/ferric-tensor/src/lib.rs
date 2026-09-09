@@ -349,7 +349,10 @@ impl Tensor {
         let d = *c.shape.last().unwrap();
         let rows = c.numel() / d;
         let out = empty(&self.ctx, c.numel());
-        run(&self.ctx, RMSNORM_WGSL, "rmsnorm", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+                // One workgroup per ROW now (see RMSNORM_WGSL), 2D because a 1D grid caps at 65535.
+        let gx = (rows as u32).min(32768);
+        let grid = (gx.max(1), (rows as u32).div_ceil(gx.max(1)), 1);
+        run(&self.ctx, RMSNORM_WGSL, "rmsnorm", &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], grid);
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -380,7 +383,10 @@ impl Tensor {
         let normo = empty(&self.ctx, a.numel());
         run(&self.ctx, ADD_RMSNORM_WGSL, "add_rmsnorm",
             &[a.buf.as_ref(), b.buf.as_ref(), weight.contiguous().buf.as_ref(), &sumo, &normo,
-              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], {
+                let gx = (rows as u32).min(32768).max(1);
+                (gx, (rows as u32).div_ceil(gx), 1)
+              });
         (Tensor::from_parts(&self.ctx, sumo, a.shape.clone()), Tensor::from_parts(&self.ctx, normo, a.shape.clone()))
     }
     /// L2 normalize over the last dim: `x / max(√Σx², eps)`. Distinct from RMSNorm — no mean, no
@@ -2247,20 +2253,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// ⛔ ONE WORKGROUP PER ROW, not one THREAD per row. The original mapped `row = gid.x`, so with 64
+/// threads per workgroup and `rows == 1` — which is EVERY decode step — sixty-three threads returned
+/// immediately and a single GPU thread walked the row twice. Measured: **220.7 us for a [1,4096]
+/// rmsnorm reading 16 KiB**, against 39.9 us for a matmul reading 176 KiB. A norm cost five times a
+/// matmul that moved eleven times the data.
+///
+/// It is the same defect as the split-K matmul's idle lanes, in a different kernel: a grid sized by
+/// ROWS starves whenever the batch is one. The reduction is now cooperative across the workgroup.
 const RMSNORM_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read>        weight: array<f32>;
 @group(0) @binding(2) var<storage,read_write>  out: array<f32>;
 @group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+var<workgroup> part: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    // `row` is uniform across the workgroup, so this early return keeps the barriers below in
+    // uniform control flow — a per-thread guard around a barrier is undefined behaviour.
+    let row = wg.x + wg.y * 32768u;
     if (row >= rows) { return; }
-    let base = row * d;
+    let t = lid.x; let base = row * d;
     var ms = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let v = x[base + j]; ms = ms + v * v; }
-    let inv = 1.0 / sqrt(ms / f32(d) + eps);
-    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = x[base + j] * inv * weight[j]; }
+    for (var j: u32 = t; j < d; j = j + 64u) { let v = x[base + j]; ms = ms + v * v; }
+    part[t] = ms;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { part[t] = part[t] + part[t + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
+    for (var j: u32 = t; j < d; j = j + 64u) { out[base + j] = x[base + j] * inv * weight[j]; }
 }
 "#;
 
@@ -2293,15 +2317,30 @@ const ADD_RMSNORM_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read_write>  sumo:  array<f32>;   // a + b (the next residual)
 @group(0) @binding(4) var<storage,read_write>  normo: array<f32>;   // rmsnorm(a+b)·weight
 @group(0) @binding(5) var<storage,read>        info: array<u32>;    // rows, d, bitcast(eps)
+// ⛔ Same defect as RMSNORM_WGSL, and worse: this walks `d` TWICE on one thread. One workgroup per
+// row, cooperative reduction. `sumo` is written in the first pass so the second can re-read it
+// instead of recomputing a+b.
+var<workgroup> part: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
-    if (row >= rows) { return; }
-    let base = row * d;
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    let row = wg.x + wg.y * 32768u;
+    if (row >= rows) { return; }        // uniform per workgroup: barriers below stay uniform
+    let t = lid.x; let base = row * d;
     var ms = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let s = a[base + j] + b[base + j]; sumo[base + j] = s; ms = ms + s * s; }
-    let inv = 1.0 / sqrt(ms / f32(d) + eps);
-    for (var j: u32 = 0u; j < d; j = j + 1u) { normo[base + j] = (a[base + j] + b[base + j]) * inv * weight[j]; }
+    for (var j: u32 = t; j < d; j = j + 64u) {
+        let sv = a[base + j] + b[base + j];
+        sumo[base + j] = sv;
+        ms = ms + sv * sv;
+    }
+    part[t] = ms;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { part[t] = part[t] + part[t + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
+    for (var j: u32 = t; j < d; j = j + 64u) { normo[base + j] = sumo[base + j] * inv * weight[j]; }
 }
 "#;
 
@@ -3930,6 +3969,86 @@ mod rope_partial_tests {
 }
 
 /// Bilinear resize against a CPU reference, and against the properties that catch a half-pixel slip.
+#[cfg(test)]
+mod norm_tests {
+    use super::*;
+
+    /// `add_rmsnorm` returns TWO tensors and must match `a+b` and `rmsnorm(a+b)·w` separately — a
+    /// test that checked only the normed output would miss a broken residual entirely, and the
+    /// residual is what the next layer consumes.
+    #[test]
+    fn add_rmsnorm_matches_cpu_reference() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED add_rmsnorm: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let eps = 1e-6f32;
+        for (rows, d) in [(1usize, 1024usize), (1, 4096), (1, 100), (3, 1024), (5, 64)] {
+            let av: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.011).sin() * 1.9).collect();
+            let bv: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.023).cos() * 0.8).collect();
+            let wv: Vec<f32> = (0..d).map(|i| 0.9 + 0.002 * i as f32).collect();
+            let a = Tensor::from_vec(&ctx, &av, &[rows, d]);
+            let b = Tensor::from_vec(&ctx, &bv, &[rows, d]);
+            let w = Tensor::from_vec(&ctx, &wv, &[d]);
+            let (sum_t, norm_t) = a.add_rmsnorm(&b, &w, eps);
+            let (gs, gn) = (pollster::block_on(sum_t.to_vec()), pollster::block_on(norm_t.to_vec()));
+
+            let mut ws_ = vec![0f32; rows * d];
+            let mut wn = vec![0f32; rows * d];
+            for r in 0..rows {
+                let base = r * d;
+                for j in 0..d { ws_[base + j] = av[base + j] + bv[base + j]; }
+                let ms: f32 = ws_[base..base + d].iter().map(|v| v * v).sum::<f32>() / d as f32;
+                let inv = 1.0 / (ms + eps).sqrt();
+                for j in 0..d { wn[base + j] = ws_[base + j] * inv * wv[j]; }
+            }
+            let sc = wn.iter().fold(0f32, |x, &v| x.max(v.abs()));
+            assert!(sc > 0.1, "rows={rows} d={d}: reference ~zero");
+            let ds = gs.iter().zip(&ws_).fold(0f32, |x, (&g, &e)| x.max((g - e).abs()));
+            let dn = gn.iter().zip(&wn).fold(0f32, |x, (&g, &e)| x.max((g - e).abs()));
+            assert!(ds < 1e-5, "rows={rows} d={d}: residual a+b differs by {ds:.3e}");
+            assert!(dn < 1e-4 * sc, "rows={rows} d={d}: normed differs by {dn:.3e}");
+        }
+    }
+
+    /// RMSNorm against a CPU reference. ⛔ THIS DID NOT EXIST, and its absence let a wrong
+    /// workgroup reduction (`part[t] = part[t+s]` instead of `+=`) build and run clean — the kernel
+    /// was rewritten from one-thread-per-row to a cooperative reduction and NOTHING in the suite
+    /// could tell. `rows == 1` is the case every decode step takes and the case a row-parallel grid
+    /// starves, so it is tested first and explicitly.
+    #[test]
+    fn rmsnorm_matches_cpu_reference() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED rmsnorm: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let eps = 1e-6f32;
+        // d values chosen to straddle the 64-wide workgroup: not a multiple (100), exactly one
+        // stride (64), less than one stride (32), and the shapes real models use.
+        for (rows, d) in [(1usize, 1024usize), (1, 4096), (1, 32), (1, 100), (3, 1024), (64, 128), (7, 64)] {
+            let xv: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.013).sin() * 2.3).collect();
+            let wv: Vec<f32> = (0..d).map(|i| 0.7 + 0.003 * i as f32).collect();
+            let x = Tensor::from_vec(&ctx, &xv, &[rows, d]);
+            let w = Tensor::from_vec(&ctx, &wv, &[d]);
+            let got = pollster::block_on(x.rmsnorm(&w, eps).to_vec());
+
+            let mut want = vec![0f32; rows * d];
+            for r in 0..rows {
+                let base = r * d;
+                let ms: f32 = xv[base..base + d].iter().map(|v| v * v).sum::<f32>() / d as f32;
+                let inv = 1.0 / (ms + eps).sqrt();
+                for j in 0..d { want[base + j] = xv[base + j] * inv * wv[j]; }
+            }
+            let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            assert!(scale > 0.1, "rows={rows} d={d}: reference is ~zero, this would pass on anything");
+            let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &e)| a.max((g - e).abs()));
+            assert!(worst < 1e-4 * scale, "rows={rows} d={d}: max |Δ| {worst:.3e} on scale {scale:.3e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod qk_norm_rope_tests {
     use super::*;
