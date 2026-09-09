@@ -325,7 +325,8 @@ impl Tensor {
         let d = p.shape[r - 1];
         let rows = p.numel() / d;
         let out = empty(&self.ctx, p.numel());
-        run(&self.ctx, SOFTMAX_WGSL, "softmax", &[p.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32])], groups(rows));
+        run(&self.ctx, SOFTMAX_WGSL, "softmax", &[p.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32])],
+            { let gx = (rows as u32).min(32768).max(1); (gx, (rows as u32).div_ceil(gx), 1) });
         let sm = Tensor::from_parts(&self.ctx, out, p.shape.clone());
         let mut inv = vec![0usize; r];
         for (i, &pp) in perm.iter().enumerate() { inv[pp] = i; }
@@ -364,7 +365,8 @@ impl Tensor {
         let out = empty(&self.ctx, c.numel());
         run(&self.ctx, LAYERNORM_WGSL, "layernorm",
             &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), bias.contiguous().buf.as_ref(), &out,
-              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], groups(rows));
+              &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])],
+            { let gx = (rows as u32).min(32768).max(1); (gx, (rows as u32).div_ceil(gx), 1) });
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -2239,17 +2241,37 @@ const SOFTMAX_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
 @group(0) @binding(2) var<storage,read>        info: array<u32>; // rows, d
+// ⛔ Same one-thread-per-row defect as RMSNORM_WGSL, and worse: THREE serial passes over `d`.
+// One workgroup per row, two cooperative reductions (max, then sum).
+var<workgroup> pmax: array<f32, 64>;
+var<workgroup> psum: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x; let rows = info[0]; let d = info[1];
-    if (row >= rows) { return; }
-    let base = row * d;
-    var mx = x[base];
-    for (var j: u32 = 1u; j < d; j = j + 1u) { mx = max(mx, x[base + j]); }
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info[0]; let d = info[1];
+    let row = wg.x + wg.y * 32768u;
+    if (row >= rows) { return; }        // uniform per workgroup: the barriers stay uniform
+    let t = lid.x; let base = row * d;
+    // A lane with no elements must not poison the max; -inf is the identity.
+    var mx = -3.40282347e38;
+    for (var j: u32 = t; j < d; j = j + 64u) { mx = max(mx, x[base + j]); }
+    pmax[t] = mx;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { pmax[t] = max(pmax[t], pmax[t + s]); }
+        workgroupBarrier();
+    }
+    let m = pmax[0];
     var sum = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let e = exp(x[base + j] - mx); out[base + j] = e; sum = sum + e; }
-    let inv = 1.0 / sum;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = out[base + j] * inv; }
+    // Each lane reads back only the elements it wrote, so no cross-thread visibility is needed.
+    for (var j: u32 = t; j < d; j = j + 64u) { let e = exp(x[base + j] - m); out[base + j] = e; sum = sum + e; }
+    psum[t] = sum;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { psum[t] = psum[t] + psum[t + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / psum[0];
+    for (var j: u32 = t; j < d; j = j + 64u) { out[base + j] = out[base + j] * inv; }
 }
 "#;
 
@@ -2294,18 +2316,34 @@ const LAYERNORM_WGSL: &str = r#"
 @group(0) @binding(2) var<storage,read>        bias: array<f32>;
 @group(0) @binding(3) var<storage,read_write>  out: array<f32>;
 @group(0) @binding(4) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+// ⛔ Same defect again, three serial passes. One workgroup per row; mean then variance, cooperatively.
+var<workgroup> pm: array<f32, 64>;
+var<workgroup> pv: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x; let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+    let row = wg.x + wg.y * 32768u;
     if (row >= rows) { return; }
-    let base = row * d;
-    var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { mean = mean + x[base + j]; }
-    mean = mean / f32(d);
-    var vari = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) { let c = x[base + j] - mean; vari = vari + c * c; }
-    let inv = 1.0 / sqrt(vari / f32(d) + eps);
-    for (var j: u32 = 0u; j < d; j = j + 1u) { out[base + j] = (x[base + j] - mean) * inv * weight[j] + bias[j]; }
+    let t = lid.x; let base = row * d;
+    var s1 = 0.0;
+    for (var j: u32 = t; j < d; j = j + 64u) { s1 = s1 + x[base + j]; }
+    pm[t] = s1;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { pm[t] = pm[t] + pm[t + s]; }
+        workgroupBarrier();
+    }
+    let mean = pm[0] / f32(d);
+    var s2 = 0.0;
+    for (var j: u32 = t; j < d; j = j + 64u) { let c = x[base + j] - mean; s2 = s2 + c * c; }
+    pv[t] = s2;
+    workgroupBarrier();
+    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+        if (t < s) { pv[t] = pv[t] + pv[t + s]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / sqrt(pv[0] / f32(d) + eps);
+    for (var j: u32 = t; j < d; j = j + 64u) { out[base + j] = (x[base + j] - mean) * inv * weight[j] + bias[j]; }
 }
 "#;
 
@@ -3972,6 +4010,57 @@ mod rope_partial_tests {
 #[cfg(test)]
 mod norm_tests {
     use super::*;
+
+    /// Softmax and LayerNorm carried the SAME one-thread-per-row defect and had no reference test
+    /// either. Both do three serial passes over `d`, so the cooperative rewrite has two reductions
+    /// each (max/sum, mean/variance) — twice the chance of the `part[t] = part[t+s]` slip that the
+    /// rmsnorm rewrite actually made. `d` values straddle the 64-wide workgroup on purpose.
+    #[test]
+    fn softmax_and_layernorm_match_cpu_reference() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED softmax/layernorm: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        for (rows, d) in [(1usize, 1024usize), (1, 4096), (1, 32), (1, 100), (4, 128), (3, 65)] {
+            // A wide value range so a missing max-subtraction would overflow exp() and show.
+            let xv: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.37).sin() * 12.0).collect();
+            let x = Tensor::from_vec(&ctx, &xv, &[rows, d]);
+
+            let got = pollster::block_on(x.softmax(1).to_vec());
+            let mut want = vec![0f32; rows * d];
+            for r in 0..rows {
+                let b = r * d;
+                let mx = xv[b..b + d].iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0f32;
+                for j in 0..d { want[b + j] = (xv[b + j] - mx).exp(); sum += want[b + j]; }
+                for j in 0..d { want[b + j] /= sum; }
+                // Every row must sum to 1 — the property a broken reduction destroys first.
+                let gs: f32 = got[b..b + d].iter().sum();
+                assert!((gs - 1.0).abs() < 1e-4, "softmax rows={rows} d={d}: row {r} sums to {gs}");
+            }
+            let w = got.iter().zip(&want).fold(0f32, |a, (&g, &e)| a.max((g - e).abs()));
+            assert!(w < 1e-5, "softmax rows={rows} d={d}: max |Δ| {w:.3e}");
+
+            let wv: Vec<f32> = (0..d).map(|i| 0.8 + 0.004 * i as f32).collect();
+            let bv: Vec<f32> = (0..d).map(|i| -0.2 + 0.001 * i as f32).collect();
+            let wt = Tensor::from_vec(&ctx, &wv, &[d]);
+            let bt = Tensor::from_vec(&ctx, &bv, &[d]);
+            let gl = pollster::block_on(x.layernorm(&wt, &bt, 1e-5).to_vec());
+            let mut wl = vec![0f32; rows * d];
+            for r in 0..rows {
+                let b = r * d;
+                let mean: f32 = xv[b..b + d].iter().sum::<f32>() / d as f32;
+                let var: f32 = xv[b..b + d].iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+                let inv = 1.0 / (var + 1e-5).sqrt();
+                for j in 0..d { wl[b + j] = (xv[b + j] - mean) * inv * wv[j] + bv[j]; }
+            }
+            let sc = wl.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            assert!(sc > 0.1, "layernorm rows={rows} d={d}: reference ~zero");
+            let dl = gl.iter().zip(&wl).fold(0f32, |a, (&g, &e)| a.max((g - e).abs()));
+            assert!(dl < 1e-4 * sc, "layernorm rows={rows} d={d}: max |Δ| {dl:.3e}");
+        }
+    }
 
     /// `add_rmsnorm` returns TWO tensors and must match `a+b` and `rmsnorm(a+b)·w` separately — a
     /// test that checked only the normed output would miss a broken residual entirely, and the

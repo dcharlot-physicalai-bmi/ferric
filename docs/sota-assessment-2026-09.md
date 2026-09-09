@@ -394,6 +394,49 @@ implement, and this repo has five rope bugs on record that each produced fluent,
 
 **Running total for the day: 26.1 → 16.4 ms/token (1.59x); gap to llama.cpp 9.6x → 6.05x.**
 
+### ⭐⭐ THE LINT: six kernels, one root cause — a grid sized by a dimension that is 1 at decode
+
+The largest single anomaly of the whole investigation was found by a **control I nearly skipped**:
+time a tiny `rmsnorm` the same way as a tiny matmul.
+
+    rmsnorm  [1,4096]              220.7 us/dispatch   (16 KiB read)
+    matmul_q [1,1024]x[256,1024]    39.9 us/dispatch   (176 KiB read)
+
+A norm cost **five times a matmul that moved eleven times the data**. The kernel was
+`row = gid.x` with `@workgroup_size(64)` — **one thread per ROW** — and at decode `rows == 1`
+always, so sixty-three threads returned immediately while one walked the row twice.
+
+⭐ **It is the same defect as the split-K matmul's idle lanes, and it was in six kernels:**
+
+| kernel | grid sized by | at decode |
+|---|---|---|
+| split-K matmul | blocks per row (`in/256`) | 4 of 64 lanes at `in=1024` |
+| `rmsnorm` | `rows` | 1 of 64 |
+| `add_rmsnorm` | `rows` (and walks `d` twice) | 1 of 64 |
+| `softmax` | `rows` (three passes) | 1 of 64 |
+| `layernorm` | `rows` (three passes) | 1 of 64 |
+| fused decode attention | `n_heads` | 16 workgroups |
+
+**Every one is a grid proportional to `rows`, `t` or `n_heads` — all of which are 1 during decode.**
+Each reads as a perfectly sensible kernel in isolation. A local runtime's only regime is batch=1,
+so this is the shape to audit for, not a series of coincidences.
+
+Measured effect of the norm rewrites alone: **16.4 → 8.0 ms/token, 2.05x**, three consecutive runs
+identical, generation byte-identical. `softmax` and `layernorm` are off qwen3's decode path — they
+serve BERT, and `layernorm` is hyv4's DSA `k_norm` on all 78 blocks — so they were fixed by the lint
+rather than by profiling, which is the point of having one.
+
+⛔ **AND THE FIRST REWRITE SHIPPED A BUG NOTHING COULD CATCH.** The rmsnorm reduction was written
+`part[t] = part[t + s]` — assignment, not accumulation. It compiled and ran clean, and
+`cargo test rmsnorm` matched **ZERO TESTS**: the kernel had no correctness test at all, so it could
+be rewritten from one-thread-per-row to a cooperative reduction with no coverage whatsoever. All
+four norms now have CPU-reference tests, each mutation-verified: breaking a reduction gives
+`softmax row sums to 48.24` (against 1.0) and `layernorm max |Δ| 4.671e1`. The softmax test asserts
+the sum-to-1 invariant precisely because that is the property a broken reduction destroys first —
+the check that would have caught the rmsnorm slip an hour earlier had it existed.
+
+**Day total: 26.1 → 8.0 ms/token (3.26x). Gap to llama.cpp, same model and fabric: 9.6x → 2.95x.**
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.

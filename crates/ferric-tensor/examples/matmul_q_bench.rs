@@ -169,5 +169,117 @@ async fn run() {
                      nbytes as f64 / (ms * 1e-3) / 1e9);
         }
     }
+    // ⛔⛔ THE ACCESS PATTERN THE MODEL ACTUALLY HAS. Every figure above re-reads ONE weight in a
+    // tight loop, so it is cache-resident and measures a rate no decode step ever sees. A real token
+    // sweeps ~112 DIFFERENT weights of 1-4 MiB each, touching every byte exactly once — nothing is
+    // reused, nothing is warm. That is a different machine-level problem, and this measures it:
+    // allocate N distinct weights and walk them once per pass.
+    println!("\n=== ONE PASS over N DISTINCT weights — no reuse, the decode pattern ===");
+    println!("{:>6}  {:>9}  {:>10}  {:>9}  {:>9}", "N", "each MiB", "total MiB", "ms/pass", "GB/s");
+    {
+        let inn = 1024usize;
+        let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        let (vals, bpb) = QMatrix::block_bytes(13).unwrap();
+        for (n_w, out) in [(28usize, 4096usize), (28, 6144), (112, 3072)] {
+            let ws: Vec<QMatrix> = (0..n_w).map(|j| {
+                let bytes = blocks(out * (inn / vals) * bpb, 1000 + j as u64, bpb);
+                QMatrix::from_bytes(&ctx, &bytes, 13, out, inn).unwrap()
+            }).collect();
+            let each = out * (inn / vals) * bpb;
+            let total = each * n_w;
+            // Warm the pipeline, not the data: one pass before timing, then time a fresh pass. With
+            // `total` far above cache the second pass is still cold, which is the point.
+            for w in &ws { let _ = x.matmul_q(w); }
+            ferric_tensor::device_sync(&ctx);
+            let t0 = Instant::now();
+            let mut sink = None;
+            for w in &ws { sink = Some(x.matmul_q(w)); }
+            ferric_tensor::device_sync(&ctx);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let _ = sink;
+            println!("{n_w:>6}  {:>9.1}  {:>10.1}  {ms:>9.3}  {:>9.1}",
+                     each as f64 / 1048576.0, total as f64 / 1048576.0,
+                     total as f64 / (ms * 1e-3) / 1e9);
+        }
+    }
+
+    // ⭐ IS THERE A FIXED COST PER MATMUL DISPATCH? The sweep above shows 2.1 MiB and 4.1 MiB weights
+    // taking the SAME ~47 us, which says the bytes are nearly free and the dispatch is the bill — and
+    // that contradicts the ~7 us/dispatch the QK-norm+RoPE A/B implied. One of those is wrong about
+    // what a dispatch costs, so measure it across a wide size range, cold, with no reuse.
+    println!("\n=== cost of ONE cold matmul vs its size (Q5_K, in=1024, 24 distinct weights each) ===");
+    println!("{:>10}  {:>10}  {:>11}  {:>11}  {:>9}", "out", "each MiB", "us unbatched", "us batched", "GB/s");
+    {
+        let inn = 1024usize;
+        let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        let (vals, bpb) = QMatrix::block_bytes(13).unwrap();
+        for out in [256usize, 1024, 4096, 16384, 65536] {
+            let n_w = 24usize;
+            let ws: Vec<QMatrix> = (0..n_w).map(|j| {
+                let bytes = blocks(out * (inn / vals) * bpb, 2000 + (out * 31 + j) as u64, bpb);
+                QMatrix::from_bytes(&ctx, &bytes, 13, out, inn).unwrap()
+            }).collect();
+            let each = out * (inn / vals) * bpb;
+            for w in &ws { let _ = x.matmul_q(w); }
+            // ⛔ BATCHED vs NOT is the whole question. Outside a `batch` region every op is its own
+            // queue submission, so a per-dispatch cost measured that way is a SUBMIT cost wearing a
+            // dispatch's name — and the model batches ~1 submit per layer. Measure both.
+            ferric_tensor::device_sync(&ctx);
+            let t0 = Instant::now();
+            let mut sink = None;
+            for w in &ws { sink = Some(x.matmul_q(w)); }
+            ferric_tensor::device_sync(&ctx);
+            let us_un = t0.elapsed().as_secs_f64() * 1e6 / n_w as f64;
+            ferric_tensor::device_sync(&ctx);
+            let t1 = Instant::now();
+            ferric_tensor::batch(&ctx, || { for w in &ws { sink = Some(x.matmul_q(w)); } });
+            ferric_tensor::device_sync(&ctx);
+            let us_b = t1.elapsed().as_secs_f64() * 1e6 / n_w as f64;
+            let _ = sink;
+            println!("{out:>10}  {:>10.2}  {us_un:>11.1}  {us_b:>11.1}  {:>9.1}",
+                     each as f64 / 1048576.0, each as f64 / (us_b * 1e-6) / 1e9);
+        }
+    }
+
+    // ⭐ THE CONTROL THAT DECIDES WHAT ~50 us MEANS. If a tiny rmsnorm also costs ~50 us, the number
+    // is a UNIVERSAL per-dispatch cost on this fabric and the 7 us implied by the QK-norm+RoPE A/B is
+    // wrong. If rmsnorm is cheap, then matmul dispatches specifically are expensive and the cause is
+    // in that path, not in wgpu. Same harness, same sync discipline, distinct buffers, no reuse.
+    println!("\n=== control: cost of a tiny NON-matmul dispatch, measured identically ===");
+    {
+        let d = 4096usize;
+        let w = Tensor::from_vec(&ctx, &vec![1.0f32; d], &[d]);
+        let n = 24usize;
+        let xs: Vec<Tensor> = (0..n).map(|j| Tensor::from_vec(
+            &ctx, &(0..d).map(|i| ((i + j * 7) as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, d])).collect();
+        for t in &xs { let _ = t.rmsnorm(&w, 1e-6); }
+        ferric_tensor::device_sync(&ctx);
+        let t0 = Instant::now();
+        let mut sink = None;
+        for t in &xs { sink = Some(t.rmsnorm(&w, 1e-6)); }
+        ferric_tensor::device_sync(&ctx);
+        let us = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let _ = sink;
+        println!("  rmsnorm [1,{d}]  {us:.1} us/dispatch  (16 KiB read)");
+
+        // And an equally tiny MATMUL, so the only variable is which kernel runs.
+        let (vals, bpb) = QMatrix::block_bytes(13).unwrap();
+        let inn = 1024usize; let out = 256usize;
+        let xm = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        let ws: Vec<QMatrix> = (0..n).map(|j| {
+            let b = blocks(out * (inn / vals) * bpb, 4000 + j as u64, bpb);
+            QMatrix::from_bytes(&ctx, &b, 13, out, inn).unwrap()
+        }).collect();
+        for q in &ws { let _ = xm.matmul_q(q); }
+        ferric_tensor::device_sync(&ctx);
+        let t1 = Instant::now();
+        let mut sink2 = None;
+        for q in &ws { sink2 = Some(xm.matmul_q(q)); }
+        ferric_tensor::device_sync(&ctx);
+        let us2 = t1.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let _ = sink2;
+        println!("  matmul_q [1,{inn}]x[{out},{inn}]  {us2:.1} us/dispatch  (176 KiB read)");
+    }
+
     println!("\n% ceil is against 430 GB/s, the midpoint of the measured scalar read ceiling.");
 }
