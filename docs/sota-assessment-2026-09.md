@@ -275,6 +275,43 @@ Mutation-verified: tightening the bound to 11.0 fails the battery with exit 1. C
 checkpoints, so this is a **local** battery — under the standing rule that the local battery is a
 superset of the CI jobs, not a subset.
 
+### ✅ The occupancy fix shipped — and what it did and did not buy
+
+`splitk_lanes` gives each output `L = largest power of two <= min(nblk, 64)` lanes and packs `64/L`
+outputs per workgroup. Correctness first: 761 tests, byte-identical generation, and the hyv4
+reference gate still matches on `sum_abs` and the greedy token.
+
+| model | before | after | |
+|---|---|---|---|
+| qwen3-0.6b-q5km | 22.2 | **17.8** ms/tok | 1.25x |
+| llama3.2-1b-q6k | 21.8 | **19.0** | 1.15x |
+| qwen2.5-0.5b-**q8_0** | 10.3 | **10.6** | 1.00x ← control, Q8_0's kernel untouched |
+
+Combined with the disabled-dump fix, decode went **26.1 → 17.8 ms/token today (1.47x)** and the gap
+to llama.cpp on the same model and fabric went **9.6x → 6.6x**.
+
+⛔ **AND A CLAIM MADE HERE THIS MORNING WAS WRONG.** The kernel table above reported Q4_K at
+325.7 GB/s on llama's `ffn_gate_up` and called it parity with llama.cpp's ~326 GB/s streaming rate.
+It is not a streaming rate. That benchmark re-reads **the same 18 MiB weight 100 times**, and 18 MiB
+fits in this machine's cache. Sweeping the weight past cache, same kernel, same shape:
+
+| weight | GB/s |
+|---|---|
+| 2.8 MiB | 75.9 |
+| 11 MiB | 203.6 |
+| 44 MiB | **325.5** ← the "parity" number, cache-resident |
+| 176 MiB | 201.3 ← past cache: the real streaming rate |
+
+⭐ **Two things follow, and they point in opposite directions.** The kernel *can* stream at ~201 GB/s,
+which is real headroom. But a decode step's matmuls are **1.4–4.3 MiB each**, and at that size the
+same kernel manages **75.9 GB/s** — there is not enough work in one small matmul to hide DRAM
+latency. Whole-model, Ferric moves 424 MB in 17.8 ms = **23.8 GB/s**, against llama.cpp's 156 GB/s on
+the same checkpoint. So the remaining 6.6x is **not** unpack arithmetic and **not** peak bandwidth;
+it is what happens to a stream of many small, mostly-serial matmuls.
+
+⚠ Every per-format number in this document is cache-resident and should be read as an upper bound.
+The honest streaming figures are the 176 MiB row and the whole-model rate.
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.

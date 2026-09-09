@@ -87,5 +87,62 @@ async fn run() {
                  bpb as f64 * 8.0 / vals as f64, nbytes as f64 / 1048576.0, 100.0 * gbs / 430.0);
     }
     }
+
+    // ⭐ THE FUSED SwiGLU PATH, which is where the FFN's gate_up actually goes. `matmul_q` carries
+    // qkv / wo / down / lm_head; `try_matmul_swiglu` carries gate_up, the single largest weight in
+    // a layer. It is a DIFFERENT kernel shape — one thread per output walking all of K serially,
+    // rather than split-K — so the lane-occupancy fix does not touch it and it needs its own number.
+    println!("\n=== fused matmul+SwiGLU (gate_up), the other half of the FFN ===");
+    println!("{:>10}  {:>16}  {:>10}  {:>9}  {:>9}", "format", "in -> 2*n_ff", "MiB", "ms/call", "GB/s");
+    for (inn, n_ff, who) in [(1024usize, 3072usize, "qwen3-0.6b"), (2048, 8192, "llama3.2-1b")] {
+        let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        for (ty, name) in [(12u32, "Q4_K"), (13, "Q5_K"), (14, "Q6_K")] {
+            let Some((vals, bpb)) = QMatrix::block_bytes(ty) else { continue };
+            let out = 2 * n_ff;                      // gate and up are one fused weight
+            let bytes = blocks(out * (inn / vals) * bpb, 99 + ty as u64, bpb);
+            let nbytes = bytes.len();
+            let Ok(m) = QMatrix::from_bytes(&ctx, &bytes, ty, out, inn) else { continue };
+            if x.try_matmul_swiglu(&m).is_none() { println!("{name:>10}  (no fused kernel)"); continue }
+            for _ in 0..5 { let _ = x.try_matmul_swiglu(&m).unwrap().to_vec().await; }
+            let n = 100;
+            ferric_tensor::device_sync(&ctx);
+            let t0 = Instant::now();
+            let mut sink = None;
+            for _ in 0..n { sink = x.try_matmul_swiglu(&m); }
+            ferric_tensor::device_sync(&ctx);
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+            let _ = sink;
+            println!("{name:>10}  {:>16}  {:>10.1}  {ms:>9.3}  {:>9.1}   {who}",
+                     format!("{inn} -> {out}"), nbytes as f64 / 1048576.0,
+                     nbytes as f64 / (ms * 1e-3) / 1e9);
+        }
+    }
+    // ⛔⛔ IS ANY OF THE ABOVE A STREAMING RATE? Every number so far re-reads the SAME weight 100
+    // times, and a 4-18 MiB weight fits in this machine's cache — so those are CACHE-RESIDENT rates,
+    // not DRAM streaming rates. A real decode step streams the whole model once: 424 MB for
+    // qwen3-0.6b-q5km, which cannot be cached. Sweep the weight past cache and watch it fall.
+    println!("\n=== the same kernel as the weight grows past cache (Q5_K, in=2048) ===");
+    println!("{:>10}  {:>10}  {:>9}  {:>9}", "out", "MiB", "ms/call", "GB/s");
+    {
+        let inn = 2048usize;
+        let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        let (vals, bpb) = QMatrix::block_bytes(13).unwrap();
+        for out in [2048usize, 8192, 32768, 131072] {
+            let bytes = blocks(out * (inn / vals) * bpb, 7, bpb);
+            let nbytes = bytes.len();
+            let Ok(m) = QMatrix::from_bytes(&ctx, &bytes, 13, out, inn) else { continue };
+            for _ in 0..3 { let _ = x.matmul_q(&m).to_vec().await; }
+            let n = 20;
+            ferric_tensor::device_sync(&ctx);
+            let t0 = Instant::now();
+            let mut sink = None;
+            for _ in 0..n { sink = Some(x.matmul_q(&m)); }
+            ferric_tensor::device_sync(&ctx);
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+            let _ = sink;
+            println!("{out:>10}  {:>10.1}  {ms:>9.3}  {:>9.1}", nbytes as f64 / 1048576.0,
+                     nbytes as f64 / (ms * 1e-3) / 1e9);
+        }
+    }
     println!("\n% ceil is against 430 GB/s, the midpoint of the measured scalar read ceiling.");
 }
