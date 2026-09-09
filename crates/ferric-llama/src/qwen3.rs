@@ -1039,11 +1039,24 @@ impl Qwen3 {
                 }
             });
         } else {
+            // ⭐ FERRIC_SKIP=attn|ffn ABLATES A SUBLAYER, for ATTRIBUTION BY SUBTRACTION.
+            //
+            // Every attribution instrument tried before this one failed the same way: the category
+            // profiler syncs at each boundary (which inflated the smaller category enough to produce
+            // a retracted "attention is 52%" claim), and kernel microbenchmarks measure shapes and
+            // cache states the model does not have. Subtraction has neither problem — both arms run
+            // the ordinary batched path at full speed, and the DIFFERENCE in wall time is that
+            // sublayer's real end-to-end cost, gaps and all.
+            //
+            // ⚠ The output is WRONG under ablation, deliberately. This is a stopwatch, not a run.
+            let skip = std::env::var("FERRIC_SKIP").unwrap_or_default();
+            let (no_attn, no_ffn) = (skip.contains("attn"), skip.contains("ffn"));
             out = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                let y = if no_attn { xin.clone() }
+                        else { self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il) };
                 // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                self.ffn(&xy_n, l, il).add(&xy)
+                if no_ffn { xy } else { self.ffn(&xy_n, l, il).add(&xy) }
             });
         }
 

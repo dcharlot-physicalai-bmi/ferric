@@ -312,6 +312,46 @@ it is what happens to a stream of many small, mostly-serial matmuls.
 ⚠ Every per-format number in this document is cache-resident and should be read as an upper bound.
 The honest streaming figures are the 176 MiB row and the whole-model rate.
 
+### ⛔→✅ UN-RETRACTING "attention is 52%": it was right, and I compared the wrong pair
+
+This document retracted the category profiler's "attention is 52% of a decode step" as a sync
+artifact, on the grounds that direct kernel timing put the fused attention kernel at 5.5%. **That
+retraction was wrong.** The profiler measured the attention **SUBLAYER**; `fattn_bench` measured the
+fused attention **KERNEL INSIDE IT**. Both numbers are correct and they are not the same quantity —
+the same "comparing two different things" trap that cost this project hours on hyv4 (`ffn_out`
+against `ffn_moe_out`), committed while writing the correction to a different error.
+
+Settled by **ablation**, which has neither failure mode: `FERRIC_SKIP=attn|ffn` drops a sublayer and
+both arms run the ordinary batched path at full speed, so the wall-time difference is that
+sublayer's real cost. Minimum of four runs on a settled machine (the ordering is its own sanity
+check — skipping both must be fastest):
+
+| | min ms/token | implies |
+|---|---|---|
+| no skip | 21.1 | — |
+| `FERRIC_SKIP=attn` | 10.5 | **attention = 10.6 ms (50%)** |
+| `FERRIC_SKIP=ffn` | 14.2 | FFN = 6.9 ms (33%) |
+| `FERRIC_SKIP=attn,ffn` | 5.7 | everything else = 5.7 ms |
+
+⭐ **And the 50% is not arithmetic.** The per-kernel census, differenced across the ablation, gives
+attention's ~12 dispatches per layer — of which **one is attention**:
+
+| kernel | per layer | what it is |
+|---|---|---|
+| `rmsnorm` | 3.25 | attn_norm + **QK-norm on q and on k, separately** |
+| `rope` | 2.17 | **q and k separately** — the fused-RoPE path is disabled whenever QK-norm exists |
+| `matmul_q5_k_splitk` | 2.70 | q/k/v **not fused** into one matmul (Q5_K_M mixes formats) + `wo` |
+| `gather` + `cat` | 2.25 | pure copies |
+| `kv_write2` + `fattn` | 2.00 | the actual attention |
+
+The targets follow directly: a fused **QK-norm + RoPE** kernel (4 dispatches → 1, ~84/token), and the
+`cat` that exists only because this checkpoint's q/k/v carry different quant formats.
+
+⚠ **Two things this does not yet explain.** The sublayer costs 10.6 ms while its parts account for
+~6 ms at measured kernel rates. And a dispatch inside a batch region costs ~11 µs while the one
+removed this morning cost ~123 µs because it sat OUTSIDE one — so dispatch count alone will not
+predict the win, and the fusion has to be measured rather than projected.
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.

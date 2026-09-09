@@ -30,6 +30,11 @@ pub struct Context {
     /// (WebGPU baseline 128 MB; Safari 256 MB–1 GB; native GPUs much higher). A weight above this must
     /// be sharded across buffers, so packed-quant loaders split oversized tensors along output rows.
     pub max_binding: u64,
+    /// Whether `TIMESTAMP_QUERY` was enabled — set only when `FERRIC_GPUPROF` asked for it AND the
+    /// adapter offers it. Lets a compute pass record GPU-side start/end ticks around a dispatch.
+    pub timestamps: bool,
+    /// GPU ticks → nanoseconds for this device's timestamp counter.
+    pub timestamp_period: f32,
     /// Whether `EXPERIMENTAL_COOPERATIVE_MATRIX` is enabled — the WGSL `coop_mat` types that lower to
     /// the hardware matrix units (Metal `simdgroup_matrix`, Vulkan `KHR_cooperative_matrix` → tensor
     /// cores / MFMA). Native-only (no browser spec yet); the path to real GEMM throughput on the
@@ -122,6 +127,12 @@ impl Context {
         let subgroups = af.contains(wgpu::Features::SUBGROUP);
         let coop_matrix = af.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
         let shader_f16 = af.contains(wgpu::Features::SHADER_F16);
+        // ⭐ GPU TIMESTAMPS: per-dispatch device time with NO host synchronisation. Every attribution
+        // instrument in this repo so far either synced at the boundary it was attributing — which
+        // inflated the smaller category and produced a retracted "attention is 52%" claim — or
+        // aggregated a whole step and hid the answer. A timestamp query records on the GPU's own
+        // clock and is read back once, so measuring costs nothing it is measuring.
+        let timestamps = af.contains(wgpu::Features::TIMESTAMP_QUERY);
         // ⭐ FERRIC_MAX_BINDING reproduces a CONSTRAINED FABRIC ON ANY MACHINE.
         // Native asks for `adapter.limits()` below so big models get big buffers. The cost of that
         // is invisible and it bit hard: nothing on a developer's Metal box fails when a path
@@ -142,6 +153,10 @@ impl Context {
         if subgroups { want |= wgpu::Features::SUBGROUP; }
         if coop_matrix { want |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX; }
         if shader_f16 { want |= wgpu::Features::SHADER_F16; }
+        // Only when asked: a query set costs memory and some drivers slow down with it enabled.
+        if timestamps && std::env::var("FERRIC_GPUPROF").is_ok() {
+            want |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         // wgpu gates EXPERIMENTAL_* features behind an explicit acknowledgment token (WIP APIs that
         // may have UB). We opt in only when the adapter advertises cooperative matrix.
         let experimental = if coop_matrix {
@@ -164,7 +179,10 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix, shader_f16 })
+        let ts_on = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let period = queue.get_timestamp_period();
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding,
+                  timestamps: ts_on, timestamp_period: period, coop_matrix, shader_f16 })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -197,7 +215,8 @@ impl Context {
             })
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
-        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding, coop_matrix: false, shader_f16: false })
+        Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding,
+                  timestamps: false, timestamp_period: 1.0, coop_matrix: false, shader_f16: false })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
