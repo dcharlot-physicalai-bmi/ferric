@@ -352,6 +352,48 @@ The targets follow directly: a fused **QK-norm + RoPE** kernel (4 dispatches →
 removed this morning cost ~123 µs because it sat OUTSIDE one — so dispatch count alone will not
 predict the win, and the fusion has to be measured rather than projected.
 
+### ✅ Fused QK-norm + RoPE: 150 fewer dispatches, 1.067x — and what that number teaches
+
+QK-norm is exactly what disables the existing fused-RoPE fast path (it normalises q and k with
+different weights, so they stop being one adjacent span), leaving Qwen3-family models paying
+`rmsnorm(q)`, `rmsnorm(k)`, `rope(q)`, `rope(k)` — plus a `gather` to materialise k's offset view —
+every layer, every token. `Tensor::qk_norm_rope` does all of it in one dispatch, reading q and k
+**in place** out of the QKV buffer so the copy disappears too.
+
+| kernel (per token) | before | after |
+|---|---|---|
+| `rmsnorm` | 92.08 | **31.42** (only `attn_norm` left) |
+| `rope` | 60.67 | **0** |
+| `gather` | 32.67 | **0** |
+| `qk_norm_rope` | — | 30.33 |
+| **total** | ~488 | **338** |
+
+Controlled A/B, interleaved, minimum of three per arm, settled machine: **17.5 → 16.4 ms/token,
+1.067x**, reproducible to the decimal on both repeats. Generation byte-identical across the switch.
+
+⭐ **The ratio is worth more than the speedup.** 150 dispatches removed for 1.1 ms is **~7 µs per
+dispatch** — consistent with `dispatch_vs_submit`'s 11 µs figure, and it **refutes the ~36 µs this
+document derived by subtraction** from the attention ablation. So attention's 50% is NOT mostly
+launch overhead, and whatever else is in there remains unaccounted for. Dispatch fusion is a real
+but small lever; the next one has to come from somewhere else.
+
+⛔ **The first A/B of this change was VACUOUS and read as a null result.** Both arms measured 17.5 ms,
+identical to the decimal — which looked like "150 dispatches buy nothing". The cause: the fused arm
+ran with `FERRIC_NO_QK_FUSE=` (empty), and `std::env::var(..).is_err()` is **false** for a set-but-
+empty variable, so the guard took the composed path in BOTH arms. Caught by checking the census
+rather than trusting the knob: the empty-var run still lists `rope`. ⭐ **Proving the knob moves the
+thing is part of running an A/B, not an afterthought** — an env-gated switch that silently does
+nothing produces a clean, confident, wrong number.
+
+⚠ Correctness, established before any timing: `qk_norm_rope_eq_composed` pins the kernel to the
+composed path (not to itself) at five shapes chosen so a mistake shows — GQA so q and k index
+differently, `t > 1` so the position advances, `pos != 0` so an ignored offset cannot pass — and
+fails if the reference output is ~zero. The guard admits only NEOX pairing, full rotation, no
+`rope_freqs`, no YaRN, non-NoPE layers; every excluded clause is a rotation this kernel does not
+implement, and this repo has five rope bugs on record that each produced fluent, wrong text.
+
+**Running total for the day: 26.1 → 16.4 ms/token (1.59x); gap to llama.cpp 9.6x → 6.05x.**
+
 ⛔ **This retires "we are bandwidth-bound", which this repo's docs said for months.** The 47 GB/s
 figure was bytes ÷ wall clock, and `docs/RUNTIME-PARITY-2026.md` already flagged it as false; the
 two-model experiment above settles it.

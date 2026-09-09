@@ -782,6 +782,19 @@ impl Qwen3 {
 
     /// Full RoPE over head_dim (Qwen rotates the whole head). Llama-3 applies its per-frequency
     /// `rope_freqs` scaling; Qwen has none, so it's plain RoPE.
+    /// Whether this layer can take the fused QK-norm+RoPE kernel. Every clause is a rotation the
+    /// fused kernel does NOT implement, and getting one wrong is silent: the model loads, the logits
+    /// are finite, and the text is fluent and wrong. `FERRIC_NO_QK_FUSE` forces the composed path for
+    /// a controlled A/B in the same binary.
+    fn qk_rope_fusable(&self, l: &Layer) -> bool {
+        l.q_norm.is_some() && l.k_norm.is_some()          // the fusion is only for QK-norm models
+            && l.rope                                      // a NoPE layer rotates nothing
+            && self.rope_freqs.is_none()                   // no Llama-3 per-frequency scaling
+            && self.cfg.yarn_factor <= 1.0                 // no YaRN post-scale
+            && !(self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err())  // NEOX only
+            && std::env::var("FERRIC_NO_QK_FUSE").is_err()
+    }
+
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
         let r = self.rope_inner(x, n_heads, offset, base);
         // YaRN scales cos/sin by (1 + 0.1·ln factor). Derivation from llama-context.cpp: the two
@@ -884,6 +897,25 @@ impl Qwen3 {
             // q's window has offset 0 (free during decode via the size-1 stride rule); k's carries an
             // offset and flows into `KvBuf::append`, which reads views in place.
             (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
+        } else if self.qk_rope_fusable(l) {
+            // ⭐ FOUR DISPATCHES INTO ONE. QK-norm is exactly what disables `fuse_rope` above (it
+            // normalises q and k with different weights, so they stop being one adjacent span), which
+            // left this architecture paying rmsnorm(q), rmsnorm(k), rope(q), rope(k) — plus a `gather`
+            // to materialise k's offset view — every layer, every token. Ablation puts the attention
+            // SUBLAYER at 50% of a decode step while the attention kernel in it is 5.5%, so this
+            // group of small ops is the cost, not the arithmetic.
+            //
+            // `Tensor::qk_norm_rope` reads q and k IN PLACE out of the QKV buffer and is pinned to the
+            // composed path by `qk_norm_rope_eq_composed` at five shapes including GQA, t > 1 and a
+            // non-zero position. Guarded to NEOX + full rotation + no rope-scaling + no YaRN, because
+            // a model built for one pairing and run with the other emits fluent garbage.
+            let (qr, kr) = Tensor::qk_norm_rope(
+                &qkv, 0, l.q_out,
+                l.q_norm.as_ref().unwrap(), l.k_norm.as_ref().unwrap(),
+                t, nh, nkv, hd, l.rope_base, offset, self.cfg.eps);
+            dump("Qcur_rope", il, &qr);
+            dump("Kcur_rope", il, &kr);
+            (qr, kr)
         } else {
             let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
             let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);

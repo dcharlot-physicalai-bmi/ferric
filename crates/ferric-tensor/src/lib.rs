@@ -540,6 +540,38 @@ impl Tensor {
     /// `[freqs, freqs]`-doubled layout) with the split-half `rotate_half` convention — used for
     /// Cosmos 3 Edge's interleaved 3-axis mRoPE, whose table `cosmos::interleaved_mrope` builds.
     /// `self` is `[n_tokens, n_heads*head_dim]`; cos/sin broadcast across heads.
+    /// Fused per-head QK RMSNorm + RoPE for `q` `[t, nh*dh]` and `k` `[t, nkv*dh]`, one dispatch
+    /// instead of four. NEOX pairing, full rotation, single sequence at absolute position `pos`.
+    /// Equivalent to `q.reshape([t,nh,dh]).rmsnorm(qw,eps).reshape(..).rope(nh,dh,base,pos)` and the
+    /// same for k — pinned to exactly that by `qk_norm_rope_eq_composed`.
+    /// Fused per-head QK RMSNorm + RoPE, one dispatch instead of four (rmsnorm q, rmsnorm k, rope q,
+    /// rope k) — plus the `gather` that materialising `k`'s offset view would have cost.
+    ///
+    /// `src` is the fused QKV output; q and k are read IN PLACE at `q_off`/`k_off` with row stride
+    /// `rs`. NEOX pairing, full rotation, one sequence at absolute position `pos`. Equivalent to
+    /// `narrow.reshape([t,h,dh]).rmsnorm(w,eps).reshape(..).rope(h,dh,base,pos)` for each of q and k,
+    /// and pinned to exactly that by `qk_norm_rope_eq_composed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope(src: &Tensor, q_col: usize, k_col: usize,
+                        qw: &Tensor, kw: &Tensor, t: usize,
+                        nh: usize, nkv: usize, dh: usize, base: f32, pos: usize, eps: f32)
+                        -> (Tensor, Tensor) {
+        // `q_col`/`k_col` are COLUMN offsets within a row of `src`; the buffer offset and row stride
+        // are the tensor's own business, not the caller's.
+        assert_eq!(src.rank(), 2, "qk_norm_rope: src is the 2D [t, qkv_width] projection output");
+        let rs = src.strides[0];
+        let (q_off, k_off) = (src.offset + q_col, src.offset + k_col);
+        let (qo, ko) = (empty(&src.ctx, t * nh * dh), empty(&src.ctx, t * nkv * dh));
+        run(&src.ctx, QK_NORM_ROPE_WGSL, "qk_norm_rope",
+            &[src.buf.as_ref(), qw.contiguous().buf.as_ref(), kw.contiguous().buf.as_ref(), &qo, &ko,
+              &u32buf(&src.ctx, &[t as u32, nh as u32, nkv as u32, dh as u32,
+                                  base.to_bits(), pos as u32, eps.to_bits(),
+                                  q_off as u32, k_off as u32, rs as u32])],
+            groups(t * (nh + nkv)));
+        (Tensor::from_parts(&src.ctx, qo, vec![t, nh * dh]),
+         Tensor::from_parts(&src.ctx, ko, vec![t, nkv * dh]))
+    }
+
     pub fn apply_rope_costable(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize) -> Tensor {
         let c = self.contiguous();
         let t = c.numel() / (n_heads * head_dim);
@@ -2385,6 +2417,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Apply RoPE from a precomputed per-token cos/sin table (doubled [freqs,freqs] layout), split-half
 // rotate_half convention. Matches ROPE_WGSL's rotation but reads angles from the table (mRoPE).
+/// **QK-norm + RoPE, fused.** Replaces four dispatches (rmsnorm q, rmsnorm k, rope q, rope k) with
+/// one, for the architectures that carry a per-head QK RMSNorm — Qwen3 and its descendants.
+///
+/// ⛔ WHY IT EXISTS. Ablation puts the attention SUBLAYER at 50% of a decode step while the fused
+/// attention kernel inside it is 5.5%: the cost is ~8 small dispatches per layer around a cheap
+/// kernel, each paying launch latency that a 1x1024 tensor cannot hide. These four are the largest
+/// removable group. ⚠ The fused-RoPE fast path is unavailable here on purpose — it needs q and k
+/// ADJACENT, and QK-norm normalises them separately with different weights, which breaks that.
+/// This kernel keeps them separate and fuses anyway.
+///
+/// ⚠ NEOX (split-half) pairing and FULL rotation only. `rope_interleaved`, `rope_scaled`, partial
+/// rope and YaRN each change the rotation, and a model built for one pairing and run with the other
+/// loads fine and emits fluent garbage — so the caller must gate, and `qk_norm_rope_eq_composed`
+/// pins this against the composed path rather than against itself.
+const QK_NORM_ROPE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:  array<f32>;    // the fused QKV output
+@group(0) @binding(1) var<storage,read>        qw: array<f32>;    // [dh] q_norm
+@group(0) @binding(2) var<storage,read>        kw: array<f32>;    // [dh] k_norm
+@group(0) @binding(3) var<storage,read_write>  qo: array<f32>;
+@group(0) @binding(4) var<storage,read_write>  ko: array<f32>;
+// t,nh,nkv,dh,bits(base),pos,bits(eps),q_off,k_off,row_stride
+// ⚠ q and k are read IN PLACE from the QKV buffer. Calling `.contiguous()` on `qkv.narrow(1, q_out, ..)`
+// instead would materialise a copy — `is_contiguous()` refuses any view with a non-zero offset — and
+// that copy is the `gather` the census shows at ~1.17 per layer. Reading through an offset removes it.
+@group(0) @binding(5) var<storage,read>        info: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = info[0]; let nh = info[1]; let nkv = info[2]; let dh = info[3];
+    let base = bitcast<f32>(info[4]); let pos = info[5]; let eps = bitcast<f32>(info[6]);
+    let q_off = info[7]; let k_off = info[8]; let rs = info[9];
+    let id = gid.x; let nq = t * nh;
+    if (id >= nq + t * nkv) { return; }
+    let is_k = id >= nq;
+    var i: u32; var head: u32; var hc: u32; var src: u32;
+    if (is_k) { let d = id - nq; hc = nkv; i = d / nkv; head = d % nkv; src = k_off; }
+    else      { hc = nh; i = id / nh; head = id % nh; src = q_off; }
+    let o = (i * hc + head) * dh;          // packed output row
+    let ib = src + i * rs + head * dh;     // strided input row, read in place
+    let half = dh / 2u;
+    // RMS over THIS HEAD's dh values — the same reduction `rmsnorm` does with rows = t*heads, d = dh.
+    var ms = 0.0;
+    for (var j: u32 = 0u; j < dh; j = j + 1u) {
+        let v = x[ib + j];
+        ms = ms + v * v;
+    }
+    let inv = 1.0 / sqrt(ms / f32(dh) + eps);
+    let lb = log(base);
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let fr = exp(-2.0 * f32(c) / f32(dh) * lb);
+        let ang = f32(pos + i) * fr; let cs = cos(ang); let sn = sin(ang);
+        let a = x[ib + c]; let b = x[ib + c + half];
+        var w1: f32; var w2: f32;
+        if (is_k) { w1 = kw[c]; w2 = kw[c + half]; } else { w1 = qw[c]; w2 = qw[c + half]; }
+        // Norm THEN rotate, in that order — the composed path is rmsnorm(x)·w followed by rope.
+        let x1 = a * inv * w1; let x2 = b * inv * w2;
+        let r1 = x1 * cs - x2 * sn; let r2 = x2 * cs + x1 * sn;
+        if (is_k) { ko[o + c] = r1; ko[o + c + half] = r2; }
+        else      { qo[o + c] = r1; qo[o + c + half] = r2; }
+    }
+}
+"#;
+
 const ROPE_COSTABLE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:   array<f32>;   // [N, h*dh]
 @group(0) @binding(1) var<storage,read>        cs:  array<f32>;   // [N, dh]
@@ -3836,6 +3930,72 @@ mod rope_partial_tests {
 }
 
 /// Bilinear resize against a CPU reference, and against the properties that catch a half-pixel slip.
+#[cfg(test)]
+mod qk_norm_rope_tests {
+    use super::*;
+
+    /// The fused kernel must equal the COMPOSED path it replaces — rmsnorm-per-head, then rope —
+    /// not merely agree with itself. Rope is the single most bug-prone thing in this repo (five
+    /// silent failures in one day: wrong pairing, out-of-bounds positions, a scaled path that
+    /// applied no rotation at all), and every one of them produced finite, fluent, wrong output.
+    /// So this pins against the two kernels it fuses, at shapes where a mistake shows:
+    /// nh != nkv (GQA, so the head-index arithmetic differs between q and k), t > 1 (so the
+    /// per-token position advances), and pos != 0 (so an ignored offset cannot pass).
+    #[test]
+    fn qk_norm_rope_eq_composed() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED qk_norm_rope: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let eps = 1e-6f32;
+        for (t, nh, nkv, dh, base, pos) in
+            [(1usize, 16usize, 8usize, 128usize, 1_000_000.0f32, 0usize),
+             (1, 16, 8, 128, 1_000_000.0, 37),
+             (3, 16, 8, 128, 1_000_000.0, 5),
+             (2, 8, 8, 64, 10_000.0, 11),
+             (5, 32, 8, 64, 500_000.0, 129)]
+        {
+            let qv: Vec<f32> = (0..t * nh * dh).map(|i| ((i as f32) * 0.017).sin() * 1.7).collect();
+            let kv: Vec<f32> = (0..t * nkv * dh).map(|i| ((i as f32) * 0.029).cos() * 0.9).collect();
+            let qwv: Vec<f32> = (0..dh).map(|i| 0.5 + 0.01 * i as f32).collect();
+            let kwv: Vec<f32> = (0..dh).map(|i| 1.3 - 0.007 * i as f32).collect();
+            // Build the fused QKV layout the model actually produces: [t, q_out + kv_out], with k
+            // at a NON-ZERO offset — which is the case that would otherwise force a copy.
+            let (q_out, kv_out) = (nh * dh, nkv * dh);
+            let rs = q_out + kv_out;
+            let mut cat = vec![0f32; t * rs];
+            for i in 0..t {
+                cat[i * rs..i * rs + q_out].copy_from_slice(&qv[i * q_out..(i + 1) * q_out]);
+                cat[i * rs + q_out..(i + 1) * rs].copy_from_slice(&kv[i * kv_out..(i + 1) * kv_out]);
+            }
+            let src = Tensor::from_vec(&ctx, &cat, &[t, rs]);
+            let q = Tensor::from_vec(&ctx, &qv, &[t, q_out]);
+            let k = Tensor::from_vec(&ctx, &kv, &[t, kv_out]);
+            let qw = Tensor::from_vec(&ctx, &qwv, &[dh]);
+            let kw = Tensor::from_vec(&ctx, &kwv, &[dh]);
+
+            let (qf, kf) = Tensor::qk_norm_rope(&src, 0, q_out, &qw, &kw, t, nh, nkv, dh, base, pos, eps);
+            let (qf, kf) = (pollster::block_on(qf.to_vec()), pollster::block_on(kf.to_vec()));
+
+            let qc = q.reshape(&[t, nh, dh]).rmsnorm(&qw, eps).reshape(&[t, nh * dh])
+                      .rope(nh, dh, base, pos);
+            let kc = k.reshape(&[t, nkv, dh]).rmsnorm(&kw, eps).reshape(&[t, nkv * dh])
+                      .rope(nkv, dh, base, pos);
+            let (qc, kc) = (pollster::block_on(qc.to_vec()), pollster::block_on(kc.to_vec()));
+
+            // Guard the premise: a fixture whose composed output is ~zero would pass on anything.
+            let scale = qc.iter().chain(&kc).fold(0f32, |a, &v| a.max(v.abs()));
+            assert!(scale > 0.1, "t={t} nh={nh}: reference is ~zero ({scale:.3e}); this proves nothing");
+
+            let dq = qf.iter().zip(&qc).fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            let dk = kf.iter().zip(&kc).fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
+            assert!(dq < 2e-4 * scale, "q differs by {dq:.3e} (scale {scale:.3e}) at t={t} nh={nh} pos={pos}");
+            assert!(dk < 2e-4 * scale, "k differs by {dk:.3e} (scale {scale:.3e}) at t={t} nkv={nkv} pos={pos}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod resize_tests {
     use super::*;

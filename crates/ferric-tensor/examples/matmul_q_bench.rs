@@ -121,6 +121,31 @@ async fn run() {
     // times, and a 4-18 MiB weight fits in this machine's cache — so those are CACHE-RESIDENT rates,
     // not DRAM streaming rates. A real decode step streams the whole model once: 424 MB for
     // qwen3-0.6b-q5km, which cannot be cached. Sweep the weight past cache and watch it fall.
+    // ⭐ THE LM HEAD. For qwen3-0.6b it is [151936, 1024] Q6_K = 126 MB — THIRTY PERCENT of the whole
+    // checkpoint in a single matmul, run once per token. Ablating both sublayers still leaves
+    // 5.7 ms/token, and this is most of what remains, so its rate matters more than any layer's.
+    println!("\n=== the LM head, the single biggest matmul in the model ===");
+    println!("{:>12}  {:>10}  {:>9}  {:>9}", "shape", "MiB", "ms/call", "GB/s");
+    for (inn, out, ty, name) in [(1024usize, 151936usize, 14u32, "qwen3-0.6b Q6_K"),
+                                 (2048, 128256, 14, "llama3.2-1b Q6_K")] {
+        let Some((vals, bpb)) = QMatrix::block_bytes(ty) else { continue };
+        let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
+        let bytes = blocks(out * (inn / vals) * bpb, 5, bpb);
+        let nbytes = bytes.len();
+        let Ok(m) = QMatrix::from_bytes(&ctx, &bytes, ty, out, inn) else { continue };
+        for _ in 0..3 { let _ = x.matmul_q(&m).to_vec().await; }
+        let n = 20;
+        ferric_tensor::device_sync(&ctx);
+        let t0 = Instant::now();
+        let mut sink = None;
+        for _ in 0..n { sink = Some(x.matmul_q(&m)); }
+        ferric_tensor::device_sync(&ctx);
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+        let _ = sink;
+        println!("{:>12}  {:>10.1}  {ms:>9.3}  {:>9.1}   {name}", format!("{inn}x{out}"),
+                 nbytes as f64 / 1048576.0, nbytes as f64 / (ms * 1e-3) / 1e9);
+    }
+
     println!("\n=== the same kernel as the weight grows past cache (Q5_K, in=2048) ===");
     println!("{:>10}  {:>10}  {:>9}  {:>9}", "out", "MiB", "ms/call", "GB/s");
     {
