@@ -211,6 +211,7 @@ async fn run() {
     println!("{:>10}  {:>10}  {:>11}  {:>11}  {:>9}", "out", "each MiB", "us unbatched", "us batched", "GB/s");
     {
         let inn = 1024usize;
+        let (mut bad, mut prev) = (0usize, None::<f64>);
         let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
         let (vals, bpb) = QMatrix::block_bytes(13).unwrap();
         for out in [256usize, 1024, 4096, 16384, 65536] {
@@ -236,8 +237,29 @@ async fn run() {
             ferric_tensor::device_sync(&ctx);
             let us_b = t1.elapsed().as_secs_f64() * 1e6 / n_w as f64;
             let _ = sink;
-            println!("{out:>10}  {:>10.2}  {us_un:>11.1}  {us_b:>11.1}  {:>9.1}",
+            // ⭐ SELF-REFUTATION CHECK. Batching only removes queue submissions; it cannot add work, so
+            // batched > unbatched is IMPOSSIBLE and means the run was contended. Likewise a bigger
+            // weight must not be faster than a smaller one at the same shape. A contended benchmark is
+            // a WRONG number, not a slow one, and nothing else in this output says so — a load gate
+            // cannot, because the dominant variation is a GPU clock state `uptime` cannot see.
+            let mut flag = "";
+            if us_b > us_un * 1.15 { flag = "  ⛔ BATCHED SLOWER THAN UNBATCHED — CONTENDED, DISCARD"; bad += 1; }
+            // ⚠ The loop walks out SMALL -> LARGE, so cost RISING is correct and must not be flagged.
+            // The impossible direction is a BIGGER weight coming out materially FASTER than a smaller
+            // one. Writing this the other way round rejected a hand-built clean table on its first
+            // replay, which is the only reason the inversion was caught.
+            if let Some(pus) = prev {
+                if us_b < pus * 0.7 { flag = "  ⛔ FASTER THAN A SMALLER WEIGHT — CONTENDED, DISCARD"; bad += 1; }
+            }
+            prev = Some(us_b);
+            println!("{out:>10}  {:>10.2}  {us_un:>11.1}  {us_b:>11.1}  {:>9.1}{flag}",
                      each as f64 / 1048576.0, each as f64 / (us_b * 1e-6) / 1e9);
+        }
+        if bad > 0 {
+            println!("\n  ⛔⛔ {bad} IMPOSSIBLE ORDERING(S) ABOVE. THIS RUN IS CONTENDED — DO NOT QUOTE IT.");
+            println!("      Re-run on a quiet machine, and read RATIOS across >=3 whole runs, not one table.");
+        } else {
+            println!("\n  ✅ no impossible orderings — batched <= unbatched and cost is monotone in size.");
         }
     }
 
