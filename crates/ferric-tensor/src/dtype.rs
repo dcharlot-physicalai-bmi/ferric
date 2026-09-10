@@ -2081,7 +2081,10 @@ impl Tensor {
         let n_ff = w.rows / 2;
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
-        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
+        let (lanes, opw) = splitk_lanes(inn / 256);
+        let nwg = n.div_ceil(opw as usize);
+        let wg = nwg; let gw = wg.min(32768);
         let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
         // Fused ∧ coalesced (FERRIC_Q4K_TRANS): the transposed weight layout inside the fused swiglu —
         // the only path to a Vulkan win (fusion already beats a plain transposed matmul). Bit-identical.
@@ -2091,7 +2094,10 @@ impl Tensor {
                   &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
             return Tensor::from_parts(&self.ctx, out, vec![rows, n_ff]);
         }
-        let src = MATMUL_Q4_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        let src = MATMUL_Q4_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_q4_k_swiglu",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
@@ -2314,9 +2320,15 @@ impl Tensor {
         let n_ff = w.rows / 2;
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
-        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
+        let (lanes, opw) = splitk_lanes(inn / 256);
+        let nwg = n.div_ceil(opw as usize);
+        let wg = nwg; let gw = wg.min(32768);
         let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
-        let src = MATMUL_Q5_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS);
+        let src = MATMUL_Q5_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_q5_k_swiglu",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
@@ -2332,9 +2344,15 @@ impl Tensor {
         let n_ff = w.rows / 2;
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
-        let wg = n.div_ceil(64); let gw = wg.min(32768);
+        // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
+        let (lanes, opw) = splitk_lanes(inn / 256);
+        let nwg = n.div_ceil(opw as usize);
+        let wg = nwg; let gw = wg.min(32768);
         let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
-        let src = MATMUL_Q6_K_SWIGLU_WGSL.replace("__HELPERS__", Q6_K_HELPERS);
+        let src = MATMUL_Q6_K_SWIGLU_WGSL.replace("__HELPERS__", Q6_K_HELPERS)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_q6_k_swiglu",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
@@ -3039,9 +3057,9 @@ const MATMUL_Q4_K_SWIGLU_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
 @group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
 __HELPERS__
-fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32, start: u32, stride: u32) -> f32 {
     var acc = 0.0;
-    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+    for (var blk: u32 = start; blk < nblk; blk = blk + stride) {
         let bi = o_row * nblk + blk; let ab = bi * 4u; let cb8 = bi * 32u;
         let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
         let xbb = r * in_dim + blk * 256u;
@@ -3060,15 +3078,35 @@ fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
     }
     return acc;
 }
+// ⛔ THE LAST KERNEL WITH NO K-PARALLELISM. One thread per OUTPUT walking all of K serially — not
+// lane-starved the way `rmsnorm` was, but with no reduction split at all. Give each output __L__
+// lanes and pack __OPW__ outputs per workgroup, as the split-K matmul now does. Two accumulators,
+// because each output needs both the gate and the up dot product.
+var<workgroup> pg: array<f32, 64>;
+var<workgroup> pu: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
-    if (idx >= rows * n_ff) { return; }
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    let t = lid.x; let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * n_ff;
+    var g = 0.0; var u = 0.0;
+    if (idx < n_all) {
     let o = idx % n_ff; let r = idx / n_ff;
     let nblk = in_dim / 256u;
-    let g = qk_dot(o, r, nblk, in_dim);         // gate row
-    let u = qk_dot(o + n_ff, r, nblk, in_dim);  // up row
-    out[idx] = (g / (1.0 + exp(-g))) * u;       // silu(g)·u
+    g = qk_dot(o, r, nblk, in_dim, bl, __L__u);         // gate row
+    u = qk_dot(o + n_ff, r, nblk, in_dim, bl, __L__u);  // up row
+    }
+    pg[t] = g; pu[t] = u;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) {
+        if (bl < s) { pg[t] = pg[t] + pg[t + s]; pu[t] = pu[t] + pu[t + s]; }
+        workgroupBarrier();
+    }
+    if (bl == 0u && idx < n_all) {
+        let gg = pg[t];
+        out[idx] = (gg / (1.0 + exp(-gg))) * pu[t];   // silu(g)·u
+    }
 }
 "#;
 
@@ -3357,9 +3395,9 @@ const MATMUL_Q5_K_SWIGLU_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
 @group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
 __HELPERS__
-fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32, start: u32, stride: u32) -> f32 {
     var acc = 0.0;
-    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+    for (var blk: u32 = start; blk < nblk; blk = blk + stride) {
         let bi = o_row * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
         let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
         let xbb = r * in_dim + blk * 256u;
@@ -3381,15 +3419,36 @@ fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
     }
     return acc;
 }
+// ⛔ THE LAST KERNEL WITH NO K-PARALLELISM. One thread per OUTPUT walking all of K serially: not
+// lane-starved the way `rmsnorm` was, but every lane redundantly re-walks the whole reduction. Give
+// each output __L__ lanes and pack __OPW__ outputs per workgroup, as the split-K matmul now does.
+// Two accumulators, because each output needs both the gate and the up dot product.
+var<workgroup> pg: array<f32, 64>;
+var<workgroup> pu: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
-    if (idx >= rows * n_ff) { return; }
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    let t = lid.x; let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * n_ff;
+    var g = 0.0; var u = 0.0;
+    // Guard the WORK; the barriers below must stay in uniform control flow.
+    if (idx < n_all) {
     let o = idx % n_ff; let r = idx / n_ff;
     let nblk = in_dim / 256u;
-    let g = qk_dot(o, r, nblk, in_dim);
-    let u = qk_dot(o + n_ff, r, nblk, in_dim);
-    out[idx] = (g / (1.0 + exp(-g))) * u;
+    g = qk_dot(o, r, nblk, in_dim, bl, __L__u);
+    u = qk_dot(o + n_ff, r, nblk, in_dim, bl, __L__u);
+    }
+    pg[t] = g; pu[t] = u;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) {
+        if (bl < s) { pg[t] = pg[t] + pg[t + s]; pu[t] = pu[t] + pu[t + s]; }
+        workgroupBarrier();
+    }
+    if (bl == 0u && idx < n_all) {
+        let gg = pg[t];
+        out[idx] = (gg / (1.0 + exp(-gg))) * pu[t];
+    }
 }
 "#;
 
@@ -3401,9 +3460,9 @@ const MATMUL_Q6_K_SWIGLU_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
 @group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
 __HELPERS__
-fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32, start: u32, stride: u32) -> f32 {
     var acc = 0.0;
-    for (var blk: u32 = 0u; blk < nblk; blk = blk + 1u) {
+    for (var blk: u32 = start; blk < nblk; blk = blk + stride) {
         let bi = o_row * nblk + blk;
         let cb = bi * 48u; let ab = bi * 5u;
         let d = unpack2x16float(aux[ab]).x;
@@ -3425,15 +3484,36 @@ fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32) -> f32 {
     }
     return acc;
 }
+// ⛔ THE LAST KERNEL WITH NO K-PARALLELISM. One thread per OUTPUT walking all of K serially: not
+// lane-starved the way `rmsnorm` was, but every lane redundantly re-walks the whole reduction. Give
+// each output __L__ lanes and pack __OPW__ outputs per workgroup, as the split-K matmul now does.
+// Two accumulators, because each output needs both the gate and the up dot product.
+var<workgroup> pg: array<f32, 64>;
+var<workgroup> pu: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x + gid.y * info.w; let rows = info.x; let n_ff = info.y; let in_dim = info.z;
-    if (idx >= rows * n_ff) { return; }
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let n_ff = info.y; let in_dim = info.z;
+    let t = lid.x; let bl = t % __L__u; let sub = t / __L__u;
+    let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
+    let n_all = rows * n_ff;
+    var g = 0.0; var u = 0.0;
+    // Guard the WORK; the barriers below must stay in uniform control flow.
+    if (idx < n_all) {
     let o = idx % n_ff; let r = idx / n_ff;
     let nblk = in_dim / 256u;
-    let g = qk_dot(o, r, nblk, in_dim);
-    let u = qk_dot(o + n_ff, r, nblk, in_dim);
-    out[idx] = (g / (1.0 + exp(-g))) * u;
+    g = qk_dot(o, r, nblk, in_dim, bl, __L__u);
+    u = qk_dot(o + n_ff, r, nblk, in_dim, bl, __L__u);
+    }
+    pg[t] = g; pu[t] = u;
+    workgroupBarrier();
+    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) {
+        if (bl < s) { pg[t] = pg[t] + pg[t + s]; pu[t] = pu[t] + pu[t + s]; }
+        workgroupBarrier();
+    }
+    if (bl == 0u && idx < n_all) {
+        let gg = pg[t];
+        out[idx] = (gg / (1.0 + exp(-gg))) * pu[t];
+    }
 }
 "#;
 
@@ -5941,6 +6021,53 @@ mod iq_kernel {
     fn acts(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed;
         (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 32) as f32 / (1u64 << 31) as f32) - 1.0 }).collect()
+    }
+
+    /// The FUSED gate_up+SwiGLU kernels against the composed path they replace. ⛔ These had NO
+    /// equivalence test, and they compute the largest weight in a layer. They were just given two
+    /// cooperative reductions each (gate and up), which is exactly the shape that produced a silent
+    /// `part[t] = part[t+s]` slip in the rmsnorm rewrite — so this pins them to
+    /// `matmul_q(w).swiglu(n_ff)`, not to themselves.
+    ///
+    /// `in` values straddle the lane split: 1024 gives nblk=4 (L=4, 16 outputs per workgroup),
+    /// 2048 gives nblk=8, 16384 gives nblk=64 (L=64, one output per workgroup — the old shape).
+    #[test]
+    fn fused_swiglu_matches_composed() {
+        let ctx = ctx_or_skip!();
+        for (ty, bpb, label) in [(12u32, 144usize, "Q4_K"), (13, 176, "Q5_K"), (14, 210, "Q6_K")] {
+            for (inn, n_ff) in [(1024usize, 512usize), (2048, 256), (16384, 128)] {
+                let rows = 1usize;                       // decode: the only shape that matters here
+                // ⚠ THE SCALES SIT IN A DIFFERENT PLACE IN EVERY FORMAT, and random bytes there are
+                // happily inf or NaN — which makes BOTH arms non-finite and the comparison
+                // meaningless. `blocks` sanitises only bytes 0..2, which is right for Q4_K/Q5_K's
+                // `d` but leaves their `dmin` (2..4) random, and misses Q6_K's `d` entirely: a Q6_K
+                // block is ql[128] qh[64] scales[16] d, so its scale is at byte 208. Both of those
+                // failed the first two runs of this test — on the fixture, not the kernel.
+                let mut bytes = blocks(2 * n_ff * (inn / 256) * bpb, 77 + ty as u64 + inn as u64, bpb);
+                for (bi, blk) in bytes.chunks_exact_mut(bpb).enumerate() {
+                    let d = half::f16::from_f32(0.01 + 0.003 * (bi % 7) as f32);
+                    if ty == 14 {
+                        blk[208..210].copy_from_slice(&d.to_le_bytes());     // Q6_K: d is LAST
+                    } else {
+                        blk[0..2].copy_from_slice(&d.to_le_bytes());          // Q4_K/Q5_K: d, then
+                        let dmin = half::f16::from_f32(0.002 + 0.0005 * (bi % 5) as f32);
+                        blk[2..4].copy_from_slice(&dmin.to_le_bytes());       // dmin
+                    }
+                }
+                let x = Tensor::from_vec(&ctx, &acts(rows * inn, 5), &[rows, inn]);
+                let Ok(m) = QMatrix::from_bytes(&ctx, &bytes, ty, 2 * n_ff, inn) else { continue };
+                let Some(fused) = x.try_matmul_swiglu(&m) else { continue };
+                let fused = pollster::block_on(fused.to_vec());
+                let composed = pollster::block_on(x.matmul_q(&m).swiglu(n_ff).to_vec());
+
+                let scale = composed.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                assert!(scale > 1e-3, "{label} in={inn}: composed reference is ~zero");
+                assert!(fused.iter().all(|v| v.is_finite()), "{label} in={inn}: fused produced non-finite");
+                let worst = fused.iter().zip(&composed).fold(0f32, |a, (&f, &c)| a.max((f - c).abs()));
+                assert!(worst < 2e-4 * scale,
+                        "{label} in={inn} n_ff={n_ff}: fused vs composed max |Δ| {worst:.3e} on {scale:.3e}");
+            }
+        }
     }
 
     /// Both packed kernels against dequantise-then-matmul. `deq_raw` is the decoder verified on
