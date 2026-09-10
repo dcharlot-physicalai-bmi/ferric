@@ -174,8 +174,15 @@ async fn run() {
     // sweeps ~112 DIFFERENT weights of 1-4 MiB each, touching every byte exactly once — nothing is
     // reused, nothing is warm. That is a different machine-level problem, and this measures it:
     // allocate N distinct weights and walk them once per pass.
-    println!("\n=== ONE PASS over N DISTINCT weights — no reuse, the decode pattern ===");
-    println!("{:>6}  {:>9}  {:>10}  {:>9}  {:>9}", "N", "each MiB", "total MiB", "ms/pass", "GB/s");
+    // ⚠ THIS SECTION USED TO BE UNBATCHED AND STILL CALLED ITSELF "the decode pattern". It was not.
+    // 28 matmuls in 28 submits cost 63.6 us each -- the ~60 us per-SUBMIT floor the control below
+    // measures, not memory time. The model runs 310 dispatches in 29 SUBMITS per token (10.7:1), a
+    // different regime entirely, so the unbatched number could never be the model's rate. Its 68.0
+    // GB/s happening to sit next to the whole-model 67 GB/s is two mechanisms landing on one number,
+    // and was nearly read as confirmation. Both arms are timed now; the BATCHED one is decode's.
+    println!("\n=== ONE PASS over N DISTINCT weights — no reuse. BATCHED is the decode pattern ===");
+    println!("{:>6}  {:>9}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}",
+             "N", "each MiB", "total MiB", "ms unbat", "GB/s unb", "ms BATCH", "GB/s BAT");
     {
         let inn = 1024usize;
         let x = Tensor::from_vec(&ctx, &(0..inn).map(|i| (i as f32 * 0.01).sin()).collect::<Vec<_>>(), &[1, inn]);
@@ -196,10 +203,17 @@ async fn run() {
             for w in &ws { sink = Some(x.matmul_q(w)); }
             ferric_tensor::device_sync(&ctx);
             let ms = t0.elapsed().as_secs_f64() * 1e3;
+            // Same weights, same order, one submit -- the way the model actually issues them.
+            ferric_tensor::device_sync(&ctx);
+            let t1 = Instant::now();
+            ferric_tensor::batch(&ctx, || { for w in &ws { sink = Some(x.matmul_q(w)); } });
+            ferric_tensor::device_sync(&ctx);
+            let ms_b = t1.elapsed().as_secs_f64() * 1e3;
             let _ = sink;
-            println!("{n_w:>6}  {:>9.1}  {:>10.1}  {ms:>9.3}  {:>9.1}",
+            println!("{n_w:>6}  {:>9.1}  {:>10.1}  {ms:>9.3}  {:>9.1}  {ms_b:>9.3}  {:>9.1}",
                      each as f64 / 1048576.0, total as f64 / 1048576.0,
-                     total as f64 / (ms * 1e-3) / 1e9);
+                     total as f64 / (ms * 1e-3) / 1e9,
+                     total as f64 / (ms_b * 1e-3) / 1e9);
         }
     }
 
@@ -237,13 +251,22 @@ async fn run() {
             ferric_tensor::device_sync(&ctx);
             let us_b = t1.elapsed().as_secs_f64() * 1e6 / n_w as f64;
             let _ = sink;
-            // ⭐ SELF-REFUTATION CHECK. Batching only removes queue submissions; it cannot add work, so
-            // batched > unbatched is IMPOSSIBLE and means the run was contended. Likewise a bigger
-            // weight must not be faster than a smaller one at the same shape. A contended benchmark is
-            // a WRONG number, not a slow one, and nothing else in this output says so — a load gate
-            // cannot, because the dominant variation is a GPU clock state `uptime` cannot see.
+            // ⭐ SELF-REFUTATION CHECK — a run that contradicts itself, without needing a quiet machine.
+            //
+            // ⛔ THIS CHECK ORIGINALLY SAID "batched > unbatched is IMPOSSIBLE, batching only removes
+            // queue submissions". THAT PREMISE IS FALSE and the check fired on a good run. On a QUIET
+            // machine (load 3.84) batched is reproducibly 1.20-1.48x SLOWER here, because THESE 24
+            // MATMULS ARE INDEPENDENT (one x, 24 distinct weights): submitted separately they overlap
+            // on the GPU, while inside one encoder they serialise. The tell is that the effect
+            // vanishes exactly where overlap cannot help — at out=65536 the kernel is bandwidth-bound
+            // at 203.8 GB/s and the ratio falls to 1.07x.
+            // ⚠ SO NEITHER COLUMN MODELS DECODE. The model's matmuls are DEPENDENT (each feeds the
+            // next), so they could not overlap even unbatched; for them batching's submit saving is
+            // pure win. Read these two columns as a bound on submit cost, never as "batching is bad".
+            // What IS still impossible is a LARGE ratio: 2.3x and 3.2x appeared only in a contended
+            // run whose gate had fallen through.
             let mut flag = "";
-            if us_b > us_un * 1.15 { flag = "  ⛔ BATCHED SLOWER THAN UNBATCHED — CONTENDED, DISCARD"; bad += 1; }
+            if us_b > us_un * 2.0 { flag = "  ⛔ BATCHED >2x UNBATCHED — CONTENDED, DISCARD"; bad += 1; }
             // ⚠ The loop walks out SMALL -> LARGE, so cost RISING is correct and must not be flagged.
             // The impossible direction is a BIGGER weight coming out materially FASTER than a smaller
             // one. Writing this the other way round rejected a hand-built clean table on its first
@@ -259,7 +282,7 @@ async fn run() {
             println!("\n  ⛔⛔ {bad} IMPOSSIBLE ORDERING(S) ABOVE. THIS RUN IS CONTENDED — DO NOT QUOTE IT.");
             println!("      Re-run on a quiet machine, and read RATIOS across >=3 whole runs, not one table.");
         } else {
-            println!("\n  ✅ no impossible orderings — batched <= unbatched and cost is monotone in size.");
+            println!("\n  ✅ no impossible orderings — cost monotone in size, batched within 2x of unbatched.");
         }
     }
 
