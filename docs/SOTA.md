@@ -388,36 +388,52 @@ identical to re-prefilling — currently 12/12 identical at 4.5× the speed.
   competitiveness does **not** depend on it (nobody else has it in-browser either).
 
 ## Roadmap — the checklist to unambiguous SOTA
-Priority order (both the C++ and Rust/browser surveys converge on this):
 
-- [x] **Pipeline caching** — compile each WGSL kernel once, not every dispatch. (~4× on small ops; the
-      single biggest per-op overhead, and table stakes every runtime has.) **Shipped.**
-- [ ] **1. Tiled register-blocked GEMM + vec4 loads + autotuning.** The naive→>1 TFLOP lever.
-      **Measured finding (M5 Max, wgpu→Metal):** the naive one-thread-per-output kernel is a *strong*
-      baseline here — Metal auto-vectorizes/caches it to **~587 GFLOP/s at 1024³** (very different from
-      the research's "naive = 1.6 GFLOP/s" on other GPUs). Both a 4×4 and an 8×8 register-blocked
-      shared-memory kernel (`matmul_tiled`) were implemented and validated bit-exact but **do not beat
-      naive on this hardware** (~0.4× at 1024³) — a straightforward tiled kernel isn't enough; the
-      published >1 TFLOP results require **vec4 loads + a bounds-check-free interior fast-path + loop
-      unrolling + per-device autotuning**, and the win is GPU-specific. **This is precisely why #6
-      (autotuning) is not optional:** there is no single kernel that wins on every GPU, so the correct
-      SOTA move is to keep both kernels and *select per device+shape by measurement* (on M5 Max that
-      selects naive; on GPUs where tiled wins, it selects tiled). Do #6 to make GEMM portably fast.
-- [ ] **2. Subgroup-accelerated GEMV (decode) + `shader-f16`.** Memory-bound decode is where LLMs live;
-      subgroups are browser-stable now. Feature-detect + fall back.
-- [ ] **3. General flash-attention WGSL** (online-softmax, tiled, GQA) + paged / quantized KV cache.
-      Proven viable on WebGPU (ORT FA2, LlamaWeb FlashDecoding).
-- [ ] **4. GGUF loader + k-quant / i-quant dequant kernels** (Q4_K_M, Q6_K, Q8_0…). Unlocks the entire
-      llama.cpp/HF quantized-model corpus. candle already reads these; we can't yet.
-- [ ] **5. Tokenizer** (byte-level BPE / SentencePiece). Table stakes for prompt→text; pure Rust, wasm-clean.
-- [ ] **6. Per-shape / per-device kernel autotuning** + a persisted cache. LlamaWeb got +41% average;
-      matters *more* for us because WebGPU spans wildly heterogeneous GPUs.
-- [ ] **7. Kernel fusion** (matmul epilogue + RMSNorm/RoPE/SwiGLU; attention fusion) via a pass over the
-      tensor graph — the memory-bandwidth win LlamaWeb blames its weak prefill on.
-- [ ] **8. Cooperative-matrix (tensor-core) tile-matmul — native-gated.** The last mile to cuBLAS/Metal
-      parity on native; feature-detected, browser falls back to #1/#2.
+⚠ **This list was written before any of it shipped and went stale for months.** Every item below now
+has code behind it, verified against the tree on 2026-09-10 (the pointer after each is where to look —
+if the pointer is gone, the claim is stale again). The list is kept rather than deleted because *what
+each item turned out to actually be* is the useful part; several were not what the survey predicted.
 
-**Reading of "done":** land 1–3 → kernel-credible; 4–5 → ergonomically complete end-to-end; 6–7 →
-capture the "free" 40%+ everyone else banks; 8 → native parity. At that point Ferric is the only stack
-that is simultaneously SOTA-Rust *and* browser-competitive *and* trainable *and* deterministic across
-cloud+local+browser — a combination no single competitor holds.
+- [x] **Pipeline caching** — compile each WGSL kernel once, not every dispatch. (~4× on small ops.)
+- [x] **1. Tiled register-blocked GEMM + vec4 loads + autotuning.** ⚠ **Shipped as a *selection*
+      problem, not a kernel.** Both a 4×4 and an 8×8 register-blocked shared-memory kernel
+      (`matmul_tiled`) are implemented and bit-exact, and they **lose to naive on M5 Max** (~0.4× at
+      1024³) — Metal auto-vectorizes the one-thread-per-output kernel to ~587 GFLOP/s, nothing like the
+      research's "naive = 1.6 GFLOP/s" on other GPUs. There is no single kernel that wins on every GPU,
+      so the shipped answer is to keep both and pick by measurement. → `Tensor::autotune_matmul`,
+      [lib.rs:1194](../crates/ferric-tensor/src/lib.rs#L1194); selection at
+      [lib.rs:1174](../crates/ferric-tensor/src/lib.rs#L1174).
+- [x] **2. Subgroup-accelerated GEMV (decode) + `shader-f16`.** Both features are *negotiated*, not
+      assumed — `Caps::subgroups` / `Caps::shader_f16` are read off the adapter and the kernels carry a
+      barrier fallback, because they are absent in parts of the fabric.
+      → [ferric-core/src/lib.rs:24-47](../crates/ferric-core/src/lib.rs#L24-L47), `MATMUL_Q4_K_SGGEMV_WGSL`.
+      ⚠ Both stay **off the bit-identical default path**: subgroup reduction order is hardware-dependent,
+      so enabling them by default would break cross-fabric identity.
+- [x] **3. General flash-attention WGSL + paged / quantized KV cache.** Prefill and decode are separate
+      kernels — `flash_attention_prefill` ([lib.rs:784](../crates/ferric-tensor/src/lib.rs#L784)) and a
+      split-KV flash-decoding path ([lib.rs:3136](../crates/ferric-tensor/src/lib.rs#L3136)), because the
+      decode shape (T=1) starves a prefill-shaped grid. Paging lives in `ferric-kv`; KV quantization in
+      `ferric-tensor/src/kvquant.rs`, selected by `FERRIC_KVQ`.
+- [x] **4. GGUF loader + k-quant / i-quant dequant kernels.** `ferric-gguf` reads *and writes* GGUF
+      (`quantize.rs`, `imatrix.rs`, `quantplan.rs` — an imatrix quantizer, not just a reader). Matmul
+      kernels exist for Q4_0/1, Q5_0/1, Q8_0, Q2_K–Q6_K, IQ2_XXS, IQ3_XXS, IQ4_XS/NL, MXFP4, STQ1_0.
+- [x] **5. Tokenizer.** `ferric-tokenizer`, pure Rust, wasm-clean.
+- [x] **6. Per-shape / per-device kernel autotuning.** Shipped with #1 — and it is what *makes* #1 true.
+- [x] **7. Kernel fusion.** `add_rmsnorm`, `qk_norm_rope` (rmsnorm-q + rmsnorm-k + rope-q + rope-k in one
+      dispatch, reading q/k in place from the QKV buffer), and fused `matmul_q*_swiglu`. ⚠ **The fusion
+      win was not the bandwidth saving the survey predicted** — see "What the perf work actually taught"
+      above: the dominant term was six kernels whose *grid* was sized by a dimension that is 1 at decode.
+- [x] **8. Cooperative-matrix tile-matmul — native-gated.** Two paths: `MATMUL_Q*_COOP_WGSL` on
+      Vulkan (`Caps::coop_matrix && shader_f16 && Backend::Vulkan`, gated at
+      [ferric-core/src/lib.rs:92](../crates/ferric-core/src/lib.rs#L92)) and
+      MetalPerformancePrimitives `tensor_ops::matmul2d` on Metal 4
+      ([metal4.rs](../crates/ferric-tensor/src/metal4.rs)). Browser falls back to #1/#2.
+
+**So what is actually left?** Not this list. The honest remaining gap is measured, not surveyed:
+
+| gap | number | where it is written down |
+|---|---|---|
+| whole-model weight streaming | **67 GB/s** vs llama.cpp's 156 | "What the perf work actually taught", above |
+| decode latency vs llama.cpp | **2.33×** (369.25 vs 158.7 tok/s, qwen3-0.6b-q5km) | same |
+| model coverage vs the Aug-2026 release wave | `qwen4exp`, Nemotron-3-Puzzle, GLM-5.x, Kimi K2/K3, Mistral 3 | 30-day cadence rule |
+

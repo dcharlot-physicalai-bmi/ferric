@@ -202,10 +202,29 @@ impl Cfg {
     }
 }
 
+/// Consecutive runs of equal quant format, as index ranges over `types`, in order.
+///
+/// ⚠ ORDER IS THE INVARIANT, not the grouping. `Proj::Split` concatenates its parts along dim 1 and
+/// every consumer addresses the result positionally (`qkv.narrow(1, 0, q_out)` is q, the next
+/// `kv_out` columns are k, and so on). Runs must therefore be contiguous and emitted left to right:
+/// grouping by format *value* — collecting all the Q5_K tensors together — would silently permute
+/// the columns and mis-slice every head. The ranges below tile `0..types.len()` exactly.
+fn same_format_runs(types: &[u32]) -> Vec<std::ops::Range<usize>> {
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for i in 0..types.len() {
+        match runs.last_mut() {
+            Some(r) if types[i] == types[i - 1] => r.end = i + 1,
+            _ => runs.push(i..i + 1),
+        }
+    }
+    runs
+}
+
 /// A projection that is *logically* one matmul emitting several stacked outputs (q|k|v, gate|up).
 /// If every part shares a quant format it's byte-fused into one QMatrix (the fast path); real Q4_K_M
-/// models mix formats even within qkv (V is often Q6_K while Q/K are Q4_K), so it falls back to one
-/// matmul per part, concatenated — same result, one extra dispatch.
+/// and Q5_K_M models mix formats even within qkv (V is often bumped a level above Q/K), so mixed
+/// projections fuse the *consecutive same-format runs* and concatenate those — same result, one
+/// dispatch per run rather than one per tensor.
 pub(crate) enum Proj {
     Fused(QMatrix),
     Split(Vec<QMatrix>),
@@ -213,13 +232,25 @@ pub(crate) enum Proj {
 impl Proj {
     pub(crate) fn load(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Proj, String> {
         let types: Vec<u32> = names.iter().map(|n| g.tensor(n).map(|t| t.ggml_type).unwrap_or(0)).collect();
-        if names.len() > 1 && types.windows(2).all(|w| w[0] == w[1]) {
-            Ok(Proj::Fused(qm_cat(ctx, g, names)?))
-        } else if names.len() == 1 {
-            Ok(Proj::Fused(qm(ctx, g, names[0])?))
-        } else {
-            Ok(Proj::Split(names.iter().map(|n| qm(ctx, g, n)).collect::<Result<_, _>>()?))
+        if names.len() == 1 { return Ok(Proj::Fused(qm(ctx, g, names[0])?)); }
+        if types.windows(2).all(|w| w[0] == w[1]) { return Ok(Proj::Fused(qm_cat(ctx, g, names)?)); }
+        // FERRIC_NO_PROJ_GROUP forces one matmul per tensor — for a controlled A/B of the grouping in
+        // the SAME binary, the way FERRIC_NOFUSE does for the SwiGLU fusion below.
+        // ⚠ `is_err()` is FALSE for a set-but-EMPTY var, so `FERRIC_NO_PROJ_GROUP= ` still takes the
+        // un-grouped arm. Clear it with `env -u`, never by setting it empty, or the A/B is vacuous.
+        if std::env::var("FERRIC_NO_PROJ_GROUP").is_ok() {
+            return Ok(Proj::Split(names.iter().map(|n| qm(ctx, g, n)).collect::<Result<_, _>>()?));
         }
+        // ⭐ GROUP CONSECUTIVE SAME-FORMAT TENSORS instead of giving up on the whole projection.
+        //
+        // The all-or-nothing test above is right that one matmul cannot span two quant formats, but
+        // it was throwing away the partial fusion. Q5_K_M is the common case and it stores
+        // attn_q and attn_k as Q5_K while bumping attn_v to Q6_K — so a mixed qkv fell all the way
+        // back to THREE matmuls and TWO `cat`s per layer, where two matmuls and one cat suffice.
+        let parts = same_format_runs(&types).iter()
+            .map(|r| if r.len() == 1 { qm(ctx, g, names[r.start]) } else { qm_cat(ctx, g, &names[r.clone()]) })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Proj::Split(parts))
     }
     pub(crate) fn matmul(&self, x: &Tensor) -> Tensor {
         match self {
@@ -1539,5 +1570,50 @@ mod kvq_cache_tests {
     #[should_panic(expected = "would install f32 rows")]
     fn set_layers_refuses_on_a_quantized_cache() {
         Cache::with_kvq(&cfg(4), Some(KvqFmt::Q8_0)).set_layers(Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod proj_grouping_tests {
+    use super::same_format_runs;
+
+    /// The whole point of the grouping: a Q5_K_M qkv (q,k are Q5_K=13; v is Q6_K=14) becomes two
+    /// matmuls, not three. And a uniform projection becomes one — the caller short-circuits that
+    /// case, but the helper must agree with it or the two paths would disagree about column order.
+    #[test]
+    fn runs_are_contiguous_ordered_and_tile_the_input() {
+        assert_eq!(same_format_runs(&[13, 13, 14]), vec![0..2, 2..3]); // Q5_K_M qkv
+        assert_eq!(same_format_runs(&[12, 12, 14]), vec![0..2, 2..3]); // Q4_K_M qkv
+        assert_eq!(same_format_runs(&[14, 13, 13]), vec![0..1, 1..3]); // run at the END
+        assert_eq!(same_format_runs(&[13, 14, 13]), vec![0..1, 1..2, 2..3]); // no fusion possible
+        assert_eq!(same_format_runs(&[13, 13, 13]), vec![0..3]); // uniform
+        assert_eq!(same_format_runs(&[13]), vec![0..1]);
+        assert_eq!(same_format_runs(&[]), vec![]);
+    }
+
+    /// ⚠ The failure this guards is silent: group by format *value* rather than by adjacency and
+    /// `[13,14,13]` collapses to {13:[0,2], 14:[1]}, so the concatenation emits q|v|k and every
+    /// `narrow` downstream reads the wrong columns with no error raised anywhere. Assert the
+    /// property directly — the ranges, flattened, must be exactly 0,1,2,… in order.
+    #[test]
+    fn runs_never_permute_columns() {
+        for types in [
+            vec![13u32, 14, 13], vec![14, 14, 13, 13, 14], vec![13, 13, 14],
+            vec![0, 1, 0, 1, 0, 1], vec![8, 8, 8, 8],
+        ] {
+            let flat: Vec<usize> = same_format_runs(&types).into_iter().flatten().collect();
+            assert_eq!(flat, (0..types.len()).collect::<Vec<_>>(), "permuted for {types:?}");
+        }
+    }
+
+    /// Every emitted run must actually be uniform — a run spanning two formats would reach
+    /// `qm_cat`, which concatenates raw quant bytes and would produce garbage weights.
+    #[test]
+    fn every_run_is_single_format() {
+        for types in [vec![13u32, 14, 13], vec![14, 14, 13, 13, 14], vec![12, 12, 14], vec![5, 5, 5]] {
+            for r in same_format_runs(&types) {
+                assert!(types[r.clone()].iter().all(|t| *t == types[r.start]), "mixed run {r:?} in {types:?}");
+            }
+        }
     }
 }
