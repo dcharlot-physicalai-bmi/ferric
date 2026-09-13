@@ -1296,14 +1296,25 @@ impl Q5_KWeights {
 impl Tensor {
     /// y = x·Wᵀ where W is a packed **Q5_K** [out, in] weight, dequantized per-super-block in-kernel.
     pub fn matmul_q5_k(&self, w: &Q5_KWeights) -> Tensor {
+        let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
+        self.matmul_q5_k_cfg(w, split, splitk_lanes_sub(w.cols / 256))
+    }
+
+    /// `matmul_q5_k` with the kernel choice and lane layout supplied rather than derived.
+    ///
+    /// ⭐ THIS EXISTS SO THE TEST DOES NOT SET ENVIRONMENT VARIABLES. `cargo test` runs tests as
+    /// threads in ONE process, so a test that flips `FERRIC_SUBBLK` or `FERRIC_Q2_0_KERNEL` to
+    /// compare two layouts mutates global state under every test running beside it — and in edition
+    /// 2024 `set_var` is `unsafe` precisely because of that. Passing the config in makes the
+    /// comparison hermetic and lets the same test pin both layouts at once.
+    pub(crate) fn matmul_q5_k_cfg(&self, w: &Q5_KWeights, split: bool, (lanes, subl, opw): (u32, u32, u32)) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (lanes, opw) = splitk_lanes(inn / 256);
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
-            // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
+        let (grid, rs, wgsl, label) = if split {
+            // Outputs are packed `opw` to a workgroup now (see `splitk_lanes_sub`), so the grid
             // covers ceil(n / opw) workgroups rather than one per output.
             let nwg = n.div_ceil(opw as usize);
             let gw = nwg.min(32768);
@@ -1315,10 +1326,14 @@ impl Tensor {
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q5_k_coop(w);
         }
+        // ⚠ __LS__ before __L__: a plain string replace of "__L__" would also eat the "__L" inside
+        // "__LS__" and leave a dangling "S__". Longest placeholder first.
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q5_K_INNER)
+            .replace("__LS__", &(lanes * subl).to_string())
+            .replace("__LH__", &(lanes * subl / 2).to_string())
             .replace("__L__", &lanes.to_string())
-            .replace("__OPW__", &opw.to_string())
-            .replace("__LH__", &(lanes / 2).to_string());
+            .replace("__S__", &subl.to_string())
+            .replace("__OPW__", &opw.to_string());
         let src = if use_subgroup(&self.ctx) { sg_reduce(&src) } else { src };
         run(&self.ctx, &src, label,
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
@@ -1499,7 +1514,7 @@ impl Tensor {
         let n = rows * o_dim;
         // Q2_K/Q3_K share the Q6_K split-K template, so they need the same lane split — without
         // this the `__L__`/`__OPW__` placeholders would reach the shader compiler verbatim.
-        let (lanes, opw) = splitk_lanes(inn / 256);
+        let (lanes, opw) = splitk_lanes_wide(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, o_dim, inn) {
             let nwg = n.div_ceil(opw as usize);
             let gw = nwg.min(32768);
@@ -1601,7 +1616,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (lanes, opw) = splitk_lanes(inn / 256);
+        let (lanes, opw) = splitk_lanes_wide(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
             // covers ceil(n / opw) workgroups rather than one per output.
@@ -1947,7 +1962,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
-        let (lanes, opw) = splitk_lanes(inn / 256);
+        let (lanes, opw) = splitk_lanes_wide(inn / 256);
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
             // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
             // covers ceil(n / opw) workgroups rather than one per output.
@@ -2321,14 +2336,17 @@ impl Tensor {
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
         // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
-        let (lanes, opw) = splitk_lanes(inn / 256);
+        let (lanes, subl, opw) = splitk_lanes_sub(inn / 256);
         let nwg = n.div_ceil(opw as usize);
         let wg = nwg; let gw = wg.min(32768);
         let grid = (gw as u32, wg.div_ceil(gw) as u32, 1u32);
+        // ⚠ __LS__ before __L__, or the replace eats the "__L" inside "__LS__". Longest first.
         let src = MATMUL_Q5_K_SWIGLU_WGSL.replace("__HELPERS__", Q4_K_HELPERS)
+            .replace("__LS__", &(lanes * subl).to_string())
+            .replace("__LH__", &(lanes * subl / 2).to_string())
             .replace("__L__", &lanes.to_string())
-            .replace("__OPW__", &opw.to_string())
-            .replace("__LH__", &(lanes / 2).to_string());
+            .replace("__S__", &subl.to_string())
+            .replace("__OPW__", &opw.to_string());
         run(&self.ctx, &src, "matmul_q5_k_swiglu",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, n_ff as u32, inn as u32, gw as u32])], grid);
@@ -2814,6 +2832,63 @@ fn splitk_lanes(nblk: usize) -> (u32, u32) {
     (l as u32, (64 / l) as u32)
 }
 
+/// Lanes for the templates whose `__BODY__` is format-specific and therefore NOT sub-splittable.
+///
+/// ⭐ `wide` IS THE FORMAT-AGNOSTIC HALF OF THE FIX. The two-level split needs to know the body's
+/// inner loop (Q4_K/Q5_K have 8 sub-blocks; Q6_K nests hf x 2 and l x 32; IQ4_NL/MXFP4 have a
+/// 32-value block and no sub-blocks at all), so it cannot be applied through a shared template
+/// without per-format knowledge — the blanket-substitution trap. Spending LANES to buy WORKGROUPS
+/// needs none: a lane with `bl >= nblk` simply never enters the block loop.
+///
+/// So `wide` gives every k-quant one workgroup per output (`opw = 1`) for the price of idle lanes,
+/// which is free when the bound is occupancy.
+fn splitk_lanes_wide(nblk: usize) -> (u32, u32) {
+    match std::env::var("FERRIC_SUBBLK").as_deref() {
+        Ok("wide") => (64, 1),
+        _ => splitk_lanes(nblk),
+    }
+}
+
+/// **Two-level K split: over blocks AND over the 8 sub-blocks inside each block.**
+///
+/// ⭐ THE GRID, NOT THE BYTES, IS WHAT DECODE STARVES. A split-K workgroup serves `opw = 64 / lanes`
+/// outputs, so the dispatch is `n_out / opw` workgroups. With one lane per 256-value block, a decode
+/// matmul at `in=1024` has `nblk = 4`, so lanes caps at 4, `opw` is 16, and `out=3072` launches just
+/// **192 workgroups**. Measured on M5 Max, the same kernel's throughput tracks workgroup count and
+/// nothing else:
+///
+/// ```text
+///   192-256 wg -> 29.8-61.9 GB/s | 1,024 wg -> 210.1 | 4,096 wg -> 257.9 | 16,384 wg -> 255.0
+/// ```
+///
+/// The `lm_head` proves bytes and blocks-per-row are NOT the variable: it has the same `in=1024`
+/// (so the same 4 blocks/row) and reaches 227.5 GB/s purely because `out=151936` gives it 9,496
+/// workgroups. This is the batch=1 starved-grid lint again, on the `n_out` axis.
+///
+/// A k-quant block is 8 sub-blocks of 32 values, each with its own 6-bit scale, and the inner loop
+/// is indexed by `s` with no carried dependency — so `s` can stride across lanes exactly like `blk`
+/// does. That multiplies available lanes by up to 8 and divides `opw` by the same, taking `in=1024,
+/// out=3072` from 192 workgroups to **1,536** — inside the saturated band.
+///
+/// ⚠ Returns `sub = 1` unless `FERRIC_SUBBLK` is set, which reproduces the single-level scheme
+/// EXACTLY (`s` from 0 stepping 1). The default path is unchanged until the A/B says otherwise.
+fn splitk_lanes_sub(nblk: usize) -> (u32, u32, u32) {
+    let (l, opw) = splitk_lanes(nblk);
+    match std::env::var("FERRIC_SUBBLK").as_deref() {
+        // ⭐ `wide`: spend LANES to buy WORKGROUPS. `opw = 64 / lanes`, so capping lanes at `nblk`
+        // (4 at in=1024) packs SIXTEEN outputs into one workgroup and divides the grid by 16 — the
+        // opposite of what a decode matmul needs. Here lanes are pinned at 8x8 = 64 whether or not
+        // there are 8 blocks to walk, so `opw` is 1 and the grid is one workgroup per output.
+        // ⚠ Lanes with `bl >= nblk` never enter the block loop and contribute a zero partial. That
+        // is deliberate: an idle lane costs nothing if the bound is occupancy, and the measured
+        // curve says it is — the same kernel does 29.8-61.9 GB/s at 192-256 workgroups and 210-258
+        // at 1k-4k.
+        Ok("wide") => (8, 8, 1),
+        Err(_) => (l, 1, opw),
+        Ok(_) => { let sub = (64 / l).min(8); (l, sub, 64 / (l * sub)) }
+    }
+}
+
 fn q2_0_split_k(rows: usize, n_out: usize, in_dim: usize) -> bool {
     match std::env::var("FERRIC_Q2_0_KERNEL").as_deref() {
         Ok("flat") | Ok("trans") => false,
@@ -3021,8 +3096,11 @@ __HELPERS__
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let rows = info.x; let o_dim = info.y; let in_dim = info.z;
     let t = lid.x;
-    // One output is served by __L__ lanes; __OPW__ outputs share this workgroup.
-    let bl = t % __L__u; let sub = t / __L__u;
+    // One output is served by __LS__ lanes (__L__ over blocks x __S__ over the 8 sub-blocks inside
+    // a block); __OPW__ outputs share this workgroup. Lanes for one output are CONTIGUOUS in t,
+    // which is what lets the reduction below walk a plain power-of-two stride.
+    let lane = t % __LS__u; let sub = t / __LS__u;
+    let bl = lane / __S__u; let sl = lane % __S__u;
     let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
     let n_all = rows * o_dim;
     var acc = 0.0;
@@ -3035,15 +3113,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             let bi = o * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
             let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
             let xbb = r * in_dim + blk * 256u;
-            for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+            for (var s: u32 = sl; s < 8u; s = s + __S__u) {
 __INNER__
             }
         }
     }
     partial[t] = acc;
     workgroupBarrier();
-    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) { if (bl < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
-    if (bl == 0u && idx < n_all) { out[idx] = partial[t]; }
+    for (var rs: u32 = __LH__u; rs > 0u; rs = rs >> 1u) { if (lane < rs) { partial[t] = partial[t] + partial[t + rs]; } workgroupBarrier(); }
+    if (lane == 0u && idx < n_all) { out[idx] = partial[t]; }
 }
 "#;
 
@@ -3395,13 +3473,13 @@ const MATMUL_Q5_K_SWIGLU_WGSL: &str = r#"
 @group(0) @binding(3) var<storage,read_write>  out:    array<f32>;
 @group(0) @binding(4) var<uniform>             info:   vec4<u32>;   // rows, n_ff(out), in, row_stride
 __HELPERS__
-fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32, start: u32, stride: u32) -> f32 {
+fn qk_dot(o_row: u32, r: u32, nblk: u32, in_dim: u32, start: u32, stride: u32, s0: u32, sstep: u32) -> f32 {
     var acc = 0.0;
     for (var blk: u32 = start; blk < nblk; blk = blk + stride) {
         let bi = o_row * nblk + blk; let ab = bi * 4u; let cb40 = bi * 40u;
         let dd = unpack2x16float(aux[ab]); let d = dd.x; let dmin = dd.y;
         let xbb = r * in_dim + blk * 256u;
-        for (var s: u32 = 0u; s < 8u; s = s + 1u) {
+        for (var s: u32 = s0; s < 8u; s = s + sstep) {
             let sm = scmin(ab, s); let ds = d * f32(sm.x); let mm = dmin * f32(sm.y);
             let cw = cb40 + 8u * (s >> 1u); let hi = s & 1u; let xv = (xbb + 32u * s) >> 2u;
             for (var w: u32 = 0u; w < 8u; w = w + 1u) {
@@ -3428,7 +3506,10 @@ var<workgroup> pu: array<f32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let rows = info.x; let n_ff = info.y; let in_dim = info.z;
-    let t = lid.x; let bl = t % __L__u; let sub = t / __L__u;
+    // __LS__ lanes per output: __L__ over blocks x __S__ over the 8 sub-blocks inside a block.
+    // Lanes for one output are contiguous in t, which the reduction below relies on.
+    let t = lid.x; let lane = t % __LS__u; let sub = t / __LS__u;
+    let bl = lane / __S__u; let sl = lane % __S__u;
     let idx = (wg.x + wg.y * info.w) * __OPW__u + sub;
     let n_all = rows * n_ff;
     var g = 0.0; var u = 0.0;
@@ -3436,16 +3517,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     if (idx < n_all) {
     let o = idx % n_ff; let r = idx / n_ff;
     let nblk = in_dim / 256u;
-    g = qk_dot(o, r, nblk, in_dim, bl, __L__u);
-    u = qk_dot(o + n_ff, r, nblk, in_dim, bl, __L__u);
+    g = qk_dot(o, r, nblk, in_dim, bl, __L__u, sl, __S__u);
+    u = qk_dot(o + n_ff, r, nblk, in_dim, bl, __L__u, sl, __S__u);
     }
     pg[t] = g; pu[t] = u;
     workgroupBarrier();
-    for (var s: u32 = __LH__u; s > 0u; s = s >> 1u) {
-        if (bl < s) { pg[t] = pg[t] + pg[t + s]; pu[t] = pu[t] + pu[t + s]; }
+    for (var rs: u32 = __LH__u; rs > 0u; rs = rs >> 1u) {
+        if (lane < rs) { pg[t] = pg[t] + pg[t + rs]; pu[t] = pu[t] + pu[t + rs]; }
         workgroupBarrier();
     }
-    if (bl == 0u && idx < n_all) {
+    if (lane == 0u && idx < n_all) {
         let gg = pg[t];
         out[idx] = (gg / (1.0 + exp(-gg))) * pu[t];
     }
@@ -6066,6 +6147,65 @@ mod iq_kernel {
                 let worst = fused.iter().zip(&composed).fold(0f32, |a, (&f, &c)| a.max((f - c).abs()));
                 assert!(worst < 2e-4 * scale,
                         "{label} in={inn} n_ff={n_ff}: fused vs composed max |Δ| {worst:.3e} on {scale:.3e}");
+            }
+        }
+    }
+
+    /// **The split-K k-quant matmul against the FLAT kernel, at decode shapes, in BOTH lane layouts.**
+    ///
+    /// The split-K kernel is the hot path of every dense decode step and had no direct correctness
+    /// test — it was verified only end-to-end, by a model's generated text. That is a real test but
+    /// a slow and coarse one: it cannot say WHICH kernel broke, and it cannot be run per-shape.
+    ///
+    /// ⭐ FLAT is the right reference because it shares no reduction structure with split-K: one
+    /// thread walks the whole row, no lanes, no workgroup barrier, no partial array. A bug in the
+    /// lane decode or the reduction tree therefore cannot cancel between the two.
+    ///
+    /// ⚠ `in=1024` is the shape that matters: `nblk = 4`, so the two-level split engages hardest
+    /// (4 block-lanes x 8 sub-lanes = 32 of 64) and `opw` drops 16 -> 2. `in=2048` takes lanes to
+    /// the full 64. Both layouts must agree with FLAT and with each other.
+    #[test]
+    fn splitk_matches_flat_in_both_lane_layouts() {
+        let ctx = ctx_or_skip!();
+        let (ty, bpb, label) = (13u32, 176usize, "Q5_K");
+        for (inn, out) in [(1024usize, 96usize), (2048, 64), (1024, 33)] {
+            let mut bytes = blocks(out * (inn / 256) * bpb, 991 + inn as u64 + out as u64, bpb);
+            for (bi, blk) in bytes.chunks_exact_mut(bpb).enumerate() {
+                // ⚠ Q5_K carries TWO f16 scales and `blocks` sanitises only bytes 0..2, so a random
+                // `dmin` is happily inf/NaN and makes BOTH arms non-finite — a fixture bug that
+                // reads as a kernel bug.
+                let d = half::f16::from_f32(0.01 + 0.003 * (bi % 7) as f32);
+                blk[0..2].copy_from_slice(&d.to_le_bytes());
+                let dmin = half::f16::from_f32(0.002 + 0.0005 * (bi % 5) as f32);
+                blk[2..4].copy_from_slice(&dmin.to_le_bytes());
+            }
+            let x = Tensor::from_vec(&ctx, &acts(inn, 11), &[1, inn]);
+            // The weight is sharded; this fixture is small enough to be a single Q5_K shard.
+            let Ok(qm) = QMatrix::from_bytes(&ctx, &bytes, ty, out, inn) else { continue };
+            let [QShard::Q5_K(m)] = &qm.shards[..] else { panic!("expected exactly one Q5_K shard") };
+
+            let nblk = inn / 256;
+            let (l, opw1) = splitk_lanes(nblk);
+            let sub = (64 / l).min(8);
+            let flat = pollster::block_on(x.matmul_q5_k_cfg(&m, false, (l, 1, opw1)).to_vec());
+
+            let scale = flat.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            assert!(scale > 1e-3, "{label} in={inn}: FLAT reference is ~zero, this would pass on anything");
+            assert!(flat.iter().all(|v| v.is_finite()), "{label} in={inn}: FLAT reference non-finite");
+
+            // ⚠ The third layout is the dangerous one: L=8 with nblk=4 means lanes 4..7 NEVER enter
+            // the block loop and contribute a zero partial. That is intended — idle lanes buy
+            // workgroups — but it is one off-by-one away from silently DROPPING a block's
+            // contribution, and the arithmetic would still look plausible.
+            for (ll, sl, o, lay) in [(l, 1u32, opw1, "S=1"), (l, sub, 64 / (l * sub), "S=8"),
+                                     (8, 8, 1, "wide 8x8 (idle lanes)")] {
+                let got = pollster::block_on(x.matmul_q5_k_cfg(&m, true, (ll, sl, o)).to_vec());
+                assert_eq!(got.len(), flat.len(), "{label} in={inn} {lay}: length");
+                assert!(got.iter().all(|v| v.is_finite()), "{label} in={inn} out={out} {lay}: non-finite");
+                let worst = flat.iter().zip(&got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));
+                assert!(worst < 2e-4 * scale,
+                        "{label} in={inn} out={out} {lay} (L={ll} S={sl} opw={o}): \
+                         split-K vs FLAT max |Δ| {worst:.3e} on {scale:.3e}");
             }
         }
     }
