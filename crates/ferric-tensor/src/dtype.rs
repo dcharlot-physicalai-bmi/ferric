@@ -2878,8 +2878,9 @@ fn splitk_lanes(nblk: usize) -> (u32, u32) {
 /// without per-format knowledge — the blanket-substitution trap. Spending LANES to buy WORKGROUPS
 /// needs none: a lane with `bl >= nblk` simply never enters the block loop.
 ///
-/// So `wide` gives every k-quant one workgroup per output (`opw = 1`) for the price of idle lanes,
-/// which is free when the bound is occupancy.
+/// So `wide` gives every k-quant one workgroup per output (`opw = 1`) for the price of idle lanes.
+/// ⛔ Measured 2026-09-14 on the RTX 4050 (Vulkan): that price is NOT free — 20% slower than the
+/// default. See `splitk_lanes_sub` for the numbers; the sub-block split is the lever that won.
 fn splitk_lanes_wide(nblk: usize) -> (u32, u32) {
     match std::env::var("FERRIC_SUBBLK").as_deref() {
         Ok("wide") => (64, 1),
@@ -2908,19 +2909,29 @@ fn splitk_lanes_wide(nblk: usize) -> (u32, u32) {
 /// does. That multiplies available lanes by up to 8 and divides `opw` by the same, taking `in=1024,
 /// out=3072` from 192 workgroups to **1,536** — inside the saturated band.
 ///
+/// ⭐ MEASURED 2026-09-14 (scripts/ab_env.sh, uncontended, generation identical, fingerprints differ):
+///   RTX 4050 / Vulkan:  101.6 -> 91.5 ms/tok, 7/7 paired, p=0.016  — RESOLVED, +11%
+///                       (re-run on a verified file: 101.2 -> 90.8, 4/4)
+///   M5 Max / Metal:     6.2 -> 5.9, delta inside spread, p=0.125   — INDISTINGUISHABLE
+/// The right lane layout is FABRIC-DEPENDENT. That is why this stays an opt-in profile rather than
+/// a per-backend default: the portable tier keeps ONE layout everywhere, which is what cross-fabric
+/// bit-identity means; a per-fabric layout carries its own recorded fingerprint.
+///
 /// ⚠ Returns `sub = 1` unless `FERRIC_SUBBLK` is set, which reproduces the single-level scheme
-/// EXACTLY (`s` from 0 stepping 1). The default path is unchanged until the A/B says otherwise.
+/// EXACTLY (`s` from 0 stepping 1).
 fn splitk_lanes_sub(nblk: usize) -> (u32, u32, u32) {
     let (l, opw) = splitk_lanes(nblk);
     match std::env::var("FERRIC_SUBBLK").as_deref() {
-        // ⭐ `wide`: spend LANES to buy WORKGROUPS. `opw = 64 / lanes`, so capping lanes at `nblk`
-        // (4 at in=1024) packs SIXTEEN outputs into one workgroup and divides the grid by 16 — the
-        // opposite of what a decode matmul needs. Here lanes are pinned at 8x8 = 64 whether or not
-        // there are 8 blocks to walk, so `opw` is 1 and the grid is one workgroup per output.
-        // ⚠ Lanes with `bl >= nblk` never enter the block loop and contribute a zero partial. That
-        // is deliberate: an idle lane costs nothing if the bound is occupancy, and the measured
-        // curve says it is — the same kernel does 29.8-61.9 GB/s at 192-256 workgroups and 210-258
-        // at 1k-4k.
+        // `wide`: spend LANES to buy WORKGROUPS — pin lanes at 8x8 = 64 whether or not there are 8
+        // blocks to walk, so `opw` is 1 and the grid is one workgroup per output. Lanes with
+        // `bl >= nblk` never enter the block loop and contribute a zero partial.
+        // ⛔ MEASURED 2026-09-14, RTX 4050 / Vulkan, uncontended: 101.5 -> 121.6 ms/tok, 0/7 paired —
+        // **20% SLOWER**, and a 22.8 ms spread (one rep at 144.4). The premise "an idle lane costs
+        // nothing if the bound is occupancy" is FALSE on this GPU: parking 60 of 64 threads to buy
+        // workgroups loses by a fifth. The workgroup-count curve this was built on was measured on
+        // Metal and did not transfer as read. Retained opt-in ONLY because AMD/Intel are unmeasured;
+        // not recommended on any fabric measured so far. The two-level split (`FERRIC_SUBBLK=1`),
+        // which adds WORKING lanes per output, is the one that won (+11%).
         Ok("wide") => (8, 8, 1),
         Err(_) => (l, 1, opw),
         Ok(_) => { let sub = (64 / l).min(8); (l, sub, 64 / (l * sub)) }
