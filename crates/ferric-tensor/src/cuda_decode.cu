@@ -117,6 +117,9 @@ extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned*
 // 121 MiB lm_head, which rules out occupancy. Same math, re-partitioned: lane j owns positions
 // [16·(j&1), +16) of the TWO sub-blocks 2c and 2c+1 (c = j>>1) — one uint4 of qs (low nibbles -> 2c,
 // high -> 2c+1), one uint4 of qh (bits 2c / 2c+1), eight lanes covering a block's 128 B contiguously.
+__device__ __forceinline__ unsigned q5_scbyte(const unsigned* __restrict__ aux, unsigned ab, unsigned i) {
+    return (aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu;
+}
 __device__ __forceinline__ void q5_scmin(const unsigned* __restrict__ aux, unsigned ab, unsigned s, float d, float dmin,
                                          float& ds, float& mm) {
     unsigned sc, mn;
