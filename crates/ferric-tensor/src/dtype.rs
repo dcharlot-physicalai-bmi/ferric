@@ -1042,6 +1042,7 @@ pub enum QShard {
     Iq4Xs(Iq4XsWeights),
     Iq4Nl(Iq4NlWeights),
     Mxfp4(Mxfp4Weights),
+    Nvfp4(Nvfp4Weights),
     /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_NL): the weight
     /// is dequantized to f32 on load and run through a plain matmul. Correct and format-complete, at
     /// the cost of f32 weight memory — a native kernel can replace it later purely as a speed/size win.
@@ -1068,8 +1069,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -1085,6 +1086,7 @@ impl QShard {
             20 => QShard::Iq4Nl(Iq4NlWeights::from_bytes(ctx, bytes, rows, cols)),
             23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
             39 => QShard::Mxfp4(Mxfp4Weights::from_bytes(ctx, bytes, rows, cols)),
+            40 => QShard::Nvfp4(Nvfp4Weights::from_bytes(ctx, bytes, rows, cols)),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
             43 => QShard::Stq1_0(Stq1_0Weights::from_bytes(ctx, bytes, rows, cols)),
             16 => QShard::Iq2Xxs(Iq2XxsWeights::from_bytes(ctx, bytes, rows, cols)),
@@ -1124,6 +1126,7 @@ impl QMatrix {
             20 => Some((32, 18)),  // IQ4_NL
             23 => Some((256, 136)),// IQ4_XS
             39 => Some((32, 17)),  // MXFP4
+            40 => Some((64, 36)),  // NVFP4: d[4] UE4M3 + qs[32] E2M1 = 4.5 bpw
             42 => Some((128, 34)), // Q2_0
             43 => Some((256, 42)), // STQ1_0
             16 => Some((256, 66)), // IQ2_XXS
@@ -1252,6 +1255,7 @@ impl Tensor {
             QShard::Iq4Xs(w) => self.matmul_iq4_xs(w),
             QShard::Iq4Nl(w) => self.matmul_iq4_nl(w),
             QShard::Mxfp4(w) => self.matmul_mxfp4(w),
+            QShard::Nvfp4(w) => self.matmul_nvfp4(w),
             QShard::Dense(w) => self.matmul(&w.wt),
         }
     }
@@ -4261,6 +4265,100 @@ const MXFP4_BODY: &str = r#"
             }
 "#;
 
+/// **NVFP4** in-kernel dequant — ggml type 40, NVIDIA's block-scaled FP4.
+///
+/// ⭐ THE VALUE TABLE IS MXFP4's. `dequantize_row_nvfp4` looks up `kvalues_mxfp4`, so `KM` from
+/// [`MXFP4_HELPERS`] is reused verbatim. Only the scale differs: four **UE4M3** bytes per block, one
+/// per 16-value sub-block, where MXFP4 has one E8M0 per 32.
+///
+/// ⭐⭐ **THE `* 0.5` AT THE END IS NOT OPTIONAL AND IS THE WHOLE TRAP.** Quantisation stores
+/// `ue4m3(amax / 6.0)` — 6.0 being the max of the *undoubled* E2M1 table `{0,.5,1,1.5,2,3,4,6}` —
+/// while dequant multiplies by the *doubled* `KM` `{0,1,2,3,4,6,8,12}`. `ggml_ue4m3_to_fp32` halves
+/// its result to reconcile them. Drop it and every weight is exactly 2x, which is a plausible-looking
+/// model that is quietly wrong. Same class as MXFP4's `2^(e−128)` vs `2^(e−127)`.
+///
+/// ✅ Unlike E8M0 there is **no subnormal hazard here**, so none of `e8m0h`'s split-exponent work is
+/// needed: the scale spans `2^−10` (exp=0, man=1) to 224 (0x7E), every value comfortably normal in
+/// f32 on a device that flushes subnormals to zero.
+///
+/// `x == 0x7F` returns 0 in ggml (it is the NaN slot), and so does this.
+const NVFP4_HELPERS: &str = r#"
+const KM: array<i32, 16> = array<i32, 16>(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+fn qsb(cb: u32, i: u32) -> u32 { return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu; }
+fn ue4m3(b: u32) -> f32 {
+    if (b == 0u || b == 0x7Fu) { return 0.0; }
+    let e = (b >> 3u) & 0xFu;
+    let m = f32(b & 0x7u);
+    var raw: f32;
+    if (e == 0u) { raw = m * 0.001953125; }          // ldexpf(man, -9)
+    else         { raw = (1.0 + m * 0.125) * exp2(f32(e) - 7.0); }
+    return raw * 0.5;
+}
+"#;
+
+/// The 64-value NVFP4 block body: four 16-element sub-blocks, each with its own UE4M3 scale.
+///
+/// ⚠ The nibble split is per SUB-BLOCK, not per block. Within sub-block `s`, byte `qs[s*8 + j]` holds
+/// element `j` in its low nibble and element `j + 8` in its high nibble — so the halves are 8 apart,
+/// not 32. Getting this wrong scrambles elements within a 16-wide window and still produces finite,
+/// plausibly-scaled output.
+///
+/// The weight is formed BEFORE it meets the activation (`x · (KM[c] · d)`), matching ggml's
+/// `y = v*d` followed by the matmul, and matching the MXFP4 body's association.
+const NVFP4_BODY: &str = r#"
+            let cb = bi * 8u;
+            let sc = aux[bi];
+            let xbb = r * in_dim + blk * 64u;
+            for (var sb: u32 = 0u; sb < 4u; sb = sb + 1u) {
+                let d = ue4m3((sc >> (8u * sb)) & 0xffu);
+                let base = xbb + sb * 16u;
+                for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+                    let b = qsb(cb, sb * 8u + j);
+                    acc = acc + x[base + j]      * (f32(KM[b & 0x0Fu]) * d);
+                    acc = acc + x[base + j + 8u] * (f32(KM[b >> 4u]) * d);
+                }
+            }
+"#;
+
+/// Packed **NVFP4** (ggml type 40) weights: `[out, in]`, `in` a multiple of 64.
+///
+/// 36 bytes per 64 values = 4.5 bpw. `codes` holds the 32 `qs` bytes as 8 u32; `aux` holds the four
+/// UE4M3 scale bytes as **exactly one u32 per block** — no cross-block packing needed, unlike MXFP4
+/// where a single scale byte had to be stuffed four blocks to a word to avoid a 3-byte hole.
+/// Resident total is 36 B/block, bit-for-bit the on-disk size.
+pub struct Nvfp4Weights {
+    ctx: Arc<Context>,
+    codes: Arc<wgpu::Buffer>, // 8 u32/block: qs[32]
+    aux: Arc<wgpu::Buffer>,   // 1 u32/block: d[4], the UE4M3 sub-block scales
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Nvfp4Weights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize) -> Nvfp4Weights {
+        assert_eq!(cols % 64, 0, "NVFP4 cols must be a multiple of 64");
+        assert_eq!(bytes.len(), rows * (cols / 64) * 36, "unexpected NVFP4 byte length");
+        let nblk = rows * (cols / 64);
+        let mut codes: Vec<u32> = vec![0; nblk * 8];
+        let mut aux: Vec<u32> = vec![0; nblk];
+        for b in 0..nblk {
+            let src = &bytes[b * 36..b * 36 + 36]; // d[4], qs[32]
+            aux[b] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            for w in 0..8 {
+                codes[b * 8 + w] =
+                    u32::from_le_bytes([src[4 + w * 4], src[5 + w * 4], src[6 + w * 4], src[7 + w * 4]]);
+            }
+        }
+        let mk = |label: &str, data: &[u32]| Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label), contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        Nvfp4Weights { ctx: ctx.clone(), codes: mk("nvfp4.codes", &codes), aux: mk("nvfp4.aux", &aux), rows, cols }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * (self.cols / 64) * 36 }
+    pub fn gpu_bytes(&self) -> usize { (self.codes.size() + self.aux.size()) as usize }
+}
+
 /// Packed **MXFP4** (OCP Microscaling FP4, ggml type 39) weights: `[out, in]`, `in` a multiple of 32.
 ///
 /// This is the format GPT-OSS ships in, and the *only* reason it exists is that the weights fit:
@@ -4337,6 +4435,40 @@ impl Tensor {
             .replace("__OPW__", &opw.to_string())
             .replace("__LH__", &(lanes / 2).to_string());
         run(&self.ctx, &src, "matmul_mxfp4",
+            &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+
+    /// `y = x·Wᵀ` where `W` is packed **NVFP4** (ggml type 40), dequantised per 64-value block
+    /// in-kernel. Same shared split-K template as Q6_K/MXFP4, with the block stride rewritten to 64.
+    pub fn matmul_nvfp4(&self, w: &Nvfp4Weights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        // `wide` applies here as it does to every k-quant: it needs no knowledge of the body.
+        let (lanes, opw) = splitk_lanes_wide(inn / 64);
+        let (grid, rs, wgsl) = if q2_0_split_k(rows, w.rows, inn) {
+            let nwg = n.div_ceil(opw as usize);
+            let gw = nwg.min(32768);
+            (((gw as u32), nwg.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_Q6_K_SPLITK_WGSL)
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL)
+        };
+        // ⚠ The shared body walks 256-value super-blocks; NVFP4's are 64. Asserted rather than
+        // trusted — a template edit that moved this site would silently read a quarter of every
+        // weight and still produce finite output. Same guard MXFP4 carries for its /32 rewrite.
+        debug_assert_eq!(wgsl.matches("in_dim / 256u").count(), 1,
+            "NVFP4 rewrites the template's block stride and expects exactly one site");
+        let src = wgsl.replace("in_dim / 256u", "in_dim / 64u")
+            .replace("__HELPERS__", NVFP4_HELPERS).replace("__BODY__", NVFP4_BODY)
+            .replace("__L__", &lanes.to_string())
+            .replace("__OPW__", &opw.to_string())
+            .replace("__LH__", &(lanes / 2).to_string());
+        run(&self.ctx, &src, "matmul_nvfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
@@ -5382,6 +5514,77 @@ mod mxfp4_kernel_tests {
         b[0] = e;
         b[1] = if high { code << 4 } else { code };
         b
+    }
+
+    /// **NVFP4 across the FULL UE4M3 x E2M1 grid** — all 256 scale bytes x 16 codes x both nibble
+    /// halves, against a transliteration of ggml's own C.
+    ///
+    /// ⚠ THE OBVIOUS VERSION OF THIS TEST IS CIRCULAR. If the reference and the kernel are both
+    /// written from my reading of the prose, they agree on my misreading. The reference below is a
+    /// LINE-BY-LINE transliteration of `ggml_ue4m3_to_fp32` and `dequantize_row_nvfp4` — including
+    /// the `* 0.5f` that reconciles the doubled `kvalues_mxfp4` table with a scale quantised against
+    /// the undoubled one, and the `x == 0x7F -> 0` NaN slot. What it pins is "the kernel computes
+    /// what the C computes", which is the only claim worth making about a format decoder.
+    #[test]
+    fn nvfp4_kernel_matches_ggml_over_the_full_ue4m3_x_e2m1_grid() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED nvfp4_kernel_matches_ggml_over_the_full_ue4m3_x_e2m1_grid: no GPU. \
+                       NOTHING about the kernel was checked.");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        // Transliterated from ggml-impl.h. Do not "simplify" — the 0.5 and the 0x7F case are load-bearing.
+        fn ue4m3_to_f32(x: u8) -> f32 {
+            if x == 0 || x == 0x7F { return 0.0; }
+            let exp = ((x >> 3) & 0xF) as i32;
+            let man = (x & 0x7) as f32;
+            let raw = if exp == 0 { man * (2f32).powi(-9) } else { (1.0 + man / 8.0) * (2f32).powi(exp - 7) };
+            raw * 0.5
+        }
+        const KV: [i32; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+        // One row per scale byte; each row's 64 values sweep every code in both nibble halves.
+        let rows = 256usize;
+        let cols = 64usize;
+        let mut raw = vec![0u8; rows * 36];
+        for r in 0..rows {
+            let b = &mut raw[r * 36..(r + 1) * 36];
+            // ⛔ THE FIRST VERSION WROTE THE SAME SCALE BYTE IN ALL FOUR SUB-BLOCKS, and a mutation
+            // that ignored three of the four sub-scales PASSED — the per-sub-block scale is exactly
+            // what distinguishes NVFP4 from MXFP4, and the fixture could not see it. Four DIFFERENT
+            // bytes, so each sub-block's scale must be read from its own slot.
+            for sb in 0..4 { b[sb] = (r as u8).wrapping_add((sb as u8) * 53); }
+            for j in 0..32 { b[4 + j] = ((j % 16) as u8) | (((15 - (j % 16)) as u8) << 4); }
+        }
+        let w = Nvfp4Weights::from_bytes(&ctx, &raw, rows, cols);
+        let xv: Vec<f32> = (0..cols).map(|i| if i % 3 == 0 { 1.0 } else { -0.5 + 0.25 * (i % 5) as f32 }).collect();
+        let x = Tensor::from_vec(&ctx, &xv, &[1, cols]);
+        let got = pollster::block_on(x.matmul_nvfp4(&w).to_vec());
+
+        let mut worst = 0f32; let mut scale = 0f32; let mut nonzero = 0usize;
+        for r in 0..rows {
+            let mut want = 0f64;
+            for sb in 0..4 {
+                let d = ue4m3_to_f32(raw[r * 36 + sb]);   // per sub-block, read from its own slot
+                for j in 0..8 {
+                    let byte = raw[r * 36 + 4 + sb * 8 + j];
+                    want += (xv[sb * 16 + j] * (KV[(byte & 0x0F) as usize] as f32 * d)) as f64;
+                    want += (xv[sb * 16 + j + 8] * (KV[(byte >> 4) as usize] as f32 * d)) as f64;
+                }
+            }
+            let want = want as f32;
+            if want != 0.0 { nonzero += 1; }
+            scale = scale.max(want.abs());
+            assert!(got[r].is_finite(), "scale byte {r:#04x}: kernel produced {}", got[r]);
+            worst = worst.max((got[r] - want).abs());
+        }
+        // ⚠ Without this the test passes on an all-zero kernel: 0x00 and 0x7F both legitimately
+        // produce 0, so a decoder that returned 0 everywhere would match those two rows and, if the
+        // reference were equally broken, all 256.
+        assert!(nonzero >= 250, "only {nonzero} of 256 scale bytes gave a non-zero reference");
+        assert!(scale > 1e-3, "reference is ~zero across the grid; this would pass on anything");
+        eprintln!("NVFP4 vs ggml C over 256x16x2: max |Δ| = {worst:.3e} on magnitudes up to {scale:.3e}");
+        assert!(worst <= 1e-4 * scale, "NVFP4 kernel diverges from ggml by {worst:.3e}");
     }
 
     /// Every one of the 256 E8M0 scale bytes x 16 E2M1 codes x both nibble halves — 8192 blocks, one
