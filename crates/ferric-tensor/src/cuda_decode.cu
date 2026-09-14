@@ -109,40 +109,71 @@ extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned*
     if (lane == 0u) out[o] = acc;
 }
 
-// ── Q5_K dot for one output row over the lane's (blk, sub-block) slice. Shared by the fused SwiGLU. ──
-__device__ __forceinline__ unsigned q5_scbyte(const unsigned* __restrict__ aux, unsigned ab, unsigned i) {
-    return (aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu;
+// ── Q5_K dot for one output row, lane-partitioned for COALESCED 16-byte loads. ──
+//
+// ⛔ THE FIRST VERSION OVER-FETCHED 3.2x. It gave each of 8 lanes one 32-value sub-block: lanes 2j
+// and 2j+1 then read the SAME 32 B `qs` chunk (low vs high nibbles), and all eight read the SAME 32 B
+// of `qh`, all through 4-byte loads — every shape sat at 59–68 GB/s, ~34% of the floor, including the
+// 121 MiB lm_head, which rules out occupancy. Same math, re-partitioned: lane j owns positions
+// [16·(j&1), +16) of the TWO sub-blocks 2c and 2c+1 (c = j>>1) — one uint4 of qs (low nibbles -> 2c,
+// high -> 2c+1), one uint4 of qh (bits 2c / 2c+1), eight lanes covering a block's 128 B contiguously.
+__device__ __forceinline__ void q5_scmin(const unsigned* __restrict__ aux, unsigned ab, unsigned s, float d, float dmin,
+                                         float& ds, float& mm) {
+    unsigned sc, mn;
+    if (s < 4u) { sc = q5_scbyte(aux, ab, s) & 63u; mn = q5_scbyte(aux, ab, s + 4u) & 63u; }
+    else { const unsigned a = q5_scbyte(aux, ab, s + 4u), lo = q5_scbyte(aux, ab, s - 4u), hi = q5_scbyte(aux, ab, s);
+           sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); mn = (a >> 4u) | ((hi >> 6u) << 4u); }
+    ds = d * (float)sc; mm = dmin * (float)mn;
 }
 __device__ __forceinline__ float q5k_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
                                               const unsigned* __restrict__ aux, unsigned o, unsigned nblk,
-                                              unsigned bl, unsigned sl) {
+                                              unsigned bl, unsigned j) {
+    const unsigned c = j >> 1u, half = j & 1u, s0 = 2u * c, s1 = s0 + 1u;
     float acc = 0.f;
     for (unsigned blk = bl; blk < nblk; blk += 4u) {
         const unsigned bi = o * nblk + blk, ab = bi * 4u, cb40 = bi * 40u;
         const unsigned dd = aux[ab];
         const float d = f16_to_f32(dd & 0xffffu), dmin = f16_to_f32(dd >> 16u);
-        const unsigned s = sl;
-        unsigned sc, mn;
-        if (s < 4u) { sc = q5_scbyte(aux, ab, s) & 63u; mn = q5_scbyte(aux, ab, s + 4u) & 63u; }
-        else { const unsigned a = q5_scbyte(aux, ab, s + 4u), lo = q5_scbyte(aux, ab, s - 4u), hi = q5_scbyte(aux, ab, s);
-               sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); mn = (a >> 4u) | ((hi >> 6u) << 4u); }
-        const float ds = d * (float)sc, mm = dmin * (float)mn;
-        const unsigned cw = cb40 + 8u * (s >> 1u), hi = s & 1u;
-        const float* xs = x + blk * 256u + 32u * s;
+        float ds0, mm0, ds1, mm1;
+        q5_scmin(aux, ab, s0, d, dmin, ds0, mm0);
+        q5_scmin(aux, ab, s1, d, dmin, ds1, mm1);
+        const uint4 q = *reinterpret_cast<const uint4*>(codes + cb40 + 8u * c + 4u * half);   // 16 B of qs
+        const uint4 h = *reinterpret_cast<const uint4*>(codes + cb40 + 32u + 4u * half);      // 16 B of qh
+        const float* x0 = x + blk * 256u + 32u * s0 + 16u * half;
+        const float* x1 = x + blk * 256u + 32u * s1 + 16u * half;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
+        float a0 = 0.f, sx0 = 0.f, a1 = 0.f, sx1 = 0.f;
         #pragma unroll
-        for (unsigned w = 0u; w < 8u; ++w) {
-            const unsigned word = codes[cw + w], qhw = codes[cb40 + 32u + w];
-            const float4 xw = *reinterpret_cast<const float4*>(xs + 4u * w);
-            float n0, n1, n2, n3;
-            if (hi == 0u) { n0 = (float)(word & 0xfu); n1 = (float)((word >> 8u) & 0xfu); n2 = (float)((word >> 16u) & 0xfu); n3 = (float)((word >> 24u) & 0xfu); }
-            else { n0 = (float)((word >> 4u) & 0xfu); n1 = (float)((word >> 12u) & 0xfu); n2 = (float)((word >> 20u) & 0xfu); n3 = (float)((word >> 28u) & 0xfu); }
-            const float b0 = (float)((qhw >> s) & 1u) * 16.f, b1 = (float)((qhw >> (8u + s)) & 1u) * 16.f;
-            const float b2 = (float)((qhw >> (16u + s)) & 1u) * 16.f, b3 = (float)((qhw >> (24u + s)) & 1u) * 16.f;
-            acc += ds * (xw.x * (n0 + b0) + xw.y * (n1 + b1) + xw.z * (n2 + b2) + xw.w * (n3 + b3))
-                 - mm * (xw.x + xw.y + xw.z + xw.w);
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xa = *reinterpret_cast<const float4*>(x0 + 4u * w);
+            const float4 xb = *reinterpret_cast<const float4*>(x1 + 4u * w);
+            const unsigned word = qw[w], qhw = hw[w];
+            const float l0 = (float)(word & 0xfu)         + (float)((qhw >> s0) & 1u)         * 16.f;
+            const float l1 = (float)((word >> 8u) & 0xfu) + (float)((qhw >> (8u + s0)) & 1u)  * 16.f;
+            const float l2 = (float)((word >> 16u) & 0xfu)+ (float)((qhw >> (16u + s0)) & 1u) * 16.f;
+            const float l3 = (float)((word >> 24u) & 0xfu)+ (float)((qhw >> (24u + s0)) & 1u) * 16.f;
+            const float u0 = (float)((word >> 4u) & 0xfu) + (float)((qhw >> s1) & 1u)         * 16.f;
+            const float u1 = (float)((word >> 12u) & 0xfu)+ (float)((qhw >> (8u + s1)) & 1u)  * 16.f;
+            const float u2 = (float)((word >> 20u) & 0xfu)+ (float)((qhw >> (16u + s1)) & 1u) * 16.f;
+            const float u3 = (float)((word >> 28u) & 0xfu)+ (float)((qhw >> (24u + s1)) & 1u) * 16.f;
+            a0 += xa.x * l0 + xa.y * l1 + xa.z * l2 + xa.w * l3;  sx0 += xa.x + xa.y + xa.z + xa.w;
+            a1 += xb.x * u0 + xb.y * u1 + xb.z * u2 + xb.w * u3;  sx1 += xb.x + xb.y + xb.z + xb.w;
         }
+        acc += ds0 * a0 - mm0 * sx0 + ds1 * a1 - mm1 * sx1;
     }
     return acc;
+}
+// ── Q5_K GEMV with the coalesced dot: 4 outputs per 128-thread block, warp-shuffle reduce. ──
+extern "C" __global__ void q5k_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                    const unsigned* __restrict__ aux, float* __restrict__ out,
+                                    unsigned o_dim, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= o_dim) return;
+    const unsigned nblk = in_dim / 256u;
+    float acc = q5k_dot_lane(x, codes, aux, o, nblk, lane >> 3u, lane & 7u);
+    acc = warp_sum(acc);
+    if (lane == 0u) out[o] = acc;
 }
 // ── fused gate|up GEMV + SwiGLU: out[o] = silu(gate_o) * up_o; weight has 2*n_ff rows. ──
 extern "C" __global__ void q5k_swiglu_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,

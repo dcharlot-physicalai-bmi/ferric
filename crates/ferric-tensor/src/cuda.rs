@@ -64,8 +64,8 @@ pub struct Driver {
     pub name: String,
     gemv_q5k: OnceLock<Option<CUfunction>>,
     /// Tier-2 kernels from `cuda_decode.ptx`, loaded once: [rmsnorm, add_rmsnorm, vadd, q6k_gemv,
-    /// q5k_swiglu_gemv, qk_norm_rope, attn_decode].
-    decode: OnceLock<Option<[CUfunction; 7]>>,
+    /// q5k_swiglu_gemv, qk_norm_rope, attn_decode, q5k_gemv (coalesced; supersedes tier 1's)].
+    decode: OnceLock<Option<[CUfunction; 8]>>,
 }
 unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
@@ -194,11 +194,11 @@ impl Driver {
         }
         Some(out)
     }
-    fn decode_kernels(&self) -> Option<&[CUfunction; 7]> {
+    fn decode_kernels(&self) -> Option<&[CUfunction; 8]> {
         self.decode.get_or_init(|| {
             let v = self.load_ptx("cuda_decode.ptx", &[b"rmsnorm\0", b"add_rmsnorm\0", b"vadd\0", b"q6k_gemv\0",
-                                                       b"q5k_swiglu_gemv\0", b"qk_norm_rope\0", b"attn_decode\0"])?;
-            Some([v[0], v[1], v[2], v[3], v[4], v[5], v[6]])
+                                                       b"q5k_swiglu_gemv\0", b"qk_norm_rope\0", b"attn_decode\0", b"q5k_gemv\0"])?;
+            Some([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
         }).as_ref()
     }
     /// 1-D launch with pointer-to-argument slots; errors print here, completion is checked by `sync`.
@@ -409,7 +409,8 @@ impl DecodeGraph {
     }
     unsafe fn gemv(&self, x: CUdeviceptr, w: (CUdeviceptr, CUdeviceptr, bool, usize), cols: usize, out: CUdeviceptr) -> bool {
         let (codes, aux, is_q6, rows) = w;
-        let f = if is_q6 { self.drv.decode_kernels().unwrap()[3] } else { self.drv.q5k_kernel().unwrap() };
+        let k = self.drv.decode_kernels().unwrap();
+        let f = if is_q6 { k[3] } else { k[7] };     // the coalesced q5k GEMV, not tier 1's
         let (mut xp, mut cp, mut ap, mut op) = (x, codes, aux, out);
         let (mut o32, mut i32_) = (rows as u32, cols as u32);
         let mut params: [*mut c_void; 6] = [&mut xp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
