@@ -1420,7 +1420,8 @@ impl Qwen3 {
                 layers, out_norm: tv(&self.out_norm), lm_head: self.lm_head.native_weight()?,
             };
             *slot = Some(DecodeGraph::build(&spec)?);
-            eprintln!("cuda: tier-2 resident decode graph built ({} layers, cap {NATIVE_CAP})", self.layers.len());
+            eprintln!("cuda: tier-2 resident decode graph built on {} ({} layers, cap {NATIVE_CAP})",
+                      ferric_tensor::cuda::device_name().unwrap_or_default(), self.layers.len());
         }
         let g = slot.as_mut().unwrap();
         let advanced = g.len > cache.kv[0].0.len();

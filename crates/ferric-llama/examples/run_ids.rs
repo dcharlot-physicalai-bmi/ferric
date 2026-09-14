@@ -41,6 +41,8 @@ async fn run() {
     // whose NVIDIA Vulkan ICD was broken, wgpu's HighPerformance preference silently fell to the
     // Intel iGPU and a day of "RTX 4050" numbers were nothing of the kind. Always first, never gated.
     println!("adapter   : {} [{:?}]", ctx.adapter_name, ctx.backend);
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    if let Some(n) = ferric_tensor::cuda::device_name() { println!("native    : {n} [CUDA tier, FERRIC_CUDA set]"); }
     let m = Qwen3::load(&ctx, &g).expect("load");
     let vn = m.cfg.n_vocab;
     println!("{} layers · d={} · {}h/{}kv × {} · vocab={}\n",

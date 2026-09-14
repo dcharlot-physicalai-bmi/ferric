@@ -54,6 +54,9 @@ pub struct Driver {
     cu_ctx_synchronize: unsafe extern "C" fn() -> CUresult,
     cu_get_error_string: unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult,
     cu_memcpy_dtod: unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
+    /// `cuDeviceGetName` of device 0, so the native tier can be NAMED in every harness header — the
+    /// wgpu adapter line says nothing about which GPU libcuda opened.
+    pub name: String,
     gemv_q5k: OnceLock<Option<CUfunction>>,
     /// Tier-2 kernels from `cuda_decode.ptx`, loaded once: [rmsnorm, add_rmsnorm, vadd, q6k_gemv,
     /// q5k_swiglu_gemv, qk_norm_rope, attn_decode].
@@ -83,6 +86,7 @@ impl Driver {
             cu_get_error_string: sym!(lib, "cuGetErrorString", unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult),
             cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult),
             _ctx: std::ptr::null_mut(),
+            name: String::new(),
             gemv_q5k: OnceLock::new(),
             decode: OnceLock::new(),
             _lib: lib,
@@ -96,7 +100,12 @@ impl Driver {
             let mut ctx: CUcontext = std::ptr::null_mut();
             if cu_primary_retain(&mut ctx, dev) != 0 { return None; }
             if cu_ctx_set_current(ctx) != 0 { return None; }
-            Some(Driver { _ctx: ctx, ..d })
+            let get_name = sym!(d._lib, "cuDeviceGetName", unsafe extern "C" fn(*mut c_char, i32, CUdevice) -> CUresult);
+            let mut buf = [0u8; 128];
+            let name = if get_name(buf.as_mut_ptr() as *mut c_char, 128, dev) == 0 {
+                CStr::from_ptr(buf.as_ptr() as *const c_char).to_string_lossy().into_owned()
+            } else { String::from("?") };
+            Some(Driver { _ctx: ctx, name, ..d })
         }
     }
 
@@ -201,6 +210,9 @@ impl Driver {
     }
     fn upload_f32(&self, v: &[f32]) -> Option<CUdeviceptr> { let p = self.alloc(v.len() * 4)?; if self.htod(p, v) { Some(p) } else { None } }
 }
+
+/// The CUDA device's name when the native tier is active — for harness headers. `None` otherwise.
+pub fn device_name() -> Option<String> { driver().map(|d| d.name.clone()) }
 
 /// Probe once. `None` when there is no driver, no device, or `FERRIC_CUDA` is unset.
 pub fn driver() -> Option<&'static Arc<Driver>> {
@@ -480,5 +492,120 @@ mod tests {
         assert!(hooked.iter().zip(&got).all(|(h, g)| h.to_bits() == g.to_bits()),
                 "matmul_q did not route to the native tier: hooked path != native kernel bit-for-bit");
         eprintln!("hook check: matmul_q -> native kernel, bit-exact ({} outputs)", got.len());
+    }
+
+    fn ctx_or_skip(name: &str) -> Option<Arc<ferric_core::Context>> {
+        if driver().is_none() { eprintln!("SKIPPED {name}: no CUDA driver / FERRIC_CUDA unset. NOTHING native was checked."); return None; }
+        pollster::block_on(ferric_core::Context::new()).ok().map(Arc::new)
+    }
+    fn q_fixture(ty: u32, bpb: usize, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+        let mut seed = seed; let mut bytes = vec![0u8; rows * (cols / 256) * bpb];
+        for b in bytes.iter_mut() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; *b = (seed >> 40) as u8; }
+        for (bi, blk) in bytes.chunks_exact_mut(bpb).enumerate() {
+            let d = half::f16::from_f32(0.01 + 0.003 * (bi % 7) as f32);
+            if ty == 14 { blk[208..210].copy_from_slice(&d.to_le_bytes()); }
+            else { blk[0..2].copy_from_slice(&d.to_le_bytes());
+                   blk[2..4].copy_from_slice(&half::f16::from_f32(0.002 + 0.0005 * (bi % 5) as f32).to_le_bytes()); }
+        }
+        bytes
+    }
+    fn close(name: &str, want: &[f32], got: &[f32], tol: f32) {
+        assert_eq!(want.len(), got.len(), "{name}: length");
+        let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        assert!(scale > 1e-3, "{name}: reference is ~zero; would pass on anything");
+        assert!(got.iter().all(|v| v.is_finite()), "{name}: non-finite");
+        let worst = want.iter().zip(got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));
+        eprintln!("{name}: max |Δ| = {worst:.3e} on {scale:.3e}");
+        assert!(worst < tol * scale, "{name}: native diverges from WGSL by {worst:.3e}");
+        assert!(worst > 0.0 || name.contains("exact"), "{name}: Δ is EXACTLY zero — two different reduction orders do not agree to the bit; suspect the reference (#68)");
+    }
+    fn bare_graph(drv: &Arc<Driver>) -> DecodeGraph {
+        DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
+            has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
+            attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0 }
+    }
+
+    /// Q6_K native GEMV vs the WGSL FLAT kernel through the hermetic seam (never the hooked entry).
+    #[test]
+    fn q6k_gemv_matches_flat_wgsl() {
+        let Some(ctx) = ctx_or_skip("q6k_gemv_matches_flat_wgsl") else { return };
+        let (inn, out) = (1024usize, 96usize);
+        let bytes = q_fixture(14, 210, out, inn, 0xC0FFEE);
+        let xv: Vec<f32> = (0..inn).map(|i| ((i as f32) * 0.29).cos()).collect();
+        let x = crate::Tensor::from_vec(&ctx, &xv, &[1, inn]);
+        let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, 14, out, inn).expect("Q6_K");
+        let want = pollster::block_on(qm.q6k_flat_wgsl(&x).expect("single shard").to_vec());
+        let w = qm.native_weight().expect("mirror"); let (c, a) = w.ptrs();
+        let drv = driver().unwrap();
+        let (xd, od) = (drv.upload_f32(&xv).unwrap(), drv.alloc(out * 4).unwrap());
+        let g = bare_graph(drv);
+        assert!(unsafe { g.gemv(xd, (c, a, true, out), inn, od) } && drv.sync());
+        let mut got = vec![0f32; out]; assert!(drv.dtoh(&mut got, od));
+        close("Q6_K gemv vs WGSL FLAT", &want, &got, 2e-4);
+    }
+
+    /// Fused gate|up + SwiGLU vs the WGSL composed path (FLAT matmul via the seam, then swiglu).
+    #[test]
+    fn q5k_swiglu_matches_wgsl_composed() {
+        let Some(ctx) = ctx_or_skip("q5k_swiglu_matches_wgsl_composed") else { return };
+        let (inn, n_ff) = (1024usize, 64usize);
+        let bytes = q_fixture(13, 176, 2 * n_ff, inn, 0xBEEF);
+        let xv: Vec<f32> = (0..inn).map(|i| ((i as f32) * 0.41).sin()).collect();
+        let x = crate::Tensor::from_vec(&ctx, &xv, &[1, inn]);
+        let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, 13, 2 * n_ff, inn).expect("Q5_K");
+        let want = pollster::block_on(qm.q5k_flat_wgsl(&x).expect("single shard").swiglu(n_ff).to_vec());
+        let w = qm.native_weight().expect("mirror"); let (c, a) = w.ptrs();
+        let drv = driver().unwrap(); let k = drv.decode_kernels().expect("decode ptx");
+        let (mut xd, mut od) = (drv.upload_f32(&xv).unwrap(), drv.alloc(n_ff * 4).unwrap());
+        let (mut cc, mut aa, mut nff, mut din) = (c, a, n_ff as u32, inn as u32);
+        let mut pr: [*mut c_void; 6] = [&mut xd as *mut _ as *mut c_void, &mut cc as *mut _ as *mut c_void, &mut aa as *mut _ as *mut c_void,
+                                        &mut od as *mut _ as *mut c_void, &mut nff as *mut _ as *mut c_void, &mut din as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[4], (n_ff as u32).div_ceil(4), 128, &mut pr) } && drv.sync());
+        let mut got = vec![0f32; n_ff]; assert!(drv.dtoh(&mut got, od));
+        close("Q5_K swiglu vs WGSL composed", &want, &got, 2e-4);
+    }
+
+    /// rmsnorm, qk_norm_rope and attn_decode against their WGSL twins.
+    #[test]
+    fn norm_rope_attention_match_wgsl() {
+        let Some(ctx) = ctx_or_skip("norm_rope_attention_match_wgsl") else { return };
+        let drv = driver().unwrap(); let k = drv.decode_kernels().expect("decode ptx");
+        let (nh, nkv, dh, s_len, eps, base, d) = (4usize, 2usize, 64usize, 37usize, 1e-6f32, 10000.0f32, 256usize);
+        let rnd = |n: usize, seed: u64| -> Vec<f32> { (0..n).map(|i| (((i as u64 * 2654435761 + seed) % 1000) as f32 / 500.0 - 1.0)).collect() };
+        let up = |v: &[f32]| drv.upload_f32(v).unwrap();
+        // rmsnorm
+        let (xv, wv) = (rnd(d, 1), rnd(d, 2).iter().map(|v| 1.0 + v * 0.1).collect::<Vec<_>>());
+        let want = pollster::block_on(crate::Tensor::from_vec(&ctx, &xv, &[1, d]).rmsnorm(&crate::Tensor::from_vec(&ctx, &wv, &[d]), eps).to_vec());
+        let (mut xd, mut wd, mut od, mut d32, mut e) = (up(&xv), up(&wv), drv.alloc(d * 4).unwrap(), d as u32, eps);
+        let mut pr: [*mut c_void; 5] = [&mut xd as *mut _ as *mut c_void, &mut wd as *mut _ as *mut c_void, &mut od as *mut _ as *mut c_void, &mut d32 as *mut _ as *mut c_void, &mut e as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[0], 1, 256, &mut pr) } && drv.sync());
+        let mut got = vec![0f32; d]; assert!(drv.dtoh(&mut got, od)); close("rmsnorm", &want, &got, 1e-4);
+        // qk_norm_rope, rows == 1
+        let (q_out, kv_out) = (nh * dh, nkv * dh); let width = q_out + 2 * kv_out;
+        let qkv = rnd(width, 3);
+        let (qw, kw): (Vec<f32>, Vec<f32>) = (rnd(dh, 4).iter().map(|v| 1.0 + v * 0.1).collect(), rnd(dh, 5).iter().map(|v| 1.0 + v * 0.1).collect());
+        let pos = 11usize;
+        let src = crate::Tensor::from_vec(&ctx, &qkv, &[1, width]);
+        let (wq, wk) = (crate::Tensor::from_vec(&ctx, &qw, &[dh]), crate::Tensor::from_vec(&ctx, &kw, &[dh]));
+        let (q_ref, k_ref) = crate::Tensor::qk_norm_rope(&src, 0, q_out, &wq, &wk, 1, nh, nkv, dh, base, pos, eps);
+        let (q_ref, k_ref) = (pollster::block_on(q_ref.to_vec()), pollster::block_on(k_ref.to_vec()));
+        let (mut sd, mut qwd, mut kwd, mut qo, mut ko) = (up(&qkv), up(&qw), up(&kw), drv.alloc(q_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap());
+        let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2, mut qoff, mut koff, mut hn) = (nh as u32, nkv as u32, dh as u32, base, pos as u32, eps, 0u32, q_out as u32, 1u32);
+        let mut pr2: [*mut c_void; 14] = [&mut sd as *mut _ as *mut c_void, &mut qwd as *mut _ as *mut c_void, &mut kwd as *mut _ as *mut c_void, &mut qo as *mut _ as *mut c_void, &mut ko as *mut _ as *mut c_void,
+            &mut nh32 as *mut _ as *mut c_void, &mut nkv32 as *mut _ as *mut c_void, &mut dh32 as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void, &mut p32 as *mut _ as *mut c_void,
+            &mut e2 as *mut _ as *mut c_void, &mut qoff as *mut _ as *mut c_void, &mut koff as *mut _ as *mut c_void, &mut hn as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[5], 1, 32, &mut pr2) } && drv.sync());
+        let (mut qg, mut kg) = (vec![0f32; q_out], vec![0f32; kv_out]); assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko));
+        close("qk_norm_rope q", &q_ref, &qg, 1e-4); close("qk_norm_rope k", &k_ref, &kg, 1e-4);
+        // attention vs fused_decode_attention
+        let (qv, kv, vv) = (rnd(q_out, 6), rnd(s_len * kv_out, 7), rnd(s_len * kv_out, 8));
+        let want = pollster::block_on(crate::Tensor::from_vec(&ctx, &qv, &[1, q_out]).fused_decode_attention(
+            &crate::Tensor::from_vec(&ctx, &kv, &[s_len, kv_out]), &crate::Tensor::from_vec(&ctx, &vv, &[s_len, kv_out]), nh, nkv, dh).to_vec());
+        let (mut qd, mut kd, mut vd, mut ad) = (up(&qv), up(&kv), up(&vv), drv.alloc(q_out * 4).unwrap());
+        let (mut s32, mut sc) = (s_len as u32, 1.0f32 / (dh as f32).sqrt());
+        let mut pr3: [*mut c_void; 9] = [&mut qd as *mut _ as *mut c_void, &mut kd as *mut _ as *mut c_void, &mut vd as *mut _ as *mut c_void, &mut ad as *mut _ as *mut c_void,
+            &mut nh32 as *mut _ as *mut c_void, &mut nkv32 as *mut _ as *mut c_void, &mut dh32 as *mut _ as *mut c_void, &mut s32 as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[6], nh as u32, 128, &mut pr3) } && drv.sync());
+        let mut got = vec![0f32; q_out]; assert!(drv.dtoh(&mut got, ad)); close("attn_decode", &want, &got, 2e-4);
     }
 }
