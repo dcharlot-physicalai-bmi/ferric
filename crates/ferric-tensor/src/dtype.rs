@@ -2879,7 +2879,7 @@ fn splitk_lanes(nblk: usize) -> (u32, u32) {
 /// needs none: a lane with `bl >= nblk` simply never enters the block loop.
 ///
 /// So `wide` gives every k-quant one workgroup per output (`opw = 1`) for the price of idle lanes.
-/// ⛔ Measured 2026-09-14 on the RTX 4050 (Vulkan): that price is NOT free — 20% slower than the
+/// ⛔ Measured 2026-09-14 on the Intel Iris Xe (Vulkan): that price is NOT free — 20% slower than the
 /// default. See `splitk_lanes_sub` for the numbers; the sub-block split is the lever that won.
 fn splitk_lanes_wide(nblk: usize) -> (u32, u32) {
     match std::env::var("FERRIC_SUBBLK").as_deref() {
@@ -2910,8 +2910,10 @@ fn splitk_lanes_wide(nblk: usize) -> (u32, u32) {
 /// out=3072` from 192 workgroups to **1,536** — inside the saturated band.
 ///
 /// ⭐ MEASURED 2026-09-14 (scripts/ab_env.sh, uncontended, generation identical, fingerprints differ):
-///   RTX 4050 / Vulkan:  101.6 -> 91.5 ms/tok, 7/7 paired, p=0.016  — RESOLVED, +11%
+///   Intel Iris Xe (RPL-P) / Vulkan (Mesa ANV):  101.6 -> 91.5 ms/tok, 7/7, p=0.016 — RESOLVED, +11%
 ///                       (re-run on a verified file: 101.2 -> 90.8, 4/4)
+///   ⛔ first labelled "RTX 4050": that box's NVIDIA Vulkan ICD was broken and wgpu silently
+///      took the iGPU. The harness now prints its adapter first. NVIDIA/Vulkan: NOT YET MEASURED.
 ///   M5 Max / Metal:     6.2 -> 5.9, delta inside spread, p=0.125   — INDISTINGUISHABLE
 /// The right lane layout is FABRIC-DEPENDENT. That is why this stays an opt-in profile rather than
 /// a per-backend default: the portable tier keeps ONE layout everywhere, which is what cross-fabric
@@ -2925,11 +2927,11 @@ fn splitk_lanes_sub(nblk: usize) -> (u32, u32, u32) {
         // `wide`: spend LANES to buy WORKGROUPS — pin lanes at 8x8 = 64 whether or not there are 8
         // blocks to walk, so `opw` is 1 and the grid is one workgroup per output. Lanes with
         // `bl >= nblk` never enter the block loop and contribute a zero partial.
-        // ⛔ MEASURED 2026-09-14, RTX 4050 / Vulkan, uncontended: 101.5 -> 121.6 ms/tok, 0/7 paired —
+        // ⛔ MEASURED 2026-09-14, Intel Iris Xe (RPL-P) / Vulkan, uncontended: 101.5 -> 121.6 ms/tok, 0/7 —
         // **20% SLOWER**, and a 22.8 ms spread (one rep at 144.4). The premise "an idle lane costs
         // nothing if the bound is occupancy" is FALSE on this GPU: parking 60 of 64 threads to buy
         // workgroups loses by a fifth. The workgroup-count curve this was built on was measured on
-        // Metal and did not transfer as read. Retained opt-in ONLY because AMD/Intel are unmeasured;
+        // Metal and did not transfer as read. Retained opt-in ONLY because AMD/NVIDIA are unmeasured;
         // not recommended on any fabric measured so far. The two-level split (`FERRIC_SUBBLK=1`),
         // which adds WORKING lanes per output, is the one that won (+11%).
         Ok("wide") => (8, 8, 1),
