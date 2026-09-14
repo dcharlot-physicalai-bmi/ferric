@@ -22,6 +22,7 @@ M=${2:?usage: ab_env.sh VAR model.gguf [reps]}
 N=${3:-7}
 R=$(cd "$(dirname "$0")/.." && pwd)
 IDS=${FERRIC_AB_IDS:-785,6722,315,9625,374}
+TOK=${FERRIC_AB_TOKENS:-24}   # llama-bench tg128 decodes 128; a short run overstates ms/tok (per-run fixed cost)
 RUN=$R/target/release/examples/run_ids
 BIT=$R/target/release/examples/kv_bitref
 [ -x "$RUN" ] || { echo "⛔ build first: cargo build -p ferric-llama --release --examples"; exit 4; }
@@ -58,12 +59,12 @@ if [ -x "$BIT" ]; then
   fi
 fi
 
-echo "=== interleaved, N=$N each ==="
+echo "=== interleaved, N=$N each, $TOK decode tokens per run ==="
 O=(); S=()
 t() { grep -o '([0-9.]* ms/tok)' | tr -d '()' | sed 's/ ms.tok//'; }
 for i in $(seq 1 $N); do
-  o=$(env -u "$VAR" $RUN "$M" "$IDS" 24 2>/dev/null | t)
-  s=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $RUN "$M" "$IDS" 24 2>/dev/null | t)
+  o=$(env -u "$VAR" $RUN "$M" "$IDS" $TOK 2>/dev/null | t)
+  s=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $RUN "$M" "$IDS" $TOK 2>/dev/null | t)
   echo "  rep $i  off $o   $VAR $s   [load $(uptime | sed 's/.*averages*: //' | cut -d' ' -f1)]"
   O+=("$o"); S+=("$s")
 done

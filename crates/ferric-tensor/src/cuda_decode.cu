@@ -216,32 +216,49 @@ extern "C" __global__ void q5k_swiglu_gemv(const float* __restrict__ x, const un
     if (lane == 0u) out[o] = (g / (1.f + expf(-g))) * u;
 }
 
-// ── QK-norm (optional) + NEOX RoPE for ONE row (decode). One thread per head: nh q-heads then nkv
-//    k-heads, reading q/k in place from the fused qkv buffer at q_off / k_off. Mirrors QK_NORM_ROPE_WGSL. ──
+// ── QK-norm (optional) + NEOX RoPE for ONE row (decode): ONE BLOCK PER HEAD, dh threads.
+//    ⛔ The first version was one THREAD per head — 24 threads doing 128 serial sinf/cosf/expf — and the
+//    profiler put it at 0.71 ms/tok, 13% of the step, for trivial math. Now: block-reduced sum of
+//    squares, then thread c handles the pair (c, c+half). K heads also write their roped row straight
+//    into the K cache at `kc_row` and copy this head's V slice into the V cache at `vc_row`, which
+//    removes the two cuMemcpyDtoD per layer (56 per token). Pass kc_row = vc_row = 0 to skip that.
+//    Mirrors QK_NORM_ROPE_WGSL's math; blocks: [0, nh) are q heads, [nh, nh+nkv) are k heads. ──
 extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
                                         const float* __restrict__ kw, float* __restrict__ qo,
                                         float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
                                         float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
-                                        unsigned has_norm) {
-    const unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id >= nh + nkv) return;
+                                        unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
+                                        unsigned v_off) {
+    __shared__ float red[4]; __shared__ float s_inv;
+    const unsigned id = blockIdx.x, t = threadIdx.x;
     const bool is_k = id >= nh;
     const unsigned head = is_k ? id - nh : id;
     const float* src = qkv + (is_k ? k_off : q_off) + head * dh;
     float* dst = (is_k ? ko : qo) + head * dh;
     const float* w = is_k ? kw : qw;
     float inv = 1.f;
-    if (has_norm) { float ms = 0.f; for (unsigned j = 0; j < dh; ++j) ms += src[j] * src[j];
-                    inv = 1.f / sqrtf(ms / (float)dh + eps); }
+    if (has_norm) {
+        float v = (t < dh) ? src[t] : 0.f;
+        float ms = warp_sum(v * v);
+        if ((t & 31u) == 0u) red[t >> 5u] = ms;
+        __syncthreads();
+        if (t == 0u) { float m = 0.f; for (unsigned i = 0; i < (blockDim.x + 31u) / 32u; ++i) m += red[i];
+                       s_inv = 1.f / sqrtf(m / (float)dh + eps); }
+        __syncthreads();
+        inv = s_inv;
+    }
     const unsigned half = dh / 2u;
-    const float lb = logf(base);
-    for (unsigned c = 0; c < half; ++c) {
-        const float fr = expf(-2.f * (float)c / (float)dh * lb);
+    if (t < half) {
+        const unsigned c = t;
+        const float fr = expf(-2.f * (float)c / (float)dh * logf(base));
         const float ang = (float)pos * fr, cs = cosf(ang), sn = sinf(ang);
         const float w1 = has_norm ? w[c] : 1.f, w2 = has_norm ? w[c + half] : 1.f;
         const float x1 = src[c] * inv * w1, x2 = src[c + half] * inv * w2;
-        dst[c] = x1 * cs - x2 * sn; dst[c + half] = x2 * cs + x1 * sn;
+        const float r1 = x1 * cs - x2 * sn, r2 = x2 * cs + x1 * sn;
+        dst[c] = r1; dst[c + half] = r2;
+        if (is_k && kc_row != 0) { kc_row[head * dh + c] = r1; kc_row[head * dh + c + half] = r2; }
     }
+    if (is_k && vc_row != 0 && t < dh) vc_row[head * dh + t] = qkv[v_off + head * dh + t];
 }
 
 // ── Fused single-query attention over an [S, nkv*dh] K/V cache. One block (128 threads) per q-head,

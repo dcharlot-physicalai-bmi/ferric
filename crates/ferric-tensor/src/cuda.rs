@@ -488,11 +488,11 @@ impl DecodeGraph {
                 let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (self.qkv, l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), self.q, self.k);
                 let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
                 let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, self.q_out as u32, self.has_qk_norm as u32);
-                let heads = (self.nh + self.nkv) as u32;
-                timed!(2, drv.launch(k[5], heads.div_ceil(32), 32, &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn)));
                 let rowb = (self.kv_out * 4) as u64;
-                timed!(3, (drv.cu_memcpy_dtod)(l.k_cache + pos as u64 * rowb, self.k, self.kv_out * 4) == 0
-                       && (drv.cu_memcpy_dtod)(l.v_cache + pos as u64 * rowb, self.qkv + ((self.q_out + self.kv_out) * 4) as u64, self.kv_out * 4) == 0);
+                // K and V rows go straight into the cache from the kernel: no D2D copies (class 3 is now 0).
+                let (mut kc_row, mut vc_row, mut voff) = (l.k_cache + pos as u64 * rowb, l.v_cache + pos as u64 * rowb, (self.q_out + self.kv_out) as u32);
+                let heads = (self.nh + self.nkv) as u32;
+                timed!(2, drv.launch(k[5], heads, 128, &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff)));
                 let (mut q, mut kc, mut vc, mut ao, mut s, mut scale) = (self.q, l.k_cache, l.v_cache, self.attn, (pos + 1) as u32, 1.0f32 / (self.dh as f32).sqrt());
                 timed!(4, drv.launch(k[6], self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)));
                 timed!(5, self.gemv(self.attn, l.wo, self.q_out, self.y));
@@ -726,10 +726,12 @@ mod tests {
         let (q_ref, k_ref) = (pollster::block_on(q_ref.to_vec()), pollster::block_on(k_ref.to_vec()));
         let (mut sd, mut qwd, mut kwd, mut qo, mut ko) = (up(&qkv), up(&qw), up(&kw), drv.alloc(q_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap());
         let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2, mut qoff, mut koff, mut hn) = (nh as u32, nkv as u32, dh as u32, base, pos as u32, eps, 0u32, q_out as u32, 1u32);
-        let mut pr2: [*mut c_void; 14] = [&mut sd as *mut _ as *mut c_void, &mut qwd as *mut _ as *mut c_void, &mut kwd as *mut _ as *mut c_void, &mut qo as *mut _ as *mut c_void, &mut ko as *mut _ as *mut c_void,
+        let (mut kc0, mut vc0, mut voff0): (CUdeviceptr, CUdeviceptr, u32) = (0, 0, 0);   // no cache write in the unit test
+        let mut pr2: [*mut c_void; 17] = [&mut sd as *mut _ as *mut c_void, &mut qwd as *mut _ as *mut c_void, &mut kwd as *mut _ as *mut c_void, &mut qo as *mut _ as *mut c_void, &mut ko as *mut _ as *mut c_void,
             &mut nh32 as *mut _ as *mut c_void, &mut nkv32 as *mut _ as *mut c_void, &mut dh32 as *mut _ as *mut c_void, &mut b as *mut _ as *mut c_void, &mut p32 as *mut _ as *mut c_void,
-            &mut e2 as *mut _ as *mut c_void, &mut qoff as *mut _ as *mut c_void, &mut koff as *mut _ as *mut c_void, &mut hn as *mut _ as *mut c_void];
-        assert!(unsafe { drv.launch(k[5], 1, 32, &mut pr2) } && drv.sync());
+            &mut e2 as *mut _ as *mut c_void, &mut qoff as *mut _ as *mut c_void, &mut koff as *mut _ as *mut c_void, &mut hn as *mut _ as *mut c_void,
+            &mut kc0 as *mut _ as *mut c_void, &mut vc0 as *mut _ as *mut c_void, &mut voff0 as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[5], (nh + nkv) as u32, 128, &mut pr2) } && drv.sync());
         let (mut qg, mut kg) = (vec![0f32; q_out], vec![0f32; kv_out]); assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko));
         close("qk_norm_rope q", &q_ref, &qg, 1e-4); close("qk_norm_rope k", &k_ref, &kg, 1e-4);
         // attention vs fused_decode_attention
