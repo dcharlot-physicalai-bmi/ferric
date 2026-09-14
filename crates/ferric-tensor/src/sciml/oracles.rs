@@ -169,8 +169,9 @@ fn loss_balancing_rescues_a_boundary_the_residual_drowns() {
 ///
 /// ⚠ Sized by measurement (`fixture_sweep_for_rar_and_causal`). At `ρ = 5`, 3000 steps: vanilla 0.23,
 /// causal 0.23 — nothing to rescue. At `ρ = 10`, 4000 steps: vanilla 0.94, causal 0.46 — the right branch,
-/// not converged. At `ρ = 10`, 8000 steps on a 48×24 grid: **vanilla 0.9372, causal 0.0943**, which is
-/// what this asserts, with headroom.
+/// not converged. At `ρ = 10`, 8000 steps on a 48×24 grid: **vanilla 0.9372, causal 0.0943** in the
+/// sweep and **0.1165** when this test was run again unchanged — the same configuration, so that spread
+/// is GPU run-to-run variance and the bound below (0.15) is set to clear it, not to flatter the better run.
 #[ignore = "trains two nets on the GPU; the six training oracles take ~40 min together — run with `cargo test --release -p ferric-tensor sciml -- --ignored`"]
 #[test]
 fn causal_training_finds_the_solution_a_vanilla_pinn_cannot() {

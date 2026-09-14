@@ -43,7 +43,7 @@ had their difficulty raised until the control broke, and the numbers below are w
 | inverse problems — a PDE coefficient as a trained parameter | Raissi et al. 2019 | heat equation, `D = 0.7` unknown, 30 measurements at 1 % noise, `D` started at 0.2 | **D = 0.6985 (0.21 % off)** |
 | physics-informed DeepONet | Wang–Wang–Perdikaris 2021 (2103.10974) | antiderivative operator from `∂ₓG[f] = f`, `G[f](0) = 0` — no solution data | held-out rel-L2 **0.035** (the data-trained example: 0.035) |
 | `LossBalancer` — gradient-norm balancing | Wang–Teng–Perdikaris 2021 (2001.04536) | 1-D Poisson `u'' = −(6π)² sin 6πx`, tanh MLP: the residual's gradients drown the boundary's | rel-L2 **0.464 → 0.0044**, λ_bc → 9.9e3 |
-| `Causal` — causal training in time | Wang–Sankaran–Perdikaris 2022 (2203.07404) | reaction equation `u_t = 10u(1−u)`, where a vanilla PINN lands on a wrong branch (Krishnapriyan 2021) | rel-L2 **0.937 → 0.094** at 8000 steps |
+| `Causal` — causal training in time | Wang–Sankaran–Perdikaris 2022 (2203.07404) | reaction equation `u_t = 10u(1−u)`, where a vanilla PINN lands on a wrong branch (Krishnapriyan 2021) | rel-L2 **0.937 → 0.094 and 0.117** on two runs of the same configuration (GPU run-to-run variance; asserted at 0.15) |
 | `rar_select` — residual-based adaptive refinement | Lu et al. 2021 (1907.04502) | selects the layer of `tanh(k(x−½))` (≥12 of 16 picks inside it) | ⚠ primitive verified; **benefit not demonstrated** — see below |
 | `Rba` — residual-based attention (per-point weights) | Anagnostopoulos et al. 2023 (2307.00379) | bookkeeping test; no fix-oracle yet | — |
 
