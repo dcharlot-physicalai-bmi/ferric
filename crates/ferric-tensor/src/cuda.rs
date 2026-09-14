@@ -468,6 +468,53 @@ impl DecodeGraph {
     }
 }
 
+/// **Per-kernel microbench for the native GEMVs** — `iters` back-to-back launches on one weight, one
+/// sync, returns (µs per call, the output). Used by `examples/cuda_gemv_bench.rs` to say WHICH decode
+/// shape is furthest from the bandwidth floor, so kernel work starts where the bytes are.
+pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone();
+    drv.bind();
+    let (cols, rows) = (w.cols(), w.rows());
+    if x.len() != cols { return None; }
+    let g = DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
+        has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
+        attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0 };
+    let (c, a) = w.ptrs(); let is_q6 = matches!(w, NativeWeight::Q6K { .. });
+    let xd = drv.upload_f32(x)?; let od = drv.alloc(rows * 4)?;
+    unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } }   // warm (PTX JIT etc.)
+    if !drv.sync() { return None; }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; rows]; if !drv.dtoh(&mut out, od) { return None; }
+    unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(od); }
+    Some((us, out))
+}
+/// Fused gate|up+SwiGLU microbench, same contract; `w` must be Q5_K with `2*n_ff` rows.
+pub fn bench_swiglu(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone();
+    drv.bind();
+    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    if x.len() != cols || rows % 2 != 0 { return None; }
+    let n_ff = rows / 2; let k = drv.decode_kernels()?;
+    let (c, a) = w.ptrs();
+    let xd = drv.upload_f32(x)?; let od = drv.alloc(n_ff * 4)?;
+    let run = |drv: &Driver| -> bool { unsafe {
+        let (mut xp, mut cp, mut ap, mut op, mut nff, mut din) = (xd, c, a, od, n_ff as u32, cols as u32);
+        let mut pr: [*mut c_void; 6] = [&mut xp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void, &mut ap as *mut _ as *mut c_void,
+                                        &mut op as *mut _ as *mut c_void, &mut nff as *mut _ as *mut c_void, &mut din as *mut _ as *mut c_void];
+        drv.launch(k[4], (n_ff as u32).div_ceil(4), 128, &mut pr) } };
+    if !run(&drv) || !drv.sync() { return None; }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { if !run(&drv) { return None; } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; n_ff]; if !drv.dtoh(&mut out, od) { return None; }
+    unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(od); }
+    Some((us, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
