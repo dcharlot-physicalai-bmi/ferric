@@ -1117,6 +1117,17 @@ impl QMatrix {
         let [QShard::Q5_K(w)] = &self.shards[..] else { return None };
         w.cuda.as_ref()?.gemv(x, w.rows, w.cols)
     }
+    /// The WGSL **FLAT** Q5_K kernel on a single-shard matrix, BYPASSING the native-tier hook in
+    /// `matmul_q5_k`. This exists because the first hardware run of the CUDA test reported
+    /// `max |Δ| = 0.000e0` — impossible for two different reduction orders — and the reason was that
+    /// its "reference" `x.matmul_q(&qm)` had itself been routed to CUDA by that hook. A reference
+    /// that silently takes the path under test is the vacuous-test mechanism in its purest form.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub(crate) fn q5k_flat_wgsl(&self, x: &Tensor) -> Option<Tensor> {
+        let [QShard::Q5_K(w)] = &self.shards[..] else { return None };
+        let (l, opw) = splitk_lanes(w.cols / 256);
+        Some(x.matmul_q5_k_cfg(w, false, (l, 1, opw)))
+    }
     /// ggml block-size in bytes for a supported type, or None if we have no native matmul for it.
     pub fn block_bytes(ggml_type: u32) -> Option<(usize, usize)> {
         match ggml_type {          // (values per block, bytes per block)

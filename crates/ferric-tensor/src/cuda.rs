@@ -122,7 +122,7 @@ impl Driver {
             let path = std::env::var("FERRIC_CUDA_PTX")
                 .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/src/cuda_q5k_gemv.ptx").to_string());
             let Ok(mut ptx) = std::fs::read(&path) else {
-                eprintln!("cuda: no PTX at {path} — build it with `nvcc -O3 -arch=compute_70 -ptx \
+                eprintln!("cuda: no PTX at {path} — build it with `nvcc -O3 -arch=compute_75 -ptx \
                            crates/ferric-tensor/src/cuda_q5k_gemv.cu -o {path}` (or set FERRIC_CUDA_PTX). \
                            Falling back to WGSL; NOTHING native ran.");
                 return None;
@@ -222,12 +222,26 @@ mod tests {
         let xv: Vec<f32> = (0..inn).map(|i| ((i as f32) * 0.37).sin()).collect();
         let x = crate::Tensor::from_vec(&ctx, &xv, &[1, inn]);
         let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, 13, out, inn).expect("Q5_K");
-        let want = pollster::block_on(x.matmul_q(&qm).to_vec());
+
+        // ⛔ NOT `x.matmul_q(&qm)`: with the driver present that call is routed to CUDA by the hook
+        // in `matmul_q5_k`, and the first hardware run "passed" with max |Δ| = 0.000e0 — CUDA
+        // against CUDA. The reference must be the WGSL FLAT kernel, reached through a seam that
+        // cannot take the native path.
+        let want = pollster::block_on(qm.q5k_flat_wgsl(&x).expect("single Q5_K shard").to_vec());
         let got = qm.cuda_q5k_gemv(&xv).expect("native path should run when the driver is present");
         let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
         assert!(scale > 1e-3, "reference is ~zero; this would pass on anything");
         let worst = want.iter().zip(&got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));
-        eprintln!("CUDA q5k_gemv vs WGSL: max |Δ| = {worst:.3e} on {scale:.3e}");
-        assert!(worst < 2e-4 * scale, "native Q5_K GEMV diverges from WGSL by {worst:.3e}");
+        eprintln!("CUDA q5k_gemv vs WGSL FLAT: max |Δ| = {worst:.3e} on {scale:.3e}");
+        assert!(worst < 2e-4 * scale, "native Q5_K GEMV diverges from WGSL FLAT by {worst:.3e}");
+
+        // The accidental identity, made explicit and labeled: through the public entry point the
+        // hook MUST route to the native kernel, so that result is bit-exactly `got`. If this ever
+        // fails, the tier silently stopped engaging (and the comparison above went back to
+        // measuring WGSL against WGSL).
+        let hooked = pollster::block_on(x.matmul_q(&qm).to_vec());
+        assert!(hooked.iter().zip(&got).all(|(h, g)| h.to_bits() == g.to_bits()),
+                "matmul_q did not route to the native tier: hooked path != native kernel bit-for-bit");
+        eprintln!("hook check: matmul_q -> native kernel, bit-exact ({} outputs)", got.len());
     }
 }

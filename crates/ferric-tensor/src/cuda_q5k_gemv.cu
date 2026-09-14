@@ -8,10 +8,11 @@
 // Lane plan mirrors the WGSL two-level split: 32 lanes per output = 4 block-lanes x 8 sub-block
 // lanes; 4 outputs per 128-thread block; warp-shuffle reduction (no shared memory, no barrier).
 // No cuBLAS, no CUTLASS, no headers: f16 decode is done by hand so the file is self-contained and
-// compiles with plain `nvcc -arch=compute_70 -ptx`.
+// compiles with plain `nvcc -arch=compute_75 -ptx`. (compute_75 = Turing+: nvcc 12.8 deprecates
+// offline compilation below sm_75; the RTX 4050 is sm_89, the A10 sm_86, both covered.)
 //
 // Build (on any machine with the CUDA toolkit; the DRIVER alone loads the resulting PTX):
-//   nvcc -O3 -arch=compute_70 -ptx cuda_q5k_gemv.cu -o cuda_q5k_gemv.ptx
+//   nvcc -O3 -arch=compute_75 -ptx cuda_q5k_gemv.cu -o cuda_q5k_gemv.ptx
 
 __device__ __forceinline__ float f16_to_f32(unsigned h) {
     const unsigned s = (h >> 15u) & 1u, e = (h >> 10u) & 0x1fu, m = h & 0x3ffu;
