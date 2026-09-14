@@ -343,14 +343,24 @@ impl Var {
             Box::new(move |g, p| { p[0].accumulate(&g.mul(&x.sin()).neg()); }),
             Box::new(|g, p| vec![g.mul(&p[0].sin()).neg()]))  // d/dx cos x = −sin x (differentiable in x)
     }
-    /// Elementwise tanh. d/dx tanh x = 1 − tanh²x. First-order (training) — enables learned tanh-unit
-    /// energies (e.g. neural-Lyapunov heads) where the activation's inner weights are trained.
+    /// Elementwise tanh. d/dx tanh x = 1 − tanh²x, **differentiable in x** — the VJP is itself a graph, so
+    /// `grad()` through a tanh net composes to any order and a loss built on `grad()` can be trained.
+    ///
+    /// ⛔ This was first-order (`Var::node`) until 2026-09-14, and the failure was silent: `grad()` yields
+    /// ZERO through a first-order op rather than an error, so `deriv(tanh(x), x)` returned `0` at every
+    /// point and every tanh-activated physics-informed net trained to nothing while reporting a finite
+    /// loss. Caught by `sciml::oracles::every_activation_differentiates_correctly_to_second_order`, a
+    /// finite-difference check that runs on every activation the sciml stack trains through.
     pub fn tanh(&self) -> Var {
         let out = self.0.value.tanh();
         let o2 = out.clone();
-        Var::node(out, vec![self.clone()], Box::new(move |g, p| {
-            p[0].accumulate(&g.mul(&o2.scalar(1.0).sub(&o2.mul(&o2))));  // g·(1−tanh²x)
-        }))
+        Var::node_d(out, vec![self.clone()],
+            Box::new(move |g, p| { p[0].accumulate(&g.mul(&o2.scalar(1.0).sub(&o2.mul(&o2)))); }),   // g·(1−tanh²x)
+            Box::new(|g, p| {
+                let t = p[0].tanh();
+                let one = Var::leaf(t.0.value.scalar(1.0));
+                vec![g.mul(&t.mul(&t).neg().add(&one))]                                             // (1 − tanh²x) as a graph
+            }))
     }
     /// Elementwise sqrt. d/dx √x = 0.5/√x. (Enables L2-normalization and VICReg std.)
     pub fn sqrt(&self) -> Var {
@@ -420,6 +430,20 @@ pub fn grad(output: &Var, wrt: &[Var], grad_output: Option<&Var>) -> Vec<Var> {
     for v in topo.iter().rev() {
         let gv = gmap.iter().find(|(p, _)| *p == Rc::as_ptr(&v.0)).map(|(_, g)| g.clone());
         let gv = match gv { Some(g) => g, None => continue };
+        // ⛔ A gradient arriving at a node that has parents but no differentiable VJP used to be DROPPED
+        // here — `grad()` returned zeros upstream of any first-order-only op (`cat`, `narrow`,
+        // `broadcast_to`, `silu`, `rmsnorm`, `conv2d`, `rope`, and `tanh` until 2026-09-14) and every
+        // physics-informed net built on `deriv` through one of them trained to nothing with a finite loss.
+        // Failing here is the only honest answer: the result would not be approximately wrong, it would be
+        // exactly zero.
+        if v.0.vjp.is_none() && !v.0.parents.is_empty() {
+            panic!(
+                "grad(): a gradient reached an op that has no differentiable VJP (built with Var::node, first-order only), \
+                 so the derivative through it would be silently zero. Use a `node_d` op on this path — \
+                 tanh/sin/cos/exp/log/sqrt/add/sub/mul/div/matmul/relu/neg/transpose/reshape/sum are differentiable; \
+                 cat/narrow/broadcast_to/silu/rmsnorm/conv2d/rope/selective_scan/contiguous are not."
+            );
+        }
         if let Some(vjp) = &v.0.vjp {
             let contribs = vjp(&gv, &v.0.parents);
             for (par, contrib) in v.0.parents.iter().zip(contribs) {

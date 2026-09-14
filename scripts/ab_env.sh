@@ -38,8 +38,12 @@ echo "  ✅ identical   $a"
 if [ -x "$BIT" ]; then
   echo "=== vacuity: the switch must actually change something ==="
   ha=$(env -u "$VAR" $BIT "$M" "the capital of France is" 3 2>/dev/null | grep -c .)
-  fa=$(env -u "$VAR" $BIT "$M" "the capital of France is" 3 2>/dev/null | grep "^step" | md5)
-  fb=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $BIT "$M" "the capital of France is" 3 2>/dev/null | grep "^step" | md5)
+  # ⚠ `md5` is macOS-only; on Linux it is `md5sum`. Without this, both fingerprints were EMPTY on
+  # Linux, compared equal, and the vacuity gate waved the run through with a warning nobody reads.
+  H=$(command -v md5 >/dev/null && echo md5 || echo "md5sum")
+  fa=$(env -u "$VAR" $BIT "$M" "the capital of France is" 3 2>/dev/null | grep "^step" | $H | cut -c1-32)
+  fb=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $BIT "$M" "the capital of France is" 3 2>/dev/null | grep "^step" | $H | cut -c1-32)
+  [ -n "$fa" ] || { echo "  ⛔ fingerprint EMPTY — kv_bitref produced no steps; the vacuity gate cannot run. STOP."; exit 2; }
   if [ "$fa" = "$fb" ]; then
     echo "  ⚠ logits fingerprints IDENTICAL — the switch changed no arithmetic."
     echo "    That is fine for a pure scheduling change, but if you expected a different"

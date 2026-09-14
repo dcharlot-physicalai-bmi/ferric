@@ -10,6 +10,25 @@ use crate::{grad, Tensor, Var};
 use ferric_core::Context;
 use std::sync::Arc;
 
+pub mod features;
+pub mod lbfgs;
+pub mod train;
+#[cfg(test)]
+mod oracles;
+pub use features::FourierNet;
+pub use lbfgs::{Lbfgs, LbfgsResult, LbfgsStop};
+pub use train::{flatten, mse, rar_select, scalar, unflatten, Causal, LossBalancer, Rba};
+
+/// Hidden-layer activation for [`Mlp::forward_act`] and [`FourierNet`]. `Sin` is the SIREN choice
+/// ([`Siren`] carries the matching initialisation); `Tanh` is the classic PINN activation; `Relu` has no
+/// second derivative and is for data-driven operators only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    Relu,
+    Tanh,
+    Sin,
+}
+
 /// A SIREN: a multilayer perceptron with **sine** activations on the hidden layers and a linear output.
 /// `dims` is the full layer spec, e.g. `[1, 32, 32, 1]` (scalar in → scalar out) for a 1-D PINN, or
 /// `[2, 40, 40, 1]` for a 2-D field. Parameters are owned `Tensor`s laid out `[W1, b1, W2, b2, …]`; wrap
@@ -83,12 +102,16 @@ impl Mlp {
     }
     /// Forward pass on `x` (`[N, dims[0]]`): ReLU on hidden layers, linear output.
     pub fn forward(pv: &[Var], x: &Var) -> Var {
+        Self::forward_act(pv, x, Act::Relu)
+    }
+    /// Forward pass with a chosen hidden activation — `Act::Tanh` for a classic PINN net.
+    pub fn forward_act(pv: &[Var], x: &Var, act: Act) -> Var {
         let nl = pv.len() / 2;
         let mut h = x.clone();
         for l in 0..nl {
             h = h.matmul(&pv[2 * l]).add(&pv[2 * l + 1]);
             if l + 1 < nl {
-                h = h.relu();
+                h = features::act(&h, act);
             }
         }
         h
@@ -101,16 +124,16 @@ impl Mlp {
 /// `x_i → y_i` yields the per-point derivative. Every op on the path must carry a VJP (all the primitives
 /// used here do), so arbitrary orders compose.
 pub fn deriv(y: &Var, x: &Var) -> Var {
-    grad(&y.sum_all(), &[x.clone()], None).remove(0)
+    grad(&y.sum_all(), core::slice::from_ref(x), None).remove(0)
 }
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> {
+pub(crate) fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let a = (h32((i as u32).wrapping_mul(2654435761).wrapping_add(seed)) % 1_000_000 + 1) as f32 / 1_000_000.0;
             let b = (h32((i as u32).wrapping_mul(2654435761).wrapping_add(seed).wrapping_add(9973)) % 1_000_000 + 1) as f32 / 1_000_000.0;
-            ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc
+            ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc
         })
         .collect()
 }
