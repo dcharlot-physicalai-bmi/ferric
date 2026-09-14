@@ -363,7 +363,7 @@ pub struct GraphSpec<'a> {
 /// profiled step is slower; the per-class numbers are what matter). Printed every 16 steps.
 struct Prof { on: bool, ev: [CUevent; 2], acc: [f64; 14], steps: u32 }
 const PROF_NAMES: [&str; 14] = ["attn_norm", "qkv_gemv", "qk_norm_rope", "kv_copy", "attn", "wo_gemv",
-                                "add_rmsnorm", "swiglu_gemv", "down_gemv", "vadd", "head_norm", "lm_head", "d2h", "h2d"];
+                                "add_rmsnorm", "swiglu_gemv", "down_gemv", "resid+next_norm", "head_norm(fused)", "lm_head", "d2h", "h2d"];
 impl Prof {
     fn new(drv: &Driver) -> Prof {
         let on = std::env::var("FERRIC_CUDA_PROFILE").is_ok();
@@ -480,9 +480,15 @@ impl DecodeGraph {
         unsafe {
             macro_rules! p { ($($e:expr),*) => { [$( &mut $e as *mut _ as *mut c_void ),*] } }
             let (mut d32, mut eps) = (d as u32, self.eps);
-            for l in &self.layers {
-                let (mut x, mut w, mut o) = (self.x, l.attn_norm, self.xn);
-                timed!(0, drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)));
+            // Layer 0's attn_norm is a plain rmsnorm; every later layer's is fused into the previous
+            // layer's residual add (one add_rmsnorm instead of vadd + rmsnorm), and the last layer's
+            // residual add is fused with out_norm the same way. 56 fewer launches per token.
+            let nl = self.layers.len();
+            for (li, l) in self.layers.iter().enumerate() {
+                if li == 0 {
+                    let (mut x, mut w, mut o) = (self.x, l.attn_norm, self.xn);
+                    timed!(0, drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)));
+                }
                 timed!(1, { let mut off = 0usize; let mut ok = true;
                     for &(c, a, q6, rows) in &l.qkv { ok &= self.gemv(self.xn, (c, a, q6, rows), d, self.qkv + (off * 4) as u64); off += rows; } ok });
                 let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (self.qkv, l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), self.q, self.k);
@@ -501,11 +507,11 @@ impl DecodeGraph {
                 let (mut xn2, mut gc, mut ga, mut h, mut nff, mut din) = (self.xn, l.gate_up.0, l.gate_up.1, self.h, self.n_ff as u32, d32);
                 timed!(7, drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)));
                 timed!(8, self.gemv(self.h, l.down, self.n_ff, self.dn));
-                let (mut a, mut b, mut o2, mut n) = (self.xy, self.dn, self.x, d32);
-                timed!(9, drv.launch(k[2], (d as u32).div_ceil(256), 256, &mut p!(a, b, o2, n)));
+                // x = xy + dn, and in the same kernel xn = rmsnorm(x) * (next attn_norm | out_norm)
+                let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
+                let (mut a, mut b, mut nw, mut xo, mut xno) = (self.xy, self.dn, next_w, self.x, self.xn);
+                timed!(9, drv.launch(k[1], 1, 256, &mut p!(a, b, nw, xo, xno, d32, eps)));
             }
-            let (mut x, mut w, mut o) = (self.x, self.out_norm, self.xn);
-            timed!(10, drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)));
             timed!(11, self.gemv(self.xn, self.lm_head, d, self.logits));
         }
         if !drv.sync() { self.prof = prof; return None; }
