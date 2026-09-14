@@ -37,6 +37,10 @@ async fn run() {
     let name = |t: u32| vocab.get(t as usize).cloned().unwrap_or_else(|| format!("<{t}>"));
 
     let ctx = Arc::new(Context::new().await.unwrap());
+    // ⛔ A benchmark that does not print its device is a benchmark on an UNKNOWN device. On a box
+    // whose NVIDIA Vulkan ICD was broken, wgpu's HighPerformance preference silently fell to the
+    // Intel iGPU and a day of "RTX 4050" numbers were nothing of the kind. Always first, never gated.
+    println!("adapter   : {} [{:?}]", ctx.adapter_name, ctx.backend);
     let m = Qwen3::load(&ctx, &g).expect("load");
     let vn = m.cfg.n_vocab;
     println!("{} layers · d={} · {}h/{}kv × {} · vocab={}\n",

@@ -26,6 +26,11 @@ RUN=$R/target/release/examples/run_ids
 BIT=$R/target/release/examples/kv_bitref
 [ -x "$RUN" ] || { echo "⛔ build first: cargo build -p ferric-llama --release --examples"; exit 4; }
 
+echo "=== device: the ONLY thing that makes the numbers below mean anything ==="
+dev=$(env -u "$VAR" $RUN "$M" "$IDS" 1 2>/dev/null | grep -m1 "^adapter")
+echo "  $dev"
+[ -n "$dev" ] || { echo "  ⛔ run_ids printed no adapter line — rebuild the examples. NO measurement taken."; exit 4; }
+echo "$dev" | grep -qiE "llvmpipe|swiftshader|software|cpu" && { echo "  ⛔ CPU/software adapter — refusing to benchmark it as a GPU."; exit 4; }
 echo "=== correctness: generated ids must be identical ==="
 a=$(env -u "$VAR" $RUN "$M" "$IDS" 16 2>/dev/null | grep "generated ids")
 b=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $RUN "$M" "$IDS" 16 2>/dev/null | grep "generated ids")

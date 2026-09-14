@@ -41,6 +41,8 @@ async fn run() {
     let n: usize = args.get(3).expect("usage: kv_bitref <model.gguf> <prompt> <n>").parse().expect("n");
 
     let ctx = Arc::new(Context::new().await.unwrap());
+    // Fingerprints differ per ADAPTER, so a fingerprint without its adapter name is unlabeled data.
+    println!("adapter   : {} [{:?}]", ctx.adapter_name, ctx.backend);
     let g = GgufFile::open(path).unwrap();
 
     let toks: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
