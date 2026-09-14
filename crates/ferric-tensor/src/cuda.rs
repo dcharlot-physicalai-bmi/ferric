@@ -750,5 +750,18 @@ mod tests {
             &mut nh32 as *mut _ as *mut c_void, &mut nkv32 as *mut _ as *mut c_void, &mut dh32 as *mut _ as *mut c_void, &mut s32 as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
         assert!(unsafe { drv.launch(k[6], nh as u32, 128, &mut pr3) } && drv.sync());
         let mut got = vec![0f32; q_out]; assert!(drv.dtoh(&mut got, ad)); close("attn_decode", &want, &got, 2e-4);
+        // The real model's head geometry (nh=16, nkv=8, dh=128 -> 4 elements per lane) and a key count
+        // that leaves a remainder across the 4 warps (133 = 4*33 + 1), so the warp-strided paths are hit.
+        let (nh2, nkv2, dh2, s2) = (16usize, 8usize, 128usize, 133usize);
+        let (qo2, kvo2) = (nh2 * dh2, nkv2 * dh2);
+        let (qv2, kv2, vv2) = (rnd(qo2, 16), rnd(s2 * kvo2, 17), rnd(s2 * kvo2, 18));
+        let want2 = pollster::block_on(crate::Tensor::from_vec(&ctx, &qv2, &[1, qo2]).fused_decode_attention(
+            &crate::Tensor::from_vec(&ctx, &kv2, &[s2, kvo2]), &crate::Tensor::from_vec(&ctx, &vv2, &[s2, kvo2]), nh2, nkv2, dh2).to_vec());
+        let (mut qd2, mut kd2, mut vd2, mut ad2) = (up(&qv2), up(&kv2), up(&vv2), drv.alloc(qo2 * 4).unwrap());
+        let (mut nh32b, mut nkv32b, mut dh32b, mut s32b, mut scb) = (nh2 as u32, nkv2 as u32, dh2 as u32, s2 as u32, 1.0f32 / (dh2 as f32).sqrt());
+        let mut pr4: [*mut c_void; 9] = [&mut qd2 as *mut _ as *mut c_void, &mut kd2 as *mut _ as *mut c_void, &mut vd2 as *mut _ as *mut c_void, &mut ad2 as *mut _ as *mut c_void,
+            &mut nh32b as *mut _ as *mut c_void, &mut nkv32b as *mut _ as *mut c_void, &mut dh32b as *mut _ as *mut c_void, &mut s32b as *mut _ as *mut c_void, &mut scb as *mut _ as *mut c_void];
+        assert!(unsafe { drv.launch(k[6], nh2 as u32, 128, &mut pr4) } && drv.sync());
+        let mut got2 = vec![0f32; qo2]; assert!(drv.dtoh(&mut got2, ad2)); close("attn_decode dh=128 S=133", &want2, &got2, 2e-4);
     }
 }

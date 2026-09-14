@@ -261,39 +261,67 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
     if (is_k && vc_row != 0 && t < dh) vc_row[head * dh + t] = qkv[v_off + head * dh + t];
 }
 
-// ── Fused single-query attention over an [S, nkv*dh] K/V cache. One block (128 threads) per q-head,
-//    GQA head -> kv head, chunked online softmax. Mirrors FUSED_ATTN_WGSL; dh <= 128. ──
+// ── Fused single-query attention over an [S, nkv*dh] K/V cache: one block (128 threads = 4 warps)
+//    per q-head, GQA head -> kv head, chunked online softmax. dh <= 128.
+//    ⛔ The first version scored keys one PER THREAD (each thread a serial 128-wide dot), reduced max
+//    and sum with 7-barrier trees, and accumulated V with every thread walking ALL keys serially;
+//    the profiler put it at 0.41 ms/tok, the largest non-GEMV class. Now a WARP scores a key (32
+//    lanes x 4 dh elements, shuffle-reduced), warps reduce max/sum with one shuffle tree each, and V is
+//    accumulated per warp over a strided key subset (lane covers 4 consecutive dh elements: coalesced
+//    128 B per key per warp), then combined across the 4 warps once. Mirrors FUSED_ATTN_WGSL's math. ──
 extern "C" __global__ void attn_decode(const float* __restrict__ q, const float* __restrict__ k,
                                        const float* __restrict__ v, float* __restrict__ out,
                                        unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
-    __shared__ float qs[128]; __shared__ float sc[2048]; __shared__ float red[128];
-    const unsigned head = blockIdx.x, t = threadIdx.x;
+    __shared__ float sc[2048];
+    __shared__ float red[4];
+    __shared__ float vacc[4][128];
+    const unsigned head = blockIdx.x, t = threadIdx.x, lane = t & 31u, warp = t >> 5u;
     const unsigned g = nh / nkv, kvh = head / g, qbase = head * dh, kvbase = kvh * dh;
-    if (t < dh) qs[t] = q[qbase + t];
-    __syncthreads();
-    float m_run = -3.0e38f, l_run = 0.f, accd = 0.f;
-    for (unsigned c0 = 0; c0 < s; c0 += 2048u) {
+    const unsigned dpl = dh / 32u;                       // dh elements per lane (dh <= 128 -> <= 4)
+    // this lane's slice of q, in registers
+    float qr[4] = {0.f, 0.f, 0.f, 0.f};
+    for (unsigned e = 0u; e < dpl; ++e) qr[e] = q[qbase + lane * dpl + e];
+    float m_run = -3.0e38f, l_run = 0.f;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};                 // per-warp partial V accumulator (lane's slice)
+    for (unsigned c0 = 0u; c0 < s; c0 += 2048u) {
         const unsigned clen = min(2048u, s - c0);
-        for (unsigned i = t; i < clen; i += 128u) {
-            float dot = 0.f; const unsigned kb = (c0 + i) * nkv * dh + kvbase;
-            for (unsigned d = 0; d < dh; ++d) dot += qs[d] * k[kb + d];
-            sc[i] = dot * scale;
+        // scores: warp w takes keys w, w+4, ...
+        for (unsigned i = warp; i < clen; i += 4u) {
+            const float* kr = k + (c0 + i) * nkv * dh + kvbase + lane * dpl;
+            float d = 0.f;
+            for (unsigned e = 0u; e < dpl; ++e) d += qr[e] * kr[e];
+            d = warp_sum(d);
+            if (lane == 0u) sc[i] = d * scale;
         }
         __syncthreads();
+        // chunk max
         float cm = -3.0e38f;
         for (unsigned i = t; i < clen; i += 128u) cm = fmaxf(cm, sc[i]);
-        red[t] = cm; __syncthreads();
-        for (unsigned st = 64u; st > 0u; st >>= 1u) { if (t < st) red[t] = fmaxf(red[t], red[t + st]); __syncthreads(); }
-        const float m_new = fmaxf(m_run, red[0]); const float corr = expf(m_run - m_new); __syncthreads();
+        cm = warp_max(cm);
+        if (lane == 0u) red[warp] = cm;
+        __syncthreads();
+        const float m_new = fmaxf(m_run, fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3])));
+        const float corr = expf(m_run - m_new);
+        __syncthreads();
+        // exponentiate + chunk sum
         float cs = 0.f;
         for (unsigned i = t; i < clen; i += 128u) { const float e = expf(sc[i] - m_new); sc[i] = e; cs += e; }
-        red[t] = cs; __syncthreads();
-        for (unsigned st = 64u; st > 0u; st >>= 1u) { if (t < st) red[t] += red[t + st]; __syncthreads(); }
-        l_run = l_run * corr + red[0];
-        if (t < dh) { float a = 0.f; for (unsigned i = 0; i < clen; ++i) a += sc[i] * v[(c0 + i) * nkv * dh + kvbase + t];
-                      accd = accd * corr + a; }
+        cs = warp_sum(cs);
+        if (lane == 0u) red[warp] = cs;
+        __syncthreads();
+        l_run = l_run * corr + red[0] + red[1] + red[2] + red[3];
+        // V: warp w accumulates keys w, w+4, ... over its lane's dh slice
+        for (unsigned e = 0u; e < dpl; ++e) acc[e] *= corr;
+        for (unsigned i = warp; i < clen; i += 4u) {
+            const float p = sc[i];
+            const float* vr = v + (c0 + i) * nkv * dh + kvbase + lane * dpl;
+            for (unsigned e = 0u; e < dpl; ++e) acc[e] += p * vr[e];
+        }
         m_run = m_new;
         __syncthreads();
     }
-    if (t < dh) out[head * dh + t] = accd / l_run;
+    for (unsigned e = 0u; e < dpl; ++e) vacc[warp][lane * dpl + e] = acc[e];
+    __syncthreads();
+    if (t < dh) out[head * dh + t] = (vacc[0][t] + vacc[1][t] + vacc[2][t] + vacc[3][t]) / l_run;
 }
+
