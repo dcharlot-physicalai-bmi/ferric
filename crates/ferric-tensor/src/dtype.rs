@@ -1128,6 +1128,22 @@ impl QMatrix {
         let (l, opw) = splitk_lanes(w.cols / 256);
         Some(x.matmul_q5_k_cfg(w, false, (l, 1, opw)))
     }
+    /// The WGSL FLAT Q6_K kernel on a single-shard matrix, bypassing any native hook (test seam).
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub(crate) fn q6k_flat_wgsl(&self, x: &Tensor) -> Option<Tensor> {
+        let [QShard::Q6_K(w)] = &self.shards[..] else { return None };
+        Some(x.matmul_q6_k_cfg(w, false))
+    }
+    /// Native-tier view of a single-shard Q5_K / Q6_K matrix: the device mirror plus [rows, cols].
+    /// `None` for any other format, for multi-shard weights, or when the tier is off.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub fn native_weight(&self) -> Option<crate::cuda::NativeWeight<'_>> {
+        match &self.shards[..] {
+            [QShard::Q5_K(w)] => w.cuda.as_ref().map(|d| crate::cuda::NativeWeight::Q5K { dev: d, rows: w.rows, cols: w.cols }),
+            [QShard::Q6_K(w)] => w.cuda.as_ref().map(|d| crate::cuda::NativeWeight::Q6K { dev: d, rows: w.rows, cols: w.cols }),
+            _ => None,
+        }
+    }
     /// ggml block-size in bytes for a supported type, or None if we have no native matmul for it.
     pub fn block_bytes(ggml_type: u32) -> Option<(usize, usize)> {
         match ggml_type {          // (values per block, bytes per block)
@@ -1584,6 +1600,9 @@ pub struct Q6_KWeights {
     aux: Arc<wgpu::Buffer>,   // 5 u32/block: [d|_, 16 scale bytes]
     pub rows: usize,
     pub cols: usize,          // multiple of 256
+    /// NVIDIA-tier mirror of `codes`/`aux` (48 + 5 words per block), from the same host words.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub cuda: Option<crate::cuda::Q6KDev>,
 }
 
 impl Q6_KWeights {
@@ -1605,7 +1624,10 @@ impl Q6_KWeights {
             label: Some(label), contents: bytemuck::cast_slice(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         }));
-        Q6_KWeights { ctx: ctx.clone(), codes: mk("q6k.codes", &codes), aux: mk("q6k.aux", &aux), rows, cols }
+        Q6_KWeights {
+            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+            cuda: crate::cuda::Q6KDev::upload(&codes, &aux),
+            ctx: ctx.clone(), codes: mk("q6k.codes", &codes), aux: mk("q6k.aux", &aux), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 210 }
 
@@ -1649,13 +1671,19 @@ impl Q6_KWeights {
 impl Tensor {
     /// y = x·Wᵀ where W is a packed **Q6_K** [out, in] weight, dequantized per-super-block in-kernel.
     pub fn matmul_q6_k(&self, w: &Q6_KWeights) -> Tensor {
+        let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
+        self.matmul_q6_k_cfg(w, split)
+    }
+    /// `matmul_q6_k` with the kernel choice supplied — the hermetic seam the native-tier test uses to
+    /// reach the FLAT kernel without env vars (see `matmul_q5_k_cfg` and vacuous-test-mechanisms #68).
+    pub(crate) fn matmul_q6_k_cfg(&self, w: &Q6_KWeights, split: bool) -> Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (lanes, opw) = splitk_lanes_wide(inn / 256);
-        let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
+        let (grid, rs, wgsl, label) = if split {
             // Outputs are packed `opw` to a workgroup now (see `splitk_lanes`), so the grid
             // covers ceil(n / opw) workgroups rather than one per output.
             let nwg = n.div_ceil(opw as usize);

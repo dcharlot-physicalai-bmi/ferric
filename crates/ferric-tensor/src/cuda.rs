@@ -53,7 +53,11 @@ pub struct Driver {
                                            *mut *mut c_void, *mut *mut c_void) -> CUresult,
     cu_ctx_synchronize: unsafe extern "C" fn() -> CUresult,
     cu_get_error_string: unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult,
+    cu_memcpy_dtod: unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
     gemv_q5k: OnceLock<Option<CUfunction>>,
+    /// Tier-2 kernels from `cuda_decode.ptx`, loaded once: [rmsnorm, add_rmsnorm, vadd, q6k_gemv,
+    /// q5k_swiglu_gemv, qk_norm_rope, attn_decode].
+    decode: OnceLock<Option<[CUfunction; 7]>>,
 }
 unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
@@ -77,8 +81,10 @@ impl Driver {
             cu_launch_kernel: sym!(lib, "cuLaunchKernel", unsafe extern "C" fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void, *mut *mut c_void) -> CUresult),
             cu_ctx_synchronize: sym!(lib, "cuCtxSynchronize", unsafe extern "C" fn() -> CUresult),
             cu_get_error_string: sym!(lib, "cuGetErrorString", unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult),
+            cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult),
             _ctx: std::ptr::null_mut(),
             gemv_q5k: OnceLock::new(),
+            decode: OnceLock::new(),
             _lib: lib,
         };
         unsafe {
@@ -139,6 +145,63 @@ impl Driver {
     }
 }
 
+impl Driver {
+    fn load_ptx(&self, file: &str, names: &[&[u8]]) -> Option<Vec<CUfunction>> {
+        let path = std::env::var("FERRIC_CUDA_PTX_DIR")
+            .map(|d| format!("{d}/{file}"))
+            .unwrap_or_else(|_| format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR")));
+        let Ok(mut ptx) = std::fs::read(&path) else {
+            eprintln!("cuda: no PTX at {path} — build with `nvcc -O3 -arch=compute_75 -ptx` (or set \
+                       FERRIC_CUDA_PTX_DIR). Native tier 2 unavailable; NOTHING native ran.");
+            return None;
+        };
+        ptx.push(0);
+        let mut m: CUmodule = std::ptr::null_mut();
+        let r = unsafe { (self.cu_module_load_data)(&mut m, ptx.as_ptr() as *const c_void) };
+        if r != 0 { eprintln!("{}", self.err(&format!("cuModuleLoadData({file})"), r)); return None; }
+        let mut out = Vec::with_capacity(names.len());
+        for n in names {
+            let mut f: CUfunction = std::ptr::null_mut();
+            let r = unsafe { (self.cu_module_get_function)(&mut f, m, n.as_ptr() as *const c_char) };
+            if r != 0 { eprintln!("{}", self.err("cuModuleGetFunction", r)); return None; }
+            out.push(f);
+        }
+        Some(out)
+    }
+    fn decode_kernels(&self) -> Option<&[CUfunction; 7]> {
+        self.decode.get_or_init(|| {
+            let v = self.load_ptx("cuda_decode.ptx", &[b"rmsnorm\0", b"add_rmsnorm\0", b"vadd\0", b"q6k_gemv\0",
+                                                       b"q5k_swiglu_gemv\0", b"qk_norm_rope\0", b"attn_decode\0"])?;
+            Some([v[0], v[1], v[2], v[3], v[4], v[5], v[6]])
+        }).as_ref()
+    }
+    /// 1-D launch with pointer-to-argument slots; errors print here, completion is checked by `sync`.
+    unsafe fn launch(&self, f: CUfunction, grid: u32, block: u32, params: &mut [*mut c_void]) -> bool {
+        let r = (self.cu_launch_kernel)(f, grid, 1, 1, block, 1, 1, 0, std::ptr::null_mut(),
+                                        params.as_mut_ptr(), std::ptr::null_mut());
+        if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
+        true
+    }
+    fn sync(&self) -> bool {
+        let r = unsafe { (self.cu_ctx_synchronize)() };
+        if r != 0 { eprintln!("{}", self.err("cuCtxSynchronize", r)); return false; }
+        true
+    }
+    fn alloc(&self, bytes: usize) -> Option<CUdeviceptr> {
+        let mut p: CUdeviceptr = 0;
+        let r = unsafe { (self.cu_mem_alloc)(&mut p, bytes.max(4)) };
+        if r != 0 { eprintln!("{}", self.err("cuMemAlloc", r)); return None; }
+        Some(p)
+    }
+    fn htod(&self, dst: CUdeviceptr, src: &[f32]) -> bool {
+        unsafe { (self.cu_memcpy_htod)(dst, src.as_ptr() as *const c_void, src.len() * 4) == 0 }
+    }
+    fn dtoh(&self, dst: &mut [f32], src: CUdeviceptr) -> bool {
+        unsafe { (self.cu_memcpy_dtoh)(dst.as_mut_ptr() as *mut c_void, src, dst.len() * 4) == 0 }
+    }
+    fn upload_f32(&self, v: &[f32]) -> Option<CUdeviceptr> { let p = self.alloc(v.len() * 4)?; if self.htod(p, v) { Some(p) } else { None } }
+}
+
 /// Probe once. `None` when there is no driver, no device, or `FERRIC_CUDA` is unset.
 pub fn driver() -> Option<&'static Arc<Driver>> {
     static D: OnceLock<Option<Arc<Driver>>> = OnceLock::new();
@@ -193,6 +256,180 @@ impl Q5KDev {
 }
 impl Drop for Q5KDev {
     fn drop(&mut self) { unsafe { (self.drv.cu_mem_free)(self.codes); (self.drv.cu_mem_free)(self.aux); } }
+}
+
+/// A Q6_K weight mirrored into CUDA memory (48 + 5 words per block), from the same host words.
+pub struct Q6KDev { codes: CUdeviceptr, aux: CUdeviceptr, drv: Arc<Driver> }
+impl Q6KDev {
+    pub fn upload(codes: &[u32], aux: &[u32]) -> Option<Q6KDev> {
+        let drv = driver()?.clone();
+        let c = drv.upload(codes)?;
+        let a = match drv.upload(aux) { Some(a) => a, None => { unsafe { (drv.cu_mem_free)(c); } return None; } };
+        Some(Q6KDev { codes: c, aux: a, drv })
+    }
+}
+impl Drop for Q6KDev {
+    fn drop(&mut self) { unsafe { (self.drv.cu_mem_free)(self.codes); (self.drv.cu_mem_free)(self.aux); } }
+}
+
+/// A single-shard quantised matrix as the native graph sees it.
+pub enum NativeWeight<'a> {
+    Q5K { dev: &'a Q5KDev, rows: usize, cols: usize },
+    Q6K { dev: &'a Q6KDev, rows: usize, cols: usize },
+}
+impl NativeWeight<'_> {
+    pub fn rows(&self) -> usize { match self { NativeWeight::Q5K { rows, .. } | NativeWeight::Q6K { rows, .. } => *rows } }
+    pub fn cols(&self) -> usize { match self { NativeWeight::Q5K { cols, .. } | NativeWeight::Q6K { cols, .. } => *cols } }
+    fn ptrs(&self) -> (CUdeviceptr, CUdeviceptr) {
+        match self { NativeWeight::Q5K { dev, .. } => (dev.codes, dev.aux), NativeWeight::Q6K { dev, .. } => (dev.codes, dev.aux) }
+    }
+}
+
+/// Everything one dense decode layer needs, as device pointers. Built once from host data.
+struct LayerDev {
+    attn_norm: CUdeviceptr, ffn_norm: CUdeviceptr, q_norm: Option<CUdeviceptr>, k_norm: Option<CUdeviceptr>,
+    /// (codes, aux, is_q6k, rows) per fused-format part, written contiguously into the qkv buffer.
+    qkv: Vec<(CUdeviceptr, CUdeviceptr, bool, usize)>,
+    wo: (CUdeviceptr, CUdeviceptr, bool, usize),
+    gate_up: (CUdeviceptr, CUdeviceptr),          // Q5_K only (fused kernel), 2*n_ff rows
+    down: (CUdeviceptr, CUdeviceptr, bool, usize),
+    k_cache: CUdeviceptr, v_cache: CUdeviceptr,   // [cap, nkv*dh] each
+}
+
+/// Host-side description of one layer for [`DecodeGraph::build`].
+pub struct LayerSpec<'a> {
+    pub attn_norm: Vec<f32>, pub ffn_norm: Vec<f32>,
+    pub q_norm: Option<Vec<f32>>, pub k_norm: Option<Vec<f32>>,
+    pub qkv_parts: Vec<NativeWeight<'a>>,
+    pub wo: NativeWeight<'a>,
+    /// Must be Q5_K with 2*n_ff rows (the fused SwiGLU kernel is Q5_K only in tier 2).
+    pub gate_up: NativeWeight<'a>,
+    pub down: NativeWeight<'a>,
+}
+pub struct GraphSpec<'a> {
+    pub d: usize, pub nh: usize, pub nkv: usize, pub dh: usize, pub n_ff: usize, pub n_vocab: usize,
+    pub eps: f32, pub rope_base: f32, pub has_qk_norm: bool, pub cap: usize,
+    pub layers: Vec<LayerSpec<'a>>,
+    pub out_norm: Vec<f32>,
+    pub lm_head: NativeWeight<'a>,
+}
+
+/// **Tier 2: one dense decode step, fully resident.** Activations, scratch and the K/V cache all live
+/// in device memory; per token the host copies ONE `[d]` embedding row in and ONE `[n_vocab]` logits
+/// row out. Nothing else crosses the bus. Prefill stays on WGSL; `seed_cache` copies its K/V in once.
+pub struct DecodeGraph {
+    drv: Arc<Driver>,
+    d: usize, nh: usize, nkv: usize, dh: usize, n_ff: usize, n_vocab: usize, eps: f32, rope_base: f32,
+    has_qk_norm: bool, cap: usize,
+    layers: Vec<LayerDev>,
+    out_norm: CUdeviceptr, lm_head: (CUdeviceptr, CUdeviceptr, bool, usize),
+    x: CUdeviceptr, xn: CUdeviceptr, qkv: CUdeviceptr, q: CUdeviceptr, k: CUdeviceptr,
+    attn: CUdeviceptr, y: CUdeviceptr, xy: CUdeviceptr, h: CUdeviceptr, dn: CUdeviceptr, logits: CUdeviceptr,
+    q_out: usize, kv_out: usize,
+    /// Rows of K/V currently valid in the device cache (== the position of the next token).
+    pub len: usize,
+}
+impl DecodeGraph {
+    pub fn build(spec: &GraphSpec<'_>) -> Option<DecodeGraph> {
+        let drv = driver()?.clone();
+        drv.decode_kernels()?; drv.q5k_kernel()?;
+        let (d, nh, nkv, dh) = (spec.d, spec.nh, spec.nkv, spec.dh);
+        if dh > 128 || d % 256 != 0 || spec.n_ff % 256 != 0 { return None; }
+        let q_out = nh * dh; let kv_out = nkv * dh;
+        let w4 = |w: &NativeWeight<'_>| { let (c, a) = w.ptrs(); (c, a, matches!(w, NativeWeight::Q6K { .. }), w.rows()) };
+        let mut layers = Vec::with_capacity(spec.layers.len());
+        for l in &spec.layers {
+            let total: usize = l.qkv_parts.iter().map(|w| w.rows()).sum();
+            if total != q_out + 2 * kv_out { return None; }
+            if !matches!(l.gate_up, NativeWeight::Q5K { .. }) || l.gate_up.rows() != 2 * spec.n_ff { return None; }
+            if l.wo.cols() != q_out || l.down.cols() != spec.n_ff { return None; }
+            let up = |v: &Vec<f32>| drv.upload_f32(v);
+            layers.push(LayerDev {
+                attn_norm: up(&l.attn_norm)?, ffn_norm: up(&l.ffn_norm)?,
+                q_norm: match &l.q_norm { Some(v) => Some(up(v)?), None => None },
+                k_norm: match &l.k_norm { Some(v) => Some(up(v)?), None => None },
+                qkv: l.qkv_parts.iter().map(|w| w4(w)).collect(),
+                wo: w4(&l.wo), gate_up: l.gate_up.ptrs(), down: w4(&l.down),
+                k_cache: drv.alloc(spec.cap * kv_out * 4)?, v_cache: drv.alloc(spec.cap * kv_out * 4)?,
+            });
+        }
+        Some(DecodeGraph {
+            d, nh, nkv, dh, n_ff: spec.n_ff, n_vocab: spec.n_vocab, eps: spec.eps, rope_base: spec.rope_base,
+            has_qk_norm: spec.has_qk_norm, cap: spec.cap, layers,
+            out_norm: drv.upload_f32(&spec.out_norm)?, lm_head: w4(&spec.lm_head),
+            x: drv.alloc(d * 4)?, xn: drv.alloc(d * 4)?, qkv: drv.alloc((q_out + 2 * kv_out) * 4)?,
+            q: drv.alloc(q_out * 4)?, k: drv.alloc(kv_out * 4)?, attn: drv.alloc(q_out * 4)?,
+            y: drv.alloc(d * 4)?, xy: drv.alloc(d * 4)?, h: drv.alloc(spec.n_ff * 4)?, dn: drv.alloc(d * 4)?,
+            logits: drv.alloc(spec.n_vocab * 4)?,
+            q_out, kv_out, len: 0, drv,
+        })
+    }
+    /// Copy a layer's K and V rows (`[len, nkv*dh]` each, host f32) into the device cache at row 0.
+    pub fn seed_cache(&mut self, il: usize, k_rows: &[f32], v_rows: &[f32], len: usize) -> bool {
+        if len > self.cap || k_rows.len() != len * self.kv_out || v_rows.len() != len * self.kv_out { return false; }
+        let l = &self.layers[il];
+        let ok = self.drv.htod(l.k_cache, k_rows) && self.drv.htod(l.v_cache, v_rows);
+        if il == self.layers.len() - 1 { self.len = len; }
+        ok
+    }
+    unsafe fn gemv(&self, x: CUdeviceptr, w: (CUdeviceptr, CUdeviceptr, bool, usize), cols: usize, out: CUdeviceptr) -> bool {
+        let (codes, aux, is_q6, rows) = w;
+        let f = if is_q6 { self.drv.decode_kernels().unwrap()[3] } else { self.drv.q5k_kernel().unwrap() };
+        let (mut xp, mut cp, mut ap, mut op) = (x, codes, aux, out);
+        let (mut o32, mut i32_) = (rows as u32, cols as u32);
+        let mut params: [*mut c_void; 6] = [&mut xp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut o32 as *mut _ as *mut c_void, &mut i32_ as *mut _ as *mut c_void];
+        self.drv.launch(f, (rows as u32).div_ceil(4), 128, &mut params)
+    }
+    /// One decode step: `x_row` is the (already scaled/normed) embedding of the token at position
+    /// `self.len`. Returns the logits row. `None` on any launch failure (the caller falls back).
+    pub fn step(&mut self, x_row: &[f32]) -> Option<Vec<f32>> {
+        if x_row.len() != self.d || self.len >= self.cap { return None; }
+        let k = *self.drv.decode_kernels()?;
+        let (d, pos) = (self.d, self.len);
+        let drv = self.drv.clone();
+        if !drv.htod(self.x, x_row) { return None; }
+        unsafe {
+            macro_rules! p { ($($e:expr),*) => { [$( &mut $e as *mut _ as *mut c_void ),*] } }
+            let (mut d32, mut eps) = (d as u32, self.eps);
+            for l in &self.layers {
+                let (mut x, mut w, mut o) = (self.x, l.attn_norm, self.xn);
+                if !drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)) { return None; }
+                let mut off = 0usize;
+                for &(c, a, q6, rows) in &l.qkv {
+                    if !self.gemv(self.xn, (c, a, q6, rows), d, self.qkv + (off * 4) as u64) { return None; }
+                    off += rows;
+                }
+                let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (self.qkv, l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), self.q, self.k);
+                let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
+                let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, self.q_out as u32, self.has_qk_norm as u32);
+                let heads = (self.nh + self.nkv) as u32;
+                if !drv.launch(k[5], heads.div_ceil(32), 32, &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn)) { return None; }
+                let rowb = (self.kv_out * 4) as u64;
+                if (drv.cu_memcpy_dtod)(l.k_cache + pos as u64 * rowb, self.k, self.kv_out * 4) != 0 { return None; }
+                if (drv.cu_memcpy_dtod)(l.v_cache + pos as u64 * rowb, self.qkv + ((self.q_out + self.kv_out) * 4) as u64, self.kv_out * 4) != 0 { return None; }
+                let (mut q, mut kc, mut vc, mut ao, mut s, mut scale) = (self.q, l.k_cache, l.v_cache, self.attn, (pos + 1) as u32, 1.0f32 / (self.dh as f32).sqrt());
+                if !drv.launch(k[6], self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)) { return None; }
+                if !self.gemv(self.attn, l.wo, self.q_out, self.y) { return None; }
+                let (mut x2, mut y2, mut fw, mut xy, mut xn) = (self.x, self.y, l.ffn_norm, self.xy, self.xn);
+                if !drv.launch(k[1], 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)) { return None; }
+                let (mut xn2, mut gc, mut ga, mut h, mut nff, mut din) = (self.xn, l.gate_up.0, l.gate_up.1, self.h, self.n_ff as u32, d32);
+                if !drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)) { return None; }
+                if !self.gemv(self.h, l.down, self.n_ff, self.dn) { return None; }
+                let (mut a, mut b, mut o2, mut n) = (self.xy, self.dn, self.x, d32);
+                if !drv.launch(k[2], (d as u32).div_ceil(256), 256, &mut p!(a, b, o2, n)) { return None; }
+            }
+            let (mut x, mut w, mut o) = (self.x, self.out_norm, self.xn);
+            if !drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)) { return None; }
+            if !self.gemv(self.xn, self.lm_head, d, self.logits) { return None; }
+        }
+        if !drv.sync() { return None; }
+        let mut out = vec![0f32; self.n_vocab];
+        if !drv.dtoh(&mut out, self.logits) { return None; }
+        self.len += 1;
+        Some(out)
+    }
 }
 
 #[cfg(test)]
