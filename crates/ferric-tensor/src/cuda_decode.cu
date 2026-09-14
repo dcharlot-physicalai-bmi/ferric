@@ -76,6 +76,15 @@ __device__ __forceinline__ float q6_scb(const unsigned* __restrict__ aux, unsign
     const unsigned b = (aux[ab + 1u + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu;
     return (float)((int)(b << 24u) >> 24);          // i8 sign-extend, as WGSL `i32(b << 24u) >> 24u`
 }
+// ⛔ SAME OVER-FETCH AS Q5_K HAD, same fix. The first lane plan gave each of 8 sub-lanes one (hf,
+// 8-l) slice and read `ql`/`qh` byte-wise through 4-byte words; every Q6_K shape sat at 60-69 GB/s.
+// Layout (WGSL Q6_K_BODY): for hf in {0,1}, ql bytes [64hf, +64): byte b<32 -> l=b: low nibble q1
+// (elem 128hf+l), high nibble q3 (elem 128hf+64+l); byte b>=32 -> l=b-32: low q2 (elem 128hf+32+l),
+// high q4 (elem 128hf+96+l). qh bytes [32hf, +32): byte l holds 2-bit high parts for q1..q4 of that l.
+// Lane j (0..8): hf = j>>2, sub = j&3; ql uint4 = bytes [64hf + 16sub, +16) -> 16 consecutive l with
+// is = l>>4 constant; q1&q3 if sub<2 (l0 = 16sub) else q2&q4 (l0 = 16(sub-2)); qh uint4 = bytes
+// [32hf + l0, +16). One uint4 of ql + one of qh + 32 x floats per lane per block; 8 lanes cover the
+// block's 128 B of ql contiguously.
 extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,
                                     const unsigned* __restrict__ aux, float* __restrict__ out,
                                     unsigned o_dim, unsigned in_dim) {
@@ -83,27 +92,42 @@ extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned*
     const unsigned o = blockIdx.x * 4u + warp;
     if (o >= o_dim) return;                          // warp-uniform
     const unsigned nblk = in_dim / 256u;
-    // 4 block-lanes x 8 sub-lanes; sub-lane owns hf = sl>>2 and l in [(sl&3)*8, +8): 2*32 (hf,l) pairs / 8.
     const unsigned sl = lane & 7u, bl = lane >> 3u;
-    const unsigned hf = sl >> 2u, l0 = (sl & 3u) * 8u;
+    const unsigned hf = sl >> 2u, sub = sl & 3u;
+    const bool second = sub >= 2u;                   // q2&q4 instead of q1&q3
+    const unsigned l0 = 16u * (second ? sub - 2u : sub);
+    const unsigned is = l0 >> 4u;                    // constant over the lane's 16 l's
     float acc = 0.f;
     for (unsigned blk = bl; blk < nblk; blk += 4u) {
         const unsigned bi = o * nblk + blk, cb = bi * 48u, ab = bi * 5u;
         const float d = f16_to_f32(aux[ab] & 0xffffu);
-        const float* xb = x + blk * 256u;
-        const unsigned qlo = 64u * hf, qho = 32u * hf, sco = 8u * hf, xh = 128u * hf;
+        const unsigned sco = 8u * hf;
+        // the two scales this lane uses (q1,q3) or (q2,q4)
+        const float sA = d * q6_scb(aux, ab, sco + is + (second ? 2u : 0u));
+        const float sB = d * q6_scb(aux, ab, sco + is + (second ? 6u : 4u));
+        const uint4 ql = *reinterpret_cast<const uint4*>(codes + cb + (64u * hf + 16u * sub) / 4u);
+        const uint4 qh = *reinterpret_cast<const uint4*>(codes + cb + 32u + (32u * hf + l0) / 4u);
+        const float* xa = x + blk * 256u + 128u * hf + (second ? 32u : 0u) + l0;   // elem of q1 (or q2)
+        const float* xb = xa + 64u;                                               // elem of q3 (or q4)
+        const unsigned qlw[4] = {ql.x, ql.y, ql.z, ql.w}, qhw[4] = {qh.x, qh.y, qh.z, qh.w};
+        const unsigned shA = second ? 2u : 0u, shB = second ? 6u : 4u;   // qh bit-pair positions
+        float accA = 0.f, accB = 0.f;
         #pragma unroll
-        for (unsigned l = l0; l < l0 + 8u; ++l) {
-            const unsigned is = l >> 4u, h = q6_qhb(codes, cb, qho + l);
-            const int q1 = (int)((q6_qlb(codes, cb, qlo + l) & 0xFu)        | ((h & 3u) << 4u))         - 32;
-            const int q2 = (int)((q6_qlb(codes, cb, qlo + l + 32u) & 0xFu)  | (((h >> 2u) & 3u) << 4u))  - 32;
-            const int q3 = (int)((q6_qlb(codes, cb, qlo + l) >> 4u)         | (((h >> 4u) & 3u) << 4u))  - 32;
-            const int q4 = (int)((q6_qlb(codes, cb, qlo + l + 32u) >> 4u)   | (((h >> 6u) & 3u) << 4u))  - 32;
-            acc += xb[xh + l]        * d * q6_scb(aux, ab, sco + is)      * (float)q1;
-            acc += xb[xh + 32u + l]  * d * q6_scb(aux, ab, sco + is + 2u) * (float)q2;
-            acc += xb[xh + 64u + l]  * d * q6_scb(aux, ab, sco + is + 4u) * (float)q3;
-            acc += xb[xh + 96u + l]  * d * q6_scb(aux, ab, sco + is + 6u) * (float)q4;
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xA = *reinterpret_cast<const float4*>(xa + 4u * w);
+            const float4 xB = *reinterpret_cast<const float4*>(xb + 4u * w);
+            const unsigned lw = qlw[w], hw = qhw[w];
+            #define Q6(k) \
+                { const unsigned lb = (lw >> (8u * (k))) & 0xffu, hb = (hw >> (8u * (k))) & 0xffu; \
+                  const int qA = (int)((lb & 0xFu) | (((hb >> shA) & 3u) << 4u)) - 32; \
+                  const int qB = (int)((lb >> 4u)  | (((hb >> shB) & 3u) << 4u)) - 32; \
+                  const float xv1 = (k)==0u?xA.x:(k)==1u?xA.y:(k)==2u?xA.z:xA.w; \
+                  const float xv2 = (k)==0u?xB.x:(k)==1u?xB.y:(k)==2u?xB.z:xB.w; \
+                  accA += xv1 * (float)qA; accB += xv2 * (float)qB; }
+            Q6(0u) Q6(1u) Q6(2u) Q6(3u)
+            #undef Q6
         }
+        acc += sA * accA + sB * accB;
     }
     acc = warp_sum(acc);
     if (lane == 0u) out[o] = acc;
