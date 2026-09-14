@@ -163,9 +163,14 @@ impl Driver {
 }
 
 impl Driver {
-    /// Make the primary context current on THIS thread. Cheap and idempotent; called by every entry
-    /// point because the driver's "current context" is thread-local state.
-    fn bind(&self) { unsafe { (self.cu_ctx_set_current)(self._ctx); } }
+    /// Make the primary context current on THIS thread — once per thread. The driver's "current
+    /// context" is thread-local state, so every entry point calls this; but calling
+    /// `cuCtxSetCurrent` on EVERY entry cost a measurable ~0.3 ms/token (≈280 driver calls at ~1 µs:
+    /// 9.3 -> 9.6 ms/tok on the RTX 4050), so a thread-local flag makes it one call per thread.
+    fn bind(&self) {
+        thread_local! { static BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        if !BOUND.with(|b| b.get()) { unsafe { (self.cu_ctx_set_current)(self._ctx); } BOUND.with(|b| b.set(true)); }
+    }
     fn load_ptx(&self, file: &str, names: &[&[u8]]) -> Option<Vec<CUfunction>> {
         self.bind();
         let path = std::env::var("FERRIC_CUDA_PTX_DIR")
