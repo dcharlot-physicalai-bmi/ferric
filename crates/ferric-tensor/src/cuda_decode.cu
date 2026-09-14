@@ -325,3 +325,78 @@ extern "C" __global__ void attn_decode(const float* __restrict__ q, const float*
     if (t < dh) out[head * dh + t] = (vacc[0][t] + vacc[1][t] + vacc[2][t] + vacc[3][t]) / l_run;
 }
 
+
+// ═══════════ OPT-IN (FERRIC_CUDA_Q8X): int8 activations + dp4a integer dots for the Q5_K GEMVs ═══════════
+// This is llama.cpp's mul_mat_vec_q technique. ⚠ Unlike every other kernel here it CHANGES THE NUMBERS,
+// not just their order: the activation row is quantised to int8 per 32-value block (~0.4% per element).
+// It therefore stays behind an explicit switch with its own fingerprint; the harness's identical-ids
+// gate and the tolerance test below are what say whether the trade is acceptable.
+
+// x[n] -> xq (4 int8 per u32, 8 words per 32-value block), xs[n/32] scales. One warp per block.
+extern "C" __global__ void quant_x_q8(const float* __restrict__ x, int* __restrict__ xq,
+                                      float* __restrict__ xs, unsigned n) {
+    const unsigned b = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u), lane = threadIdx.x & 31u;
+    if (b * 32u >= n) return;
+    const float v = x[b * 32u + lane];
+    const float am = warp_max(fabsf(v));
+    const float inv = am > 0.f ? 127.f / am : 0.f;
+    const int q = __float2int_rn(v * inv);
+    const int q1 = __shfl_down_sync(0xffffffffu, q, 1), q2 = __shfl_down_sync(0xffffffffu, q, 2), q3 = __shfl_down_sync(0xffffffffu, q, 3);
+    if ((lane & 3u) == 0u) xq[b * 8u + (lane >> 2u)] = (q & 0xff) | ((q1 & 0xff) << 8) | ((q2 & 0xff) << 16) | ((q3 & 0xff) << 24);
+    if (lane == 0u) xs[b] = am / 127.f;
+}
+// Same lane partition as q5k_dot_lane; the x side is int8 and the dots are dp4a.
+__device__ __forceinline__ float q5k_dot_lane_q8(const int* __restrict__ xq, const float* __restrict__ xs,
+                                                 const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                                 unsigned o, unsigned nblk, unsigned bl, unsigned j) {
+    const unsigned c = j >> 1u, half = j & 1u, s0 = 2u * c, s1 = s0 + 1u;
+    float acc = 0.f;
+    for (unsigned blk = bl; blk < nblk; blk += 4u) {
+        const unsigned bi = o * nblk + blk, ab = bi * 4u, cb40 = bi * 40u;
+        const unsigned dd = aux[ab];
+        const float d = f16_to_f32(dd & 0xffffu), dmin = f16_to_f32(dd >> 16u);
+        float ds0, mm0, ds1, mm1;
+        q5_scmin(aux, ab, s0, d, dmin, ds0, mm0);
+        q5_scmin(aux, ab, s1, d, dmin, ds1, mm1);
+        const uint4 q = *reinterpret_cast<const uint4*>(codes + cb40 + 8u * c + 4u * half);
+        const uint4 h = *reinterpret_cast<const uint4*>(codes + cb40 + 32u + 4u * half);
+        const uint4 xa = *reinterpret_cast<const uint4*>(xq + (blk * 8u + s0) * 8u + 4u * half);
+        const uint4 xb = *reinterpret_cast<const uint4*>(xq + (blk * 8u + s1) * 8u + 4u * half);
+        const float sx0 = xs[blk * 8u + s0], sx1 = xs[blk * 8u + s1];
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
+        const int xaw[4] = {(int)xa.x, (int)xa.y, (int)xa.z, (int)xa.w}, xbw[4] = {(int)xb.x, (int)xb.y, (int)xb.z, (int)xb.w};
+        int d0 = 0, n0 = 0, d1 = 0, n1 = 0;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const unsigned word = qw[w], qhw = hw[w];
+            const int qlo = (int)((word & 0x0f0f0f0fu)         | (((qhw >> s0) & 0x01010101u) << 4u));
+            const int qhi = (int)(((word >> 4u) & 0x0f0f0f0fu) | (((qhw >> s1) & 0x01010101u) << 4u));
+            d0 = __dp4a(xaw[w], qlo, d0); n0 = __dp4a(xaw[w], 0x01010101, n0);
+            d1 = __dp4a(xbw[w], qhi, d1); n1 = __dp4a(xbw[w], 0x01010101, n1);
+        }
+        acc += sx0 * (ds0 * (float)d0 - mm0 * (float)n0) + sx1 * (ds1 * (float)d1 - mm1 * (float)n1);
+    }
+    return acc;
+}
+extern "C" __global__ void q5k_gemv_q8(const int* __restrict__ xq, const float* __restrict__ xs,
+                                       const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                       float* __restrict__ out, unsigned o_dim, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= o_dim) return;
+    float acc = q5k_dot_lane_q8(xq, xs, codes, aux, o, in_dim / 256u, lane >> 3u, lane & 7u);
+    acc = warp_sum(acc);
+    if (lane == 0u) out[o] = acc;
+}
+extern "C" __global__ void q5k_swiglu_gemv_q8(const int* __restrict__ xq, const float* __restrict__ xs,
+                                              const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                              float* __restrict__ out, unsigned n_ff, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= n_ff) return;
+    const unsigned nblk = in_dim / 256u, sl = lane & 7u, bl = lane >> 3u;
+    float g = q5k_dot_lane_q8(xq, xs, codes, aux, o, nblk, bl, sl);
+    float u = q5k_dot_lane_q8(xq, xs, codes, aux, o + n_ff, nblk, bl, sl);
+    g = warp_sum(g); u = warp_sum(u);
+    if (lane == 0u) out[o] = (g / (1.f + expf(-g))) * u;
+}

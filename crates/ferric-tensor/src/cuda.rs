@@ -70,8 +70,9 @@ pub struct Driver {
     pub name: String,
     gemv_q5k: OnceLock<Option<CUfunction>>,
     /// Tier-2 kernels from `cuda_decode.ptx`, loaded once: [rmsnorm, add_rmsnorm, vadd, q6k_gemv,
-    /// q5k_swiglu_gemv, qk_norm_rope, attn_decode, q5k_gemv (coalesced; supersedes tier 1's)].
-    decode: OnceLock<Option<[CUfunction; 8]>>,
+    /// q5k_swiglu_gemv, qk_norm_rope, attn_decode, q5k_gemv (coalesced; supersedes tier 1's),
+    /// quant_x_q8, q5k_gemv_q8, q5k_swiglu_gemv_q8 (the FERRIC_CUDA_Q8X opt-in)].
+    decode: OnceLock<Option<[CUfunction; 11]>>,
 }
 unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
@@ -204,13 +205,16 @@ impl Driver {
         }
         Some(out)
     }
-    fn decode_kernels(&self) -> Option<&[CUfunction; 8]> {
+    fn decode_kernels(&self) -> Option<&[CUfunction; 11]> {
         self.decode.get_or_init(|| {
             let v = self.load_ptx("cuda_decode.ptx", &[b"rmsnorm\0", b"add_rmsnorm\0", b"vadd\0", b"q6k_gemv\0",
-                                                       b"q5k_swiglu_gemv\0", b"qk_norm_rope\0", b"attn_decode\0", b"q5k_gemv\0"])?;
-            Some([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+                                                       b"q5k_swiglu_gemv\0", b"qk_norm_rope\0", b"attn_decode\0", b"q5k_gemv\0",
+                                                       b"quant_x_q8\0", b"q5k_gemv_q8\0", b"q5k_swiglu_gemv_q8\0"])?;
+            Some([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]])
         }).as_ref()
     }
+    /// Quantise `x[n]` (f32, device) into `xq` (4 int8 per u32) + `xs` (n/32 scales), n % 32 == 0.
+
     /// 1-D launch with pointer-to-argument slots; errors print here, completion is checked by `sync`.
     unsafe fn launch(&self, f: CUfunction, grid: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
@@ -409,6 +413,8 @@ pub struct DecodeGraph {
     /// Rows of K/V currently valid in the device cache (== the position of the next token).
     pub len: usize,
     prof: Prof,
+    /// FERRIC_CUDA_Q8X: int8 activations + dp4a for the Q5_K GEMVs. Changes numerics; opt-in.
+    q8x: bool, xq: CUdeviceptr, xs: CUdeviceptr,
 }
 impl DecodeGraph {
     pub fn build(spec: &GraphSpec<'_>) -> Option<DecodeGraph> {
@@ -442,7 +448,10 @@ impl DecodeGraph {
             q: drv.alloc(q_out * 4)?, k: drv.alloc(kv_out * 4)?, attn: drv.alloc(q_out * 4)?,
             y: drv.alloc(d * 4)?, xy: drv.alloc(d * 4)?, h: drv.alloc(spec.n_ff * 4)?, dn: drv.alloc(d * 4)?,
             logits: drv.alloc(spec.n_vocab * 4)?,
-            q_out, kv_out, len: 0, prof: Prof::new(&drv), drv,
+            q_out, kv_out, len: 0, prof: Prof::new(&drv),
+            q8x: std::env::var("FERRIC_CUDA_Q8X").is_ok(),
+            xq: drv.alloc(d.max(q_out) * 4)?, xs: drv.alloc((d.max(q_out) / 32) * 4)?,
+            drv,
         })
     }
     /// Copy a layer's K and V rows (`[len, nkv*dh]` each, host f32) into the device cache at row 0.
@@ -453,9 +462,20 @@ impl DecodeGraph {
         if il == self.layers.len() - 1 { self.len = len; }
         ok
     }
+    unsafe fn quant_x(&self, k: &[CUfunction; 11], x: CUdeviceptr, xq: CUdeviceptr, xs: CUdeviceptr, n: usize) -> bool {
+        DecodeGraph::quant_x_static(&self.drv, k, x, xq, xs, n)
+    }
     unsafe fn gemv(&self, x: CUdeviceptr, w: (CUdeviceptr, CUdeviceptr, bool, usize), cols: usize, out: CUdeviceptr) -> bool {
         let (codes, aux, is_q6, rows) = w;
         let k = self.drv.decode_kernels().unwrap();
+        if !is_q6 && self.q8x {
+            if !self.quant_x(k, x, self.xq, self.xs, cols) { return false; }
+            let (mut qp, mut sp, mut cp, mut ap, mut op) = (self.xq, self.xs, codes, aux, out);
+            let (mut o32, mut i32_) = (rows as u32, cols as u32);
+            let mut pr: [*mut c_void; 7] = [&mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
+                &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut o32 as *mut _ as *mut c_void, &mut i32_ as *mut _ as *mut c_void];
+            return self.drv.launch(k[9], (rows as u32).div_ceil(4), 128, &mut pr);
+        }
         let f = if is_q6 { k[3] } else { k[7] };     // the coalesced q5k GEMV, not tier 1's
         let (mut xp, mut cp, mut ap, mut op) = (x, codes, aux, out);
         let (mut o32, mut i32_) = (rows as u32, cols as u32);
@@ -505,7 +525,13 @@ impl DecodeGraph {
                 let (mut x2, mut y2, mut fw, mut xy, mut xn) = (self.x, self.y, l.ffn_norm, self.xy, self.xn);
                 timed!(6, drv.launch(k[1], 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
                 let (mut xn2, mut gc, mut ga, mut h, mut nff, mut din) = (self.xn, l.gate_up.0, l.gate_up.1, self.h, self.n_ff as u32, d32);
-                timed!(7, drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)));
+                if self.q8x {
+                    let (mut qp, mut sp) = (self.xq, self.xs);
+                    timed!(7, self.quant_x(&k, self.xn, self.xq, self.xs, d)
+                              && drv.launch(k[10], (self.n_ff as u32).div_ceil(4), 128, &mut p!(qp, sp, gc, ga, h, nff, din)));
+                } else {
+                    timed!(7, drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)));
+                }
                 timed!(8, self.gemv(self.h, l.down, self.n_ff, self.dn));
                 // x = xy + dn, and in the same kernel xn = rmsnorm(x) * (next attn_norm | out_norm)
                 let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
@@ -536,7 +562,7 @@ pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64,
     if x.len() != cols { return None; }
     let g = DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
         has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
-        attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 } };
+        attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 }, q8x: false, xq: 0, xs: 0 };
     let (c, a) = w.ptrs(); let is_q6 = matches!(w, NativeWeight::Q6K { .. });
     let xd = drv.upload_f32(x)?; let od = drv.alloc(rows * 4)?;
     unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } }   // warm (PTX JIT etc.)
@@ -548,6 +574,35 @@ pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64,
     let mut out = vec![0f32; rows]; if !drv.dtoh(&mut out, od) { return None; }
     unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(od); }
     Some((us, out))
+}
+/// Q5_K GEMV with int8 activations (the FERRIC_CUDA_Q8X path): quantise + dp4a GEMV per call.
+pub fn bench_gemv_q8(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone(); drv.bind();
+    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    if x.len() != cols { return None; }
+    let k = drv.decode_kernels()?; let (c, a) = w.ptrs();
+    let (xd, xq, xs, od) = (drv.upload_f32(x)?, drv.alloc(cols * 4)?, drv.alloc(cols / 32 * 4)?, drv.alloc(rows * 4)?);
+    let run = |d: &Driver| -> bool { unsafe {
+        if !DecodeGraph::quant_x_static(d, k, xd, xq, xs, cols) { return false; }
+        let (mut qp, mut sp, mut cp, mut ap, mut op, mut o32, mut i32_) = (xq, xs, c, a, od, rows as u32, cols as u32);
+        let mut pr: [*mut c_void; 7] = [&mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut o32 as *mut _ as *mut c_void, &mut i32_ as *mut _ as *mut c_void];
+        d.launch(k[9], (rows as u32).div_ceil(4), 128, &mut pr) } };
+    if !run(&drv) || !drv.sync() { return None; }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { if !run(&drv) { return None; } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; rows]; if !drv.dtoh(&mut out, od) { return None; }
+    unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(xq); (drv.cu_mem_free)(xs); (drv.cu_mem_free)(od); }
+    Some((us, out))
+}
+impl DecodeGraph {
+    unsafe fn quant_x_static(d: &Driver, k: &[CUfunction; 11], x: CUdeviceptr, xq: CUdeviceptr, xs: CUdeviceptr, n: usize) -> bool {
+        let (mut xp, mut qp, mut sp, mut n32) = (x, xq, xs, n as u32);
+        let mut pr: [*mut c_void; 4] = [&mut xp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut n32 as *mut _ as *mut c_void];
+        d.launch(k[8], ((n / 32) as u32).div_ceil(4), 128, &mut pr)
+    }
 }
 /// Fused gate|up+SwiGLU microbench, same contract; `w` must be Q5_K with `2*n_ff` rows.
 pub fn bench_swiglu(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
@@ -661,7 +716,7 @@ mod tests {
     fn bare_graph(drv: &Arc<Driver>) -> DecodeGraph {
         DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
             has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
-            attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 } }
+            attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 }, q8x: false, xq: 0, xs: 0 }
     }
 
     /// Q6_K native GEMV vs the WGSL FLAT kernel through the hermetic seam (never the hooked entry).
@@ -681,6 +736,29 @@ mod tests {
         assert!(unsafe { g.gemv(xd, (c, a, true, out), inn, od) } && drv.sync());
         let mut got = vec![0f32; out]; assert!(drv.dtoh(&mut got, od));
         close("Q6_K gemv vs WGSL FLAT", &want, &got, 2e-4);
+    }
+
+    /// The int8-activation Q5_K GEMV vs the f32 WGSL FLAT kernel. ⚠ This one is EXPECTED to differ
+    /// beyond the 2e-4 the other tests use: the activation is quantised to int8 per 32 values. The
+    /// tolerance here (1.5e-2 relative) is the accuracy trade being measured, and the test prints the
+    /// actual number so the policy call can be made on it rather than on the tolerance.
+    #[test]
+    fn q5k_q8_gemv_vs_flat_wgsl_reports_the_accuracy_trade() {
+        let Some(ctx) = ctx_or_skip("q5k_q8_gemv_vs_flat_wgsl_reports_the_accuracy_trade") else { return };
+        let (inn, out) = (1024usize, 96usize);
+        let bytes = q_fixture(13, 176, out, inn, 0xA11CE);
+        let xv: Vec<f32> = (0..inn).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let x = crate::Tensor::from_vec(&ctx, &xv, &[1, inn]);
+        let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, 13, out, inn).expect("Q5_K");
+        let want = pollster::block_on(qm.q5k_flat_wgsl(&x).expect("single shard").to_vec());
+        let w = qm.native_weight().expect("mirror");
+        let (_, got) = bench_gemv_q8(&w, &xv, 1).expect("q8 path");
+        let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        let worst = want.iter().zip(&got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));
+        eprintln!("Q5_K int8-activation GEMV vs f32 WGSL FLAT: max |Δ| = {worst:.3e} on {scale:.3e}  (rel {:.2e})", worst / scale);
+        assert!(got.iter().all(|v| v.is_finite()));
+        assert!(worst > 0.0, "int8 activations cannot match f32 to the bit; an exact match means the f32 path ran");
+        assert!(worst < 1.5e-2 * scale, "q8 GEMV diverges more than the int8 budget: {worst:.3e}");
     }
 
     /// Fused gate|up + SwiGLU vs the WGSL composed path (FLAT matmul via the seam, then swiglu).
