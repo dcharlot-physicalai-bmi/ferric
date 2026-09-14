@@ -39,3 +39,7 @@ objc2-core-ml = { version = "0.3", features = [
 objc2-foundation = "0.3"
 half = "2"
 block2 = "0.6"
+
+# NVIDIA native tier: the CUDA driver API over dlopen. Already vendored (via ash); no new source.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+libloading = "0.8"

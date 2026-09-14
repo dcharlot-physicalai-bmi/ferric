@@ -29,6 +29,8 @@ pub mod nn; // transformer blocks expressed on the general runtime
 pub mod optim; // optimizers (Adam)
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 pub mod metal4;
+/// NVIDIA native tier (driver API over dlopen; linux/windows only). See `cuda.rs`.
+pub mod cuda;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_arch = "wasm32")))]
 pub mod npu_coreml; // Metal 4 tensor-unit GEMM backend (~280× the WGSL path on Apple silicon)
 #[cfg(not(target_arch = "wasm32"))]

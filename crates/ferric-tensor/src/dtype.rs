@@ -1110,6 +1110,13 @@ pub struct QMatrix {
 }
 
 impl QMatrix {
+    /// NVIDIA-tier Q5_K GEMV on a single-shard matrix, bypassing wgpu entirely — the seam the
+    /// driver test uses so it needs no env var. `None` off-tier, off-format, or if the kernel fails.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub fn cuda_q5k_gemv(&self, x: &[f32]) -> Option<Vec<f32>> {
+        let [QShard::Q5_K(w)] = &self.shards[..] else { return None };
+        w.cuda.as_ref()?.gemv(x, w.rows, w.cols)
+    }
     /// ggml block-size in bytes for a supported type, or None if we have no native matmul for it.
     pub fn block_bytes(ggml_type: u32) -> Option<(usize, usize)> {
         match ggml_type {          // (values per block, bytes per block)
@@ -1271,6 +1278,9 @@ pub struct Q5_KWeights {
     aux: Arc<wgpu::Buffer>,   // 4 u32/block: d|dmin, 12 scale bytes
     pub rows: usize,
     pub cols: usize,
+    /// NVIDIA-tier mirror of `codes`/`aux`, uploaded from the same host words. `None` off-tier.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub cuda: Option<crate::cuda::Q5KDev>,
 }
 
 impl Q5_KWeights {
@@ -1292,7 +1302,10 @@ impl Q5_KWeights {
             label: Some(label), contents: bytemuck::cast_slice(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         }));
-        Q5_KWeights { ctx: ctx.clone(), codes: mk("q5k.codes", &codes), aux: mk("q5k.aux", &aux), rows, cols }
+        Q5_KWeights {
+            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+            cuda: crate::cuda::Q5KDev::upload(&codes, &aux),
+            ctx: ctx.clone(), codes: mk("q5k.codes", &codes), aux: mk("q5k.aux", &aux), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 176 }
 }
@@ -1300,6 +1313,16 @@ impl Q5_KWeights {
 impl Tensor {
     /// y = x·Wᵀ where W is a packed **Q5_K** [out, in] weight, dequantized per-super-block in-kernel.
     pub fn matmul_q5_k(&self, w: &Q5_KWeights) -> Tensor {
+        // NVIDIA native tier first (opt-in, decode rows only); any `None` falls through to WGSL.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if self.shape[0] == 1 {
+            if let Some(dev) = &w.cuda {
+                let xv = pollster::block_on(self.contiguous().to_vec());
+                if let Some(out) = dev.gemv(&xv, w.rows, w.cols) {
+                    return Tensor::from_vec(&self.ctx, &out, &[1, w.rows]);
+                }
+            }
+        }
         let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
         self.matmul_q5_k_cfg(w, split, splitk_lanes_sub(w.cols / 256))
     }
