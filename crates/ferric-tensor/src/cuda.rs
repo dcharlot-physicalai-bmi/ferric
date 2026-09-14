@@ -30,6 +30,7 @@ type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUdeviceptr = u64;
 type CUstream = *mut c_void;
+type CUevent = *mut c_void;
 
 macro_rules! sym {
     ($lib:expr, $name:literal, $ty:ty) => {{
@@ -59,6 +60,11 @@ pub struct Driver {
     /// current context: allocations returned errors, and under test parallelism the driver
     /// segfaulted with no message. Every entry point now re-binds (idempotent, a per-thread slot).
     cu_ctx_set_current: unsafe extern "C" fn(CUcontext) -> CUresult,
+    // cuEvent* for the FERRIC_CUDA_PROFILE per-kernel-class breakdown (events on the null stream).
+    cu_event_create: unsafe extern "C" fn(*mut CUevent, u32) -> CUresult,
+    cu_event_record: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
+    cu_event_synchronize: unsafe extern "C" fn(CUevent) -> CUresult,
+    cu_event_elapsed: unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult,
     /// `cuDeviceGetName` of device 0, so the native tier can be NAMED in every harness header — the
     /// wgpu adapter line says nothing about which GPU libcuda opened.
     pub name: String,
@@ -91,6 +97,10 @@ impl Driver {
             cu_get_error_string: sym!(lib, "cuGetErrorString", unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult),
             cu_memcpy_dtod: sym!(lib, "cuMemcpyDtoD_v2", unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult),
             cu_ctx_set_current,
+            cu_event_create: sym!(lib, "cuEventCreate", unsafe extern "C" fn(*mut CUevent, u32) -> CUresult),
+            cu_event_record: sym!(lib, "cuEventRecord", unsafe extern "C" fn(CUevent, CUstream) -> CUresult),
+            cu_event_synchronize: sym!(lib, "cuEventSynchronize", unsafe extern "C" fn(CUevent) -> CUresult),
+            cu_event_elapsed: sym!(lib, "cuEventElapsedTime", unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult),
             _ctx: std::ptr::null_mut(),
             name: String::new(),
             gemv_q5k: OnceLock::new(),
@@ -349,6 +359,41 @@ pub struct GraphSpec<'a> {
     pub lm_head: NativeWeight<'a>,
 }
 
+/// `FERRIC_CUDA_PROFILE=1`: time each kernel CLASS of a step with cuEvents (a sync per class, so the
+/// profiled step is slower; the per-class numbers are what matter). Printed every 16 steps.
+struct Prof { on: bool, ev: [CUevent; 2], acc: [f64; 14], steps: u32 }
+const PROF_NAMES: [&str; 14] = ["attn_norm", "qkv_gemv", "qk_norm_rope", "kv_copy", "attn", "wo_gemv",
+                                "add_rmsnorm", "swiglu_gemv", "down_gemv", "vadd", "head_norm", "lm_head", "d2h", "h2d"];
+impl Prof {
+    fn new(drv: &Driver) -> Prof {
+        let on = std::env::var("FERRIC_CUDA_PROFILE").is_ok();
+        let mut ev: [CUevent; 2] = [std::ptr::null_mut(); 2];
+        if on { unsafe { (drv.cu_event_create)(&mut ev[0], 0); (drv.cu_event_create)(&mut ev[1], 0); } }
+        Prof { on, ev, acc: [0.0; 14], steps: 0 }
+    }
+    #[inline] fn start(&self, drv: &Driver) { if self.on { unsafe { (drv.cu_event_record)(self.ev[0], std::ptr::null_mut()); } } }
+    #[inline] fn stop(&mut self, drv: &Driver, cls: usize) {
+        if !self.on { return; }
+        unsafe {
+            (drv.cu_event_record)(self.ev[1], std::ptr::null_mut());
+            (drv.cu_event_synchronize)(self.ev[1]);
+            let mut ms = 0f32; (drv.cu_event_elapsed)(&mut ms, self.ev[0], self.ev[1]);
+            self.acc[cls] += ms as f64;
+        }
+    }
+    fn tick(&mut self) {
+        if !self.on { return; }
+        self.steps += 1;
+        if self.steps % 16 == 0 {
+            let tot: f64 = self.acc.iter().sum();
+            eprintln!("cuda profile: per-token GPU time by kernel class over {} steps (total {:.2} ms/tok):", self.steps, tot / self.steps as f64);
+            let mut rows: Vec<(usize, f64)> = self.acc.iter().copied().enumerate().collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (i, v) in rows { if v > 0.0 { eprintln!("   {:<13} {:>7.3} ms  {:>5.1}%", PROF_NAMES[i], v / self.steps as f64, v / tot * 100.0); } }
+        }
+    }
+}
+
 /// **Tier 2: one dense decode step, fully resident.** Activations, scratch and the K/V cache all live
 /// in device memory; per token the host copies ONE `[d]` embedding row in and ONE `[n_vocab]` logits
 /// row out. Nothing else crosses the bus. Prefill stays on WGSL; `seed_cache` copies its K/V in once.
@@ -363,6 +408,7 @@ pub struct DecodeGraph {
     q_out: usize, kv_out: usize,
     /// Rows of K/V currently valid in the device cache (== the position of the next token).
     pub len: usize,
+    prof: Prof,
 }
 impl DecodeGraph {
     pub fn build(spec: &GraphSpec<'_>) -> Option<DecodeGraph> {
@@ -396,7 +442,7 @@ impl DecodeGraph {
             q: drv.alloc(q_out * 4)?, k: drv.alloc(kv_out * 4)?, attn: drv.alloc(q_out * 4)?,
             y: drv.alloc(d * 4)?, xy: drv.alloc(d * 4)?, h: drv.alloc(spec.n_ff * 4)?, dn: drv.alloc(d * 4)?,
             logits: drv.alloc(spec.n_vocab * 4)?,
-            q_out, kv_out, len: 0, drv,
+            q_out, kv_out, len: 0, prof: Prof::new(&drv), drv,
         })
     }
     /// Copy a layer's K and V rows (`[len, nkv*dh]` each, host f32) into the device cache at row 0.
@@ -426,44 +472,49 @@ impl DecodeGraph {
         let (d, pos) = (self.d, self.len);
         let drv = self.drv.clone();
         drv.bind();
+        let mut prof = std::mem::replace(&mut self.prof, Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 });
+        prof.start(&drv);
         if !drv.htod(self.x, x_row) { return None; }
+        prof.stop(&drv, 13);
+        macro_rules! timed { ($cls:expr, $body:expr) => {{ prof.start(&drv); let ok: bool = $body; prof.stop(&drv, $cls); if !ok { self.prof = prof; return None; } }} }
         unsafe {
             macro_rules! p { ($($e:expr),*) => { [$( &mut $e as *mut _ as *mut c_void ),*] } }
             let (mut d32, mut eps) = (d as u32, self.eps);
             for l in &self.layers {
                 let (mut x, mut w, mut o) = (self.x, l.attn_norm, self.xn);
-                if !drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)) { return None; }
-                let mut off = 0usize;
-                for &(c, a, q6, rows) in &l.qkv {
-                    if !self.gemv(self.xn, (c, a, q6, rows), d, self.qkv + (off * 4) as u64) { return None; }
-                    off += rows;
-                }
+                timed!(0, drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)));
+                timed!(1, { let mut off = 0usize; let mut ok = true;
+                    for &(c, a, q6, rows) in &l.qkv { ok &= self.gemv(self.xn, (c, a, q6, rows), d, self.qkv + (off * 4) as u64); off += rows; } ok });
                 let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (self.qkv, l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), self.q, self.k);
                 let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
                 let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, self.q_out as u32, self.has_qk_norm as u32);
                 let heads = (self.nh + self.nkv) as u32;
-                if !drv.launch(k[5], heads.div_ceil(32), 32, &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn)) { return None; }
+                timed!(2, drv.launch(k[5], heads.div_ceil(32), 32, &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn)));
                 let rowb = (self.kv_out * 4) as u64;
-                if (drv.cu_memcpy_dtod)(l.k_cache + pos as u64 * rowb, self.k, self.kv_out * 4) != 0 { return None; }
-                if (drv.cu_memcpy_dtod)(l.v_cache + pos as u64 * rowb, self.qkv + ((self.q_out + self.kv_out) * 4) as u64, self.kv_out * 4) != 0 { return None; }
+                timed!(3, (drv.cu_memcpy_dtod)(l.k_cache + pos as u64 * rowb, self.k, self.kv_out * 4) == 0
+                       && (drv.cu_memcpy_dtod)(l.v_cache + pos as u64 * rowb, self.qkv + ((self.q_out + self.kv_out) * 4) as u64, self.kv_out * 4) == 0);
                 let (mut q, mut kc, mut vc, mut ao, mut s, mut scale) = (self.q, l.k_cache, l.v_cache, self.attn, (pos + 1) as u32, 1.0f32 / (self.dh as f32).sqrt());
-                if !drv.launch(k[6], self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)) { return None; }
-                if !self.gemv(self.attn, l.wo, self.q_out, self.y) { return None; }
+                timed!(4, drv.launch(k[6], self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)));
+                timed!(5, self.gemv(self.attn, l.wo, self.q_out, self.y));
                 let (mut x2, mut y2, mut fw, mut xy, mut xn) = (self.x, self.y, l.ffn_norm, self.xy, self.xn);
-                if !drv.launch(k[1], 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)) { return None; }
+                timed!(6, drv.launch(k[1], 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
                 let (mut xn2, mut gc, mut ga, mut h, mut nff, mut din) = (self.xn, l.gate_up.0, l.gate_up.1, self.h, self.n_ff as u32, d32);
-                if !drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)) { return None; }
-                if !self.gemv(self.h, l.down, self.n_ff, self.dn) { return None; }
+                timed!(7, drv.launch(k[4], (self.n_ff as u32).div_ceil(4), 128, &mut p!(xn2, gc, ga, h, nff, din)));
+                timed!(8, self.gemv(self.h, l.down, self.n_ff, self.dn));
                 let (mut a, mut b, mut o2, mut n) = (self.xy, self.dn, self.x, d32);
-                if !drv.launch(k[2], (d as u32).div_ceil(256), 256, &mut p!(a, b, o2, n)) { return None; }
+                timed!(9, drv.launch(k[2], (d as u32).div_ceil(256), 256, &mut p!(a, b, o2, n)));
             }
             let (mut x, mut w, mut o) = (self.x, self.out_norm, self.xn);
-            if !drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)) { return None; }
-            if !self.gemv(self.xn, self.lm_head, d, self.logits) { return None; }
+            timed!(10, drv.launch(k[0], 1, 256, &mut p!(x, w, o, d32, eps)));
+            timed!(11, self.gemv(self.xn, self.lm_head, d, self.logits));
         }
-        if !drv.sync() { return None; }
+        if !drv.sync() { self.prof = prof; return None; }
         let mut out = vec![0f32; self.n_vocab];
-        if !drv.dtoh(&mut out, self.logits) { return None; }
+        prof.start(&drv);
+        if !drv.dtoh(&mut out, self.logits) { self.prof = prof; return None; }
+        prof.stop(&drv, 12);
+        prof.tick();
+        self.prof = prof;
         self.len += 1;
         Some(out)
     }
@@ -479,7 +530,7 @@ pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64,
     if x.len() != cols { return None; }
     let g = DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
         has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
-        attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0 };
+        attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 } };
     let (c, a) = w.ptrs(); let is_q6 = matches!(w, NativeWeight::Q6K { .. });
     let xd = drv.upload_f32(x)?; let od = drv.alloc(rows * 4)?;
     unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } }   // warm (PTX JIT etc.)
@@ -604,7 +655,7 @@ mod tests {
     fn bare_graph(drv: &Arc<Driver>) -> DecodeGraph {
         DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
             has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
-            attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0 }
+            attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 } }
     }
 
     /// Q6_K native GEMV vs the WGSL FLAT kernel through the hermetic seam (never the hooked entry).
