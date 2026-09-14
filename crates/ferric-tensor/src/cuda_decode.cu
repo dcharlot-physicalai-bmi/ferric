@@ -85,63 +85,49 @@ __device__ __forceinline__ float q6_scb(const unsigned* __restrict__ aux, unsign
 // is = l>>4 constant; q1&q3 if sub<2 (l0 = 16sub) else q2&q4 (l0 = 16(sub-2)); qh uint4 = bytes
 // [32hf + l0, +16). One uint4 of ql + one of qh + 32 x floats per lane per block; 8 lanes cover the
 // block's 128 B of ql contiguously.
-__device__ __forceinline__ float q6k_block(const float* __restrict__ x, const unsigned* __restrict__ aux,
-                                           unsigned bi, unsigned blk, unsigned hf, bool second, unsigned l0,
-                                           unsigned is, uint4 ql, uint4 qh) {
-    const unsigned ab = bi * 5u;
-    const float d = f16_to_f32(aux[ab] & 0xffffu);
-    const unsigned sco = 8u * hf;
-    const float sA = d * q6_scb(aux, ab, sco + is + (second ? 2u : 0u));
-    const float sB = d * q6_scb(aux, ab, sco + is + (second ? 6u : 4u));
-    const float* xa = x + blk * 256u + 128u * hf + (second ? 32u : 0u) + l0;
-    const float* xb = xa + 64u;
-    const unsigned qlw[4] = {ql.x, ql.y, ql.z, ql.w}, qhw[4] = {qh.x, qh.y, qh.z, qh.w};
-    const unsigned shA = second ? 2u : 0u, shB = second ? 6u : 4u;
-    float accA = 0.f, accB = 0.f;
-    #pragma unroll
-    for (unsigned w = 0u; w < 4u; ++w) {
-        const float4 xA = *reinterpret_cast<const float4*>(xa + 4u * w);
-        const float4 xB = *reinterpret_cast<const float4*>(xb + 4u * w);
-        const unsigned lw = qlw[w], hw = qhw[w];
-        #define Q6(k, XA, XB) \
-            { const unsigned lb = (lw >> (8u * (k))) & 0xffu, hb = (hw >> (8u * (k))) & 0xffu; \
-              const int qA = (int)((lb & 0xFu) | (((hb >> shA) & 3u) << 4u)) - 32; \
-              const int qB = (int)((lb >> 4u)  | (((hb >> shB) & 3u) << 4u)) - 32; \
-              accA += (XA) * (float)qA; accB += (XB) * (float)qB; }
-        Q6(0u, xA.x, xB.x) Q6(1u, xA.y, xB.y) Q6(2u, xA.z, xB.z) Q6(3u, xA.w, xB.w)
-        #undef Q6
-    }
-    return sA * accA + sB * accB;
-}
 extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,
                                     const unsigned* __restrict__ aux, float* __restrict__ out,
                                     unsigned o_dim, unsigned in_dim) {
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
     const unsigned o = blockIdx.x * 4u + warp;
-    if (o >= o_dim) return;
+    if (o >= o_dim) return;                          // warp-uniform
     const unsigned nblk = in_dim / 256u;
     const unsigned sl = lane & 7u, bl = lane >> 3u;
     const unsigned hf = sl >> 2u, sub = sl & 3u;
-    const bool second = sub >= 2u;
+    const bool second = sub >= 2u;                   // q2&q4 instead of q1&q3
     const unsigned l0 = 16u * (second ? sub - 2u : sub);
-    const unsigned is = l0 >> 4u;
-    const unsigned qlo = (64u * hf + 16u * sub) / 4u, qho = 32u + (32u * hf + l0) / 4u;
+    const unsigned is = l0 >> 4u;                    // constant over the lane's 16 l's
     float acc = 0.f;
-    unsigned blk = bl;
-    for (; blk + 4u < nblk; blk += 8u) {
-        const unsigned biA = o * nblk + blk, biB = biA + 4u;
-        const uint4 qlA = *reinterpret_cast<const uint4*>(codes + biA * 48u + qlo);
-        const uint4 qhA = *reinterpret_cast<const uint4*>(codes + biA * 48u + qho);
-        const uint4 qlB = *reinterpret_cast<const uint4*>(codes + biB * 48u + qlo);
-        const uint4 qhB = *reinterpret_cast<const uint4*>(codes + biB * 48u + qho);
-        acc += q6k_block(x, aux, biA, blk, hf, second, l0, is, qlA, qhA);
-        acc += q6k_block(x, aux, biB, blk + 4u, hf, second, l0, is, qlB, qhB);
-    }
-    if (blk < nblk) {
-        const unsigned bi = o * nblk + blk;
-        const uint4 ql = *reinterpret_cast<const uint4*>(codes + bi * 48u + qlo);
-        const uint4 qh = *reinterpret_cast<const uint4*>(codes + bi * 48u + qho);
-        acc += q6k_block(x, aux, bi, blk, hf, second, l0, is, ql, qh);
+    for (unsigned blk = bl; blk < nblk; blk += 4u) {
+        const unsigned bi = o * nblk + blk, cb = bi * 48u, ab = bi * 5u;
+        const float d = f16_to_f32(aux[ab] & 0xffffu);
+        const unsigned sco = 8u * hf;
+        // the two scales this lane uses (q1,q3) or (q2,q4)
+        const float sA = d * q6_scb(aux, ab, sco + is + (second ? 2u : 0u));
+        const float sB = d * q6_scb(aux, ab, sco + is + (second ? 6u : 4u));
+        const uint4 ql = *reinterpret_cast<const uint4*>(codes + cb + (64u * hf + 16u * sub) / 4u);
+        const uint4 qh = *reinterpret_cast<const uint4*>(codes + cb + 32u + (32u * hf + l0) / 4u);
+        const float* xa = x + blk * 256u + 128u * hf + (second ? 32u : 0u) + l0;   // elem of q1 (or q2)
+        const float* xb = xa + 64u;                                               // elem of q3 (or q4)
+        const unsigned qlw[4] = {ql.x, ql.y, ql.z, ql.w}, qhw[4] = {qh.x, qh.y, qh.z, qh.w};
+        const unsigned shA = second ? 2u : 0u, shB = second ? 6u : 4u;   // qh bit-pair positions
+        float accA = 0.f, accB = 0.f;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xA = *reinterpret_cast<const float4*>(xa + 4u * w);
+            const float4 xB = *reinterpret_cast<const float4*>(xb + 4u * w);
+            const unsigned lw = qlw[w], hw = qhw[w];
+            #define Q6(k) \
+                { const unsigned lb = (lw >> (8u * (k))) & 0xffu, hb = (hw >> (8u * (k))) & 0xffu; \
+                  const int qA = (int)((lb & 0xFu) | (((hb >> shA) & 3u) << 4u)) - 32; \
+                  const int qB = (int)((lb >> 4u)  | (((hb >> shB) & 3u) << 4u)) - 32; \
+                  const float xv1 = (k)==0u?xA.x:(k)==1u?xA.y:(k)==2u?xA.z:xA.w; \
+                  const float xv2 = (k)==0u?xB.x:(k)==1u?xB.y:(k)==2u?xB.z:xB.w; \
+                  accA += xv1 * (float)qA; accB += xv2 * (float)qB; }
+            Q6(0u) Q6(1u) Q6(2u) Q6(3u)
+            #undef Q6
+        }
+        acc += sA * accA + sB * accB;
     }
     acc = warp_sum(acc);
     if (lane == 0u) out[o] = acc;
@@ -166,60 +152,41 @@ __device__ __forceinline__ void q5_scmin(const unsigned* __restrict__ aux, unsig
            sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); mn = (a >> 4u) | ((hi >> 6u) << 4u); }
     ds = d * (float)sc; mm = dmin * (float)mn;
 }
-__device__ __forceinline__ float q5k_block(const float* __restrict__ x, const unsigned* __restrict__ aux,
-                                           unsigned bi, unsigned blk, unsigned s0, unsigned s1, unsigned half,
-                                           uint4 q, uint4 h) {
-    const unsigned ab = bi * 4u;
-    const unsigned dd = aux[ab];
-    const float d = f16_to_f32(dd & 0xffffu), dmin = f16_to_f32(dd >> 16u);
-    float ds0, mm0, ds1, mm1;
-    q5_scmin(aux, ab, s0, d, dmin, ds0, mm0);
-    q5_scmin(aux, ab, s1, d, dmin, ds1, mm1);
-    const float* x0 = x + blk * 256u + 32u * s0 + 16u * half;
-    const float* x1 = x + blk * 256u + 32u * s1 + 16u * half;
-    const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
-    float a0 = 0.f, sx0 = 0.f, a1 = 0.f, sx1 = 0.f;
-    #pragma unroll
-    for (unsigned w = 0u; w < 4u; ++w) {
-        const float4 xa = *reinterpret_cast<const float4*>(x0 + 4u * w);
-        const float4 xb = *reinterpret_cast<const float4*>(x1 + 4u * w);
-        const unsigned word = qw[w], qhw = hw[w];
-        const float l0 = (float)(word & 0xfu)         + (float)((qhw >> s0) & 1u)         * 16.f;
-        const float l1 = (float)((word >> 8u) & 0xfu) + (float)((qhw >> (8u + s0)) & 1u)  * 16.f;
-        const float l2 = (float)((word >> 16u) & 0xfu)+ (float)((qhw >> (16u + s0)) & 1u) * 16.f;
-        const float l3 = (float)((word >> 24u) & 0xfu)+ (float)((qhw >> (24u + s0)) & 1u) * 16.f;
-        const float u0 = (float)((word >> 4u) & 0xfu) + (float)((qhw >> s1) & 1u)         * 16.f;
-        const float u1 = (float)((word >> 12u) & 0xfu)+ (float)((qhw >> (8u + s1)) & 1u)  * 16.f;
-        const float u2 = (float)((word >> 20u) & 0xfu)+ (float)((qhw >> (16u + s1)) & 1u) * 16.f;
-        const float u3 = (float)((word >> 28u) & 0xfu)+ (float)((qhw >> (24u + s1)) & 1u) * 16.f;
-        a0 += xa.x * l0 + xa.y * l1 + xa.z * l2 + xa.w * l3;  sx0 += xa.x + xa.y + xa.z + xa.w;
-        a1 += xb.x * u0 + xb.y * u1 + xb.z * u2 + xb.w * u3;  sx1 += xb.x + xb.y + xb.z + xb.w;
-    }
-    return ds0 * a0 - mm0 * sx0 + ds1 * a1 - mm1 * sx1;
-}
-// ⭐ ILP: two blocks per iteration with all four 16-byte weight loads issued before any arithmetic, so
-// each lane keeps 64 B in flight instead of 32. The per-block math is unchanged.
 __device__ __forceinline__ float q5k_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
                                               const unsigned* __restrict__ aux, unsigned o, unsigned nblk,
                                               unsigned bl, unsigned j) {
     const unsigned c = j >> 1u, half = j & 1u, s0 = 2u * c, s1 = s0 + 1u;
-    const unsigned qo = 8u * c + 4u * half, ho = 32u + 4u * half;
     float acc = 0.f;
-    unsigned blk = bl;
-    for (; blk + 4u < nblk; blk += 8u) {
-        const unsigned biA = o * nblk + blk, biB = biA + 4u;
-        const uint4 qA = *reinterpret_cast<const uint4*>(codes + biA * 40u + qo);
-        const uint4 hA = *reinterpret_cast<const uint4*>(codes + biA * 40u + ho);
-        const uint4 qB = *reinterpret_cast<const uint4*>(codes + biB * 40u + qo);
-        const uint4 hB = *reinterpret_cast<const uint4*>(codes + biB * 40u + ho);
-        acc += q5k_block(x, aux, biA, blk, s0, s1, half, qA, hA);
-        acc += q5k_block(x, aux, biB, blk + 4u, s0, s1, half, qB, hB);
-    }
-    if (blk < nblk) {
-        const unsigned bi = o * nblk + blk;
-        const uint4 q = *reinterpret_cast<const uint4*>(codes + bi * 40u + qo);
-        const uint4 h = *reinterpret_cast<const uint4*>(codes + bi * 40u + ho);
-        acc += q5k_block(x, aux, bi, blk, s0, s1, half, q, h);
+    for (unsigned blk = bl; blk < nblk; blk += 4u) {
+        const unsigned bi = o * nblk + blk, ab = bi * 4u, cb40 = bi * 40u;
+        const unsigned dd = aux[ab];
+        const float d = f16_to_f32(dd & 0xffffu), dmin = f16_to_f32(dd >> 16u);
+        float ds0, mm0, ds1, mm1;
+        q5_scmin(aux, ab, s0, d, dmin, ds0, mm0);
+        q5_scmin(aux, ab, s1, d, dmin, ds1, mm1);
+        const uint4 q = *reinterpret_cast<const uint4*>(codes + cb40 + 8u * c + 4u * half);   // 16 B of qs
+        const uint4 h = *reinterpret_cast<const uint4*>(codes + cb40 + 32u + 4u * half);      // 16 B of qh
+        const float* x0 = x + blk * 256u + 32u * s0 + 16u * half;
+        const float* x1 = x + blk * 256u + 32u * s1 + 16u * half;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
+        float a0 = 0.f, sx0 = 0.f, a1 = 0.f, sx1 = 0.f;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xa = *reinterpret_cast<const float4*>(x0 + 4u * w);
+            const float4 xb = *reinterpret_cast<const float4*>(x1 + 4u * w);
+            const unsigned word = qw[w], qhw = hw[w];
+            const float l0 = (float)(word & 0xfu)         + (float)((qhw >> s0) & 1u)         * 16.f;
+            const float l1 = (float)((word >> 8u) & 0xfu) + (float)((qhw >> (8u + s0)) & 1u)  * 16.f;
+            const float l2 = (float)((word >> 16u) & 0xfu)+ (float)((qhw >> (16u + s0)) & 1u) * 16.f;
+            const float l3 = (float)((word >> 24u) & 0xfu)+ (float)((qhw >> (24u + s0)) & 1u) * 16.f;
+            const float u0 = (float)((word >> 4u) & 0xfu) + (float)((qhw >> s1) & 1u)         * 16.f;
+            const float u1 = (float)((word >> 12u) & 0xfu)+ (float)((qhw >> (8u + s1)) & 1u)  * 16.f;
+            const float u2 = (float)((word >> 20u) & 0xfu)+ (float)((qhw >> (16u + s1)) & 1u) * 16.f;
+            const float u3 = (float)((word >> 28u) & 0xfu)+ (float)((qhw >> (24u + s1)) & 1u) * 16.f;
+            a0 += xa.x * l0 + xa.y * l1 + xa.z * l2 + xa.w * l3;  sx0 += xa.x + xa.y + xa.z + xa.w;
+            a1 += xb.x * u0 + xb.y * u1 + xb.z * u2 + xb.w * u3;  sx1 += xb.x + xb.y + xb.z + xb.w;
+        }
+        acc += ds0 * a0 - mm0 * sx0 + ds1 * a1 - mm1 * sx1;
     }
     return acc;
 }
