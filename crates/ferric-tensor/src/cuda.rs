@@ -628,6 +628,31 @@ pub fn bench_swiglu(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f6
     Some((us, out))
 }
 
+/// Fused gate|up+SwiGLU with int8 activations (FERRIC_CUDA_Q8X). Same contract as `bench_swiglu`,
+/// so the two are directly comparable — the swiglu shape is the LARGEST per-layer Q5_K weight read,
+/// and leaving it out of the table let the q8x rows cover under half of that traffic.
+pub fn bench_swiglu_q8(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone(); drv.bind();
+    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    if x.len() != cols || rows % 2 != 0 { return None; }
+    let n_ff = rows / 2; let k = drv.decode_kernels()?; let (c, a) = w.ptrs();
+    let (xd, xq, xs, od) = (drv.upload_f32(x)?, drv.alloc(cols * 4)?, drv.alloc(cols / 32 * 4)?, drv.alloc(n_ff * 4)?);
+    let run = |d: &Driver| -> bool { unsafe {
+        if !DecodeGraph::quant_x_static(d, k, xd, xq, xs, cols) { return false; }
+        let (mut qp, mut sp, mut cp, mut ap, mut op, mut nff, mut din) = (xq, xs, c, a, od, n_ff as u32, cols as u32);
+        let mut pr: [*mut c_void; 7] = [&mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut nff as *mut _ as *mut c_void, &mut din as *mut _ as *mut c_void];
+        d.launch(k[10], (n_ff as u32).div_ceil(4), 128, &mut pr) } };
+    if !run(&drv) || !drv.sync() { return None; }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { if !run(&drv) { return None; } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; n_ff]; if !drv.dtoh(&mut out, od) { return None; }
+    unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(xq); (drv.cu_mem_free)(xs); (drv.cu_mem_free)(od); }
+    Some((us, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
