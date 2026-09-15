@@ -94,9 +94,15 @@ features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. Measured (200
 | problem | vanilla | full | note |
 |---|---|---|---|
 | heat | 0.0448 | **0.0074** | Fourier scales `[0.5, 1]` set from the solution's frequency π; with the default `[1, 3]` the full recipe scored **0.3177** — the scale choice was the whole difference |
-| burgers (ν = 0.01/π) | **0.2079** | 0.5294 | the full recipe is 2.5× WORSE: its loss ends low (7.7e-3) on a wrong solution — a low residual on a shock problem is not a solved shock; the same recipe scored ~0.50 in the refinement fixture | `the_full_recipe_beats_vanilla_on_every_benchmark`
+| burgers (ν = 0.01/π) | **0.2079** | 0.5294 | the full recipe is 2.5× WORSE: its loss ends low (7.7e-3) on a wrong solution — a low residual on a shock problem is not a solved shock |
 | advection (β = 30) | 0.9144 | 1.0815 | unsolved by both — Krishnapriyan 2021's failure case, and the one causal training exists for; `Recipe::full()` carries no causal weighting (that is the `Causal` oracle) |
 | helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | unsolved by both at 4000 steps; the source paper trains ten times longer with NTK weighting, and reproduces exactly across runs here |
+
+⭐ **Two of four rows say the recipe as configured is not a free lunch, and that is the harness earning its
+keep.** It is one `Recipe` applied to four problems: the pieces each have their own fail-then-fix oracle
+above, but bundling them and pointing the bundle at an arbitrary PDE is a different claim, and on Burgers
+it is false. The rows are measurements; only `rel_l2.is_finite()` is asserted, and each row prints
+solved / partial / unsolved rather than passing or failing a bar chosen after the fact.
 prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage.

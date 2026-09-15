@@ -5,7 +5,7 @@
 
 use super::bench;
 use super::util::*;
-use super::{flatten, mse, scalar, unflatten, Act, FourierNet, Lbfgs, LossBalancer, Mlp};
+use super::{flatten, mse, scalar, unflatten, Act, Causal, FourierNet, Lbfgs, LossBalancer, Mlp, NtkBalancer};
 use crate::{Adam, Tensor, Var};
 use ferric_core::Context;
 use std::sync::Arc;
@@ -20,8 +20,15 @@ pub trait Problem {
     fn hi(&self) -> Vec<f64>;
     /// PDE residual at the `[N, dim]` points `x`, as `[N, 1]`, for the network `fwd`.
     fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var;
-    /// Mean-square loss of all boundary / initial / periodic constraints, sampled with `n` points each.
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var;
+    /// Boundary / initial / periodic constraint RESIDUALS, each `[·, 1]`, sampled with `n` points each.
+    ///
+    /// ⛔ Residual vectors, not a summed loss: an NTK trace is a property of the per-point Jacobian, and
+    /// summing first destroys it. The harness takes the mean square of each for the loss.
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var>;
+    /// Index of the time coordinate, if the problem is time-dependent — the axis causal weighting slabs.
+    fn time_axis(&self) -> Option<usize> {
+        None
+    }
     fn reference(&self, x: &[f64]) -> f64;
     /// Fourier-feature scales that suit the problem's frequency content.
     fn scales(&self) -> Vec<f32> {
@@ -36,6 +43,17 @@ pub enum Net {
     Fourier { m_per_scale: usize, hidden: Vec<usize> },
 }
 
+/// How the residual and constraint terms are weighted against each other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Weighting {
+    /// One fixed multiplier on every constraint term.
+    Fixed(f32),
+    /// Gradient-norm balancing — equalises how hard each term PULLS (arXiv 2001.04536).
+    GradNorm,
+    /// NTK-trace balancing — equalises how fast each term's error DECAYS (arXiv 2007.14527).
+    Ntk,
+}
+
 /// A named training recipe.
 #[derive(Clone, Debug)]
 pub struct Recipe {
@@ -44,18 +62,29 @@ pub struct Recipe {
     pub adam_steps: usize,
     pub lr: f32,
     pub lbfgs_iters: usize,
-    pub balance: bool,
-    pub bc_weight: f32,
+    pub weighting: Weighting,
+    /// Causal weighting in time with this many slabs (arXiv 2203.07404). Requires `Problem::time_axis`.
+    pub causal_slabs: Option<usize>,
 }
 
 impl Recipe {
     /// The classic: tanh MLP, Adam, fixed boundary weight.
     pub fn vanilla() -> Self {
-        Recipe { name: "vanilla", net: Net::TanhMlp { hidden: vec![64, 64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 0, balance: false, bc_weight: 10.0 }
+        Recipe { name: "vanilla", net: Net::TanhMlp { hidden: vec![64, 64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 0, weighting: Weighting::Fixed(10.0), causal_slabs: None }
     }
     /// Fourier features + gradient-norm balancing + Adam then strong-Wolfe L-BFGS.
     pub fn full() -> Self {
-        Recipe { name: "fourier+balance+lbfgs", net: Net::Fourier { m_per_scale: 32, hidden: vec![64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 500, balance: true, bc_weight: 1.0 }
+        Recipe { name: "fourier+balance+lbfgs", net: Net::Fourier { m_per_scale: 32, hidden: vec![64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 500, weighting: Weighting::GradNorm, causal_slabs: None }
+    }
+    /// The full recipe with NTK-trace weighting instead of gradient-norm — what jaxpi/PirateNets run, and
+    /// what the Helmholtz row of the benchmark table names as missing.
+    pub fn ntk() -> Self {
+        Recipe { name: "fourier+ntk+lbfgs", weighting: Weighting::Ntk, ..Self::full() }
+    }
+    /// The full recipe plus causal weighting in time — for the problems where a vanilla PINN fits a later
+    /// time first and lands on a wrong branch (advection at beta = 30, the reaction equation).
+    pub fn causal(slabs: usize) -> Self {
+        Recipe { name: "fourier+causal+lbfgs", causal_slabs: Some(slabs), ..Self::full() }
     }
 }
 
@@ -101,25 +130,67 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
             NetImpl::Fourier(f) => f.forward(pv, x),
         }
     };
-    let losses = |pv: &[Var], it: u32| -> (Var, Var) {
+    // per-point residual and constraint residual VECTORS; the loss takes their mean squares
+    let terms = |pv: &[Var], it: u32| -> Vec<Var> {
         let fwd = |x: &Var| forward(pv, x);
         let xv = leaf(ctx, colloc, &[n, d]);
-        let r = problem.residual(ctx, &fwd, &xv, n);
-        (mse(&r), problem.constraints(ctx, &fwd, 200, seed.wrapping_add(it)))
+        let mut v = vec![problem.residual(ctx, &fwd, &xv, n)];
+        v.extend(problem.constraints(ctx, &fwd, 200, seed.wrapping_add(it)));
+        v
     };
+    // causal slab index of each collocation point, from the problem's time axis
+    let slab: Option<Vec<usize>> = recipe.causal_slabs.and_then(|k| {
+        problem.time_axis().map(|ax| {
+            let (lo, hi) = (problem.lo()[ax], problem.hi()[ax]);
+            colloc
+                .chunks(d)
+                .map(|p| {
+                    let f = ((p[ax] as f64 - lo) / (hi - lo)).clamp(0.0, 0.999);
+                    (f * k as f64) as usize
+                })
+                .collect()
+        })
+    });
 
     let mut wp = params0;
-    let mut bal = LossBalancer::new(2, 0.1);
+    let n_terms = 1 + problem.constraints(ctx, &|x: &Var| forward(&vars(&wp), x), 8, 0).len();
+    let mut bal = LossBalancer::new(n_terms, 0.1);
+    let mut ntk = NtkBalancer::new(n_terms, 4, 0.5);
+    let mut causal = recipe.causal_slabs.map(|_| Causal::new(vec![1e-2, 1e-1, 1.0, 10.0, 100.0], 0.99));
     let loss_after_adam = pollster::block_on(async {
         let mut adam = Adam::new(&wp, recipe.lr);
         let mut last = f32::NAN;
         for it in 0..recipe.adam_steps {
             let pv = vars(&wp);
-            let (l_res, l_bc) = losses(&pv, it as u32);
-            if recipe.balance && it % 100 == 0 {
-                bal.update(&[l_res.clone(), l_bc.clone()], &pv).await;
+            let mut t = terms(&pv, it as u32);
+            // causal weighting multiplies the RESIDUAL term's points by sqrt(w) before the mean square
+            if let (Some(cz), Some(sl), Some(k)) = (causal.as_mut(), slab.as_ref(), recipe.causal_slabs) {
+                let r = t[0].value().to_vec().await;
+                let w = cz.weights(&Causal::slab_losses(&r, sl, k));
+                t[0] = t[0].mul(&Causal::point_weights(ctx, &w, sl).sqrt());
             }
-            let loss = if recipe.balance { bal.combine(&[l_res, l_bc]) } else { l_res.add(&l_bc.mul(&scalar(&l_bc, recipe.bc_weight))) };
+            let loss = match recipe.weighting {
+                Weighting::Fixed(w) => {
+                    let mut l = mse(&t[0]);
+                    for c in &t[1..] {
+                        l = l.add(&mse(c).mul(&scalar(c, w)));
+                    }
+                    l
+                }
+                Weighting::GradNorm => {
+                    let ls: Vec<Var> = t.iter().map(mse).collect();
+                    if it % 100 == 0 {
+                        bal.update(&ls, &pv).await;
+                    }
+                    bal.combine(&ls)
+                }
+                Weighting::Ntk => {
+                    if it % 100 == 0 {
+                        ntk.update(ctx, &t, &pv, it as u32);
+                    }
+                    ntk.combine(&t)
+                }
+            };
             last = step(ctx, &loss, &pv, &mut wp, &mut adam).await;
         }
         last
@@ -128,12 +199,19 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
     if recipe.lbfgs_iters > 0 {
         let shapes: Vec<Vec<usize>> = wp.iter().map(|t| t.shape.clone()).collect();
         let x0 = pollster::block_on(flatten(&wp));
-        let w_bc = if recipe.balance { bal.weights[1] } else { recipe.bc_weight };
+        let w_final: Vec<f32> = match recipe.weighting {
+            Weighting::Fixed(w) => std::iter::once(1.0).chain(std::iter::repeat_n(w, n_terms - 1)).collect(),
+            Weighting::GradNorm => bal.weights.clone(),
+            Weighting::Ntk => ntk.weights.clone(),
+        };
         let evaluate = |flat: &[f32]| -> (f32, Vec<f32>) {
             let ts = unflatten(ctx, flat, &shapes);
             let pv = vars(&ts);
-            let (l_res, l_bc) = losses(&pv, 0);
-            let loss = l_res.add(&l_bc.mul(&scalar(&l_bc, w_bc)));
+            let t = terms(&pv, 0);
+            let mut loss = mse(&t[0]).mul(&scalar(&t[0], w_final[0]));
+            for (c, &w) in t[1..].iter().zip(&w_final[1..]) {
+                loss = loss.add(&mse(c).mul(&scalar(c, w)));
+            }
             loss.backward();
             pollster::block_on(async {
                 let v = loss.value().to_vec().await[0];
@@ -186,14 +264,17 @@ impl Problem for Burgers {
         let u_xx = dcol(ctx, &u_x, x, n, 2, 0);
         u_t.add(&u.mul(&u_x)).sub(&u_xx.mul(&scalar(&u_xx, self.nu as f32)))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
         let xs: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed ^ 0x5151) - 1.0).collect();
         let bl: Vec<f32> = t.iter().flat_map(|&t| [-1.0, t]).collect();
         let br: Vec<f32> = t.iter().flat_map(|&t| [1.0, t]).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| -(std::f32::consts::PI * x).sin()).collect();
-        mse(&fwd(&leaf(ctx, &bl, &[n, 2]))).add(&mse(&fwd(&leaf(ctx, &br, &[n, 2])))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+        vec![fwd(&leaf(ctx, &bl, &[n, 2])), fwd(&leaf(ctx, &br, &[n, 2])), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+    }
+    fn time_axis(&self) -> Option<usize> {
+        Some(1)
     }
     fn reference(&self, x: &[f64]) -> f64 {
         bench::burgers(x[0], x[1], self.nu)
@@ -232,13 +313,13 @@ impl Problem for Helmholtz {
         let q: Vec<f32> = pts.chunks(2).map(|p| bench::helmholtz(p[0] as f64, p[1] as f64, self.a1, self.a2, self.k).1 as f32).collect();
         lap.add(&u.mul(&scalar(&u, (self.k * self.k) as f32))).sub(&col(ctx, &q))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let s: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed) - 1.0).collect();
         let mut b = Vec::with_capacity(8 * n);
         for &v in &s {
             b.extend([-1.0, v, 1.0, v, v, -1.0, v, 1.0]);
         }
-        mse(&fwd(&leaf(ctx, &b, &[4 * n, 2])))
+        vec![fwd(&leaf(ctx, &b, &[4 * n, 2]))]
     }
     fn reference(&self, x: &[f64]) -> f64 {
         bench::helmholtz(x[0], x[1], self.a1, self.a2, self.k).0
@@ -269,13 +350,16 @@ impl Problem for Heat {
         let u_x = dcol(ctx, &u, x, n, 2, 0);
         u_t.sub(&dcol(ctx, &u_x, x, n, 2, 0))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
         let xs: Vec<f32> = (0..n).map(|i| u01(i as u32, seed ^ 0x77)).collect();
         let b: Vec<f32> = t.iter().flat_map(|&t| [0.0, t, 1.0, t]).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| (std::f32::consts::PI * x).sin()).collect();
-        mse(&fwd(&leaf(ctx, &b, &[2 * n, 2]))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+        vec![fwd(&leaf(ctx, &b, &[2 * n, 2])), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+    }
+    fn time_axis(&self) -> Option<usize> {
+        Some(1)
     }
     fn reference(&self, x: &[f64]) -> f64 {
         bench::heat(x[0], x[1])
@@ -310,14 +394,17 @@ impl Problem for Advection {
         let u_x = dcol(ctx, &u, x, n, 2, 0);
         u_t.add(&u_x.mul(&scalar(&u_x, self.beta as f32)))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
         let xs: Vec<f32> = (0..n).map(|i| std::f32::consts::TAU * u01(i as u32, seed ^ 0x99)).collect();
         let l: Vec<f32> = t.iter().flat_map(|&t| [0.0, t]).collect();
         let r: Vec<f32> = t.iter().flat_map(|&t| [std::f32::consts::TAU, t]).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| x.sin()).collect();
-        mse(&fwd(&leaf(ctx, &l, &[n, 2])).sub(&fwd(&leaf(ctx, &r, &[n, 2])))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+        vec![fwd(&leaf(ctx, &l, &[n, 2])).sub(&fwd(&leaf(ctx, &r, &[n, 2]))), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+    }
+    fn time_axis(&self) -> Option<usize> {
+        Some(1)
     }
     fn reference(&self, x: &[f64]) -> f64 {
         bench::advection(x[0], x[1], self.beta)
@@ -373,6 +460,38 @@ mod tests {
     fn benchmark_helmholtz() {
         bench_one(&Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 }, 2000, 1);
     }
+
+    /// One problem against a named list of recipes — for the rows where the table says a specific piece
+    /// is missing. Prints; asserts only that each score is a number.
+    fn compare(p: &dyn Problem, recipes: &[Recipe], colloc_n: usize, seed: u32) -> Vec<Report> {
+        let ctx = ctx();
+        let colloc = box_points(&p.lo(), &p.hi(), colloc_n, 7);
+        recipes
+            .iter()
+            .map(|r| {
+                let rep = run(&ctx, p, r, &colloc, 51, seed);
+                eprintln!("  {:<12} {:<24} rel-L2 {:.4}  ({:.0}s, loss {:.1e} -> {:.1e})", p.name(), rep.recipe, rep.rel_l2, rep.secs, rep.loss_after_adam, rep.loss_final);
+                assert!(rep.rel_l2.is_finite(), "{} produced a non-finite score", rep.recipe);
+                rep
+            })
+            .collect()
+    }
+
+    /// ⭐ **Helmholtz, where the table said NTK weighting was the missing piece** — gradient-norm against
+    /// NTK-trace weighting, same net, same steps, same points.
+    #[ignore = "two trainings on the GPU (~14 min); run with -- --ignored"]
+    #[test]
+    fn helmholtz_gradnorm_against_ntk_weighting() {
+        compare(&Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 }, &[Recipe::full(), Recipe::ntk()], 2000, 1);
+    }
+
+    /// ⭐ **Advection at β = 30, where the table said causal weighting was the missing piece** — the full
+    /// recipe against the same recipe with causal weighting in time.
+    #[ignore = "two trainings on the GPU (~10 min); run with -- --ignored"]
+    #[test]
+    fn advection_with_and_without_causal_weighting() {
+        compare(&Advection { beta: 30.0 }, &[Recipe::full(), Recipe::causal(16)], 2000, 1);
+    }
     #[ignore = "two trainings on the GPU (~12 min); run with -- --ignored"]
     #[test]
     fn benchmark_burgers() {
@@ -405,10 +524,13 @@ mod tests {
             let mut wp = net.params.clone();
             pollster::block_on(async {
                 let mut adam = Adam::new(&wp, 1e-3);
-                for it in 0..3000usize {
+                // ⚠ 1500, not 3000: this warm-up exists only to produce a residual field good enough to
+                // SELECT points from — the scoring runs are the two full-recipe solves below, and at
+                // 3000 the whole test exceeded a 40-minute budget twice.
+                for it in 0..1500usize {
                     let pv = vars(&wp);
                     let fwd = |x: &Var| net.forward(&pv, x);
-                    if it > 0 && it % 500 == 0 && pts.len() / 2 < 2540 {
+                    if it > 0 && it % 250 == 0 && pts.len() / 2 < 2540 {
                         let nc = cand.len() / 2;
                         let cv = leaf(&ctx, &cand, &[nc, 2]);
                         let r = p.residual(&ctx, &fwd, &cv, nc).value().to_vec().await;
@@ -418,7 +540,10 @@ mod tests {
                     }
                     let n = pts.len() / 2;
                     let xv = leaf(&ctx, &pts, &[n, 2]);
-                    let loss = train::mse(&p.residual(&ctx, &fwd, &xv, n)).add(&p.constraints(&ctx, &fwd, 200, it as u32));
+                    let mut loss = train::mse(&p.residual(&ctx, &fwd, &xv, n));
+                    for c in p.constraints(&ctx, &fwd, 200, it as u32) {
+                        loss = loss.add(&train::mse(&c));
+                    }
                     step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
                 }
             });

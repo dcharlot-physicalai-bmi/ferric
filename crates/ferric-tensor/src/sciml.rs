@@ -16,6 +16,7 @@ pub mod features;
 pub mod geometry;
 pub mod harness;
 pub mod lbfgs;
+pub mod ntk;
 pub mod operators;
 pub mod train;
 pub mod util;
@@ -23,6 +24,7 @@ pub mod util;
 mod oracles;
 pub use features::FourierNet;
 pub use lbfgs::{Lbfgs, LbfgsResult, LbfgsStop};
+pub use ntk::NtkBalancer;
 pub use train::{flatten, mse, rar_select, scalar, unflatten, Causal, LossBalancer, Rba};
 
 /// Hidden-layer activation for [`Mlp::forward_act`] and [`FourierNet`]. `Sin` is the SIREN choice

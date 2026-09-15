@@ -39,7 +39,7 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub mod sciml; // physics-informed / scientific-ML building blocks (SIREN PINN net + differentiable deriv)
 pub use autograd::{grad, Var};
-pub use sciml::{deriv, flatten, mse, rar_select, scalar, unflatten, Act, Causal, FourierNet, Lbfgs, LbfgsResult, LbfgsStop, LossBalancer, Mlp, Rba, Siren};
+pub use sciml::{deriv, flatten, mse, rar_select, scalar, unflatten, Act, Causal, FourierNet, Lbfgs, LbfgsResult, LbfgsStop, LossBalancer, Mlp, NtkBalancer, Rba, Siren};
 pub mod image; // PPM in, preprocessed tensor out — no image-codec dependency
 pub use dtype::{Iq4XsWeights, Iq4NlWeights, Mxfp4Weights, DType, Half, QMatrix, QShard, Q2_0Weights, Q4_0Weights, Q4_1Weights, Q5_0Weights, Q5_1Weights, Q4_KWeights, Q5_KWeights, Q6_KWeights, Q8_0Weights, QRow, QTensor, Ternary};
 pub use optim::Adam;
