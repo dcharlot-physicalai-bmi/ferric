@@ -795,7 +795,7 @@ mod tests {
         let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, 13, out, inn).expect("Q5_K");
         let want = pollster::block_on(qm.q5k_flat_wgsl(&x).expect("single shard").to_vec());
         let w = qm.native_weight().expect("mirror");
-        let (_, got) = bench_gemv_q8(&w, &xv, 1).expect("q8 path");
+        let (_, got) = bench_gemv_q8(std::slice::from_ref(&w), &xv, 1).expect("q8 path");
         let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs()));
         let worst = want.iter().zip(&got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));
         eprintln!("Q5_K int8-activation GEMV vs f32 WGSL FLAT: max |Δ| = {worst:.3e} on {scale:.3e}  (rel {:.2e})", worst / scale);
