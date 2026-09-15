@@ -1,6 +1,9 @@
 //! **Native-tier GEMV microbench at the real decode shapes.** Which kernel/shape is furthest from the
 //! bandwidth floor? That is where kernel work starts. Needs `FERRIC_CUDA=1` and an NVIDIA driver.
 //!
+//! ⛔ Each shape is measured over a ROTATING SET of distinct weights totalling >2x L2. Decode reads
+//! every weight once per token out of a 444 MB model; a loop over ONE sub-L2 weight measures cache.
+//!
 //!   FERRIC_CUDA=1 cargo run -p ferric-tensor --release --example cuda_gemv_bench
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 fn main() {
@@ -24,16 +27,25 @@ fn main() {
         ("attn q+k  (Q5_K)", 1024, 3072, 13), ("attn v    (Q6_K)", 1024, 1024, 14), ("attn wo   (Q5_K)", 2048, 1024, 13),
         ("ffn gate|up swiglu (Q5_K)", 1024, 6144, 13), ("ffn down  (Q6_K)", 3072, 1024, 14), ("lm_head   (Q6_K)", 1024, 151936, 14),
     ];
-    println!("{:<28} {:>9} {:>10} {:>9}   (floor: bytes / ~192 GB/s)", "shape", "MiB", "us/call", "GB/s");
+    println!("{:<28} {:>9} {:>10} {:>9}   (floor: bytes / 192.0 GB/s DRAM; weights rotated past L2)", "shape", "MiB", "us/call", "GB/s");
     for (label, inn, out, ty) in shapes {
         let (vals, bpb) = QMatrix::block_bytes(ty).unwrap();
         let bytes = blk(out * (inn / vals) * bpb, ty, bpb);
         let x: Vec<f32> = (0..inn).map(|i| ((i as f32) * 0.37).sin()).collect();
-        let qm = QMatrix::from_bytes(&ctx, &bytes, ty, out, inn).expect("qmatrix");
-        let w = qm.native_weight().expect("native mirror (FERRIC_CUDA set?)");
-        let r = if label.contains("swiglu") { cuda::bench_swiglu(&w, &x, 200) } else { cuda::bench_gemv(&w, &x, 200) };
+        // ⛔ ONE weight looped 200x MEASURES L2, NOT DRAM. This card's L2 is 24 MiB (cuDeviceGetAttribute
+        // 38) and DRAM is exactly 192.0 GB/s (8001 MHz x2 x 96b). Every shape here except lm_head is
+        // under 24 MiB, so the old single-weight loop re-read a CACHE-RESIDENT weight and reported
+        // 217 GB/s for the q8x swiglu -- ABOVE the DRAM ceiling, which is the tell. Rotate over enough
+        // DISTINCT copies to exceed L2 twice over, so each read is a real memory read like decode's.
+        let reps = (2 * 24 * 1024 * 1024 / bytes.len().max(1)).max(1);
+        let qms: Vec<_> = (0..reps).map(|_| {
+            let b = blk(out * (inn / vals) * bpb, ty, bpb);   // distinct bytes: no dedup, no reuse
+            QMatrix::from_bytes(&ctx, &b, ty, out, inn).expect("qmatrix")
+        }).collect();
+        let ws: Vec<_> = qms.iter().map(|q| q.native_weight().expect("native mirror (FERRIC_CUDA set?)")).collect();
+        let r = if label.contains("swiglu") { cuda::bench_swiglu(&ws, &x, 200) } else { cuda::bench_gemv(&ws, &x, 200) };
         if ty == 13 {
-            let q8 = if label.contains("swiglu") { cuda::bench_swiglu_q8(&w, &x, 200) } else { cuda::bench_gemv_q8(&w, &x, 200) };
+            let q8 = if label.contains("swiglu") { cuda::bench_swiglu_q8(&ws, &x, 200) } else { cuda::bench_gemv_q8(&ws, &x, 200) };
             if let Some((us8, _)) = q8 {
                 println!("{:<28} {:>9.2} {us8:>10.1} {:>9.1}   ← int8 activations + dp4a (quantise incl.)",
                          format!("  ↳ q8x  {}", label.trim()), bytes.len() as f64 / 1048576.0, bytes.len() as f64 / (us8 * 1e-6) / 1e9);

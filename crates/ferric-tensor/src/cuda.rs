@@ -555,20 +555,23 @@ impl DecodeGraph {
 /// **Per-kernel microbench for the native GEMVs** — `iters` back-to-back launches on one weight, one
 /// sync, returns (µs per call, the output). Used by `examples/cuda_gemv_bench.rs` to say WHICH decode
 /// shape is furthest from the bandwidth floor, so kernel work starts where the bytes are.
-pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+pub fn bench_gemv(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
     let drv = driver()?.clone();
     drv.bind();
+    let w = ws.first()?;
     let (cols, rows) = (w.cols(), w.rows());
     if x.len() != cols { return None; }
     let g = DecodeGraph { drv: drv.clone(), d: 0, nh: 0, nkv: 0, dh: 0, n_ff: 0, n_vocab: 0, eps: 0.0, rope_base: 0.0,
         has_qk_norm: false, cap: 0, layers: vec![], out_norm: 0, lm_head: (0, 0, false, 0), x: 0, xn: 0, qkv: 0, q: 0, k: 0,
         attn: 0, y: 0, xy: 0, h: 0, dn: 0, logits: 0, q_out: 0, kv_out: 0, len: 0, prof: Prof { on: false, ev: [std::ptr::null_mut(); 2], acc: [0.0; 14], steps: 0 }, q8x: false, xq: 0, xs: 0 };
-    let (c, a) = w.ptrs(); let is_q6 = matches!(w, NativeWeight::Q6K { .. });
+    let is_q6 = matches!(w, NativeWeight::Q6K { .. });
+    let (c, a) = w.ptrs();
     let xd = drv.upload_f32(x)?; let od = drv.alloc(rows * 4)?;
     unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } }   // warm (PTX JIT etc.)
     if !drv.sync() { return None; }
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } } }
+    for i in 0..iters { let (c, a) = ws[i % ws.len()].ptrs();
+        unsafe { if !g.gemv(xd, (c, a, is_q6, rows), cols, od) { return None; } } }
     if !drv.sync() { return None; }
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let mut out = vec![0f32; rows]; if !drv.dtoh(&mut out, od) { return None; }
@@ -576,21 +579,21 @@ pub fn bench_gemv(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64,
     Some((us, out))
 }
 /// Q5_K GEMV with int8 activations (the FERRIC_CUDA_Q8X path): quantise + dp4a GEMV per call.
-pub fn bench_gemv_q8(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+pub fn bench_gemv_q8(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
     let drv = driver()?.clone(); drv.bind();
-    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    let NativeWeight::Q5K { rows, cols, .. } = *ws.first()? else { return None };
     if x.len() != cols { return None; }
-    let k = drv.decode_kernels()?; let (c, a) = w.ptrs();
+    let k = drv.decode_kernels()?;
     let (xd, xq, xs, od) = (drv.upload_f32(x)?, drv.alloc(cols * 4)?, drv.alloc(cols / 32 * 4)?, drv.alloc(rows * 4)?);
-    let run = |d: &Driver| -> bool { unsafe {
+    let run = |d: &Driver, (c, a): (CUdeviceptr, CUdeviceptr)| -> bool { unsafe {
         if !DecodeGraph::quant_x_static(d, k, xd, xq, xs, cols) { return false; }
         let (mut qp, mut sp, mut cp, mut ap, mut op, mut o32, mut i32_) = (xq, xs, c, a, od, rows as u32, cols as u32);
         let mut pr: [*mut c_void; 7] = [&mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
             &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut o32 as *mut _ as *mut c_void, &mut i32_ as *mut _ as *mut c_void];
         d.launch(k[9], (rows as u32).div_ceil(4), 128, &mut pr) } };
-    if !run(&drv) || !drv.sync() { return None; }
+    if !run(&drv, ws[0].ptrs()) || !drv.sync() { return None; }
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { if !run(&drv) { return None; } }
+    for i in 0..iters { if !run(&drv, ws[i % ws.len()].ptrs()) { return None; } }
     if !drv.sync() { return None; }
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let mut out = vec![0f32; rows]; if !drv.dtoh(&mut out, od) { return None; }
@@ -605,22 +608,21 @@ impl DecodeGraph {
     }
 }
 /// Fused gate|up+SwiGLU microbench, same contract; `w` must be Q5_K with `2*n_ff` rows.
-pub fn bench_swiglu(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+pub fn bench_swiglu(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
     let drv = driver()?.clone();
     drv.bind();
-    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    let NativeWeight::Q5K { rows, cols, .. } = *ws.first()? else { return None };
     if x.len() != cols || rows % 2 != 0 { return None; }
     let n_ff = rows / 2; let k = drv.decode_kernels()?;
-    let (c, a) = w.ptrs();
     let xd = drv.upload_f32(x)?; let od = drv.alloc(n_ff * 4)?;
-    let run = |drv: &Driver| -> bool { unsafe {
+    let run = |drv: &Driver, (c, a): (CUdeviceptr, CUdeviceptr)| -> bool { unsafe {
         let (mut xp, mut cp, mut ap, mut op, mut nff, mut din) = (xd, c, a, od, n_ff as u32, cols as u32);
         let mut pr: [*mut c_void; 6] = [&mut xp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void, &mut ap as *mut _ as *mut c_void,
                                         &mut op as *mut _ as *mut c_void, &mut nff as *mut _ as *mut c_void, &mut din as *mut _ as *mut c_void];
         drv.launch(k[4], (n_ff as u32).div_ceil(4), 128, &mut pr) } };
-    if !run(&drv) || !drv.sync() { return None; }
+    if !run(&drv, ws[0].ptrs()) || !drv.sync() { return None; }
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { if !run(&drv) { return None; } }
+    for i in 0..iters { if !run(&drv, ws[i % ws.len()].ptrs()) { return None; } }
     if !drv.sync() { return None; }
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let mut out = vec![0f32; n_ff]; if !drv.dtoh(&mut out, od) { return None; }
@@ -631,21 +633,21 @@ pub fn bench_swiglu(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f6
 /// Fused gate|up+SwiGLU with int8 activations (FERRIC_CUDA_Q8X). Same contract as `bench_swiglu`,
 /// so the two are directly comparable — the swiglu shape is the LARGEST per-layer Q5_K weight read,
 /// and leaving it out of the table let the q8x rows cover under half of that traffic.
-pub fn bench_swiglu_q8(w: &NativeWeight<'_>, x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
+pub fn bench_swiglu_q8(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> {
     let drv = driver()?.clone(); drv.bind();
-    let NativeWeight::Q5K { rows, cols, .. } = *w else { return None };
+    let NativeWeight::Q5K { rows, cols, .. } = *ws.first()? else { return None };
     if x.len() != cols || rows % 2 != 0 { return None; }
-    let n_ff = rows / 2; let k = drv.decode_kernels()?; let (c, a) = w.ptrs();
+    let n_ff = rows / 2; let k = drv.decode_kernels()?;
     let (xd, xq, xs, od) = (drv.upload_f32(x)?, drv.alloc(cols * 4)?, drv.alloc(cols / 32 * 4)?, drv.alloc(n_ff * 4)?);
-    let run = |d: &Driver| -> bool { unsafe {
+    let run = |d: &Driver, (c, a): (CUdeviceptr, CUdeviceptr)| -> bool { unsafe {
         if !DecodeGraph::quant_x_static(d, k, xd, xq, xs, cols) { return false; }
         let (mut qp, mut sp, mut cp, mut ap, mut op, mut nff, mut din) = (xq, xs, c, a, od, n_ff as u32, cols as u32);
         let mut pr: [*mut c_void; 7] = [&mut qp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void, &mut cp as *mut _ as *mut c_void,
             &mut ap as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut nff as *mut _ as *mut c_void, &mut din as *mut _ as *mut c_void];
         d.launch(k[10], (n_ff as u32).div_ceil(4), 128, &mut pr) } };
-    if !run(&drv) || !drv.sync() { return None; }
+    if !run(&drv, ws[0].ptrs()) || !drv.sync() { return None; }
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { if !run(&drv) { return None; } }
+    for i in 0..iters { if !run(&drv, ws[i % ws.len()].ptrs()) { return None; } }
     if !drv.sync() { return None; }
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     let mut out = vec![0f32; n_ff]; if !drv.dtoh(&mut out, od) { return None; }
