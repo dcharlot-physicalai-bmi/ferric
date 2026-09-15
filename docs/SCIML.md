@@ -98,6 +98,30 @@ features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. Measured (200
 | advection (β = 30) | 0.9144 | 1.0815 | unsolved by both — Krishnapriyan 2021's failure case, and the one causal training exists for; `Recipe::full()` carries no causal weighting (that is the `Causal` oracle) |
 | helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | unsolved by both at 4000 steps; the source paper trains ten times longer with NTK weighting, and reproduces exactly across runs here |
 
+### The two pieces the table named
+
+`Weighting::{Fixed, GradNorm, Ntk}` and `causal_slabs` are recipe options, so the rows that identified a
+missing piece have a head-to-head test rather than a note.
+
+**NTK-trace weighting** (Wang, Yu & Perdikaris 2022, arXiv 2007.14527) — what jaxpi and PirateNets run.
+Gradient-norm balancing equalises how hard each term *pulls*; the NTK view asks how fast each term's error
+*decays*, and weights by the inverse kernel trace `λ_i = (Σ_j tr K_jj) / tr K_ii`. ⛔ The trace is
+**estimated, not assembled**: `tr K_ii = ‖J_i‖_F²` needs one backward pass per collocation point (jaxpi gets
+them from `jacrev` + `vmap`; this fabric has neither), so Hutchinson's identity is used instead — for a
+Rademacher `v`, `E‖∇_θ(vᵀr)‖² = tr(J Jᵀ)`. Checked against a closed form on a residual linear in the
+parameters, where `tr K = ‖A‖_F²` exactly: against 127.817, one probe is +6.6 %, four +10.6 %, sixteen
++4.7 %, sixty-four **+1.7 %** — the test watches it converge rather than asserting one draw. Weights for two
+terms whose traces differ 10⁴× come out 9371× apart, and a term whose trace has gone to zero is floored,
+the same guard `LossBalancer` needed.
+
+**Causal weighting** reuses the `Causal` machinery (which has its own fail-then-fix oracle above) against
+the problem's `time_axis`. `Recipe::ntk()` and `Recipe::causal(k)` are the named recipes;
+`helmholtz_gradnorm_against_ntk_weighting` and `advection_with_and_without_causal_weighting` run them.
+
+⛔ `Problem::constraints` returns residual **vectors**, not a summed loss: an NTK trace is a property of the
+per-point Jacobian and summing first destroys it. Every boundary, initial and periodic condition is its own
+term — which is also the paper's formulation.
+
 ⭐ **Two of four rows say the recipe as configured is not a free lunch, and that is the harness earning its
 keep.** It is one `Recipe` applied to four problems: the pieces each have their own fail-then-fix oracle
 above, but bundling them and pointing the bundle at an arbitrary PDE is a different claim, and on Burgers
@@ -105,7 +129,11 @@ it is false. The rows are measurements; only `rel_l2.is_finite()` is asserted, a
 solved / partial / unsolved rather than passing or failing a bar chosen after the fact.
 prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
-2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage.
+2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage. Measured at **exactly equal
+budget**: uniform(2540) **0.5008**, refined(2540) **0.3833** — 23 % lower from where the points are, not
+how many. Contrast the earlier `k`-sweep on a 1-D layer, where refinement never beat uniform because Adam
+alone left that regime optimisation-limited: the difference is that both arms here end on L-BFGS, so the
+smooth part is solved and the shock is what remains.
 
 ## Domains, boundaries and boundary conditions
 
@@ -121,9 +149,10 @@ underneath the flux ones.
 must leave the shape and stepped against it must stay inside — on the primitives and on every composite
 (`primitives_and_csg_composites_have_outward_normals_and_consistent_membership`). That check is what gives a
 Neumann condition its sign; a normal pointing the wrong way is a flux condition of the wrong sign, and no
-loss curve would show it. Two ignored GPU oracles close the loop with closed forms: Laplace on the annulus
-(`u = ln(r/½)/ln 2`) through CSG + Dirichlet, and the 1-D Neumann sign test (`u'' = 0`, `u(0) = 0`,
-`u'(1) = 1` ⇒ `u = x`; a flipped normal would return `−x`).
+loss curve would show it. Two GPU oracles close the loop with closed forms, both measured: Laplace on the annulus through
+CSG + Dirichlet reaches **rel-L2 0.0082** against `u = ln(r/½)/ln 2`, and the 1-D Neumann sign test
+(`u'' = 0`, `u(0) = 0`, `u'(1) = 1` ⇒ `u = x`) returns **u(½) = 0.5002** where a flipped outward normal
+would have given −0.5.
 
 ## The certificate, extended to PDEs — the piece the incumbents do not ship
 
