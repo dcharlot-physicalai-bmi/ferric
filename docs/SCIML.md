@@ -115,8 +115,20 @@ terms whose traces differ 10⁴× come out 9371× apart, and a term whose trace 
 the same guard `LossBalancer` needed.
 
 **Causal weighting** reuses the `Causal` machinery (which has its own fail-then-fix oracle above) against
-the problem's `time_axis`. `Recipe::ntk()` and `Recipe::causal(k)` are the named recipes;
-`helmholtz_gradnorm_against_ntk_weighting` and `advection_with_and_without_causal_weighting` run them.
+the problem's `time_axis`. `Recipe::ntk()` and `Recipe::causal(k)` are the named recipes.
+
+⚠ **Both head-to-head comparisons came back negative, and neither discriminates.** Helmholtz:
+gradient-norm **0.4781**, NTK **0.5183**. Advection at β = 30: **1.0815** without causal, **1.0935** with.
+In each case *both* arms are unsolved — advection's are worse than predicting zero — so the ordering is
+noise, and two failing arms cannot rank two techniques. That is the same rule that sent the balancing and
+causal fixtures back to be re-sized earlier on this page, applied to my own new work.
+
+What this does **not** say is that the techniques do not work: `causal_training_finds_the_solution_a_vanilla_pinn_cannot`
+takes the reaction equation from 0.937 to 0.094 with a control that fails, and the NTK estimator is
+verified against a closed form. It says the bundled recipe does not rescue *these two problems at this
+budget*, and that making one arm succeed is the open work. `compare()` prints
+`⚠ every arm failed — this comparison does not rank the recipes` when it happens, so the next reader
+cannot mistake it for a ranking.
 
 ⛔ `Problem::constraints` returns residual **vectors**, not a summed loss: an NTK trace is a property of the
 per-point Jacobian and summing first destroys it. Every boundary, initial and periodic condition is its own

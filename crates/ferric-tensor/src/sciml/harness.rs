@@ -466,27 +466,44 @@ mod tests {
     fn compare(p: &dyn Problem, recipes: &[Recipe], colloc_n: usize, seed: u32) -> Vec<Report> {
         let ctx = ctx();
         let colloc = box_points(&p.lo(), &p.hi(), colloc_n, 7);
-        recipes
+        let reports = recipes
             .iter()
             .map(|r| {
                 let rep = run(&ctx, p, r, &colloc, 51, seed);
-                eprintln!("  {:<12} {:<24} rel-L2 {:.4}  ({:.0}s, loss {:.1e} -> {:.1e})", p.name(), rep.recipe, rep.rel_l2, rep.secs, rep.loss_after_adam, rep.loss_final);
+                let verdict = if rep.rel_l2 < 0.05 { "solved" } else if rep.rel_l2 < 1.0 { "partial" } else { "UNSOLVED (worse than zero)" };
+                eprintln!("  {:<12} {:<24} rel-L2 {:.4}  {:<26} ({:.0}s, loss {:.1e} -> {:.1e})", p.name(), rep.recipe, rep.rel_l2, verdict, rep.secs, rep.loss_after_adam, rep.loss_final);
                 assert!(rep.rel_l2.is_finite(), "{} produced a non-finite score", rep.recipe);
                 rep
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if reports.iter().all(|r| r.rel_l2 >= 0.2) {
+            eprintln!("  ⚠ every arm failed on {} — this comparison does not rank the recipes", p.name());
+        }
+        reports
     }
 
-    /// ⭐ **Helmholtz, where the table said NTK weighting was the missing piece** — gradient-norm against
-    /// NTK-trace weighting, same net, same steps, same points.
+    /// ⚠ **Helmholtz, where the table said NTK weighting was the missing piece — and the comparison does
+    /// NOT discriminate.** Gradient-norm 0.4781, NTK 0.5183: NTK is marginally worse, and both are far
+    /// from solved at 4000 steps. Two failing arms cannot rank two techniques, which is the same rule
+    /// that sent the balancing and causal fixtures in `oracles.rs` back to be re-sized. What this row
+    /// says is that NTK weighting does not rescue Helmholtz at THIS budget; the paper's own result uses
+    /// ten times the steps. Making one arm succeed first is the open work.
+    ///
+    /// ⭐ The technique-level evidence lives in `oracles.rs`, where each piece has a fixture its control
+    /// measurably fails. A bundled recipe on an arbitrary PDE is a different, weaker claim.
     #[ignore = "two trainings on the GPU (~14 min); run with -- --ignored"]
     #[test]
     fn helmholtz_gradnorm_against_ntk_weighting() {
         compare(&Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 }, &[Recipe::full(), Recipe::ntk()], 2000, 1);
     }
 
-    /// ⭐ **Advection at β = 30, where the table said causal weighting was the missing piece** — the full
-    /// recipe against the same recipe with causal weighting in time.
+    /// ⚠ **Advection at β = 30, where the table said causal weighting was the missing piece — and again
+    /// the comparison does NOT discriminate.** 1.0815 without, 1.0935 with: both arms are worse than
+    /// predicting zero, so neither is solving anything and the ordering is noise. Note what this does
+    /// NOT contradict — `causal_training_finds_the_solution_a_vanilla_pinn_cannot` shows the same
+    /// machinery taking the reaction equation from 0.937 to 0.094, with a control that fails. Causal
+    /// weighting works where the arrow of time is the binding constraint; at β = 30 with these Fourier
+    /// scales something upstream is failing first, and finding it is the open work.
     #[ignore = "two trainings on the GPU (~10 min); run with -- --ignored"]
     #[test]
     fn advection_with_and_without_causal_weighting() {
