@@ -79,18 +79,14 @@ impl Geometry for BoxDomain {
             let mut r = u01(i as u32, seed) as f64 * total;
             let mut face = 0usize;
             let mut side = 0usize;
-            for a in 0..d {
+            'faces: for (a, &area) in areas.iter().enumerate() {
                 for s in 0..2 {
-                    if r < areas[a] {
+                    if r < area {
                         face = a;
                         side = s;
-                        r = -1.0;
-                        break;
+                        break 'faces;
                     }
-                    r -= areas[a];
-                }
-                if r < 0.0 {
-                    break;
+                    r -= area;
                 }
             }
             for a in 0..d {

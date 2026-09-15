@@ -88,7 +88,15 @@ its initial condition and boundaries (worst FD residual 1.75e-7, shock formed by
 | `Advection` | `u_t + β u_x = 0`, periodic, `β = 30` | `sin(x − βt)` (Krishnapriyan 2021's hard case) |
 
 `Recipe::vanilla()` is a tanh MLP with Adam and a fixed boundary weight; `Recipe::full()` is Fourier
-features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. `the_full_recipe_beats_vanilla_on_every_benchmark`
+features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. Measured (2000 collocation points,
+4000 Adam steps, + 500 L-BFGS for the full recipe, scored on a 51² grid):
+
+| problem | vanilla | full | note |
+|---|---|---|---|
+| heat | 0.0448 | **0.0074** | Fourier scales `[0.5, 1]` set from the solution's frequency π; with the default `[1, 3]` the full recipe scored **0.3177** — the scale choice was the whole difference |
+| burgers (ν = 0.01/π) | **0.2079** | 0.5294 | the full recipe is 2.5× WORSE: its loss ends low (7.7e-3) on a wrong solution — a low residual on a shock problem is not a solved shock; the same recipe scored ~0.50 in the refinement fixture | `the_full_recipe_beats_vanilla_on_every_benchmark`
+| advection (β = 30) | 0.9144 | 1.0815 | unsolved by both — Krishnapriyan 2021's failure case, and the one causal training exists for; `Recipe::full()` carries no causal weighting (that is the `Causal` oracle) |
+| helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | unsolved by both at 4000 steps; the source paper trains ten times longer with NTK weighting, and reproduces exactly across runs here |
 prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage.
