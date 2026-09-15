@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod bench;
 pub mod certify;
 pub mod features;
+pub mod geometry;
 pub mod harness;
 pub mod lbfgs;
 pub mod operators;

@@ -93,6 +93,24 @@ prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage.
 
+## Domains, boundaries and boundary conditions
+
+`sciml::geometry` is the ergonomic layer every PINN user meets first. `BoxDomain` and `Disk` are the
+primitives; `Union`, `Difference` and `Intersection` compose them (constructive solid geometry), with the
+composite's boundary taken from the parts' boundaries filtered by membership in the other part — an annulus
+is a disk minus a disk, and its boundary is the outer circle plus the inner circle with the normal flipped.
+`interior` samples a shape by rejection; `boundary_f32` returns boundary points with outward unit normals;
+`dirichlet`, `neumann`, `robin` and `periodic` turn the conditions into loss terms, with `normal_derivative`
+underneath the flux ones.
+
+⭐ Every sampler is checked against its own geometry: a boundary point stepped a little along its normal
+must leave the shape and stepped against it must stay inside — on the primitives and on every composite
+(`primitives_and_csg_composites_have_outward_normals_and_consistent_membership`). That check is what gives a
+Neumann condition its sign; a normal pointing the wrong way is a flux condition of the wrong sign, and no
+loss curve would show it. Two ignored GPU oracles close the loop with closed forms: Laplace on the annulus
+(`u = ln(r/½)/ln 2`) through CSG + Dirichlet, and the 1-D Neumann sign test (`u'' = 0`, `u(0) = 0`,
+`u'(1) = 1` ⇒ `u = x`; a flipped normal would return `−x`).
+
 ## The certificate, extended to PDEs — the piece the incumbents do not ship
 
 `sciml::certify` turns a trained network's residual into a bound on the error it cannot see. For
