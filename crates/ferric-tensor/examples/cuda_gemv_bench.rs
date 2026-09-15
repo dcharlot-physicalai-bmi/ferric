@@ -32,8 +32,9 @@ fn main() {
         let qm = QMatrix::from_bytes(&ctx, &bytes, ty, out, inn).expect("qmatrix");
         let w = qm.native_weight().expect("native mirror (FERRIC_CUDA set?)");
         let r = if label.contains("swiglu") { cuda::bench_swiglu(&w, &x, 200) } else { cuda::bench_gemv(&w, &x, 200) };
-        if ty == 13 && !label.contains("swiglu") {
-            if let Some((us8, _)) = cuda::bench_gemv_q8(&w, &x, 200) {
+        if ty == 13 {
+            let q8 = if label.contains("swiglu") { cuda::bench_swiglu_q8(&w, &x, 200) } else { cuda::bench_gemv_q8(&w, &x, 200) };
+            if let Some((us8, _)) = q8 {
                 println!("{:<28} {:>9.2} {us8:>10.1} {:>9.1}   ← int8 activations + dp4a (quantise incl.)",
                          format!("  ↳ q8x  {}", label.trim()), bytes.len() as f64 / 1048576.0, bytes.len() as f64 / (us8 * 1e-6) / 1e9);
             }
