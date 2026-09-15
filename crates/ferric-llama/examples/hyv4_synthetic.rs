@@ -482,14 +482,15 @@ fn main() {
         // ⚠ ONE observation each. If an entry ever flakes the honest response is to DELETE IT — a
         // lock loosened until it stops failing is not a lock — and rely on the portable checks above.
         //
-        // ⛔ DELIBERATELY UNLOCKED, 2026-09-15: "Apple Paravirtual device" (GitHub macOS runner) and
-        // "llvmpipe" (GitHub ubuntu runner). Their recorded values were from BEFORE df0235e, and no
-        // one has observed either fabric on this tree — a value nobody has measured is not evidence
-        // about that fabric, so re-asserting it would only keep CI red on a number we invented. This
-        // laptop cannot produce either adapter. The `None` arm below PRINTS the hash and does not
-        // assert, so the next green CI run reports both; add them back in a follow-up commit that
-        // names the run. ⚠ Until then those two fabrics are covered only by the portable
-        // self-comparisons above — which is exactly what an unrecorded fabric has always meant here.
+        // ⭐ RE-LOCKED from the first green run on this tree, CI run 35003836157 (500915f), which
+        // reported both because the `None` arm prints instead of asserting. That is the whole point
+        // of unlocking rather than copying a pre-df0235e value forward: the fabric published its own
+        // number and we recorded what it said.
+        ("Apple Paravirtual device", 0xcba077dcf508c026),  // GitHub macOS runner, run 35003836157
+        // Prefix, deliberately: the runner reports "llvmpipe (LLVM 20.1.2, 256 bits)" and the LLVM
+        // version moves with the image. A lock that breaks on an unrelated image bump teaches people
+        // to ignore it — which is exactly what six days of red CI did to this one.
+        ("llvmpipe",                 0x78084577bcacd8c5),  // GitHub ubuntu runner, run 35003836157
     ];
     let adapter = &ctx.adapter_name;
     match GOLDEN.iter().find(|(a, _)| adapter.starts_with(a)) {
