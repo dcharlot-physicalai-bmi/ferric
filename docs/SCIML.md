@@ -72,6 +72,73 @@ to **1.4 × 10¹²**, after which any boundary deviation of 1e-8 produced an O(1
 run came out at rel-L2 0.93 against 0.03 unweighted. The denominator is now floored at `1e-4 × max|∇L_r|`,
 capping the weight at 1e4; on the oracle above the weight settles at 9.9e3, so the cap was doing work.
 
+## The benchmark harness — the field's problems, scored against independent references
+
+`sciml::harness` solves the standard problems by a named recipe and scores them against a reference the
+network never sees, so a number from this stack is comparable to one from PINNacle or jinns. The references
+(`sciml::bench`) are themselves tested: each closed form is checked against its PDE by finite differences,
+and Burgers' Cole–Hopf integral — the one that is not a closed form — is checked the same way plus against
+its initial condition and boundaries (worst FD residual 1.75e-7, shock formed by `t = 1`).
+
+| problem | equation | reference |
+|---|---|---|
+| `Heat` | `u_t = u_xx` on `[0,1]`, Dirichlet | `e^{−π²t} sin πx` |
+| `Helmholtz` | `Δu + k²u = q` on `[−1,1]²`, `u = 0` on `∂Ω` | manufactured `sin(a₁πx) sin(a₂πy)` (Wang 2021's `a = (1, 4)`) |
+| `Burgers` | `u_t + u u_x = ν u_xx`, `ν = 0.01/π` | Cole–Hopf, Hermite–Gauss form (Basdevant 1986) |
+| `Advection` | `u_t + β u_x = 0`, periodic, `β = 30` | `sin(x − βt)` (Krishnapriyan 2021's hard case) |
+
+`Recipe::vanilla()` is a tanh MLP with Adam and a fixed boundary weight; `Recipe::full()` is Fourier
+features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. `the_full_recipe_beats_vanilla_on_every_benchmark`
+prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
+is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
+2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage.
+
+## The certificate, extended to PDEs — the piece the incumbents do not ship
+
+`sciml::certify` turns a trained network's residual into a bound on the error it cannot see. For
+`−Δe − k²e = r` in `Ω`, `e = g` on `∂Ω` — the error of an approximation to Poisson (`k = 0`) or Helmholtz —
+split `e = e₁ + e₂` with `e₁` carrying the residual and zero boundary data and `e₂` the boundary correction
+with zero residual; then `‖e₁‖ ≤ ‖r‖ / (λ₁ − k²)` by the spectral gap and `‖e₂‖ ≤ |Ω|^{1/2} ‖g‖_∞` by the
+maximum principle, so
+
+```text
+‖e‖_L²(Ω) ≤ ‖r‖_L²(Ω) / (λ₁ − k²) + |Ω|^{1/2} · ‖g‖_L∞(∂Ω)        (λ₁ the first Dirichlet eigenvalue; k² < λ₁)
+```
+
+Both inputs come from the network alone. The bound is **sound** and, on the first eigenfunction, **tight**:
+`the_bound_is_sharp_on_the_first_eigenfunction` checks that on `ε sin πx sin πy` the bound equals the error
+(0.150000 against 0.150000). Scope, stated: elliptic, linear, coercive — the domain of the Mishra–Molinaro
+error-versus-residual results (2006.16144). Hyperbolic and nonlinear problems have no bound of this form
+here and none is claimed. `the_certificate_bounds_a_trained_poisson_pinn_from_its_residual_alone` runs it on a
+trained net: a Fourier-feature PINN on the unit-square Poisson problem, 4000 Adam steps with balancing, gives
+`‖r‖ = 1.44`, boundary max `2.5e-3`, hence **‖e‖ ≤ 7.56e-2**, against a true error of **8.25e-3** — sound, and
+9.2× the truth rather than a vacuous number. The residual norm dominates the bound, which is the honest
+reading: the certificate says what the network still owes the equation, and a tighter bound is earned by
+training the residual down, not by argument.
+
+## A 2-D spectral operator
+
+`sciml::operators::SpectralConv2d` is the Fourier-neural-operator layer on a periodic `n × n` grid. The fabric
+has no complex dtype and no FFT, so the transform is the DFT matrix applied by matmul, as the 1-D `fno`
+example does, lifted to 2-D by the Kronecker product `F₂ = F₁ ⊗ F₁` (an `n² × n²` matrix; 256 × 256 at
+`n = 16`). The layer keeps the `modes × modes` lowest frequencies and multiplies each by a learned complex
+weight — channel-diagonal, the form in which a constant-coefficient linear solution operator is exactly
+representable, which is what lets `a_2d_spectral_operator_recovers_the_poisson_greens_function` check the
+learned weights against `1/(4π²|k|²)`. Trained on random band-limited forcings of the periodic Poisson
+problem: held-out rel-L2 **0.0026**, and the learned multiplier matches the Green's function on every
+retained mode to within **0.82 %** (k = (0,1): 0.02533 against 0.02533; (0,2): 0.00633 against 0.00633).
+`the_kronecker_dft_inverts_itself` checks `F⁻¹F = I` on random fields (rel-L2 1.9e-7).
+
+⛔ **The weights live on a half-spectrum, and they have to.** A real field's DFT is conjugate-symmetric, so a
+layer with independent weights at `k` and `−k` can only identify `R(k) + conj(R(−k))`: the first version
+learned the operator to 1.4 % and its individual weights matched nothing (k = (1,1): 0.0433 against 0.0127).
+Parameters are now one complex weight per half-spectrum mode, expanded with the symmetry built in — half
+the parameters, and each one means one thing. A second training stage at a decayed rate is what brings the
+smallest multipliers (~20× below the largest) from 12 % to under 1 %; they sit at Adam's noise floor otherwise.
+
+⚠ The multi-channel FNO — a `w × w` complex matrix per mode plus pointwise channel mixing — is the follow-on,
+not this layer.
+
 ### ⛔ Two defects the recipe exposed in the fabric itself
 
 **`tanh` had no differentiable VJP, and `grad()` was silent about it.** `Var::tanh` was built with

@@ -10,9 +10,14 @@ use crate::{grad, Tensor, Var};
 use ferric_core::Context;
 use std::sync::Arc;
 
+pub mod bench;
+pub mod certify;
 pub mod features;
+pub mod harness;
 pub mod lbfgs;
+pub mod operators;
 pub mod train;
+pub mod util;
 #[cfg(test)]
 mod oracles;
 pub use features::FourierNet;

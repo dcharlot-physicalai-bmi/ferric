@@ -5,53 +5,11 @@
 //! proves nothing — several of these had their difficulty raised until the baseline broke, and the
 //! numbers in each test's doc are what was measured.
 
+use super::util::*;
 use super::*;
 use crate::Adam;
 use ferric_core::Context;
 use std::sync::Arc;
-
-fn h32(mut h: u32) -> u32 {
-    h ^= h >> 15;
-    h = h.wrapping_mul(2246822519);
-    h ^= h >> 13;
-    h = h.wrapping_mul(3266489917);
-    h ^= h >> 16;
-    h
-}
-fn u01(i: u32, s: u32) -> f32 {
-    (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0
-}
-
-fn leaf(ctx: &Arc<Context>, v: &[f32], shape: &[usize]) -> Var {
-    Var::leaf(Tensor::from_vec(ctx, v, shape))
-}
-fn col(ctx: &Arc<Context>, v: &[f32]) -> Var {
-    leaf(ctx, v, &[v.len(), 1])
-}
-/// One Adam step on `loss`; returns the loss value.
-async fn step(ctx: &Arc<Context>, loss: &Var, pv: &[Var], wp: &mut [Tensor], adam: &mut Adam) -> f32 {
-    loss.backward();
-    let g: Vec<Tensor> = pv.iter().zip(wp.iter()).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::zeros(ctx, &t.shape))).collect();
-    adam.step(wp, &g);
-    loss.value().to_vec().await[0]
-}
-/// Column `k` of the gradient of a scalar field `u` (`[N,1]`) with respect to a `[N,d]` input.
-fn dcol(ctx: &Arc<Context>, u: &Var, x: &Var, n: usize, d: usize, k: usize) -> Var {
-    let g = deriv(u, x);
-    let mut m = vec![0.0f32; n * d];
-    for i in 0..n {
-        m[i * d + k] = 1.0;
-    }
-    g.mul(&leaf(ctx, &m, &[n, d])).sum(&[1]).reshape(&[n, 1])
-}
-fn rel_l2(pred: &[f32], truth: &[f32]) -> f32 {
-    let num: f32 = pred.iter().zip(truth).map(|(a, b)| (a - b) * (a - b)).sum();
-    let den: f32 = truth.iter().map(|b| b * b).sum();
-    (num / den.max(1e-30)).sqrt()
-}
-fn vars(wp: &[Tensor]) -> Vec<Var> {
-    wp.iter().map(|t| Var::leaf(t.clone())).collect()
-}
 
 /// ⭐⭐ **Spectral bias, and its cure.** `u'' + ω²u = 0`, `u(0)=1`, `u'(0)=0`, true `cos ωt`, at a frequency
 /// a plain tanh net cannot reach in the step budget. Same optimiser, same steps, same width: the tanh

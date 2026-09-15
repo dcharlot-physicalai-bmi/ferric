@@ -1,0 +1,492 @@
+//! **The benchmark harness** — the field's standard problems ([`super::bench`]) solved by a named recipe,
+//! scored against an independent reference, so a number from this stack means the same thing as one from
+//! PINNacle or jinns. A [`Problem`] supplies its residual, its constraints and its reference; a
+//! [`Recipe`] names the net, the optimiser stages and the loss handling; [`run`] trains and scores.
+
+use super::bench;
+use super::util::*;
+use super::{flatten, mse, scalar, unflatten, Act, FourierNet, Lbfgs, LossBalancer, Mlp};
+use crate::{Adam, Tensor, Var};
+use ferric_core::Context;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// A PDE benchmark: its box domain, PDE residual, constraint losses and reference solution.
+pub trait Problem {
+    fn name(&self) -> &str;
+    /// Input dimension (space and time coordinates together).
+    fn dim(&self) -> usize;
+    fn lo(&self) -> Vec<f64>;
+    fn hi(&self) -> Vec<f64>;
+    /// PDE residual at the `[N, dim]` points `x`, as `[N, 1]`, for the network `fwd`.
+    fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var;
+    /// Mean-square loss of all boundary / initial / periodic constraints, sampled with `n` points each.
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var;
+    fn reference(&self, x: &[f64]) -> f64;
+    /// Fourier-feature scales that suit the problem's frequency content.
+    fn scales(&self) -> Vec<f32> {
+        vec![1.0, 3.0]
+    }
+}
+
+/// Which network the recipe trains.
+#[derive(Clone, Debug)]
+pub enum Net {
+    TanhMlp { hidden: Vec<usize> },
+    Fourier { m_per_scale: usize, hidden: Vec<usize> },
+}
+
+/// A named training recipe.
+#[derive(Clone, Debug)]
+pub struct Recipe {
+    pub name: &'static str,
+    pub net: Net,
+    pub adam_steps: usize,
+    pub lr: f32,
+    pub lbfgs_iters: usize,
+    pub balance: bool,
+    pub bc_weight: f32,
+}
+
+impl Recipe {
+    /// The classic: tanh MLP, Adam, fixed boundary weight.
+    pub fn vanilla() -> Self {
+        Recipe { name: "vanilla", net: Net::TanhMlp { hidden: vec![64, 64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 0, balance: false, bc_weight: 10.0 }
+    }
+    /// Fourier features + gradient-norm balancing + Adam then strong-Wolfe L-BFGS.
+    pub fn full() -> Self {
+        Recipe { name: "fourier+balance+lbfgs", net: Net::Fourier { m_per_scale: 32, hidden: vec![64, 64] }, adam_steps: 4000, lr: 1e-3, lbfgs_iters: 500, balance: true, bc_weight: 1.0 }
+    }
+}
+
+/// What a run produced.
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub problem: String,
+    pub recipe: &'static str,
+    pub n_colloc: usize,
+    pub rel_l2: f32,
+    pub loss_after_adam: f32,
+    pub loss_final: f32,
+    pub secs: f64,
+}
+
+enum NetImpl {
+    Mlp(Mlp),
+    Fourier(FourierNet),
+}
+
+/// Train `recipe` on `problem` with `colloc` collocation points (`[N, dim]` flattened) and score it on a
+/// `grid_m`-per-axis grid against the reference. Synchronous; the L-BFGS stage blocks on readbacks.
+pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &[f32], grid_m: usize, seed: u32) -> Report {
+    let t0 = Instant::now();
+    let d = problem.dim();
+    let n = colloc.len() / d;
+    let net = match &recipe.net {
+        Net::TanhMlp { hidden } => {
+            let mut dims = vec![d];
+            dims.extend(hidden);
+            dims.push(1);
+            NetImpl::Mlp(Mlp::new(ctx, &dims, seed))
+        }
+        Net::Fourier { m_per_scale, hidden } => NetImpl::Fourier(FourierNet::new(ctx, d, *m_per_scale, &problem.scales(), hidden, 1, Act::Tanh, seed)),
+    };
+    let params0: Vec<Tensor> = match &net {
+        NetImpl::Mlp(m) => m.params.clone(),
+        NetImpl::Fourier(f) => f.params.clone(),
+    };
+    let forward = |pv: &[Var], x: &Var| -> Var {
+        match &net {
+            NetImpl::Mlp(_) => Mlp::forward_act(pv, x, Act::Tanh),
+            NetImpl::Fourier(f) => f.forward(pv, x),
+        }
+    };
+    let losses = |pv: &[Var], it: u32| -> (Var, Var) {
+        let fwd = |x: &Var| forward(pv, x);
+        let xv = leaf(ctx, colloc, &[n, d]);
+        let r = problem.residual(ctx, &fwd, &xv, n);
+        (mse(&r), problem.constraints(ctx, &fwd, 200, seed.wrapping_add(it)))
+    };
+
+    let mut wp = params0;
+    let mut bal = LossBalancer::new(2, 0.1);
+    let loss_after_adam = pollster::block_on(async {
+        let mut adam = Adam::new(&wp, recipe.lr);
+        let mut last = f32::NAN;
+        for it in 0..recipe.adam_steps {
+            let pv = vars(&wp);
+            let (l_res, l_bc) = losses(&pv, it as u32);
+            if recipe.balance && it % 100 == 0 {
+                bal.update(&[l_res.clone(), l_bc.clone()], &pv).await;
+            }
+            let loss = if recipe.balance { bal.combine(&[l_res, l_bc]) } else { l_res.add(&l_bc.mul(&scalar(&l_bc, recipe.bc_weight))) };
+            last = step(ctx, &loss, &pv, &mut wp, &mut adam).await;
+        }
+        last
+    });
+    let mut loss_final = loss_after_adam;
+    if recipe.lbfgs_iters > 0 {
+        let shapes: Vec<Vec<usize>> = wp.iter().map(|t| t.shape.clone()).collect();
+        let x0 = pollster::block_on(flatten(&wp));
+        let w_bc = if recipe.balance { bal.weights[1] } else { recipe.bc_weight };
+        let evaluate = |flat: &[f32]| -> (f32, Vec<f32>) {
+            let ts = unflatten(ctx, flat, &shapes);
+            let pv = vars(&ts);
+            let (l_res, l_bc) = losses(&pv, 0);
+            let loss = l_res.add(&l_bc.mul(&scalar(&l_bc, w_bc)));
+            loss.backward();
+            pollster::block_on(async {
+                let v = loss.value().to_vec().await[0];
+                let mut g = Vec::with_capacity(flat.len());
+                for (p, t) in pv.iter().zip(&ts) {
+                    match p.grad() {
+                        Some(gt) => g.extend(gt.to_vec().await),
+                        None => g.extend(vec![0.0; t.numel()]),
+                    }
+                }
+                (v, g)
+            })
+        };
+        let r = Lbfgs::new(20).minimize(x0, evaluate, recipe.lbfgs_iters, 1e-9);
+        loss_final = r.f;
+        wp = unflatten(ctx, &r.x, &shapes);
+    }
+    // score on the grid
+    let (lo, hi) = (problem.lo(), problem.hi());
+    let g = box_grid(&lo, &hi, grid_m);
+    let ng = g.len() / d;
+    let pred = pollster::block_on(async { forward(&vars(&wp), &leaf(ctx, &g, &[ng, d])).value().to_vec().await });
+    let truth: Vec<f32> = g.chunks(d).map(|p| problem.reference(&p.iter().map(|&v| v as f64).collect::<Vec<_>>()) as f32).collect();
+    Report { problem: problem.name().to_string(), recipe: recipe.name, n_colloc: n, rel_l2: rel_l2(&pred, &truth), loss_after_adam, loss_final, secs: t0.elapsed().as_secs_f64() }
+}
+
+// ---------------------------------------------------------------- the problems ------------------
+
+/// Burgers, `ν = 0.01/π`: the PINNacle / Raissi setting, with the shock at `x = 0`.
+pub struct Burgers {
+    pub nu: f64,
+}
+impl Problem for Burgers {
+    fn name(&self) -> &str {
+        "burgers1d"
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn lo(&self) -> Vec<f64> {
+        vec![-1.0, 0.0]
+    }
+    fn hi(&self) -> Vec<f64> {
+        vec![1.0, 1.0]
+    }
+    fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var {
+        let u = fwd(x);
+        let u_t = dcol(ctx, &u, x, n, 2, 1);
+        let u_x = dcol(ctx, &u, x, n, 2, 0);
+        let u_xx = dcol(ctx, &u_x, x, n, 2, 0);
+        u_t.add(&u.mul(&u_x)).sub(&u_xx.mul(&scalar(&u_xx, self.nu as f32)))
+    }
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+        let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
+        let xs: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed ^ 0x5151) - 1.0).collect();
+        let bl: Vec<f32> = t.iter().flat_map(|&t| [-1.0, t]).collect();
+        let br: Vec<f32> = t.iter().flat_map(|&t| [1.0, t]).collect();
+        let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
+        let u0: Vec<f32> = xs.iter().map(|&x| -(std::f32::consts::PI * x).sin()).collect();
+        mse(&fwd(&leaf(ctx, &bl, &[n, 2]))).add(&mse(&fwd(&leaf(ctx, &br, &[n, 2])))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+    }
+    fn reference(&self, x: &[f64]) -> f64 {
+        bench::burgers(x[0], x[1], self.nu)
+    }
+    fn scales(&self) -> Vec<f32> {
+        vec![1.0, 4.0]
+    }
+}
+
+/// Helmholtz on `[−1,1]²` with the manufactured `sin(a₁πx) sin(a₂πy)`.
+pub struct Helmholtz {
+    pub a1: f64,
+    pub a2: f64,
+    pub k: f64,
+}
+impl Problem for Helmholtz {
+    fn name(&self) -> &str {
+        "helmholtz2d"
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn lo(&self) -> Vec<f64> {
+        vec![-1.0, -1.0]
+    }
+    fn hi(&self) -> Vec<f64> {
+        vec![1.0, 1.0]
+    }
+    fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var {
+        let u = fwd(x);
+        let ux = dcol(ctx, &u, x, n, 2, 0);
+        let uy = dcol(ctx, &u, x, n, 2, 1);
+        let lap = dcol(ctx, &ux, x, n, 2, 0).add(&dcol(ctx, &uy, x, n, 2, 1));
+        // q at the collocation points comes from the reference's own forcing
+        let pts = pollster::block_on(x.value().to_vec());
+        let q: Vec<f32> = pts.chunks(2).map(|p| bench::helmholtz(p[0] as f64, p[1] as f64, self.a1, self.a2, self.k).1 as f32).collect();
+        lap.add(&u.mul(&scalar(&u, (self.k * self.k) as f32))).sub(&col(ctx, &q))
+    }
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+        let s: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed) - 1.0).collect();
+        let mut b = Vec::with_capacity(8 * n);
+        for &v in &s {
+            b.extend([-1.0, v, 1.0, v, v, -1.0, v, 1.0]);
+        }
+        mse(&fwd(&leaf(ctx, &b, &[4 * n, 2])))
+    }
+    fn reference(&self, x: &[f64]) -> f64 {
+        bench::helmholtz(x[0], x[1], self.a1, self.a2, self.k).0
+    }
+    fn scales(&self) -> Vec<f32> {
+        vec![1.0, 2.0]
+    }
+}
+
+/// Heat equation on `[0,1] × [0,1]`.
+pub struct Heat;
+impl Problem for Heat {
+    fn name(&self) -> &str {
+        "heat1d"
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn lo(&self) -> Vec<f64> {
+        vec![0.0, 0.0]
+    }
+    fn hi(&self) -> Vec<f64> {
+        vec![1.0, 1.0]
+    }
+    fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var {
+        let u = fwd(x);
+        let u_t = dcol(ctx, &u, x, n, 2, 1);
+        let u_x = dcol(ctx, &u, x, n, 2, 0);
+        u_t.sub(&dcol(ctx, &u_x, x, n, 2, 0))
+    }
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+        let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
+        let xs: Vec<f32> = (0..n).map(|i| u01(i as u32, seed ^ 0x77)).collect();
+        let b: Vec<f32> = t.iter().flat_map(|&t| [0.0, t, 1.0, t]).collect();
+        let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
+        let u0: Vec<f32> = xs.iter().map(|&x| (std::f32::consts::PI * x).sin()).collect();
+        mse(&fwd(&leaf(ctx, &b, &[2 * n, 2]))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+    }
+    fn reference(&self, x: &[f64]) -> f64 {
+        bench::heat(x[0], x[1])
+    }
+    /// The solution is `sin πx`: half a cycle per unit, so scales near `0.5`; the default `[1, 3]`
+    /// measured 7× WORSE than a plain tanh net here.
+    fn scales(&self) -> Vec<f32> {
+        vec![0.5, 1.0]
+    }
+}
+
+/// Advection with speed `β`, periodic on `[0, 2π] × [0, 1]`.
+pub struct Advection {
+    pub beta: f64,
+}
+impl Problem for Advection {
+    fn name(&self) -> &str {
+        "advection1d"
+    }
+    fn dim(&self) -> usize {
+        2
+    }
+    fn lo(&self) -> Vec<f64> {
+        vec![0.0, 0.0]
+    }
+    fn hi(&self) -> Vec<f64> {
+        vec![std::f64::consts::TAU, 1.0]
+    }
+    fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var {
+        let u = fwd(x);
+        let u_t = dcol(ctx, &u, x, n, 2, 1);
+        let u_x = dcol(ctx, &u, x, n, 2, 0);
+        u_t.add(&u_x.mul(&scalar(&u_x, self.beta as f32)))
+    }
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Var {
+        let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
+        let xs: Vec<f32> = (0..n).map(|i| std::f32::consts::TAU * u01(i as u32, seed ^ 0x99)).collect();
+        let l: Vec<f32> = t.iter().flat_map(|&t| [0.0, t]).collect();
+        let r: Vec<f32> = t.iter().flat_map(|&t| [std::f32::consts::TAU, t]).collect();
+        let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
+        let u0: Vec<f32> = xs.iter().map(|&x| x.sin()).collect();
+        mse(&fwd(&leaf(ctx, &l, &[n, 2])).sub(&fwd(&leaf(ctx, &r, &[n, 2])))).add(&mse(&fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))))
+    }
+    fn reference(&self, x: &[f64]) -> f64 {
+        bench::advection(x[0], x[1], self.beta)
+    }
+    fn scales(&self) -> Vec<f32> {
+        vec![1.0, (self.beta / 6.0) as f32]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sciml::{rar_select, train};
+
+    fn ctx() -> Arc<Context> {
+        Arc::new(pollster::block_on(Context::new()).unwrap())
+    }
+
+    /// One benchmark problem, both recipes, printed as a table row and sanity-checked. The bars are
+    /// deliberately loose until the table has been measured: a benchmark harness that asserts the
+    /// result it hopes for is not a benchmark. Measured rows are recorded in `docs/SCIML.md`.
+    ///
+    /// ⛔ The first version ran all four problems in one test — eight trainings, ~50 min — and timed out
+    /// at 58 min sharing the GPU with another run, having produced two rows: heat vanilla 0.045 vs full
+    /// 0.318 (the recipe's default Fourier scales `[1, 3]` are wrong for a solution at frequency π, and
+    /// the harness is what made that visible), and Helmholtz `a = (1, 4)` 0.477 vs 0.478 — unsolved by
+    /// either at 4000 steps, where the source paper uses ten times as many.
+    fn bench_one(p: &dyn Problem, colloc_n: usize, seed: u32) -> (Report, Report) {
+        let ctx = ctx();
+        let colloc = box_points(&p.lo(), &p.hi(), colloc_n, 7);
+        let v = run(&ctx, p, &Recipe::vanilla(), &colloc, 51, seed);
+        let f = run(&ctx, p, &Recipe::full(), &colloc, 51, seed);
+        eprintln!("  {:<12} vanilla {:.4} ({:.0}s)   full {:.4} ({:.0}s)   full losses {:.1e}->{:.1e}", p.name(), v.rel_l2, v.secs, f.rel_l2, f.secs, f.loss_after_adam, f.loss_final);
+        for r in [&v, &f] {
+            assert!(r.rel_l2.is_finite(), "{}: {} produced a non-finite score", p.name(), r.recipe);
+            assert!(r.rel_l2 < 1.0, "{}: {} is no better than predicting zero: {:.4}", p.name(), r.recipe, r.rel_l2);
+        }
+        (v, f)
+    }
+
+    #[ignore = "two trainings on the GPU (~12 min); run with -- --ignored"]
+    #[test]
+    fn benchmark_heat() {
+        bench_one(&Heat, 2000, 1);
+    }
+    #[ignore = "two trainings on the GPU (~12 min); run with -- --ignored"]
+    #[test]
+    fn benchmark_helmholtz() {
+        bench_one(&Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 }, 2000, 1);
+    }
+    #[ignore = "two trainings on the GPU (~12 min); run with -- --ignored"]
+    #[test]
+    fn benchmark_burgers() {
+        bench_one(&Burgers { nu: 0.01 / std::f64::consts::PI }, 2000, 1);
+    }
+    #[ignore = "two trainings on the GPU (~12 min); run with -- --ignored"]
+    #[test]
+    fn benchmark_advection() {
+        bench_one(&Advection { beta: 30.0 }, 2000, 1);
+    }
+
+    /// ⭐ **Refinement, in the regime where it can be shown to help.** Burgers with its shock, both arms
+    /// Fourier features + Adam + L-BFGS, equal budget: 2540 uniform against 2000 uniform + 540 refined —
+    /// DeepXDE's own numbers for this problem (Lu et al. 2021, §3.2).
+    #[ignore = "two Burgers solves on the GPU (~15 min); run with -- --ignored"]
+    #[test]
+    fn refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget() {
+        let ctx = ctx();
+        let p = Burgers { nu: 0.01 / std::f64::consts::PI };
+        let (lo, hi) = (p.lo(), p.hi());
+        let recipe = Recipe::full();
+        // uniform arm
+        let uni = box_points(&lo, &hi, 2540, 7);
+        let r_uni = run(&ctx, &p, &recipe, &uni, 51, 1);
+        // refined arm: a warm-up on the base set, then residual-selected additions, then the full recipe
+        let mut pts = box_points(&lo, &hi, 2000, 7);
+        let cand = box_points(&lo, &hi, 20000, 99);
+        {
+            let net = FourierNet::new(&ctx, 2, 32, &p.scales(), &[64, 64], 1, Act::Tanh, 1);
+            let mut wp = net.params.clone();
+            pollster::block_on(async {
+                let mut adam = Adam::new(&wp, 1e-3);
+                for it in 0..3000usize {
+                    let pv = vars(&wp);
+                    let fwd = |x: &Var| net.forward(&pv, x);
+                    if it > 0 && it % 500 == 0 && pts.len() / 2 < 2540 {
+                        let nc = cand.len() / 2;
+                        let cv = leaf(&ctx, &cand, &[nc, 2]);
+                        let r = p.residual(&ctx, &fwd, &cv, nc).value().to_vec().await;
+                        for i in rar_select(&r, 108) { // 5 batches at 500..2500 = 540, DeepXDE's count
+                            pts.extend([cand[2 * i], cand[2 * i + 1]]);
+                        }
+                    }
+                    let n = pts.len() / 2;
+                    let xv = leaf(&ctx, &pts, &[n, 2]);
+                    let loss = train::mse(&p.residual(&ctx, &fwd, &xv, n)).add(&p.constraints(&ctx, &fwd, 200, it as u32));
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+            });
+        }
+        let r_rar = run(&ctx, &p, &recipe, &pts, 51, 1);
+        eprintln!("  burgers: uniform({}) rel-L2 {:.4}   refined({}) rel-L2 {:.4}", r_uni.n_colloc, r_uni.rel_l2, r_rar.n_colloc, r_rar.rel_l2);
+        assert_eq!(r_uni.n_colloc, r_rar.n_colloc, "equal budget or it is not a comparison");
+        assert!(r_rar.rel_l2 < r_uni.rel_l2, "refinement must beat uniform on the shock: {:.4} vs {:.4}", r_rar.rel_l2, r_uni.rel_l2);
+    }
+
+    /// ⭐⭐ **The certificate, on a trained PINN.** Poisson on the unit square (the `pinn_poisson2d` setting):
+    /// the bound computed from the net's own residual and boundary mismatch must sit ABOVE the true error
+    /// against the manufactured solution, and not absurdly so.
+    #[ignore = "trains one PINN on the GPU (~5 min); run with -- --ignored"]
+    #[test]
+    fn the_certificate_bounds_a_trained_poisson_pinn_from_its_residual_alone() {
+        use crate::sciml::certify::{elliptic_l2_bound, grid_l2};
+        let ctx = ctx();
+        let pi = std::f32::consts::PI;
+        let net = FourierNet::new(&ctx, 2, 32, &[1.0, 2.0], &[64, 64], 1, Act::Tanh, 1);
+        let mut wp = net.params.clone();
+        let colloc = box_points(&[0.0, 0.0], &[1.0, 1.0], 2000, 7);
+        let n = 2000;
+        let f: Vec<f32> = colloc.chunks(2).map(|p| -2.0 * pi * pi * (pi * p[0]).sin() * (pi * p[1]).sin()).collect();
+        let residual = |pv: &[Var], x: &Var, nn: usize, fv: &[f32]| -> Var {
+            let u = net.forward(pv, x);
+            let ux = dcol(&ctx, &u, x, nn, 2, 0);
+            let uy = dcol(&ctx, &u, x, nn, 2, 1);
+            dcol(&ctx, &ux, x, nn, 2, 0).add(&dcol(&ctx, &uy, x, nn, 2, 1)).sub(&col(&ctx, fv))
+        };
+        pollster::block_on(async {
+            let mut adam = Adam::new(&wp, 1e-3);
+            let mut bal = LossBalancer::new(2, 0.1);
+            for it in 0..4000usize {
+                let pv = vars(&wp);
+                let xv = leaf(&ctx, &colloc, &[n, 2]);
+                let l_res = mse(&residual(&pv, &xv, n, &f));
+                let s: Vec<f32> = (0..200).map(|i| u01(i, it as u32)).collect();
+                let mut b = Vec::new();
+                for &v in &s {
+                    b.extend([0.0, v, 1.0, v, v, 0.0, v, 1.0]);
+                }
+                let l_bc = mse(&net.forward(&pv, &leaf(&ctx, &b, &[800, 2])));
+                if it % 100 == 0 {
+                    bal.update(&[l_res.clone(), l_bc.clone()], &pv).await;
+                }
+                let loss = bal.combine(&[l_res, l_bc]);
+                step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+            }
+        });
+        // the certificate's inputs, from the net alone
+        let m = 101usize;
+        let g = box_grid(&[0.0, 0.0], &[1.0, 1.0], m);
+        let ng = m * m;
+        let fg: Vec<f32> = g.chunks(2).map(|p| -2.0 * pi * pi * (pi * p[0]).sin() * (pi * p[1]).sin()).collect();
+        let pv = vars(&wp);
+        let (r, u) = pollster::block_on(async {
+            let xv = leaf(&ctx, &g, &[ng, 2]);
+            (residual(&pv, &xv, ng, &fg).value().to_vec().await, net.forward(&pv, &xv).value().to_vec().await)
+        });
+        let r_l2 = grid_l2(&r, m, 2, 1.0);
+        let mut bmax = 0.0f32;
+        for i in 0..m {
+            for &(x, y) in &[(0usize, i), (m - 1, i), (i, 0), (i, m - 1)] {
+                bmax = bmax.max(u[x * m + y].abs());
+            }
+        }
+        let bound = elliptic_l2_bound(r_l2, bmax as f64, 2.0 * (pi as f64).powi(2), 0.0, 1.0).expect("Poisson is coercive");
+        let truth: Vec<f32> = g.chunks(2).map(|p| (pi * p[0]).sin() * (pi * p[1]).sin()).collect();
+        let e: Vec<f32> = u.iter().zip(&truth).map(|(a, b)| a - b).collect();
+        let e_l2 = grid_l2(&e, m, 2, 1.0);
+        eprintln!("  Poisson PINN: ‖residual‖ = {r_l2:.3e}, boundary max = {bmax:.3e}  ⇒  certificate ‖e‖ ≤ {bound:.3e};  true ‖e‖ = {e_l2:.3e}  ({:.1}x)", bound / e_l2);
+        assert!(bound >= e_l2, "the certificate must be SOUND: bound {bound:.3e} < true error {e_l2:.3e}");
+        assert!(bound < 100.0 * e_l2, "and not vacuous: {:.1}x the true error", bound / e_l2);
+    }
+}
