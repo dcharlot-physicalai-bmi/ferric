@@ -416,6 +416,22 @@ pub struct DecodeGraph {
     /// FERRIC_CUDA_Q8X: int8 activations + dp4a for the Q5_K GEMVs. Changes numerics; opt-in.
     q8x: bool, xq: CUdeviceptr, xs: CUdeviceptr,
 }
+/// ⛔ **`ferric-serve` asserts `Engine: Send` at compile time, and `Qwen3` now owns a
+/// `RefCell<Option<DecodeGraph>>`.** Without this impl the raw handles inside (`CUdeviceptr`,
+/// `CUfunction`, the two `CUevent`s in `Prof`) make `Qwen3` — and therefore the whole server —
+/// `!Send`, which broke `origin/main`'s CI for five pushes. ⚠ It is invisible on macOS: this module
+/// is `#![cfg(linux/windows)]`, so `DecodeGraph` does not exist there and the local Mac gate cannot
+/// see the violation. Cross-check with `--target x86_64-unknown-linux-gnu` before pushing.
+///
+/// **Why it is sound.** These handles belong to the CUDA *context*, not to a thread, and every entry
+/// point — `launch`, `sync`, `alloc`, `htod`, `dtoh`, and `step` itself — calls `Driver::bind()`
+/// first, which makes the context current on whatever thread is using it (thread_local, once per
+/// thread). `Driver` already carries the same pair of impls for the same reason.
+/// ⛔ **`Send`, deliberately NOT `Sync`**: the graph owns mutable device scratch (`x`, `xn`, `qkv`,
+/// `xq`, …) that two threads must never drive at once. The `RefCell` around it already forbids that;
+/// this keeps the type system saying so too.
+unsafe impl Send for DecodeGraph {}
+
 impl DecodeGraph {
     pub fn build(spec: &GraphSpec<'_>) -> Option<DecodeGraph> {
         let drv = driver()?.clone();

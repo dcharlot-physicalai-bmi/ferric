@@ -469,12 +469,27 @@ fn main() {
     // hashes to a third value. Prefix because llvmpipe carries an LLVM version that moves with the
     // runner image ("llvmpipe (LLVM 20.1.2, 256 bits)"), and a lock that breaks on an unrelated
     // image bump teaches people to ignore it.
+    // ⛔ THIS LOCK HELD A STALE VALUE FOR SIX DAYS AND TURNED CI RED ON EVERY PUSH. `df0235e`
+    // (2026-09-09, "Apply the lint: softmax and layernorm had the same one-thread…") changed the
+    // reduction order on ALL THREE fabrics; the first red run shows both remaining adapters failing
+    // this same assertion. Twenty-five pushes then landed on a red `main`, which is how a lock stops
+    // being read at all. ⚠ `cargo test` does NOT run examples, so no local test battery could see it
+    // — only the CI step that runs this example. The lesson is not about the lock, which did its job.
     const GOLDEN: &[(&str, u64)] = &[
-        ("Apple M5 Max",             0x29142d075f1beadc),
-        ("Apple Paravirtual device", 0x13cfd14821cf04d5),  // GitHub macOS runner, run 33999082940
+        // Re-locked 2026-09-15 on the current tree: reproducible across two debug runs and a release
+        // run on this laptop. It carries every kernel change since df0235e, not just the lint.
+        ("Apple M5 Max",             0xc8bff1b85d92a87a),
         // ⚠ ONE observation each. If an entry ever flakes the honest response is to DELETE IT — a
         // lock loosened until it stops failing is not a lock — and rely on the portable checks above.
-        ("llvmpipe",                 0xf690016066e7574b),  // GitHub ubuntu runner (lavapipe)
+        //
+        // ⛔ DELIBERATELY UNLOCKED, 2026-09-15: "Apple Paravirtual device" (GitHub macOS runner) and
+        // "llvmpipe" (GitHub ubuntu runner). Their recorded values were from BEFORE df0235e, and no
+        // one has observed either fabric on this tree — a value nobody has measured is not evidence
+        // about that fabric, so re-asserting it would only keep CI red on a number we invented. This
+        // laptop cannot produce either adapter. The `None` arm below PRINTS the hash and does not
+        // assert, so the next green CI run reports both; add them back in a follow-up commit that
+        // names the run. ⚠ Until then those two fabrics are covered only by the portable
+        // self-comparisons above — which is exactly what an unrecorded fabric has always meant here.
     ];
     let adapter = &ctx.adapter_name;
     match GOLDEN.iter().find(|(a, _)| adapter.starts_with(a)) {
