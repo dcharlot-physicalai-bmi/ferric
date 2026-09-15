@@ -32,14 +32,36 @@ dev=$(env -u "$VAR" $RUN "$M" "$IDS" 1 2>/dev/null | grep -m1 "^adapter")
 echo "  $dev"
 [ -n "$dev" ] || { echo "  ⛔ run_ids printed no adapter line — rebuild the examples. NO measurement taken."; exit 4; }
 echo "$dev" | grep -qiE "llvmpipe|swiftshader|software|cpu" && { echo "  ⛔ CPU/software adapter — refusing to benchmark it as a GPU."; exit 4; }
-echo "=== correctness: generated ids must be identical ==="
-a=$(env -u "$VAR" $RUN "$M" "$IDS" 16 2>/dev/null | grep "generated ids")
-b=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $RUN "$M" "$IDS" 16 2>/dev/null | grep "generated ids")
-if [ "$a" != "$b" ]; then
-  echo "  ⛔ GENERATION DIFFERS — correctness regression, no timings taken."
-  echo "    off: $a"; echo "    on : $b"; exit 2
+# ⛔⛔ THIS GATE ONCE PASSED ON A CHANGE THAT DID ALTER THE OUTPUT. It compared 16 ids on ONE prompt.
+# FERRIC_CUDA_Q8X (int8 activations) passed it, then diverged on 3 of 5 prompts at 128 tokens — the
+# earliest at TOKEN 31, i.e. just past the old window. Sixteen tokens is not evidence a numerics change
+# is output-neutral; it is evidence the first sixteen tokens agree. Now: the SAME horizon as the timed
+# runs (FERRIC_AB_TOKENS), over SEVERAL prompts, and it reports WHERE the first divergence is.
+CTOK=${FERRIC_AB_CHECK_TOKENS:-$TOK}
+SEEDS=${FERRIC_AB_SEEDS:-"$IDS 40,1265,315,264,3283 9707,11,847,829,374 3838,374,279,6722,315"}
+echo "=== correctness: generated ids must be identical ($CTOK tokens x $(echo $SEEDS | wc -w) prompts) ==="
+bad=0
+for sd in $SEEDS; do
+  a=$(env -u "$VAR" $RUN "$M" "$sd" "$CTOK" 2>/dev/null | grep "generated ids")
+  b=$(env "$VAR=${FERRIC_AB_VAL:-1}"  $RUN "$M" "$sd" "$CTOK" 2>/dev/null | grep "generated ids")
+  [ -n "$a" ] || { echo "  ⛔ no ids from run_ids on seed $sd — the gate cannot run. STOP."; exit 4; }
+  if [ "$a" != "$b" ]; then
+    bad=$((bad+1))
+    n=$(paste -d'\n' <(echo "$a") <(echo "$b") | awk 'NR==1{split($0,x,",");next}{split($0,y,",");for(i=1;i<=length(x);i++) if(x[i]!=y[i]){print i;exit}}')
+    echo "  ⛔ DIVERGED on seed $sd — first difference at token ${n:-?}"
+  else
+    echo "  ✅ identical   seed $sd"
+  fi
+done
+if [ "$bad" != 0 ]; then
+  echo "  ⛔ GENERATION DIFFERS on $bad prompt(s) — no timings taken."
+  echo "    A faster wrong answer is not a result. If the change is a deliberate numerics trade"
+  echo "    (quantised activations, a different accumulation width), it belongs behind its OWN"
+  echo "    opt-in with its OWN fingerprint — measure it with FERRIC_AB_ALLOW_DIVERGENCE=1, which"
+  echo "    keeps this report and proceeds to the timings."
+  [ -n "$FERRIC_AB_ALLOW_DIVERGENCE" ] || exit 2
+  echo "  ⚠ FERRIC_AB_ALLOW_DIVERGENCE set — proceeding, and the timings below compare DIFFERENT OUTPUTS."
 fi
-echo "  ✅ identical   $a"
 
 if [ -x "$BIT" ]; then
   echo "=== vacuity: the switch must actually change something ==="
@@ -55,7 +77,7 @@ if [ -x "$BIT" ]; then
     echo "    That is fine for a pure scheduling change, but if you expected a different"
     echo "    reduction order, the arm is not engaging and the timings below mean nothing."
   else
-    echo "  ✅ arms differ (logits fingerprint moved; generation did not)"
+    echo "  ✅ arms differ (logits fingerprint moved)"
   fi
 fi
 
