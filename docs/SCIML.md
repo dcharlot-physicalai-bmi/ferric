@@ -116,6 +116,39 @@ above, but bundling them and pointing the bundle at an arbitrary PDE is a differ
 are measurements; only `rel_l2.is_finite()` is asserted, and each row prints solved / partial / unsolved
 rather than passing or failing a bar chosen after the fact.
 
+### Weighting: what the table named, and what measuring it said
+
+`Weighting::{Fixed, GradNorm, Ntk}` and `causal_slabs` are recipe options, so a row that identifies a
+missing piece gets a head-to-head test rather than a note.
+
+**NTK-trace weighting** (Wang, Yu & Perdikaris 2022, arXiv 2007.14527) — what jaxpi and PirateNets run.
+Gradient-norm balancing equalises how hard each term *pulls*; the NTK view asks how fast each term's error
+*decays*, and weights by the inverse kernel trace `λ_i = (Σ_j tr K_jj) / tr K_ii`. ⛔ The trace is
+**estimated, not assembled**: `tr K_ii = ‖J_i‖_F²` needs one backward pass per collocation point (jaxpi gets
+them from `jacrev` + `vmap`; this fabric has neither), so Hutchinson's identity is used — for a Rademacher
+`v`, `E‖∇_θ(vᵀr)‖² = tr(J Jᵀ)`. Checked against a closed form on a residual linear in the parameters, where
+`tr K = ‖A‖_F²` exactly: against 127.817, one probe is +6.6 %, four +10.6 %, sixteen +4.7 %, sixty-four
+**+1.7 %** — the test watches it converge rather than asserting one draw. Weights for two terms whose traces
+differ 10⁴× come out 9371× apart, and a term whose trace has gone to zero is floored, the same guard
+`LossBalancer` needed.
+
+**Causal weighting** reuses the `Causal` machinery (which has its own fail-then-fix oracle above) against
+the problem's `time_axis`. `Recipe::ntk()` and `Recipe::causal(k)` are the named recipes.
+
+⚠ **Neither head-to-head comparison discriminates, before or after the frequency fix.** Helmholtz,
+gradient-norm against NTK: **0.4781 / 0.5183** with isotropic scales, **0.3066 / 0.3014** with per-axis ones
+— NTK flipped from marginally worse to marginally better, 1.7 % apart, with both still unsolved. Advection:
+**1.0815 / 1.0935** isotropic, **0.9712 / 0.9706** per-axis. In every case *both* arms fail, so the ordering
+is noise: two failing arms cannot rank two techniques. That is the rule that sent the balancing and causal
+fixtures back to be re-sized earlier on this page, applied to my own new work — and `compare()` prints
+`⚠ every arm failed — this comparison does not rank the recipes` itself rather than leaving it to the reader.
+Both sets of numbers are kept: a technique that changes sign when an unrelated layer is fixed is worth
+showing twice.
+
+⛔ `Problem::constraints` returns residual **vectors**, not a summed loss: an NTK trace is a property of the
+per-point Jacobian and summing first destroys it. Every boundary, initial and periodic condition is its own
+term — which is also the paper's formulation.
+
 ### Time marching
 
 `run_time_marched` is the piece the advection row named: a training **strategy**, not a loss term
@@ -139,8 +172,9 @@ causal — all barely better than predicting zero). Per-axis scales moved it 1.0
 moves it further. **Time marching does**: 0.7745 → 0.3252 at eight windows (see above). That is consistent
 with Krishnapriyan et al., who solve this case the same way — and it is the clearest result on this page
 that *how you train* can outrank every term you put in the loss.
-prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
-is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
+One `#[ignore]`d test per problem (`benchmark_heat`, `benchmark_burgers`, …) prints its row.
+`refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget` is the RAR fixture in the regime
+where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage. Measured at **exactly equal
 budget**: uniform(2540) **0.5008**, refined(2540) **0.3833** — 23 % lower from where the points are, not
 how many. Contrast the earlier `k`-sweep on a 1-D layer, where refinement never beat uniform because Adam
