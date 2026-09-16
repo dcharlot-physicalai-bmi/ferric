@@ -239,15 +239,30 @@ fn refinement_selects_the_layer_even_where_it_cannot_yet_be_shown_to_help() {
             -2.0 * k * k * (k * (x - 0.5)).tanh() * s
         };
         let cand: Vec<f32> = (0..800).map(|i| (i as f32 + 0.5) / 800.0).collect();
-        // an UNTRAINED net: its residual is dominated by −f, which is the layer's own signature
-        let net = FourierNet::new(&ctx, 1, 32, &[1.0, 5.0], &[64, 64], 1, Act::Tanh, 5);
+        let fvals: Vec<f32> = cand.iter().map(|&c| f_ex(c)).collect();
+        // An untrained net, whose residual should be dominated by −f — the layer's own signature.
+        //
+        // ⛔ THE PREMISE IS ASSERTED, NOT ASSUMED. The first version took it on faith and passed 16 of 16;
+        // it then read 0 of 16 after an unrelated refactor changed nothing but the random draw of the
+        // frequencies. At σ = 5 an untrained net's u'' carries a factor of (2πσ)² ≈ 10³ and can swamp the
+        // forcing outright, so whether this fixture tested selection or tested one lucky initialisation
+        // was decided by the seed. Low scales keep the net's own curvature below the forcing, and the
+        // check below fails loudly with the ratio if it ever stops being true.
+        let net = FourierNet::new(&ctx, 1, 32, &[0.25, 0.5], &[64, 64], 1, Act::Tanh, 5);
         let pv = net.vars();
         let cv = col(&ctx, &cand);
         let u = net.forward(&pv, &cv);
-        let r = deriv(&deriv(&u, &cv), &cv).sub(&col(&ctx, &cand.iter().map(|&c| f_ex(c)).collect::<Vec<_>>())).value().to_vec().await;
+        let uxx = deriv(&deriv(&u, &cv), &cv).value().to_vec().await;
+        let net_max = uxx.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let f_max = fvals.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            net_max < 0.25 * f_max,
+            "the fixture's premise is that the forcing dominates: |u''|max = {net_max:.1} against |f|max = {f_max:.1}"
+        );
+        let r: Vec<f32> = uxx.iter().zip(&fvals).map(|(a, b)| a - b).collect();
         let picked = rar_select(&r, 16);
         let in_layer = picked.iter().filter(|&&i| (cand[i] - 0.5).abs() < 2.0 / k).count();
-        eprintln!("  RAR picked 16 points; {in_layer} lie within 2/k of the layer centre (layer width ≈ {:.3})", 2.0 / k);
+        eprintln!("  RAR picked 16 points; {in_layer} within 2/k of the layer (|u''|max {net_max:.1} vs |f|max {f_max:.1}, premise holds)");
         assert!(in_layer >= 12, "refinement must concentrate on the layer: {in_layer} of 16");
         assert_eq!(picked.len(), 16);
     });

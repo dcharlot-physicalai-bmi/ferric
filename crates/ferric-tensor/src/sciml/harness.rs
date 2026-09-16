@@ -20,11 +20,30 @@ pub trait Problem {
     fn hi(&self) -> Vec<f64>;
     /// PDE residual at the `[N, dim]` points `x`, as `[N, 1]`, for the network `fwd`.
     fn residual(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var;
-    /// Boundary / initial / periodic constraint RESIDUALS, each `[·, 1]`, sampled with `n` points each.
+    /// Constraint residuals that hold at **every** time — spatial boundaries, periodicity — each `[·, 1]`.
     ///
     /// ⛔ Residual vectors, not a summed loss: an NTK trace is a property of the per-point Jacobian, and
     /// summing first destroys it. The harness takes the mean square of each for the loss.
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var>;
+    ///
+    /// ⚠ Separated from the initial condition because **time marching replaces the initial condition and
+    /// keeps the boundaries**. A single `constraints()` cannot express that: window two must satisfy the
+    /// same walls as window one but is handed its start state by window one, not by `t = 0`.
+    fn boundary_constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var>;
+    /// The `t = 0` initial condition, if the problem has one. `None` for a steady problem.
+    fn initial_constraint(&self, _ctx: &Arc<Context>, _fwd: &dyn Fn(&Var) -> Var, _n: usize, _seed: u32) -> Option<Var> {
+        None
+    }
+    /// Every constraint: the boundaries plus the initial condition. What ordinary (unwindowed) training uses.
+    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
+        let mut v = self.boundary_constraints(ctx, fwd, n, seed);
+        v.extend(self.initial_constraint(ctx, fwd, n, seed));
+        v
+    }
+    /// Points on the time slice `t`, for handing one window's end state to the next. `None` unless the
+    /// problem is time-dependent.
+    fn time_slice(&self, _n: usize, _t: f64, _seed: u32) -> Option<Vec<f32>> {
+        None
+    }
     /// Index of the time coordinate, if the problem is time-dependent — the axis causal weighting slabs.
     fn time_axis(&self) -> Option<usize> {
         None
@@ -108,13 +127,23 @@ enum NetImpl {
     Fourier(FourierNet),
 }
 
-/// Train `recipe` on `problem` with `colloc` collocation points (`[N, dim]` flattened) and score it on a
-/// `grid_m`-per-axis grid against the reference. Synchronous; the L-BFGS stage blocks on readbacks.
-pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &[f32], grid_m: usize, seed: u32) -> Report {
-    let t0 = Instant::now();
-    let d = problem.dim();
-    let n = colloc.len() / d;
-    let net = match &recipe.net {
+impl NetImpl {
+    fn params(&self) -> Vec<Tensor> {
+        match self {
+            NetImpl::Mlp(m) => m.params.clone(),
+            NetImpl::Fourier(f) => f.params.clone(),
+        }
+    }
+    fn forward(&self, pv: &[Var], x: &Var) -> Var {
+        match self {
+            NetImpl::Mlp(_) => Mlp::forward_act(pv, x, Act::Tanh),
+            NetImpl::Fourier(f) => f.forward(pv, x),
+        }
+    }
+}
+
+fn build_net(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, d: usize, seed: u32) -> NetImpl {
+    match &recipe.net {
         Net::TanhMlp { hidden } => {
             let mut dims = vec![d];
             dims.extend(hidden);
@@ -122,17 +151,18 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
             NetImpl::Mlp(Mlp::new(ctx, &dims, seed))
         }
         Net::Fourier { m_per_scale, hidden } => NetImpl::Fourier(FourierNet::new_anisotropic(ctx, *m_per_scale, &problem.scales(), hidden, 1, Act::Tanh, seed)),
-    };
-    let params0: Vec<Tensor> = match &net {
-        NetImpl::Mlp(m) => m.params.clone(),
-        NetImpl::Fourier(f) => f.params.clone(),
-    };
-    let forward = |pv: &[Var], x: &Var| -> Var {
-        match &net {
-            NetImpl::Mlp(_) => Mlp::forward_act(pv, x, Act::Tanh),
-            NetImpl::Fourier(f) => f.forward(pv, x),
-        }
-    };
+    }
+}
+
+/// Train `recipe` on `problem` with `colloc` collocation points (`[N, dim]` flattened) and score it on a
+/// `grid_m`-per-axis grid against the reference. Synchronous; the L-BFGS stage blocks on readbacks.
+pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &[f32], grid_m: usize, seed: u32) -> Report {
+    let t0 = Instant::now();
+    let d = problem.dim();
+    let n = colloc.len() / d;
+    let net = build_net(ctx, problem, recipe, d, seed);
+    let params0: Vec<Tensor> = net.params();
+    let forward = |pv: &[Var], x: &Var| -> Var { net.forward(pv, x) };
     // per-point residual and constraint residual VECTORS; the loss takes their mean squares
     let terms = |pv: &[Var], it: u32| -> Vec<Var> {
         let fwd = |x: &Var| forward(pv, x);
@@ -241,6 +271,97 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
     Report { problem: problem.name().to_string(), recipe: recipe.name, n_colloc: n, rel_l2: rel_l2(&pred, &truth), loss_after_adam, loss_final, secs: t0.elapsed().as_secs_f64() }
 }
 
+/// **Time-marched training** (Krishnapriyan et al. 2021, arXiv 2109.01050 §5, "seq2seq") — the piece the
+/// advection row of the benchmark table names, and a training *strategy* rather than a loss term.
+///
+/// A PINN asked to fit `sin(x − 30t)` over the whole of `t ∈ [0, 1]` must represent five wavelengths of a
+/// travelling wave at once, and every recipe here failed at it (0.91–1.08, barely better than predicting
+/// zero). Marching splits the horizon into `k` windows and solves them in order: window `w` sees only
+/// `t ∈ [t_w, t_{w+1}]`, keeps the problem's spatial boundary conditions, and takes its **initial
+/// condition from window `w−1`'s trained network**, evaluated on the slice `t = t_w` and frozen.
+///
+/// ⛔ **Each window keeps its own network, and that is not an optimisation.** Warm-starting one network
+/// through the windows would end with a network that fits only the last one — the earlier windows are
+/// trained away, which is exactly the catastrophic forgetting marching exists to avoid. Scoring therefore
+/// evaluates each point with the network that owns its time slab.
+pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &[f32], windows: usize, grid_m: usize, seed: u32) -> Report {
+    let t0 = Instant::now();
+    let d = problem.dim();
+    let ax = problem.time_axis().expect("time marching needs a time axis");
+    let (lo, hi) = (problem.lo()[ax], problem.hi()[ax]);
+    assert!(windows >= 1);
+    let edge = |w: usize| lo + (hi - lo) * w as f64 / windows as f64;
+
+    let mut per_window: Vec<Vec<Tensor>> = Vec::with_capacity(windows);
+    let mut prev: Option<(Vec<Tensor>, Vec<f32>, Vec<f32>)> = None; // params, slice points, frozen values
+    for w in 0..windows {
+        let (a, b) = (edge(w), edge(w + 1));
+        let pts: Vec<f32> = colloc
+            .chunks(d)
+            .filter(|p| (p[ax] as f64) >= a && (p[ax] as f64) <= b)
+            .flatten()
+            .copied()
+            .collect();
+        let n = pts.len() / d;
+        assert!(n > 0, "window {w} has no collocation points");
+        let net = build_net(ctx, problem, recipe, d, seed.wrapping_add(w as u32));
+        let mut wp = net.params();
+        let fwd_with = |pv: &[Var], x: &Var| net.forward(pv, x);
+        pollster::block_on(async {
+            let mut adam = Adam::new(&wp, recipe.lr);
+            for it in 0..recipe.adam_steps {
+                let pv = vars(&wp);
+                let fwd = |x: &Var| fwd_with(&pv, x);
+                let xv = leaf(ctx, &pts, &[n, d]);
+                let mut loss = mse(&problem.residual(ctx, &fwd, &xv, n));
+                for c in problem.boundary_constraints(ctx, &fwd, 200, seed.wrapping_add(it as u32)) {
+                    loss = loss.add(&mse(&c).mul(&scalar(&c, 10.0)));
+                }
+                // the start state: the problem's own IC in window 0, the previous window's net after that
+                let start = match &prev {
+                    None => problem.initial_constraint(ctx, &fwd, 200, seed.wrapping_add(it as u32)),
+                    Some((_, sl, vals)) => {
+                        let m = sl.len() / d;
+                        Some(fwd(&leaf(ctx, sl, &[m, d])).sub(&leaf(ctx, vals, &[m, 1])))
+                    }
+                };
+                if let Some(st) = start {
+                    loss = loss.add(&mse(&st).mul(&scalar(&st, 100.0)));
+                }
+                step(ctx, &loss, &pv, &mut wp, &mut adam).await;
+            }
+        });
+        // hand this window's end state to the next, frozen
+        if w + 1 < windows {
+            let sl = problem.time_slice(400, b, seed.wrapping_add(7717 + w as u32)).expect("a time-dependent problem must give a slice");
+            let m = sl.len() / d;
+            let vals = pollster::block_on(async { fwd_with(&vars(&wp), &leaf(ctx, &sl, &[m, d])).value().to_vec().await });
+            prev = Some((wp.clone(), sl, vals));
+        }
+        per_window.push(wp);
+    }
+
+    // score: every grid point evaluated by the network that owns its slab
+    let g = box_grid(&problem.lo(), &problem.hi(), grid_m);
+    let ng = g.len() / d;
+    let mut pred = vec![0.0f32; ng];
+    for (w, wp) in per_window.iter().enumerate() {
+        let (a, b) = (edge(w), edge(w + 1));
+        let idx: Vec<usize> = (0..ng).filter(|&i| { let t = g[i * d + ax] as f64; t >= a && (t <= b || w + 1 == windows) && (w == 0 || t > a) }).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let sub: Vec<f32> = idx.iter().flat_map(|&i| g[i * d..(i + 1) * d].to_vec()).collect();
+        let net = build_net(ctx, problem, recipe, d, seed.wrapping_add(w as u32));
+        let out = pollster::block_on(async { net.forward(&vars(wp), &leaf(ctx, &sub, &[idx.len(), d])).value().to_vec().await });
+        for (k, &i) in idx.iter().enumerate() {
+            pred[i] = out[k];
+        }
+    }
+    let truth: Vec<f32> = g.chunks(d).map(|p| problem.reference(&p.iter().map(|&v| v as f64).collect::<Vec<_>>()) as f32).collect();
+    Report { problem: problem.name().to_string(), recipe: "time-marched", n_colloc: colloc.len() / d, rel_l2: rel_l2(&pred, &truth), loss_after_adam: f32::NAN, loss_final: f32::NAN, secs: t0.elapsed().as_secs_f64() }
+}
+
 // ---------------------------------------------------------------- the problems ------------------
 
 /// Burgers, `ν = 0.01/π`: the PINNacle / Raissi setting, with the shock at `x = 0`.
@@ -267,14 +388,20 @@ impl Problem for Burgers {
         let u_xx = dcol(ctx, &u_x, x, n, 2, 0);
         u_t.add(&u.mul(&u_x)).sub(&u_xx.mul(&scalar(&u_xx, self.nu as f32)))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
+    fn boundary_constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
-        let xs: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed ^ 0x5151) - 1.0).collect();
         let bl: Vec<f32> = t.iter().flat_map(|&t| [-1.0, t]).collect();
         let br: Vec<f32> = t.iter().flat_map(|&t| [1.0, t]).collect();
+        vec![fwd(&leaf(ctx, &bl, &[n, 2])), fwd(&leaf(ctx, &br, &[n, 2]))]
+    }
+    fn initial_constraint(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Option<Var> {
+        let xs: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed ^ 0x5151) - 1.0).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| -(std::f32::consts::PI * x).sin()).collect();
-        vec![fwd(&leaf(ctx, &bl, &[n, 2])), fwd(&leaf(ctx, &br, &[n, 2])), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+        Some(fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0)))
+    }
+    fn time_slice(&self, n: usize, t: f64, seed: u32) -> Option<Vec<f32>> {
+        Some((0..n).flat_map(|i| [2.0 * u01(i as u32, seed) - 1.0, t as f32]).collect())
     }
     fn time_axis(&self) -> Option<usize> {
         Some(1)
@@ -317,7 +444,7 @@ impl Problem for Helmholtz {
         let q: Vec<f32> = pts.chunks(2).map(|p| bench::helmholtz(p[0] as f64, p[1] as f64, self.a1, self.a2, self.k).1 as f32).collect();
         lap.add(&u.mul(&scalar(&u, (self.k * self.k) as f32))).sub(&col(ctx, &q))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
+    fn boundary_constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let s: Vec<f32> = (0..n).map(|i| 2.0 * u01(i as u32, seed) - 1.0).collect();
         let mut b = Vec::with_capacity(8 * n);
         for &v in &s {
@@ -355,13 +482,19 @@ impl Problem for Heat {
         let u_x = dcol(ctx, &u, x, n, 2, 0);
         u_t.sub(&dcol(ctx, &u_x, x, n, 2, 0))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
+    fn boundary_constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
-        let xs: Vec<f32> = (0..n).map(|i| u01(i as u32, seed ^ 0x77)).collect();
         let b: Vec<f32> = t.iter().flat_map(|&t| [0.0, t, 1.0, t]).collect();
+        vec![fwd(&leaf(ctx, &b, &[2 * n, 2]))]
+    }
+    fn initial_constraint(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Option<Var> {
+        let xs: Vec<f32> = (0..n).map(|i| u01(i as u32, seed ^ 0x77)).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| (std::f32::consts::PI * x).sin()).collect();
-        vec![fwd(&leaf(ctx, &b, &[2 * n, 2])), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+        Some(fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0)))
+    }
+    fn time_slice(&self, n: usize, t: f64, seed: u32) -> Option<Vec<f32>> {
+        Some((0..n).flat_map(|i| [u01(i as u32, seed), t as f32]).collect())
     }
     fn time_axis(&self) -> Option<usize> {
         Some(1)
@@ -399,14 +532,20 @@ impl Problem for Advection {
         let u_x = dcol(ctx, &u, x, n, 2, 0);
         u_t.add(&u_x.mul(&scalar(&u_x, self.beta as f32)))
     }
-    fn constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
+    fn boundary_constraints(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Vec<Var> {
         let t: Vec<f32> = (0..n).map(|i| u01(i as u32, seed)).collect();
-        let xs: Vec<f32> = (0..n).map(|i| std::f32::consts::TAU * u01(i as u32, seed ^ 0x99)).collect();
         let l: Vec<f32> = t.iter().flat_map(|&t| [0.0, t]).collect();
         let r: Vec<f32> = t.iter().flat_map(|&t| [std::f32::consts::TAU, t]).collect();
+        vec![fwd(&leaf(ctx, &l, &[n, 2])).sub(&fwd(&leaf(ctx, &r, &[n, 2])))]
+    }
+    fn initial_constraint(&self, ctx: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, n: usize, seed: u32) -> Option<Var> {
+        let xs: Vec<f32> = (0..n).map(|i| std::f32::consts::TAU * u01(i as u32, seed ^ 0x99)).collect();
         let ic: Vec<f32> = xs.iter().flat_map(|&x| [x, 0.0]).collect();
         let u0: Vec<f32> = xs.iter().map(|&x| x.sin()).collect();
-        vec![fwd(&leaf(ctx, &l, &[n, 2])).sub(&fwd(&leaf(ctx, &r, &[n, 2]))), fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0))]
+        Some(fwd(&leaf(ctx, &ic, &[n, 2])).sub(&col(ctx, &u0)))
+    }
+    fn time_slice(&self, n: usize, t: f64, seed: u32) -> Option<Vec<f32>> {
+        Some((0..n).flat_map(|i| [std::f32::consts::TAU * u01(i as u32, seed), t as f32]).collect())
     }
     fn time_axis(&self) -> Option<usize> {
         Some(1)
@@ -504,6 +643,24 @@ mod tests {
     #[test]
     fn helmholtz_gradnorm_against_ntk_weighting() {
         compare(&Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 }, &[Recipe::full(), Recipe::ntk()], 2000, 1);
+    }
+
+    /// ⭐⭐ **Advection at β = 30 by TIME MARCHING** — the piece the table named after weighting failed.
+    /// One global fit against eight windows solved in order, each with its own network, each handed its
+    /// start state by the previous one. Same net size, same per-window step budget.
+    #[ignore = "nine trainings on the GPU (~20 min); run with -- --ignored"]
+    #[test]
+    fn advection_by_time_marching_against_one_global_fit() {
+        let ctx = ctx();
+        let p = Advection { beta: 30.0 };
+        let colloc = box_points(&p.lo(), &p.hi(), 4000, 7);
+        let one = run(&ctx, &p, &Recipe::full(), &colloc, 51, 1);
+        let marched = Recipe { adam_steps: 1500, lbfgs_iters: 0, ..Recipe::full() };
+        let many = run_time_marched(&ctx, &p, &marched, &colloc, 8, 51, 1);
+        eprintln!("  advection β=30: one global fit {:.4} ({:.0}s)   8 windows marched {:.4} ({:.0}s)", one.rel_l2, one.secs, many.rel_l2, many.secs);
+        assert!(one.rel_l2.is_finite() && many.rel_l2.is_finite());
+        let verdict = |r: f32| if r < 0.05 { "solved" } else if r < 1.0 { "partial" } else { "UNSOLVED" };
+        eprintln!("    global {} / marched {}", verdict(one.rel_l2), verdict(many.rel_l2));
     }
 
     /// ⚠ **Advection at β = 30, where the table said causal weighting was the missing piece — and again

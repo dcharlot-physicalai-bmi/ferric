@@ -116,7 +116,21 @@ above, but bundling them and pointing the bundle at an arbitrary PDE is a differ
 are measurements; only `rel_l2.is_finite()` is asserted, and each row prints solved / partial / unsolved
 rather than passing or failing a bar chosen after the fact.
 
-⛔ **Advection at β = 30 remains unsolved by every recipe here** (0.9144 / 0.9712 / 0.9706 with causal —
+### Time marching
+
+`run_time_marched` is the piece the advection row named: a training **strategy**, not a loss term
+(Krishnapriyan et al. 2021 §5). The horizon is split into `k` windows solved in order; window `w` sees only
+`t ∈ [t_w, t_{w+1}]`, keeps the problem's spatial boundary conditions, and takes its initial condition from
+window `w−1`'s trained network, evaluated on the slice `t = t_w` and frozen. That required splitting
+`Problem`'s constraints into `boundary_constraints` (true at every time) and `initial_constraint` (true only
+at `t = 0`) — a single list cannot express "same walls, different start".
+
+⛔ **Each window keeps its own network, and that is not an optimisation.** Warm-starting one network through
+the windows ends with a network that fits only the last one; scoring therefore evaluates each point with the
+network that owns its time slab. `advection_by_time_marching_against_one_global_fit` runs eight windows
+against one global fit.
+
+⛔ **Advection at β = 30 remains unsolved by every *single-fit* recipe here** (0.9144 / 0.9712 / 0.9706 with causal —
 all barely better than predicting zero). Per-axis scales moved it 1.08 → 0.97 and no weighting moves it
 further, which is consistent with the literature: Krishnapriyan et al. solve this case by **time
 marching** — train on `[0, ΔT]`, then use that solution as the initial condition for the next window —
