@@ -14,20 +14,32 @@
 //! ⚠ **Nothing here has run against a Tenstorrent card.** No Wormhole or Blackhole device has been
 //! available to this project. Every function returns `Option`/`Result` and the absent-device path IS
 //! tested; the present-device path is **unverified** and says so at each call site. The ABI itself is
-//! not guesswork — it is checked against the real header by a C compiler, see `abi` below.
-#![cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+//! not guesswork — it is checked against the real header by a C compiler, see the tests below.
+//!
+//! ⭐ **Only the SYSCALLS are linux-gated; the ABI is not.** An earlier draft put the whole module
+//! behind `#![cfg(target_os = "linux")]`, which would have hidden every checkable fact — the struct
+//! layouts, the ioctl numbers, the argument rules — from the Mac where most commits are made. That is
+//! vacuous-test mechanism #84, paid for once already today by a `Send` bound no local run could see.
+//! These structs are fixed-size integer aggregates, so their `#[repr(C)]` layout is identical on every
+//! mainstream 64-bit target: the layout test is *more* trustworthy for running in both places, not
+//! less. `Device` and the `libc` externs stay linux-only, because `/dev/tenstorrent` does.
 
-use std::ffi::{c_char, c_int, c_ulong, c_void, CString};
+use std::ffi::c_ulong;
+#[cfg(target_os = "linux")]
+use std::ffi::{c_char, c_int, c_void, CString};
 
 // ⛔ `ioctl` is variadic in C. Declaring it non-variadically happens to work on x86-64 SysV and is
 // exactly the kind of "works on my arch" that this tier exists to avoid — tt hardware also ships on
 // aarch64 hosts. Declared variadic, as C declares it.
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
+#[cfg(target_os = "linux")]
 const O_RDWR: c_int = 2;
+#[cfg(target_os = "linux")]
 const O_CLOEXEC: c_int = 0o2000000;
 
 /// `_IO(0xFA, nr)` — Linux's `_IOC(dir=_IOC_NONE, type, nr, size=0)` collapses to `(type << 8) | nr`.
@@ -133,17 +145,20 @@ pub struct NocIo {
     pub value: u64,
 }
 
-/// One open `/dev/tenstorrent/N`.
+/// One open `/dev/tenstorrent/N`. ⚠ linux only — the device node does not exist elsewhere.
+#[cfg(target_os = "linux")]
 pub struct Device {
     fd: c_int,
     pub index: u32,
 }
+#[cfg(target_os = "linux")]
 impl Drop for Device {
     fn drop(&mut self) {
         unsafe { close(self.fd) };
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Device {
     /// Opens `/dev/tenstorrent/{index}`. `None` when the node is absent (no card, or `tt-kmd` not
     /// loaded) — the same probe-and-decline contract as `cuda::driver()`.
@@ -272,9 +287,14 @@ mod tests {
     /// mistake the code made. The header is NOT vendored here — it is GPL-2.0, and Ferric does not
     /// take GPL source into its tree; only these measured facts about the ABI are recorded.
     ///
-    /// ⚠ A field reordered, a `reserved` dropped, or a `u32` where the header says `u64` all move at
-    /// least one of these. That is the whole point: the calls are untestable without a card, so the
-    /// LAYOUT is where the checkable truth lives.
+    /// ⚠ **Mutation-tested, and the results are worth writing down because two of them surprised me.**
+    /// CAUGHT: swapping `bus_dev_fn` with `pci_domain` (a reorder), and widening `bus_dev_fn` to
+    /// `u32` (a mid-struct width change). NOT caught, and correctly so: **dropping a TRAILING
+    /// `reserved` field changes nothing** — `DeviceInfoOut` is 20 bytes either way because Rust pads
+    /// to the 4-byte alignment, and `Mapping` is 24 either way because `mapping_base: u64` aligns to 8
+    /// regardless. Those are ABI-benign, not blind spots. The layout is where the checkable truth
+    /// lives, since the calls are untestable without a card — but it checks OFFSETS, so only changes
+    /// that move a field are in scope.
     #[test]
     fn struct_layout_matches_the_c_compiler_on_tt_kmds_own_header() {
         assert_eq!(size_of::<DeviceInfoOut>(), 20);
@@ -337,6 +357,7 @@ mod tests {
     /// machine without a card must decline quietly, never panic and never block, exactly as
     /// `cuda::driver()` does without an NVIDIA driver. On a machine that DOES have one this reports
     /// what it found rather than asserting, because a lock nobody has recorded is not evidence.
+    #[cfg(target_os = "linux")]
     #[test]
     fn probing_a_machine_without_a_card_declines_quietly() {
         let found = Device::enumerate();
