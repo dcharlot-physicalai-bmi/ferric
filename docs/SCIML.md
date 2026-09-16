@@ -243,9 +243,6 @@ Parameters are now one complex weight per half-spectrum mode, expanded with the 
 the parameters, and each one means one thing. A second training stage at a decayed rate is what brings the
 smallest multipliers (~20× below the largest) from 12 % to under 1 %; they sit at Adam's noise floor otherwise.
 
-⚠ The multi-channel FNO — a `w × w` complex matrix per mode plus pointwise channel mixing — is the follow-on,
-not this layer.
-
 ### ⛔ Two defects the recipe exposed in the fabric itself
 
 **`tanh` had no differentiable VJP, and `grad()` was silent about it.** `Var::tanh` was built with
@@ -270,6 +267,63 @@ matrices rather than concatenating them.
 pair was rejected, the history froze, and its direction collapsed to `|d| ≈ 1.8e-3` — accepted at unit
 step every time. The Wolfe curvature condition makes `sᵀy > 0` by construction; with it, 36 iterations,
 49 evaluations, `f = 0` at `(1, 1)`.
+
+## The multi-channel FNO — `sciml::fno`
+
+The channel-diagonal layer above is one complex *scalar* per mode. The FNO of Li et al. (2010.08895) is the
+general case: at each retained wavevector a learned complex **matrix** `R(k) ∈ ℂ^{w×w}` applied to the channel
+vector of the spectrum. `SpectralConvMulti` is that layer and `Fno2d` the surrounding network — lift `d_in → w`
+pointwise, `L` Fourier layers `h ← σ(W h + b + SpectralConvMulti(h))`, project `w → d_out`.
+
+The per-mode matrices are **not** a loop over modes: the retained spectrum is compressed to `[B, w, M]`,
+transposed to mode-major `[M, B, w]`, and multiplied by `R` of shape `[M, w, w]` as a single batched GEMM.
+
+| oracle | result |
+|---|---|
+| `SpectralConvMulti` on a channel-**coupling** operator `M(k) = g(k)A + i s(k)B` | held-out rel-L2 **0.0001** |
+| the same layer with its off-diagonal blocks masked (channel-diagonal ablation) | rel-L2 **0.6007** — it cannot represent the coupling |
+| the learned per-mode matrices against the closed-form `M(k)`, entry by entry | worst entry off by **1.24e-4**, against entries spanning ±1.0 |
+| `Fno2d` (width 8, 2 layers, tanh) on the nonlinear operator `f ↦ s + s²`, `s` = `f` smoothed by `4/|k|²` | held-out rel-L2 **0.0248** |
+| the same network with its activations removed (exactly linear, same parameter count) | rel-L2 **0.5999** |
+
+(`s` is a Poisson-type smoothing of `f` — the multiplier `4/|k|²`, scaled so `s` is O(1) rather than the
+Green's function's `1/(4π²|k|²)`.) The nonlinear fixture asserts its own premise in numbers before it compares
+anything: `‖s²‖/‖u‖ = 0.734`, so
+the quadratic term genuinely dominates and the linear arm is *forced* to fail. Both reference operators are
+built in real space as explicit sums of sinusoids with the multiplier applied in closed form per mode — they
+touch neither the network nor its DFT matrices.
+
+⛔ **Every fixture was symmetric under the transformation that was wrong.** The batched GEMM contracts the
+channel axis against `R`'s last axis, so the stored layout is `[in, out]`; the oracle wrote its reference
+matrix `[out, in]`, the way an operator matrix is always written. The layer was learning the **transpose of the
+truth**, and three tests passed over it: `R = I` is the identity and `Iᵀ = I`; width 1 matches the
+channel-diagonal layer and a 1×1 matrix is its own transpose; and held-out error after training was **0.0000**,
+because the transpose is exactly as learnable as the truth. Only the trained weight read wrong — `0` where the
+truth said `1.0` — and the first explanation that came to mind (an untrainable DC mode) was wrong.
+
+What found it in one run, and is now a permanent test: **install the reference weights and compare the forward
+map to the closed form with no training in the loop** — if that fails the conventions differ and no amount of
+training reconciles them — then repeat it **one mode at a time** on a field carrying that mode alone, because a
+whole-field norm hides one bad mode under the modes that dominate it. `R` is now stored and read `[out, in]`
+and transposed at the GEMM. Same family as the conjugate-symmetry defect above: a good loss is not evidence
+that a weight means anything.
+
+⚠ **Two weight groups are masked to zero rather than left to drift**, for the same reason: the imaginary part
+at a self-mirrored mode (`k = −k mod n`), whose spectrum is real for a real field and whose imaginary output
+the symmetry expansion discards, and the off-diagonal blocks of the channel-diagonal ablation. Unmasked they
+sit at their random initialisation with zero gradient and read like learned values.
+
+### ⛔ A third defect the operator exposed in the fabric
+
+**`Var::matmul` had a broken backward pass for a batched operand against an unbatched one.** The VJP
+transposed *both* operands by the rank of the first, so `[B, m, k] × [k, n]` — the shape every FNO layer and
+every pointwise channel projection makes — panicked with `permute rank mismatch` the moment a gradient flowed
+through it. The forward pass was always correct, which is why the shape reads as supported; nothing in the
+stack had mixed ranks before. Each operand now transposes by its own rank, and the unbatched operand's
+gradient is summed back over the broadcast batch (which `accumulate` and `grad()` already did centrally — a
+belt-and-braces `unbroadcast_var` inside the VJP was written and then removed, because no mutation could
+distinguish it from its absence). Covered by a finite-difference check on both operands plus an assertion on
+the shape `grad()` returns for the unbatched one.
 
 ## Design notes
 
@@ -296,5 +350,8 @@ step every time. The Wolfe curvature condition makes `sᵀy > 0` by construction
 - **Joules-per-solve is not measured** — Apple Silicon exposes no RAPL; an honest per-solve energy number
   needs the external-meter / Jetson path (see `FABRIC.md`). Not fabricated.
 - **Remaining:** an FFT primitive (to make the FNO asymptotically fast), a separable PINN (SPINN) for
-  higher dimensions, and a WebGPU **in-browser** build — the same fabric runs in-browser (Bonsai does), but
-  in-browser *training* + second-order `grad()` on WebGPU is unproven and needs a de-risking spike first.
+  higher dimensions, and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
+  wasm32-unknown-unknown` is **clean**, so nothing in the tensor crate — `sciml` included — is host-only at
+  the type level. That is a compile, not a run: it says nothing about whether the WebGPU compute path, the
+  tape, or second-order `grad()` behave in a browser, and in-browser *training* remains unproven and still
+  needs a de-risking spike.
