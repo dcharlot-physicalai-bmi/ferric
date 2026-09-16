@@ -1,0 +1,13 @@
+// A Tensix baby-core shaped kernel: read a mailbox word in L1, transform it, write it back, spin.
+// Carries .text, .rodata and .bss on purpose so a loader meets every segment kind.
+extern "C" {
+volatile unsigned* const MBOX = (volatile unsigned*)0x19000;
+const unsigned TABLE[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+unsigned SCRATCH[64];            // .bss  -> memsz > filesz
+void _start() {
+  unsigned v = *MBOX;
+  SCRATCH[v & 63] = v;
+  *MBOX = v * 3u + TABLE[v & 3];
+  for (;;) {}
+}
+}

@@ -109,3 +109,57 @@ fn it_refuses_every_image_it_cannot_faithfully_load() {
     // ⚠ THE CONTROL. Without it a parse() that returned Err for everything would pass all of the above.
     assert!(elf::parse(ELF).is_ok(), "the unmutated fixture must still parse");
 }
+
+/// ⭐⭐ **THE REAL THING: an ELF from Tenstorrent's OWN compiler, for a real Tensix core.**
+///
+/// The test above proves the parser agrees with an independent parser about a genuine RISC-V image,
+/// but it was LLVM's output, and the commit that added it said plainly that it proved nothing about
+/// SFPI's layout. This closes that gap. `fixtures/tensix_wh_kernel.elf` was built with
+/// **`riscv-tt-elf-g++` 15.1.0 from `tenstorrent/sfpi` 7.77.0**, targeting **`-mcpu=tt-wh`** — the
+/// toolchain's own Wormhole multilib, not a generic `rv32`:
+///
+///   riscv-tt-elf-g++ -mcpu=tt-wh -mabi=ilp32 -O2 -ffreestanding -nostdlib -nostartfiles \
+///                    -fno-exceptions -fno-rtti -T kernel.ld -o k_tt-wh.elf kernel.cc
+///   4948 bytes, sha256 d9e81e6c1eabd0b5500b6b41d222f76e8f353fc177904fe3fadde35445bec3df
+///
+/// Source and linker script are beside it (`tensix_kernel.cc.txt`, `tensix_kernel.ld.txt`). Expected
+/// values come from **SFPI's own `riscv-tt-elf-readelf`**, not from me. A Blackhole build
+/// (`-mcpu=tt-bh`) was produced in the same run and parses the same way; one fixture is committed
+/// because two would assert the same property twice.
+///
+/// ⭐ **This is the premise of the whole tier, demonstrated**: tt-metal JITs kernels at runtime, but
+/// the artifact is an ordinary ELF and the compiler is an ordinary cross-compiler. **No Tenstorrent
+/// hardware was involved in producing this** — so Ferric can ship tracked ELFs beside their sources
+/// exactly as it ships `.ptx` beside `.cu`.
+///
+/// ⚠ Still unproven, and not claimed: that this kernel RUNS. Executing it needs a card.
+#[test]
+fn parses_a_kernel_built_by_tenstorrents_own_compiler_for_a_wormhole_core() {
+    const WH: &[u8] = include_bytes!("fixtures/tensix_wh_kernel.elf");
+    let img = elf::parse(WH).expect("an SFPI-built Tensix kernel must parse");
+
+    // From `riscv-tt-elf-readelf -h`: Entry point address 0x10000, ELF32, little endian, RISC-V.
+    assert_eq!(img.entry, 0x10000);
+    // From `riscv-tt-elf-readelf -lW`:
+    //   LOAD  0x001000 0x00010000 0x00010000 0x0005c 0x0015c RWE 0x1000
+    assert_eq!(img.loads.len(), 1, "one LOAD segment");
+    let l = &img.loads[0];
+    assert_eq!((l.file_off, l.addr, l.file_len, l.mem_len), (0x1000, 0x10000, 0x5c, 0x15c));
+
+    // ⭐ 0x15c - 0x5c = 256 bytes of .bss: the SCRATCH[64] array, which exists in NO file byte.
+    // A loader that skips this leaves the core reading the previous kernel's leavings — a bug that
+    // reproduces as "works the first time" and is why this fixture carries a .bss at all.
+    assert_eq!(l.zero_len(), 256);
+    assert_eq!(l.bytes(WH).len(), 0x5c);
+    assert_eq!(img.mem_bytes(), 0x15c);
+
+    // The entry is the first byte of the segment: _start leads the image, as a core expects.
+    assert_eq!(img.entry, l.addr);
+
+    // ⚠ This fixture's program header 0 is PT_RISCV_ATTRIBUTES with filesz 0x2a and memsz 0 — i.e.
+    // filesz > memsz, which for a PT_LOAD is a hard error above. It is skipped, correctly, because
+    // the loader reads only what it writes to a core. Recorded because a control aimed at THAT header
+    // "passed" and briefly looked like the test was blind; the real control corrupts ph1's p_memsz
+    // and does turn this test red.
+    assert_eq!(img.loads.len(), 1, "only the PT_LOAD is taken, not the attributes header");
+}
