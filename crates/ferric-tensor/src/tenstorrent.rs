@@ -20,9 +20,15 @@
 //! behind `#![cfg(target_os = "linux")]`, which would have hidden every checkable fact — the struct
 //! layouts, the ioctl numbers, the argument rules — from the Mac where most commits are made. That is
 //! vacuous-test mechanism #84, paid for once already today by a `Send` bound no local run could see.
-//! These structs are fixed-size integer aggregates, so their `#[repr(C)]` layout is identical on every
-//! mainstream 64-bit target: the layout test is *more* trustworthy for running in both places, not
-//! less. `Device` and the `libc` externs stay linux-only, because `/dev/tenstorrent` does.
+//! `Device` and the `libc` externs stay linux-only, because `/dev/tenstorrent` does.
+//!
+//! ⚠ That split rests on a claim, so the claim was MEASURED rather than asserted in prose: the header
+//! was compiled with all 21 size/offset facts as `_Static_assert`s under
+//! `--target={x86_64,aarch64}-unknown-linux-gnu` and `{aarch64,x86_64}-apple-darwin`. **All 21 hold on
+//! all four**, so these fixed-size integer aggregates really do lay out identically on every host tt
+//! ships on, and running the layout test on the Mac is evidence about linux. Control: flipping one
+//! expected value to a wrong number fails exactly one assertion, so the check is not vacuously
+//! compiling.
 
 use std::ffi::c_ulong;
 #[cfg(target_os = "linux")]
