@@ -96,19 +96,24 @@ impl Var {
             Box::new(move |g, p| { p[0].accumulate(&g.mul(&b)); p[1].accumulate(&g.mul(&a)); }),
             Box::new(|g, p| vec![g.mul(&p[1]), g.mul(&p[0])]))
     }
-    /// Matmul (last two dims; equal or absent batch dims).
+    /// Matmul on the last two dims; batch dims broadcast, so a batched operand may meet an unbatched
+    /// one (e.g. `[B, n, k] × [k, m]`) and the unbatched operand's gradient sums over the batch.
     pub fn matmul(&self, o: &Var) -> Var {
         let out = self.0.value.matmul(&o.0.value);
         let (a, b) = (self.0.value.clone(), o.0.value.clone());
         Var::node_d(out, vec![self.clone(), o.clone()],
             Box::new(move |g, p| {
-                let r = a.rank();
-                p[0].accumulate(&g.matmul(&b.transpose(r - 1, r - 2)));   // dA = g · Bᵀ
-                p[1].accumulate(&a.transpose(r - 1, r - 2).matmul(g));    // dB = Aᵀ · g
+                // ⛔ Each operand must transpose by ITS OWN rank. One rank used for both panics
+                // (`permute rank mismatch`) the moment a batched activation meets an unbatched weight,
+                // which is every layer of the FNO; it went unseen because nothing mixed ranks before.
+                let (ra, rb) = (a.rank(), b.rank());
+                p[0].accumulate(&g.matmul(&b.transpose(rb - 1, rb - 2)));   // dA = g · Bᵀ
+                p[1].accumulate(&a.transpose(ra - 1, ra - 2).matmul(g));    // dB = Aᵀ · g
             }),
             Box::new(|g, p| {
-                let r = p[0].value().rank();
-                vec![g.matmul(&p[1].transpose(r - 1, r - 2)), p[0].transpose(r - 1, r - 2).matmul(g)]
+                // no un-broadcasting here: `grad()` reduces every contribution to its parent's shape
+                let (ra, rb) = (p[0].value().rank(), p[1].value().rank());
+                vec![g.matmul(&p[1].transpose(rb - 1, rb - 2)), p[0].transpose(ra - 1, ra - 2).matmul(g)]
             }))
     }
     /// Matmul against a FROZEN quantized weight `w` [out, in], WITHOUT dequantizing it to fp — the
@@ -499,4 +504,66 @@ fn unbroadcast(g: &Tensor, shape: &[usize]) -> Tensor {
         out = out.reshape(shape);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferric_core::Context;
+    use std::sync::Arc;
+
+    /// ⛔ **A batched activation against an unbatched weight** — `[B, m, k] × [k, n]`, the shape every
+    /// FNO layer and every pointwise channel projection makes — used to panic in the backward pass with
+    /// `permute rank mismatch`, because the VJP transposed *both* operands by the rank of the first.
+    /// Nothing in the stack mixed ranks before, so nothing caught it. Both gradients are checked against
+    /// central differences; the unbatched operand's is the interesting one, since it must sum over the
+    /// batch that broadcasting introduced.
+    #[test]
+    fn a_batched_matmul_against_an_unbatched_weight_differentiates() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (bs, m, k, n) = (3usize, 2usize, 4usize, 5usize);
+            let av: Vec<f32> = (0..bs * m * k).map(|i| ((i * 37) % 11) as f32 * 0.1 - 0.5).collect();
+            let bv: Vec<f32> = (0..k * n).map(|i| ((i * 53) % 13) as f32 * 0.1 - 0.6).collect();
+            let build = |p: &[f32], q: &[f32]| {
+                let a = Var::leaf(Tensor::from_vec(&ctx, p, &[bs, m, k]));
+                let b = Var::leaf(Tensor::from_vec(&ctx, q, &[k, n]));
+                let y = a.matmul(&b);
+                let l = y.mul(&y).sum_all();
+                (a, b, l)
+            };
+            let (a, b, l) = build(&av, &bv);
+            l.backward();
+            let (ga, gb) = (a.grad().unwrap().to_vec().await, b.grad().unwrap().to_vec().await);
+            assert_eq!(gb.len(), k * n, "the unbatched operand's gradient must keep its own shape");
+            // the same gradients through the differentiable (second-order-capable) VJP
+            let gv = grad(&l, &[a.clone(), b.clone()], None);
+            let (ga2, gb2) = (gv[0].value().to_vec().await, gv[1].value().to_vec().await);
+            assert_eq!(
+                gv[1].value().shape,
+                vec![k, n],
+                "grad() must reduce the unbatched operand's gradient back over the broadcast batch"
+            );
+            let eps = 1e-3f32;
+            let mut worst = 0.0f32;
+            for (vals, gref, gdif, shape) in [(&av, &ga, &ga2, "A"), (&bv, &gb, &gb2, "B")] {
+                for i in (0..vals.len()).step_by(3) {
+                    let (mut p, mut q) = (vals.to_vec(), vals.to_vec());
+                    p[i] += eps;
+                    q[i] -= eps;
+                    let (lp, lm) = if shape == "A" {
+                        (build(&p, &bv).2.value().to_vec().await[0], build(&q, &bv).2.value().to_vec().await[0])
+                    } else {
+                        (build(&av, &p).2.value().to_vec().await[0], build(&av, &q).2.value().to_vec().await[0])
+                    };
+                    let fd = (lp - lm) / (2.0 * eps);
+                    let tol = 2e-2 * (1.0 + fd.abs());
+                    assert!((fd - gref[i]).abs() < tol, "d{shape}[{i}]: backward {} vs finite difference {fd}", gref[i]);
+                    assert!((fd - gdif[i]).abs() < tol, "d{shape}[{i}]: grad() {} vs finite difference {fd}", gdif[i]);
+                    worst = worst.max((fd - gref[i]).abs());
+                }
+            }
+            eprintln!("  batched × unbatched matmul: worst |backward − finite difference| {worst:.2e}");
+        });
+    }
 }
