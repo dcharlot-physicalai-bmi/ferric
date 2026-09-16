@@ -36,14 +36,34 @@ impl FourierNet {
     #[allow(clippy::too_many_arguments)]
     pub fn new(ctx: &Arc<Context>, d_in: usize, m_per_scale: usize, scales: &[f32], hidden: &[usize], d_out: usize, act: Act, seed: u32) -> Self {
         assert!(!scales.is_empty() && !hidden.is_empty(), "need at least one scale and one hidden layer");
-        let m = m_per_scale * scales.len();
-        // B: column block s holds m_per_scale frequencies ~ N(0, σ_s²), times 2π
+        Self::new_anisotropic(ctx, m_per_scale, &scales.iter().map(|&s| vec![s; d_in]).collect::<Vec<_>>(), hidden, d_out, act, seed)
+    }
+
+    /// **Per-AXIS frequency scales** — one `σ` for each input coordinate in each group.
+    ///
+    /// ⛔ The isotropic constructor gives every axis the same `σ`, and for an anisotropic solution that
+    /// is not a tuning detail, it is a wall. Advection at `β = 30` has the exact solution
+    /// `sin(x − 30t)`: a plane wave whose wavevector is `(1, 30)` rad/unit, so the right features carry
+    /// frequency ~1 in `x` and ~30 in `t`. One `σ` cannot be both — at `σ = 5` the time features are
+    /// about right and the space features are thirty times too fast; at `σ = 1` the reverse. Measured,
+    /// the isotropic recipe scored **1.08** on that problem, worse than predicting zero, with and
+    /// without causal weighting.
+    ///
+    /// `axis_scales[g][a]` is the standard deviation for group `g`, axis `a`, in cycles per unit (the
+    /// `2π` is applied here). Set it from the problem's known frequency content rather than by search.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_anisotropic(ctx: &Arc<Context>, m_per_scale: usize, axis_scales: &[Vec<f32>], hidden: &[usize], d_out: usize, act: Act, seed: u32) -> Self {
+        assert!(!axis_scales.is_empty() && !hidden.is_empty(), "need at least one scale group and one hidden layer");
+        let d_in = axis_scales[0].len();
+        assert!(axis_scales.iter().all(|g| g.len() == d_in), "every scale group must give one sigma per input axis");
+        let m = m_per_scale * axis_scales.len();
+        // B: column block g holds m_per_scale frequencies, axis a drawn from N(0, (2π σ_{g,a})²)
         let mut bvec = vec![0.0f32; d_in * m];
-        for (s, &sigma) in scales.iter().enumerate() {
-            let block = randn(d_in * m_per_scale, seed.wrapping_add(1000 + s as u32), sigma * std::f32::consts::TAU);
-            for i in 0..d_in {
+        for (g, sigmas) in axis_scales.iter().enumerate() {
+            for (i, &sigma) in sigmas.iter().enumerate() {
+                let block = randn(m_per_scale, seed.wrapping_add(1000 + (g * 31 + i) as u32), sigma * std::f32::consts::TAU);
                 for j in 0..m_per_scale {
-                    bvec[i * m + s * m_per_scale + j] = block[i * m_per_scale + j];
+                    bvec[i * m + g * m_per_scale + j] = block[j];
                 }
             }
         }

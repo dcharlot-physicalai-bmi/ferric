@@ -91,54 +91,37 @@ its initial condition and boundaries (worst FD residual 1.75e-7, shock formed by
 features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. Measured (2000 collocation points,
 4000 Adam steps, + 500 L-BFGS for the full recipe, scored on a 51² grid):
 
-| problem | vanilla | full | note |
+| problem | vanilla | full (isotropic σ) | full (per-axis σ) |
 |---|---|---|---|
-| heat | 0.0448 | **0.0074** | Fourier scales `[0.5, 1]` set from the solution's frequency π; with the default `[1, 3]` the full recipe scored **0.3177** — the scale choice was the whole difference |
-| burgers (ν = 0.01/π) | **0.2079** | 0.5294 | the full recipe is 2.5× WORSE: its loss ends low (7.7e-3) on a wrong solution — a low residual on a shock problem is not a solved shock |
-| advection (β = 30) | 0.9144 | 1.0815 | unsolved by both — Krishnapriyan 2021's failure case, and the one causal training exists for; `Recipe::full()` carries no causal weighting (that is the `Causal` oracle) |
-| helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | unsolved by both at 4000 steps; the source paper trains ten times longer with NTK weighting, and reproduces exactly across runs here |
+| heat | 0.0448 | 0.0074 | **0.0082** |
+| burgers (ν = 0.01/π) | **0.2079** | 0.5294 | 0.2434 |
+| advection (β = 30) | 0.9144 | 1.0815 | 0.9712 |
+| helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | **0.3066** |
 
-### The two pieces the table named
+⭐⭐ **The middle column was mostly one bad assumption, not four bad rows.** `FourierNet` drew frequencies
+from an isotropic `N(0, σ²)` — one `σ` for every input axis — and the solutions here are anisotropic:
+advection's `sin(x − 30t)` has a wavevector of `(1, 30)` rad/unit, so no single `σ` can serve both. Giving
+each axis its own scale, set a priori from the solution's known frequency content and never searched, moved
+Burgers **0.5294 → 0.2434** (from 2.5× worse than plain Adam to comparable) and Helmholtz
+**0.4781 → 0.3066** (from no difference to 1.6× better than vanilla). Heat is unchanged and advection is
+still unsolved.
 
-`Weighting::{Fixed, GradNorm, Ntk}` and `causal_slabs` are recipe options, so the rows that identified a
-missing piece have a head-to-head test rather than a note.
+⚠ So the earlier reading — *the bundled recipe is not a free lunch* — stands, but its diagnosis was too
+generous to me: two of the four rows were a configuration flaw in my own Fourier layer, and the harness is
+what made that visible. The remaining honest statement is narrower: the recipe wins on heat (5.5×) and
+Helmholtz (1.6×), ties on Burgers, and neither arm solves advection.
 
-**NTK-trace weighting** (Wang, Yu & Perdikaris 2022, arXiv 2007.14527) — what jaxpi and PirateNets run.
-Gradient-norm balancing equalises how hard each term *pulls*; the NTK view asks how fast each term's error
-*decays*, and weights by the inverse kernel trace `λ_i = (Σ_j tr K_jj) / tr K_ii`. ⛔ The trace is
-**estimated, not assembled**: `tr K_ii = ‖J_i‖_F²` needs one backward pass per collocation point (jaxpi gets
-them from `jacrev` + `vmap`; this fabric has neither), so Hutchinson's identity is used instead — for a
-Rademacher `v`, `E‖∇_θ(vᵀr)‖² = tr(J Jᵀ)`. Checked against a closed form on a residual linear in the
-parameters, where `tr K = ‖A‖_F²` exactly: against 127.817, one probe is +6.6 %, four +10.6 %, sixteen
-+4.7 %, sixty-four **+1.7 %** — the test watches it converge rather than asserting one draw. Weights for two
-terms whose traces differ 10⁴× come out 9371× apart, and a term whose trace has gone to zero is floored,
-the same guard `LossBalancer` needed.
+⭐ It is still one `Recipe` applied to four problems: the pieces each have their own fail-then-fix oracle
+above, but bundling them and pointing the bundle at an arbitrary PDE is a different, weaker claim. The rows
+are measurements; only `rel_l2.is_finite()` is asserted, and each row prints solved / partial / unsolved
+rather than passing or failing a bar chosen after the fact.
 
-**Causal weighting** reuses the `Causal` machinery (which has its own fail-then-fix oracle above) against
-the problem's `time_axis`. `Recipe::ntk()` and `Recipe::causal(k)` are the named recipes.
-
-⚠ **Both head-to-head comparisons came back negative, and neither discriminates.** Helmholtz:
-gradient-norm **0.4781**, NTK **0.5183**. Advection at β = 30: **1.0815** without causal, **1.0935** with.
-In each case *both* arms are unsolved — advection's are worse than predicting zero — so the ordering is
-noise, and two failing arms cannot rank two techniques. That is the same rule that sent the balancing and
-causal fixtures back to be re-sized earlier on this page, applied to my own new work.
-
-What this does **not** say is that the techniques do not work: `causal_training_finds_the_solution_a_vanilla_pinn_cannot`
-takes the reaction equation from 0.937 to 0.094 with a control that fails, and the NTK estimator is
-verified against a closed form. It says the bundled recipe does not rescue *these two problems at this
-budget*, and that making one arm succeed is the open work. `compare()` prints
-`⚠ every arm failed — this comparison does not rank the recipes` when it happens, so the next reader
-cannot mistake it for a ranking.
-
-⛔ `Problem::constraints` returns residual **vectors**, not a summed loss: an NTK trace is a property of the
-per-point Jacobian and summing first destroys it. Every boundary, initial and periodic condition is its own
-term — which is also the paper's formulation.
-
-⭐ **Two of four rows say the recipe as configured is not a free lunch, and that is the harness earning its
-keep.** It is one `Recipe` applied to four problems: the pieces each have their own fail-then-fix oracle
-above, but bundling them and pointing the bundle at an arbitrary PDE is a different claim, and on Burgers
-it is false. The rows are measurements; only `rel_l2.is_finite()` is asserted, and each row prints
-solved / partial / unsolved rather than passing or failing a bar chosen after the fact.
+⛔ **Advection at β = 30 remains unsolved by every recipe here** (0.9144 / 0.9712 / 0.9706 with causal —
+all barely better than predicting zero). Per-axis scales moved it 1.08 → 0.97 and no weighting moves it
+further, which is consistent with the literature: Krishnapriyan et al. solve this case by **time
+marching** — train on `[0, ΔT]`, then use that solution as the initial condition for the next window —
+not by re-weighting a single global fit. That is a training *strategy*, not a loss term, and it is the
+identified next piece rather than something this page claims.
 prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage. Measured at **exactly equal

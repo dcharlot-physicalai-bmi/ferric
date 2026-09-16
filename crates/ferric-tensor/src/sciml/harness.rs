@@ -30,9 +30,12 @@ pub trait Problem {
         None
     }
     fn reference(&self, x: &[f64]) -> f64;
-    /// Fourier-feature scales that suit the problem's frequency content.
-    fn scales(&self) -> Vec<f32> {
-        vec![1.0, 3.0]
+    /// Fourier-feature scales that suit the problem's frequency content, per group and per INPUT AXIS
+    /// (cycles per unit). One `σ` per axis, not one per group: an anisotropic solution — a travelling
+    /// wave, anything with very different space and time frequencies — cannot be covered by a single
+    /// number. See [`FourierNet::new_anisotropic`](super::features::FourierNet::new_anisotropic).
+    fn scales(&self) -> Vec<Vec<f32>> {
+        vec![vec![1.0; self.dim()], vec![3.0; self.dim()]]
     }
 }
 
@@ -118,7 +121,7 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
             dims.push(1);
             NetImpl::Mlp(Mlp::new(ctx, &dims, seed))
         }
-        Net::Fourier { m_per_scale, hidden } => NetImpl::Fourier(FourierNet::new(ctx, d, *m_per_scale, &problem.scales(), hidden, 1, Act::Tanh, seed)),
+        Net::Fourier { m_per_scale, hidden } => NetImpl::Fourier(FourierNet::new_anisotropic(ctx, *m_per_scale, &problem.scales(), hidden, 1, Act::Tanh, seed)),
     };
     let params0: Vec<Tensor> = match &net {
         NetImpl::Mlp(m) => m.params.clone(),
@@ -279,8 +282,9 @@ impl Problem for Burgers {
     fn reference(&self, x: &[f64]) -> f64 {
         bench::burgers(x[0], x[1], self.nu)
     }
-    fn scales(&self) -> Vec<f32> {
-        vec![1.0, 4.0]
+    /// `−sin πx` initially, steepening to a shock of width ~ν at `x = 0`: low in `t`, and a spread in `x`.
+    fn scales(&self) -> Vec<Vec<f32>> {
+        vec![vec![0.5, 0.5], vec![4.0, 1.0]]
     }
 }
 
@@ -324,8 +328,9 @@ impl Problem for Helmholtz {
     fn reference(&self, x: &[f64]) -> f64 {
         bench::helmholtz(x[0], x[1], self.a1, self.a2, self.k).0
     }
-    fn scales(&self) -> Vec<f32> {
-        vec![1.0, 2.0]
+    /// `sin(a₁πx) sin(a₂πy)`: `a₁/2` and `a₂/2` cycles per unit on the two axes.
+    fn scales(&self) -> Vec<Vec<f32>> {
+        vec![vec![(self.a1 / 2.0) as f32, (self.a2 / 2.0) as f32], vec![self.a1 as f32, self.a2 as f32]]
     }
 }
 
@@ -364,10 +369,10 @@ impl Problem for Heat {
     fn reference(&self, x: &[f64]) -> f64 {
         bench::heat(x[0], x[1])
     }
-    /// The solution is `sin πx`: half a cycle per unit, so scales near `0.5`; the default `[1, 3]`
-    /// measured 7× WORSE than a plain tanh net here.
-    fn scales(&self) -> Vec<f32> {
-        vec![0.5, 1.0]
+    /// `e^{−π²t} sin πx`: half a cycle per unit in `x`, and a decay in `t` slower still. The default
+    /// isotropic `[1, 3]` measured 7× WORSE than a plain tanh net here.
+    fn scales(&self) -> Vec<Vec<f32>> {
+        vec![vec![0.5, 0.25], vec![1.0, 0.5]]
     }
 }
 
@@ -409,8 +414,12 @@ impl Problem for Advection {
     fn reference(&self, x: &[f64]) -> f64 {
         bench::advection(x[0], x[1], self.beta)
     }
-    fn scales(&self) -> Vec<f32> {
-        vec![1.0, (self.beta / 6.0) as f32]
+    /// ⭐ The exact solution `sin(x − βt)` is a plane wave with wavevector `(1, β)` rad/unit, i.e.
+    /// `(1/2π, β/2π)` cycles per unit — which is `(0.16, 4.8)` at `β = 30`. A single `σ` cannot be both,
+    /// and the isotropic recipe scored 1.08 here, worse than predicting zero.
+    fn scales(&self) -> Vec<Vec<f32>> {
+        let tau = std::f32::consts::TAU;
+        vec![vec![1.0 / tau, self.beta as f32 / tau], vec![2.0 / tau, 2.0 * self.beta as f32 / tau]]
     }
 }
 
@@ -537,7 +546,7 @@ mod tests {
         let mut pts = box_points(&lo, &hi, 2000, 7);
         let cand = box_points(&lo, &hi, 20000, 99);
         {
-            let net = FourierNet::new(&ctx, 2, 32, &p.scales(), &[64, 64], 1, Act::Tanh, 1);
+            let net = FourierNet::new_anisotropic(&ctx, 32, &p.scales(), &[64, 64], 1, Act::Tanh, 1);
             let mut wp = net.params.clone();
             pollster::block_on(async {
                 let mut adam = Adam::new(&wp, 1e-3);
