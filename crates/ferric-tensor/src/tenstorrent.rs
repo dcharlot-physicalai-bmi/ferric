@@ -281,6 +281,122 @@ fn noc_io(x: u16, y: u16, noc: u8, addr: u64, width: u8, value: u64) -> std::io:
     })
 }
 
+/// **RISC-V ELF32 loading — the `.ptx` analogue for this fabric.**
+///
+/// tt-metal compiles kernels at runtime by shelling out to SFPI's `riscv-tt-elf-g++`, but that is its
+/// choice, not the hardware's: the artifact is a plain **ELF32 RISC-V** and tt-exalens builds the same
+/// per-core ELFs fully offline. Ferric ships `.ptx` beside `.cu` for NVIDIA; the same shape here is a
+/// tracked ELF beside its source, which needs a host-side loader — this.
+///
+/// The bring-up sequence this feeds is tt-exalens's `run_elf`, 244 lines: assert the core's reset,
+/// write each segment into L1, set the code-start address, deassert, poll a mailbox.
+///
+/// ⚠ Deliberately NOT linux-gated: parsing bytes is arithmetic, so it compiles and tests everywhere
+/// ([[vacuous-test-mechanisms]] #84). ⛔ Scope: PT_LOAD segments and the entry point. tt-metal's
+/// `tt_elffile` additionally applies XIP relocations for its own packaging; that is a later slice and
+/// is NOT silently half-done here — `parse` rejects a file carrying relocation program headers.
+pub mod elf {
+    /// One loadable piece: `mem_len - file_len` trailing bytes must be written as ZERO (`.bss`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Load {
+        pub addr: u32,
+        pub file_off: usize,
+        pub file_len: usize,
+        pub mem_len: usize,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Image {
+        pub entry: u32,
+        pub loads: Vec<Load>,
+    }
+
+    const PT_LOAD: u32 = 1;
+    const EM_RISCV: u16 = 243;
+    const EHDR_LEN: usize = 52;
+    const PHDR_LEN: usize = 32;
+
+    fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
+    fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) }
+
+    /// ⛔ Every rejection below is a bug that would otherwise land as garbage in a core's L1 and show
+    /// up as a hang, which is the least debuggable failure this stack has. Refuse at parse time.
+    pub fn parse(b: &[u8]) -> Result<Image, String> {
+        if b.len() < EHDR_LEN {
+            return Err(format!("truncated: {} bytes, ELF32 header is {EHDR_LEN}", b.len()));
+        }
+        if &b[0..4] != b"\x7fELF" {
+            return Err("not an ELF (bad magic)".into());
+        }
+        if b[4] != 1 {
+            return Err(format!("EI_CLASS {} — Tensix cores are 32-bit, this is not ELF32", b[4]));
+        }
+        if b[5] != 1 {
+            return Err(format!("EI_DATA {} — expected little-endian", b[5]));
+        }
+        let machine = u16le(b, 18);
+        if machine != EM_RISCV {
+            return Err(format!("e_machine {machine} — expected EM_RISCV ({EM_RISCV})"));
+        }
+        let phentsize = u16le(b, 42) as usize;
+        if phentsize != PHDR_LEN {
+            return Err(format!("e_phentsize {phentsize} — ELF32 program headers are {PHDR_LEN}"));
+        }
+        let (entry, phoff, phnum) = (u32le(b, 24), u32le(b, 28) as usize, u16le(b, 44) as usize);
+        let end = phoff.checked_add(phnum * PHDR_LEN).ok_or("program header table overflows")?;
+        if end > b.len() {
+            return Err(format!("program header table ends at {end}, file is {}", b.len()));
+        }
+
+        let mut loads = Vec::new();
+        for i in 0..phnum {
+            let p = phoff + i * PHDR_LEN;
+            let (ptype, off, vaddr, filesz, memsz) =
+                (u32le(b, p), u32le(b, p + 4) as usize, u32le(b, p + 8), u32le(b, p + 16) as usize,
+                 u32le(b, p + 20) as usize);
+            // ⛔ Do not quietly ignore a relocatable image: silently loading one un-relocated is the
+            // failure this comment exists to prevent. PT_DYNAMIC(2) / PT_INTERP(3) mean the file
+            // expects work this loader does not do.
+            if ptype == 2 || ptype == 3 {
+                return Err(format!(
+                    "program header {i} is PT_{} — this loader does not relocate or interpret; \
+                     build a static ELF (tt kernels are static)",
+                    if ptype == 2 { "DYNAMIC" } else { "INTERP" }
+                ));
+            }
+            if ptype != PT_LOAD {
+                continue;
+            }
+            if filesz > memsz {
+                return Err(format!("segment {i}: p_filesz {filesz} > p_memsz {memsz}"));
+            }
+            let fend = off.checked_add(filesz).ok_or("segment overflows")?;
+            if fend > b.len() {
+                return Err(format!("segment {i} ends at {fend}, file is {}", b.len()));
+            }
+            loads.push(Load { addr: vaddr, file_off: off, file_len: filesz, mem_len: memsz });
+        }
+        if loads.is_empty() {
+            return Err("no PT_LOAD segments — nothing to write to the core".into());
+        }
+        Ok(Image { entry, loads })
+    }
+
+    impl Image {
+        /// Total bytes this image puts into a core's memory, zero-fill included. What a caller needs
+        /// to know before it starts writing, since L1 is small.
+        pub fn mem_bytes(&self) -> usize { self.loads.iter().map(|l| l.mem_len).sum() }
+    }
+    impl Load {
+        /// The initialised bytes of this segment, borrowed from the original file.
+        pub fn bytes<'a>(&self, elf: &'a [u8]) -> &'a [u8] {
+            &elf[self.file_off..self.file_off + self.file_len]
+        }
+        /// Trailing bytes that must be written as ZERO — `.bss`. A loader that forgets these leaves a
+        /// core reading whatever the last kernel left there, which reproduces as "works the first time".
+        pub fn zero_len(&self) -> usize { self.mem_len - self.file_len }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

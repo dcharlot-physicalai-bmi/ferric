@@ -1,0 +1,18 @@
+#![no_std] #![no_main]
+use core::panic::PanicInfo;
+#[panic_handler] fn p(_: &PanicInfo) -> ! { loop {} }
+// Shaped like a Tensix baby-core kernel: read a mailbox word, transform it, write it back, spin.
+// Three section kinds ON PURPOSE so the loader meets every case: .text (code), .rodata (initialised
+// data) and .bss (memsz > filesz, which is the ZERO-FILL path a loader gets wrong silently).
+#[unsafe(no_mangle)] pub static TABLE: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+#[unsafe(no_mangle)] pub static mut SCRATCH: [u32; 64] = [0; 64];
+#[unsafe(no_mangle)] pub extern "C" fn _start() -> ! {
+    let mbox = 0x0001_0000 as *mut u32;
+    unsafe {
+        let v = core::ptr::read_volatile(mbox);
+        let s = &raw mut SCRATCH;
+        core::ptr::write_volatile((s as *mut u32).add((v & 63) as usize), v);
+        core::ptr::write_volatile(mbox, v.wrapping_mul(3).wrapping_add(TABLE[(v & 3) as usize]));
+    }
+    loop {}
+}
