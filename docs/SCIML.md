@@ -127,15 +127,18 @@ at `t = 0`) — a single list cannot express "same walls, different start".
 
 ⛔ **Each window keeps its own network, and that is not an optimisation.** Warm-starting one network through
 the windows ends with a network that fits only the last one; scoring therefore evaluates each point with the
-network that owns its time slab. `advection_by_time_marching_against_one_global_fit` runs eight windows
-against one global fit.
+network that owns its time slab.
 
-⛔ **Advection at β = 30 remains unsolved by every *single-fit* recipe here** (0.9144 / 0.9712 / 0.9706 with causal —
-all barely better than predicting zero). Per-axis scales moved it 1.08 → 0.97 and no weighting moves it
-further, which is consistent with the literature: Krishnapriyan et al. solve this case by **time
-marching** — train on `[0, ΔT]`, then use that solution as the initial condition for the next window —
-not by re-weighting a single global fit. That is a training *strategy*, not a loss term, and it is the
-identified next piece rather than something this page claims.
+⭐⭐ **Measured, and it is the first thing to move advection.** 4000 collocation points, same network, same
+per-window budget: one global fit **0.7745**, eight marched windows **0.3252** — 2.4× lower. Every weighting
+scheme on this page left that row between 0.91 and 1.08; the literature says the fix is a training strategy
+rather than a loss term, and on this stack it is.
+
+⛔ **Advection at β = 30 is not solved by any *single-fit* recipe here** (0.9144 / 0.9712 / 0.9706 with
+causal — all barely better than predicting zero). Per-axis scales moved it 1.08 → 0.97 and no weighting
+moves it further. **Time marching does**: 0.7745 → 0.3252 at eight windows (see above). That is consistent
+with Krishnapriyan et al., who solve this case the same way — and it is the clearest result on this page
+that *how you train* can outrank every term you put in the loss.
 prints the table and asserts the ordering; `refinement_beats_uniform_sampling_on_the_burgers_shock_at_equal_budget`
 is the RAR fixture in the regime where it can be shown to help — DeepXDE's own numbers for this problem,
 2540 uniform against 2000 + 540 refined, both arms with the L-BFGS stage. Measured at **exactly equal
