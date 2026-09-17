@@ -469,6 +469,41 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
+    /// **Multimodal RoPE**, the `qwen2vl` (MROPE) and `qwen3vl`/`qwen35` (IMROPE) rule.
+    ///
+    /// `pos` is **section-major**, `4 * t` entries: all `t` time positions, then height, then width,
+    /// then the 4th component — the same layout `llama_batch.pos` uses, so a reference trace drops in
+    /// without reshaping. For a pure-text token llama.cpp sets `t = h = w = position` and `e = 0`
+    /// (`llm_graph_input_pos::set_input`), which is why text-only inference needs no vision tower.
+    ///
+    /// `sections` is `rope.dimension_sections` from the GGUF: `[24,20,20,0]` for Qwen3-VL,
+    /// `[16,24,24,0]` for Qwen2-VL. `imrope` picks interleaved (`[ttyxttyx…]`) over chunked
+    /// (`[tttt…yy…xx…]`).
+    ///
+    /// ⚠ **This deliberately reproduces llama.cpp, which differs from HuggingFace.** With
+    /// `[24,20,20,0]` and `head_dim 128`, sectors 61 and 62 match neither arm and fall to the 4th
+    /// component, which is always 0 here — so they do not rotate. HF assigns them the time position.
+    /// The gap is ~4e-4 rad at position 1000. Ferric follows llama.cpp because every other port here
+    /// is checked against llama.cpp; the choice is the point, not the default.
+    pub fn rope_mrope(
+        &self, n_heads: usize, head_dim: usize, base: f32, pos: &[u32], sections: [u32; 4], imrope: bool,
+    ) -> Tensor {
+        let owned;
+        let c = if self.rank() == 2 && self.strides[1] == 1 { self } else { owned = self.contiguous(); &owned };
+        let t = c.numel() / (n_heads * head_dim);
+        assert_eq!(pos.len(), t * 4, "rope_mrope wants 4 positions per row (section-major): {} rows needs {}, got {}", t, t * 4, pos.len());
+        assert!(sections.iter().sum::<u32>() > 0, "rope_mrope needs non-empty sections");
+        let out = empty(&self.ctx, c.numel());
+        let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
+        let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(),
+                            u32::from(imrope), c.offset as u32, srs as u32, head_dim as u32];
+        info.extend_from_slice(&sections);
+        info.extend_from_slice(pos);
+        run(&self.ctx, ROPE_MROPE_WGSL, "rope_mrope",
+            &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info)], groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     /// RoPE where every row carries its **own absolute position**.
     ///
     /// [`rope`](Self::rope) assumes rows are consecutive (`offset + i`), which holds for one sequence.
@@ -2428,6 +2463,66 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// **Multimodal RoPE (ggml `MROPE` / `IMROPE`)** — the position a dimension rotates by depends on
+/// which *section* it lands in, so one token can carry a time, a height and a width at once.
+///
+/// ⛔ **The four positions are section-major (SoA), exactly as llama.cpp lays them out**: `info[8..]`
+/// holds `t[0..n)`, then `h[0..n)`, then `w[0..n)`, then `e[0..n)`. Matching the reference's memory
+/// layout rather than inventing an interleaved one keeps the port checkable against it.
+///
+/// The sector→component rule is transcribed from `ggml_mrope_cache_init`
+/// (`ggml/src/ggml-cpu/ops.cpp`). ⚠ Note the `else` arm: a sector that matches **neither** the modulus
+/// nor the bound falls to `e`, which for Qwen3-VL is **always 0** — that is what leaves two dimensions
+/// unrotated, and it is a real divergence from HuggingFace, not a rounding difference. See
+/// `mrope_text_positions_match_plain_rope_except_where_llama_cpp_drops_them`.
+const ROPE_MROPE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x: array<f32>;
+@group(0) @binding(1) var<storage,read_write>  out: array<f32>;
+// info: t, h, dh, bitcast(base), imrope, src_off, src_row_stride, n_rot,
+//       s0, s1, s2, s3, then 4*t positions (section-major: t, h, w, e)
+@group(0) @binding(2) var<storage,read>        info: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]);
+    let imrope = info[4];
+    let id = gid.x; if (id >= t * h) { return; }
+    let i = id / h; let head = id % h;
+    let n_rot = info[7]; let half = n_rot / 2u;
+    let s0 = info[8]; let s1 = info[9]; let s2 = info[10]; let s3 = info[11];
+    let sect_dims = s0 + s1 + s2 + s3;
+    let pbase = 12u;
+    let ob = (i * h + head) * dh;
+    let ib = info[5] + i * info[6] + head * dh;
+    let lb = log(base);
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let inv = exp(-2.0 * f32(c) / f32(n_rot) * lb);
+        // Which position component does this sector rotate by?
+        let sector = c % sect_dims;
+        var comp: u32 = 3u;                       // default = e, the 4th component
+        if (imrope == 1u) {
+            if      (sector % 3u == 1u && sector < 3u * s1) { comp = 1u; }
+            else if (sector % 3u == 2u && sector < 3u * s2) { comp = 2u; }
+            else if (sector % 3u == 0u && sector < 3u * s0) { comp = 0u; }
+        } else {
+            let sec_w = s0 + s1;
+            if      (sector < s0)                       { comp = 0u; }
+            else if (sector < sec_w)                    { comp = 1u; }
+            else if (sector < sec_w + s2)               { comp = 2u; }
+        }
+        let pos = info[pbase + comp * t + i];
+        let ang = f32(pos) * inv; let cs = cos(ang); let sn = sin(ang);
+        // NEOX pairing: ggml applies MROPE and IMROPE with the split-half partner layout.
+        let p0 = c; let p1 = c + half;
+        let x1 = x[ib + p0]; let x2 = x[ib + p1];
+        out[ob + p0] = x1 * cs - x2 * sn;
+        out[ob + p1] = x2 * cs + x1 * sn;
+    }
+    for (var c: u32 = n_rot; c < dh; c = c + 1u) {
+        out[ob + c] = x[ib + c];
+    }
+}
+"#;
+
 const ROPE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
@@ -4262,5 +4357,188 @@ mod resize_tests {
             }
         }
         eprintln!("resize_bilinear: identity exact, constants preserved, {oh}x{ow} matches reference");
+    }
+}
+
+#[cfg(test)]
+mod mrope_tests {
+    use super::*;
+
+    /// ⭐ An **independent CPU reference**, transcribed from `ggml_mrope_cache_init`
+    /// (`ggml/src/ggml-cpu/ops.cpp`) rather than from the WGSL kernel, so the two share no code and a
+    /// mistake in either shows up as a disagreement. f64 throughout: the GPU runs f32, and a reference
+    /// that carries the same rounding cannot expose a wrong angle.
+    fn mrope_ref(x: &[f32], n_heads: usize, dh: usize, base: f64, pos: &[u32], s: [u32; 4], imrope: bool) -> Vec<f32> {
+        let t = x.len() / (n_heads * dh);
+        let half = dh / 2;
+        let sect_dims: u32 = s.iter().sum();
+        let mut out = vec![0f32; x.len()];
+        for i in 0..t {
+            for hd in 0..n_heads {
+                let b = (i * n_heads + hd) * dh;
+                for c in 0..half {
+                    let sector = (c as u32) % sect_dims;
+                    let comp = if imrope {
+                        if sector % 3 == 1 && sector < 3 * s[1] { 1 }
+                        else if sector % 3 == 2 && sector < 3 * s[2] { 2 }
+                        else if sector % 3 == 0 && sector < 3 * s[0] { 0 }
+                        else { 3 }
+                    } else {
+                        let sec_w = s[0] + s[1];
+                        if sector < s[0] { 0 } else if sector < sec_w { 1 }
+                        else if sector < sec_w + s[2] { 2 } else { 3 }
+                    };
+                    let p = pos[comp * t + i] as f64;
+                    let inv = base.powf(-2.0 * c as f64 / dh as f64);
+                    let (cs, sn) = ((p * inv).cos(), (p * inv).sin());
+                    let (x1, x2) = (x[b + c] as f64, x[b + c + half] as f64);
+                    out[b + c] = (x1 * cs - x2 * sn) as f32;
+                    out[b + c + half] = (x2 * cs + x1 * sn) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// ⛔⛔ **THE FINDING THIS TEST EXISTS FOR.** For a text token llama.cpp sets `t = h = w = pos`
+    /// and `e = 0`, so interleaved M-RoPE collapses to ordinary NEOX RoPE — **except** where a sector
+    /// matches neither arm of the rule and falls through to `e`, which is always 0 for Qwen3-VL.
+    ///
+    /// With `sections = [24,20,20,0]` and `head_dim = 128` those are **sectors 61 and 62, and only
+    /// those**. HuggingFace's `apply_interleaved_mrope` instead defaults every sector to `t` and
+    /// overwrites only H and W, so it rotates 61 and 62 where llama.cpp does not. `inv_freq[61]` is
+    /// ~4.1e-7, so the divergence is ~4e-4 rad at position 1000 — small enough to hide, large enough
+    /// to make "bit-exact" meaningless until a reference is named. **Ferric follows llama.cpp.**
+    ///
+    /// The test asserts both halves: identical to plain rope everywhere else, and *provably unrotated*
+    /// at 61/62 — a one-sided check would pass on a kernel that rotated nothing at all.
+    #[test]
+    fn mrope_text_positions_match_plain_rope_except_where_llama_cpp_drops_them() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return };
+        let ctx = std::sync::Arc::new(ctx);
+        let (dh, nh, t) = (128usize, 2usize, 5usize);
+        let base = 5_000_000f32;
+        let sections = [24u32, 20, 20, 0];
+        let x: Vec<f32> = (0..t * nh * dh).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let xt = Tensor::from_vec(&ctx, &x, &[t, nh * dh]);
+
+        // text: t = h = w = position, e = 0 — section-major, as llama.cpp fills it
+        let start = 1000usize;
+        let mut pos = Vec::with_capacity(t * 4);
+        for _ in 0..3 { pos.extend((0..t).map(|i| (start + i) as u32)); }
+        pos.extend(std::iter::repeat_n(0u32, t));
+
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
+        let plain = pollster::block_on(xt.rope(nh, dh, base, start).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, true);
+
+        // 1) agrees with the independent CPU reference everywhere.
+        // ⚠ The tolerance is set by f32 ARGUMENT REDUCTION, not by the rule. At position 1000 the
+        // lowest sectors rotate by ~1000 rad, where an f32 angle's ulp is already ~6e-5, so the GPU's
+        // f32 sin/cos cannot agree with an f64 reference more closely than that. Asserting 2e-5 here
+        // failed at 5.5e-5 — the right response is to SHOW the cause, not to loosen the bound and move
+        // on, so the same comparison is repeated at small positions below where the angle is tiny.
+        let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
+        assert!(worst < 2e-4, "mrope vs independent CPU reference @pos~1000: max |Δ| = {worst:.3e}");
+
+        // 1b) THE EVIDENCE that 1a's residual is angle magnitude and not a wrong sector rule: run the
+        // identical comparison at positions 0..t, where every angle is < 5 rad. If the mapping were
+        // wrong, the error would stay; it collapses by ~2 orders of magnitude instead.
+        let mut small = Vec::with_capacity(t * 4);
+        for _ in 0..3 { small.extend((0..t).map(|i| i as u32)); }
+        small.extend(std::iter::repeat_n(0u32, t));
+        let got_s = pollster::block_on(xt.rope_mrope(nh, dh, base, &small, sections, true).to_vec());
+        let want_s = mrope_ref(&x, nh, dh, base as f64, &small, sections, true);
+        let worst_s = got_s.iter().zip(&want_s).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
+        assert!(worst_s < 2e-6, "mrope vs reference @pos<5: max |Δ| = {worst_s:.3e} (should be ~1e-7)");
+        assert!(worst_s * 10.0 < worst, "the pos~1000 residual must be dominated by angle magnitude: \
+                 {worst_s:.3e} at small positions vs {worst:.3e} at ~1000");
+
+        // 2) equals plain NEOX rope at every sector EXCEPT 61 and 62
+        let half = dh / 2;
+        let mut differing = std::collections::BTreeSet::new();
+        for i in 0..t { for hd in 0..nh { let b = (i * nh + hd) * dh;
+            for c in 0..half {
+                if (got[b + c] - plain[b + c]).abs() > 1e-5
+                    || (got[b + c + half] - plain[b + c + half]).abs() > 1e-5 { differing.insert(c); }
+            }
+        }}
+        assert_eq!(differing.into_iter().collect::<Vec<_>>(), vec![61, 62],
+                   "exactly sectors 61 and 62 may differ from plain rope");
+
+        // 3) and at 61/62 the kernel leaves the input UNROTATED (angle 0), which is the actual claim.
+        // Without this, a kernel that zeroed those dims would satisfy (2) just as well.
+        for i in 0..t { for hd in 0..nh { let b = (i * nh + hd) * dh;
+            for c in [61usize, 62] {
+                assert!((got[b + c] - x[b + c]).abs() < 1e-6, "sector {c} lo must pass through");
+                assert!((got[b + c + half] - x[b + c + half]).abs() < 1e-6, "sector {c} hi must pass through");
+            }
+        }}
+    }
+
+    /// ⛔ **THIS TEST EXISTS BECAUSE A MUTATION SURVIVED.** Swapping the H and W components inside
+    /// the *interleaved* branch passed every other test here: the text test sets `t = h = w`, so an
+    /// H/W swap is invisible by construction, and the chunked test never enters that branch. With
+    /// `sections[1] == sections[2] == 20` the two arms even share a bound, so the swap is structurally
+    /// symmetric — the only thing that separates them is a position that differs.
+    ///
+    /// So: interleaved rule, three genuinely distinct position components, against the independent
+    /// reference. Small positions keep f32 argument reduction out of the comparison.
+    #[test]
+    fn interleaved_mrope_distinguishes_height_from_width() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return };
+        let ctx = std::sync::Arc::new(ctx);
+        let (dh, nh, t) = (128usize, 1usize, 4usize);
+        let base = 5_000_000f32;
+        let sections = [24u32, 20, 20, 0];
+        let x: Vec<f32> = (0..t * nh * dh).map(|i| ((i as f32) * 0.023).sin()).collect();
+        let xt = Tensor::from_vec(&ctx, &x, &[t, nh * dh]);
+        let mut pos = Vec::new();
+        pos.extend((0..t).map(|i| 3 + i as u32));       // t
+        pos.extend((0..t).map(|i| 11 + i as u32));      // h  — distinct from w
+        pos.extend((0..t).map(|i| 29 + i as u32));      // w
+        pos.extend(std::iter::repeat_n(0u32, t));       // e
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, true);
+        let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
+        assert!(worst < 2e-6, "interleaved mrope with distinct h/w vs reference: max |Δ| = {worst:.3e}");
+
+        // ⚠ And prove the positions actually reach different dimensions: swapping h with w in the
+        // INPUT must change the output. If it does not, the kernel is ignoring one of them and the
+        // comparison above would be satisfied by a reference making the same mistake.
+        let mut swapped = pos.clone();
+        for i in 0..t { swapped.swap(t + i, 2 * t + i); }
+        let other = pollster::block_on(xt.rope_mrope(nh, dh, base, &swapped, sections, true).to_vec());
+        let d = got.iter().zip(&other).fold(0f32, |a, (&g, &o)| a.max((g - o).abs()));
+        assert!(d > 1e-3, "h and w must land on different dimensions (swap changed output by {d:.3e})");
+    }
+
+    /// Qwen2-VL's **chunked** M-RoPE (`[16,24,24]`, sums to 64 = head_dim/2) against the same
+    /// independent reference, with three genuinely different position components so the section split
+    /// is actually exercised — equal positions would make any section mapping look correct.
+    #[test]
+    fn chunked_mrope_splits_sections_the_way_qwen2vl_does() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return };
+        let ctx = std::sync::Arc::new(ctx);
+        let (dh, nh, t) = (128usize, 1usize, 4usize);
+        let base = 1_000_000f32;
+        let sections = [16u32, 24, 24, 0];
+        let x: Vec<f32> = (0..t * nh * dh).map(|i| ((i as f32) * 0.011).cos()).collect();
+        let xt = Tensor::from_vec(&ctx, &x, &[t, nh * dh]);
+        let mut pos = Vec::new();
+        pos.extend((0..t).map(|i| 7 + i as u32));        // t
+        pos.extend((0..t).map(|i| 30 + 2 * i as u32));   // h
+        pos.extend((0..t).map(|i| 90 + 3 * i as u32));   // w
+        pos.extend(std::iter::repeat_n(0u32, t));        // e
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, false).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, false);
+        let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
+        assert!(worst < 2e-5, "chunked mrope vs reference: max |Δ| = {worst:.3e}");
+
+        // ⚠ The control: with distinct t/h/w this must NOT equal the interleaved rule, or the
+        // `imrope` flag would be decorative and both Qwen2-VL and Qwen3-VL would silently share one path.
+        let inter = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
+        let d = got.iter().zip(&inter).fold(0f32, |a, (&g, &j)| a.max((g - j).abs()));
+        assert!(d > 1e-3, "chunked and interleaved must differ on distinct positions (max |Δ| = {d:.3e})");
     }
 }
