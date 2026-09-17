@@ -189,6 +189,23 @@ pub const REGISTRY: &[Arch] = &[
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked, incl. per-head QK RMSNorm" },
+    // Qwen3-VL-8B-Instruct is the #2 most-downloaded model on Hugging Face (18.4M/30d, 2026-09).
+    // ⚠ TEXT-ONLY, and that is not a hedge — it is what llama.cpp does. `n_embd_inp` is
+    // `n_embd * (1 + n_deepstack_layers)`, but the token path ZERO-PADS to that width
+    // (`llama-graph.cpp`: `ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0,0,0)`), so every
+    // deepstack injection adds exactly 0 for a text token. Ferric therefore omits deepstack entirely
+    // on this path and is arithmetically identical, NOT approximate.
+    // ⛔ What is missing is images: the vision tower, the merger, and the deepstack rows it produces.
+    // Feeding an image would need all three, so the loader must not pretend otherwise.
+    Arch { name: "qwen3vl", runtime: Runtime::Dense, status: Status::Loads,
+           note: "TEXT-ONLY. qwen3 + interleaved multimodal rope (rope.dimension_sections [24,20,20]). \
+                  Text tokens set t=h=w=pos, e=0, so deepstack contributes zero and is omitted — \
+                  identical, not approximate. ⛔ No vision tower yet: images are unsupported. \
+                  ⚠ Ferric follows llama.cpp's sector rule, which leaves sectors 61/62 unrotated \
+                  where HF rotates them (~4e-4 rad @pos 1000) — see Tensor::rope_mrope" },
+    Arch { name: "qwen3vlmoe", runtime: Runtime::Dense, status: Status::Parts,
+           note: "the mrope and text path are shared with qwen3vl, but the MoE FFN is not wired to \
+                  this arch's tensor names; refused rather than run half-configured" },
     Arch { name: "llama", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked against llama-cli on Llama-3.2-1B-Instruct. NORM (interleaved) \
                   rope, unlike the Qwen family sharing this loader" },

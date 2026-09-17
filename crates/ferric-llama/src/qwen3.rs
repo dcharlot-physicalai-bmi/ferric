@@ -58,6 +58,88 @@ pub(crate) fn rope_is_interleaved(arch: &str) -> bool {
     matches!(arch, "muse-glimmer" | "llama")
 }
 
+/// A plain Qwen3-shaped `Cfg` for tests that need one without a checkpoint. Shared so the two
+/// modules that build one cannot drift apart while claiming to test the same thing.
+#[cfg(test)]
+pub(crate) fn qwen3_test_cfg() -> Cfg {
+    Cfg {
+        n_embd: 896, n_layer: 4, n_head: 14, n_head_kv: 2, head_dim: 64, n_ff: 4864,
+        n_vocab: 151936, eps: 1e-6, rope_base: 1e6, has_qk_norm: true, qkv_bias: false,
+        is_gemma: false, embd_scale: 1.0, sliding_window: 0, sliding_pattern: 0,
+        gemma2: false, attn_softcap: 0.0, final_softcap: 0.0,
+        swa: vec![false; 4], logit_scale: 1.0, post_norms: false, nope_global: false,
+        rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
+        yarn_factor: 1.0, yarn_orig_ctx: 0,
+        mrope_sections: None, mrope_interleaved: false,
+    }
+}
+
+/// **Which rotation a layer will actually apply**, decided from configuration alone.
+///
+/// ⛔ Extracted because two wiring mutations SURVIVED a full test run: re-enabling the fused QK
+/// kernel under multimodal rope, and making `rope_inner` ignore `mrope_sections` entirely. Both
+/// produce a model that loads, emits finite logits and writes fluent, wrong text — and neither was
+/// reachable from a test, because `rope_inner` needs a loaded model and no test has weights. A
+/// decision that cannot be tested without a checkpoint will not be tested.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RopePlan {
+    /// NEOX split-half pairing, one position per token.
+    Neox,
+    /// NORM interleaved pairing (`llama`, `muse-glimmer`).
+    Norm,
+    /// Llama-3 per-frequency scaling, NEOX pairing.
+    ScaledNeox,
+    /// Llama-3 per-frequency scaling, NORM pairing.
+    ScaledNorm,
+    /// Multimodal: four positions per token, sections decide which one each sector rotates by.
+    /// The bool is `true` for the interleaved rule (`qwen3vl`), `false` for chunked (`qwen2vl`).
+    Mrope([u32; 4], bool),
+}
+
+/// ⚠ Order matters and is the whole content of this function: multimodal rope SUPERSEDES the scaling
+/// and pairing arms, because its sections already encode the pairing and its positions replace the
+/// single sequence position. Checking it second would let a vision model silently take plain rope.
+pub(crate) fn rope_plan(cfg: &Cfg, has_freqs: bool, neox_override: bool) -> RopePlan {
+    if let Some(sections) = cfg.mrope_sections {
+        return RopePlan::Mrope(sections, cfg.mrope_interleaved);
+    }
+    let norm = cfg.rope_interleaved && !neox_override;
+    match (has_freqs, norm) {
+        (true, true) => RopePlan::ScaledNorm,
+        (true, false) => RopePlan::ScaledNeox,
+        (false, true) => RopePlan::Norm,
+        (false, false) => RopePlan::Neox,
+    }
+}
+
+/// Whether the fused QK-norm+RoPE kernel may serve this layer. Every `false` is a rotation the fused
+/// kernel does not implement.
+///
+/// ⛔ `mrope` must force `false`: the fused kernel applies ORDINARY rope, but under multimodal rope
+/// two sectors fall to the always-zero 4th component and must not rotate at all. Fusing there rotates
+/// them — no error, finite logits, fluent wrong text.
+pub(crate) fn qk_fusable(
+    cfg: &Cfg, has_qk_norm: bool, layer_ropes: bool, has_freqs: bool, neox_override: bool, disabled: bool,
+) -> bool {
+    has_qk_norm
+        && layer_ropes
+        && !has_freqs
+        && cfg.yarn_factor <= 1.0
+        && !(cfg.rope_interleaved && !neox_override)
+        && cfg.mrope_sections.is_none()
+        && !disabled
+}
+
+/// Whether `arch` uses the **interleaved** multimodal-RoPE rule/// Whether `arch` uses the **interleaved** multimodal-RoPE rule (`IMROPE`) rather than the chunked
+/// one (`MROPE`). Audited against `llama_model_rope_type` (`src/llama-model.cpp`): `QWEN2VL` and
+/// `PADDLEOCR` are MROPE; `QWEN3VL`, `QWEN3VLMOE`, `QWEN35`, `QWEN35MOE` are IMROPE.
+///
+/// ⚠ This is the SHIPPED predicate the `Cfg` builder consults — kept here so the registry test can
+/// call it rather than keep a copy that would pass while the real one drifted.
+pub(crate) fn mrope_is_interleaved_arch(arch: &str) -> bool {
+    arch == "qwen3vl" || arch == "qwen3vlmoe" || arch.starts_with("qwen35")
+}
+
 pub struct Cfg {
     pub n_embd: usize,
     pub n_layer: usize,
@@ -125,6 +207,12 @@ pub struct Cfg {
     /// Bonsai declares factor 4) silently got no rope scaling at all.
     pub yarn_factor: f32,
     pub yarn_orig_ctx: usize,
+    /// **Multimodal RoPE sections** (`{arch}.rope.dimension_sections`) — `Some` only for the
+    /// `qwen2vl`/`qwen3vl` family. `[24,20,20,0]` for Qwen3-VL, `[16,24,24,0]` for Qwen2-VL.
+    /// `None` means ordinary RoPE and nothing below changes.
+    pub mrope_sections: Option<[u32; 4]>,
+    /// `true` for the **interleaved** rule (`qwen3vl`, `qwen35`), `false` for chunked (`qwen2vl`).
+    pub mrope_interleaved: bool,
 }
 
 impl Cfg {
@@ -198,6 +286,19 @@ impl Cfg {
             yarn_factor: if matches!(g.metadata().get(&format!("{arch}.rope.scaling.type")), Some(Meta::Str(t)) if t == "yarn")
                 { f("rope.scaling.factor").unwrap_or(1.0) } else { 1.0 },
             yarn_orig_ctx: u("rope.scaling.original_context_length").unwrap_or(0),
+            // ⚠ Absent means ordinary RoPE, not "assume zeros" — an empty sections array would make
+            // every sector fall to the 4th component and rotate nothing at all.
+            mrope_sections: match g.metadata().get(&format!("{arch}.rope.dimension_sections")) {
+                Some(Meta::Arr(a)) if !a.is_empty() => {
+                    let mut v = [0u32; 4];
+                    for (i, m) in a.iter().take(4).enumerate() {
+                        v[i] = match m { Meta::U(x) => *x as u32, Meta::I(x) => *x as u32, _ => 0 };
+                    }
+                    (v.iter().sum::<u32>() > 0).then_some(v)
+                }
+                _ => None,
+            },
+            mrope_interleaved: mrope_is_interleaved_arch(&arch),
         })
     }
 }
@@ -829,12 +930,9 @@ impl Qwen3 {
     /// are finite, and the text is fluent and wrong. `FERRIC_NO_QK_FUSE` forces the composed path for
     /// a controlled A/B in the same binary.
     fn qk_rope_fusable(&self, l: &Layer) -> bool {
-        l.q_norm.is_some() && l.k_norm.is_some()          // the fusion is only for QK-norm models
-            && l.rope                                      // a NoPE layer rotates nothing
-            && self.rope_freqs.is_none()                   // no Llama-3 per-frequency scaling
-            && self.cfg.yarn_factor <= 1.0                 // no YaRN post-scale
-            && !(self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err())  // NEOX only
-            && std::env::var("FERRIC_NO_QK_FUSE").is_err()
+        qk_fusable(&self.cfg, l.q_norm.is_some() && l.k_norm.is_some(), l.rope,
+                   self.rope_freqs.is_some(), std::env::var("FERRIC_NEOX").is_ok(),
+                   std::env::var("FERRIC_NO_QK_FUSE").is_ok())
     }
 
     fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
@@ -853,6 +951,24 @@ impl Qwen3 {
     }
 
     fn rope_inner(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
+        // The choice lives in `rope_plan`, which is a pure function of the config so it can be tested
+        // without a checkpoint. This body only carries it out.
+        // **Multimodal RoPE**, first because it supersedes every arm below.
+        //
+        // For a TEXT token llama.cpp sets the three spatial components to the sequence position and
+        // the 4th to 0 (`llm_graph_input_pos::set_input`), which is what makes text-only inference on
+        // a vision model exactly correct with no vision tower. ⚠ It does NOT reduce to ordinary RoPE:
+        // with `[24,20,20,0]` two sectors match neither arm of the rule, fall to the always-zero 4th
+        // component, and stay unrotated. See `Tensor::rope_mrope` for why that differs from HF.
+        if let RopePlan::Mrope(sections, interleaved) =
+            rope_plan(&self.cfg, self.rope_freqs.is_some(), std::env::var("FERRIC_NEOX").is_ok())
+        {
+            let t = x.numel() / (n_heads * self.cfg.head_dim);
+            let mut pos = Vec::with_capacity(t * 4);
+            for _ in 0..3 { pos.extend((0..t).map(|i| (offset + i) as u32)); }
+            pos.extend(std::iter::repeat_n(0u32, t));
+            return x.rope_mrope(n_heads, self.cfg.head_dim, base, &pos, sections, interleaved);
+        }
         match &self.rope_freqs {
             // The scaled path must honour the pairing too. It did not: `rope_interleaved` was
             // consulted only in the `None` arm, so any model with rope_freqs (every Llama-3.1+)
@@ -1521,12 +1637,18 @@ impl Qwen3 {
 
 #[cfg(test)]
 mod rope_type_tests {
-    use super::rope_is_interleaved;
+    use super::{mrope_is_interleaved_arch, qk_fusable, rope_is_interleaved, rope_plan, RopePlan};
 
     /// Architectures served by this loader, with the rope type llama.cpp resolves for each.
     /// Audited against its `llama_model_rope_type` switch on 2026-08-15.
     const NORM_ARCHES: &[&str] = &["llama", "muse-glimmer"];
-    const NEOX_ARCHES: &[&str] = &["qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "gemma4", "lfm2"];
+    // ⚠ `qwen3vl`/`qwen3vlmoe` are NEOX *pairing* — llama.cpp applies MROPE and IMROPE through the
+    // same `rotate_pairs<T>(n_dims, n_dims/2, …)` split-half path as NEOX (`ops.cpp`: the NEOX, MROPE
+    // and IMROPE cases share one arm). What differs is which POSITION each sector rotates by, not
+    // which partner it pairs with — so they belong here, and the multimodal rule is carried by
+    // `Cfg::mrope_sections` instead.
+    const NEOX_ARCHES: &[&str] = &["qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "gemma4",
+                                   "lfm2", "qwen3vl", "qwen3vlmoe"];
 
     #[test]
     fn every_norm_arch_is_interleaved_and_every_neox_arch_is_not() {
@@ -1539,6 +1661,61 @@ mod rope_type_tests {
         for a in NEOX_ARCHES {
             assert!(!rope_is_interleaved(a), "{a} is NEOX in llama.cpp; this loader would rotate NORM pairs");
         }
+    }
+
+    /// ⛔ A vision arch added to NEOX_ARCHES is still WRONG without `mrope_sections`: pairing and
+    /// position rule are independent, and the registry's note is the only place that says so. This
+    /// asserts the two stay in step — that every arch whose note claims multimodal rope is one the
+    /// loader would actually give multimodal rope to, by NAME, using the shipped predicate.
+    #[test]
+    fn every_arch_claiming_multimodal_rope_is_one_the_loader_treats_that_way() {
+        let claims: Vec<&str> = crate::arch::REGISTRY.iter()
+            .filter(|e| e.note.contains("multimodal rope")).map(|e| e.name).collect();
+        assert!(!claims.is_empty(), "no arch claims multimodal rope — this test would check nothing");
+        for name in claims {
+            assert!(mrope_is_interleaved_arch(name),
+                    "{name}'s note claims multimodal rope but the loader would not apply it");
+        }
+        // The control: an ordinary arch must NOT be treated as multimodal.
+        assert!(!mrope_is_interleaved_arch("qwen3"), "plain qwen3 must not take the multimodal path");
+    }
+
+    /// ⛔⛔ **THESE TWO TESTS EXIST BECAUSE MUTATIONS SURVIVED.** With the kernel fully unit-tested,
+    /// a full `cargo test` still passed when (a) the fused QK kernel was re-enabled under multimodal
+    /// rope and (b) `rope_inner` ignored `mrope_sections` outright. Both ship a model that loads,
+    /// produces finite logits and writes fluent, wrong text. Neither was reachable from a test,
+    /// because the decisions lived inside methods needing loaded weights — so they are now pure
+    /// functions of the config and these tests call them.
+    #[test]
+    fn a_multimodal_config_plans_multimodal_rope_and_never_the_fused_kernel() {
+        let mut c = super::qwen3_test_cfg();
+        // plain text config: ordinary NEOX, and the fusion is allowed
+        assert_eq!(rope_plan(&c, false, false), RopePlan::Neox);
+        assert!(qk_fusable(&c, true, true, false, false, false), "plain qwen3 should fuse");
+
+        // the same config with Qwen3-VL's sections
+        c.mrope_sections = Some([24, 20, 20, 0]);
+        c.mrope_interleaved = true;
+        assert_eq!(rope_plan(&c, false, false), RopePlan::Mrope([24, 20, 20, 0], true),
+                   "a config with sections must plan multimodal rope");
+        assert!(!qk_fusable(&c, true, true, false, false, false),
+                "the fused kernel applies ORDINARY rope and must be refused under multimodal rope");
+
+        // ⚠ and it must SUPERSEDE the other arms, not lose to them: with rope_freqs present and NORM
+        // pairing set, a vision model must still take the multimodal path.
+        c.rope_interleaved = true;
+        assert_eq!(rope_plan(&c, true, false), RopePlan::Mrope([24, 20, 20, 0], true),
+                   "multimodal rope outranks both scaling and pairing");
+    }
+
+    /// Qwen2-VL's chunked rule must not be reported as interleaved — one flag separates two models.
+    #[test]
+    fn the_chunked_and_interleaved_rules_are_not_interchangeable() {
+        let mut c = super::qwen3_test_cfg();
+        c.mrope_sections = Some([16, 24, 24, 0]);
+        c.mrope_interleaved = false;                       // qwen2vl
+        assert_eq!(rope_plan(&c, false, false), RopePlan::Mrope([16, 24, 24, 0], false));
+        assert_ne!(rope_plan(&c, false, false), RopePlan::Mrope([16, 24, 24, 0], true));
     }
 
     #[test]
@@ -1567,6 +1744,7 @@ mod kvq_cache_tests {
             swa: vec![false; n_layer], logit_scale: 1.0, post_norms: false, nope_global: false,
             rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
             yarn_factor: 1.0, yarn_orig_ctx: 0,
+            mrope_sections: None, mrope_interleaved: false,
         }
     }
 
