@@ -4412,6 +4412,15 @@ mod mrope_tests {
     ///
     /// The test asserts both halves: identical to plain rope everywhere else, and *provably unrotated*
     /// at 61/62 — a one-sided check would pass on a kernel that rotated nothing at all.
+    ///
+    /// ⭐ The constants below are READ FROM THE REAL CHECKPOINTS, not copied from a description of
+    /// them: `Qwen3-VL-8B-Instruct/config.json` and `Qwen3-VL-Embedding-2B/config.json` both carry
+    /// `head_dim 128`, `rope_theta 5000000` and
+    /// `rope_scaling {mrope_interleaved: true, mrope_section: [24,20,20], rope_type: "default"}`.
+    /// ⚠ Note HF stores `mrope_interleaved` as CONFIG while llama.cpp derives it from the ARCH
+    /// (`LLM_ARCH_QWEN3VL → LLAMA_ROPE_TYPE_IMROPE`, no KV). Ferric derives it from the arch too,
+    /// which is what matches the GGUF path — a model whose HF config disagreed with its arch would
+    /// be a llama.cpp divergence, not a Ferric one.
     #[test]
     fn mrope_text_positions_match_plain_rope_except_where_llama_cpp_drops_them() {
         let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return };
