@@ -292,12 +292,50 @@ pointwise, `L` Fourier layers `h ← σ(W h + b + SpectralConvMulti(h))`, projec
 The per-mode matrices are **not** a loop over modes: the retained spectrum is compressed to `[B, w, M]`,
 transposed to mode-major `[M, B, w]`, and multiplied by `R` of shape `[M, w, w]` as a single batched GEMM.
 
+### The transform: two exact plans, chosen by measurement
+
+`F₂ = F₁ ⊗ F₁` as one `n² × n²` matmul costs `n⁴` per field and needs an `n² × n²` matrix — **4.29 GB** of
+DFT matrices at `n = 128`, which is the wall the layer actually hits. The transform is separable, so it can
+instead be two `n × n` matmuls with a transpose between: `2n³` per field from a **65.5 kB** matrix, exact,
+and built only from `matmul`/`transpose`/`reshape`, so the layer stays second-order differentiable.
+`Dft2` carries both plans and they agree to **1.4e-7**.
+
+⚠ **The flop ratio is not the speed ratio, and measuring it changed the design.** A forward-plus-inverse
+pair is 12 matmuls of `n³` against 4 of `n⁴` — `n/3` the arithmetic, but **three times the dispatches**.
+Measured at batch 48 on Metal:
+
+| n | Kronecker | separable | speedup | matrices |
+|---|---|---|---|---|
+| 16 | 0.39 ms | 1.23 ms | **0.32×** | 1.0 MB vs 4.1 kB |
+| 32 | 1.01 ms | 1.37 ms | **0.73×** | 16.8 MB vs 16.4 kB |
+| 64 | 11.90 ms | 2.36 ms | **5.05×** | 268.4 MB vs 65.5 kB |
+
+The separable plan *loses* by ~3× at `n = 16` — dispatch-bound, not compute-bound — and wins by 3.6–5× at
+`n = 64`. (⚠ The absolute milliseconds move with machine load: a contended run of the same test gave
+1.61/4.51, 3.46/6.49 and 15.14/4.18 ms. The ratios and the crossover did not move, and the ratios are what
+the test asserts.) So `Dft2::new` picks by grid size (`SEPARABLE_ABOVE = 32`, the crossover as measured) rather than
+replacing one with the other, and the memory ratio (`n²`, always) is what unlocks the resolutions the
+Kronecker form could never hold: the layer is exact to **1.9e-7** at `n = 64` with 113 retained modes.
+
+⛔ **Making the choice automatic nearly made three tests vacuous.** Once `Dft2::new` picked by `n`, the
+separable-vs-Kronecker agreement test and the wall-clock benchmark were both constructing the *Kronecker*
+plan for their "separable" arm at `n ≤ 32` — each comparing a plan to itself and passing. Every test that
+depends on which plan is running now names it with `with_plan` and asserts `dft.plan`; mutating
+`SEPARABLE_ABOVE` to 0 or to a huge value is caught in both directions.
+
+⚠ `SpectralConv2d`, the channel-diagonal layer, is deliberately left on its own Kronecker matrices. It is
+the independent reference the separable plan is checked against, and porting it would collapse that check
+into a tautology. This is also not the FFT: `n² log n` needs a butterfly primitive built from gather/scatter,
+and those carry no differentiable VJP here. The separable plan is the whole of the asymptotic gain available
+from differentiable ops today.
+
 | oracle | result |
 |---|---|
 | `SpectralConvMulti` on a channel-**coupling** operator `M(k) = g(k)A + i s(k)B` | held-out rel-L2 **0.0001** |
 | the same layer with its off-diagonal blocks masked (channel-diagonal ablation) | rel-L2 **0.6007** — it cannot represent the coupling |
 | the learned per-mode matrices against the closed-form `M(k)`, entry by entry | worst entry off by **1.24e-4**, against entries spanning ±1.0 |
 | `Fno2d` (width 8, 2 layers, tanh) on the nonlinear operator `f ↦ s + s²`, `s` = `f` smoothed by `4/|k|²` | held-out rel-L2 **0.0248** |
+| the layer at `n = 64`, 113 retained modes, reference weights installed | rel-L2 vs the closed form **1.9e-7** |
 | the same network with its activations removed (exactly linear, same parameter count) | rel-L2 **0.5999** |
 
 (`s` is a Poisson-type smoothing of `f` — the multiplier `4/|k|²`, scaled so `s` is O(1) rather than the
@@ -351,9 +389,11 @@ the shape `grad()` returns for the unbatched one.
   certifies it. Sound in-distribution / for the well-posed regime; state the domain of validity.
 - **Operators vs PINNs.** A PINN solves one instance; an operator learns the whole solution *map* (one
   forward pass per new input, no re-solving) — the primitive for real-time / parametric / many-query use.
-- **FNO without FFT.** Ferric has no FFT/complex, but the DFT is a matmul, so the spectral conv is
-  DFT-as-matmul with a real/imag split. `O(n²)` vs `O(n log n)` — FFT is the asymptotic speedup only, and at
-  these grid sizes it does not matter; the learned per-mode weights are identical either way.
+- **FNO without FFT.** Ferric has no FFT/complex, so the spectral conv is DFT-as-matmul with a real/imag
+  split. ⚠ Corrected: on a 2-D `n × n` grid the Kronecker form is `O(n⁴)` per field with an `n² × n²`
+  matrix, not `O(n²)` — it is the **memory**, not the asymptotics, that bites first (4.29 GB at `n = 128`).
+  The separable plan brings that to `2n³` from an `n × n` matrix and is what makes `n = 64`+ reachable; the
+  remaining gap to a true FFT is `n/log n`. The learned per-mode weights are identical under every plan.
 
 ## Honest scope & what's not here
 
@@ -363,7 +403,9 @@ the shape `grad()` returns for the unbatched one.
   high-DOF plants, and are cited, not claimed here.
 - **Joules-per-solve is not measured** — Apple Silicon exposes no RAPL; an honest per-solve energy number
   needs the external-meter / Jetson path (see `FABRIC.md`). Not fabricated.
-- **Remaining:** an FFT primitive (to make the FNO asymptotically fast), a separable PINN (SPINN) for
+- **Remaining:** an FFT primitive (the separable plan took the 2-D transform from `n⁴` to `2n³`; an FFT
+  would take it to `n² log n`, and needs a butterfly built from gather/scatter, neither of which carries a
+  differentiable VJP here), a separable PINN (SPINN) for
   higher dimensions, and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
   wasm32-unknown-unknown` is **clean**, so nothing in the tensor crate — `sciml` included — is host-only at
   the type level. That is a compile, not a run: it says nothing about whether the WebGPU compute path, the

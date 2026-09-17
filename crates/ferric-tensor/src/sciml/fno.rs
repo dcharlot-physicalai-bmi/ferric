@@ -24,6 +24,155 @@ use crate::{Tensor, Var};
 use ferric_core::Context;
 use std::sync::Arc;
 
+/// **The separable 2-D DFT** — two 1-D transforms instead of one Kronecker matrix.
+///
+/// `F₂ = F₁ ⊗ F₁` applied as a single `n² × n²` matmul costs `n⁴` per field and needs an `n² × n²`
+/// matrix: 1.07 GB at `n = 128`, times four for the real/imaginary forward and inverse pair. Because the
+/// transform is separable it is instead two `n × n` matmuls, one along each axis with a transpose between
+/// — `2n³` per field from a 65 kB matrix. Counting the actual dispatches, a forward-plus-inverse pair is
+/// **12 matmuls of `n³` against 4 of `n⁴`**, an arithmetic ratio of `n/3`; the matrix memory ratio is the
+/// blunt one, `n²` — 16,384× at `n = 128`, the difference between a transform that fits and one that does
+/// not. ⚠ Three times the dispatches means the small-`n` end is not automatically faster in wall-clock;
+/// `the_separable_transform_against_the_kronecker_one_in_wall_clock` measures it rather than assuming it.
+///
+/// This is not the FFT — that would take it to `n² log n` and needs a butterfly primitive the fabric does
+/// not have (the gather/scatter it would be built from carry no differentiable VJP). It is the whole of
+/// the asymptotic gain available from existing differentiable ops, and it is exact: matmul, transpose and
+/// reshape only, so the layer stays second-order differentiable.
+/// Which of the two exact plans a [`Dft2`] runs. They agree to fp precision; they differ only in how the
+/// work is divided, and therefore in where each one wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dft2Plan {
+    /// One `n² × n²` matmul per part: 4 dispatches for a forward-plus-inverse pair, `n⁴` each.
+    Kronecker,
+    /// Two `n × n` matmuls per part with a transpose between: 12 dispatches, `n³` each.
+    Separable,
+}
+
+pub struct Dft2 {
+    pub n: usize,
+    pub plan: Dft2Plan,
+    /// Forward `[n, n]` (separable) or `[n², n²]` (Kronecker), real and imaginary.
+    fr: Tensor,
+    fi: Tensor,
+    /// Inverse, with the normalisation folded in — `1/n` per pass for the separable plan, `1/n²` once
+    /// for the Kronecker one.
+    cr: Tensor,
+    ci: Tensor,
+}
+
+/// Above this grid size the separable plan is chosen. ⚠ Set from measurement, not from the flop count:
+/// at batch 48 on Metal a forward-plus-inverse pair runs Kronecker/separable at 1.61/4.51 ms (n=16),
+/// 3.46/6.49 ms (n=32) and 15.14/4.18 ms (n=64). The separable plan does `n/3` the arithmetic but three
+/// times the dispatches, so it *loses* by 2.8× at n=16 and wins by 3.6× at n=64.
+pub const SEPARABLE_ABOVE: usize = 32;
+
+impl Dft2 {
+    /// The plan chosen by [`SEPARABLE_ABOVE`] — what a caller should use unless it is measuring.
+    pub fn new(ctx: &Arc<Context>, n: usize) -> Self {
+        Self::with_plan(ctx, n, if n > SEPARABLE_ABOVE { Dft2Plan::Separable } else { Dft2Plan::Kronecker })
+    }
+
+    pub fn with_plan(ctx: &Arc<Context>, n: usize, plan: Dft2Plan) -> Self {
+        let tau = std::f64::consts::TAU;
+        let w1 = |j: usize, k: usize| -> (f64, f64) {
+            let th = -tau * ((j * k) % n) as f64 / n as f64;
+            (th.cos(), th.sin())
+        };
+        let (fr, fi, cr, ci, shape) = match plan {
+            Dft2Plan::Separable => {
+                let (mut fr, mut fi, mut cr, mut ci) = (vec![0.0f32; n * n], vec![0.0f32; n * n], vec![0.0f32; n * n], vec![0.0f32; n * n]);
+                for j in 0..n {
+                    for k in 0..n {
+                        let (c, sn) = w1(j, k);
+                        fr[j * n + k] = c as f32;
+                        fi[j * n + k] = sn as f32;
+                        // the inverse is the conjugate transpose over n; indexed [k, j] so it contracts k
+                        cr[k * n + j] = (c / n as f64) as f32;
+                        ci[k * n + j] = (-sn / n as f64) as f32;
+                    }
+                }
+                (fr, fi, cr, ci, vec![n, n])
+            }
+            Dft2Plan::Kronecker => {
+                let nn = n * n;
+                let (mut fr, mut fi, mut cr, mut ci) = (vec![0.0f32; nn * nn], vec![0.0f32; nn * nn], vec![0.0f32; nn * nn], vec![0.0f32; nn * nn]);
+                for j1 in 0..n {
+                    for j2 in 0..n {
+                        for k1 in 0..n {
+                            for k2 in 0..n {
+                                let ((a, b), (c, d)) = (w1(j1, k1), w1(j2, k2));
+                                let (re, im) = (a * c - b * d, a * d + b * c);
+                                let (row, col) = (j1 * n + j2, k1 * n + k2);
+                                fr[row * nn + col] = re as f32;
+                                fi[row * nn + col] = im as f32;
+                                cr[col * nn + row] = (re / nn as f64) as f32;
+                                ci[col * nn + row] = (-im / nn as f64) as f32;
+                            }
+                        }
+                    }
+                }
+                (fr, fi, cr, ci, vec![nn, nn])
+            }
+        };
+        Dft2 {
+            n,
+            plan,
+            fr: Tensor::from_vec(ctx, &fr, &shape),
+            fi: Tensor::from_vec(ctx, &fi, &shape),
+            cr: Tensor::from_vec(ctx, &cr, &shape),
+            ci: Tensor::from_vec(ctx, &ci, &shape),
+        }
+    }
+
+    /// Bytes the two plans need for their matrices, at grid size `n` — `(Kronecker, separable)`.
+    pub fn matrix_bytes(n: usize) -> (usize, usize) {
+        (4 * (n * n) * (n * n) * 4, 4 * (n * n) * 4)
+    }
+
+    /// Forward transform of a real field `[…, n, n]`, returning `(Re X̂, Im X̂)` of the same shape.
+    pub fn forward(&self, x: &Var) -> (Var, Var) {
+        let r = x.value().rank();
+        assert!(r >= 2 && x.value().shape[r - 1] == self.n && x.value().shape[r - 2] == self.n, "Dft2 wants […, n, n]");
+        let (fr, fi) = (Var::leaf(self.fr.clone()), Var::leaf(self.fi.clone()));
+        if self.plan == Dft2Plan::Kronecker {
+            let (flat, back) = self.flatten(x);
+            return (flat.matmul(&fr).reshape(&back), flat.matmul(&fi).reshape(&back));
+        }
+        // along the last axis (j2 → k2); the input is real, so no cross terms yet
+        let (ar, ai) = (x.matmul(&fr), x.matmul(&fi));
+        // along the other axis: transpose so j1 is last, transform, transpose back
+        let (tr, ti) = (ar.transpose(r - 2, r - 1), ai.transpose(r - 2, r - 1));
+        let br = tr.matmul(&fr).sub(&ti.matmul(&fi));
+        let bi = tr.matmul(&fi).add(&ti.matmul(&fr));
+        (br.transpose(r - 2, r - 1), bi.transpose(r - 2, r - 1))
+    }
+
+    /// Inverse transform, returning the **real part** — the field, for a conjugate-symmetric spectrum.
+    pub fn inverse(&self, re: &Var, im: &Var) -> Var {
+        let r = re.value().rank();
+        let (cr, ci) = (Var::leaf(self.cr.clone()), Var::leaf(self.ci.clone()));
+        if self.plan == Dft2Plan::Kronecker {
+            let (fre, back) = self.flatten(re);
+            let (fim, _) = self.flatten(im);
+            return fre.matmul(&cr).sub(&fim.matmul(&ci)).reshape(&back);
+        }
+        let ar = re.matmul(&cr).sub(&im.matmul(&ci));
+        let ai = re.matmul(&ci).add(&im.matmul(&cr));
+        let (tr, ti) = (ar.transpose(r - 2, r - 1), ai.transpose(r - 2, r - 1));
+        // only the real part survives, so the imaginary half of the second pass is never formed
+        tr.matmul(&cr).sub(&ti.matmul(&ci)).transpose(r - 2, r - 1)
+    }
+
+    /// `[…, n, n]` → `[…, n²]` for the Kronecker plan, with the shape to restore afterwards.
+    fn flatten(&self, x: &Var) -> (Var, Vec<usize>) {
+        let back = x.value().shape.clone();
+        let mut flat = back[..back.len() - 2].to_vec();
+        flat.push(self.n * self.n);
+        (x.reshape(&flat), back)
+    }
+}
+
 /// Multi-channel 2-D spectral convolution on an `n × n` periodic grid with `width` channels, keeping
 /// `modes` frequencies per axis. Parameters are `[Rr, Ri]`, each `[M, width, width]` in **[out, in]** order
 /// (`R[k][c][d]` is output channel `c`'s share of input channel `d`), indexed by the
@@ -35,10 +184,8 @@ pub struct SpectralConvMulti {
     pub width: usize,
     /// Half-spectrum representatives `(k1, k2)` of the retained modes — the mode axis of `Rr`/`Ri`.
     pub reps: Vec<(usize, usize)>,
-    fr: Tensor,
-    fi: Tensor,
-    cr: Tensor,
-    ci: Tensor,
+    /// The separable transform — `2n³` per field from two `n × n` matrices, not `n⁴` from an `n² × n²` one.
+    pub dft: Dft2,
     /// `[n², M]`: picks each representative's column out of the full spectrum.
     sel: Tensor,
     /// `[M, n²]`: places a representative's value at its mode and its mirror (`pr`), or with the sign
@@ -67,28 +214,6 @@ impl SpectralConvMulti {
 
     fn build(ctx: &Arc<Context>, n: usize, modes: usize, width: usize, seed: u32, diag: bool) -> Self {
         let nn = n * n;
-        let tau = std::f64::consts::TAU;
-        let w1 = |j: usize, k: usize| -> (f64, f64) {
-            let th = -tau * ((j * k) % n) as f64 / n as f64;
-            (th.cos(), th.sin())
-        };
-        let (mut fr, mut fi) = (vec![0.0f32; nn * nn], vec![0.0f32; nn * nn]);
-        let (mut cr, mut ci) = (vec![0.0f32; nn * nn], vec![0.0f32; nn * nn]);
-        for j1 in 0..n {
-            for j2 in 0..n {
-                for k1 in 0..n {
-                    for k2 in 0..n {
-                        let ((a, b), (c, d)) = (w1(j1, k1), w1(j2, k2));
-                        let (re, im) = (a * c - b * d, a * d + b * c);
-                        let (row, colk) = (j1 * n + j2, k1 * n + k2);
-                        fr[row * nn + colk] = re as f32;
-                        fi[row * nn + colk] = im as f32;
-                        cr[colk * nn + row] = (re / nn as f64) as f32;
-                        ci[colk * nn + row] = (-im / nn as f64) as f32;
-                    }
-                }
-            }
-        }
         let keep = |k: usize| k < modes || n - k < modes;
         let mirror = |k: usize| (n - k) % n;
         let mut reps: Vec<(usize, usize)> = Vec::new();
@@ -136,10 +261,7 @@ impl SpectralConvMulti {
             modes,
             width,
             reps,
-            fr: Tensor::from_vec(ctx, &fr, &[nn, nn]),
-            fi: Tensor::from_vec(ctx, &fi, &[nn, nn]),
-            cr: Tensor::from_vec(ctx, &cr, &[nn, nn]),
-            ci: Tensor::from_vec(ctx, &ci, &[nn, nn]),
+            dft: Dft2::new(ctx, n),
             sel: Tensor::from_vec(ctx, &sel, &[nn, m]),
             pr: Tensor::from_vec(ctx, &pr, &[m, nn]),
             pi: Tensor::from_vec(ctx, &pi, &[m, nn]),
@@ -175,8 +297,9 @@ impl SpectralConvMulti {
         // matrix to the transpose of the truth, which an identity or diagonal check can never reveal.
         let (rr, ri) = self.effective(pv);
         let (rr, ri) = (rr.transpose(1, 2), ri.transpose(1, 2));
-        // forward transform along the grid axis, then keep only the representative modes
-        let (xr, xi) = (x.matmul(&Var::leaf(self.fr.clone())), x.matmul(&Var::leaf(self.fi.clone())));
+        // forward transform along both grid axes, then keep only the representative modes
+        let (xr, xi) = self.dft.forward(&x.reshape(&[b, self.width, self.n, self.n]));
+        let (xr, xi) = (xr.reshape(&[b, self.width, nn]), xi.reshape(&[b, self.width, nn]));
         let sel = Var::leaf(self.sel.clone());
         // [B, w, M] → mode-major [M, B, w] so the per-mode matrices are one batched GEMM
         let to_modes = |t: Var| t.matmul(&sel).transpose(0, 2).transpose(1, 2);
@@ -187,8 +310,10 @@ impl SpectralConvMulti {
         );
         // back to [B, w, M], then expand to the full spectrum with conjugate symmetry
         let un = |t: Var| t.transpose(0, 1).transpose(1, 2);
-        let (fr_, fi_) = (un(yr).matmul(&Var::leaf(self.pr.clone())), un(yi).matmul(&Var::leaf(self.pi.clone())));
-        fr_.matmul(&Var::leaf(self.cr.clone())).sub(&fi_.matmul(&Var::leaf(self.ci.clone())))
+        let sh = [b, self.width, self.n, self.n];
+        let fr_ = un(yr).matmul(&Var::leaf(self.pr.clone())).reshape(&sh);
+        let fi_ = un(yi).matmul(&Var::leaf(self.pi.clone())).reshape(&sh);
+        self.dft.inverse(&fr_, &fi_).reshape(&[b, self.width, nn])
     }
 }
 
@@ -289,6 +414,8 @@ mod tests {
     use super::*;
     use crate::sciml::operators::SpectralConv2d;
     use crate::sciml::util::{leaf, rel_l2, step, u01, vars};
+
+    fn leaf_t(t: &Tensor) -> Var { Var::leaf(t.clone()) }
     use crate::Adam;
 
     /// A two-channel sample of the reference operator, built **in real space** as an explicit sum of
@@ -330,6 +457,67 @@ mod tests {
         (x.iter().map(|&v| v as f32).collect(), y.iter().map(|&v| v as f32).collect())
     }
 
+
+    /// The separable transform against the **Kronecker** one, which the channel-diagonal layer already
+    /// verifies two independent ways (`F⁻¹F = I`, and its learned weights matching the Poisson Green's
+    /// function). Both the forward pair and the inverse are compared, so an error in either pass shows.
+    #[test]
+    fn the_separable_transform_agrees_with_the_kronecker_form() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            for n in [8usize, 16] {
+                let nn = n * n;
+                let kron = SpectralConv2d::new(&ctx, n, n, 1); // all modes kept; we only use its matrices
+                // ⛔ named explicitly: `Dft2::new` picks by `n`, so at these sizes it would hand back the
+                // Kronecker plan and this test would compare that plan to itself
+                let sep = Dft2::with_plan(&ctx, n, Dft2Plan::Separable);
+                assert_eq!(sep.plan, Dft2Plan::Separable, "this test must exercise the separable plan");
+                let b = 3usize;
+                let xv: Vec<f32> = (0..b * nn).map(|i| u01(i as u32, 31) - 0.5).collect();
+                let xflat = leaf(&ctx, &xv, &[b, nn]);
+                let kr = xflat.matmul(&leaf_t(&kron.fr));
+                let ki = xflat.matmul(&leaf_t(&kron.fi));
+                let (sr, si) = sep.forward(&leaf(&ctx, &xv, &[b, n, n]));
+                let er = rel_l2(&sr.value().to_vec().await, &kr.value().to_vec().await);
+                let ei = rel_l2(&si.value().to_vec().await, &ki.value().to_vec().await);
+                // inverse: feed both the SAME spectrum, taken from the Kronecker forward
+                let kinv = kr.matmul(&leaf_t(&kron.cr)).sub(&ki.matmul(&leaf_t(&kron.ci)));
+                let sinv = sep.inverse(&kr.reshape(&[b, n, n]), &ki.reshape(&[b, n, n]));
+                let ev = rel_l2(&sinv.value().to_vec().await, &kinv.value().to_vec().await);
+                let rt = rel_l2(&sep.inverse(&sr, &si).value().to_vec().await, &xv);
+                eprintln!("  n={n}: separable vs Kronecker — forward Re {er:.2e}, Im {ei:.2e}, inverse {ev:.2e}; round trip {rt:.2e}");
+                for (e, what) in [(er, "forward real"), (ei, "forward imaginary"), (ev, "inverse"), (rt, "round trip")] {
+                    assert!(e < 1e-4, "n={n}: the separable transform must match the Kronecker form on the {what}: {e:.2e}");
+                }
+            }
+        });
+    }
+
+    /// The point of the separable form: it runs at a resolution where the Kronecker matrices do not fit.
+    #[test]
+    fn the_separable_transform_runs_where_the_kronecker_matrices_do_not_fit() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let n = 128usize;
+            let (kron_bytes, sep_bytes) = Dft2::matrix_bytes(n);
+            let sep = Dft2::new(&ctx, n);
+            assert_eq!(sep.plan, Dft2Plan::Separable, "at n={n} the default plan must be the separable one");
+            let xv: Vec<f32> = (0..n * n).map(|i| u01(i as u32, 77) - 0.5).collect();
+            let x = leaf(&ctx, &xv, &[1, n, n]);
+            let (re, im) = sep.forward(&x);
+            let back = sep.inverse(&re, &im).value().to_vec().await;
+            let e = rel_l2(&back, &xv);
+            eprintln!(
+                "  n={n}: round trip {e:.2e}; DFT matrices would be {:.2} GB as Kronecker, are {:.1} kB separable ({}x)",
+                kron_bytes as f64 / 1e9,
+                sep_bytes as f64 / 1e3,
+                kron_bytes / sep_bytes
+            );
+            assert!(e < 1e-3, "the separable transform must invert itself at n={n}: {e:.2e}");
+            assert!(kron_bytes / sep_bytes >= 1000, "the whole point is the memory ratio: {}x", kron_bytes / sep_bytes);
+        });
+    }
+
     /// With `R(k) = I` at every mode the multi-channel layer must be the identity — the check that the
     /// compress / mode-major transpose / expand plumbing puts every channel and mode back where it came
     /// from. A single transposed axis or a mis-ordered `sel`/`pr` pair breaks this.
@@ -366,6 +554,10 @@ mod tests {
             let diag = SpectralConv2d::new(&ctx, n, modes, 11);
             let multi = SpectralConvMulti::new(&ctx, n, modes, 1, 11);
             assert_eq!(diag.reps, multi.reps, "the two layers must enumerate the same half-spectrum");
+            // ⚠ at this `n` both sides run the Kronecker plan, so an exact 0 here is agreement of the
+            // layer logic, NOT of the transforms; the transforms are compared in
+            // `the_separable_transform_agrees_with_the_kronecker_form`
+            assert_eq!(multi.dft.plan, Dft2Plan::Kronecker, "expected the small-n default");
             let nr = diag.reps.len();
             let wr: Vec<f32> = (0..nr).map(|i| u01(i as u32, 21) - 0.5).collect();
             // the imaginary weight of a self-mirrored mode is masked in the multi-channel layer and
@@ -436,6 +628,99 @@ mod tests {
             eprintln!("  reference weights installed: rel-L2 {err:.3e}; worst single mode {worst:.3e} at {worst_at:?}");
             assert!(err < 1e-4, "the layer's per-mode convention must match the closed form: {err:.3e}");
             assert!(worst < 1e-4, "mode {worst_at:?} alone disagrees with the closed form: {worst:.3e}");
+        });
+    }
+
+
+    /// The **layer** — not just the transform — at a grid the Kronecker form could not have held, checked
+    /// the same way as at `n = 16`: reference weights installed, output against the closed form. This is
+    /// what the separable transform buys, stated as a working resolution rather than a flop count.
+    #[test]
+    fn the_layer_runs_at_a_resolution_the_kronecker_form_could_not_hold() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (n, modes, w) = (64usize, 8usize, 2usize);
+            let nn = n * n;
+            let sc = SpectralConvMulti::new(&ctx, n, modes, w, 1);
+            assert_eq!(sc.dft.plan, Dft2Plan::Separable, "at n={n} the layer must have taken the separable plan");
+            let m = sc.reps.len();
+            let (mut rr, mut ri) = (vec![0.0f32; m * w * w], vec![0.0f32; m * w * w]);
+            for (r, &(k1, k2)) in sc.reps.iter().enumerate() {
+                let (mr, mi) = coupling_operator(n, k1, k2);
+                for c in 0..w {
+                    for d in 0..w {
+                        rr[r * w * w + c * w + d] = mr[c][d] as f32;
+                        ri[r * w * w + c * w + d] = mi[c][d] as f32;
+                    }
+                }
+            }
+            let pv = vec![leaf(&ctx, &rr, &[m, w, w]), leaf(&ctx, &ri, &[m, w, w])];
+            let (x, y) = sample(n, &sc.reps, 5);
+            let p = sc.forward(&pv, &leaf(&ctx, &x, &[1, w, nn])).value().to_vec().await;
+            let e = rel_l2(&p, &y);
+            let (kron_bytes, sep_bytes) = Dft2::matrix_bytes(n);
+            eprintln!(
+                "  n={n}, {m} retained modes, {w} channels: rel-L2 vs the closed form {e:.3e}; transform matrices {:.1} MB as Kronecker, {:.1} kB separable",
+                kron_bytes as f64 / 1e6,
+                sep_bytes as f64 / 1e3
+            );
+            assert!(e < 1e-4, "the layer must stay exact at n={n}: {e:.3e}");
+            // and it still differentiates — the shapes changed, the tape did not
+            let loss = sc.forward(&pv, &leaf(&ctx, &x, &[1, w, nn])).mul(&leaf(&ctx, &x, &[1, w, nn])).sum_all();
+            loss.backward();
+            let g = pv[0].grad().expect("the per-mode weights must receive a gradient at this resolution");
+            assert_eq!(g.shape, vec![m, w, w], "gradient shape");
+        });
+    }
+
+
+    /// ⚠ **Flops are not wall-clock.** The separable form does `12` matmuls of `n³` where the Kronecker
+    /// form does `4` of `n⁴` — an arithmetic ratio of `n/3`, but three times the dispatches. On a GPU with
+    /// per-dispatch overhead the small-`n` end can go either way, so this measures it instead of asserting
+    /// it. Run with `-- --ignored --nocapture`; it prints, and only asserts the thing that cannot flip:
+    /// that the advantage grows with `n`.
+    #[ignore = "a wall-clock measurement, not a correctness check; run with -- --ignored --nocapture"]
+    #[test]
+    fn the_separable_transform_against_the_kronecker_one_in_wall_clock() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (b, iters) = (48usize, 20);
+            let mut ratios = Vec::new();
+            for n in [16usize, 32, 64] {
+                let nn = n * n;
+                let kron = SpectralConv2d::new(&ctx, n, n, 1);
+                let sep = Dft2::with_plan(&ctx, n, Dft2Plan::Separable);
+                let xv: Vec<f32> = (0..b * nn).map(|i| u01(i as u32, 3) - 0.5).collect();
+                let (xf, xg) = (leaf(&ctx, &xv, &[b, nn]), leaf(&ctx, &xv, &[b, n, n]));
+                let (fr, fi, cr, ci) = (leaf_t(&kron.fr), leaf_t(&kron.fi), leaf_t(&kron.cr), leaf_t(&kron.ci));
+                let kron_once = |_: usize| {
+                    let (a, c) = (xf.matmul(&fr), xf.matmul(&fi));
+                    a.matmul(&cr).sub(&c.matmul(&ci))
+                };
+                let sep_once = |_: usize| {
+                    let (a, c) = sep.forward(&xg);
+                    sep.inverse(&a, &c)
+                };
+                // warm up both (kernel selection and any autotuning happen on first use)
+                let _ = kron_once(0).value().to_vec().await;
+                let _ = sep_once(0).value().to_vec().await;
+                let t0 = std::time::Instant::now();
+                for i in 0..iters { let _ = kron_once(i).value().to_vec().await; }
+                let tk = t0.elapsed().as_secs_f64() / iters as f64;
+                let t1 = std::time::Instant::now();
+                for i in 0..iters { let _ = sep_once(i).value().to_vec().await; }
+                let ts = t1.elapsed().as_secs_f64() / iters as f64;
+                let (kb, sb) = Dft2::matrix_bytes(n);
+                eprintln!(
+                    "  n={n:3} (batch {b}): Kronecker {:8.2} ms   separable {:8.2} ms   speedup {:5.2}x   matrices {:8.1} MB vs {:6.1} kB",
+                    tk * 1e3, ts * 1e3, tk / ts, kb as f64 / 1e6, sb as f64 / 1e3
+                );
+                ratios.push(tk / ts);
+            }
+            assert!(
+                ratios[2] > ratios[0],
+                "the separable form's advantage must grow with n (that is the whole claim): {ratios:?}"
+            );
         });
     }
 
