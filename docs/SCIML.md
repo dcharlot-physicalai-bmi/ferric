@@ -262,6 +262,20 @@ sum sum_all exp log sin cos tanh sqrt`. Not safe: `cat narrow broadcast_to silu 
 selective_scan contiguous` — which is why `FourierNet` feeds `sin(xB)` and `cos(xB)` through two weight
 matrices rather than concatenating them.
 
+**Every one of the safe ops is now checked against central differences**, on broadcast and mixed-rank shapes,
+in three ways at once: `backward()`, the functional `grad()`, and — for the smooth ones — the gradient of
+`Σ(∂L/∂x)²`, which is the only check that exercises a VJP's *own* VJP. 23 cases; worst first-order gap
+3.0e-3. This is the battery that would have caught the `matmul` defect on the day it was written.
+
+⛔ **A finite-difference battery cannot see a defect in the forward pass** — it checks the derivative of
+whatever function is implemented, so a wrong constant changes the value and its gradient consistently and
+passes. Mutating `mean`'s divisor to 1, making it `sum`, left the whole battery green. A companion test now
+pins 26 forward behaviours to closed forms computed in Rust from the inputs (`mean` against its own sum over
+its own count, `softmax` rows summing to 1 with ratios equal to `exp` of the difference, `matmul` against a
+product written out by hand, the elementwise maps against `std`). Mutations that the battery missed and the
+companion catches: `mean` divides by 1; `softmax` normalises over the wrong axis; `sum` drops keepdim;
+`mean_all` divides by the rank.
+
 **L-BFGS needs a Wolfe line search, not Armijo.** With backtracking alone, Rosenbrock stalled at
 `f = 3.47` for 200 iterations: from iteration 3 every accepted step had `sᵀy ≈ −5e-7`, so every curvature
 pair was rejected, the history froze, and its direction collapsed to `|d| ≈ 1.8e-3` — accepted at unit

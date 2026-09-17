@@ -512,6 +512,206 @@ mod tests {
     use ferric_core::Context;
     use std::sync::Arc;
 
+
+    type Build = fn(&[Var]) -> Var;
+
+    /// Rebuild the graph from raw values each call — the tape is consumed by `backward()`.
+    fn leaves(ctx: &Arc<Context>, vals: &[Vec<f32>], shapes: &[Vec<usize>]) -> Vec<Var> {
+        vals.iter().zip(shapes).map(|(v, s)| Var::leaf(Tensor::from_vec(ctx, v, s))).collect()
+    }
+
+    async fn loss_of(ctx: &Arc<Context>, b: Build, vals: &[Vec<f32>], shapes: &[Vec<usize>]) -> f32 {
+        b(&leaves(ctx, vals, shapes)).value().to_vec().await[0]
+    }
+
+    /// `Σᵢ (∂L/∂xᵢ)²` through the differentiable `grad()` — a scalar whose own gradient exercises the
+    /// second-order path, and which finite differences can check independently.
+    async fn gradsq_of(ctx: &Arc<Context>, b: Build, vals: &[Vec<f32>], shapes: &[Vec<usize>]) -> f32 {
+        let vs = leaves(ctx, vals, shapes);
+        let gs = grad(&b(&vs), &vs, None);
+        let mut h = gs[0].mul(&gs[0]).sum_all();
+        for g in &gs[1..] {
+            h = h.add(&g.mul(g).sum_all());
+        }
+        h.value().to_vec().await[0]
+    }
+
+    /// ⭐⭐ **Every differentiable `Var` op against central differences, on broadcast and mixed-rank
+    /// shapes.** The `matmul` defect above was latent for the life of the crate because no caller had
+    /// ever made a batched-against-unbatched call; the forward pass was fine and the backward pass had
+    /// never run. This battery asks the question of every op at once, in three ways: `backward()` against
+    /// finite differences, the functional `grad()` against the same, and — for the smooth ops — the
+    /// gradient of `Σ(∂L/∂x)²` against finite differences of that scalar, which is the only check that
+    /// exercises a VJP's own VJP.
+    #[test]
+    fn every_differentiable_op_matches_finite_differences_on_broadcast_shapes() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            // name, input shapes, second-order too?, builder (must return a scalar)
+            let cases: Vec<(&str, Vec<Vec<usize>>, bool, Build)> = vec![
+                ("add broadcast [2,3]+[1,3]", vec![vec![2, 3], vec![1, 3]], true, |v| v[0].add(&v[1]).mul(&v[0]).sum_all()),
+                ("sub broadcast [2,3]-[3,1]... rank-1", vec![vec![2, 3], vec![3]], true, |v| v[0].sub(&v[1]).mul(&v[0]).sum_all()),
+                ("mul broadcast [2,3]*[1,3]", vec![vec![2, 3], vec![1, 3]], true, |v| v[0].mul(&v[1]).sum_all()),
+                ("mul scalar [2,3]*[1]", vec![vec![2, 3], vec![1]], true, |v| v[0].mul(&v[1]).mul(&v[1]).sum_all()),
+                ("div broadcast [2,3]/[1,3]", vec![vec![2, 3], vec![1, 3]], true, |v| v[0].div(&v[1]).sum_all()),
+                ("matmul [2,3]x[3,4]", vec![vec![2, 3], vec![3, 4]], true, |v| v[0].matmul(&v[1]).mul(&v[0].matmul(&v[1])).sum_all()),
+                ("matmul batched x unbatched [2,2,3]x[3,4]", vec![vec![2, 2, 3], vec![3, 4]], true, |v| v[0].matmul(&v[1]).mul(&v[0].matmul(&v[1])).sum_all()),
+                ("matmul batched x batched [2,2,3]x[2,3,4]", vec![vec![2, 2, 3], vec![2, 3, 4]], true, |v| v[0].matmul(&v[1]).sum_all()),
+                ("exp", vec![vec![2, 3]], true, |v| v[0].exp().sum_all()),
+                ("log", vec![vec![2, 3]], true, |v| v[0].log().sum_all()),
+                ("sin", vec![vec![2, 3]], true, |v| v[0].sin().sum_all()),
+                ("cos", vec![vec![2, 3]], true, |v| v[0].cos().sum_all()),
+                ("tanh", vec![vec![2, 3]], true, |v| v[0].tanh().sum_all()),
+                ("sqrt", vec![vec![2, 3]], true, |v| v[0].sqrt().sum_all()),
+                ("neg", vec![vec![2, 3]], true, |v| v[0].neg().mul(&v[0]).sum_all()),
+                ("sum over axis 0, then broadcast back", vec![vec![2, 3]], true, |v| v[0].sum(&[0]).mul(&v[0]).sum_all()),
+                ("sum over axis 1", vec![vec![2, 3]], true, |v| v[0].sum(&[1]).mul(&v[0]).sum_all()),
+                ("mean over axis 1", vec![vec![2, 3]], true, |v| v[0].mean(&[1]).mul(&v[0]).sum_all()),
+                ("mean_all", vec![vec![2, 3]], true, |v| v[0].mean_all().mul(&v[0].mean_all()).sum_all()),
+                ("softmax over axis 1", vec![vec![2, 3]], true, |v| v[0].softmax(1).mul(&v[0]).sum_all()),
+                ("transpose", vec![vec![2, 3]], true, |v| v[0].transpose(0, 1).mul(&v[0].transpose(0, 1)).sum_all()),
+                ("reshape", vec![vec![2, 3]], true, |v| v[0].reshape(&[3, 2]).mul(&v[0].reshape(&[3, 2])).sum_all()),
+                // relu's second derivative is zero a.e. and its kink is not differentiable, so first order only
+                ("relu (signed inputs, first order only)", vec![vec![2, 3]], false, |v| v[0].relu().mul(&v[0]).sum_all()),
+            ];
+            let eps = 2e-3f32;
+            let (mut worst1, mut worst2) = (0.0f32, 0.0f32);
+            let (mut at1, mut at2) = ("", "");
+            for (name, shapes, second, build) in &cases {
+                // inputs kept well away from 0 (log/sqrt/div need positive; relu needs a definite sign)
+                let signed = name.starts_with("relu");
+                let vals: Vec<Vec<f32>> = shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sh)| {
+                        (0..sh.iter().product::<usize>())
+                            .map(|j| {
+                                let u = crate::sciml::util::u01((i * 31 + j) as u32, 7);
+                                if signed { if u > 0.5 { 0.4 + u } else { -0.4 - u } } else { 0.45 + 0.9 * u }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let vs = leaves(&ctx, &vals, shapes);
+                let l = build(&vs);
+                l.backward();
+                let gb: Vec<Vec<f32>> = {
+                    let mut o = Vec::new();
+                    for v in &vs { o.push(v.grad().unwrap().to_vec().await); }
+                    o
+                };
+                let vs2 = leaves(&ctx, &vals, shapes);
+                let gf = grad(&build(&vs2), &vs2, None);
+                let mut gfv = Vec::new();
+                for g in &gf {
+                    assert_eq!(g.value().shape, vs2[gfv.len()].value().shape, "{name}: grad() returned the wrong shape");
+                    gfv.push(g.value().to_vec().await);
+                }
+                for (i, sh) in shapes.iter().enumerate() {
+                    for j in 0..sh.iter().product::<usize>() {
+                        let (mut up, mut dn) = (vals.clone(), vals.clone());
+                        up[i][j] += eps;
+                        dn[i][j] -= eps;
+                        let fd = (loss_of(&ctx, *build, &up, shapes).await - loss_of(&ctx, *build, &dn, shapes).await) / (2.0 * eps);
+                        let tol = 3e-2 * (1.0 + fd.abs());
+                        let (eb, ef) = ((fd - gb[i][j]).abs(), (fd - gfv[i][j]).abs());
+                        assert!(eb < tol, "{name}: backward d/dx[{i}][{j}] = {} but finite differences say {fd}", gb[i][j]);
+                        assert!(ef < tol, "{name}: grad() d/dx[{i}][{j}] = {} but finite differences say {fd}", gfv[i][j]);
+                        if eb.max(ef) > worst1 { worst1 = eb.max(ef); at1 = name; }
+                        if !*second { continue; }
+                        // second order: the gradient of Σ(∂L/∂x)² against finite differences of it
+                        let hu = gradsq_of(&ctx, *build, &up, shapes).await;
+                        let hd = gradsq_of(&ctx, *build, &dn, shapes).await;
+                        let fd2 = (hu - hd) / (2.0 * eps);
+                        let vs3 = leaves(&ctx, &vals, shapes);
+                        let gs = grad(&build(&vs3), &vs3, None);
+                        let mut hh = gs[0].mul(&gs[0]).sum_all();
+                        for g in &gs[1..] { hh = hh.add(&g.mul(g).sum_all()); }
+                        hh.backward();
+                        let an = vs3[i].grad().unwrap().to_vec().await[j];
+                        let tol2 = 5e-2 * (1.0 + fd2.abs());
+                        assert!((fd2 - an).abs() < tol2, "{name}: d/dx[{i}][{j}] of Σ(∂L/∂x)² = {an} but finite differences say {fd2}");
+                        if (fd2 - an).abs() > worst2 { worst2 = (fd2 - an).abs(); at2 = name; }
+                    }
+                }
+            }
+            eprintln!("  {} ops × (backward, grad(), second order): worst first-order gap {worst1:.2e} ({at1}), worst second-order gap {worst2:.2e} ({at2})", cases.len());
+        });
+    }
+
+
+    /// ⛔ **A finite-difference battery cannot see a defect in the forward pass.** It checks the derivative
+    /// of *whatever function is implemented*, so a wrong constant changes the value and its gradient
+    /// consistently and passes: mutating `mean`'s divisor to 1 (making it `sum`) left
+    /// `every_differentiable_op_matches_finite_differences_on_broadcast_shapes` green. This is the
+    /// companion that pins the forward semantics to closed forms computed here, in Rust, from the inputs.
+    #[test]
+    fn every_op_computes_the_right_forward_value() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let v: Vec<f32> = vec![0.5, 1.5, 2.0, 3.0, 0.25, 4.0];
+            let x = Var::leaf(Tensor::from_vec(&ctx, &v, &[2, 3]));
+            let close = |a: f32, b: f32, what: &str| assert!((a - b).abs() < 1e-5, "{what}: got {a}, want {b}");
+
+            let m1 = x.mean(&[1]).value().to_vec().await;
+            close(m1[0], (0.5 + 1.5 + 2.0) / 3.0, "mean over axis 1, row 0");
+            close(m1[1], (3.0 + 0.25 + 4.0) / 3.0, "mean over axis 1, row 1");
+            let m0 = x.mean(&[0]).value().to_vec().await;
+            close(m0[0], (0.5 + 3.0) / 2.0, "mean over axis 0, col 0");
+            close(x.mean_all().value().to_vec().await[0], v.iter().sum::<f32>() / 6.0, "mean_all");
+            close(x.sum_all().value().to_vec().await[0], v.iter().sum::<f32>(), "sum_all");
+            let s1 = x.sum(&[1]).value().to_vec().await;
+            close(s1[0], 0.5 + 1.5 + 2.0, "sum over axis 1, row 0");
+            assert_eq!(x.sum(&[1]).value().shape, vec![2, 1], "sum keeps the summed axis as 1");
+
+            // softmax: rows sum to 1, and the ratio of two entries is exp of their difference
+            let sm = x.softmax(1).value().to_vec().await;
+            close(sm[0] + sm[1] + sm[2], 1.0, "softmax row 0 sums to 1");
+            close(sm[3] + sm[4] + sm[5], 1.0, "softmax row 1 sums to 1");
+            close(sm[1] / sm[0], (v[1] - v[0]).exp(), "softmax ratio is exp of the difference");
+
+            // matmul against a product written out by hand
+            let b = Var::leaf(Tensor::from_vec(&ctx, &[1.0, -2.0, 0.5, 3.0, 1.0, -1.0], &[3, 2]));
+            let mm = x.matmul(&b).value().to_vec().await;
+            close(mm[0], 0.5 * 1.0 + 1.5 * 0.5 + 2.0 * 1.0, "matmul [0][0]");
+            close(mm[1], 0.5 * -2.0 + 1.5 * 3.0 + 2.0 * -1.0, "matmul [0][1]");
+            close(mm[3], 3.0 * -2.0 + 0.25 * 3.0 + 4.0 * -1.0, "matmul [1][1]");
+
+            // layout ops move elements without changing them
+            let tr = x.transpose(0, 1).value().to_vec().await;
+            assert_eq!(tr, vec![v[0], v[3], v[1], v[4], v[2], v[5]], "transpose");
+            assert_eq!(x.reshape(&[3, 2]).value().to_vec().await, v, "reshape keeps row-major order");
+
+            // broadcasting binary ops against the same arithmetic done here
+            let r = Var::leaf(Tensor::from_vec(&ctx, &[2.0, 4.0, 8.0], &[1, 3]));
+            let dv = x.div(&r).value().to_vec().await;
+            close(dv[0], v[0] / 2.0, "div broadcast [0][0]");
+            close(dv[5], v[5] / 8.0, "div broadcast [1][2]");
+            let ad = x.add(&r).value().to_vec().await;
+            close(ad[4], v[4] + 4.0, "add broadcast [1][1]");
+            let ml = x.mul(&r).value().to_vec().await;
+            close(ml[3], v[3] * 2.0, "mul broadcast [1][0]");
+            close(x.sub(&r).value().to_vec().await[2], v[2] - 8.0, "sub broadcast [0][2]");
+
+            // elementwise maps against std
+            let sg = Var::leaf(Tensor::from_vec(&ctx, &[-1.25, 0.75], &[2]));
+            for (got, want, what) in [
+                (x.exp().value().to_vec().await[0], v[0].exp(), "exp"),
+                (x.log().value().to_vec().await[1], v[1].ln(), "log"),
+                (x.sin().value().to_vec().await[2], v[2].sin(), "sin"),
+                (x.cos().value().to_vec().await[3], v[3].cos(), "cos"),
+                (x.tanh().value().to_vec().await[4], v[4].tanh(), "tanh"),
+                (x.sqrt().value().to_vec().await[5], v[5].sqrt(), "sqrt"),
+                (x.neg().value().to_vec().await[0], -v[0], "neg"),
+                (sg.relu().value().to_vec().await[0], 0.0, "relu below zero"),
+                (sg.relu().value().to_vec().await[1], 0.75, "relu above zero"),
+            ] {
+                close(got, want, what);
+            }
+            eprintln!("  forward semantics pinned for 26 op behaviours against closed forms");
+        });
+    }
+
     /// ⛔ **A batched activation against an unbatched weight** — `[B, m, k] × [k, n]`, the shape every
     /// FNO layer and every pointwise channel projection makes — used to panic in the backward pass with
     /// `permute rank mismatch`, because the VJP transposed *both* operands by the rank of the first.
