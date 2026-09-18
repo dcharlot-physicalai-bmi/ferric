@@ -1,7 +1,15 @@
 [package]
 name = "ferric-tensor"
 description = "Ferric L2 — a general N-dimensional tensor runtime on the GPU fabric: arbitrary rank, strided views, broadcasting, general reductions, batched matmul (dtypes + autograd next)."
-version.workspace = true
+# ⚠ NOT `version.workspace = true`, and only until the next workspace bump.
+#
+# 0.3.0 as published could not compile on macOS — it reached for a `wgpu-hal` accessor that exists
+# only in this repo's fork, applied through a `[patch.crates-io]` that IS NOT PUBLISHED. The fix
+# shipped as a patch release of THIS CRATE ALONE, because bumping the shared workspace version would
+# have republished all nineteen while two of them had uncommitted work in flight.
+#
+# Restore `version.workspace = true` at the next workspace bump, which must be to 0.3.2 or higher.
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
