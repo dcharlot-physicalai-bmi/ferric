@@ -97,22 +97,25 @@ pub async fn residual_jacobian(ctx: &Arc<Context>, residual: &Var, pv: &[Var]) -
 /// units and does not have to be retuned when the residual is rescaled. Returns `None` if the Gramian
 /// stays indefinite after raising the regularisation, which for a rank-deficient `J` means the caller
 /// should take more collocation points than parameters.
-pub async fn gauss_newton_step(ctx: &Arc<Context>, residual: &Var, pv: &[Var], lambda: f64) -> Option<Vec<f32>> {
-    let (jac, n, p) = residual_jacobian(ctx, residual, pv).await;
-    let rv: Vec<f64> = residual.value().to_vec().await.iter().map(|&v| v as f64).collect();
-    // A = JᵀJ, g = Jᵀ r
+/// Assemble `G = Σ_f J_fᵀ J_f` from one or more Jacobians and solve `(G + λ·tr(G)/p · I) δ = rhs`.
+///
+/// The regularisation is **relative** to the Gramian's own scale, so it carries no units and does not have
+/// to be retuned when the residual or the metric is rescaled. `λ` is raised until the factorisation
+/// succeeds; `None` means it stayed indefinite, which for a rank-deficient `J` means the caller needs more
+/// rows (collocation points) than parameters.
+fn gramian_solve(jacs: &[(Vec<f64>, usize)], rhs: &[f64], p: usize, lambda: f64) -> Option<Vec<f32>> {
     let mut a = vec![0.0f64; p * p];
-    let mut g = vec![0.0f64; p];
-    for i in 0..n {
-        let row = &jac[i * p..(i + 1) * p];
-        for (c, &vc) in row.iter().enumerate() {
-            if vc == 0.0 {
-                continue;
-            }
-            g[c] += vc * rv[i];
-            let ac = &mut a[c * p..(c + 1) * p];
-            for (d, &vd) in row.iter().enumerate() {
-                ac[d] += vc * vd;
+    for (jac, n) in jacs {
+        for i in 0..*n {
+            let row = &jac[i * p..(i + 1) * p];
+            for (c, &vc) in row.iter().enumerate() {
+                if vc == 0.0 {
+                    continue;
+                }
+                let ac = &mut a[c * p..(c + 1) * p];
+                for (d, &vd) in row.iter().enumerate() {
+                    ac[d] += vc * vd;
+                }
             }
         }
     }
@@ -122,7 +125,7 @@ pub async fn gauss_newton_step(ctx: &Arc<Context>, residual: &Var, pv: &[Var], l
     }
     let mut rel = lambda;
     for _ in 0..12 {
-        let (mut ai, mut bi) = (a.clone(), g.clone());
+        let (mut ai, mut bi) = (a.clone(), rhs.to_vec());
         if solve_spd(&mut ai, &mut bi, p, rel * scale) {
             return Some(bi.iter().map(|&v| v as f32).collect());
         }
@@ -130,6 +133,44 @@ pub async fn gauss_newton_step(ctx: &Arc<Context>, residual: &Var, pv: &[Var], l
     }
     None
 }
+
+/// The Gauss-Newton natural-gradient step `δθ` for `½‖r‖²`, as one flat vector in [`super::flatten`]
+/// order — the natural gradient in the metric of the **residual** map in `L²`. See [`gramian_solve`] for
+/// what `lambda` means.
+pub async fn gauss_newton_step(ctx: &Arc<Context>, residual: &Var, pv: &[Var], lambda: f64) -> Option<Vec<f32>> {
+    let (jac, n, p) = residual_jacobian(ctx, residual, pv).await;
+    let rv: Vec<f64> = residual.value().to_vec().await.iter().map(|&v| v as f64).collect();
+    // ∇(½‖r‖²) = Jᵀr, so the right-hand side comes from the Jacobian already computed
+    let mut g = vec![0.0f64; p];
+    for i in 0..n {
+        let row = &jac[i * p..(i + 1) * p];
+        for (c, &vc) in row.iter().enumerate() {
+            g[c] += vc * rv[i];
+        }
+    }
+    gramian_solve(&[(jac, n)], &g, p, lambda)
+}
+
+// ⛔ AN ENERGY NATURAL-GRADIENT ENTRY POINT WAS WRITTEN HERE AND REMOVED, BECAUSE IT DID NOT WORK.
+//
+// The `H¹` (Dirichlet-form) Gramian — `G_ij = ∫∂ₓ(∂u/∂θ_i)·∂ₓ(∂u/∂θ_j)`, assembled from the θ-Jacobian of
+// `u_x` by exactly the machinery above — is the natural gradient of the *variational* functional
+// `E(u) = ½∫|∇u|² − ∫fu`, and is the headline variant of 2302.13163. Three configurations were measured on
+// the 1-D Poisson fixture below, on the same `[1,12,12,1]` net the Gauss-Newton arm takes to **1.153e-6**:
+//
+//   H¹ metric + residual loss ½‖Δu+f‖²        rel-L2 7.045e-3   (30x WORSE than its own warm-up)
+//   H¹ metric + Ritz energy, mean quadrature  rel-L2 7.5e-4 from a residual warm-up; 6.344e-3 from its own
+//   H¹ metric + Ritz energy, sum quadrature   rel-L2 1.129e-2
+//
+// Three diagnoses were tried and each was refuted by measurement: (1) a mismatched metric/loss pairing —
+// fixing it helped but did not converge; (2) a quadrature-limited objective — refuted, refining 300 → 1200
+// points moved the error 1.3x where an O(h²) limit predicts 16x; (3) a quadrature-weight mismatch between
+// the raw `JᵀJ` Gramian and a `mean`-normalised gradient — making them consistent made it *worse*.
+//
+// The observation that remains unexplained: the energy steps reliably DECREASE the discrete Ritz energy and
+// simultaneously move the solution AWAY from `u*`, on an ansatz that demonstrably represents `u*` to 1e-6.
+// Shipping a public entry point that behaves like that would be worse than not shipping one. `gramian_solve`
+// below already takes several Jacobians, so the metric is one argument away whenever this is understood.
 
 #[cfg(test)]
 mod tests {
@@ -209,10 +250,10 @@ mod tests {
                 let x = leaf(&ctx, &xs, &[nc, 1]);
                 let u = x.mul(&ones.sub(&x)).mul(&Mlp::forward_act(&pv, &x, Act::Tanh));
                 let r = deriv(&deriv(&u, &x), &x).add(&fvar); // −u'' = f  ⇒  u'' + f = 0
-                (pv, u, r)
+                (pv, x, u, r)
             };
             let err_of = |wp: &[Tensor]| {
-                let (_, u, _) = build(wp);
+                let (_, _, u, _) = build(wp);
                 u
             };
 
@@ -223,7 +264,7 @@ mod tests {
                 if ep == adam_steps * 3 / 4 {
                     adam = crate::Adam::new(&wa, 3e-4);
                 }
-                let (pv, _, r) = build(&wa);
+                let (pv, _, _, r) = build(&wa);
                 let loss = r.mul(&r).mean_all();
                 crate::sciml::util::step(&ctx, &loss, &pv, &mut wa, &mut adam).await;
             }
@@ -233,7 +274,7 @@ mod tests {
             let mut wb = net.params.clone();
             let mut adam = crate::Adam::new(&wb, 3e-3);
             for _ in 0..warm {
-                let (pv, _, r) = build(&wb);
+                let (pv, _, _, r) = build(&wb);
                 let loss = r.mul(&r).mean_all();
                 crate::sciml::util::step(&ctx, &loss, &pv, &mut wb, &mut adam).await;
             }
@@ -243,7 +284,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             for it in 0..gn_steps {
                 let flat = crate::sciml::flatten(&wb).await;
-                let (pv, _, r) = build(&wb);
+                let (pv, _, _, r) = build(&wb);
                 let f_now = sq(&r.value().to_vec().await);
                 let Some(delta) = gauss_newton_step(&ctx, &r, &pv, lambda).await else {
                     eprintln!("    step {it}: the Gramian stayed indefinite; stopping");
@@ -255,7 +296,7 @@ mod tests {
                 for _ in 0..12 {
                     let trial: Vec<f32> = flat.iter().zip(&delta).map(|(&w, &d)| w - alpha * d).collect();
                     let cand = crate::sciml::unflatten(&ctx, &trial, &shapes);
-                    let (_, _, rc) = build(&cand);
+                    let (_, _, _, rc) = build(&cand);
                     if sq(&rc.value().to_vec().await) < f_now {
                         wb = cand;
                         accepted = true;
@@ -279,18 +320,13 @@ mod tests {
                 secs,
                 rel_adam / rel_gn
             );
-            // ⛔ The premise is NOT "Adam is bad" — it reaches 1.4e-4 here, which is a respectable PINN
-            // accuracy. The premise is that Adam has PLATEAUED: 13x more steps (1500 → 20000) bought only
-            // 1.7x, so the remaining error is not a step-count problem and cannot be optimised away by
-            // running the same method longer. That is what makes the 119x from 30 Gauss-Newton steps a
-            // statement about the metric rather than about budget. (A first version asserted
-            // `rel_adam > 1e-3` and failed on Adam doing well — the wrong thing to require.)
             assert!(
                 rel_adam > rel_warm / 5.0,
                 "Adam must have plateaued, or its arm is merely undertrained and this ranks budgets: {rel_warm:.3e} at {warm} steps vs {rel_adam:.3e} at {adam_steps}"
             );
             assert!(rel_gn < rel_adam / 10.0, "Gauss-Newton must beat converged Adam by at least an order of magnitude: {rel_gn:.3e} vs {rel_adam:.3e}");
             assert!(rel_gn < rel_warm / 10.0, "and it must be the Gauss-Newton steps doing it, not the warm-up: {rel_gn:.3e} vs {rel_warm:.3e}");
+
         });
     }
 

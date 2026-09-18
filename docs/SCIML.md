@@ -437,8 +437,8 @@ direction in the metric induced by the residual map is the Gauss-Newton step `δ
 Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent* (2302.13163).
 
 ⚠ **Named precisely.** This is the **Gauss-Newton** natural gradient — the Gramian of the *residual* map in
-`L²`. The paper's headline variant uses the PDE's **energy** (`H¹`-type) inner product, a different Gramian;
-that is the follow-on, not this. Both are natural gradients, in different metrics.
+`L²`. The paper's headline variant uses the PDE's **energy** (`H¹`-type) inner product, a different Gramian.
+⛔ **That variant was attempted and is not shipped** — see below.
 
 1-D Poisson `−u'' = f`, `u* = sin(πx) + ½sin(3πx)`, boundary conditions hard-constrained by `x(1−x)` so both
 arms optimise exactly the same objective on the same `[1,12,12,1]` tanh net (193 parameters) and the same
@@ -461,6 +461,26 @@ backward passes over a graph that already contains the residual's own second der
 about 4 s per step. It pays only because the step count collapses from tens of thousands to tens. `J` must
 also have at least as many rows as parameters or the Gramian is singular; the Tikhonov term is **relative**
 (`λ·tr(JᵀJ)/p`), so it carries no units and survives a rescaling of the residual.
+
+⛔ **The energy variant was built, measured three ways, and removed.** The `H¹` Gramian
+`G_ij = ∫∂ₓ(∂u/∂θ_i)·∂ₓ(∂u/∂θ_j)` assembles from the θ-Jacobian of `u_x` with exactly the machinery above,
+and is the natural gradient of the variational functional `E(u) = ½∫|∇u|² − ∫fu`. On the same net the
+Gauss-Newton arm takes to **1.153e-6**:
+
+| configuration | rel-L2 |
+|---|---|
+| `H¹` metric + residual loss `½‖Δu+f‖²` | 7.045e-3 — 30× *worse* than its own warm-up |
+| `H¹` metric + Ritz energy, mean quadrature | 7.5e-4 from a residual warm-up; 6.344e-3 from its own |
+| `H¹` metric + Ritz energy, sum quadrature | 1.129e-2 |
+
+Three diagnoses were tried and **measurement refuted each**: a mismatched metric/loss pairing (fixing it
+helped, did not converge); a quadrature-limited objective (refuted — refining 300 → 1200 points moved the
+error 1.3×, where an `O(h²)` limit predicts 16×); and a quadrature-weight mismatch between the raw `JᵀJ`
+Gramian and a `mean`-normalised gradient (making them consistent made it *worse*). What remains unexplained
+is that the energy steps reliably **decrease** the discrete Ritz energy while moving the solution **away**
+from `u*`, on an ansatz that demonstrably represents `u*` to 1e-6. The public entry point was deleted rather
+than shipped with that behaviour; `gramian_solve` already accepts several Jacobians, so the metric is one
+argument away whenever this is understood. This remains an open gap, not a completed feature.
 
 Both primitives are checked against something that shares nothing with them: the `f64` Cholesky against a
 system whose answer is known by construction *and* against its own residual recomputed from a kept copy of
@@ -496,8 +516,8 @@ plausible-looking step that descends the wrong direction, and nothing downstream
   needs the external-meter / Jetson path (see `FABRIC.md`). Not fabricated.
 - **Remaining:** an FFT primitive (the separable plan took the 2-D transform from `n⁴` to `2n³`; an FFT
   would take it to `n² log n`, and needs a butterfly built from gather/scatter, neither of which carries a
-  differentiable VJP here), the **energy** natural gradient (the `H¹` Gramian, against the `L²` residual one
-  shipped here), and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
+  differentiable VJP here), the **energy** natural gradient (attempted, three configurations measured, none
+  convergent — see above), and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
   wasm32-unknown-unknown` is **clean**, so nothing in the tensor crate — `sciml` included — is host-only at
   the type level. That is a compile, not a run: it says nothing about whether the WebGPU compute path, the
   tape, or second-order `grad()` behave in a browser, and in-browser *training* remains unproven and still
