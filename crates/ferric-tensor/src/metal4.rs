@@ -218,9 +218,32 @@ fn tensor_desc(dt: MTLTensorDataType, dims: &[isize], strides: &[isize], mode: M
 
 /// The raw `MTLBuffer` behind a wgpu buffer (Metal backend only) — the interop handle that lets the
 /// tensor units read/write wgpu-resident data with no host copy. Caller owns queue synchronization.
+///
+/// # Returns `None` without the `metal4-interop` feature, and that is deliberate
+///
+/// Reaching the `MTLBuffer` needs `wgpu_hal::metal::Buffer::raw_handle`, which stock `wgpu-hal` does
+/// not expose — the field is private and there is no accessor. This repo carries a two-line fork that
+/// adds one, applied through `[patch.crates-io]`, and **a `[patch]` section is not published**: a
+/// crate uploaded to crates.io resolves stock `wgpu-hal` and fails to compile. That is not
+/// hypothetical; `ferric-tensor` 0.3.0 shipped in exactly that state and cannot build on macOS for
+/// anyone who installs it.
+///
+/// So the default build asks stock `wgpu` for nothing it does not offer, and returns `None` here.
+/// Every in-library caller already propagates that with `?` into the WGSL fallback, so the result is
+/// a slower correct path rather than a compile error. Enable `metal4-interop` where the patched hal
+/// is present and the accelerated path returns.
+#[cfg(feature = "metal4-interop")]
 pub fn wgpu_buffer_raw(buf: &wgpu::Buffer) -> Option<Obj<dyn MTLBuffer>> {
     let hal = unsafe { buf.as_hal::<wgpu::hal::api::Metal>() }?;
     Some(hal.raw_handle().clone())
+}
+
+/// The stock-dependency form: no accessor exists, so there is no handle to return.
+///
+/// See the enabled form above for why this is a `None` and not a compile error.
+#[cfg(not(feature = "metal4-interop"))]
+pub fn wgpu_buffer_raw(_buf: &wgpu::Buffer) -> Option<Obj<dyn MTLBuffer>> {
+    None
 }
 
 impl Metal4Gemm {
@@ -1138,6 +1161,11 @@ mod tests {
     /// The interop proof for the resident path: MTLTensor views created directly on **wgpu-created**
     /// buffers (via `as_hal`), dispatched on a Metal-4 queue built from **wgpu's own MTLDevice**, with
     /// the result read back through wgpu — no host copy of the operands anywhere.
+    // Exercises the wgpu<->Metal interop itself, so it needs the accessor the stock `wgpu-hal`
+    // does not expose. Without the feature `wgpu_buffer_raw` correctly returns `None` and this test
+    // would `expect` on it; the library path it guards degrades to WGSL instead, which is what the
+    // default build is for.
+    #[cfg(feature = "metal4-interop")]
     #[test]
     fn tensor_views_on_wgpu_buffers_feed_the_tensor_units_directly() {
         use std::sync::Arc;

@@ -10,6 +10,28 @@ homepage.workspace = true
 keywords = ["tensor", "gpu", "webgpu", "ndarray", "ai"]
 categories = ["science", "mathematics"]
 
+# ⛔ `metal4-interop` IS OFF BY DEFAULT AND MUST STAY OFF, and the reason is a publishing defect
+# this crate shipped once already.
+#
+# The Metal-4 tensor-unit path needs the `MTLBuffer` behind a wgpu buffer. Stock `wgpu-hal` keeps
+# that field private and exposes no accessor, so this repo carries a two-line fork in `forks/` that
+# adds `Buffer::raw_handle`, applied through `[patch.crates-io]` in the workspace manifest.
+#
+# **`[patch]` SECTIONS ARE NOT PUBLISHED.** A crate uploaded to crates.io resolves STOCK `wgpu-hal`,
+# where `raw_handle` does not exist — so `ferric-tensor` 0.3.0 as published cannot compile on macOS
+# for anybody, while building perfectly in this repo. The fork that makes local development pleasant
+# is exactly what hides the breakage from everyone who has it.
+#
+# So the default build uses only stock, current dependencies and the interop returns `None`, which
+# every in-library caller already handles by falling back to WGSL. Turn the feature on when you have
+# the patched hal (that is: in this repo), and the accelerated path returns.
+#
+# The real fix is upstream: `raw_handle` is a read-only accessor on an already-`unsafe` API surface,
+# and wgpu should expose it. Until it does, this line is the honest position.
+[features]
+default = []
+metal4-interop = []
+
 [dependencies]
 ferric-core = { path = "../ferric-core", version = "0.3" }
 wgpu = "30.0.0"
