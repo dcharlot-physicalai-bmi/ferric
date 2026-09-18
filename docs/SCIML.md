@@ -429,6 +429,45 @@ recorded in the test: `sin(mπ·)` up to `m = 5` stalled at 0.185 because the 1-
 *identically* 0.0990, because the `q = 0` term carried nearly all the energy and the sweep measured nothing.
 What survives is the monotone dependence on rank, and the claim is kept to that.
 
+## Natural gradients — `sciml::natgrad`
+
+Adam and L-BFGS descend in the *parameter* metric. For a least-squares PINN loss `½‖r(θ)‖²` the natural
+direction in the metric induced by the residual map is the Gauss-Newton step `δθ = (JᵀJ)⁺Jᵀr`, with
+`J = ∂r/∂θ` at the collocation points. This is the mechanism behind the accuracy gap reported by Müller &
+Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent* (2302.13163).
+
+⚠ **Named precisely.** This is the **Gauss-Newton** natural gradient — the Gramian of the *residual* map in
+`L²`. The paper's headline variant uses the PDE's **energy** (`H¹`-type) inner product, a different Gramian;
+that is the follow-on, not this. Both are natural gradients, in different metrics.
+
+1-D Poisson `−u'' = f`, `u* = sin(πx) + ½sin(3πx)`, boundary conditions hard-constrained by `x(1−x)` so both
+arms optimise exactly the same objective on the same `[1,12,12,1]` tanh net (193 parameters) and the same
+300 collocation points. The only difference is the metric the step is taken in:
+
+| arm | rel-L2 vs the exact solution |
+|---|---|
+| Adam, 20,000 steps | 1.376e-4 |
+| Adam, 1,500 steps | 2.339e-4 |
+| + **30 Gauss-Newton steps** (118 s) | **1.153e-6** — 119× better |
+
+⛔ **The premise is not "Adam is bad".** 1.4e-4 is a respectable PINN accuracy. The premise is that Adam has
+**plateaued**: 13× more steps (1,500 → 20,000) bought 1.7×, so the remaining error is not a step-count
+problem and cannot be optimised away by running the same method longer. That is what makes 119× from 30
+Gauss-Newton steps a statement about the metric rather than about budget, and it is what the fixture asserts.
+A first version asserted `rel_adam > 1e-3` and failed *because Adam did well* — the wrong thing to require.
+
+**The cost is real and structural.** Reverse mode yields one *row* of `J` per pass, so a step costs `N`
+backward passes over a graph that already contains the residual's own second derivatives — 300 passes here,
+about 4 s per step. It pays only because the step count collapses from tens of thousands to tens. `J` must
+also have at least as many rows as parameters or the Gramian is singular; the Tikhonov term is **relative**
+(`λ·tr(JᵀJ)/p`), so it carries no units and survives a rescaling of the residual.
+
+Both primitives are checked against something that shares nothing with them: the `f64` Cholesky against a
+system whose answer is known by construction *and* against its own residual recomputed from a kept copy of
+the matrix (1.4e-16 / 4.4e-16; an indefinite matrix is refused, not silently mis-solved), and the residual
+Jacobian against central differences in **every** parameter (worst 1.9e-4) — a wrong `J` is a
+plausible-looking step that descends the wrong direction, and nothing downstream would say so.
+
 ## Design notes
 
 - **PINN loss = physics, no data.** Minimize the PDE residual at collocation points plus the boundary/initial
@@ -457,8 +496,8 @@ What survives is the monotone dependence on rank, and the claim is kept to that.
   needs the external-meter / Jetson path (see `FABRIC.md`). Not fabricated.
 - **Remaining:** an FFT primitive (the separable plan took the 2-D transform from `n⁴` to `2n³`; an FFT
   would take it to `n² log n`, and needs a butterfly built from gather/scatter, neither of which carries a
-  differentiable VJP here), a separable PINN (SPINN) for
-  higher dimensions, and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
+  differentiable VJP here), the **energy** natural gradient (the `H¹` Gramian, against the `L²` residual one
+  shipped here), and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
   wasm32-unknown-unknown` is **clean**, so nothing in the tensor crate — `sciml` included — is host-only at
   the type level. That is a compile, not a run: it says nothing about whether the WebGPU compute path, the
   tape, or second-order `grad()` behave in a browser, and in-browser *training* remains unproven and still

@@ -17,6 +17,7 @@ pub mod fno;
 pub mod geometry;
 pub mod harness;
 pub mod lbfgs;
+pub mod natgrad;
 pub mod ntk;
 pub mod operators;
 pub mod spinn;
