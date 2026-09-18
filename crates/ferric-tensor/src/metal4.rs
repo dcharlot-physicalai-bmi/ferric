@@ -1065,14 +1065,31 @@ kernel void conv(tensor<device half,  dextents<int32_t, 4>> A,
 /// first use (one per process); guarded by raw-device identity so a second `Context` on a different
 /// device falls back to the portable path instead of crossing Metal devices.
 pub fn resident_for(ctx: &ferric_core::Context) -> Option<&'static Metal4Gemm> {
-    use std::sync::OnceLock;
-    static DEV: OnceLock<Option<Metal4Gemm>> = OnceLock::new();
-    let raw = {
-        let hal = unsafe { ctx.device.as_hal::<wgpu::hal::api::Metal>() }?;
-        Retained::as_ptr(hal.raw_device()) as usize
-    };
-    let g = DEV.get_or_init(|| Metal4Gemm::for_wgpu(&ctx.device)).as_ref()?;
-    (Retained::as_ptr(&g.device) as usize == raw).then_some(g)
+    // ⛔ Without `metal4-interop` there is no `raw_handle` accessor, so `wgpu_buffer_raw` returns
+    // `None` and EVERY resident dispatch fails — yet this function used to hand back a device
+    // anyway. Four tests guard themselves with `let Some(g) = resident_for(..) else { skip }`, so
+    // that guard could never fire: instead of skipping they ran and panicked at "resident dispatch".
+    // Main went red the moment `[patch.crates-io]` was removed so the crate could publish — which is
+    // precisely the configuration this `None` is documented to describe (see `wgpu_buffer_raw`).
+    //
+    // Reporting the capability the SAME way the accessor reports it makes every existing skip guard
+    // in this file correct, with no test changed and no behaviour altered where the feature is on.
+    #[cfg(not(feature = "metal4-interop"))]
+    {
+        let _ = ctx;
+        None
+    }
+    #[cfg(feature = "metal4-interop")]
+    {
+        use std::sync::OnceLock;
+        static DEV: OnceLock<Option<Metal4Gemm>> = OnceLock::new();
+        let raw = {
+            let hal = unsafe { ctx.device.as_hal::<wgpu::hal::api::Metal>() }?;
+            Retained::as_ptr(hal.raw_device()) as usize
+        };
+        let g = DEV.get_or_init(|| Metal4Gemm::for_wgpu(&ctx.device)).as_ref()?;
+        (Retained::as_ptr(&g.device) as usize == raw).then_some(g)
+    }
 }
 
 /// Whether the resident fast path would fire for a workload of `flops` on this context — the

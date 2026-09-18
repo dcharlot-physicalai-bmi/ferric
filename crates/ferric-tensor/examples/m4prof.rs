@@ -16,6 +16,16 @@ mod macos_only {
     use std::time::Instant;
 
     pub fn main() {
+        // This profile measures the wgpu<->Metal interop, which needs the `raw_handle` accessor that
+        // stock `wgpu-hal` does not expose; see `ferric_tensor::metal4::wgpu_buffer_raw`. Without the
+        // feature there is nothing here to time, and saying so beats unwrapping a `None`.
+        #[cfg(not(feature = "metal4-interop"))]
+        {
+            eprintln!("m4prof needs --features metal4-interop (and the patched wgpu-hal in forks/)");
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
         let ctx = Arc::new(pollster::block_on(Context::new()).unwrap());
         let g = metal4::resident_for(&ctx).expect("metal4");
         let nn = 1024usize;
@@ -76,24 +86,14 @@ mod macos_only {
             let _ = metal4::wgpu_buffer_raw(t2.buffer()).unwrap();
             let _ = metal4::wgpu_buffer_raw(t3.buffer()).unwrap();
         });
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 fn main() { macos_only::main() }
-    // This profile measures the wgpu<->Metal interop, which needs the `raw_handle` accessor that
-    // stock `wgpu-hal` does not expose; see `ferric_tensor::metal4::wgpu_buffer_raw`. Without the
-    // feature there is nothing here to time, and saying so beats unwrapping a `None`.
-    #[cfg(not(feature = "metal4-interop"))]
-    {
-        eprintln!("m4prof needs --features metal4-interop (and the patched wgpu-hal in forks/)");
-        return;
-    }
-    #[cfg(feature = "metal4-interop")]
-    {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!("m4prof: nothing to run -- it profiles the Metal 4 tensor-unit GEMM backend, which exists only on macOS.");
-    }
 }

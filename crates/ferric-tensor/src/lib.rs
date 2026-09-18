@@ -4459,7 +4459,8 @@ mod mrope_tests {
         let got_s = pollster::block_on(xt.rope_mrope(nh, dh, base, &small, sections, true).to_vec());
         let want_s = mrope_ref(&x, nh, dh, base as f64, &small, sections, true);
         let worst_s = got_s.iter().zip(&want_s).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
-        assert!(worst_s < 2e-6, "mrope vs reference @pos<5: max |Δ| = {worst_s:.3e} (should be ~1e-7)");
+        assert!(worst_s < 1e-5, "mrope vs reference @pos<5: max |Δ| = {worst_s:.3e} (~1e-7 on an M5 Max; \
+                 the bound allows the per-adapter f32 floor, which CI measured at 2.2e-6 elsewhere)");
         assert!(worst_s * 10.0 < worst, "the pos~1000 residual must be dominated by angle magnitude: \
                  {worst_s:.3e} at small positions vs {worst:.3e} at ~1000");
 
@@ -4510,7 +4511,15 @@ mod mrope_tests {
         let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
         let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, true);
         let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
-        assert!(worst < 2e-6, "interleaved mrope with distinct h/w vs reference: max |Δ| = {worst:.3e}");
+        // ⚠ THE BOUND IS SET BY f32 ACROSS ADAPTERS, NOT BY THE RULE — and it was set wrong once.
+        // 2e-6 passed on an Apple M5 Max and FAILED CI at **2.205e-6** on the "Apple Paravirtual
+        // device" runner: same code, same f64 reference, a different f32 sin/cos. That is the
+        // per-adapter boundary this project already documents, arriving in a tolerance.
+        // The bound is chosen to sit between two measured quantities, not nudged until green:
+        //   f32 floor across adapters   ~2.2e-6   (observed)
+        //   the signal it must not mask  >1e-3    (the h/w swap, asserted below)
+        // 1e-5 is ~5x the floor and ~100x below the signal, so a real h/w confusion cannot hide here.
+        assert!(worst < 1e-5, "interleaved mrope with distinct h/w vs reference: max |Δ| = {worst:.3e}");
 
         // ⚠ And prove the positions actually reach different dimensions: swapping h with w in the
         // INPUT must change the output. If it does not, the kernel is ignoring one of them and the
@@ -4542,7 +4551,9 @@ mod mrope_tests {
         let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, false).to_vec());
         let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, false);
         let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
-        assert!(worst < 2e-5, "chunked mrope vs reference: max |Δ| = {worst:.3e}");
+        // Same reasoning as the interleaved test: an f32 floor that differs per adapter, kept far
+        // below the >1e-3 chunked-vs-interleaved signal asserted immediately after.
+        assert!(worst < 1e-5, "chunked mrope vs reference: max |Δ| = {worst:.3e}");
 
         // ⚠ The control: with distinct t/h/w this must NOT equal the interleaved rule, or the
         // `imrope` flag would be decorative and both Qwen2-VL and Qwen3-VL would silently share one path.
