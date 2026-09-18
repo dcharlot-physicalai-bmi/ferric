@@ -967,7 +967,8 @@ impl Qwen3 {
             let mut pos = Vec::with_capacity(t * 4);
             for _ in 0..3 { pos.extend((0..t).map(|i| (offset + i) as u32)); }
             pos.extend(std::iter::repeat_n(0u32, t));
-            return x.rope_mrope(n_heads, self.cfg.head_dim, base, &pos, sections, interleaved);
+            let mode = if interleaved { ferric_tensor::MropeMode::Interleaved } else { ferric_tensor::MropeMode::Chunked };
+            return x.rope_mrope(n_heads, self.cfg.head_dim, base, &pos, sections, mode);
         }
         match &self.rope_freqs {
             // The scaled path must honour the pairing too. It did not: `rope_interleaved` was

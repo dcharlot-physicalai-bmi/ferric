@@ -486,7 +486,7 @@ impl Tensor {
     /// The gap is ~4e-4 rad at position 1000. Ferric follows llama.cpp because every other port here
     /// is checked against llama.cpp; the choice is the point, not the default.
     pub fn rope_mrope(
-        &self, n_heads: usize, head_dim: usize, base: f32, pos: &[u32], sections: [u32; 4], imrope: bool,
+        &self, n_heads: usize, head_dim: usize, base: f32, pos: &[u32], sections: [u32; 4], mode: MropeMode,
     ) -> Tensor {
         let owned;
         let c = if self.rank() == 2 && self.strides[1] == 1 { self } else { owned = self.contiguous(); &owned };
@@ -496,7 +496,7 @@ impl Tensor {
         let out = empty(&self.ctx, c.numel());
         let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
         let mut info = vec![t as u32, n_heads as u32, head_dim as u32, base.to_bits(),
-                            u32::from(imrope), c.offset as u32, srs as u32, head_dim as u32];
+                            mode as u32, c.offset as u32, srs as u32, head_dim as u32];
         info.extend_from_slice(&sections);
         info.extend_from_slice(pos);
         run(&self.ctx, ROPE_MROPE_WGSL, "rope_mrope",
@@ -2463,6 +2463,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Which sector rule a multimodal RoPE follows. These are ggml's three `GGML_ROPE_TYPE_*` variants
+/// that take four positions per token, kept as one enum because a bool cannot express three cases and
+/// the third is the one a vision tower needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MropeMode {
+    /// `MROPE` (8) — contiguous chunks `[tttt…yy…xx…]`. Qwen2-VL's text model.
+    Chunked = 0,
+    /// `IMROPE` (40) — interleaved `[ttyxttyx…]`. Qwen3-VL / Qwen3.5 text.
+    Interleaved = 1,
+    /// `VISION` (24) — contiguous chunks **and** `indep_sects`: each component's frequency ladder
+    /// RESTARTS at its section boundary. Qwen2-VL and Qwen3-VL vision towers, where the two axes
+    /// must each span the full frequency range rather than share one ladder.
+    Vision = 2,
+}
+
 /// **Multimodal RoPE (ggml `MROPE` / `IMROPE`)** — the position a dimension rotates by depends on
 /// which *section* it lands in, so one token can carry a time, a height and a width at once.
 ///
@@ -2478,13 +2494,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const ROPE_MROPE_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x: array<f32>;
 @group(0) @binding(1) var<storage,read_write>  out: array<f32>;
-// info: t, h, dh, bitcast(base), imrope, src_off, src_row_stride, n_rot,
+// info: t, h, dh, bitcast(base), mode, src_off, src_row_stride, n_rot,
 //       s0, s1, s2, s3, then 4*t positions (section-major: t, h, w, e)
 @group(0) @binding(2) var<storage,read>        info: array<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = info[0]; let h = info[1]; let dh = info[2]; let base = bitcast<f32>(info[3]);
-    let imrope = info[4];
+    let mode = info[4];   // 0 = chunked MROPE, 1 = interleaved IMROPE, 2 = VISION
     let id = gid.x; if (id >= t * h) { return; }
     let i = id / h; let head = id % h;
     let n_rot = info[7]; let half = n_rot / 2u;
@@ -2495,22 +2511,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ib = info[5] + i * info[6] + head * dh;
     let lb = log(base);
     for (var c: u32 = 0u; c < half; c = c + 1u) {
-        let inv = exp(-2.0 * f32(c) / f32(n_rot) * lb);
         // Which position component does this sector rotate by?
         let sector = c % sect_dims;
+        let sec_w = s0 + s1;
+        let sec_e = sec_w + s2;
         var comp: u32 = 3u;                       // default = e, the 4th component
-        if (imrope == 1u) {
-            if      (sector % 3u == 1u && sector < 3u * s1) { comp = 1u; }
-            else if (sector % 3u == 2u && sector < 3u * s2) { comp = 2u; }
-            else if (sector % 3u == 0u && sector < 3u * s0) { comp = 0u; }
-        } else {
-            let sec_w = s0 + s1;
-            if      (sector < s0)                       { comp = 0u; }
-            else if (sector < sec_w)                    { comp = 1u; }
-            else if (sector < sec_w + s2)               { comp = 2u; }
+        var start: u32 = sec_e;                   // where this component's section begins
+        if (mode == 1u) {                         // IMROPE — interleaved (qwen3vl text)
+            if      (sector % 3u == 1u && sector < 3u * s1) { comp = 1u; start = s0; }
+            else if (sector % 3u == 2u && sector < 3u * s2) { comp = 2u; start = sec_w; }
+            else if (sector % 3u == 0u && sector < 3u * s0) { comp = 0u; start = 0u; }
+        } else {                                  // MROPE / VISION — contiguous chunks
+            if      (sector < s0)    { comp = 0u; start = 0u; }
+            else if (sector < sec_w) { comp = 1u; start = s0; }
+            else if (sector < sec_e) { comp = 2u; start = sec_w; }
         }
+        // ⛔ VISION resets each component's frequency ladder at its section start (ggml's
+        // `indep_sects`), so the exponent counts from the SECTION, not from dim 0. Without this a
+        // vision tower's two axes share one ladder and every patch lands at the wrong angle.
+        var e: u32 = c;
+        if (mode == 2u) { e = c - start; }
+        let inv2 = exp(-2.0 * f32(e) / f32(n_rot) * lb);
         let pos = info[pbase + comp * t + i];
-        let ang = f32(pos) * inv; let cs = cos(ang); let sn = sin(ang);
+        let ang = f32(pos) * inv2; let cs = cos(ang); let sn = sin(ang);
         // NEOX pairing: ggml applies MROPE and IMROPE with the split-half partner layout.
         let p0 = c; let p1 = c + half;
         let x1 = x[ib + p0]; let x2 = x[ib + p1];
@@ -4368,7 +4391,7 @@ mod mrope_tests {
     /// (`ggml/src/ggml-cpu/ops.cpp`) rather than from the WGSL kernel, so the two share no code and a
     /// mistake in either shows up as a disagreement. f64 throughout: the GPU runs f32, and a reference
     /// that carries the same rounding cannot expose a wrong angle.
-    fn mrope_ref(x: &[f32], n_heads: usize, dh: usize, base: f64, pos: &[u32], s: [u32; 4], imrope: bool) -> Vec<f32> {
+    fn mrope_ref(x: &[f32], n_heads: usize, dh: usize, base: f64, pos: &[u32], s: [u32; 4], mode: MropeMode) -> Vec<f32> {
         let t = x.len() / (n_heads * dh);
         let half = dh / 2;
         let sect_dims: u32 = s.iter().sum();
@@ -4378,18 +4401,22 @@ mod mrope_tests {
                 let b = (i * n_heads + hd) * dh;
                 for c in 0..half {
                     let sector = (c as u32) % sect_dims;
-                    let comp = if imrope {
-                        if sector % 3 == 1 && sector < 3 * s[1] { 1 }
-                        else if sector % 3 == 2 && sector < 3 * s[2] { 2 }
-                        else if sector % 3 == 0 && sector < 3 * s[0] { 0 }
-                        else { 3 }
-                    } else {
-                        let sec_w = s[0] + s[1];
-                        if sector < s[0] { 0 } else if sector < sec_w { 1 }
-                        else if sector < sec_w + s[2] { 2 } else { 3 }
-                    };
+                    let sec_w = s[0] + s[1];
+                    let sec_e = sec_w + s[2];
+                    // (component, where its section starts) — the start is what `indep_sects` resets to.
+                    let (comp, start) = if mode == MropeMode::Interleaved {
+                        if sector % 3 == 1 && sector < 3 * s[1] { (1usize, s[0]) }
+                        else if sector % 3 == 2 && sector < 3 * s[2] { (2, sec_w) }
+                        else if sector % 3 == 0 && sector < 3 * s[0] { (0, 0) }
+                        else { (3, sec_e) }
+                    } else if sector < s[0] { (0, 0) }
+                    else if sector < sec_w { (1, s[0]) }
+                    else if sector < sec_e { (2, sec_w) }
+                    else { (3, sec_e) };
                     let p = pos[comp * t + i] as f64;
-                    let inv = base.powf(-2.0 * c as f64 / dh as f64);
+                    // VISION restarts each component's ladder at its section boundary.
+                    let e = if mode == MropeMode::Vision { c as u32 - start } else { c as u32 };
+                    let inv = base.powf(-2.0 * e as f64 / dh as f64);
                     let (cs, sn) = ((p * inv).cos(), (p * inv).sin());
                     let (x1, x2) = (x[b + c] as f64, x[b + c + half] as f64);
                     out[b + c] = (x1 * cs - x2 * sn) as f32;
@@ -4437,9 +4464,9 @@ mod mrope_tests {
         for _ in 0..3 { pos.extend((0..t).map(|i| (start + i) as u32)); }
         pos.extend(std::iter::repeat_n(0u32, t));
 
-        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Interleaved).to_vec());
         let plain = pollster::block_on(xt.rope(nh, dh, base, start).to_vec());
-        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, true);
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, MropeMode::Interleaved);
 
         // 1) agrees with the independent CPU reference everywhere.
         // ⚠ The tolerance is set by f32 ARGUMENT REDUCTION, not by the rule. At position 1000 the
@@ -4456,8 +4483,8 @@ mod mrope_tests {
         let mut small = Vec::with_capacity(t * 4);
         for _ in 0..3 { small.extend((0..t).map(|i| i as u32)); }
         small.extend(std::iter::repeat_n(0u32, t));
-        let got_s = pollster::block_on(xt.rope_mrope(nh, dh, base, &small, sections, true).to_vec());
-        let want_s = mrope_ref(&x, nh, dh, base as f64, &small, sections, true);
+        let got_s = pollster::block_on(xt.rope_mrope(nh, dh, base, &small, sections, MropeMode::Interleaved).to_vec());
+        let want_s = mrope_ref(&x, nh, dh, base as f64, &small, sections, MropeMode::Interleaved);
         let worst_s = got_s.iter().zip(&want_s).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
         assert!(worst_s < 1e-5, "mrope vs reference @pos<5: max |Δ| = {worst_s:.3e} (~1e-7 on an M5 Max; \
                  the bound allows the per-adapter f32 floor, which CI measured at 2.2e-6 elsewhere)");
@@ -4508,8 +4535,8 @@ mod mrope_tests {
         pos.extend((0..t).map(|i| 11 + i as u32));      // h  — distinct from w
         pos.extend((0..t).map(|i| 29 + i as u32));      // w
         pos.extend(std::iter::repeat_n(0u32, t));       // e
-        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
-        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, true);
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Interleaved).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, MropeMode::Interleaved);
         let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
         // ⚠ THE BOUND IS SET BY f32 ACROSS ADAPTERS, NOT BY THE RULE — and it was set wrong once.
         // 2e-6 passed on an Apple M5 Max and FAILED CI at **2.205e-6** on the "Apple Paravirtual
@@ -4526,9 +4553,61 @@ mod mrope_tests {
         // comparison above would be satisfied by a reference making the same mistake.
         let mut swapped = pos.clone();
         for i in 0..t { swapped.swap(t + i, 2 * t + i); }
-        let other = pollster::block_on(xt.rope_mrope(nh, dh, base, &swapped, sections, true).to_vec());
+        let other = pollster::block_on(xt.rope_mrope(nh, dh, base, &swapped, sections, MropeMode::Interleaved).to_vec());
         let d = got.iter().zip(&other).fold(0f32, |a, (&g, &o)| a.max((g - o).abs()));
         assert!(d > 1e-3, "h and w must land on different dimensions (swap changed output by {d:.3e})");
+    }
+
+    /// **VISION mode** — the vision tower's 2-D rope, which `Chunked` cannot stand in for.
+    ///
+    /// Qwen3-VL's tower calls `ggml_rope_multi(..., d_head/2, {18,18,18,18}, GGML_ROPE_TYPE_VISION,
+    /// …, freq_base 10000, …)` with `d_head = 72`. VISION sets ggml's `indep_sects`: each component's
+    /// frequency ladder **restarts at its section boundary**, so sectors 0..17 carry the row position
+    /// over the full 18-step ladder and sectors 18..35 carry the column over its own full ladder.
+    /// Without the reset the two axes share one ladder and every patch lands at the wrong angle —
+    /// a model that loads, runs, and describes the wrong part of the picture.
+    ///
+    /// The spec trail says this one is HF-exact (`Qwen3VLVisionRotaryEmbedding(36)` → 18 inverse
+    /// frequencies over base 10000, `[h·invf ‖ w·invf]`), so unlike the text path there is no
+    /// reference disagreement to choose between here.
+    #[test]
+    fn vision_mrope_restarts_each_sections_frequency_ladder() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return };
+        let ctx = std::sync::Arc::new(ctx);
+        let (dh, nh, t) = (72usize, 1usize, 6usize);   // Qwen3-VL tower: d_head 72
+        let base = 10_000f32;
+        let sections = [18u32, 18, 18, 18];
+        let x: Vec<f32> = (0..t * nh * dh).map(|i| ((i as f32) * 0.031).sin()).collect();
+        let xt = Tensor::from_vec(&ctx, &x, &[t, nh * dh]);
+        // positions as clip.cpp fills them: section 0 = row, section 1 = column.
+        let (rows, cols) = ([0u32, 0, 1, 1, 2, 2], [0u32, 1, 0, 1, 0, 1]);
+        let mut pos = Vec::new();
+        pos.extend_from_slice(&rows); pos.extend_from_slice(&cols);
+        pos.extend_from_slice(&rows); pos.extend_from_slice(&cols);  // sections 2/3 duplicate, unused
+
+        let got = pollster::block_on(
+            xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Vision).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, MropeMode::Vision);
+        let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
+        assert!(worst < 1e-5, "vision mrope vs independent reference: max |Δ| = {worst:.3e}");
+
+        // ⛔ THE POINT OF THE MODE, asserted: Chunked and Vision must DIFFER on the same input.
+        // They pick the same component per sector — only the ladder reset separates them, so if the
+        // reset were dropped this test is the only thing between that and a silently wrong tower.
+        let chunked = pollster::block_on(
+            xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Chunked).to_vec());
+        let d = got.iter().zip(&chunked).fold(0f32, |a, (&v, &c)| a.max((v - c).abs()));
+        assert!(d > 1e-2, "Vision must not reduce to Chunked (max |Δ| = {d:.3e})");
+
+        // ⚠ And the control that the positions actually reach the axes: swapping rows with columns
+        // must change the output, or the tower would be rotating one axis twice.
+        let mut swapped = Vec::new();
+        swapped.extend_from_slice(&cols); swapped.extend_from_slice(&rows);
+        swapped.extend_from_slice(&cols); swapped.extend_from_slice(&rows);
+        let other = pollster::block_on(
+            xt.rope_mrope(nh, dh, base, &swapped, sections, MropeMode::Vision).to_vec());
+        let ds = got.iter().zip(&other).fold(0f32, |a, (&v, &o)| a.max((v - o).abs()));
+        assert!(ds > 1e-3, "row and column must land on different sectors (swap moved {ds:.3e})");
     }
 
     /// Qwen2-VL's **chunked** M-RoPE (`[16,24,24]`, sums to 64 = head_dim/2) against the same
@@ -4548,8 +4627,8 @@ mod mrope_tests {
         pos.extend((0..t).map(|i| 30 + 2 * i as u32));   // h
         pos.extend((0..t).map(|i| 90 + 3 * i as u32));   // w
         pos.extend(std::iter::repeat_n(0u32, t));        // e
-        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, false).to_vec());
-        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, false);
+        let got = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Chunked).to_vec());
+        let want = mrope_ref(&x, nh, dh, base as f64, &pos, sections, MropeMode::Chunked);
         let worst = got.iter().zip(&want).fold(0f32, |a, (&g, &w)| a.max((g - w).abs()));
         // Same reasoning as the interleaved test: an f32 floor that differs per adapter, kept far
         // below the >1e-3 chunked-vs-interleaved signal asserted immediately after.
@@ -4557,7 +4636,7 @@ mod mrope_tests {
 
         // ⚠ The control: with distinct t/h/w this must NOT equal the interleaved rule, or the
         // `imrope` flag would be decorative and both Qwen2-VL and Qwen3-VL would silently share one path.
-        let inter = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, true).to_vec());
+        let inter = pollster::block_on(xt.rope_mrope(nh, dh, base, &pos, sections, MropeMode::Interleaved).to_vec());
         let d = got.iter().zip(&inter).fold(0f32, |a, (&g, &j)| a.max((g - j).abs()));
         assert!(d > 1e-3, "chunked and interleaved must differ on distinct positions (max |Δ| = {d:.3e})");
     }
