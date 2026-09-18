@@ -306,14 +306,15 @@ Measured at batch 48 on Metal:
 
 | n | Kronecker | separable | speedup | matrices |
 |---|---|---|---|---|
-| 16 | 0.39 ms | 1.23 ms | **0.32×** | 1.0 MB vs 4.1 kB |
-| 32 | 1.01 ms | 1.37 ms | **0.73×** | 16.8 MB vs 16.4 kB |
-| 64 | 11.90 ms | 2.36 ms | **5.05×** | 268.4 MB vs 65.5 kB |
+| 16 | 1.21 ms | 2.06 ms | **0.59×** | 1.0 MB vs 4.1 kB |
+| 32 | 1.23 ms | 1.68 ms | **0.73×** | 16.8 MB vs 16.4 kB |
+| 64 | 11.64 ms | 2.40 ms | **4.84×** | 268.4 MB vs 65.5 kB |
 
-The separable plan *loses* by ~3× at `n = 16` — dispatch-bound, not compute-bound — and wins by 3.6–5× at
-`n = 64`. (⚠ The absolute milliseconds move with machine load: a contended run of the same test gave
-1.61/4.51, 3.46/6.49 and 15.14/4.18 ms. The ratios and the crossover did not move, and the ratios are what
-the test asserts.) So `Dft2::new` picks by grid size (`SEPARABLE_ABOVE = 32`, the crossover as measured) rather than
+The separable plan *loses* at `n = 16` — dispatch-bound, not compute-bound — and wins by ~5× at `n = 64`.
+(⚠ The absolute milliseconds move a lot with machine load — contended runs of this same test gave
+1.61/4.51/3.46/6.49/15.14/4.18 and 0.39/1.23/1.01/1.37/11.90/2.36 ms. Here the crossover held across all
+three runs, so the threshold is safe; it did **not** hold for the separable-PINN measurement below, where
+contention moved the crossover an octave. Measure on an idle machine.) So `Dft2::new` picks by grid size (`SEPARABLE_ABOVE = 32`, the crossover as measured) rather than
 replacing one with the other, and the memory ratio (`n²`, always) is what unlocks the resolutions the
 Kronecker form could never hold: the layer is exact to **1.9e-7** at `n = 64` with 113 retained modes.
 
@@ -376,6 +377,57 @@ gradient is summed back over the broadcast batch (which `accumulate` and `grad()
 belt-and-braces `unbroadcast_var` inside the VJP was written and then removed, because no mutation could
 distinguish it from its absence). Covered by a finite-difference check on both operands plus an assertion on
 the shape `grad()` returns for the unbatched one.
+
+## The separable PINN — `sciml::spinn`
+
+Cho et al., *Separable Physics-Informed Neural Networks* (2306.15969). A dense PINN on a `d`-dimensional
+tensor grid of `N` points per axis evaluates its network at `N^d` collocation points. A separable one
+factors the field into a rank-`r` sum of products of **one-dimensional** networks,
+`u(x₁,…,x_d) = Σ_{j≤r} Π_i f_i(x_i)_j`, so the same `N^d` grid costs `d·N` network evaluations. The residual
+still sees every grid point, because the product is formed as a tensor contraction *after* the networks run.
+
+**`jvp_1d` is what makes it affordable here.** The residual needs `∂f_i/∂x_i` for a `[N,1] → [N,r]` map, and
+reverse mode gives one output column per pass — `r` passes. The original uses forward mode (`jax.jvp`),
+which this fabric does not have. Instead: differentiate `uᵀy` with respect to `x`, giving `Jᵀu` as a graph
+linear in the cotangent `u`, then differentiate *that* with respect to `u`. Two passes, whatever `r` is.
+Checked against central differences to second order (worst 5.9e-5 / 8.0e-5) **and** against `r` seeded
+reverse passes (1.2e-7) — two independent routes to the same quantity. The contraction is checked against
+the same sum written as explicit loops in Rust (exact).
+
+| oracle | result |
+|---|---|
+| separable PINN on 3-D Poisson, `16³ = 4096` points from **48 network rows/step** | rel-L2 vs the exact solution **0.0003** |
+| residual cost per step, separable vs dense, `n = 8 / 16 / 32` | **0.99× / 2.81× / 11.4×** |
+| fit vs rank on a separation-rank-5 field, ranks 1 / 2 / 5 / 12 | 0.862 / 0.703 / 0.348 / 0.289 |
+
+⚠ **The saving appears with scale, and it is worth ~1.0× until it does.** Separable 61.6 / 93.5 / 114.3 ms
+against dense 61.2 / 262.5 / **1299.0** ms: the separable arm's cost grows slowly with the grid, the dense
+arm's tracks it. At `n = 8` both sit on the dispatch floor and the 21× fewer network rows buy nothing. The
+test asserts a large-grid phenomenon rather than a blanket win.
+
+⛔ **These numbers moved by a factor of three when the machine went idle, and one of them changed sign.** An
+earlier run of this same test with other cargo jobs sharing the GPU read **0.97× / 0.90× / 2.82×** — which
+says the saving does not appear until `n = 32`, a full octave too high, and says it is *negative* at `n = 16`
+where it is really 2.8×. Contention did not add noise, it moved the conclusion. Every wall-clock number in
+this document is from an otherwise idle machine, and the transform crossover above was re-measured idle for
+the same reason (0.59× / 0.73× / 4.84× at n = 16 / 32 / 64 — the `SEPARABLE_ABOVE = 32` threshold stands).
+
+⛔ **What is *not* claimed, and why.** A head-to-head "separable beats dense" was built first and then
+deleted: the dense arm did not solve the problem. At `n = 16` on a rank-3 target it reached rel-L2 0.198
+after 3500 steps, and on an easier rank-2 target it plateaued at 0.26 — a plain tanh MLP on a 3-D input with
+a hard `Π x_k(1−x_k)` constraint. The fixture's own assertion caught it (*"the dense arm must solve the
+problem, or this comparison ranks nothing"*), and rather than tune the baseline until it lost politely, the
+comparison was split: cost is measured on its own with no accuracy claim, and accuracy is measured against
+the closed-form solution with no dense arm. One fixture, one claim.
+
+⛔ **The rank sweep shows less than it was built to show, and says so.** A clean rank limit would fall to
+near zero at `r = R` and flatten; it does not — 0.348 at rank 5 and still falling to 0.289 at rank 12. So
+rank is not cleanly separated from optimisation difficulty (fitting a sum of products is a nonconvex tensor
+factorisation, plainly not solved to optimality here). Two earlier targets failed differently and are
+recorded in the test: `sin(mπ·)` up to `m = 5` stalled at 0.185 because the 1-D nets could not fit
+`sin(5πx)` — spectral bias, not rank — and Legendre terms weighted `1/(q+1)` left ranks 1 and 2 scoring
+*identically* 0.0990, because the `q = 0` term carried nearly all the energy and the sweep measured nothing.
+What survives is the monotone dependence on rank, and the claim is kept to that.
 
 ## Design notes
 

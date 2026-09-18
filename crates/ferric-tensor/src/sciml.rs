@@ -19,6 +19,7 @@ pub mod harness;
 pub mod lbfgs;
 pub mod ntk;
 pub mod operators;
+pub mod spinn;
 pub mod train;
 pub mod util;
 #[cfg(test)]
