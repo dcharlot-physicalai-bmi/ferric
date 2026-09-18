@@ -72,6 +72,7 @@ impl HfCheckpoint {
 
         let (meta, name_map) = match model_type.as_str() {
             "lfm2" => lfm2_map(&cfg, &st)?,
+            "qwen3_vl" => qwen3vl_map(&cfg, &st)?,
             other => return Err(format!(
                 "no HF mapping for model_type '{other}'. Adding one is a table of metadata keys and \
                  tensor names — see `lfm2_map` — but it is only worth adding alongside something \
@@ -120,6 +121,91 @@ impl GgufSource for HfCheckpoint {
 /// ⭐ GGUF encodes the schedule as a per-layer `head_count_kv` array where **0 means this layer is a
 /// conv block**, and HF encodes it as `layer_types: ["conv", "full_attention", ...]`. The two say
 /// the same thing in different alphabets, which is what makes this translatable at all.
+/// **Qwen3-VL, text side.** The vision tower, the merger and the deepstack mergers are present in the
+/// checkpoint and deliberately NOT mapped: llama.cpp zero-pads the text rows of its wider input
+/// embedding, so every deepstack injection adds exactly 0 for a text token and omitting them is
+/// arithmetically identical, not an approximation. Mapping them without the tower that feeds them
+/// would be worse than leaving them out.
+///
+/// ⚠ Names are read from a real checkpoint (`Qwen3-VL-Embedding-2B`), not from a description: the
+/// text stack sits under `model.language_model.*`, one level deeper than a text-only Qwen3, and the
+/// attention output is `o_proj` (not `out_proj`, which is LFM2's spelling). Both are the kind of
+/// difference that loads fine and produces confident nonsense.
+fn qwen3vl_map(cfg: &serde_json::Value, st: &SafeTensors)
+    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+{
+    // Qwen3-VL nests everything real under `text_config`; a flat lookup silently finds nothing.
+    let t = cfg.get("text_config").unwrap_or(cfg);
+    let need_u = |k: &str| cfg_u(t, k).ok_or_else(|| format!("config.json text_config: missing {k}"));
+    let need_f = |k: &str| cfg_f(t, k).ok_or_else(|| format!("config.json text_config: missing {k}"));
+    let n_layer = need_u("num_hidden_layers")? as usize;
+    let n_vocab = need_u("vocab_size")? as usize;
+
+    // ⛔ The sections are the whole reason this arch exists as a separate mapping. Absent means the
+    // runtime would fall back to ordinary RoPE and be wrong at every position — so this REFUSES
+    // rather than defaulting.
+    let sections: Vec<u64> = t.pointer("/rope_scaling/mrope_section")
+        .and_then(|v| v.as_array())
+        .ok_or("config.json: qwen3_vl needs rope_scaling.mrope_section; without it the model would \
+                silently take ordinary RoPE")?
+        .iter().filter_map(|x| x.as_u64()).collect();
+    if sections.iter().sum::<u64>() == 0 {
+        return Err("rope_scaling.mrope_section summed to 0".into());
+    }
+
+    let mut m = HashMap::new();
+    m.insert("general.architecture".into(), Meta::Str("qwen3vl".into()));
+    m.insert("qwen3vl.block_count".into(), Meta::U(n_layer as u64));
+    m.insert("qwen3vl.embedding_length".into(), Meta::U(need_u("hidden_size")?));
+    m.insert("qwen3vl.feed_forward_length".into(), Meta::U(need_u("intermediate_size")?));
+    m.insert("qwen3vl.attention.head_count".into(), Meta::U(need_u("num_attention_heads")?));
+    m.insert("qwen3vl.attention.head_count_kv".into(), Meta::U(need_u("num_key_value_heads")?));
+    m.insert("qwen3vl.attention.key_length".into(), Meta::U(need_u("head_dim")?));
+    m.insert("qwen3vl.attention.layer_norm_rms_epsilon".into(), Meta::F(need_f("rms_norm_eps")?));
+    m.insert("qwen3vl.rope.freq_base".into(), Meta::F(need_f("rope_theta")?));
+    m.insert("qwen3vl.rope.dimension_sections".into(),
+             Meta::Arr(sections.iter().map(|s| Meta::U(*s)).collect()));
+    // ⚠ The runtime takes n_vocab from the token list's LENGTH. This path feeds token IDs directly
+    // and never tokenises text, so the strings are placeholders and only the count is load-bearing —
+    // said here because a silently empty vocabulary would otherwise look like a tokenizer bug later.
+    m.insert("tokenizer.ggml.tokens".into(),
+             Meta::Arr(vec![Meta::Str(String::new()); n_vocab]));
+
+    let mut n: Vec<(String, String)> = vec![
+        ("token_embd.weight".into(), "model.language_model.embed_tokens.weight".into()),
+        ("output_norm.weight".into(), "model.language_model.norm.weight".into()),
+    ];
+    // Untied head only if the checkpoint has one — Qwen3-VL-Embedding-2B sets tie_word_embeddings
+    // and ships no `lm_head.weight`, and the runtime falls back to token_embd.
+    if st.info("lm_head.weight").is_some() {
+        n.push(("output.weight".into(), "lm_head.weight".into()));
+    }
+    for il in 0..n_layer {
+        let p = format!("model.language_model.layers.{il}");
+        for (suffix, hf) in [
+            ("attn_norm.weight", format!("{p}.input_layernorm.weight")),
+            ("attn_q.weight", format!("{p}.self_attn.q_proj.weight")),
+            ("attn_k.weight", format!("{p}.self_attn.k_proj.weight")),
+            ("attn_v.weight", format!("{p}.self_attn.v_proj.weight")),
+            ("attn_output.weight", format!("{p}.self_attn.o_proj.weight")),
+            ("attn_q_norm.weight", format!("{p}.self_attn.q_norm.weight")),
+            ("attn_k_norm.weight", format!("{p}.self_attn.k_norm.weight")),
+            ("ffn_norm.weight", format!("{p}.post_attention_layernorm.weight")),
+            ("ffn_gate.weight", format!("{p}.mlp.gate_proj.weight")),
+            ("ffn_up.weight", format!("{p}.mlp.up_proj.weight")),
+            ("ffn_down.weight", format!("{p}.mlp.down_proj.weight")),
+        ] {
+            n.push((format!("blk.{il}.{suffix}"), hf));
+        }
+    }
+    // Every mapped name must exist, or the failure surfaces as a missing tensor deep in load rather
+    // than here where the mapping is visible.
+    if let Some((g, h)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
+        return Err(format!("mapping points {g} at {h}, which the checkpoint does not contain"));
+    }
+    Ok((m, n))
+}
+
 fn lfm2_map(cfg: &serde_json::Value, st: &SafeTensors)
     -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
 {
