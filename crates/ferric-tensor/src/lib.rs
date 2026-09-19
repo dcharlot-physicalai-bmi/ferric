@@ -2530,8 +2530,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // `indep_sects`), so the exponent counts from the SECTION, not from dim 0. Without this a
         // vision tower's two axes share one ladder and every patch lands at the wrong angle.
         var e: u32 = c;
-        if (mode == 2u) { e = c - start; }
-        let inv2 = exp(-2.0 * f32(e) / f32(n_rot) * lb);
+        var denom: u32 = n_rot;
+        if (mode == 2u) {
+            e = c - start;
+            // ⛔ VISION passes n_dims = head_dim/2 to ggml_rope_multi while the cache loop runs over
+            // ne0 = head_dim, and `theta_scale = freq_base^(-2/n_dims)` uses THAT n_dims. Using the
+            // full head width here halves every exponent — the angles stay smooth and plausible, so
+            // nothing looks broken; the tower just attends to the wrong places.
+            denom = n_rot / 2u;
+        }
+        let inv2 = exp(-2.0 * f32(e) / f32(denom) * lb);
         let pos = info[pbase + comp * t + i];
         let ang = f32(pos) * inv2; let cs = cos(ang); let sn = sin(ang);
         // NEOX pairing: ggml applies MROPE and IMROPE with the split-half partner layout.
@@ -4415,8 +4423,15 @@ mod mrope_tests {
                     else { (3, sec_e) };
                     let p = pos[comp * t + i] as f64;
                     // VISION restarts each component's ladder at its section boundary.
+                    // ⚠ `n_dims` is NOT `dh` for vision: ggml_rope_multi is called with
+                    // n_dims = head_dim/2 while the cache loop covers ne0 = head_dim, and
+                    // theta_scale = freq_base^(-2/n_dims). An earlier draft of this reference
+                    // substituted `dh` here — the SAME slip the kernel made — so the two agreed and
+                    // the test passed while both were wrong. Derived from the op's argument, not
+                    // from the kernel.
                     let e = if mode == MropeMode::Vision { c as u32 - start } else { c as u32 };
-                    let inv = base.powf(-2.0 * e as f64 / dh as f64);
+                    let n_dims = if mode == MropeMode::Vision { dh / 2 } else { dh };
+                    let inv = base.powf(-2.0 * e as f64 / n_dims as f64);
                     let (cs, sn) = ((p * inv).cos(), (p * inv).sin());
                     let (x1, x2) = (x[b + c] as f64, x[b + c + half] as f64);
                     out[b + c] = (x1 * cs - x2 * sn) as f32;
