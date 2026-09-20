@@ -145,6 +145,20 @@ more windows is not monotonically better. ⚠ Only the two global-fit rows and t
 configuration; the table rows and the marching-alone number come from other nets and point counts and are
 context, not a controlled comparison.
 
+⛔⛔ **A correction to the helmholtz claim: the constraint alone is not what did it.** `Problem` now
+carries a `hard_constraint` hook, so the library's own harness can impose conditions structurally instead of
+by penalty. Turning it on for helmholtz — the same `(1−x²)(1−y²)·M`, under the harness's own recipes — was
+measured and is **worse**: vanilla **6.3903** against 0.4766, full recipe **0.8154** against 0.3066. So the
+fixture's 0.0059 comes from the whole configuration (cell-centred interior points, a 501-parameter tanh net,
+15,000 Adam steps at 3e-3), not from the constraint in isolation. The harness samples 2000 *random* points —
+some arbitrarily close to the edge, where the constraint's own factor vanishes — runs 4000 steps at 1e-3,
+and hands a Fourier net scales chosen for `u` rather than for `u/(1−x²)(1−y²)`.
+
+This is the "not a controlled comparison" caveat on that row turning out to matter. The `~50×` should be
+read as *this configuration against the table*, and the attribution to hard constraints specifically is
+weaker than the advection and burgers results, where the arms were matched. The hook ships; helmholtz does
+**not** enable it by default, because enabling it is a retuning job and not a switch.
+
 ### The four rows, diagnosed
 
 The method that came out of this: **rule representation in or out first**, with a cheap regression fit of
@@ -155,7 +169,7 @@ the residual landscape.
 | row | regression fit | soft | hard | diagnosis |
 |---|---|---|---|---|
 | heat | — | 0.0448 | — | already solved by the recipe (0.0082) |
-| helmholtz | — | 0.3066 (table) | **0.0059 / 0.0064** | **loss balancing** |
+| helmholtz | — | 0.3066 (table) | **0.0059 / 0.0064** | **loss balancing** (⚠ not the constraint alone — below) |
 | advection | 0.0142 | 0.8098 | 0.9781 | **residual landscape** → marching × hard ICs, **0.0251** |
 | burgers | **0.0050** | 0.1980 | 0.3957 | representation ruled out; balancing ruled out → **residual landscape** → marching × hard, **0.0142** |
 
@@ -164,7 +178,7 @@ the residual landscape.
 | row | recipe table's best | after diagnosis | |
 |---|---|---|---|
 | heat | **0.0082** | — | the recipe already reaches it |
-| helmholtz | 0.3066 | **0.0059 / 0.0064** | hard constraints, ~50× |
+| helmholtz | 0.3066 | **0.0059 / 0.0064** | hard constraints **plus its configuration** — see the correction below |
 | advection | 0.9712 | **0.0251** | marching × hard conditions, 36× |
 | burgers | 0.2079 | **0.0142** | marching × hard conditions, 14× |
 

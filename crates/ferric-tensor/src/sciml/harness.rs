@@ -48,6 +48,21 @@ pub trait Problem {
     fn time_axis(&self) -> Option<usize> {
         None
     }
+    /// Wrap the raw network output so the problem's conditions hold **by construction** — `u = A(x) +
+    /// B(x)·M(x)` with `A` satisfying the condition and `B` vanishing where it is imposed. Returning
+    /// `Some` tells [`run`] to drop every penalty term, because there is nothing left to weight.
+    ///
+    /// ⭐ On the benchmark's helmholtz row this is worth ~50× (0.3066 with a soft penalty and the full
+    /// recipe, against 0.0059 with `(1−x²)(1−y²)·M` and plain Adam). ⚠ It is not a general win: on
+    /// advection and burgers it makes things *worse*, because their binding constraint is the residual
+    /// landscape rather than the balancing this removes. See `sciml::hardbc`.
+    ///
+    /// ⛔ A problem that supplies this must not be handed to [`run_time_marched`]: the constraint bakes in
+    /// the `t = 0` initial condition, which is exactly what window two must NOT satisfy. `run_time_marched`
+    /// refuses such a problem rather than silently solving the wrong thing.
+    fn hard_constraint(&self, _ctx: &Arc<Context>, _x: &Var, _raw: &Var) -> Option<Var> {
+        None
+    }
     fn reference(&self, x: &[f64]) -> f64;
     /// Fourier-feature scales that suit the problem's frequency content, per group and per INPUT AXIS
     /// (cycles per unit). One `σ` per axis, not one per group: an anisotropic solution — a travelling
@@ -162,13 +177,26 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
     let n = colloc.len() / d;
     let net = build_net(ctx, problem, recipe, d, seed);
     let params0: Vec<Tensor> = net.params();
-    let forward = |pv: &[Var], x: &Var| -> Var { net.forward(pv, x) };
+    let forward = |pv: &[Var], x: &Var| -> Var {
+        let raw = net.forward(pv, x);
+        problem.hard_constraint(ctx, x, &raw).unwrap_or(raw)
+    };
+    // does this problem impose its conditions structurally? asked once, on a single probe point, so the
+    // flag and the wrapper above cannot disagree about it
+    let hard = {
+        let px = leaf(ctx, &colloc[..d], &[1, d]);
+        let pv = vars(&params0);
+        let raw = net.forward(&pv, &px);
+        problem.hard_constraint(ctx, &px, &raw).is_some()
+    };
     // per-point residual and constraint residual VECTORS; the loss takes their mean squares
     let terms = |pv: &[Var], it: u32| -> Vec<Var> {
         let fwd = |x: &Var| forward(pv, x);
         let xv = leaf(ctx, colloc, &[n, d]);
         let mut v = vec![problem.residual(ctx, &fwd, &xv, n)];
-        v.extend(problem.constraints(ctx, &fwd, 200, seed.wrapping_add(it)));
+        if !hard {
+            v.extend(problem.constraints(ctx, &fwd, 200, seed.wrapping_add(it)));
+        }
         v
     };
     // causal slab index of each collocation point, from the problem's time axis
@@ -186,7 +214,7 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
     });
 
     let mut wp = params0;
-    let n_terms = 1 + problem.constraints(ctx, &|x: &Var| forward(&vars(&wp), x), 8, 0).len();
+    let n_terms = if hard { 1 } else { 1 + problem.constraints(ctx, &|x: &Var| forward(&vars(&wp), x), 8, 0).len() };
     let mut bal = LossBalancer::new(n_terms, 0.1);
     let mut ntk = NtkBalancer::new(n_terms, 4, 0.5);
     let mut causal = recipe.causal_slabs.map(|_| Causal::new(vec![1e-2, 1e-1, 1.0, 10.0, 100.0], 0.99));
@@ -290,6 +318,21 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
     let ax = problem.time_axis().expect("time marching needs a time axis");
     let (lo, hi) = (problem.lo()[ax], problem.hi()[ax]);
     assert!(windows >= 1);
+    // ⛔ A stationary hard constraint bakes in the t = 0 initial condition, which is exactly what window
+    // two must NOT satisfy — it is handed its start state by window one. Silently solving that would give
+    // a plausible-looking wrong answer, so refuse instead. (Marched hard constraints are a real technique
+    // and they work — `sciml::hardbc` measures 0.0251 on advection and 0.0142 on burgers — but they need
+    // the previous window's g, g′ and g″ threaded through this loop, which this harness does not do.)
+    {
+        let px = leaf(ctx, &colloc[..d], &[1, d]);
+        let net = build_net(ctx, problem, recipe, d, seed);
+        let raw = net.forward(&vars(&net.params()), &px);
+        assert!(
+            problem.hard_constraint(ctx, &px, &raw).is_none(),
+            "run_time_marched cannot take a problem with a stationary hard constraint: it fixes u at t = 0, \
+             which window two must not satisfy. See sciml::hardbc for the marched form."
+        );
+    }
     let edge = |w: usize| lo + (hi - lo) * w as f64 / windows as f64;
 
     let mut per_window: Vec<Vec<Tensor>> = Vec::with_capacity(windows);
@@ -452,6 +495,14 @@ impl Problem for Helmholtz {
         }
         vec![fwd(&leaf(ctx, &b, &[4 * n, 2]))]
     }
+    // ⛔ Helmholtz does NOT supply a hard constraint here, though `sciml::hardbc` measures 0.0059 for one.
+    // Turning `(1−x²)(1−y²)·M` on under THIS harness's recipes was measured and is WORSE: vanilla 6.3903
+    // against 0.4766, full 0.8154 against 0.3066. The fixture's 0.0059 comes from the whole configuration
+    // — cell-centred interior points, a 501-parameter tanh net, 15000 Adam steps at 3e-3 — and not from
+    // the constraint alone. The recipes here sample 2000 random points (some arbitrarily close to the
+    // edge, where the constraint's own factor vanishes), run 4000 steps at 1e-3, and give a Fourier net
+    // scales chosen for `u` rather than for `u/(1−x²)(1−y²)`. The hook is available; enabling it is a
+    // retuning job, not a switch.
     fn reference(&self, x: &[f64]) -> f64 {
         bench::helmholtz(x[0], x[1], self.a1, self.a2, self.k).0
     }

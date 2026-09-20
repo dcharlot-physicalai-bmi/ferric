@@ -58,6 +58,46 @@ mod tests {
     use crate::sciml::util::{leaf, rel_l2, step, vars};
     use crate::sciml::{Act, Mlp};
 
+
+    /// The harness hook itself, on a toy problem: the wrapper is applied to the network's output, and a
+    /// problem that supplies one is **refused** by time marching rather than silently solved wrong.
+    #[test]
+    fn the_harness_applies_a_hard_constraint_and_refuses_to_march_one() {
+        pollster::block_on(async {
+            use crate::sciml::harness::{run_time_marched, Problem, Recipe};
+            struct Toy;
+            impl Problem for Toy {
+                fn name(&self) -> &str { "toy" }
+                fn dim(&self) -> usize { 2 }
+                fn lo(&self) -> Vec<f64> { vec![-1.0, 0.0] }
+                fn hi(&self) -> Vec<f64> { vec![1.0, 1.0] }
+                fn residual(&self, _c: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, _n: usize) -> Var { fwd(x) }
+                fn boundary_constraints(&self, _c: &Arc<Context>, _f: &dyn Fn(&Var) -> Var, _n: usize, _s: u32) -> Vec<Var> { vec![] }
+                fn time_axis(&self) -> Option<usize> { Some(1) }
+                fn reference(&self, _x: &[f64]) -> f64 { 0.0 }
+                fn hard_constraint(&self, ctx: &Arc<Context>, x: &Var, raw: &Var) -> Option<Var> {
+                    let xc = col_of(ctx, x, 2, 0);
+                    let one = Var::leaf(Tensor::from_vec(ctx, &[1.0f32], &[1]));
+                    Some(one.sub(&xc.mul(&xc)).mul(raw))
+                }
+            }
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let t = Toy;
+            // the wrapper multiplies by (1−x²), so the constrained field is exactly zero at x = ±1
+            let x = leaf(&ctx, &[1.0, 0.5, 0.0, 0.5, -1.0, 0.5], &[3, 2]);
+            let raw = leaf(&ctx, &[7.0, 7.0, 7.0], &[3, 1]);
+            let u = t.hard_constraint(&ctx, &x, &raw).expect("Toy supplies one").value().to_vec().await;
+            assert!(u[0].abs() < 1e-6 && u[2].abs() < 1e-6, "must vanish at x = ±1: {u:?}");
+            assert!((u[1] - 7.0).abs() < 1e-5, "and be the raw output where the factor is 1: {u:?}");
+            // ⛔ and marching must refuse it: the constraint fixes t = 0, which window two must not satisfy
+            let colloc: Vec<f32> = (0..64).flat_map(|i| [(i % 8) as f32 / 8.0 - 0.5, (i / 8) as f32 / 8.0]).collect();
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_time_marched(&ctx, &t, &Recipe::vanilla(), &colloc, 2, 4, 1)
+            }));
+            assert!(caught.is_err(), "run_time_marched must refuse a problem with a stationary hard constraint");
+        });
+    }
+
     /// The hard-constrained advection ansatz: `u = sin x + t·M(sin x, cos x, t)`. Exactly `2π`-periodic in
     /// `x` and exactly `sin x` at `t = 0`, for every `M`.
     fn advection_ansatz(ctx: &Arc<Context>, pv: &[Var], x: &Var, n: usize) -> Var {
