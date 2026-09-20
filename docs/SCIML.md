@@ -106,8 +106,22 @@ boundary instead, `u = (1−x²)(1−y²)·M(x,y)`, exactly zero on all four edg
 **0.0059 / 0.0064** at two seeds on 900 points with Adam alone. That is ~50× better than the best recipe in
 the row above. ⚠ It is not a controlled recipe comparison (different net, different point count, different
 formulation); it is evidence that the binding constraint here was the loss balancing that a soft penalty
-forces on you. Re-running the whole table with hard constraints where the geometry admits them is the
-follow-on, and until that is measured nothing is claimed about the other rows.
+forces on you.
+
+⛔⛔ **And it does not generalise — the advection row was tried next and hard constraints made it worse.**
+`u_t + β u_x = 0` at `β = 30`: same net body, same 4096 points, same steps, same seed, only the treatment of
+the initial and periodic conditions differing. Soft penalties **0.8098**; hard constraints
+(`u = sin x + t·M(sin x, cos x, t)`, exactly `sin x` at `t = 0` and exactly `2π`-periodic for every `M`)
+**0.9781**. The companion fixture supplies the diagnosis: *that same ansatz*, fitted to `sin(x − βt)` by
+plain regression, reaches **0.0142**. So the ansatz can represent the answer to 1.4 % and residual training
+from it lands at 98 % — the limitation is neither the network nor the boundary treatment, but that
+minimising this residual does not lead to this solution (the large-`β` advection failure of Krishnapriyan
+et al., 2109.01050, which is what *time marching* addresses).
+
+**So: hard constraints fix the failure mode they address.** Helmholtz's binding constraint was loss
+balancing, which they remove by construction; advection's is the residual landscape, which they do not
+touch. "Re-run the table with hard constraints" is not a general prescription — it is worth trying per row,
+and the fixtures record both the win and the counterexample.
 
 ⭐⭐ **The middle column was mostly one bad assumption, not four bad rows.** `FourierNet` drew frequencies
 from an isotropic `N(0, σ²)` — one `σ` for every input axis — and the solutions here are anisotropic:

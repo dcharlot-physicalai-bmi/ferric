@@ -15,6 +15,7 @@ pub mod certify;
 pub mod features;
 pub mod fno;
 pub mod geometry;
+pub mod hardbc;
 pub mod harness;
 pub mod lbfgs;
 pub mod natgrad;
