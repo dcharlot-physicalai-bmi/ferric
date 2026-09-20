@@ -24,11 +24,19 @@ base = m.model if hasattr(m, "model") else m          # Qwen3VLModel
 vc = base.config.vision_config
 tc = base.config.text_config
 IMG = base.config.image_token_id
+VS, VE = base.config.vision_start_token_id, base.config.vision_end_token_id
 merge = vc.spatial_merge_size
 n_img = (gh // merge) * (gw // merge)
 
-# a short prompt with the image in the middle
-ids = [9707, 11] + [IMG] * n_img + [1526, 264, 2168, 13]
+# ⛔⛔ THE <vision_start> MARKER IS LOAD-BEARING AND ITS ABSENCE IS SILENT.
+# This generator first emitted `[text, text, IMG*4, text...]` with no marker. transformers 5.1.0
+# locates images by scanning for vision_start_token_id and reading the token AFTER it, so with no
+# marker it finds ZERO images, falls through to the text branch, and hands the rotary plain
+# positions 0..9 on all three axes. The forward still runs, the image embeddings are still spliced
+# in, deepstack is still applied — only mRoPE silently never happens. The resulting fixture looks
+# like a multimodal reference and is a text-position one, and anything checked against it is being
+# asked the wrong question. The chat template always emits these markers; so does this.
+ids = [9707, 11, VS] + [IMG] * n_img + [VE, 1526, 264, 2168, 13]
 input_ids = torch.tensor([ids], dtype=torch.long)
 pos_img = [i for i, t in enumerate(ids) if t == IMG]
 
@@ -63,11 +71,20 @@ for k in (1, 2, 3):
     dump(f"{out}.layer{k-1}", caught[f"in{k}"])   # input to layer k = output of layer k-1 + deepstack
 dump(f"{out}.final", o.last_hidden_state[0])
 dump(f"{out}.px", px)
+# ⛔ A GUARD, because the failure above was invisible: if the three position axes are identical,
+# mRoPE did not happen and this is a text-position capture wearing a multimodal costume.
+_p, _d = base.get_rope_index(input_ids, image_grid_thw=grid)
+assert not (torch.equal(_p[0], _p[1]) and torch.equal(_p[1], _p[2])), (
+    "all three position axes are identical -> get_rope_index found NO image; the <vision_start> "
+    "marker is missing and this fixture would not exercise mRoPE at all")
+print("mrope positions t/h/w:", [_p[k, 0].tolist() for k in range(3)])
 with open(f"{out}.meta", "w") as f:
     f.write(f"ids {','.join(map(str, ids))}\n")
     f.write(f"image_token_id {IMG}\n")
     f.write(f"grid {1},{gh},{gw}\n")
     f.write(f"image_positions {','.join(map(str, pos_img))}\n")
+    f.write(f"types {''.join('1' if t == IMG else '0' for t in ids)}\n")
+    f.write(f"vision_start_token_id {VS}\nvision_end_token_id {VE}\n")
     f.write(f"d_text {tc.hidden_size}\n")
     f.write(f"n_layers {tc.num_hidden_layers}\n")
     f.write(f"deepstack_visual_indexes {','.join(map(str, vc.deepstack_visual_indexes))}\n")

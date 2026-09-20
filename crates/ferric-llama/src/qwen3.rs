@@ -935,8 +935,9 @@ impl Qwen3 {
                    std::env::var("FERRIC_NO_QK_FUSE").is_ok())
     }
 
-    fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
-        let r = self.rope_inner(x, n_heads, offset, base);
+    fn rope(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32,
+            mrope: Option<&[u32]>) -> Tensor {
+        let r = self.rope_inner(x, n_heads, offset, base, mrope);
         // YaRN scales cos/sin by (1 + 0.1·ln factor). Derivation from llama-context.cpp: the two
         // adjustments there cancel to yarn_attn_factor = 1.0 for a non-DeepSeek model, and ggml's
         // `rope_yarn` then re-multiplies by exactly this term inside the kernel. (The same arithmetic
@@ -950,7 +951,8 @@ impl Qwen3 {
         r
     }
 
-    fn rope_inner(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32) -> Tensor {
+    fn rope_inner(&self, x: &Tensor, n_heads: usize, offset: usize, base: f32,
+                  mrope: Option<&[u32]>) -> Tensor {
         // The choice lives in `rope_plan`, which is a pure function of the config so it can be tested
         // without a checkpoint. This body only carries it out.
         // **Multimodal RoPE**, first because it supersedes every arm below.
@@ -964,9 +966,33 @@ impl Qwen3 {
             rope_plan(&self.cfg, self.rope_freqs.is_some(), std::env::var("FERRIC_NEOX").is_ok())
         {
             let t = x.numel() / (n_heads * self.cfg.head_dim);
-            let mut pos = Vec::with_capacity(t * 4);
-            for _ in 0..3 { pos.extend((0..t).map(|i| (offset + i) as u32)); }
-            pos.extend(std::iter::repeat_n(0u32, t));
+            // ⛔ MULTIMODAL positions are SUPPLIED, not derived. An image's rows carry grid
+            // coordinates, the three components stop agreeing with each other, and the sequence
+            // position is not `offset + i` across them — see `qwen3vl_rope::rope_index`. Deriving
+            // them here would rotate every image row by a text position: fluent, position-scaled,
+            // and invisible to every shape check.
+            let pos = match mrope {
+                Some(p) => {
+                    assert_eq!(p.len(), 4 * t,
+                               "mrope positions must be 4 components x {t} tokens, got {}", p.len());
+                    p.to_vec()
+                }
+                None => {
+                    let mut pos = Vec::with_capacity(t * 4);
+                    for _ in 0..3 { pos.extend((0..t).map(|i| (offset + i) as u32)); }
+                    pos.extend(std::iter::repeat_n(0u32, t));
+                    pos
+                }
+            };
+            // FERRIC_DEBUG_MROPE prints the positions actually handed to the kernel. Added while
+            // chasing a multimodal mismatch whose per-row signature was ambiguous between "positions
+            // ignored" and "components in the wrong order" — printing the vector settles it in one run.
+            if std::env::var("FERRIC_DEBUG_MROPE").is_ok() {
+                let n = t.min(10);
+                eprintln!("mrope supplied={} t={t} sections={sections:?} interleaved={interleaved}\n                             c0={:?}\n  c1={:?}\n  c2={:?}\n  c3={:?}",
+                          mrope.is_some(), &pos[..n], &pos[t..t + n], &pos[2 * t..2 * t + n],
+                          &pos[3 * t..3 * t + n]);
+            }
             let mode = if interleaved { ferric_tensor::MropeMode::Interleaved } else { ferric_tensor::MropeMode::Chunked };
             return x.rope_mrope(n_heads, self.cfg.head_dim, base, &pos, sections, mode);
         }
@@ -997,7 +1023,8 @@ impl Qwen3 {
         if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
     }
 
-    fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize) -> Tensor {
+    fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize,
+            mrope: Option<&[u32]>) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         self.grab(format!("l{il}.qkv"), h); // GPTQ calibration: capture wqkv input
         // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
@@ -1052,7 +1079,7 @@ impl Qwen3 {
         } else if fuse_rope {
             // Go through `self.rope` so the fused span picks up rope_freqs/YaRN and the NORM/NEOX
             // pairing exactly as the split path does; `head_dim` is shared, only the head count differs.
-            let qk = self.rope(&qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv, offset, l.rope_base);
+            let qk = self.rope(&qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv, offset, l.rope_base, mrope);
             // q's window has offset 0 (free during decode via the size-1 stride rule); k's carries an
             // offset and flows into `KvBuf::append`, which reads views in place.
             (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
@@ -1079,7 +1106,8 @@ impl Qwen3 {
             let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
             let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
             {
-                let (qr, kr) = (self.rope(&q, nh, offset, l.rope_base), self.rope(&k, nkv, offset, l.rope_base));
+                let (qr, kr) = (self.rope(&q, nh, offset, l.rope_base, mrope),
+                            self.rope(&k, nkv, offset, l.rope_base, mrope));
                 dump("Qcur_rope", il, &qr);
                 dump("Kcur_rope", il, &kr);
                 (qr, kr)
@@ -1184,7 +1212,8 @@ impl Qwen3 {
     /// Pulling it out is what makes a **stepping** forward possible: a caller that must await something
     /// between layers — a browser fetching the next layer's weights — cannot use a loop that runs to
     /// completion. See [`Qwen3::step_layer`].
-    fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize) -> Tensor {
+    fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize,
+                   mrope: Option<&[u32]>) -> Tensor {
         use ferric_tensor::{batch, prof};
         dump("inpL", il, x);
         dump_with("attn_norm", il, || x.rmsnorm(&l.attn_norm, self.cfg.eps));
@@ -1193,7 +1222,7 @@ impl Qwen3 {
         let xin = x;
         if profiling {
             // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
-            let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il));
+            let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope));
             prof(&self.ctx, "attn");
             out = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
             prof(&self.ctx, "ffn");
@@ -1207,7 +1236,7 @@ impl Qwen3 {
             // different model from the same weights.
             let mode = std::env::var("FERRIC_POSTNORM").unwrap_or_default();
             out = batch(&self.ctx, || {
-                let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il);
+                let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il, mrope);
                 match mode.as_str() {
                     "off" => {
                         let x1 = xin.add(&a);
@@ -1244,7 +1273,7 @@ impl Qwen3 {
             let (no_attn, no_ffn) = (skip.contains("attn"), skip.contains("ffn"));
             out = batch(&self.ctx, || {
                 let y = if no_attn { xin.clone() }
-                        else { self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il) };
+                        else { self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope) };
                 // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
                 if no_ffn { xy } else { self.ffn(&xy_n, l, il).add(&xy) }
@@ -1412,7 +1441,7 @@ impl Qwen3 {
     pub fn step_layer(&self, step: &mut Step, cache: &mut Cache) -> bool {
         let Some(il) = step.next_layer() else { return true };
         let l = self.layer_ref(il);
-        step.x = self.apply_layer(&step.x, &l, cache.layer_kv(il), step.pos, il);
+        step.x = self.apply_layer(&step.x, &l, cache.layer_kv(il), step.pos, il, None);
         step.il += 1;
         step.il >= step.n_layer
     }
@@ -1433,7 +1462,7 @@ impl Qwen3 {
         for il in 0..self.cfg.n_layer {
             // A streamed layer is dropped at the end of the iteration — that drop IS the eviction.
             let l = self.layer_ref(il);
-            x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il);
+            x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il, None);
         }
         cache.pos += tokens.len();
         x
@@ -1459,10 +1488,78 @@ impl Qwen3 {
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None);
         }
         cache.pos += t;
         batch(&self.ctx, || self.head(&h))
+    }
+
+    /// Replace or add a CONTIGUOUS block of rows at `start`, without a scatter kernel.
+    ///
+    /// Qwen3-VL's image tokens are one unbroken run per image (the placeholder is repeated), so
+    /// narrow+cat expresses both the embedding splice and the deepstack add natively. A general
+    /// scatter would be needed only for interleaved positions, which this model does not produce.
+    fn splice_rows(h: &Tensor, start: usize, rows: &Tensor, add: bool) -> Tensor {
+        let (t, n) = (h.shape[0], rows.shape[0]);
+        assert!(start + n <= t, "rows [{start}, {}) do not fit in {t}", start + n);
+        let mid = if add { h.narrow(0, start, n).add(rows) } else { rows.clone() };
+        let head = if start > 0 { Some(h.narrow(0, 0, start).contiguous()) } else { None };
+        let tail = if start + n < t { Some(h.narrow(0, start + n, t - start - n).contiguous()) } else { None };
+        match (head, tail) {
+            (None, None) => mid,
+            (Some(a), None) => a.cat(&mid, 0),
+            (None, Some(b)) => mid.cat(&b, 0),
+            (Some(a), Some(b)) => a.cat(&mid, 0).cat(&b, 0),
+        }
+    }
+
+    /// Put a vision tower's projected rows in place of the image placeholder tokens' embeddings.
+    ///
+    /// `embeds` must be RAW rows from [`Self::embed_tokens`] — the weightless embedding norm runs
+    /// once, after this splice, on text and image rows together, because that is where the reference
+    /// applies it.
+    pub fn splice_image_embeds(&self, embeds: &Tensor, start: usize, rows: &Tensor) -> Tensor {
+        assert_eq!(rows.shape[1], self.cfg.n_embd,
+                   "image rows are {} wide, the text model is {}", rows.shape[1], self.cfg.n_embd);
+        Self::splice_rows(embeds, start, rows, false)
+    }
+
+    /// **The multimodal forward.** Precomputed embeddings, explicit per-token mRoPE positions, and
+    /// deepstack features folded in as the first layers run. Returns the post-norm hidden state,
+    /// which is what the reference calls `last_hidden_state`.
+    ///
+    /// ⛔ `deepstack[k]` is added after LM LAYER `k` — layers 0, 1, 2 — even though the features were
+    /// produced by VISION blocks `[5, 11, 17]`. The two index spaces are different and pairing them
+    /// by value injects at layers 5/11/17, which still produces fluent output about the right image.
+    /// The addition lands on the IMAGE ROWS ONLY; text rows are untouched.
+    ///
+    /// ⚠ The order is: run the layer, THEN add. The reference applies `_deepstack_process` to the
+    /// value the layer returned, so adding before the layer is one step early and looks plausible.
+    ///
+    /// `taps` receives the state after each injection, so a caller can localise a mismatch to a
+    /// layer instead of only seeing the final tensor.
+    pub fn forward_embeds_mm(&self, x: &Tensor, cache: &mut Cache, mrope: &[u32],
+                             deepstack: &[Tensor], img_start: usize,
+                             taps: &mut Vec<Tensor>) -> Tensor {
+        use ferric_tensor::batch;
+        assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
+        let t = x.shape[0];
+        assert_eq!(mrope.len(), 4 * t,
+                   "mrope needs 4 components x {t} tokens, got {}", mrope.len());
+        assert!(deepstack.len() <= self.cfg.n_layer,
+                "{} deepstack features for {} layers", deepstack.len(), self.cfg.n_layer);
+        let pos = cache.pos;
+        let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
+        for il in 0..self.cfg.n_layer {
+            let l = self.layer_ref(il);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, Some(mrope));
+            if let Some(d) = deepstack.get(il) {
+                h = Self::splice_rows(&h, img_start, d, true);
+                taps.push(h.clone());
+            }
+        }
+        cache.pos += t;
+        batch(&self.ctx, || h.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 
     /// **Raw** embedding rows for `tokens` — deliberately WITHOUT the weightless embedding norm.
@@ -1585,7 +1682,7 @@ impl Qwen3 {
             let lc = cache.layer_kv(il);
             let xin = &x;
             x = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
                 self.ffn(&xy_n, l, il).add(&xy)
             });
@@ -1613,12 +1710,12 @@ impl Qwen3 {
             let xin = &x;
             if il == last {
                 return batch(&self.ctx, || {
-                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
                     xin.add(&y) // post-attention residual, BEFORE the FFN
                 });
             }
             x = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il);
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
                 self.ffn(&xy_n, l, il).add(&xy)
             });
