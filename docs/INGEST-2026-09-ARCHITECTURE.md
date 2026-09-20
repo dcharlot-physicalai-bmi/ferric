@@ -184,6 +184,19 @@ a = −0.75. Qwen3-VL's `preprocessor_config.json` says only `"resample": 3`, an
 config selects two different kernels depending on which class loads it. This is the same failure
 shape as the NVFP4 scale disagreement, one layer earlier: in the *pixels*, before any weight is read.
 
+**And it is now measured, not argued (2026-09-20).** Running Qwen3-VL's whole image path twice —
+once on Ferric's own preprocessed pixels, once on the reference processor's — attributes the error:
+
+| pixels | final hidden state, vs HF |
+|---|---|
+| the reference processor's | **4.25e-6** relative — the path itself, f32 drift |
+| Ferric's own | **3.63e-4** relative |
+
+Ferric reproduces Pillow's 8-bit resampler *exactly* and sits 1 level from HF's on 0.46% of values —
+the same distance Pillow itself sits from it. That disagreement, between two conformant bicubic
+implementations, is worth **85× the arithmetic noise** 28 layers later. **A bit-exactness claim that
+starts at the tensor starts too late**: the largest term is upstream of the first weight.
+
 → **Decode can be bit-exact; encode cannot be assumed to be.** That is a crisp, defensible thesis, it is
 exactly the seam Ferric already owns (*cross-fabric identity boundary*: hashes differ per **adapter**),
 and it hands us five concrete regression targets. Accumulation is also below IEEE independently of
