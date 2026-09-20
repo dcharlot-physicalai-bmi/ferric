@@ -100,6 +100,8 @@ pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 pub mod qwen3vl_vision;
 /// Qwen3-VL image preprocessing — smart_resize, patch rows. Resampler NOT included.
 pub mod qwen3vl_image;
+/// Qwen3-VL mRoPE position index for mixed text+image sequences.
+pub mod qwen3vl_rope;
 pub mod parakeet;       // NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T decoder
 pub mod unipc;
 
