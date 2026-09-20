@@ -4683,3 +4683,60 @@ mod mrope_tests {
         assert!(d > 1e-3, "chunked and interleaved must differ on distinct positions (max |Δ| = {d:.3e})");
     }
 }
+
+#[cfg(test)]
+mod gemm_agreement_tests {
+    use super::*;
+
+    macro_rules! ctx_or_skip {
+        () => { match pollster::block_on(crate::Context::new()) { Ok(c) => Arc::new(c), Err(_) => { eprintln!("no GPU context — skipping"); return } } };
+    }
+
+    fn mk(n: usize, seed: u64) -> Vec<f32> {
+        (0..n).map(|i| {
+            let x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(seed);
+            ((x >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        }).collect()
+    }
+
+    /// ⛔⛔ **`matmul` PICKS ITS KERNEL BY A WALL-CLOCK RACE.** `autotune_matmul` times
+    /// `matmul_naive` against `matmul_tiled` and caches the winner in `GEMM_CACHE`, which is
+    /// THREAD-LOCAL — so an untuned thread runs naive while a tuned one may run tiled. If the two
+    /// kernels disagreed by even one ULP, Ferric's logits would depend on who won a race on a loaded
+    /// machine, and every bit-identity claim would be a claim about a coin toss.
+    ///
+    /// They agree — measured bit-for-bit, 0 differing elements on every shape below, including a
+    /// 4096-deep reduction where any reassociation would show. But nothing asserted it: before this
+    /// test, `matmul_tiled` appeared only in `lib.rs` and a benchmark. The property held by accident.
+    ///
+    /// ⚠ Scope: this proves the two kernels agree ON THIS ADAPTER. It does not prove cross-fabric
+    /// identity, which `docs/determinism/` covers separately.
+    #[test]
+    fn the_two_gemm_kernels_are_bit_identical() {
+        let ctx = ctx_or_skip!();
+        // (m, k, n) — including a deep-k case, a GEMV-shaped case, and non-round sizes, because a
+        // tile-boundary bug hides completely on shapes that are multiples of the tile.
+        let shapes = [(64usize, 64usize, 64usize), (128, 256, 128), (37, 53, 71),
+                      (1, 4096, 4096), (320, 4096, 320)];
+        let mut checked = 0usize;
+        for (m, k, n) in shapes {
+            let a = Tensor::from_vec(&ctx, &mk(m * k, 1), &[m, k]);
+            let b = Tensor::from_vec(&ctx, &mk(k * n, 2), &[k, n]);
+            let naive = pollster::block_on(a.matmul_naive(&b).to_vec());
+            let tiled = pollster::block_on(a.matmul_tiled(&b).to_vec());
+            assert_eq!(naive.len(), tiled.len(), "({m},{k},{n}) shape mismatch");
+            let ndiff = naive.iter().zip(&tiled).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            assert_eq!(ndiff, 0,
+                "({m},{k},{n}): the GEMM kernels differ on {ndiff}/{} elements. `matmul` chooses \
+                 between them by timing, so this makes the runtime's output depend on a race.",
+                naive.len());
+            checked += naive.len();
+        }
+        // ⚠ and the inputs were not degenerate: summing equal terms is order-independent, so a
+        // constant or a ramp would pass this test against a genuinely reassociating kernel.
+        let probe = mk(4096, 1);
+        assert!(probe.iter().any(|&v| v > 0.0) && probe.iter().any(|&v| v < 0.0),
+                "the generator must be two-signed or cancellation is never exercised");
+        assert!(checked > 100_000, "only {checked} elements compared — the shape list shrank");
+    }
+}
