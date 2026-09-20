@@ -70,6 +70,113 @@ mod tests {
     }
 
 
+
+    /// ⭐⭐ **The consequence of the diagnosis: hard constraints + time marching solve the advection row.**
+    ///
+    /// The fixture above shows hard constraints alone do not help, because advection's limit is the
+    /// residual landscape rather than the boundary treatment — at `β = 30` the solution turns ~4.8 times
+    /// over `t ∈ [0,1]` and minimising the global residual does not lead to it. Time marching attacks
+    /// exactly that: on a window of width `Δt`, the phase only turns `βΔt`, and with eight windows that is
+    /// 3.75 radians rather than 30.
+    ///
+    /// The two compose. Each window carries its initial condition **structurally** — `u = g(x) + τ·M`,
+    /// which is `g` at `τ = 0` for every `M` — where `g` is the previous window's solution at its own end.
+    /// So no window has an initial-condition penalty to balance, and no window has to learn a long horizon.
+    /// `g` and `g′` are evaluated once per window and carried as constants, so the residual is written out
+    /// (`u_τ = M + τM_τ`, `u_x = g′ + τM_x`) rather than differentiated through a growing stack of frozen
+    /// networks — the cost per window stays flat instead of growing with the window index.
+    #[ignore = "trains eight advection windows on the GPU (~15 min); run with -- --ignored"]
+    #[test]
+    fn hard_constraints_and_time_marching_together_solve_the_advection_row() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (nx, ntau, windows, beta, steps) = (64usize, 16usize, 8usize, 30.0f32, 3000u32);
+            let n = nx * ntau;
+            let dt = 1.0f32 / windows as f32;
+            let xs: Vec<f32> = (0..nx).map(|i| std::f32::consts::TAU * i as f32 / nx as f32).collect();
+            let taus: Vec<f32> = (0..ntau).map(|j| dt * j as f32 / (ntau as f32 - 1.0)).collect();
+            let mut pts = vec![0.0f32; n * 2];
+            for i in 0..nx {
+                for j in 0..ntau {
+                    pts[(i * ntau + j) * 2] = xs[i];
+                    pts[(i * ntau + j) * 2 + 1] = taus[j];
+                }
+            }
+            let betav = leaf(&ctx, &[beta], &[1]);
+            // g and g′ at the grid's x values: the previous window's solution and slope at its own end
+            let mut g: Vec<f32> = xs.iter().map(|&x| x.sin()).collect();
+            let mut gp: Vec<f32> = xs.iter().map(|&x| x.cos()).collect();
+            // g repeated down each x row so it lines up with the [nx*ntau, 1] collocation layout
+            let tile = |v: &[f32]| -> Vec<f32> { (0..n).map(|k| v[k / ntau]).collect() };
+
+            let (mut worst_window, mut rel_all_num, mut rel_all_den) = (0.0f32, 0.0f64, 0.0f64);
+            for w in 0..windows {
+                let t0 = w as f32 * dt;
+                let net = Mlp::new(&ctx, &[3, 48, 48, 1], 7 + w as u32);
+                let mut wp = net.params.clone();
+                let mut adam = crate::Adam::new(&wp, 3e-3);
+                let gv = leaf(&ctx, &tile(&g), &[n, 1]);
+                let gpv = leaf(&ctx, &tile(&gp), &[n, 1]);
+                let forward = |pv: &[Var], x: &Var| {
+                    let xc = col_of(&ctx, x, 2, 0);
+                    let tc = col_of(&ctx, x, 2, 1);
+                    let (sn, cs) = periodic_pair(&xc, std::f32::consts::TAU);
+                    let feats = place(&ctx, &[sn, cs, tc.clone()], 3);
+                    (Mlp::forward_act(pv, &feats, Act::Tanh), tc)
+                };
+                for ep in 0..steps {
+                    if ep == steps * 3 / 4 {
+                        adam = crate::Adam::new(&wp, 3e-4);
+                    }
+                    let pv = vars(&wp);
+                    let x = leaf(&ctx, &pts, &[n, 2]);
+                    let (mm, tc) = forward(&pv, &x);
+                    let dm = crate::sciml::deriv(&mm, &x);
+                    let (mx, mt) = (col_of(&ctx, &dm, 2, 0), col_of(&ctx, &dm, 2, 1));
+                    // u = g + τ·M  ⇒  u_τ = M + τ·M_τ,  u_x = g′ + τ·M_x, written out because g is a constant
+                    let ut = mm.add(&tc.mul(&mt));
+                    let ux = gpv.add(&tc.mul(&mx));
+                    let r = ut.add(&ux.mul(&betav));
+                    let loss = r.mul(&r).mean_all();
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+                // the window's own error against the closed form, and its end state for the next window
+                let pv = vars(&wp);
+                let x = leaf(&ctx, &pts, &[n, 2]);
+                let (mm, tc) = forward(&pv, &x);
+                let dm = crate::sciml::deriv(&mm, &x);
+                let mx = col_of(&ctx, &dm, 2, 0);
+                let u = gv.add(&tc.mul(&mm));
+                let uv = u.value().to_vec().await;
+                let uxv = gpv.add(&tc.mul(&mx)).value().to_vec().await;
+                let mut num = 0.0f64;
+                let mut den = 0.0f64;
+                for (i, &xv) in xs.iter().enumerate() {
+                    for (j, &tv) in taus.iter().enumerate() {
+                        let k = i * ntau + j;
+                        let want = (xv - beta * (t0 + tv)).sin();
+                        num += (uv[k] - want).powi(2) as f64;
+                        den += (want * want) as f64;
+                    }
+                }
+                let e = (num / den).sqrt() as f32;
+                worst_window = worst_window.max(e);
+                rel_all_num += num;
+                rel_all_den += den;
+                for i in 0..nx {
+                    g[i] = uv[i * ntau + (ntau - 1)];
+                    gp[i] = uxv[i * ntau + (ntau - 1)];
+                }
+                eprintln!("    [banked] window {w} (t ∈ [{t0:.3}, {:.3}]): rel-L2 in-window {e:.4}", t0 + dt);
+            }
+            let rel = (rel_all_num / rel_all_den).sqrt() as f32;
+            eprintln!(
+                "  advection β={beta}, {windows} time windows × hard initial conditions, [3,48,48,1] per window, {steps} Adam steps each:\n    rel-L2 over the whole domain: {rel:.4}   (worst single window {worst_window:.4})\n    against: 0.9144 vanilla and 0.9712 full recipe in the table; 0.8098 soft / 0.9781 hard as ONE global fit; 0.3252 for time marching alone in 8 windows"
+            );
+            assert!(rel < 0.1, "hard constraints and time marching together must solve the advection row: {rel:.4}");
+        });
+    }
+
     /// ⛔⛔ **Hard constraints do NOT fix advection — and the contrast with Helmholtz is the finding.**
     /// `u_t + β u_x = 0` at `β = 30`, periodic on `[0, 2π]`, `u(x,0) = sin x`, exact `sin(x − βt)`. The
     /// table's numbers on this row are **0.9144** (vanilla) and **0.9712** (the full recipe) — no better

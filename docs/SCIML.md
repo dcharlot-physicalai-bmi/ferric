@@ -123,6 +123,32 @@ balancing, which they remove by construction; advection's is the residual landsc
 touch. "Re-run the table with hard constraints" is not a general prescription — it is worth trying per row,
 and the fixtures record both the win and the counterexample.
 
+⭐⭐ **And then the two compose, and the advection row falls: 0.0251.** The diagnosis says advection needs
+the *horizon* shortened, which is what time marching does; hard constraints then remove the one thing time
+marching adds back, namely an initial-condition penalty per window. Eight windows, each carrying its
+initial condition structurally as `u = g(x) + τ·M(sin x, cos x, τ)` where `g` is the previous window's
+solution at its own end, `[3,48,48,1]` per window, 3000 Adam steps each:
+
+| method | rel-L2 |
+|---|---|
+| vanilla recipe (table) | 0.9144 |
+| full recipe (table) | 0.9712 |
+| one global fit, soft conditions | 0.8098 |
+| one global fit, hard conditions | 0.9781 |
+| time marching alone, 8 windows | 0.3252 |
+| **time marching × hard conditions, 8 windows** | **0.0251** |
+
+13× better than marching alone and 36× better than the table's best. The per-window errors are 0.0051,
+0.0095, 0.0140, 0.0205, 0.0261, 0.0321, 0.0352, 0.0365 — mild monotone accumulation, which is how a
+marching scheme is supposed to behave and also its limit: each window inherits the last one's error, so
+more windows is not monotonically better. ⚠ Only the two global-fit rows and this one share a
+configuration; the table rows and the marching-alone number come from other nets and point counts and are
+context, not a controlled comparison.
+
+`g` and `g′` are evaluated once per window and carried as constants, with the residual written out
+(`u_τ = M + τM_τ`, `u_x = g′ + τM_x`) rather than differentiated through a growing stack of frozen networks
+— so the cost per window stays flat instead of growing with the window index.
+
 ⭐⭐ **The middle column was mostly one bad assumption, not four bad rows.** `FourierNet` drew frequencies
 from an isotropic `N(0, σ²)` — one `σ` for every input axis — and the solutions here are anisotropic:
 advection's `sin(x − 30t)` has a wavevector of `(1, 30)` rad/unit, so no single `σ` can serve both. Giving
