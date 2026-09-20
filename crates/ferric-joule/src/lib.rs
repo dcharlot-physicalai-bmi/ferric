@@ -1097,24 +1097,50 @@ impl Meter for Nameplate {
 /// Returns `None` when nothing real is available, rather than silently handing back a [`Nameplate`].
 /// A caller that wants an estimate has to ask for one by name.
 pub fn best() -> Option<Box<dyn Meter>> {
-    if let Some(m) = Rapl::new() { return Some(Box::new(m)); }
-    if let Some(m) = NvidiaSmi::new() { return Some(Box::new(m)); }
-    if let Some(m) = MacBattery::new() { return Some(Box::new(m)); }
-    None
+    METERS.iter().find_map(|(_, make, _)| make())
 }
+
+/// How often [`Macmon`] samples when this module starts one. 100 ms is `macmon`'s own comfortable
+/// cadence; joules come from integrating these samples, so the interval sets the integration error.
+const MACMON_INTERVAL_MS: u64 = 100;
+
+/// **The meters this machine might have, in preference order — ONE list.**
+///
+/// ⛔ This table exists because `best()` and `capability_report()` used to keep SEPARATE lists, and
+/// [`Macmon`] was missing from both. The consequence was measured on the project's own development
+/// machine, an Apple laptop with `macmon` installed and `impl Meter for Macmon` in this very file:
+/// `capability_report()` printed "Nothing measurable here" and `best()` returned `None`. Every
+/// energy claim on the Institute's primary metric routed to the refusal path, on the machine the
+/// work is done on, because a working sudoless meter was never added to two hand-maintained lists.
+///
+/// ⚠ Order matters and is not alphabetical. `Macmon` comes BEFORE `MacBattery` because it reads the
+/// SoC without root and works while plugged in, whereas battery discharge is whole-system and only
+/// exists on battery — so on a desk machine the battery meter is not a fallback, it is nothing.
+#[allow(clippy::type_complexity)]
+static METERS: &[(&str, fn() -> Option<Box<dyn Meter>>, &str)] = &[
+    ("rapl:package", || Rapl::new().map(|m| Box::new(m) as Box<dyn Meter>),
+     "Linux only, CPU package, excludes discrete GPU"),
+    ("nvidia-smi:board", || NvidiaSmi::new().map(|m| Box::new(m) as Box<dyn Meter>),
+     "GPU board only, sampled at ~10 ms so task-level not kernel-level"),
+    ("macos:macmon-soc", || Macmon::start(MacmonScope::Soc, MACMON_INTERVAL_MS).map(|m| Box::new(m) as Box<dyn Meter>),
+     "Apple Silicon SoC (CPU+GPU+RAM), no root, works on mains — integrates sampled power"),
+    ("macos:battery-discharge", || MacBattery::new().map(|m| Box::new(m) as Box<dyn Meter>),
+     "whole system, but ONLY while on battery"),
+];
 
 /// Human-readable account of what this machine can and cannot measure, and why.
 pub fn capability_report() -> String {
     let mut out = String::from("energy measurement on this machine:\n");
-    let rows: [(&str, bool, &str); 3] = [
-        ("rapl:package", Rapl::new().is_some(), "Linux only, CPU package, excludes discrete GPU"),
-        ("nvidia-smi:board", NvidiaSmi::new().is_some(), "GPU board only, sampled at ~10 ms so task-level not kernel-level"),
-        ("macos:battery-discharge", MacBattery::new().is_some(), "whole system, but ONLY while on battery"),
-    ];
-    for (name, ok, note) in rows {
-        out.push_str(&format!("  [{}] {:<26} {}\n", if ok { "available" } else { "  --     " }, name, note));
+    // ⚠ A REAL probe per row, not a guess — each entry constructs its meter and drops it. That costs
+    // a `macmon` spawn and up to its start-up window, which is the honest price of the row meaning
+    // "this machine can actually measure", and it is also why the summary below reads the results
+    // rather than calling `best()` again and probing everything a second time.
+    let probed: Vec<(&str, bool, &str)> =
+        METERS.iter().map(|(name, make, note)| (*name, make().is_some(), *note)).collect();
+    for (name, ok, note) in &probed {
+        out.push_str(&format!("  [{}] {:<26} {}\n", if *ok { "available" } else { "  --     " }, name, note));
     }
-    if best().is_none() {
+    if !probed.iter().any(|(_, ok, _)| *ok) {
         out.push_str("\n  Nothing measurable here. `Nameplate` exists for sizing, is classed Estimated,\n");
         out.push_str("  and Saving::claimable() will refuse to let it back a claim. That refusal is the point.\n");
     }
@@ -1558,5 +1584,65 @@ mod boundary_tests {
         let names: Vec<&str> = power_gates().iter().map(|g| g.name).collect();
         assert!(names.contains(&"paging traffic"), "{names:?}");
         assert!(!names.contains(&"swap in use"), "occupancy gate is retracted: {names:?}");
+    }
+}
+
+#[cfg(test)]
+mod meter_registry_tests {
+    use super::*;
+
+    /// ⛔⛔ THE GATE THAT WOULD HAVE CAUGHT IT. A `Meter` can be fully implemented, documented and
+    /// correct, and still be unreachable — because `best()` and `capability_report()` each kept a
+    /// hand-written list and `Macmon` was in neither. On the project's own Apple development machine,
+    /// with `macmon` installed, the advertised entry point printed "Nothing measurable here".
+    ///
+    /// So this reads THIS FILE and asserts every shipped `impl Meter for X` is reachable from the one
+    /// table. Adding a meter and forgetting to register it now fails the build, which is the only
+    /// mechanism that survives someone in a hurry.
+    #[test]
+    fn every_shipped_meter_is_reachable_from_the_one_table() {
+        const SRC: &str = include_str!("lib.rs");
+        // the test fakes below live under #[cfg(test)]; only the shipped half counts
+        let shipped = &SRC[..SRC.find("#[cfg(test)]").unwrap_or(SRC.len())];
+        let table_start = shipped.find("static METERS").expect("the METERS table");
+        let table = &shipped[table_start..shipped[table_start..].find("];").unwrap() + table_start];
+
+        // Deliberately unreachable, with the reason stated here rather than left to be rediscovered.
+        const EXEMPT: &[(&str, &str)] = &[
+            ("Nameplate", "an Estimated-class stand-in; `best()` must never hand one back silently, \
+                           and Saving::claimable() refuses it — that refusal is the point"),
+        ];
+
+        let mut unreachable = Vec::new();
+        for (i, _) in shipped.match_indices("impl Meter for ") {
+            let rest = &shipped[i + "impl Meter for ".len()..];
+            let ty: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            if ty.is_empty() { continue; }
+            if EXEMPT.iter().any(|(e, _)| *e == ty) { continue; }
+            if !table.contains(&ty) { unreachable.push(ty); }
+        }
+        assert!(unreachable.is_empty(),
+                "these meters are implemented but no entry point can return them: {unreachable:?} — \
+                 add them to METERS or exempt them with a reason");
+    }
+
+    /// The report and the selector must be two views of the same table, not two lists.
+    #[test]
+    fn the_report_has_one_row_per_candidate() {
+        let rows = capability_report().lines().filter(|l| l.contains("[available]") || l.contains("[  --")).count();
+        assert_eq!(rows, METERS.len(), "capability_report drifted from METERS");
+        for (name, _, _) in METERS {
+            assert!(capability_report().contains(name), "{name} is in METERS but not in the report");
+        }
+    }
+
+    /// ⚠ `Macmon` before `MacBattery`, because on a desk machine battery discharge is not a fallback
+    /// — it is nothing. Order is load-bearing and silent when wrong.
+    #[test]
+    fn macmon_outranks_battery_discharge() {
+        let names: Vec<&str> = METERS.iter().map(|(n, _, _)| *n).collect();
+        let m = names.iter().position(|n| n.contains("macmon")).expect("macmon must be registered");
+        let b = names.iter().position(|n| n.contains("battery")).expect("battery must be registered");
+        assert!(m < b, "macmon must be preferred over battery discharge, got {names:?}");
     }
 }
