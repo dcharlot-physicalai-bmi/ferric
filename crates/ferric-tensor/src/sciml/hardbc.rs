@@ -151,6 +151,118 @@ mod tests {
     }
 
 
+
+    /// ⭐ **Testing the burgers prediction.** The diagnosis says burgers is residual-landscape-limited like
+    /// advection, so marching should be its fix too. The machinery is heavier: the residual needs `u_xx`,
+    /// so each window must carry `g″` as well as `g` and `g′`, and a second derivative accumulated from
+    /// window to window is the obvious place for this to fall apart. With
+    /// `u = g(x) + τ(1−x²)·M(x,τ)` and `b = 1−x²`:
+    ///
+    /// ```text
+    /// u_τ  = b(M + τ M_τ)
+    /// u_x  = g′  + τ(−2x·M + b·M_x)
+    /// u_xx = g″  + τ(−2M − 4x·M_x + b·M_xx)
+    /// ```
+    ///
+    /// The boundary stays exact across every window for free: `u(±1) = g(±1)` because `b(±1) = 0`, and
+    /// `g` starts at `−sin(πx)`, which is already zero there.
+    #[ignore = "trains eight burgers windows on the GPU (~25 min); run with -- --ignored"]
+    #[test]
+    fn marching_with_hard_conditions_on_the_burgers_row() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (nx, ntau, windows, steps) = (128usize, 16usize, 8usize, 3000u32);
+            let nu = 0.01 / std::f64::consts::PI;
+            let n = nx * ntau;
+            let dt = 1.0f32 / windows as f32;
+            let xs: Vec<f32> = (0..nx).map(|i| -1.0 + 2.0 * (i as f32 + 0.5) / nx as f32).collect();
+            let taus: Vec<f32> = (0..ntau).map(|j| dt * j as f32 / (ntau as f32 - 1.0)).collect();
+            let mut pts = vec![0.0f32; n * 2];
+            for (i, &xv) in xs.iter().enumerate() {
+                for (j, &tv) in taus.iter().enumerate() {
+                    pts[(i * ntau + j) * 2] = xv;
+                    pts[(i * ntau + j) * 2 + 1] = tv;
+                }
+            }
+            let tile = |v: &[f32]| -> Vec<f32> { (0..n).map(|k| v[k / ntau]).collect() };
+            let bx: Vec<f32> = (0..n).map(|k| 1.0 - xs[k / ntau] * xs[k / ntau]).collect();
+            let bpx: Vec<f32> = (0..n).map(|k| -2.0 * xs[k / ntau]).collect();
+            let bv = leaf(&ctx, &bx, &[n, 1]);
+            let bpv = leaf(&ctx, &bpx, &[n, 1]);
+            let two = leaf(&ctx, &[2.0f32], &[1]);
+            let nuv = leaf(&ctx, &[nu as f32], &[1]);
+            let pi = std::f32::consts::PI;
+            let mut g: Vec<f32> = xs.iter().map(|&x| -(pi * x).sin()).collect();
+            let mut gp: Vec<f32> = xs.iter().map(|&x| -pi * (pi * x).cos()).collect();
+            let mut gpp: Vec<f32> = xs.iter().map(|&x| pi * pi * (pi * x).sin()).collect();
+
+            let (mut num_all, mut den_all, mut worst) = (0.0f64, 0.0f64, 0.0f32);
+            for w in 0..windows {
+                let t0 = w as f32 * dt;
+                let net = Mlp::new(&ctx, &[2, 64, 64, 1], 13 + w as u32);
+                let mut wp = net.params.clone();
+                let mut adam = crate::Adam::new(&wp, 3e-3);
+                let gv = leaf(&ctx, &tile(&g), &[n, 1]);
+                let gpv = leaf(&ctx, &tile(&gp), &[n, 1]);
+                let gppv = leaf(&ctx, &tile(&gpp), &[n, 1]);
+                let parts = |pv: &[Var], x: &Var| {
+                    let tc = col_of(&ctx, x, 2, 1);
+                    let mm = Mlp::forward_act(pv, x, Act::Tanh);
+                    let d1 = crate::sciml::deriv(&mm, x);
+                    let mx = col_of(&ctx, &d1, 2, 0);
+                    let mt = col_of(&ctx, &d1, 2, 1);
+                    let mxx = col_of(&ctx, &crate::sciml::deriv(&mx, x), 2, 0);
+                    let u = gv.add(&tc.mul(&bv).mul(&mm));
+                    let ut = bv.mul(&mm.add(&tc.mul(&mt)));
+                    let ux = gpv.add(&tc.mul(&bpv.mul(&mm).add(&bv.mul(&mx))));
+                    let uxx = gppv.add(&tc.mul(
+                        &mm.mul(&two).neg().add(&bpv.mul(&mx).mul(&two)).add(&bv.mul(&mxx)),
+                    ));
+                    (u, ut, ux, uxx)
+                };
+                for ep in 0..steps {
+                    if ep == steps * 3 / 4 {
+                        adam = crate::Adam::new(&wp, 3e-4);
+                    }
+                    let pv = vars(&wp);
+                    let x = leaf(&ctx, &pts, &[n, 2]);
+                    let (u, ut, ux, uxx) = parts(&pv, &x);
+                    let r = ut.add(&u.mul(&ux)).sub(&uxx.mul(&nuv));
+                    let loss = r.mul(&r).mean_all();
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+                let pv = vars(&wp);
+                let x = leaf(&ctx, &pts, &[n, 2]);
+                let (u, _, ux, uxx) = parts(&pv, &x);
+                let (uv, uxv, uxxv) = (u.value().to_vec().await, ux.value().to_vec().await, uxx.value().to_vec().await);
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for (i, &xv) in xs.iter().enumerate() {
+                    for (j, &tv) in taus.iter().enumerate() {
+                        let want = crate::sciml::bench::burgers(xv as f64, (t0 + tv) as f64, nu) as f32;
+                        num += (uv[i * ntau + j] - want).powi(2) as f64;
+                        den += (want * want) as f64;
+                    }
+                }
+                let e = (num / den).sqrt() as f32;
+                worst = worst.max(e);
+                num_all += num;
+                den_all += den;
+                for i in 0..nx {
+                    let k = i * ntau + (ntau - 1);
+                    g[i] = uv[k];
+                    gp[i] = uxv[k];
+                    gpp[i] = uxxv[k];
+                }
+                eprintln!("    [banked] burgers window {w} (t ∈ [{t0:.3}, {:.3}]): rel-L2 in-window {e:.4}", t0 + dt);
+            }
+            let rel = (num_all / den_all).sqrt() as f32;
+            eprintln!(
+                "  burgers ν=0.01/π, {windows} time windows × hard conditions, [2,64,64,1] per window, {steps} Adam steps each:\n    rel-L2 over the whole domain: {rel:.4}   (worst single window {worst:.4})\n    against: 0.2079 vanilla and 0.2434 full recipe in the table; 0.1980 soft / 0.3957 hard as ONE global fit; and 0.0050 for the ansatz regressed onto the reference"
+            );
+            assert!(rel < 0.1, "marching must fix the burgers row if the residual-landscape diagnosis is right: {rel:.4}");
+        });
+    }
+
     /// ⭐ **Which failure mode is it, then?** The regression fixture rules representation out, leaving the
     /// two the other rows turned on: the loss balancing a soft boundary penalty forces (Helmholtz's), or
     /// the residual landscape (advection's). Hard constraints separate them — they remove the first

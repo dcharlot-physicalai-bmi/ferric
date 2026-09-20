@@ -157,16 +157,31 @@ the residual landscape.
 | heat | — | 0.0448 | — | already solved by the recipe (0.0082) |
 | helmholtz | — | 0.3066 (table) | **0.0059 / 0.0064** | **loss balancing** |
 | advection | 0.0142 | 0.8098 | 0.9781 | **residual landscape** → marching × hard ICs, **0.0251** |
-| burgers | **0.0050** | 0.1980 | 0.3957 | representation ruled out; balancing ruled out → **residual landscape** |
+| burgers | **0.0050** | 0.1980 | 0.3957 | representation ruled out; balancing ruled out → **residual landscape** → marching × hard, **0.0142** |
+
+**All four rows now have a diagnosis, and the two the recipes could not reach are solved:**
+
+| row | recipe table's best | after diagnosis | |
+|---|---|---|---|
+| heat | **0.0082** | — | the recipe already reaches it |
+| helmholtz | 0.3066 | **0.0059 / 0.0064** | hard constraints, ~50× |
+| advection | 0.9712 | **0.0251** | marching × hard conditions, 36× |
+| burgers | 0.2079 | **0.0142** | marching × hard conditions, 14× |
 
 Burgers is the row where the obvious suspect was wrong twice over. The shock at `ν = 0.01/π` is genuinely
 steep — the reference jumps **0.615** between neighbouring `x` at `t = 1` on a `Δx = 0.0078` grid — so
 spectral bias looked like the limit, and it is not: the ansatz regresses onto the reference at **0.0050**,
 and a much larger net does no better (0.0056). Nor is it loss balancing: hard constraints make it *worse*
 (0.3957 against 0.1980 soft), exactly as on advection. By elimination it is the residual landscape, which
-predicts that marching is its fix too. ⚠ That prediction is **not yet measured** — burgers marching has to
-carry `g″` from window to window because the residual needs `u_xx`, and until that is built and run,
-nothing is claimed about it.
+predicts that marching is its fix too — **and it does: 0.0142** over eight windows, 14× the table's best
+and within 3× of the 0.0050 the ansatz can express at all. Per-window errors 0.0006, 0.0014, 0.0093, 0.0127,
+0.0102, 0.0157, 0.0304, 0.0283.
+
+Burgers marching has to carry `g″` from window to window, because the residual needs `u_xx` and the ansatz's
+second derivative is `g″ + τ(−2M − 4x·M_x + b·M_xx)`. A second derivative accumulated across windows was the
+obvious place for this to fall apart, and it did not — but that is the thing to watch if the window count
+goes up. The boundary stays exact across every window for free: `u(±1) = g(±1)` because `b(±1) = 0`, and `g`
+starts at `−sin(πx)`, which is already zero there.
 
 `g` and `g′` are evaluated once per window and carried as constants, with the residual written out
 (`u_τ = M + τM_τ`, `u_x = g′ + τM_x`) rather than differentiated through a growing stack of frozen networks
