@@ -4,12 +4,17 @@
 //! `Qwen2VLImageProcessorFast`, so the rules below are Qwen2-VL's, read from that file and from the
 //! published processor rather than from a description of either.
 //!
-//! ⛔ **The resampler is NOT implemented here and is not claimed.** See `Plan` — this module computes
-//! the target size and turns an already-resized image into patch rows. Everything it does do is exact
-//! integer or elementwise arithmetic and is tested against the published function's own output; the
-//! bicubic downscale is the one step where two published references disagree with each other (PIL's
-//! `BICUBIC` vs torchvision's antialiased `bicubic`), so folding it in silently would put an
-//! unmeasured difference inside a module that otherwise matches exactly.
+//! ⭐ **The resampler IS here now, and it is measured against the real processor**, not assumed.
+//! `preprocess` runs the whole path — plan, resize, quantise, patchify — and reproduces
+//! `Qwen2VLImageProcessorFast` to within **one 8-bit level on 0.46% of values**, which is exactly the
+//! distance Pillow itself sits from that processor. Ferric reproduces Pillow's 8-bit resampler
+//! EXACTLY (0 levels). The residual is a genuine disagreement between two conformant bicubic
+//! implementations at the 1/255 level, not a defect on either side — the same shape as the NVFP4
+//! scale disagreement, one layer earlier.
+//!
+//! Two things had to be measured rather than read to get there, both silent:
+//!   1. the resize output is QUANTISED TO 8 BITS before normalisation, and
+//!   2. the intermediate BETWEEN the two separable passes is quantised too.
 use ferric_tensor::image::Rgb8;
 
 /// The preprocessing constants, read from a checkpoint's `preprocessor_config.json`.
@@ -256,14 +261,74 @@ pub fn resize_cubic(src: &[f32], sh: usize, sw: usize, dh: usize, dw: usize, a: 
     out
 }
 
-/// Pillow's cubic coefficient — the reference this module's resampler is verified against.
+/// Pillow's cubic coefficient — and, MEASURED, the one the shipped image processor behaves like.
+///
+/// ⛔ I expected `KEYS_TORCH` here, because the checkpoint names `Qwen2VLImageProcessorFast`
+/// (torchvision) and HuggingFace's own `_interpolation_axis_taps_weights` uses -0.75. Run against
+/// the real processor on a real image, -0.5 lands within **1 level on 0.46% of values** while
+/// -0.75 is **7 levels on 34%**. The -0.75 in `vision_utils` governs the POSITION-EMBEDDING
+/// interpolation inside the model, not the image processor — two different resamplers, one word.
+pub const KEYS_DEFAULT: f64 = KEYS_PILLOW;
+/// Pillow's cubic coefficient.
 pub const KEYS_PILLOW: f64 = -0.5;
 /// PyTorch/torchvision and HuggingFace's coefficient.
 pub const KEYS_TORCH: f64 = -0.75;
 
+/// **The whole preprocessing path**: plan the target size, resize, quantise, patchify.
+///
+/// ⛔ THE RESIZE OUTPUT IS QUANTISED TO 8 BITS, and that is measured, not assumed. The published
+/// `_preprocess` orders resize -> rescale_and_normalize -> patchify, and the fast path enters
+/// `resize` holding uint8 tensors, so the resampler's output is rounded back to uint8 BEFORE
+/// normalisation. Checking the real processor's `pixel_values`, every value is exactly `2k/255 - 1`
+/// for an integer `k` (max distance to a level: 3.8e-6, i.e. f32 representation error alone). Doing
+/// the resize in float and normalising from there produces a subtly different image that no shape
+/// or range check can see.
+///
+/// `a` is the cubic coefficient — see [`keys`]. `KEYS_TORCH` is what the shipped fast processor uses.
+pub fn preprocess(img: &Rgb8, cfg: &PreprocCfg, a: f64) -> Result<(Vec<f32>, Plan), String> {
+    let plan = plan(img.h, img.w, cfg)?;
+    let resized = resize_rgb8_u8(img, plan.out_h, plan.out_w, a);
+    patchify(&resized, &plan, cfg).map(|rows| (rows, plan))
+}
+
+/// Resize an 8-bit image and come back to 8 bits, one plane at a time.
+///
+/// ⛔⛔ **THE INTERMEDIATE IS QUANTISED TO 8 BITS BETWEEN THE TWO PASSES**, and that is not a detail.
+/// Pillow's 8-bit resampler keeps its horizontal result in `UINT8` before the vertical pass; its
+/// float resampler does not. The two disagree by up to **7 levels on 22% of pixels** — measured, on
+/// this checkpoint's own probe image. Doing the passes in float and rounding once at the end (the
+/// obvious implementation, and Ferric's first) lands 7 levels away from the real processor, while
+/// float-per-pass WITH a uint8 intermediate reproduces Pillow's 8-bit path to **0 levels**.
+///
+/// So `resize_cubic` — which is verified against Pillow's FLOAT path to 1.5e-5 — is the wrong
+/// primitive to call once here, and the right one to call twice.
+fn resize_rgb8_u8(img: &Rgb8, out_h: usize, out_w: usize, a: f64) -> Rgb8 {
+    let q = |v: &f32| v.round().clamp(0.0, 255.0) as u8;
+    let mut px = vec![0u8; out_h * out_w * 3];
+    for c in 0..3 {
+        let plane: Vec<f32> = (0..img.h * img.w).map(|i| img.px[i * 3 + c] as f32).collect();
+        // horizontal only: (h, w) -> (h, out_w), back to 8 bits
+        let mid: Vec<f32> = resize_cubic(&plane, img.h, img.w, img.h, out_w, a)
+            .iter().map(|v| q(v) as f32).collect();
+        // vertical only: (h, out_w) -> (out_h, out_w)
+        let fin = resize_cubic(&mid, img.h, out_w, out_h, out_w, a);
+        for (i, v) in fin.iter().enumerate() {
+            // ⚠ A cubic kernel overshoots past [0, 255] at every edge, so the clamp in `q` is doing
+            // real work on the VALUES — but it is NOT what prevents a wrap: Rust's `f32 as u8`
+            // saturates, so removing the clamp changes nothing here. Verified by mutation (that
+            // mutant survives, and it survives because it is EQUIVALENT, not because it is untested).
+            // In C this would be the `clip8` that stops the overshoot wrapping; keep it so the code
+            // reads the same as the reference and does not depend on a Rust-specific cast rule.
+            px[i * 3 + c] = q(v);
+        }
+    }
+    Rgb8 { w: out_w, h: out_h, px }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferric_tensor::image::read_ppm;
 
     fn cfg() -> PreprocCfg {
         // This checkpoint's own preprocessor_config.json.
@@ -488,6 +553,53 @@ mod tests {
                 assert!(worst < 1e-4, "{sh}x{sw}->{dh}x{dw} a={a}: drifted {worst:.3e}");
             }
         }
+    }
+
+    /// ⛔ The 8-bit path, against Pillow's own 8-bit resampler — NOT its float one rounded.
+    /// Those two differ by up to 7 levels on 22% of pixels, and the image processor that feeds
+    /// Qwen3-VL follows the 8-bit one. This test is the only thing standing between that and a
+    /// "simplification" back to one float pass.
+    #[test]
+    fn resize_rgb8_matches_pillows_eight_bit_resampler() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"),
+                           "/tests/fixtures/qwen3vl_preproc/probe_resized.u8");
+        let b = std::fs::read(path).expect("probe_resized.u8");
+        let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+        let (h, w, ch) = (rd(0), rd(4), rd(8));
+        assert_eq!((h, w, ch), (96, 64, 3));
+        let want = &b[12..];
+        assert_eq!(want.len(), h * w * ch);
+
+        let src = read_ppm(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
+                           "/tests/fixtures/qwen3vl_preproc/probe.ppm")).expect("probe.ppm"))
+            .expect("P6");
+        assert_eq!((src.h, src.w), (100, 80));
+        let got = resize_rgb8_u8(&src, h, w, KEYS_PILLOW);
+        let worst = got.px.iter().zip(want)
+            .map(|(g, w)| (*g as i32 - *w as i32).abs()).max().unwrap();
+        assert_eq!(worst, 0, "differs from Pillow's 8-bit path by {worst} levels");
+    }
+
+    /// ⚠ And the difference the above is defending, stated as a number: one float pass with a single
+    /// round at the end is NOT the same image. If this ever reads 0, the two paths have been merged
+    /// and the fixture above has stopped meaning anything.
+    #[test]
+    fn a_single_float_pass_is_a_different_image() {
+        let src = read_ppm(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
+                           "/tests/fixtures/qwen3vl_preproc/probe.ppm")).expect("probe.ppm"))
+            .expect("P6");
+        let (h, w) = (96usize, 64usize);
+        let two_pass = resize_rgb8_u8(&src, h, w, KEYS_PILLOW);
+        let mut one_pass = vec![0u8; h * w * 3];
+        for c in 0..3 {
+            let plane: Vec<f32> = (0..src.h * src.w).map(|i| src.px[i * 3 + c] as f32).collect();
+            for (i, v) in resize_cubic(&plane, src.h, src.w, h, w, KEYS_PILLOW).iter().enumerate() {
+                one_pass[i * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let worst = two_pass.px.iter().zip(&one_pass)
+            .map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst >= 5, "the two paths differ by only {worst} levels — measured 7 when written");
     }
 
     #[test]

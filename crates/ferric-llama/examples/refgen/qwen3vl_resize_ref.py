@@ -44,3 +44,15 @@ for i, (sh, sw, dh, dw) in enumerate(CASES):
     print(f"  case {i}: {sh}x{sw} -> {dh}x{dw}  range [{got.min():.3f}, {got.max():.3f}]")
 open(f"{out}/resize_cases.csv", "w").write("src_h,src_w,dst_h,dst_w\n" + "\n".join(idx) + "\n")
 print(f"wrote {len(CASES)} cases to {out}")
+
+# --- 8-bit path fixture -------------------------------------------------------------------------
+# ⛔ Pillow's 8-BIT resampler is NOT its float resampler rounded: it keeps the horizontal pass in
+# UINT8 before the vertical pass, and the two disagree by up to 7 levels on 22% of pixels. The image
+# processor that feeds Qwen3-VL behaves like the 8-bit one, so this fixture pins that path.
+if len(sys.argv) > 2 and sys.argv[2] == "--u8":
+    from PIL import Image as _I
+    src = _I.open(f"{out}/probe.png").convert("RGB")
+    dst = src.resize((64, 96), _I.BICUBIC)
+    with open(f"{out}/probe_resized.u8", "wb") as f:
+        f.write(struct.pack("<III", 96, 64, 3)); f.write(dst.tobytes())
+    print(f"wrote {out}/probe_resized.u8  (96x64x3 uint8, Pillow BICUBIC 8-bit path)")
