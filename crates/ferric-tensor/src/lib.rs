@@ -780,6 +780,21 @@ impl Tensor {
     /// shifts every sample by half a pixel, which survives as a plausible-looking image and a wrong
     /// embedding.
     pub fn resize_bilinear(&self, out_h: usize, out_w: usize) -> Tensor {
+        self.resize_bilinear_impl(out_h, out_w, false)
+    }
+
+    /// The **align-corners** sibling: `src = dst * (in-1)/(out-1)`, endpoints preserved exactly.
+    ///
+    /// ⛔ Not a variant spelling of the above — the two differ by half a pixel everywhere, and the
+    /// doc on `resize_bilinear` exists because that difference is invisible downstream. Qwen3-VL's
+    /// learned position grid needs THIS one: llama.cpp passes `GGML_SCALE_FLAG_ALIGN_CORNERS` and
+    /// HF's hand-rolled `fast_pos_embed_interpolate` uses `linspace(0, side-1, n)`, which is the
+    /// same rule. Image preprocessing still needs the half-pixel form, so both ship.
+    pub fn resize_bilinear_align_corners(&self, out_h: usize, out_w: usize) -> Tensor {
+        self.resize_bilinear_impl(out_h, out_w, true)
+    }
+
+    fn resize_bilinear_impl(&self, out_h: usize, out_w: usize, align: bool) -> Tensor {
         let c = self.contiguous();
         assert_eq!(c.rank(), 3, "resize_bilinear expects [H, W, C]");
         let (h, w, ch) = (c.shape[0], c.shape[1], c.shape[2]);
@@ -788,7 +803,8 @@ impl Tensor {
         let (grid, rs) = groups2d(n);
         run(&self.ctx, RESIZE_BILINEAR_WGSL, "resize_bilinear",
             &[c.buf.as_ref(), &out,
-              &u32buf(&self.ctx, &[h as u32, w as u32, ch as u32, out_h as u32, out_w as u32, rs, n as u32])],
+              &u32buf(&self.ctx, &[h as u32, w as u32, ch as u32, out_h as u32, out_w as u32, rs,
+                                   n as u32, u32::from(align)])],
             grid);
         Tensor::from_parts(&self.ctx, out, vec![out_h, out_w, ch])
     }
@@ -2822,7 +2838,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 const RESIZE_BILINEAR_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:    array<f32>;   // [H, W, C]
 @group(0) @binding(1) var<storage,read_write>  out:  array<f32>;   // [OH, OW, C]
-@group(0) @binding(2) var<storage,read>        info: array<u32>;   // H, W, C, OH, OW, rs, tot
+@group(0) @binding(2) var<storage,read>        info: array<u32>;   // H, W, C, OH, OW, rs, tot, align
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = info[0]; let w = info[1]; let ch = info[2];
@@ -2832,9 +2848,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c  = idx % ch;
     let ox = (idx / ch) % ow;
     let oy = idx / (ch * ow);
-    // Half-pixel centres, matching GGML_SCALE_MODE_BILINEAR.
-    let sx = (f32(ox) + 0.5) * f32(w) / f32(ow) - 0.5;
-    let sy = (f32(oy) + 0.5) * f32(h) / f32(oh) - 0.5;
+    // Two conventions, and they are NOT interchangeable — half a pixel of shift survives as a
+    // plausible image and a wrong embedding.
+    //   align == 0 : half-pixel centres, GGML_SCALE_MODE_BILINEAR
+    //   align == 1 : ALIGN_CORNERS, src = dst * (in-1)/(out-1) — what Qwen3-VL's position grid uses
+    //                (llama.cpp sets GGML_SCALE_FLAG_ALIGN_CORNERS; HF's hand-rolled version is
+    //                linspace(0, side-1, n) + floor/ceil weights, which is the same thing)
+    var sx: f32; var sy: f32;
+    if (info[7] == 1u) {
+        sx = select(0.0, f32(ox) * f32(w - 1u) / f32(ow - 1u), ow > 1u);
+        sy = select(0.0, f32(oy) * f32(h - 1u) / f32(oh - 1u), oh > 1u);
+    } else {
+        sx = (f32(ox) + 0.5) * f32(w) / f32(ow) - 0.5;
+        sy = (f32(oy) + 0.5) * f32(h) / f32(oh) - 0.5;
+    }
     let x0 = max(i32(floor(sx)), 0);
     let y0 = max(i32(floor(sy)), 0);
     let x1 = min(x0 + 1, i32(w) - 1);
