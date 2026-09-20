@@ -190,7 +190,7 @@ impl VisionTower {
 /// ⚠ It is also the order the PIXEL ROWS ALREADY ARRIVE IN — the image processor's
 /// `permute(0,3,6,4,7,2,1,5,8)` emits it — so this must never be used to reorder them. Doing that
 /// once cost rel 5.7e-1 against the published tower with every assertion still green.
-fn sweep_rc(m: usize, gw: usize, i: usize) -> (usize, usize) {
+pub(crate) fn sweep_rc(m: usize, gw: usize, i: usize) -> (usize, usize) {
     let by = i / (m * m * (gw / m));
     let bx = (i / (m * m)) % (gw / m);
     let dy = (i / m) % m;

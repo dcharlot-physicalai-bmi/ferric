@@ -98,6 +98,8 @@ pub mod hyv4;
 pub mod glimmer_vision; // Muse Glimmer ViT: mmproj in, image tokens out
 /// Qwen3-VL vision tower — patch embed, 24 blocks, 2x2 merge, merger + 3 deepstack mergers.
 pub mod qwen3vl_vision;
+/// Qwen3-VL image preprocessing — smart_resize, patch rows. Resampler NOT included.
+pub mod qwen3vl_image;
 pub mod parakeet;       // NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T decoder
 pub mod unipc;
 
