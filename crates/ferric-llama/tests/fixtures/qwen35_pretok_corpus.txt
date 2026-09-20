@@ -1,0 +1,20 @@
+Hello-Reyes
+the year 2026 and 1999
+don't can't it's we're they've I'll
+print(x)  # 3.14
+CamelCaseWord snake_case kebab-case
+a--b a-1 x    y
+café déjà-vu naïve résumé
+Grüße aus München
+Θεσσαλονίκη καλημέρα
+Москва и Санкт-Петербург
+مرحبا بالعالم
+नमस्ते दुनिया
+สวัสดีชาวโลก
+こんにちは世界
+한국어 텍스트입니다
+Tiếng Việt có dấu
+עברית עם ניקוד
+let v: Vec<u32> = (0..10).collect();
+https://example.com/a?b=1&c=2
+e-mail: a.b@c.de

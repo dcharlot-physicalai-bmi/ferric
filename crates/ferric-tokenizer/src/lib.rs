@@ -84,8 +84,30 @@ impl Pre {
     pub fn from_gguf(pre: Option<&str>) -> Pre {
         match pre {
             Some("qwen2") => Pre::Qwen2,
+            // ⛔ Qwen 3.5 declares `qwen35` and llama.cpp gives it its OWN pre-type
+            // (LLAMA_VOCAB_PRE_TYPE_QWEN35, llama-vocab.cpp:2223) — NOT qwen2's. Its regex is qwen2's
+            // with combining marks folded into the letter run: `[\p{L}\p{M}]+` instead of `\p{L}+`
+            // (unicode.cpp:608-609). Ferric has no \p{M} predicate, so qwen2 is the closest rule it
+            // owns, and it is a MEASURED improvement rather than a guess — against `llama-tokenize`
+            // on apodex-1.1-mini (pre=qwen35), over a 20-string multi-script corpus:
+            //     Gpt2 (what this did before) 12/20 · Qwen2 19/20 · Hyv4 17/20
+            // ⚠ THE RESIDUAL IS NAMED, NOT HIDDEN: the single miss is Devanagari, because Rust's
+            // `char::is_alphabetic()` is TRUE for Other_Alphabetic marks (U+0947 vowel sign) and
+            // FALSE for the virama (U+094D), so a letter run breaks mid-syllable. Closing it needs a
+            // real \p{M} table (321 Mn/Mc/Me ranges); `pretokenizer_conformance` is the gate that
+            // would show it closing. Until then this is right for Latin/Cyrillic/Greek/CJK and
+            // imperfect for Indic — stated here so nobody has to rediscover it.
+            Some("qwen35") => Pre::Qwen2,
             // llama.cpp maps deepseek3-llm and hunyuan-dense to the identical regex string.
             Some("hyv4") | Some("deepseek3-llm") | Some("hunyuan-dense") => Pre::Hyv4,
+            // ⚠ FALL-OPEN, AND ITS SIZE IS MEASURED. An unmapped value silently becomes GPT-2,
+            // "which is what the tree did unconditionally before this existed". A survey of the 32
+            // GGUFs on the development machine found 16 declaring a `pre` that lands here:
+            //   qwen35 (now mapped) · default · llama-bpe · lfm2 · pixtral · llama4 · laguna · deepseek-llm
+            // Each needs its own check against `llama-tokenize` before being mapped — qwen35 showed
+            // why guessing by family is not safe: the obvious inference (it is a Qwen, so qwen2)
+            // would have been right for English and wrong for Hindi. Use
+            // `examples/pretokenizer_conformance` with a reference corpus to settle one.
             _ => Pre::Gpt2,
         }
     }
@@ -795,5 +817,50 @@ mod sentencepiece_routing_tests {
         assert!(sp.iter().all(|t| !t.starts_with('\u{0120}')),
                 "a SentencePiece vocabulary carries no Ġ pieces for BPE to merge spaces into");
         assert!(sentencepiece_fraction(&sp) > 0.05, "so the guard must fire on it");
+    }
+}
+
+#[cfg(test)]
+mod qwen35_pretokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn qwen35_uses_the_qwen_rule_not_gpt2() {
+        assert_eq!(Pre::from_gguf(Some("qwen35")), Pre::Qwen2,
+                   "qwen35 fell through to GPT-2, which splits `-Reyes` and makes the merge `- Re` \
+                    unreachable; measured 12/20 vs 19/20 against llama-tokenize");
+        // ⛔ and the neighbours must not move with it
+        assert_eq!(Pre::from_gguf(Some("qwen2")), Pre::Qwen2);
+        assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "still unmapped, deliberately");
+    }
+
+    /// The constructs the two rules actually differ on — ordinary prose agrees under both, which is
+    /// why this went unnoticed on a checkpoint the registry lists as Verified.
+    #[test]
+    fn the_qwen_rule_keeps_a_lead_punctuation_char_with_its_word() {
+        assert_eq!(pretokenize_with("Hello-Reyes", Pre::Qwen2), vec!["Hello", "-Reyes"]);
+        assert_eq!(pretokenize_with("Hello-Reyes", Pre::Gpt2), vec!["Hello", "-", "Reyes"]);
+        assert_eq!(pretokenize_with("café", Pre::Qwen2), vec!["café"]);
+    }
+
+    /// ⛔⛔ **A RECORDED GAP, ASSERTED SO IT CANNOT BE FORGOTTEN.** llama.cpp gives `qwen35` its own
+    /// pre-type whose letter run is `[\p{L}\p{M}]+`; Ferric's `is_l` is `char::is_alphabetic()`,
+    /// which is TRUE for Other_Alphabetic marks (U+0947 DEVANAGARI VOWEL SIGN E) and FALSE for the
+    /// virama (U+094D). So a Devanagari syllable splits at the virama and Ferric emits 7 ids where
+    /// llama.cpp emits 6 — the single miss in an otherwise 19/20 corpus.
+    ///
+    /// ⭐ This test asserts the CURRENT, WRONG behaviour on purpose. When a real \p{M} predicate
+    /// lands, this test fails, and its failure is the instruction to update it — which is the only
+    /// way a known limitation stays known.
+    #[test]
+    fn devanagari_still_splits_at_the_virama_known_gap() {
+        let split = pretokenize_with("नमस्ते", Pre::Qwen2);
+        assert!(split.len() > 1,
+                "Devanagari now stays whole ({split:?}) — a \\p{{M}} predicate must have landed. \
+                 Re-run examples/pretokenizer_conformance; if it is 20/20, delete this test and \
+                 update the note in Pre::from_gguf.");
+        // the break is at the virama specifically, not anywhere
+        assert!('\u{094D}'.is_alphabetic() == false, "U+094D virama is not Alphabetic in Rust");
+        assert!('\u{0947}'.is_alphabetic(), "U+0947 vowel sign IS Alphabetic (Other_Alphabetic)");
     }
 }
