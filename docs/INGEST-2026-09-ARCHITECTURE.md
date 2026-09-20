@@ -175,6 +175,15 @@ cross-implementation divergences:
   implementation-defined conversion recipes"; NVFP4's global-scale divisor is likewise free (448 vs 256
   vs adaptive). **Two conformant quantizers produce different files from identical BF16 weights.**
 
+**A sixth, found first-hand while building against it (2026-09-20):** *"bicubic" does not name a
+resampler.* Pillow's `BICUBIC` is the Keys kernel with **a = −0.5**; PyTorch/torchvision and
+HuggingFace's own `_interpolation_axis_taps_weights` use **a = −0.75**. Measured here by impulse
+response, not read from a document: residual **0.000e+00** against a = −0.5 and **3.69e-2** against
+a = −0.75. Qwen3-VL's `preprocessor_config.json` says only `"resample": 3`, and its named processor
+(`Qwen2VLImageProcessorFast`) is the torch one while the slow sibling is the PIL one — so the same
+config selects two different kernels depending on which class loads it. This is the same failure
+shape as the NVFP4 scale disagreement, one layer earlier: in the *pixels*, before any weight is read.
+
 → **Decode can be bit-exact; encode cannot be assumed to be.** That is a crisp, defensible thesis, it is
 exactly the seam Ferric already owns (*cross-fabric identity boundary*: hashes differ per **adapter**),
 and it hands us five concrete regression targets. Accumulation is also below IEEE independently of

@@ -172,6 +172,95 @@ pub fn patchify(img: &Rgb8, plan: &Plan, cfg: &PreprocCfg) -> Result<Vec<f32>, S
     Ok(out)
 }
 
+/// The Keys cubic kernel. `a` is the convention, and it is **not** agreed across references.
+///
+/// ⛔ Pillow's `BICUBIC` uses **a = -0.5**; PyTorch/torchvision and HuggingFace's own
+/// `_interpolation_axis_taps_weights` use **a = -0.75**. Established by impulse response, not read
+/// from a document: against Pillow's output the residual is 0.000e+00 at a = -0.5 and 3.69e-2 at
+/// a = -0.75. So "bicubic" alone does not name a resampler, and a preprocessing path that says only
+/// "bicubic" has not specified itself.
+#[inline]
+fn keys(x: f64, a: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 { ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0 }
+    else if x < 2.0 { (((x - 5.0) * x + 8.0) * x - 4.0) * a }
+    else { 0.0 }
+}
+
+/// Per-output-pixel taps for one axis, with the **support scaled by the downscale factor** — the
+/// "antialias" behaviour. Without it, downscaling by 4x reads 4 source pixels out of every 16 and
+/// aliases; with it the filter widens to cover them all.
+fn axis_taps(in_size: usize, out_size: usize, a: f64) -> (Vec<(usize, usize)>, Vec<f64>, usize) {
+    let scale = in_size as f64 / out_size as f64;
+    let filterscale = scale.max(1.0);
+    let support = 2.0 * filterscale;
+    let ksize = (support.ceil() as usize) * 2 + 1;
+    let mut bounds = Vec::with_capacity(out_size);
+    let mut kk = vec![0f64; out_size * ksize];
+    for xx in 0..out_size {
+        let center = (xx as f64 + 0.5) * scale;
+        let ss = 1.0 / filterscale;
+        // ⚠ C's `(int)` truncates toward zero; these are clamped straight after, exactly as Pillow
+        // does, so the truncation only ever matters on the positive side.
+        let mut xmin = (center - support + 0.5) as i64;
+        if xmin < 0 { xmin = 0; }
+        let mut xmax = (center + support + 0.5) as i64;
+        if xmax > in_size as i64 { xmax = in_size as i64; }
+        let n = (xmax - xmin).max(0) as usize;
+        let xmin = xmin as usize;
+        let mut ww = 0.0;
+        for i in 0..n {
+            let w = keys(((i + xmin) as f64 - center + 0.5) * ss, a);
+            kk[xx * ksize + i] = w;
+            ww += w;
+        }
+        // Normalising to 1 is what keeps a flat region flat at every scale; it is also why a wrong
+        // kernel constant does NOT show up as a brightness shift, only as different sharpness.
+        if ww != 0.0 { for i in 0..n { kk[xx * ksize + i] /= ww; } }
+        bounds.push((xmin, n));
+    }
+    (bounds, kk, ksize)
+}
+
+/// Separable cubic resize of one f32 plane, horizontal pass then vertical, accumulating in f64 and
+/// storing f32 between passes — Pillow's order and precision.
+///
+/// ⚠ **A KNOWN SURVIVING MUTANT, recorded rather than hidden.** Carrying the intermediate in f64
+/// instead of f32 passes every test here: against Pillow the worst deviation is 1.53e-5 on values of
+/// order 1e2 either way, so at f32 output resolution the intermediate's precision is not observable.
+/// The f32 store is kept because it is what Pillow does, not because a test defends it — if the
+/// accumulation schedule ever becomes part of a bit-exactness claim, this line needs a check that can
+/// actually see it.
+pub fn resize_cubic(src: &[f32], sh: usize, sw: usize, dh: usize, dw: usize, a: f64) -> Vec<f32> {
+    assert_eq!(src.len(), sh * sw, "plane is not {sh}x{sw}");
+    let (hb, hk, hks) = axis_taps(sw, dw, a);
+    let mut mid = vec![0f32; sh * dw];
+    for y in 0..sh {
+        for x in 0..dw {
+            let (xmin, n) = hb[x];
+            let mut s = 0f64;
+            for i in 0..n { s += src[y * sw + xmin + i] as f64 * hk[x * hks + i]; }
+            mid[y * dw + x] = s as f32;   // ⚠ f32 between passes, as Pillow stores it
+        }
+    }
+    let (vb, vk, vks) = axis_taps(sh, dh, a);
+    let mut out = vec![0f32; dh * dw];
+    for y in 0..dh {
+        let (ymin, n) = vb[y];
+        for x in 0..dw {
+            let mut s = 0f64;
+            for i in 0..n { s += mid[(ymin + i) * dw + x] as f64 * vk[y * vks + i]; }
+            out[y * dw + x] = s as f32;
+        }
+    }
+    out
+}
+
+/// Pillow's cubic coefficient — the reference this module's resampler is verified against.
+pub const KEYS_PILLOW: f64 = -0.5;
+/// PyTorch/torchvision and HuggingFace's coefficient.
+pub const KEYS_TORCH: f64 = -0.75;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +421,73 @@ mod tests {
         let e = PreprocCfg::load(dir.to_str().unwrap()).unwrap_err();
         assert!(e.contains("min_pixels") && e.contains("shortest_edge"), "unhelpful error: {e}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn read_f32s(path: &str) -> Vec<f32> {
+        let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        assert_eq!(b.len(), 4 + n * 4, "{path}: header says {n} floats");
+        b[4..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    /// Against **Pillow's own C resampler**, not a reimplementation of it.
+    #[test]
+    fn resize_cubic_matches_pillow() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qwen3vl_vision");
+        let csv = std::fs::read_to_string(format!("{dir}/resize_cases.csv")).expect("resize_cases.csv");
+        let mut n_cases = 0;
+        let mut worst = 0f32;
+        for (i, line) in csv.lines().skip(1).filter(|l| !l.trim().is_empty()).enumerate() {
+            let f: Vec<usize> = line.split(',').map(|v| v.parse().unwrap()).collect();
+            let (sh, sw, dh, dw) = (f[0], f[1], f[2], f[3]);
+            let src = read_f32s(&format!("{dir}/resize{i}.src"));
+            let want = read_f32s(&format!("{dir}/resize{i}.dst"));
+            assert_eq!(src.len(), sh * sw);
+            assert_eq!(want.len(), dh * dw);
+            let got = resize_cubic(&src, sh, sw, dh, dw, KEYS_PILLOW);
+            let mut w = 0f32;
+            for (g, x) in got.iter().zip(&want) { w = w.max((g - x).abs()); }
+            // values are ~1e2, so this is f32 round-off on a f64 accumulation, not agreement by luck
+            assert!(w < 1e-3, "case {i} ({sh}x{sw} -> {dh}x{dw}): max |Δ| = {w:.3e}");
+            worst = worst.max(w);
+            n_cases += 1;
+        }
+        eprintln!("resize_cubic vs Pillow: {n_cases} cases, worst max |Δ| = {worst:.3e}");
+        assert!(n_cases >= 6, "only {n_cases} resize cases — fixture shrank");
+        assert!(worst > 0.0, "every case matched to the bit, which means the fixtures are suspect");
+    }
+
+    /// ⛔ The coefficient is the documented fork between the two published processors, so it is
+    /// pinned as a closed form at BOTH values — otherwise "bicubic" names nothing.
+    #[test]
+    fn the_two_published_cubic_kernels_are_different_and_both_are_exact() {
+        // Keys kernel identities that hold for any `a`: 1 at 0, 0 at ±1 and ±2.
+        for &a in &[KEYS_PILLOW, KEYS_TORCH] {
+            assert!((keys(0.0, a) - 1.0).abs() < 1e-15, "a={a}");
+            for d in [1.0, -1.0, 2.0, -2.0, 3.0] {
+                assert!(keys(d, a).abs() < 1e-15, "a={a} at {d}");
+            }
+        }
+        // and they genuinely differ in between — 3.69e-2 is the impulse-response gap measured
+        // against Pillow, and it reappears here as a kernel-weight gap of the same order.
+        let gap = (0..40).map(|i| {
+            let d = i as f64 * 0.05;
+            (keys(d, KEYS_PILLOW) - keys(d, KEYS_TORCH)).abs()
+        }).fold(0f64, f64::max);
+        assert!(gap > 3e-2, "the two kernels differ by only {gap:.3e} — one of the constants is wrong");
+    }
+
+    /// A flat field must survive any scale, or the normalisation is broken in a way that a
+    /// content-bearing fixture would show only as a small bias.
+    #[test]
+    fn resize_preserves_a_constant_field_at_every_scale() {
+        for &(sh, sw, dh, dw) in &[(40usize, 40usize, 13usize, 29usize), (7, 5, 64, 64), (64, 64, 64, 64)] {
+            for &a in &[KEYS_PILLOW, KEYS_TORCH] {
+                let got = resize_cubic(&vec![7.25f32; sh * sw], sh, sw, dh, dw, a);
+                let worst = got.iter().fold(0f32, |m, &v| m.max((v - 7.25).abs()));
+                assert!(worst < 1e-4, "{sh}x{sw}->{dh}x{dw} a={a}: drifted {worst:.3e}");
+            }
+        }
     }
 
     #[test]
