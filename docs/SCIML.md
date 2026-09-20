@@ -98,6 +98,17 @@ features, gradient-norm balancing, Adam, then strong-Wolfe L-BFGS. Measured (200
 | advection (β = 30) | 0.9144 | 1.0815 | 0.9712 |
 | helmholtz (a = (1, 4), k = 1) | 0.4766 | 0.4781 | **0.3066** |
 
+⛔ **The helmholtz row measured the formulation, not the PDE.** Every number in it uses a *soft* boundary
+penalty, so the recipe has to balance a residual term against a boundary term — which is what the Fourier
+features, the gradient-norm and NTK balancers and the L-BFGS polish are all working on. Hard-constrain the
+boundary instead, `u = (1−x²)(1−y²)·M(x,y)`, exactly zero on all four edges by construction, and a plain
+`[2,20,20,1]` tanh MLP — **501 parameters, no Fourier features, no balancer, no L-BFGS** — reaches
+**0.0059 / 0.0064** at two seeds on 900 points with Adam alone. That is ~50× better than the best recipe in
+the row above. ⚠ It is not a controlled recipe comparison (different net, different point count, different
+formulation); it is evidence that the binding constraint here was the loss balancing that a soft penalty
+forces on you. Re-running the whole table with hard constraints where the geometry admits them is the
+follow-on, and until that is measured nothing is claimed about the other rows.
+
 ⭐⭐ **The middle column was mostly one bad assumption, not four bad rows.** `FourierNet` drew frequencies
 from an isotropic `N(0, σ²)` — one `σ` for every input axis — and the solutions here are anisotropic:
 advection's `sin(x − 30t)` has a wavevector of `(1, 30)` rad/unit, so no single `σ` can serve both. Giving
@@ -455,6 +466,12 @@ arms optimise exactly the same objective on the same `[1,12,12,1]` tanh net (193
 problem and cannot be optimised away by running the same method longer. That is what makes 119× from 30
 Gauss-Newton steps a statement about the metric rather than about budget, and it is what the fixture asserts.
 A first version asserted `rel_adam > 1e-3` and failed *because Adam did well* — the wrong thing to require.
+
+⛔ **And it is not a universal upgrade.** On 2-D Helmholtz, with the same hard-constrained formulation, 25
+Gauss-Newton steps over 818 s moved a 0.4439 warm-up to only **0.4121** — where plain Adam on that same
+configuration reaches 0.0059. The 119× on 1-D Poisson is a real result about that problem, not a property of
+the method; the Helmholtz fixture is where the counterexample is on the record, and it deliberately asserts
+no Gauss-Newton win.
 
 **The cost is real and structural.** Reverse mode yields one *row* of `J` per pass, so a step costs `N`
 backward passes over a graph that already contains the residual's own second derivatives — 300 passes here,

@@ -175,7 +175,7 @@ pub async fn gauss_newton_step(ctx: &Arc<Context>, residual: &Var, pv: &[Var], l
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sciml::util::{leaf, rel_l2, u01};
+    use crate::sciml::util::{dcol, leaf, rel_l2, u01};
     use crate::sciml::{deriv, Act, Mlp};
 
     /// The Cholesky solve against a system whose answer is known by construction, and against its own
@@ -326,6 +326,165 @@ mod tests {
             );
             assert!(rel_gn < rel_adam / 10.0, "Gauss-Newton must beat converged Adam by at least an order of magnitude: {rel_gn:.3e} vs {rel_adam:.3e}");
             assert!(rel_gn < rel_warm / 10.0, "and it must be the Gauss-Newton steps doing it, not the warm-up: {rel_gn:.3e} vs {rel_warm:.3e}");
+
+        });
+    }
+
+
+    /// ⭐⭐ **The Helmholtz row was not a recipe problem — it was a boundary-condition problem.**
+    /// `Δu + k²u = q` on `[−1,1]²` with `a = (1,4)`, `k = 1` and the manufactured `sin(πx) sin(4πy)`. The
+    /// recipe table's best is **0.3066** — per-axis Fourier features, gradient-norm or NTK balancing,
+    /// Adam then strong-Wolfe L-BFGS, 2000 collocation points, and a **soft** boundary penalty.
+    ///
+    /// Hard-constrain the boundary instead — `u = (1−x²)(1−y²)·M(x,y)`, which is exactly zero on all four
+    /// edges by construction, so there is no boundary term to weight at all — and a plain `[2,20,20,1]`
+    /// tanh MLP with 501 parameters and Adam reaches **0.0059** on 900 points. Two seeds, both solved.
+    ///
+    /// ⚠ This is **not** a recipe comparison: different net, different point count, and above all a
+    /// different formulation. What it is evidence for is that the binding constraint on this row was the
+    /// loss balancing that a soft boundary penalty forces on you, and that removing the penalty removes
+    /// the problem. The table's number stands as a soft-BC result; it should not be read as the difficulty
+    /// of the PDE.
+    ///
+    /// ⛔ **And Gauss-Newton does not help here**, in contrast to the 119× it gives on 1-D Poisson: 25
+    /// steps over 900 s moved the same warm-up from 0.4439 to only 0.4121. The natural gradient is not a
+    /// universal upgrade, and this fixture is where that is on the record.
+    #[ignore = "trains three arms of a 2-D Helmholtz PINN on the GPU (~40 min); run with -- --ignored"]
+    #[test]
+    fn hard_boundary_constraints_solve_the_helmholtz_row_the_recipe_table_could_not() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (m, rank_steps, warm, adam_steps) = (30usize, 25usize, 1500u32, 15000u32);
+            let (a1, a2, k) = (1.0f64, 4.0, 1.0);
+            let n = m * m;
+            // interior tensor grid on (−1,1)²; the hard constraint makes the boundary exact
+            let mut pts = vec![0.0f32; n * 2];
+            let (mut qv, mut ustar) = (vec![0.0f32; n], vec![0.0f32; n]);
+            for i in 0..m {
+                for j in 0..m {
+                    let x = -1.0 + 2.0 * (i as f64 + 0.5) / m as f64;
+                    let y = -1.0 + 2.0 * (j as f64 + 0.5) / m as f64;
+                    let (u, q) = crate::sciml::bench::helmholtz(x, y, a1, a2, k);
+                    let idx = i * m + j;
+                    pts[idx * 2] = x as f32;
+                    pts[idx * 2 + 1] = y as f32;
+                    qv[idx] = q as f32;
+                    ustar[idx] = u as f32;
+                }
+            }
+            let qvar = leaf(&ctx, &qv, &[n, 1]);
+            let ones = leaf(&ctx, &vec![1.0f32; n], &[n, 1]);
+            let net = Mlp::new(&ctx, &[2, 20, 20, 1], 11);
+            let shapes: Vec<Vec<usize>> = net.params.iter().map(|t| t.shape.clone()).collect();
+            let nparams: usize = net.params.iter().map(|t| t.numel()).sum();
+            let onehot = |c: usize| {
+                let mut e = vec![0.0f32; 2];
+                e[c] = 1.0;
+                leaf(&ctx, &e, &[2, 1])
+            };
+            let build = |wp: &[Tensor]| {
+                let pv: Vec<Var> = wp.iter().map(|t| Var::leaf(t.clone())).collect();
+                let x = leaf(&ctx, &pts, &[n, 2]);
+                let (xc, yc) = (x.matmul(&onehot(0)), x.matmul(&onehot(1)));
+                // (1−x²)(1−y²) vanishes on all four edges, so u = 0 there by construction
+                let bc = ones.sub(&xc.mul(&xc)).mul(&ones.sub(&yc.mul(&yc)));
+                let u = bc.mul(&Mlp::forward_act(&pv, &x, Act::Tanh));
+                let g = deriv(&u, &x);
+                let mut lap: Option<Var> = None;
+                for c in 0..2 {
+                    let mut mask = vec![0.0f32; n * 2];
+                    for i in 0..n {
+                        mask[i * 2 + c] = 1.0;
+                    }
+                    let gc = g.mul(&leaf(&ctx, &mask, &[n, 2])).sum(&[1]).reshape(&[n, 1]);
+                    let t = dcol(&ctx, &gc, &x, n, 2, c);
+                    lap = Some(match lap {
+                        None => t,
+                        Some(l) => l.add(&t),
+                    });
+                }
+                let kk = leaf(&ctx, &[(k * k) as f32], &[1]);
+                let r = lap.unwrap().add(&u.mul(&kk)).sub(&qvar);
+                (pv, u, r)
+            };
+            let sq = |v: &[f32]| v.iter().map(|&a| (a as f64) * (a as f64)).sum::<f64>();
+
+            // ---- arm A: Adam alone on the same configuration, at two seeds ----
+            // ⛔ Two seeds because this is the fixture's headline claim, and one seed is one seed.
+            let mut rel_adams = Vec::new();
+            for seed in [11u32, 4242] {
+                let mut wa = Mlp::new(&ctx, &[2, 20, 20, 1], seed).params;
+                let mut adam = crate::Adam::new(&wa, 3e-3);
+                for ep in 0..adam_steps {
+                    if ep == adam_steps * 3 / 4 {
+                        adam = crate::Adam::new(&wa, 3e-4);
+                    }
+                    let (pv, _, r) = build(&wa);
+                    let loss = r.mul(&r).mean_all();
+                    crate::sciml::util::step(&ctx, &loss, &pv, &mut wa, &mut adam).await;
+                }
+                let r = rel_l2(&build(&wa).1.value().to_vec().await, &ustar);
+                eprintln!("    [banked] Adam {adam_steps} steps, seed {seed}: rel-L2 {r:.4}");
+                rel_adams.push(r);
+            }
+            let rel_adam = rel_adams[0];
+
+            // ---- arm B: the same warm-up, then Gauss-Newton ----
+            let mut wb = net.params.clone();
+            let mut adam = crate::Adam::new(&wb, 3e-3);
+            for _ in 0..warm {
+                let (pv, _, r) = build(&wb);
+                let loss = r.mul(&r).mean_all();
+                crate::sciml::util::step(&ctx, &loss, &pv, &mut wb, &mut adam).await;
+            }
+            let rel_warm = rel_l2(&build(&wb).1.value().to_vec().await, &ustar);
+            eprintln!("    [banked] Adam {warm} steps (the Gauss-Newton warm-up): rel-L2 {rel_warm:.4}");
+            let mut lambda = 1e-8f64;
+            let t0 = std::time::Instant::now();
+            for it in 0..rank_steps {
+                let flat = crate::sciml::flatten(&wb).await;
+                let (pv, _, r) = build(&wb);
+                let f_now = sq(&r.value().to_vec().await);
+                let Some(delta) = gauss_newton_step(&ctx, &r, &pv, lambda).await else {
+                    eprintln!("    step {it}: the Gramian stayed indefinite; stopping");
+                    break;
+                };
+                let mut accepted = false;
+                let mut alpha = 1.0f32;
+                for _ in 0..12 {
+                    let trial: Vec<f32> = flat.iter().zip(&delta).map(|(&w, &d)| w - alpha * d).collect();
+                    let cand = crate::sciml::unflatten(&ctx, &trial, &shapes);
+                    if sq(&build(&cand).2.value().to_vec().await) < f_now {
+                        wb = cand;
+                        accepted = true;
+                        break;
+                    }
+                    alpha *= 0.5;
+                }
+                if !accepted {
+                    lambda *= 10.0;
+                    if lambda > 1.0 {
+                        eprintln!("    converged at step {it}: no step reduced the residual");
+                        break;
+                    }
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let rel_gn = rel_l2(&build(&wb).1.value().to_vec().await, &ustar);
+            eprintln!("    [banked] + {rank_steps} Gauss-Newton steps ({secs:.0} s): rel-L2 {rel_gn:.4}");
+            eprintln!(
+                "  Helmholtz a=({a1},{a2}) k={k} on [−1,1]², {n} points, [2,20,20,1] tanh ({nparams} params), HARD boundary constraints:\n    Adam {adam_steps} steps, seeds 11 / 4242:  rel-L2 {:.4} / {:.4}\n    Adam {warm} steps:                    rel-L2 {rel_warm:.4}\n    + {rank_steps} Gauss-Newton steps ({:.0} s):  rel-L2 {rel_gn:.4}\n    for context, the recipe table's best on this row with a SOFT boundary penalty, a Fourier net and 2000 points: 0.3066",
+                rel_adams[0], rel_adams[1], secs
+            );
+            // the claim: hard boundary conditions solve this row, at both seeds
+            for (i, &r) in rel_adams.iter().enumerate() {
+                assert!(r < 0.05, "hard BCs must solve Helmholtz at seed {i}: {r:.4}");
+            }
+            assert!(rel_warm > 10.0 * rel_adam, "and it must be the training that got there, not the initialisation: {rel_warm:.4} vs {rel_adam:.4}");
+            // ⛔ NOT asserted: any Gauss-Newton win. It does not have one here, and the printed number is
+            // the record of that. Asserting one would mean tuning this fixture until the method looked
+            // good on a problem where it is not.
+            assert!(rel_gn <= rel_warm, "the Gauss-Newton arm must at least not go backwards: {rel_gn:.4} vs {rel_warm:.4}");
 
         });
     }
