@@ -174,6 +174,25 @@ arms were matched from the start.
 The hook ships; helmholtz does **not** enable it by default, because enabling it under the existing recipes
 is a retuning job and not a switch.
 
+⛔⛔ **The same thing happened to the marched hook, which is the stronger result.** `Problem` also carries
+`marched_constraint`, so `run_time_marched` can make each window's *start state* structural — the technique
+that takes advection to 0.0251 and burgers to 0.0142 in `sciml::hardbc`. Wired into the harness and turned on
+for advection, it measures **1.4835** against **0.3252** for the soft marching it replaces. Worse, on the
+same 8 windows.
+
+So both hard-constraint hooks land the same way: the technique is real and the fixtures measure it working,
+and neither drops into the harness's configuration without retuning. The fixtures share a fixed cell-centred
+grid across every window, make the walls structural too (a `sin x`/`cos x` embedding for advection), and
+freeze `g` as data with analytic derivatives; the harness filters *random* points per window and inherits the
+previous window's error through a chain of eight networks that a hard constraint forces it to match exactly.
+That difference is worth 50× here. **A technique and a library are not the same artefact**, and this page now
+says so with numbers on both hooks rather than implying the fixtures' results are what `run` would give you.
+
+⚠ On the way there, the first wiring evaluated the previous window's **raw network** as the start state
+rather than its own constrained solution. Every assertion still passed and advection scored **123.5** — two
+orders of magnitude worse than predicting nothing. `hardbc::the_harness_can_march_a_hard_constrained_problem`
+is the cheap check that catches it: at `t = t₀` the constrained field must equal the start state *exactly*.
+
 ### The four rows, diagnosed
 
 The method that came out of this: **rule representation in or out first**, with a cheap regression fit of

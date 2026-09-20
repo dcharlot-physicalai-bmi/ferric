@@ -100,6 +100,62 @@ mod tests {
 
 
 
+
+    /// The **marched** hard-constraint hook, on a toy problem: window zero takes the problem's own
+    /// `initial_value`, later windows take the previous window's *solution* (recursively, not its raw
+    /// network), and the wrapper is exact at each window's start time.
+    ///
+    /// ⛔ A first version of `run_time_marched`'s wiring evaluated the previous window's RAW network as the
+    /// start state. Every assertion still passed and advection scored **123.5** — two orders of magnitude
+    /// worse than predicting nothing. This fixture is the cheap check that would have caught it: the
+    /// constrained field at `t = t₀` must equal the start state exactly, which a raw-network start state
+    /// does not.
+    #[test]
+    fn the_harness_can_march_a_hard_constrained_problem() {
+        pollster::block_on(async {
+            use crate::sciml::harness::Problem;
+            struct Toy;
+            impl Problem for Toy {
+                fn name(&self) -> &str { "toy-marched" }
+                fn dim(&self) -> usize { 2 }
+                fn lo(&self) -> Vec<f64> { vec![0.0, 0.0] }
+                fn hi(&self) -> Vec<f64> { vec![1.0, 1.0] }
+                fn residual(&self, _c: &Arc<Context>, fwd: &dyn Fn(&Var) -> Var, x: &Var, _n: usize) -> Var { fwd(x) }
+                fn boundary_constraints(&self, _c: &Arc<Context>, _f: &dyn Fn(&Var) -> Var, _n: usize, _s: u32) -> Vec<Var> { vec![] }
+                fn time_axis(&self) -> Option<usize> { Some(1) }
+                fn reference(&self, _x: &[f64]) -> f64 { 0.0 }
+                fn initial_value(&self, ctx: &Arc<Context>, x: &Var) -> Option<Var> {
+                    Some(col_of(ctx, x, 2, 0).sin())
+                }
+                fn marched_constraint(&self, ctx: &Arc<Context>, x: &Var, t0: f64, start: &dyn Fn(&Var) -> Var, raw: &Var) -> Option<Var> {
+                    let xc = col_of(ctx, x, 2, 0);
+                    let tc = col_of(ctx, x, 2, 1);
+                    let t0v = Var::leaf(Tensor::from_vec(ctx, &[t0 as f32], &[1]));
+                    let at_start = place(ctx, &[xc, tc.sub(&tc).add(&t0v)], 2);
+                    Some(start(&at_start).add(&tc.sub(&t0v).mul(raw)))
+                }
+            }
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let t = Toy;
+            // at t = t₀ the wrapper must be EXACTLY the start state, whatever the raw output is
+            let t0 = 0.25f64;
+            let xs = vec![0.3f32, t0 as f32, 0.7, t0 as f32, 1.1, t0 as f32];
+            let x = leaf(&ctx, &xs, &[3, 2]);
+            let raw = leaf(&ctx, &[9.0, -4.0, 2.5], &[3, 1]);
+            let start = |xx: &Var| col_of(&ctx, xx, 2, 0).mul(&Var::leaf(Tensor::from_vec(&ctx, &[2.0f32], &[1])));
+            let u = t.marched_constraint(&ctx, &x, t0, &start, &raw).expect("Toy supplies one").value().to_vec().await;
+            for (i, &xv) in [0.3f32, 0.7, 1.1].iter().enumerate() {
+                assert!((u[i] - 2.0 * xv).abs() < 1e-5, "at t = t₀ the field must be the start state: got {} want {}", u[i], 2.0 * xv);
+            }
+            // and away from t₀ it must move with the raw output
+            let x2 = leaf(&ctx, &[0.3f32, 0.75, 0.7, 0.75], &[2, 2]);
+            let raw2 = leaf(&ctx, &[1.0f32, 1.0], &[2, 1]);
+            let u2 = t.marched_constraint(&ctx, &x2, t0, &start, &raw2).expect("some").value().to_vec().await;
+            assert!((u2[0] - (2.0 * 0.3 + 0.5)).abs() < 1e-5, "u = g + (t−t₀)·raw: got {}", u2[0]);
+            eprintln!("  marched hook: exact at t₀ on 3 points, and g + (t−t₀)·raw away from it");
+        });
+    }
+
     /// ⛔ **Reproducing the number that says enabling the hook under the harness's own recipes is worse.**
     /// `docs/SCIML.md` quotes vanilla 6.3903 and full 0.8154 for helmholtz with `(1−x²)(1−y²)·M` turned on.
     /// That measurement was originally a one-off — the hook was enabled on `Helmholtz`, run, and removed —

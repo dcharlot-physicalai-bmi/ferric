@@ -63,6 +63,27 @@ pub trait Problem {
     fn hard_constraint(&self, _ctx: &Arc<Context>, _x: &Var, _raw: &Var) -> Option<Var> {
         None
     }
+    /// The initial state as a **function** of the input, for hard-constrained marching — window zero's
+    /// start state. `None` unless the problem supports [`Problem::marched_constraint`].
+    fn initial_value(&self, _ctx: &Arc<Context>, _x: &Var) -> Option<Var> {
+        None
+    }
+    /// Wrap the raw output for one time-marched window so its **start state holds by construction**:
+    /// `u = g(x) + (t − t₀)·B(x)·M(x,t)`, where `g` is the window's start state and `B` vanishes wherever a
+    /// spatial condition is imposed. Returning `Some` tells [`run_time_marched`] to drop the start-state
+    /// penalty, because there is nothing left to weight; a problem whose `B` also handles the walls can
+    /// return an empty [`Problem::boundary_constraints`] and have no penalty terms at all.
+    ///
+    /// `start` evaluates the window's start state at any points — the problem's own
+    /// [`Problem::initial_value`] in window zero, the previous window's frozen network after that. Its
+    /// graph is differentiable, so `deriv` reaches through it and no derivative of `g` has to be carried
+    /// by hand.
+    ///
+    /// ⭐ This is what solves the advection and burgers rows: `sciml::hardbc` measures **0.0251** and
+    /// **0.0142** with it, against 0.9712 and 0.2434 for the best recipe with soft conditions.
+    fn marched_constraint(&self, _ctx: &Arc<Context>, _x: &Var, _t0: f64, _start: &dyn Fn(&Var) -> Var, _raw: &Var) -> Option<Var> {
+        None
+    }
     fn reference(&self, x: &[f64]) -> f64;
     /// Fourier-feature scales that suit the problem's frequency content, per group and per INPUT AXIS
     /// (cycles per unit). One `σ` per axis, not one per group: an anisotropic solution — a travelling
@@ -299,6 +320,39 @@ pub fn run(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Recipe, colloc: &
     Report { problem: problem.name().to_string(), recipe: recipe.name, n_colloc: n, rel_l2: rel_l2(&pred, &truth), loss_after_adam, loss_final, secs: t0.elapsed().as_secs_f64() }
 }
 
+/// The start state for time-marched window `w`, as a differentiable function of the input.
+///
+/// ⛔ This is **recursive**, and it has to be. Window `w`'s start state is window `w−1`'s *solution* at the
+/// boundary time — which is itself `g_{w−1}(x) + (t − t_{w−1})·raw_{w−1}`, not `raw_{w−1}`. A first version
+/// evaluated the previous window's RAW network here; the start state was then wrong from window one onward,
+/// each window inherited the error and amplified it, and advection scored **123.5** where soft marching
+/// scores 0.3252. The tell was that it was worse than predicting nothing, by two orders of magnitude.
+///
+/// Cost is `O(w)` network evaluations at window `w`, which is the price of not carrying `g′` and `g″` by
+/// hand; `deriv` reaches through the whole chain because every frozen parameter is a constant leaf.
+#[allow(clippy::too_many_arguments)]
+fn marched_start(
+    ctx: &Arc<Context>,
+    problem: &dyn Problem,
+    recipe: &Recipe,
+    d: usize,
+    seed: u32,
+    history: &[(Vec<Tensor>, f64)],
+    w: usize,
+    x: &Var,
+) -> Var {
+    if w == 0 {
+        return problem
+            .initial_value(ctx, x)
+            .expect("a marched hard constraint needs Problem::initial_value for window zero");
+    }
+    let (pp, t_prev) = &history[w - 1];
+    let pnet = build_net(ctx, problem, recipe, d, seed.wrapping_add((w - 1) as u32));
+    let raw = pnet.forward(&vars(pp), x);
+    let start = |xx: &Var| marched_start(ctx, problem, recipe, d, seed, history, w - 1, xx);
+    problem.marched_constraint(ctx, x, *t_prev, &start, &raw).unwrap_or(raw)
+}
+
 /// **Time-marched training** (Krishnapriyan et al. 2021, arXiv 2109.01050 §5, "seq2seq") — the piece the
 /// advection row of the benchmark table names, and a training *strategy* rather than a loss term.
 ///
@@ -337,6 +391,7 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
 
     let mut per_window: Vec<Vec<Tensor>> = Vec::with_capacity(windows);
     let mut prev: Option<(Vec<Tensor>, Vec<f32>, Vec<f32>)> = None; // params, slice points, frozen values
+    let mut history: Vec<(Vec<Tensor>, f64)> = Vec::with_capacity(windows); // params and start time per window
     for w in 0..windows {
         let (a, b) = (edge(w), edge(w + 1));
         let pts: Vec<f32> = colloc
@@ -349,7 +404,22 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
         assert!(n > 0, "window {w} has no collocation points");
         let net = build_net(ctx, problem, recipe, d, seed.wrapping_add(w as u32));
         let mut wp = net.params();
-        let fwd_with = |pv: &[Var], x: &Var| net.forward(pv, x);
+        // the window's start state as a differentiable function of x — the previous window's SOLUTION,
+        // recursively (see `marched_start`), not its raw network
+        let start_at = |x: &Var| -> Var { marched_start(ctx, problem, recipe, d, seed, &history, w, x) };
+        let hard_marched = {
+            let px = leaf(ctx, &pts[..d], &[1, d]);
+            let raw = net.forward(&vars(&wp), &px);
+            problem.marched_constraint(ctx, &px, a, &start_at, &raw).is_some()
+        };
+        let fwd_with = |pv: &[Var], x: &Var| -> Var {
+            let raw = net.forward(pv, x);
+            if hard_marched {
+                problem.marched_constraint(ctx, x, a, &start_at, &raw).unwrap_or(raw)
+            } else {
+                raw
+            }
+        };
         pollster::block_on(async {
             let mut adam = Adam::new(&wp, recipe.lr);
             for it in 0..recipe.adam_steps {
@@ -360,16 +430,19 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
                 for c in problem.boundary_constraints(ctx, &fwd, 200, seed.wrapping_add(it as u32)) {
                     loss = loss.add(&mse(&c).mul(&scalar(&c, 10.0)));
                 }
-                // the start state: the problem's own IC in window 0, the previous window's net after that
-                let start = match &prev {
-                    None => problem.initial_constraint(ctx, &fwd, 200, seed.wrapping_add(it as u32)),
-                    Some((_, sl, vals)) => {
-                        let m = sl.len() / d;
-                        Some(fwd(&leaf(ctx, sl, &[m, d])).sub(&leaf(ctx, vals, &[m, 1])))
+                // the start state: structural if the problem supplies a marched constraint, otherwise a
+                // penalty — the problem's own IC in window 0, the previous window's net after that
+                if !hard_marched {
+                    let start = match &prev {
+                        None => problem.initial_constraint(ctx, &fwd, 200, seed.wrapping_add(it as u32)),
+                        Some((_, sl, vals)) => {
+                            let m = sl.len() / d;
+                            Some(fwd(&leaf(ctx, sl, &[m, d])).sub(&leaf(ctx, vals, &[m, 1])))
+                        }
+                    };
+                    if let Some(st) = start {
+                        loss = loss.add(&mse(&st).mul(&scalar(&st, 100.0)));
                     }
-                };
-                if let Some(st) = start {
-                    loss = loss.add(&mse(&st).mul(&scalar(&st, 100.0)));
                 }
                 step(ctx, &loss, &pv, &mut wp, &mut adam).await;
             }
@@ -381,6 +454,7 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
             let vals = pollster::block_on(async { fwd_with(&vars(&wp), &leaf(ctx, &sl, &[m, d])).value().to_vec().await });
             prev = Some((wp.clone(), sl, vals));
         }
+        history.push((wp.clone(), a));
         per_window.push(wp);
     }
 
@@ -396,7 +470,15 @@ pub fn run_time_marched(ctx: &Arc<Context>, problem: &dyn Problem, recipe: &Reci
         }
         let sub: Vec<f32> = idx.iter().flat_map(|&i| g[i * d..(i + 1) * d].to_vec()).collect();
         let net = build_net(ctx, problem, recipe, d, seed.wrapping_add(w as u32));
-        let out = pollster::block_on(async { net.forward(&vars(wp), &leaf(ctx, &sub, &[idx.len(), d])).value().to_vec().await });
+        // ⛔ scored through the SAME wrapper it was trained through: scoring the raw network of a
+        // hard-constrained run would grade a different function than the one that was fitted
+        let start_at = |x: &Var| -> Var { marched_start(ctx, problem, recipe, d, seed, &history, w, x) };
+        let out = pollster::block_on(async {
+            let xv = leaf(ctx, &sub, &[idx.len(), d]);
+            let raw = net.forward(&vars(wp), &xv);
+            let u = problem.marched_constraint(ctx, &xv, a, &start_at, &raw).unwrap_or(raw);
+            u.value().to_vec().await
+        });
         for (k, &i) in idx.iter().enumerate() {
             pred[i] = out[k];
         }
@@ -601,6 +683,16 @@ impl Problem for Advection {
     fn time_axis(&self) -> Option<usize> {
         Some(1)
     }
+    // ⛔ Advection does NOT supply `initial_value` / `marched_constraint` here, though `sciml::hardbc`
+    // measures 0.0251 with marched hard conditions. Wiring them into THIS harness was measured and is
+    // WORSE: 1.4835 against 0.3252 for soft marching, on the same 8 windows. The same verdict as the
+    // stationary hook on helmholtz, for the same reason — the fixture's number comes from its whole
+    // configuration (a fixed cell-centred grid shared by every window, a periodic sin/cos embedding that
+    // makes the walls structural too, `g` frozen as data with analytic derivatives), while the harness
+    // filters random points per window and inherits the previous window's error through a chain of eight
+    // networks that the hard constraint forces it to match exactly. The hook is available and exercised by
+    // `hardbc::the_harness_can_march_a_hard_constrained_problem`; turning it on for a benchmark row is a
+    // retuning job, not a switch.
     fn reference(&self, x: &[f64]) -> f64 {
         bench::advection(x[0], x[1], self.beta)
     }
