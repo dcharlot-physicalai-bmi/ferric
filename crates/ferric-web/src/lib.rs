@@ -503,7 +503,10 @@ impl FerricModel {
         // robust enough to answer " Paris." through the garbage, which MASKED it; the Q4 requant was
         // not, which exposed it. The file carries real scores for all 262,144 tokens, and scored
         // greedy merge (Spm) is the algorithm that matches its piece style.
-        let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"), Some(Meta::Str(s)) if s == "llama" || s == "gemma4" || s == "t5");
+        // ⛔ ONE predicate, shared with ferric-serve. These two lists drifted apart once — serve
+        // had only "llama" — and the same file was tokenized two ways by the two front ends.
+        let is_spm = matches!(g.metadata().get("tokenizer.ggml.model"),
+                              Some(Meta::Str(s)) if ferric_tokenizer::is_sentencepiece_model(s));
         // BERT carries NO merge table — WordPiece scores its pieces the way SentencePiece does, so
         // demanding merges rejects every encoder checkpoint with "no merges". The real tokenizer for
         // these files is the `wordpiece` field built below; the Bpe here is an empty placeholder that

@@ -318,9 +318,27 @@ impl Engine {
         // so it needs the same fix or generation here diverges from generation there.
         let bpe = Bpe::new_with_pre(vocab.clone(), &merges, ferric_tokenizer::Pre::from_gguf(
             match g.metadata.get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => Some(p.as_str()), _ => None }));
-        // SentencePiece models carry a per-token score array and no merges — detect and build an Spm.
+        // SentencePiece models carry a per-token score array — detect and build an Spm.
+        //
+        // ⛔ THIS LIST USED TO BE `s == "llama"` ALONE while ferric-web's was `llama | gemma4 | t5`,
+        // so the same Gemma-4 file was tokenized two different ways by the two front ends. Measured on
+        // `gemma-4-E2B-it-Q8_0.gguf` (52.5% of its 262,144 tokens begin with ▁, exactly 1 begins with
+        // Ġ): 0 of 4 prompts agreed, this path emitted 28 ids where the browser emitted 17, and the
+        // lone Ġ token 245237 appeared 11 times — `[The, Ġ, capital, Ġ, of, Ġ, France, Ġ, is]`. The
+        // model still answered, which is why it survived. Both front ends now call ONE predicate.
+        let tok_model = match g.metadata.get("tokenizer.ggml.model") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
+        // ⭐ And the name list is backed by a check that reads the VOCABULARY, so the next
+        // SentencePiece checkpoint declaring an unlisted name is refused rather than mis-tokenized.
+        if !ferric_tokenizer::is_sentencepiece_model(&tok_model) {
+            // `load` returns `Engine`, so fail-closed here means refusing to START. That is the
+            // right trade: a server that will not boot is a bug report, a server that tokenizes
+            // a SentencePiece vocabulary as byte-level BPE is fluent wrong text nobody notices.
+            if let Err(e) = ferric_tokenizer::check_byte_level_choice(&tok_model, &tokens) {
+                panic!("{e}");
+            }
+        }
         let spm = match g.metadata.get("tokenizer.ggml.model") {
-            Some(Meta::Str(s)) if s == "llama" => {
+            Some(Meta::Str(s)) if ferric_tokenizer::is_sentencepiece_model(s) => {
                 let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {
                     Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
                     _ => Vec::new(),

@@ -91,6 +91,47 @@ impl Pre {
     }
 }
 
+/// Does this `tokenizer.ggml.model` name a **SentencePiece-convention** vocabulary?
+///
+/// ⛔ ONE DEFINITION, because two definitions is exactly how this went wrong. `ferric-web` listed
+/// `llama | gemma4 | t5`; `ferric-serve` listed `llama` alone. The same Gemma-4 file therefore got
+/// scored greedy merge in the browser and byte-level BPE in the server — measured on
+/// `gemma-4-E2B-it-Q8_0.gguf`: 0 of 4 prompts agreed, 28 ids where the browser emits 17, and the lone
+/// `Ġ` token 245237 appeared 11 times, i.e. `[The, Ġ, capital, Ġ, of, Ġ, France, Ġ, is]`. Q8_0 was
+/// robust enough to answer through it, which is why it survived.
+pub fn is_sentencepiece_model(model: &str) -> bool {
+    matches!(model, "llama" | "gemma4" | "t5")
+}
+
+/// The fraction of `tokens` carrying SentencePiece's `▁` (U+2581) word-boundary mark.
+///
+/// ⭐ The list above will always be incomplete — it is a list of names, and the next SentencePiece
+/// checkpoint will declare a name nobody has added yet. THIS is the check that generalises, because
+/// it reads the vocabulary instead of trusting its label: a byte-level BPE vocabulary marks word
+/// boundaries with `Ġ` (U+0120) and essentially never with `▁`.
+pub fn sentencepiece_fraction(tokens: &[String]) -> f32 {
+    if tokens.is_empty() { return 0.0; }
+    tokens.iter().filter(|t| t.starts_with('\u{2581}')).count() as f32 / tokens.len() as f32
+}
+
+/// Refuse a tokenizer choice the VOCABULARY contradicts.
+///
+/// Call this wherever byte-level BPE is selected. A `▁`-heavy vocabulary under byte-level BPE strands
+/// every space as an unjoinable token: the output stays fluent-looking and is wrong, and no shape,
+/// length or round-trip check can see it. Fail closed — a wrong tokenizer is a wrong prompt, and a
+/// wrong prompt is a confidently wrong answer.
+pub fn check_byte_level_choice(model: &str, tokens: &[String]) -> Result<(), String> {
+    let f = sentencepiece_fraction(tokens);
+    if f > 0.05 {
+        return Err(format!(
+            "tokenizer.ggml.model = {model:?} was routed to byte-level BPE, but {:.1}% of its {} \
+             tokens begin with ▁ — this is a SentencePiece vocabulary. Byte-level BPE would strand \
+             every space as a lone Ġ. Add {model:?} to is_sentencepiece_model.",
+            100.0 * f, tokens.len()));
+    }
+    Ok(())
+}
+
 pub struct Bpe {
     pre: Pre,
     encoder: HashMap<String, u32>,      // token string → id
@@ -696,5 +737,63 @@ mod wordpiece_tests {
         let t = wp(&[("\u{2581}the", 5)]);
         assert_eq!(t.encode("THE"), vec![101, 5, 102]);
         assert_eq!(t.encode(""), vec![101, 102], "an empty string is still CLS+SEP, not empty");
+    }
+}
+
+#[cfg(test)]
+mod sentencepiece_routing_tests {
+    use super::*;
+
+    fn vocab(sp: usize, bl: usize, plain: usize) -> Vec<String> {
+        let mut v = Vec::new();
+        for i in 0..sp { v.push(format!("\u{2581}word{i}")); }
+        for i in 0..bl { v.push(format!("\u{0120}word{i}")); }
+        for i in 0..plain { v.push(format!("word{i}")); }
+        v
+    }
+
+    #[test]
+    fn the_sentencepiece_names_are_exactly_these() {
+        for m in ["llama", "gemma4", "t5"] {
+            assert!(is_sentencepiece_model(m), "{m} declares a ▁-convention vocabulary");
+        }
+        // ⛔ gpt2 is the byte-level one and MUST stay out — routing Qwen to Spm is the mirror bug.
+        for m in ["gpt2", "bert", "", "GEMMA4", "llama3"] {
+            assert!(!is_sentencepiece_model(m), "{m} must not route to SentencePiece");
+        }
+    }
+
+    #[test]
+    fn the_fraction_reads_the_vocabulary_not_the_label() {
+        assert!((sentencepiece_fraction(&vocab(100, 0, 100)) - 0.5).abs() < 1e-6);
+        assert_eq!(sentencepiece_fraction(&vocab(0, 200, 0)), 0.0);
+        assert_eq!(sentencepiece_fraction(&[]), 0.0, "an empty vocab must not divide by zero");
+        // the real file's shape: 52.5% ▁ and a single Ġ out of 262,144
+        let f = sentencepiece_fraction(&vocab(137_541, 1, 262_144 - 137_542));
+        assert!((f - 0.525).abs() < 0.01, "measured 52.5% on gemma-4-E2B-it-Q8_0, got {f}");
+    }
+
+    /// ⛔ The guard that does NOT depend on the name list being complete — the list is names, and the
+    /// next SentencePiece checkpoint will declare one nobody has added.
+    #[test]
+    fn a_sentencepiece_vocabulary_under_byte_level_bpe_is_refused() {
+        let e = check_byte_level_choice("gemma5", &vocab(500, 1, 499)).unwrap_err();
+        assert!(e.contains("gemma5") && e.contains("SentencePiece") && e.contains("▁"),
+                "the refusal must name the model and the evidence: {e}");
+        assert!(e.contains("is_sentencepiece_model"), "and say how to fix it: {e}");
+        // a genuinely byte-level vocabulary passes
+        check_byte_level_choice("gpt2", &vocab(0, 900, 100)).expect("byte-level vocab must pass");
+        // ⚠ and the threshold is not zero: a handful of ▁ tokens in a byte-level vocab is normal
+        check_byte_level_choice("gpt2", &vocab(20, 900, 80)).expect("2% ▁ must not trip the guard");
+    }
+
+    /// ⚠ The bug this whole thing exists for, reproduced as arithmetic: under byte-level BPE a
+    /// ▁-convention vocabulary has no token for a space except the lone Ġ, so spaces cannot merge.
+    #[test]
+    fn the_two_conventions_do_not_share_a_space_token() {
+        let sp = vocab(10, 0, 0);
+        assert!(sp.iter().all(|t| !t.starts_with('\u{0120}')),
+                "a SentencePiece vocabulary carries no Ġ pieces for BPE to merge spaces into");
+        assert!(sentencepiece_fraction(&sp) > 0.05, "so the guard must fire on it");
     }
 }
