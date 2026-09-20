@@ -98,6 +98,103 @@ mod tests {
         });
     }
 
+
+    /// ⭐ **The matched helmholtz comparison the row never had.** Advection and burgers were settled with
+    /// arms that shared everything but the condition treatment; helmholtz was only ever compared against
+    /// the *recipe table*, which differs in net, point count and formulation at once. Then the harness hook
+    /// measured the same constraint as **worse** under the harness's recipes (vanilla 6.3903, full 0.8154),
+    /// which makes "hard constraints fixed helmholtz" an attribution resting on nothing controlled.
+    ///
+    /// So: same `[2,20,20,1]` tanh net, same 900 cell-centred interior points, same 10,000 Adam steps and
+    /// schedule, same seed. Only the boundary treatment differs — a penalty on the four edges, against
+    /// `(1−x²)(1−y²)·M` which is exactly zero on all of them.
+    #[ignore = "trains two helmholtz PINNs on the GPU (~30 min); run with -- --ignored"]
+    #[test]
+    fn soft_against_hard_conditions_on_the_helmholtz_row() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (m, steps, bw) = (30usize, 10000u32, 100.0f32);
+            let (a1, a2, k) = (1.0f64, 4.0, 1.0);
+            let n = m * m;
+            let (mut pts, mut qv, mut ustar) = (vec![0.0f32; n * 2], vec![0.0f32; n], vec![0.0f32; n]);
+            for i in 0..m {
+                for j in 0..m {
+                    let x = -1.0 + 2.0 * (i as f64 + 0.5) / m as f64;
+                    let y = -1.0 + 2.0 * (j as f64 + 0.5) / m as f64;
+                    let (u, q) = crate::sciml::bench::helmholtz(x, y, a1, a2, k);
+                    let idx = i * m + j;
+                    pts[idx * 2] = x as f32;
+                    pts[idx * 2 + 1] = y as f32;
+                    qv[idx] = q as f32;
+                    ustar[idx] = u as f32;
+                }
+            }
+            // the soft arm's boundary supervision: the four edges of [−1,1]²
+            let mut edges = Vec::new();
+            for i in 0..m {
+                let v = -1.0 + 2.0 * (i as f32 + 0.5) / m as f32;
+                edges.extend([-1.0, v, 1.0, v, v, -1.0, v, 1.0]);
+            }
+            let nb = edges.len() / 2;
+            let qvar = leaf(&ctx, &qv, &[n, 1]);
+            let ones = leaf(&ctx, &vec![1.0f32; n], &[n, 1]);
+            let kk = leaf(&ctx, &[(k * k) as f32], &[1]);
+            let bwv = leaf(&ctx, &[bw], &[1]);
+
+            let mut results = Vec::new();
+            for hard in [false, true] {
+                let net = Mlp::new(&ctx, &[2, 20, 20, 1], 11);
+                let mut wp = net.params.clone();
+                let mut adam = crate::Adam::new(&wp, 3e-3);
+                let field = |pv: &[Var], x: &Var| -> Var {
+                    let raw = Mlp::forward_act(pv, x, Act::Tanh);
+                    if !hard {
+                        return raw;
+                    }
+                    let (xc, yc) = (col_of(&ctx, x, 2, 0), col_of(&ctx, x, 2, 1));
+                    let onec = Var::leaf(Tensor::from_vec(&ctx, &[1.0f32], &[1]));
+                    onec.sub(&xc.mul(&xc)).mul(&onec.sub(&yc.mul(&yc))).mul(&raw)
+                };
+                let resid = |pv: &[Var]| -> Var {
+                    let x = leaf(&ctx, &pts, &[n, 2]);
+                    let u = field(pv, &x);
+                    let g = crate::sciml::deriv(&u, &x);
+                    let mut lap: Option<Var> = None;
+                    for c in 0..2 {
+                        let gc = col_of(&ctx, &g, 2, c);
+                        let t = col_of(&ctx, &crate::sciml::deriv(&gc, &x), 2, c);
+                        lap = Some(match lap { None => t, Some(l) => l.add(&t) });
+                    }
+                    lap.unwrap().add(&u.mul(&kk)).sub(&qvar)
+                };
+                for ep in 0..steps {
+                    if ep == steps * 3 / 4 {
+                        adam = crate::Adam::new(&wp, 3e-4);
+                    }
+                    let pv = vars(&wp);
+                    let r = resid(&pv);
+                    let mut loss = r.mul(&r).mean_all();
+                    if !hard {
+                        let ub = field(&pv, &leaf(&ctx, &edges, &[nb, 2]));
+                        loss = loss.add(&ub.mul(&ub).mean_all().mul(&bwv));
+                    }
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+                let pv = vars(&wp);
+                let u = field(&pv, &leaf(&ctx, &pts, &[n, 2])).value().to_vec().await;
+                let e = rel_l2(&u, &ustar);
+                eprintln!("    [banked] helmholtz a=(1,4) k=1, {} conditions, {steps} Adam steps: rel-L2 {e:.4}", if hard { "HARD" } else { "soft" });
+                let _ = &ones;
+                results.push(e);
+            }
+            let (soft, hard) = (results[0], results[1]);
+            eprintln!(
+                "  helmholtz a=(1,4) k=1 on [−1,1]², {n} points, [2,20,20,1] tanh, {steps} Adam steps, same net/points/steps/seed:\n    soft boundary penalty (weight {bw}):  rel-L2 {soft:.4}\n    hard boundary constraint:             rel-L2 {hard:.4}\n    for context: 0.3066 is the recipe table's best on this row, with a different net and 2000 random points"
+            );
+            assert!(soft.is_finite() && hard.is_finite(), "both arms must produce a number: soft {soft:.4} hard {hard:.4}");
+        });
+    }
+
     /// The hard-constrained advection ansatz: `u = sin x + t·M(sin x, cos x, t)`. Exactly `2π`-periodic in
     /// `x` and exactly `sin x` at `t = 0`, for every `M`.
     fn advection_ansatz(ctx: &Arc<Context>, pv: &[Var], x: &Var, n: usize) -> Var {

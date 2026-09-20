@@ -145,19 +145,32 @@ more windows is not monotonically better. ⚠ Only the two global-fit rows and t
 configuration; the table rows and the marching-alone number come from other nets and point counts and are
 context, not a controlled comparison.
 
-⛔⛔ **A correction to the helmholtz claim: the constraint alone is not what did it.** `Problem` now
-carries a `hard_constraint` hook, so the library's own harness can impose conditions structurally instead of
-by penalty. Turning it on for helmholtz — the same `(1−x²)(1−y²)·M`, under the harness's own recipes — was
-measured and is **worse**: vanilla **6.3903** against 0.4766, full recipe **0.8154** against 0.3066. So the
-fixture's 0.0059 comes from the whole configuration (cell-centred interior points, a 501-parameter tanh net,
-15,000 Adam steps at 3e-3), not from the constraint in isolation. The harness samples 2000 *random* points —
-some arbitrarily close to the edge, where the constraint's own factor vanishes — runs 4000 steps at 1e-3,
-and hands a Fourier net scales chosen for `u` rather than for `u/(1−x²)(1−y²)`.
+⛔⛔ **The helmholtz "~50×" decomposed, on matched arms — and most of it was not the constraint.** That row
+was the one comparison here that was never controlled: it put a hard-constrained fixture against the *recipe
+table*, which differs in net, point count, schedule and formulation all at once. Two measurements settle it.
 
-This is the "not a controlled comparison" caveat on that row turning out to matter. The `~50×` should be
-read as *this configuration against the table*, and the attribution to hard constraints specifically is
-weaker than the advection and burgers results, where the arms were matched. The hook ships; helmholtz does
-**not** enable it by default, because enabling it is a retuning job and not a switch.
+First, `Problem` now carries a `hard_constraint` hook, so the harness itself can impose conditions
+structurally. Turning it on for helmholtz under the harness's own recipes is **worse**: vanilla **6.3903**
+against 0.4766, full recipe **0.8154** against 0.3066.
+
+Second, the matched pair the row should have had from the start — same `[2,20,20,1]` tanh net, same 900
+cell-centred interior points, same 10,000 Adam steps and schedule, same seed, only the boundary treatment
+differing:
+
+| | rel-L2 |
+|---|---|
+| recipe table's best (different net, 2000 random points, soft penalty) | 0.3066 |
+| matched arm, **soft** boundary penalty | **0.0244** |
+| matched arm, **hard** boundary constraint | **0.0091** |
+
+So the original ~50× splits as **12.6× from the configuration** and **2.7× from the constraint**. Hard
+constraints do help this row — the diagnosis was directionally right, and 2.7× on matched arms is a real
+effect — but the headline number was mostly the cell-centred sampling, the small net and the longer schedule,
+none of which is what I attributed it to. ⚠ The advection and burgers attributions are unaffected: those
+arms were matched from the start.
+
+The hook ships; helmholtz does **not** enable it by default, because enabling it under the existing recipes
+is a retuning job and not a switch.
 
 ### The four rows, diagnosed
 
@@ -169,7 +182,7 @@ the residual landscape.
 | row | regression fit | soft | hard | diagnosis |
 |---|---|---|---|---|
 | heat | — | 0.0448 | — | already solved by the recipe (0.0082) |
-| helmholtz | — | 0.3066 (table) | **0.0059 / 0.0064** | **loss balancing** (⚠ not the constraint alone — below) |
+| helmholtz | — | **0.0244** matched | **0.0091** matched | **loss balancing**, worth 2.7× on matched arms |
 | advection | 0.0142 | 0.8098 | 0.9781 | **residual landscape** → marching × hard ICs, **0.0251** |
 | burgers | **0.0050** | 0.1980 | 0.3957 | representation ruled out; balancing ruled out → **residual landscape** → marching × hard, **0.0142** |
 
@@ -178,7 +191,7 @@ the residual landscape.
 | row | recipe table's best | after diagnosis | |
 |---|---|---|---|
 | heat | **0.0082** | — | the recipe already reaches it |
-| helmholtz | 0.3066 | **0.0059 / 0.0064** | hard constraints **plus its configuration** — see the correction below |
+| helmholtz | 0.3066 | **0.0091** matched (0.0059 at 15k steps) | configuration 12.6× **×** hard constraints 2.7× — decomposed below |
 | advection | 0.9712 | **0.0251** | marching × hard conditions, 36× |
 | burgers | 0.2079 | **0.0142** | marching × hard conditions, 14× |
 
