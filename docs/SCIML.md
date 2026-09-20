@@ -145,6 +145,29 @@ more windows is not monotonically better. ⚠ Only the two global-fit rows and t
 configuration; the table rows and the marching-alone number come from other nets and point counts and are
 context, not a controlled comparison.
 
+### The four rows, diagnosed
+
+The method that came out of this: **rule representation in or out first**, with a cheap regression fit of
+the hard-constrained ansatz onto the reference and no PDE residual in the loop. Then hard constraints
+separate the remaining two failure modes, because they remove loss balancing entirely and do nothing about
+the residual landscape.
+
+| row | regression fit | soft | hard | diagnosis |
+|---|---|---|---|---|
+| heat | — | 0.0448 | — | already solved by the recipe (0.0082) |
+| helmholtz | — | 0.3066 (table) | **0.0059 / 0.0064** | **loss balancing** |
+| advection | 0.0142 | 0.8098 | 0.9781 | **residual landscape** → marching × hard ICs, **0.0251** |
+| burgers | **0.0050** | 0.1980 | 0.3957 | representation ruled out; balancing ruled out → **residual landscape** |
+
+Burgers is the row where the obvious suspect was wrong twice over. The shock at `ν = 0.01/π` is genuinely
+steep — the reference jumps **0.615** between neighbouring `x` at `t = 1` on a `Δx = 0.0078` grid — so
+spectral bias looked like the limit, and it is not: the ansatz regresses onto the reference at **0.0050**,
+and a much larger net does no better (0.0056). Nor is it loss balancing: hard constraints make it *worse*
+(0.3957 against 0.1980 soft), exactly as on advection. By elimination it is the residual landscape, which
+predicts that marching is its fix too. ⚠ That prediction is **not yet measured** — burgers marching has to
+carry `g″` from window to window because the residual needs `u_xx`, and until that is built and run,
+nothing is claimed about it.
+
 `g` and `g′` are evaluated once per window and carried as constants, with the residual written out
 (`u_τ = M + τM_τ`, `u_x = g′ + τM_x`) rather than differentiated through a growing stack of frozen networks
 — so the cost per window stays flat instead of growing with the window index.

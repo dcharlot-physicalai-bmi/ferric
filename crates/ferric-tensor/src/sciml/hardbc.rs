@@ -71,6 +71,162 @@ mod tests {
 
 
 
+
+    /// The hard-constrained Burgers ansatz: `u = −sin(πx) + t(1−x²)·M(x,t)`. Exactly `−sin(πx)` at `t = 0`
+    /// and exactly zero at `x = ±1`, for every `M` — both conditions structural.
+    fn burgers_ansatz(ctx: &Arc<Context>, pv: &[Var], x: &Var) -> Var {
+        let xc = col_of(ctx, x, 2, 0);
+        let tc = col_of(ctx, x, 2, 1);
+        let pi = Var::leaf(Tensor::from_vec(&x.value().ctx_arc(), &[std::f32::consts::PI], &[1]));
+        let one = Var::leaf(Tensor::from_vec(&x.value().ctx_arc(), &[1.0f32], &[1]));
+        let ic = xc.mul(&pi).sin().neg();
+        let bc = one.sub(&xc.mul(&xc));
+        ic.add(&tc.mul(&bc).mul(&Mlp::forward_act(pv, x, Act::Tanh)))
+    }
+
+    /// ⚠ **Diagnosing the burgers row before building anything for it — and the suspect was wrong.** At
+    /// `ν = 0.01/π ≈ 0.0032` the solution steepens into a shock at `x = 0`, so spectral bias looked like
+    /// the obvious limit. It is not: fitted to the Cole–Hopf reference by plain regression with no PDE
+    /// residual in the loop, the ansatz reaches **0.0050**, and a much larger net reaches 0.0056 — no
+    /// better. The shock is genuinely steep on this grid (the reference jumps **0.615** between
+    /// neighbouring `x` at `t = 1`) and the network represents it anyway.
+    ///
+    /// So representation is not what limits this row, and the table's 0.2079 is ~40× worse than what the
+    /// same ansatz can express. That leaves the two failure modes the other rows turned on — loss
+    /// balancing, or the residual landscape — which the companion fixture separates.
+    ///
+    /// ⚠ The grid resolves the shock only marginally: `Δx = 2/256 = 0.0078` against a width of ~0.0032, so
+    /// these numbers measure the ansatz on *this sampling*, which is the same sampling the PDE arms would
+    /// use. A finer grid is a different question and is not answered here.
+    #[ignore = "fits the burgers ansatz by regression on the GPU (~6 min); run with -- --ignored"]
+    #[test]
+    fn representation_is_not_what_limits_the_burgers_row() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (nx, nt, steps) = (256usize, 64usize, 6000u32);
+            let nu = 0.01 / std::f64::consts::PI;
+            let n = nx * nt;
+            let (mut pts, mut target) = (vec![0.0f32; n * 2], vec![0.0f32; n]);
+            for i in 0..nx {
+                for j in 0..nt {
+                    let x = -1.0 + 2.0 * (i as f64 + 0.5) / nx as f64;
+                    let t = j as f64 / (nt as f64 - 1.0);
+                    let k = i * nt + j;
+                    pts[k * 2] = x as f32;
+                    pts[k * 2 + 1] = t as f32;
+                    target[k] = crate::sciml::bench::burgers(x, t, nu) as f32;
+                }
+            }
+            // how steep does the reference actually get on this grid? the premise, in a number
+            let mut worst_jump = 0.0f32;
+            for i in 1..nx {
+                worst_jump = worst_jump.max((target[i * nt + (nt - 1)] - target[(i - 1) * nt + (nt - 1)]).abs());
+            }
+            eprintln!("    [banked] reference at t=1 on Δx={:.4}: largest neighbour jump {worst_jump:.3}", 2.0 / nx as f32);
+            let tv = leaf(&ctx, &target, &[n, 1]);
+            for dims in [vec![2usize, 96, 96, 96, 1], vec![2, 128, 128, 128, 128, 1]] {
+                let net = Mlp::new(&ctx, &dims, 5);
+                let mut wp = net.params.clone();
+                let mut adam = crate::Adam::new(&wp, 3e-3);
+                for ep in 0..steps {
+                    if ep == steps * 3 / 4 {
+                        adam = crate::Adam::new(&wp, 3e-4);
+                    }
+                    let pv = vars(&wp);
+                    let u = burgers_ansatz(&ctx, &pv, &leaf(&ctx, &pts, &[n, 2]));
+                    let d = u.sub(&tv);
+                    let loss = d.mul(&d).mean_all();
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+                let pv = vars(&wp);
+                let uv = burgers_ansatz(&ctx, &pv, &leaf(&ctx, &pts, &[n, 2])).value().to_vec().await;
+                let e = rel_l2(&uv, &target);
+                // the ansatz's own guarantees, checked rather than assumed
+                let at_t0 = (0..nx).map(|i| (uv[i * nt] - target[i * nt]).abs()).fold(0.0f32, f32::max);
+                let at_edge = (0..nt).map(|j| uv[j].abs().max(uv[(nx - 1) * nt + j].abs())).fold(0.0f32, f32::max);
+                eprintln!("    [banked] burgers ansatz {dims:?}, {steps} Adam steps: rel-L2 {e:.4} (t=0 exact to {at_t0:.1e}, |u| at the nearest x to ±1 is {at_edge:.3})");
+                assert!(at_t0 < 1e-4, "the ansatz must be exactly −sin(πx) at t = 0: worst {at_t0:.2e}");
+            }
+        });
+    }
+
+
+    /// ⭐ **Which failure mode is it, then?** The regression fixture rules representation out, leaving the
+    /// two the other rows turned on: the loss balancing a soft boundary penalty forces (Helmholtz's), or
+    /// the residual landscape (advection's). Hard constraints separate them — they remove the first
+    /// entirely and do nothing about the second, so this arm pair is the test.
+    ///
+    /// Both arms share the grid, steps, schedule, seed, optimiser and hidden layers; only the treatment of
+    /// the initial and boundary conditions differs. ⚠ The PDE grid is coarser than the regression one
+    /// (`Δx = 0.0156` against a shock width of ~0.0032) because the residual needs `u_xx` at every point;
+    /// both arms carry that identically, so it bounds the achievable error for both rather than favouring
+    /// either.
+    #[ignore = "trains two burgers PINNs on the GPU (~25 min); run with -- --ignored"]
+    #[test]
+    fn soft_against_hard_conditions_on_the_burgers_row() {
+        pollster::block_on(async {
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let (nx, nt, steps, bw) = (128usize, 32usize, 8000u32, 100.0f32);
+            let nu = 0.01 / std::f64::consts::PI;
+            let n = nx * nt;
+            let (mut pts, mut exact) = (vec![0.0f32; n * 2], vec![0.0f32; n]);
+            for i in 0..nx {
+                for j in 0..nt {
+                    let x = -1.0 + 2.0 * (i as f64 + 0.5) / nx as f64;
+                    let t = j as f64 / (nt as f64 - 1.0);
+                    let k = i * nt + j;
+                    pts[k * 2] = x as f32;
+                    pts[k * 2 + 1] = t as f32;
+                    exact[k] = crate::sciml::bench::burgers(x, t, nu) as f32;
+                }
+            }
+            let ic: Vec<f32> = (0..nx).flat_map(|i| [-1.0 + 2.0 * (i as f32 + 0.5) / nx as f32, 0.0]).collect();
+            let ic_u: Vec<f32> = (0..nx).map(|i| -((std::f32::consts::PI * (-1.0 + 2.0 * (i as f32 + 0.5) / nx as f32)).sin())).collect();
+            let edges: Vec<f32> = (0..nt).flat_map(|j| [-1.0, j as f32 / (nt as f32 - 1.0), 1.0, j as f32 / (nt as f32 - 1.0)]).collect();
+            let nuv = leaf(&ctx, &[nu as f32], &[1]);
+            let bwv = leaf(&ctx, &[bw], &[1]);
+
+            let mut results = Vec::new();
+            for hard in [false, true] {
+                let net = Mlp::new(&ctx, &[2, 96, 96, 96, 1], 5);
+                let mut wp = net.params.clone();
+                let mut adam = crate::Adam::new(&wp, 3e-3);
+                for ep in 0..steps {
+                    if ep == steps * 3 / 4 {
+                        adam = crate::Adam::new(&wp, 3e-4);
+                    }
+                    let pv = vars(&wp);
+                    let x = leaf(&ctx, &pts, &[n, 2]);
+                    let u = if hard { burgers_ansatz(&ctx, &pv, &x) } else { Mlp::forward_act(&pv, &x, Act::Tanh) };
+                    let g = crate::sciml::deriv(&u, &x);
+                    let ux = col_of(&ctx, &g, 2, 0);
+                    let ut = col_of(&ctx, &g, 2, 1);
+                    let uxx = col_of(&ctx, &crate::sciml::deriv(&ux, &x), 2, 0);
+                    let r = ut.add(&u.mul(&ux)).sub(&uxx.mul(&nuv));
+                    let mut loss = r.mul(&r).mean_all();
+                    if !hard {
+                        let ui = Mlp::forward_act(&pv, &leaf(&ctx, &ic, &[nx, 2]), Act::Tanh);
+                        let di = ui.sub(&leaf(&ctx, &ic_u, &[nx, 1]));
+                        let ub = Mlp::forward_act(&pv, &leaf(&ctx, &edges, &[2 * nt, 2]), Act::Tanh);
+                        loss = loss.add(&di.mul(&di).mean_all().add(&ub.mul(&ub).mean_all()).mul(&bwv));
+                    }
+                    step(&ctx, &loss, &pv, &mut wp, &mut adam).await;
+                }
+                let pv = vars(&wp);
+                let x = leaf(&ctx, &pts, &[n, 2]);
+                let u = if hard { burgers_ansatz(&ctx, &pv, &x) } else { Mlp::forward_act(&pv, &x, Act::Tanh) };
+                let e = rel_l2(&u.value().to_vec().await, &exact);
+                eprintln!("    [banked] burgers ν=0.01/π, {} conditions, {steps} Adam steps: rel-L2 {e:.4}", if hard { "HARD" } else { "soft" });
+                results.push(e);
+            }
+            let (soft, hard) = (results[0], results[1]);
+            eprintln!(
+                "  burgers ν=0.01/π on [−1,1]×[0,1], {n} collocation points, same net / steps / seed:\n    soft conditions (weight {bw}):  rel-L2 {soft:.4}\n    hard conditions:                rel-L2 {hard:.4}\n    for context: 0.2079 vanilla and 0.2434 full recipe in the table; and this ansatz regresses onto the reference at 0.0050"
+            );
+            assert!(hard < 0.5 && soft < 0.9, "both arms must produce something, or this ranks nothing: soft {soft:.4} hard {hard:.4}");
+        });
+    }
+
     /// ⭐⭐ **The consequence of the diagnosis: hard constraints + time marching solve the advection row.**
     ///
     /// The fixture above shows hard constraints alone do not help, because advection's limit is the
