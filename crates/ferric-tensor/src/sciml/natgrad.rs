@@ -331,27 +331,24 @@ mod tests {
     }
 
 
-    /// ⭐⭐ **The Helmholtz row was not a recipe problem — it was a boundary-condition problem.**
-    /// `Δu + k²u = q` on `[−1,1]²` with `a = (1,4)`, `k = 1` and the manufactured `sin(πx) sin(4πy)`. The
-    /// recipe table's best is **0.3066** — per-axis Fourier features, gradient-norm or NTK balancing,
-    /// Adam then strong-Wolfe L-BFGS, 2000 collocation points, and a **soft** boundary penalty.
+    /// ⛔ **Gauss-Newton does not help on helmholtz, where plain Adam solves it.** The counterexample to
+    /// the 119× that natural gradients give on 1-D Poisson, and the reason this module claims a result
+    /// about *that problem* rather than about the method.
     ///
-    /// Hard-constrain the boundary instead — `u = (1−x²)(1−y²)·M(x,y)`, which is exactly zero on all four
-    /// edges by construction, so there is no boundary term to weight at all — and a plain `[2,20,20,1]`
-    /// tanh MLP with 501 parameters and Adam reaches **0.0059** on 900 points. Two seeds, both solved.
+    /// `Δu + k²u = q` on `[−1,1]²`, `a = (1,4)`, `k = 1`, boundary hard-constrained by `(1−x²)(1−y²)` so
+    /// there is no penalty to balance. Plain Adam on a 501-parameter tanh MLP reaches **0.0059 / 0.0064**
+    /// at two seeds; 25 Gauss-Newton steps over 900 s move the same warm-up from 0.4439 to only **0.4121**.
     ///
-    /// ⚠ This is **not** a recipe comparison: different net, different point count, and above all a
-    /// different formulation. What it is evidence for is that the binding constraint on this row was the
-    /// loss balancing that a soft boundary penalty forces on you, and that removing the penalty removes
-    /// the problem. The table's number stands as a soft-BC result; it should not be read as the difficulty
-    /// of the PDE.
-    ///
-    /// ⛔ **And Gauss-Newton does not help here**, in contrast to the 119× it gives on 1-D Poisson: 25
-    /// steps over 900 s moved the same warm-up from 0.4439 to only 0.4121. The natural gradient is not a
-    /// universal upgrade, and this fixture is where that is on the record.
+    /// ⚠ **This fixture does not attribute that 0.0059 to the hard constraint.** It compares against the
+    /// recipe table, which differs in net, point count, schedule and formulation at once. The matched
+    /// comparison lives in `sciml::hardbc::soft_against_hard_conditions_on_the_helmholtz_row` and splits it:
+    /// **0.0244 soft against 0.0091 hard** on identical arms, so the constraint is worth 2.7× and the rest
+    /// of the gap to the table's 0.3066 is the configuration. An earlier version of this docstring claimed
+    /// the row "was a boundary-condition problem"; that was an uncontrolled comparison read as a controlled
+    /// one, and it is corrected here and in docs/SCIML.md.
     #[ignore = "trains three arms of a 2-D Helmholtz PINN on the GPU (~40 min); run with -- --ignored"]
     #[test]
-    fn hard_boundary_constraints_solve_the_helmholtz_row_the_recipe_table_could_not() {
+    fn gauss_newton_does_not_help_on_helmholtz_where_plain_adam_solves_it() {
         pollster::block_on(async {
             let ctx = Arc::new(Context::new().await.unwrap());
             let (m, rank_steps, warm, adam_steps) = (30usize, 25usize, 1500u32, 15000u32);
@@ -478,7 +475,7 @@ mod tests {
             );
             // the claim: hard boundary conditions solve this row, at both seeds
             for (i, &r) in rel_adams.iter().enumerate() {
-                assert!(r < 0.05, "hard BCs must solve Helmholtz at seed {i}: {r:.4}");
+                assert!(r < 0.05, "plain Adam on this configuration must solve Helmholtz at seed {i}: {r:.4}");
             }
             assert!(rel_warm > 10.0 * rel_adam, "and it must be the training that got there, not the initialisation: {rel_warm:.4} vs {rel_adam:.4}");
             // ⛔ NOT asserted: any Gauss-Newton win. It does not have one here, and the printed number is

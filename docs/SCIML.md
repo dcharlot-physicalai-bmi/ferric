@@ -151,7 +151,9 @@ table*, which differs in net, point count, schedule and formulation all at once.
 
 First, `Problem` now carries a `hard_constraint` hook, so the harness itself can impose conditions
 structurally. Turning it on for helmholtz under the harness's own recipes is **worse**: vanilla **6.3903**
-against 0.4766, full recipe **0.8154** against 0.3066.
+against 0.4766, full recipe **0.8154** against 0.3066 (reproduced by
+`hardbc::enabling_the_hard_constraint_under_the_harness_recipes_is_worse_on_helmholtz`, which asserts the
+negative so that the day it stops holding, the assertion fires instead of this page going quietly stale).
 
 Second, the matched pair the row should have had from the start — same `[2,20,20,1]` tanh net, same 900
 cell-centred interior points, same 10,000 Adam steps and schedule, same seed, only the boundary treatment

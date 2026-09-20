@@ -99,6 +99,52 @@ mod tests {
     }
 
 
+
+    /// ⛔ **Reproducing the number that says enabling the hook under the harness's own recipes is worse.**
+    /// `docs/SCIML.md` quotes vanilla 6.3903 and full 0.8154 for helmholtz with `(1−x²)(1−y²)·M` turned on.
+    /// That measurement was originally a one-off — the hook was enabled on `Helmholtz`, run, and removed —
+    /// which left a load-bearing figure in the docs with no fixture behind it. This is the fixture: a
+    /// test-local wrapper that delegates every part of the problem and adds only the constraint.
+    #[ignore = "two harness trainings on the GPU (~25 min); run with -- --ignored"]
+    #[test]
+    fn enabling_the_hard_constraint_under_the_harness_recipes_is_worse_on_helmholtz() {
+        pollster::block_on(async {
+            use crate::sciml::harness::{run, Helmholtz, Problem, Recipe};
+            use crate::sciml::util::box_points;
+            struct Hard(Helmholtz);
+            impl Problem for Hard {
+                fn name(&self) -> &str { "helmholtz2d-hard" }
+                fn dim(&self) -> usize { self.0.dim() }
+                fn lo(&self) -> Vec<f64> { self.0.lo() }
+                fn hi(&self) -> Vec<f64> { self.0.hi() }
+                fn residual(&self, c: &Arc<Context>, f: &dyn Fn(&Var) -> Var, x: &Var, n: usize) -> Var { self.0.residual(c, f, x, n) }
+                fn boundary_constraints(&self, c: &Arc<Context>, f: &dyn Fn(&Var) -> Var, n: usize, s: u32) -> Vec<Var> { self.0.boundary_constraints(c, f, n, s) }
+                fn reference(&self, x: &[f64]) -> f64 { self.0.reference(x) }
+                fn scales(&self) -> Vec<Vec<f32>> { self.0.scales() }
+                fn hard_constraint(&self, ctx: &Arc<Context>, x: &Var, raw: &Var) -> Option<Var> {
+                    let (xc, yc) = (col_of(ctx, x, 2, 0), col_of(ctx, x, 2, 1));
+                    let one = Var::leaf(Tensor::from_vec(ctx, &[1.0f32], &[1]));
+                    Some(one.sub(&xc.mul(&xc)).mul(&one.sub(&yc.mul(&yc))).mul(raw))
+                }
+            }
+            let ctx = Arc::new(Context::new().await.unwrap());
+            let p = Hard(Helmholtz { a1: 1.0, a2: 4.0, k: 1.0 });
+            let colloc = box_points(&p.lo(), &p.hi(), 2000, 7);
+            let v = run(&ctx, &p, &Recipe::vanilla(), &colloc, 51, 1);
+            eprintln!("    [banked] harness + hard constraint, vanilla: rel-L2 {:.4} (soft was 0.4766)", v.rel_l2);
+            let f = run(&ctx, &p, &Recipe::full(), &colloc, 51, 1);
+            eprintln!("    [banked] harness + hard constraint, full:    rel-L2 {:.4} (soft was 0.3066)", f.rel_l2);
+            eprintln!("  helmholtz with the hook on, under the harness's own recipes and 2000 RANDOM points:\n    vanilla {:.4} against 0.4766 soft;  full {:.4} against 0.3066 soft", v.rel_l2, f.rel_l2);
+            // ⛔ A RECORDED NEGATIVE, as in the advection fixture: if this ever fires, enabling the hook
+            // under these recipes has started helping and docs/SCIML.md must be rewritten.
+            assert!(
+                v.rel_l2 > 0.4766 && f.rel_l2 > 0.3066,
+                "RECORDED NEGATIVE OVERTURNED: the hook now helps under the harness recipes (vanilla {:.4}, full {:.4}) — update docs/SCIML.md",
+                v.rel_l2, f.rel_l2
+            );
+        });
+    }
+
     /// ⭐ **The matched helmholtz comparison the row never had.** Advection and burgers were settled with
     /// arms that shared everything but the condition treatment; helmholtz was only ever compared against
     /// the *recipe table*, which differs in net, point count and formulation at once. Then the harness hook
