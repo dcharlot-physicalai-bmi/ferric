@@ -87,11 +87,29 @@ that, so they were re-run end to end (7 oracles, 63 minutes). Six reproduce thei
 | gradient-norm balancing | 0.464 → 0.0044, λ → 9.9e3 | **0.4639 → 0.0044**, λ = **9852.2** |
 | spectral bias, control arm | 0.958 | **0.9582** |
 
-⚠ **One drifted.** The Fourier-feature arm of the spectral-bias oracle was documented at **0.0017** and
-re-measures at **0.0065** — same fixture, same steps, 3.8× apart. The test never noticed, because its bar is
-`e_ff < 0.05` and both pass it with room. I have **not** isolated whether that is the `matmul` change or
-run-to-run variance, and I did not check out the old code to find out; the table now carries the current
-number with the earlier one beside it, the way the causal row already carries two.
+A second batch covered the rest of the stack's documented figures. The 2-D spectral operator reproduces
+**exactly** — held-out **0.0026**, the learned multipliers still 0.02533 and 0.00633 against the Green's
+function, worst deviation **8.179e-3** (the documented 0.82 %) — and so does the Neumann sign test,
+**u(½) = 0.5002**.
+
+⚠ **Four numbers drifted, out of eleven audited, and every assertion stayed green throughout.**
+
+| claim | documented | re-measured |
+|---|---|---|
+| spectral bias, Fourier arm | 0.0017 | **0.0065** (bar: `< 0.05`) |
+| Laplace on the annulus | 0.0082 | **0.0033** — *better* |
+| certificate: `‖r‖`, bound, true error | 1.44, 7.56e-2, 8.25e-3 | **1.051, 5.764e-2, 6.788e-3** |
+
+None of these is a correctness change: the certificate stayed sound (8.5× where it was 9.2×), the annulus
+improved, and the spectral-bias arm is still two orders below its control. They are the spread of a
+stochastic training run, which the pages had been quoting as if they were constants. The tables now carry
+the current value with the earlier one beside it. I have **not** isolated how much of the spread is the
+`matmul` VJP fix and how much is run-to-run variance, and I did not check out old code to find out.
+
+⛔ The lesson is the method, not the numbers: **re-run the numbers, not the tests.** Every one of these
+fixtures passed, every time, before and after. Only comparing the printed values against this page found the
+drift — an assertion bar with 7.7× headroom is not a regression detector, and a documented figure with no
+tolerance beside it will read as reproducible long after it stops being so.
 
 ⭐ The causal row's "two runs of the same configuration" is no longer a hedge: this run produced **both** of
 its documented values in one pass — 0.1165 from the oracle and 0.0943 from the sweep, on the same fixture.
@@ -357,7 +375,7 @@ must leave the shape and stepped against it must stay inside — on the primitiv
 (`primitives_and_csg_composites_have_outward_normals_and_consistent_membership`). That check is what gives a
 Neumann condition its sign; a normal pointing the wrong way is a flux condition of the wrong sign, and no
 loss curve would show it. Two GPU oracles close the loop with closed forms, both measured: Laplace on the annulus through
-CSG + Dirichlet reaches **rel-L2 0.0082** against `u = ln(r/½)/ln 2`, and the 1-D Neumann sign test
+CSG + Dirichlet reaches **rel-L2 0.0033** against `u = ln(r/½)/ln 2` (0.0082 on an earlier run), and the 1-D Neumann sign test
 (`u'' = 0`, `u(0) = 0`, `u'(1) = 1` ⇒ `u = x`) returns **u(½) = 0.5002** where a flipped outward normal
 would have given −0.5.
 
@@ -379,7 +397,7 @@ Both inputs come from the network alone. The bound is **sound** and, on the firs
 error-versus-residual results (2006.16144). Hyperbolic and nonlinear problems have no bound of this form
 here and none is claimed. `the_certificate_bounds_a_trained_poisson_pinn_from_its_residual_alone` runs it on a
 trained net: a Fourier-feature PINN on the unit-square Poisson problem, 4000 Adam steps with balancing, gives
-`‖r‖ = 1.44`, boundary max `2.5e-3`, hence **‖e‖ ≤ 7.56e-2**, against a true error of **8.25e-3** — sound, and
+`‖r‖ = 1.051`, boundary max `4.374e-3`, hence **‖e‖ ≤ 5.764e-2**, against a true error of **6.788e-3** — sound at 8.5×. (An earlier run of the same fixture gave `‖r‖ = 1.44`, bound 7.56e-2, true 8.25e-3, sound at 9.2×: the PINN converges somewhere slightly different each time and every number moves with it, while what is asserted — that the bound holds — does not.) Sound, and
 9.2× the truth rather than a vacuous number. The residual norm dominates the bound, which is the honest
 reading: the certificate says what the network still owes the equation, and a tighter bound is earned by
 training the residual down, not by argument.
