@@ -58,6 +58,13 @@ pub enum Pre {
     Gpt2,
     /// Qwen2/Qwen3, and anything else declaring `qwen2`.
     Qwen2,
+    /// Llama 3.x and the family that shares its regex — `llama-v3`, `llama-bpe`, `falcon3`,
+    /// `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano`.
+    ///
+    /// Qwen2's rule with ONE difference: digits group in runs of up to three (`\p{N}{1,3}`) instead
+    /// of one at a time (`\p{N}`). That is the whole delta, and it is enough — "2026" is one token
+    /// boundary under Qwen2 and another under Llama3.
+    Llama3,
     /// Qwen 3.5 (`qwen35`) — Qwen2's rule with COMBINING MARKS folded into the letter run:
     /// `[\p{L}\p{M}]+` rather than `\p{L}+`. llama.cpp gives it its own pre-type
     /// (`LLAMA_VOCAB_PRE_TYPE_QWEN35`); it is not an alias for qwen2, and the difference is every
@@ -86,13 +93,23 @@ pub enum Pre {
 impl Pre {
     /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
     /// tree did unconditionally before this existed.
+    /// Does this rule emit a pre-token verbatim when the vocabulary already holds it, skipping the
+    /// merge loop? llama.cpp calls this `ignore_merges` and sets it for the LLAMA3 family.
+    ///
+    /// ⚠ Scoped to what has been VERIFIED against the reference. llama.cpp also sets it for DEFAULT,
+    /// GPT4O, JAIS, TEKKEN, DEEPSEEK3 and others; those rules are not implemented here yet, so
+    /// claiming the flag for them would be asserting behaviour for a path that does not exist.
+    pub fn ignores_merges(self) -> bool { matches!(self, Pre::Llama3) }
+
     /// Is this `tokenizer.ggml.pre` value one Ferric actually IMPLEMENTS, or does it fall open?
     ///
     /// ⛔ The distinction is invisible at the call site: `from_gguf` returns a perfectly good
     /// `Pre::Gpt2` either way. This is what lets a caller — or a conformance sweep — tell "we chose
     /// GPT-2" from "we defaulted to GPT-2 because nobody taught us this one".
     pub fn is_mapped(pre: &str) -> bool {
-        matches!(pre, "gpt2" | "qwen2" | "qwen35" | "hyv4" | "deepseek3-llm" | "hunyuan-dense")
+        matches!(pre, "gpt2" | "qwen2" | "qwen35" | "hyv4" | "deepseek3-llm" | "hunyuan-dense"
+                      | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
+                      | "midm-2.0" | "lfm2" | "jina-v5-nano")
     }
 
     pub fn from_gguf(pre: Option<&str>) -> Pre {
@@ -112,6 +129,10 @@ impl Pre {
             // would show it closing. Until then this is right for Latin/Cyrillic/Greek/CJK and
             // imperfect for Indic — stated here so nobody has to rediscover it.
             Some("qwen35") => Pre::Qwen35,
+            // The eight values llama.cpp folds into LLAMA_VOCAB_PRE_TYPE_LLAMA3 — verified in
+            // llama-vocab.cpp, not inferred from the names.
+            Some("llama-v3") | Some("llama-bpe") | Some("falcon3") | Some("falcon-h1")
+            | Some("pixtral") | Some("midm-2.0") | Some("lfm2") | Some("jina-v5-nano") => Pre::Llama3,
             // llama.cpp maps deepseek3-llm and hunyuan-dense to the identical regex string.
             Some("hyv4") | Some("deepseek3-llm") | Some("hunyuan-dense") => Pre::Hyv4,
             // ⚠ FALL-OPEN, AND ITS SIZE IS MEASURED. An unmapped value silently becomes GPT-2,
@@ -244,8 +265,18 @@ impl Bpe {
     /// Encode text → token ids (lossless byte-level).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
+        let ignore_merges = self.pre.ignores_merges();
         for word in pretokenize_with(text, self.pre) {
             let symbols: Vec<String> = word.bytes().map(|b| self.b2u[b as usize].to_string()).collect();
+            // ⛔ `ignore_merges` (llama-vocab.cpp:623). For the LLAMA3 family, a pre-token that is
+            // ALREADY a vocabulary entry is emitted as that entry and the merge loop never runs.
+            // Without it, Ferric re-derived `Tiếng` from its bytes and reached a different split:
+            // llama.cpp `[46451, 27160, ...]`, Ferric something else, on a word both tokenizers hold
+            // verbatim. Nothing about it looks wrong — it is a valid tokenization of the same text.
+            if ignore_merges {
+                let whole: String = symbols.concat();
+                if let Some(&id) = self.encoder.get(&whole) { ids.push(id); continue; }
+            }
             for tok in self.bpe(symbols) {
                 // any merged token is in the vocab; base byte-symbols always are
                 ids.push(*self.encoder.get(&tok).expect("token missing from vocab"));
@@ -451,14 +482,22 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
     // Digits step: isolate each digit; group consecutive non-digits.
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
+    // ⛔ `\p{N}`, not `is_ascii_digit()`. The regexes say \p{N} = Nd+Nl+No: Arabic-Indic and
+    // Devanagari digits (Nd), Roman numerals (Nl), vulgar fractions (No). Measured against
+    // llama-tokenize before this changed, `½ and ⅓ and Ⅻ` was the one miss in five.
+    //
+    // ⚠ And HOW MANY digits form one fragment is per-rule: `\p{N}` takes them one at a time, while
+    // Llama3's `\p{N}{1,3}` is GREEDY over runs of three — so "2026" splits 202|6 there and 2|0|2|6
+    // here. One character of regex, a different tokenization of every number in the corpus.
+    let digit_group = if pre == Pre::Llama3 { 3 } else { 1 };
+    let mut run = 0usize;
     for c in text.chars() {
-        // ⛔ `\p{N}`, not `is_ascii_digit()`. The regexes say \p{N}, which is Nd+Nl+No: Arabic-Indic
-        // and Devanagari digits (Nd), Roman numerals (Nl), vulgar fractions (No). Measured against
-        // llama-tokenize before this line changed, `½ and ⅓ and Ⅻ` was the one miss in five.
         if unicode_classes::is_number_cat(c) {
-            if !cur.is_empty() { frags.push(std::mem::take(&mut cur)); }
-            frags.push(vec![c]);
+            if !cur.is_empty() && run == 0 { frags.push(std::mem::take(&mut cur)); }
+            if run == 0 || run == digit_group { frags.push(vec![c]); run = 1; }
+            else { frags.last_mut().expect("a digit fragment is open").push(c); run += 1; }
         } else {
+            run = 0;
             cur.push(c);
         }
     }
@@ -496,7 +535,7 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
             //
             // A space still falls through to the branch below when what follows is NOT a letter, so
             // ` (Reyes` keeps its ` (` punctuation chunk and tokenises identically under both schemes.
-            if matches!(pre, Pre::Qwen2 | Pre::Qwen35) && !is_l(c) && !is_n(c) && c != '\r' && c != '\n'
+            if matches!(pre, Pre::Qwen2 | Pre::Qwen35 | Pre::Llama3) && !is_l(c) && !is_n(c) && c != '\r' && c != '\n'
                 && i + 1 < n && is_l(f[i + 1]) {
                 let mut e = i + 1;
                 while e < n && is_l(f[e]) { e += 1; }
@@ -570,7 +609,12 @@ mod pre_tests {
     #[test]
     fn the_gguf_key_maps_and_defaults_to_gpt2() {
         assert_eq!(Pre::from_gguf(Some("qwen2")), Pre::Qwen2);
-        assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "unknown values keep the old behaviour");
+        // ⚠ A FICTIONAL value, not a real-but-unmapped one. This assertion used `"llama-bpe"` and
+        // broke the day llama-bpe was implemented — a correct change failing a test that was only
+        // ever about the FALLBACK. "Unknown" has to be something that cannot stop being unknown.
+        assert_eq!(Pre::from_gguf(Some("no-such-pretokenizer-v9")), Pre::Gpt2,
+                   "an unrecognised value falls back to GPT-2");
+        assert!(!Pre::is_mapped("no-such-pretokenizer-v9"), "and is reported as unmapped");
         assert_eq!(Pre::from_gguf(None), Pre::Gpt2, "a file with no key is what the tree assumed for all");
     }
     /// The distinctive rule: leading ASCII punctuation binds to the letters after it. This is what
@@ -862,7 +906,10 @@ mod qwen35_pretokenizer_tests {
                     every mark-bearing script); Pre::Qwen35 is 20/20.");
         // ⛔ and the neighbours must not move with it
         assert_eq!(Pre::from_gguf(Some("qwen2")), Pre::Qwen2);
-        assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "still unmapped, deliberately");
+        // llama-bpe is now the LLAMA3 family, verified against the reference
+        assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Llama3);
+        assert_eq!(Pre::from_gguf(Some("lfm2")), Pre::Llama3);
+        assert_eq!(Pre::from_gguf(Some("pixtral")), Pre::Llama3);
     }
 
     /// The constructs the two rules actually differ on — ordinary prose agrees under both, which is

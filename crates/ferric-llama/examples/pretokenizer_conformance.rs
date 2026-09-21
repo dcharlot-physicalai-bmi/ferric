@@ -47,8 +47,8 @@ fn main() {
     // ⛔ EVERY variant must be listed, or a model whose rule is missing here reports NO "(current)"
     // row and the sweep quietly files it as "not BPE". That happened the moment Pre::Qwen35 landed:
     // the three checkpoints the fix was FOR vanished from the results it was meant to prove.
-    let variants: [(&str, Pre); 4] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2),
-                                      ("Qwen35", Pre::Qwen35), ("Hyv4", Pre::Hyv4)];
+    let variants: [(&str, Pre); 5] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2),
+                                      ("Qwen35", Pre::Qwen35), ("Llama3", Pre::Llama3), ("Hyv4", Pre::Hyv4)];
     let mut best = ("", 0usize);
     for (name, p) in variants {
         let b = Bpe::new_with_pre(vocab.clone(), &merges, p);
