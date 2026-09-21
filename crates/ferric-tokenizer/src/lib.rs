@@ -81,6 +81,15 @@ pub enum Pre {
 impl Pre {
     /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
     /// tree did unconditionally before this existed.
+    /// Is this `tokenizer.ggml.pre` value one Ferric actually IMPLEMENTS, or does it fall open?
+    ///
+    /// ⛔ The distinction is invisible at the call site: `from_gguf` returns a perfectly good
+    /// `Pre::Gpt2` either way. This is what lets a caller — or a conformance sweep — tell "we chose
+    /// GPT-2" from "we defaulted to GPT-2 because nobody taught us this one".
+    pub fn is_mapped(pre: &str) -> bool {
+        matches!(pre, "gpt2" | "qwen2" | "qwen35" | "hyv4" | "deepseek3-llm" | "hunyuan-dense")
+    }
+
     pub fn from_gguf(pre: Option<&str>) -> Pre {
         match pre {
             Some("qwen2") => Pre::Qwen2,

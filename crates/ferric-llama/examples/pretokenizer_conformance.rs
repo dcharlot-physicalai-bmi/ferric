@@ -35,9 +35,16 @@ fn main() {
         if ids.is_empty() { None } else { Some((s.to_string(), ids)) }
     }).collect();
 
-    println!("model pre={declared:?}  ·  currently mapped to {:?}  ·  {} reference cases\n",
+    let mapped = Pre::is_mapped(&declared);
+    println!("model pre={declared:?}  ·  {}  ·  rule {:?}  ·  {} reference cases\n",
+             if mapped { "IMPLEMENTED" } else { "FALL-OPEN (no rule for this value)" },
              Pre::from_gguf(Some(&declared)), cases.len());
-    let variants: [(&str, Pre); 3] = [("Gpt2 (current)", Pre::Gpt2), ("Qwen2", Pre::Qwen2), ("Hyv4", Pre::Hyv4)];
+    // ⛔ "(current)" MUST be computed, not written. The first version hardcoded it on the Gpt2 row,
+    // so a sweep over 34 checkpoints reported every one as diverging — including files that map to
+    // Qwen2 and score 19/20 — because the label said "current" on a row that was not. A gate whose
+    // own annotation is a constant reports the same answer whatever the code does.
+    let actual = Pre::from_gguf(Some(&declared));
+    let variants: [(&str, Pre); 3] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2), ("Hyv4", Pre::Hyv4)];
     let mut best = ("", 0usize);
     for (name, p) in variants {
         let b = Bpe::new_with_pre(vocab.clone(), &merges, p);
@@ -47,8 +54,20 @@ fn main() {
             if &b.encode(s) == want { ok += 1 } else if fails.len() < 6 { fails.push(s) }
         }
         if ok > best.1 { best = (name, ok); }
-        println!("  {name:<16} {ok:>2}/{} exact", cases.len());
+        let tag = if p == actual { " (current)" } else { "" };
+        println!("  {:<18} {ok:>2}/{} exact", format!("{name}{tag}"), cases.len());
         if !fails.is_empty() { println!("      misses: {}", fails.join(" · ")); }
     }
-    println!("\n  closest to the reference: {} ({}/{})", best.0, best.1, cases.len());
+    // ⛔ NO "best available" RECOMMENDATION. An earlier version printed the highest-scoring rule,
+    // and on a `laguna` checkpoint that was Qwen2 at 20/20 — while llama.cpp's LAGUNA regex is
+    // `[^\n]+|[\n]+`, a NEWLINE SPLITTER with nothing in common with Qwen2. It won only because a
+    // 20-string corpus is mostly newline-free. A conformance score ranks rules on the corpus you
+    // happened to write; it is not evidence about which rule is correct, and printing it as advice
+    // invites exactly the family-inference mistake that `qwen35` already demonstrated.
+    if !mapped {
+        println!("\n  ⛔ this checkpoint's pre-tokenizer is NOT implemented — the score above is the");
+        println!("     GPT-2 fallback's, and the fix is to port the rule llama.cpp names for {declared:?},");
+        println!("     not to adopt whichever existing rule scores highest here.");
+    }
+    let _ = best;
 }
