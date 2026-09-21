@@ -38,7 +38,7 @@ had their difficulty raised until the control broke, and the numbers below are w
 
 | piece | source | oracle | control → technique |
 |---|---|---|---|
-| `FourierNet` — random Fourier features, multi-scale | Tancik 2020 (2006.10739); Wang–Wang–Perdikaris 2021 (2012.10047) | `u''+ω²u=0` at ω = 10, tanh MLP vs Fourier net, same width and steps | rel-L2 **0.958 → 0.0017** |
+| `FourierNet` — random Fourier features, multi-scale | Tancik 2020 (2006.10739); Wang–Wang–Perdikaris 2021 (2012.10047) | `u''+ω²u=0` at ω = 10, tanh MLP vs Fourier net, same width and steps | rel-L2 **0.958 → 0.0065** (0.0017 on an earlier run; asserted at 0.05 — see the re-verification note) |
 | `Lbfgs` — strong-Wolfe L-BFGS | Nocedal & Wright Alg. 7.4/7.5 + 3.5/3.6 | 1-D Poisson: Adam to its plateau, then L-BFGS from the same point | loss **4.9e-3 → 1.2e-4** in 300 iterations |
 | inverse problems — a PDE coefficient as a trained parameter | Raissi et al. 2019 | heat equation, `D = 0.7` unknown, 30 measurements at 1 % noise, `D` started at 0.2 | **D = 0.6985 (0.21 % off)** |
 | physics-informed DeepONet | Wang–Wang–Perdikaris 2021 (2103.10974) | antiderivative operator from `∂ₓG[f] = f`, `G[f](0) = 0` — no solution data | held-out rel-L2 **0.035** (the data-trained example: 0.035) |
@@ -71,6 +71,30 @@ has no floor: once the boundary term is satisfied to float precision its gradien
 to **1.4 × 10¹²**, after which any boundary deviation of 1e-8 produced an O(1e4) gradient — the balanced
 run came out at rel-L2 0.93 against 0.03 unweighted. The denominator is now floored at `1e-4 × max|∇L_r|`,
 capping the weight at 1e4; on the oracle above the weight settles at 9.9e3, so the cap was doing work.
+
+### Re-verified 2026-09-21, after the `matmul` VJP fix
+
+`Var::matmul`'s backward pass was corrected for mixed-rank operands partway through this work, which changes
+the backward path of **every** matmul in the stack. The recipe oracles above had all been measured before
+that, so they were re-run end to end (7 oracles, 63 minutes). Six reproduce their documented numbers:
+
+| oracle | documented | re-measured |
+|---|---|---|
+| physics-informed DeepONet | 0.035 | **0.0351** |
+| unknown coefficient from sparse noisy data | 0.7 to 0.21 % | **0.6985** |
+| causal training, reaction `ρ = 10` | 0.937 → 0.094 and 0.117 | **0.9372 → 0.1165** and **0.9372 → 0.0943** |
+| strong-Wolfe L-BFGS past Adam's plateau | 4.9e-3 → 1.2e-4 | **4.927e-3 → 1.209e-4** |
+| gradient-norm balancing | 0.464 → 0.0044, λ → 9.9e3 | **0.4639 → 0.0044**, λ = **9852.2** |
+| spectral bias, control arm | 0.958 | **0.9582** |
+
+⚠ **One drifted.** The Fourier-feature arm of the spectral-bias oracle was documented at **0.0017** and
+re-measures at **0.0065** — same fixture, same steps, 3.8× apart. The test never noticed, because its bar is
+`e_ff < 0.05` and both pass it with room. I have **not** isolated whether that is the `matmul` change or
+run-to-run variance, and I did not check out the old code to find out; the table now carries the current
+number with the earlier one beside it, the way the causal row already carries two.
+
+⭐ The causal row's "two runs of the same configuration" is no longer a hedge: this run produced **both** of
+its documented values in one pass — 0.1165 from the oracle and 0.0943 from the sweep, on the same fixture.
 
 ## The benchmark harness — the field's problems, scored against independent references
 
