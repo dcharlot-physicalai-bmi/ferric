@@ -82,6 +82,64 @@ pub async fn ferric_matmul_demo(m: u32, k: u32, n: u32) -> std::result::Result<S
     Ok(format!("{:?}|{:.3e}|{:?}", ctx.backend, diff, &gpu[..6.min(gpu.len())]))
 }
 
+/// Trains a **physics-informed net in the browser**, from the PDE residual alone and no solution data:
+/// `u'' + ω²u = 0` with `u(0) = 1`, `u'(0) = 0`, whose answer is `cos ωt`. Returns
+/// `"backend|steps|max_err|loss"`, where `max_err` is measured against `cos ωt` on a held-out grid the
+/// training never saw.
+///
+/// ⛔ **This entry point is why `sciml` is in the bundle at all.** The crate compiles for wasm either way,
+/// but nothing here called it, so the linker stripped every byte of it: "sciml compiles for wasm" and
+/// "sciml is in the browser bundle" are different claims and only the first was true. The wasm grows when
+/// this is linked in, which is the check that it is genuinely there rather than optimised away.
+///
+/// ⚠ Deliberately built from `Siren` + `deriv` + `Adam` only, never `sciml::harness`, which uses
+/// `std::time::Instant` — that panics on wasm32. The browser surface and the benchmark harness are not the
+/// same subset of this stack.
+#[wasm_bindgen]
+pub async fn ferric_pinn_demo(steps: usize) -> std::result::Result<String, JsValue> {
+    console_error_panic_hook::set_once();
+    let ctx = Arc::new(Context::new().await.map_err(|e| jserr(&e))?);
+    let backend = format!("{:?}", ctx.backend);
+    let (err, loss) = pinn_harmonic(&ctx, steps).await;
+    Ok(format!("{backend}|{steps}|{err:.4e}|{loss:.3e}"))
+}
+
+/// The oscillator PINN itself, shared by the browser entry point and the native test so the two cannot
+/// drift. Returns `(max |u − cos ωt| on a held-out grid, final loss)`.
+async fn pinn_harmonic(ctx: &Arc<Context>, steps: usize) -> (f32, f32) {
+    use ferric_tensor::sciml::{deriv, Siren};
+    use ferric_tensor::{Adam, Tensor, Var};
+    let (w, t_max, nc) = (2.0f32, 3.0f32, 40usize);
+    let net = Siren::new(ctx, &[1, 32, 32, 1], 1);
+    let mut wp = net.params.clone();
+    let mut adam = Adam::new(&wp, 3e-3);
+    let tcol: Vec<f32> = (0..nc).map(|i| i as f32 * t_max / (nc as f32 - 1.0)).collect();
+    let mut last = f32::NAN;
+    for _ in 0..steps {
+        let pv: Vec<Var> = wp.iter().map(|t| Var::leaf(t.clone())).collect();
+        let tv = Var::leaf(Tensor::from_vec(ctx, &tcol, &[nc, 1]));
+        let u = Siren::forward(&pv, &tv);
+        let u_tt = deriv(&deriv(&u, &tv), &tv);
+        let res = u_tt.add(&u.mul(&Var::leaf(Tensor::from_vec(ctx, &vec![w * w; nc], &[nc, 1]))));
+        let t0 = Var::leaf(Tensor::from_vec(ctx, &[0.0], &[1, 1]));
+        let u0 = Siren::forward(&pv, &t0);
+        let u0t = deriv(&u0, &t0);
+        let e0 = u0.sub(&Var::leaf(Tensor::from_vec(ctx, &[1.0], &[1, 1])));
+        let ic = e0.mul(&e0).sum_all().add(&u0t.mul(&u0t).sum_all());
+        let loss = res.mul(&res).mean_all().add(&ic.mul(&Var::leaf(Tensor::from_vec(ctx, &[40.0], &[1]))));
+        loss.backward();
+        let g: Vec<Tensor> = pv.iter().zip(&wp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::zeros(ctx, &t.shape))).collect();
+        adam.step(&mut wp, &g);
+        last = loss.value().to_vec().await[0];
+    }
+    // held out: 100 points the training never used
+    let pv: Vec<Var> = wp.iter().map(|t| Var::leaf(t.clone())).collect();
+    let te: Vec<f32> = (0..100).map(|i| i as f32 * t_max / 99.0).collect();
+    let ue = Siren::forward(&pv, &Var::leaf(Tensor::from_vec(ctx, &te, &[100, 1]))).value().to_vec().await;
+    let err = te.iter().zip(&ue).map(|(&t, &u)| (u - (w * t).cos()).abs()).fold(0.0f32, f32::max);
+    (err, last)
+}
+
 /// A persistent WebGPU fabric handle for the browser: keeps one `Context` alive so a page can time
 /// matmuls on the tab's GPU vs the in-wasm CPU reference across sizes, and route adaptively — the
 /// heterogeneous fabric, in the browser. Each method returns a checksum (sum of the output) so the caller
@@ -835,6 +893,7 @@ mod preflight_tests {
 
 #[cfg(test)]
 mod pool_tests {
+
     use super::pool;
 
     #[test]
@@ -1400,4 +1459,39 @@ pub async fn ferric_rmsnorm_diff() -> std::result::Result<String, JsValue> {
         rows.push(format!("row {row:>2}: {bad}/64{first}"));
     }
     Ok(rows.join("\n"))
+}
+
+#[cfg(test)]
+mod pinn_surface_tests {
+    /// ⭐ **The browser's PINN surface, trained natively.** `ferric_pinn_demo` is the only call path from
+    /// this crate into `sciml`, so it is the only reason any of it survives the linker — and it is the one
+    /// piece of the browser bundle that cannot be checked by building alone. Same inner function the wasm
+    /// entry point calls, so the two cannot drift.
+    ///
+    /// ⚠ What this does NOT show: that it runs in a browser. It shows the code path converges on this
+    /// fabric and that the surface is real. The in-browser run is still unproven.
+    /// The cheap half, which the default lane runs: the path executes and produces finite numbers.
+    /// ⚠ 60 steps does not converge and is not meant to — it is a smoke test that the browser surface is
+    /// wired to a working `sciml`, so a break shows up in CI rather than only in the 7-minute oracle below.
+    #[test]
+    fn the_browser_pinn_surface_runs() {
+        pollster::block_on(async {
+            let ctx = std::sync::Arc::new(ferric_core::Context::new().await.unwrap());
+            let (err, loss) = super::pinn_harmonic(&ctx, 60).await;
+            assert!(err.is_finite() && loss.is_finite(), "the surface must produce numbers: err {err}, loss {loss}");
+            assert!(err < 2.0, "and stay in the neighbourhood of the answer even undertrained: {err:.3e}");
+        });
+    }
+
+    #[ignore = "trains the browser's PINN surface to convergence on the GPU (~7 min); run with -- --ignored"]
+    #[test]
+    fn the_browser_pinn_surface_trains_from_the_residual_alone() {
+        pollster::block_on(async {
+            let ctx = std::sync::Arc::new(ferric_core::Context::new().await.unwrap());
+            let (err, loss) = super::pinn_harmonic(&ctx, 2500).await;
+            eprintln!("  browser PINN surface, 2500 steps: max |u − cos ωt| on 100 held-out points = {err:.4e}, loss {loss:.3e}");
+            assert!(err < 0.1, "the browser's PINN surface must converge: {err:.4e}");
+            assert!(loss.is_finite() && loss < 1.0, "and its loss must be finite and small: {loss:.3e}");
+        });
+    }
 }

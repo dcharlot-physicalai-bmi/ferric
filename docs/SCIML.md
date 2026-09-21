@@ -670,8 +670,30 @@ plausible-looking step that descends the wrong direction, and nothing downstream
   sweep at 32,768 collocation points — also green under the clamp. Nothing in this stack allocates near that
   ceiling; the largest buffer it builds is the `n = 16` Kronecker DFT at 262 kB.
 
-  ⚠ What that is **not**: a run in a browser. Both facts are native, one with a clamped limit. They say the
-  crate type-checks for wasm and that its memory footprint fits the browser's baseline — not that the WebGPU
-  compute path, the tape, or second-order `grad()` behave there. In-browser *training* remains unproven and
-  still needs a de-risking spike; ⛔ there is no CPU backend to fall back on, because `Context::new` requires
-  a wgpu adapter, so `wasm32-wasip1` under `wasmtime` is not a route to running this.
+  ⛔ **And `sciml` was not in the browser bundle at all.** `wasm-pack build crates/ferric-web` — the command
+  that actually produces the bundle, as opposed to the `cargo build --target wasm32` that CI runs — succeeds
+  and yields a **1,314,282-byte** wasm. But `ferric-web` contained **zero** references to `sciml`, so the
+  linker stripped every byte of it. *Compiles for wasm* and *is in the browser bundle* are different claims,
+  and only the first was true.
+
+  `ferric_web::ferric_pinn_demo(steps)` is now the call path: it trains `u'' + ω²u = 0` from the residual
+  alone on the tab's WebGPU and returns `backend|steps|max_err|loss`, measured against `cos ωt` on a
+  held-out grid. Three things check it without a browser:
+
+  | check | result |
+  |---|---|
+  | the same inner function, trained natively (2500 steps) | max error **1.57e-3** on 100 held-out points |
+  | `cargo build -p ferric-web --target wasm32-unknown-unknown` (CI's gate) | clean |
+  | the bundle, rebuilt with the surface linked | 1,314,282 → **1,346,855** bytes, **+31.8 kB** |
+
+  That last row is the one that matters: the wasm **grows**, which is how you know `sciml` is genuinely
+  linked rather than optimised away. ⚠ It is deliberately built from `Siren` + `deriv` + `Adam` only, never
+  `sciml::harness`, which uses `std::time::Instant` — that panics on wasm32. The browser surface and the
+  benchmark harness are not the same subset of this stack.
+
+  ⚠ What none of this is: **a run in a browser.** Every fact above is native. They say the crate type-checks
+  for wasm, that its footprint fits the browser's memory baseline, that the bundle builds, and that the PINN
+  surface is really in it — not that the WebGPU compute path, the tape, or second-order `grad()` behave
+  there. In-browser *training* remains unproven and still needs a spike with real browser automation;
+  ⛔ there is no CPU backend to fall back on, because `Context::new` requires a wgpu adapter, so
+  `wasm32-wasip1` under `wasmtime` is not a route to running this.
