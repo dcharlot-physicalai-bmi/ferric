@@ -44,7 +44,11 @@ fn main() {
     // Qwen2 and score 19/20 — because the label said "current" on a row that was not. A gate whose
     // own annotation is a constant reports the same answer whatever the code does.
     let actual = Pre::from_gguf(Some(&declared));
-    let variants: [(&str, Pre); 3] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2), ("Hyv4", Pre::Hyv4)];
+    // ⛔ EVERY variant must be listed, or a model whose rule is missing here reports NO "(current)"
+    // row and the sweep quietly files it as "not BPE". That happened the moment Pre::Qwen35 landed:
+    // the three checkpoints the fix was FOR vanished from the results it was meant to prove.
+    let variants: [(&str, Pre); 4] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2),
+                                      ("Qwen35", Pre::Qwen35), ("Hyv4", Pre::Hyv4)];
     let mut best = ("", 0usize);
     for (name, p) in variants {
         let b = Bpe::new_with_pre(vocab.clone(), &merges, p);
@@ -69,5 +73,9 @@ fn main() {
         println!("     GPT-2 fallback's, and the fix is to port the rule llama.cpp names for {declared:?},");
         println!("     not to adopt whichever existing rule scores highest here.");
     }
+    // a listed variant must have matched `actual`, or the table above is not describing this model
+    assert!(variants.iter().any(|(_, p)| *p == actual) || !mapped,
+            "Pre::{actual:?} is mapped but absent from this probe's variant list — the sweep would \
+             report this checkpoint as un-evaluated rather than as passing or failing");
     let _ = best;
 }

@@ -58,6 +58,11 @@ pub enum Pre {
     Gpt2,
     /// Qwen2/Qwen3, and anything else declaring `qwen2`.
     Qwen2,
+    /// Qwen 3.5 (`qwen35`) — Qwen2's rule with COMBINING MARKS folded into the letter run:
+    /// `[\p{L}\p{M}]+` rather than `\p{L}+`. llama.cpp gives it its own pre-type
+    /// (`LLAMA_VOCAB_PRE_TYPE_QWEN35`); it is not an alias for qwen2, and the difference is every
+    /// script that writes with marks.
+    Qwen35,
     /// Tencent Hy4 (`hyv4`), and the deepseek3-llm / hunyuan-dense family it shares a regex with.
     ///
     /// Structurally unlike the other two: **no digit rule and no contraction rule**. Its six
@@ -106,7 +111,7 @@ impl Pre {
             // real \p{M} table (321 Mn/Mc/Me ranges); `pretokenizer_conformance` is the gate that
             // would show it closing. Until then this is right for Latin/Cyrillic/Greek/CJK and
             // imperfect for Indic — stated here so nobody has to rediscover it.
-            Some("qwen35") => Pre::Qwen2,
+            Some("qwen35") => Pre::Qwen35,
             // llama.cpp maps deepseek3-llm and hunyuan-dense to the identical regex string.
             Some("hyv4") | Some("deepseek3-llm") | Some("hunyuan-dense") => Pre::Hyv4,
             // ⚠ FALL-OPEN, AND ITS SIZE IS MEASURED. An unmapped value silently becomes GPT-2,
@@ -129,6 +134,10 @@ impl Pre {
 /// scored greedy merge in the browser and byte-level BPE in the server — measured on
 /// `gemma-4-E2B-it-Q8_0.gguf`: 0 of 4 prompts agreed, 28 ids where the browser emits 17, and the lone
 /// `Ġ` token 245237 appeared 11 times, i.e. `[The, Ġ, capital, Ġ, of, Ġ, France, Ġ, is]`. Q8_0 was
+
+mod unicode_classes;
+pub use unicode_classes::{is_letter, is_mark, is_number_cat};
+
 /// robust enough to answer through it, which is why it survived.
 pub fn is_sentencepiece_model(model: &str) -> bool {
     matches!(model, "llama" | "gemma4" | "t5")
@@ -443,7 +452,10 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
     for c in text.chars() {
-        if c.is_ascii_digit() {
+        // ⛔ `\p{N}`, not `is_ascii_digit()`. The regexes say \p{N}, which is Nd+Nl+No: Arabic-Indic
+        // and Devanagari digits (Nd), Roman numerals (Nl), vulgar fractions (No). Measured against
+        // llama-tokenize before this line changed, `½ and ⅓ and Ⅻ` was the one miss in five.
+        if unicode_classes::is_number_cat(c) {
             if !cur.is_empty() { frags.push(std::mem::take(&mut cur)); }
             frags.push(vec![c]);
         } else {
@@ -452,8 +464,17 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
     }
     if !cur.is_empty() { frags.push(cur); }
 
-    let is_l = |c: char| c.is_alphabetic();
-    let is_n = |c: char| c.is_ascii_digit();
+    // ⛔ `\p{L}`, NOT `char::is_alphabetic()`. Rust's method is `\p{L}` PLUS Other_Alphabetic, so it
+    // is wrong in BOTH directions here and the direction depends on the script: it swallows Thai
+    // U+0E31/U+0E35 (Mn) that the reference treats as marks — which is why every qwen2 checkpoint
+    // missed `สวัสดีชาวโลก` — and it rejects the Devanagari virama U+094D (Mn) while accepting the
+    // vowel sign U+0947 (Mn), splitting `नमस्ते` mid-syllable. The table is generated from the
+    // reference tokenizer's own data; see `unicode_classes`.
+    let is_l = |c: char| {
+        if pre == Pre::Qwen35 { unicode_classes::is_letter(c) || unicode_classes::is_mark(c) }
+        else { unicode_classes::is_letter(c) }
+    };
+    let is_n = |c: char| unicode_classes::is_number_cat(c);
     let is_punct = |c: char| !c.is_whitespace() && !is_l(c) && !is_n(c);
     let mut out = Vec::new();
     for f in &frags {
@@ -475,7 +496,7 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
             //
             // A space still falls through to the branch below when what follows is NOT a letter, so
             // ` (Reyes` keeps its ` (` punctuation chunk and tokenises identically under both schemes.
-            if pre == Pre::Qwen2 && !is_l(c) && !is_n(c) && c != '\r' && c != '\n'
+            if matches!(pre, Pre::Qwen2 | Pre::Qwen35) && !is_l(c) && !is_n(c) && c != '\r' && c != '\n'
                 && i + 1 < n && is_l(f[i + 1]) {
                 let mut e = i + 1;
                 while e < n && is_l(f[e]) { e += 1; }
@@ -835,9 +856,10 @@ mod qwen35_pretokenizer_tests {
 
     #[test]
     fn qwen35_uses_the_qwen_rule_not_gpt2() {
-        assert_eq!(Pre::from_gguf(Some("qwen35")), Pre::Qwen2,
-                   "qwen35 fell through to GPT-2, which splits `-Reyes` and makes the merge `- Re` \
-                    unreachable; measured 12/20 vs 19/20 against llama-tokenize");
+        assert_eq!(Pre::from_gguf(Some("qwen35")), Pre::Qwen35,
+                   "qwen35 has its OWN rule — qwen2's letter run plus combining marks. It fell open \
+                    to GPT-2 (12/20 vs llama-tokenize), then briefly aliased to Qwen2 (19/20, missing \
+                    every mark-bearing script); Pre::Qwen35 is 20/20.");
         // ⛔ and the neighbours must not move with it
         assert_eq!(Pre::from_gguf(Some("qwen2")), Pre::Qwen2);
         assert_eq!(Pre::from_gguf(Some("llama-bpe")), Pre::Gpt2, "still unmapped, deliberately");
@@ -852,24 +874,66 @@ mod qwen35_pretokenizer_tests {
         assert_eq!(pretokenize_with("café", Pre::Qwen2), vec!["café"]);
     }
 
-    /// ⛔⛔ **A RECORDED GAP, ASSERTED SO IT CANNOT BE FORGOTTEN.** llama.cpp gives `qwen35` its own
-    /// pre-type whose letter run is `[\p{L}\p{M}]+`; Ferric's `is_l` is `char::is_alphabetic()`,
-    /// which is TRUE for Other_Alphabetic marks (U+0947 DEVANAGARI VOWEL SIGN E) and FALSE for the
-    /// virama (U+094D). So a Devanagari syllable splits at the virama and Ferric emits 7 ids where
-    /// llama.cpp emits 6 — the single miss in an otherwise 19/20 corpus.
+    /// ⭐ **THE GAP THAT CLOSED, AND THE ONE THAT CORRECTLY DID NOT.** The previous version of this
+    /// test asserted the WRONG behaviour on purpose, so that landing a real `\p{M}` predicate would
+    /// break it and the break would be the instruction to update. That is what happened.
     ///
-    /// ⭐ This test asserts the CURRENT, WRONG behaviour on purpose. When a real \p{M} predicate
-    /// lands, this test fails, and its failure is the instruction to update it — which is the only
-    /// way a known limitation stays known.
+    /// Both halves matter. `Qwen35` folds marks into the letter run, so a Devanagari syllable stays
+    /// whole. `Qwen2` must STILL split it — its regex is `\p{L}+` with no `\p{M}`, so "fixing" it
+    /// too would be a new divergence, not a repair.
+    fn marks_join_the_letter_run_under_qwen35_and_not_under_qwen2() {
+        assert_eq!(pretokenize_with("नमस्ते", Pre::Qwen35), vec!["नमस्ते"],
+                   "qwen35 folds \\p{{M}} into the letter run");
+        assert!(pretokenize_with("नमस्ते", Pre::Qwen2).len() > 1,
+                "qwen2's regex is \\p{{L}}+ with no \\p{{M}} — it MUST still split, or we have invented \
+                 a divergence while repairing one");
+        // Thai: the same root cause, a different script, and the case that was failing on every
+        // qwen2 checkpoint because Rust called its marks letters.
+        assert!(is_mark('\u{0E31}') && !is_letter('\u{0E31}'), "Thai MAI HAN-AKAT is \\p{{M}}");
+        assert!(is_letter('\u{0E2A}') && !is_mark('\u{0E2A}'), "Thai SO SUA is \\p{{L}}");
+        // ⛔ and the predicate Rust offers is neither, in both directions
+        assert!('\u{0E31}'.is_alphabetic(), "is_alphabetic() wrongly accepts this mark");
+        assert!(!'\u{094D}'.is_alphabetic(), "is_alphabetic() wrongly rejects the virama");
+    }
+}
+
+#[cfg(test)]
+mod unicode_class_tests {
+    use super::*;
+
+    /// ⛔ The three predicates Rust does not give you correctly, each pinned on the codepoint whose
+    /// misclassification produced a measured, shipped divergence from the reference tokenizer.
     #[test]
-    fn devanagari_still_splits_at_the_virama_known_gap() {
-        let split = pretokenize_with("नमस्ते", Pre::Qwen2);
-        assert!(split.len() > 1,
-                "Devanagari now stays whole ({split:?}) — a \\p{{M}} predicate must have landed. \
-                 Re-run examples/pretokenizer_conformance; if it is 20/20, delete this test and \
-                 update the note in Pre::from_gguf.");
-        // the break is at the virama specifically, not anywhere
-        assert!('\u{094D}'.is_alphabetic() == false, "U+094D virama is not Alphabetic in Rust");
-        assert!('\u{0947}'.is_alphabetic(), "U+0947 vowel sign IS Alphabetic (Other_Alphabetic)");
+    fn the_classes_are_the_references_classes_not_rusts() {
+        // \p{L} — Rust's is_alphabetic() is \p{L} PLUS Other_Alphabetic, so it OVER-includes
+        assert!(is_letter('\u{0E2A}'), "Thai SO SUA is Lo");
+        assert!(!is_letter('\u{0E31}'), "Thai MAI HAN-AKAT is Mn, not a letter");
+        assert!('\u{0E31}'.is_alphabetic(), "...but Rust says it is — the over-inclusion");
+
+        // \p{M} — and Rust has no mark predicate at all; is_alphabetic() UNDER-includes here
+        assert!(is_mark('\u{094D}'), "Devanagari virama is Mn");
+        assert!(!'\u{094D}'.is_alphabetic(), "...and Rust says not alphabetic — the under-inclusion");
+        assert!(is_mark('\u{0947}') && is_mark('\u{0301}'), "vowel sign and combining acute are Mn");
+
+        // \p{N} — Nd, Nl AND No, where is_ascii_digit() is only part of Nd
+        assert!(is_number_cat('5') && is_number_cat('\u{0662}'), "ASCII and Arabic-Indic are Nd");
+        assert!(is_number_cat('\u{00BD}'), "½ is No");
+        assert!(is_number_cat('\u{216B}'), "Ⅻ is Nl");
+        assert!(!'\u{00BD}'.is_ascii_digit() && !'\u{216B}'.is_ascii_digit(),
+                "...neither is an ASCII digit — measured as the one miss in five before this landed");
+        assert!(!is_number_cat('\u{4E00}'), "CJK 一 is Lo, a letter, NOT a number");
+    }
+
+    /// ⚠ The classes must be disjoint where Unicode says they are — a table generated from the wrong
+    /// column would still look plausible row by row.
+    #[test]
+    fn the_classes_do_not_overlap() {
+        for c in ['a', 'Z', '\u{0E2A}', '\u{4E00}'] { assert!(is_letter(c) && !is_mark(c) && !is_number_cat(c), "{c:?}"); }
+        for c in ['\u{094D}', '\u{0947}', '\u{0301}', '\u{0E31}'] { assert!(is_mark(c) && !is_letter(c) && !is_number_cat(c), "{c:?}"); }
+        for c in ['7', '\u{0662}', '\u{00BD}'] { assert!(is_number_cat(c) && !is_letter(c) && !is_mark(c), "{c:?}"); }
+        // and the tables are non-trivial — an empty or tiny table passes every membership test above
+        assert!(unicode_classes::LETTER_RANGES.len() > 500, "letter table looks truncated");
+        assert!(unicode_classes::MARK_RANGES.len() > 200, "mark table looks truncated");
+        assert!(unicode_classes::NUMBER_RANGES.len() > 100, "number table looks truncated");
     }
 }

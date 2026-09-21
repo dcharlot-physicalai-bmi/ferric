@@ -18,3 +18,8 @@ Tiếng Việt có dấu
 let v: Vec<u32> = (0..10).collect();
 https://example.com/a?b=1&c=2
 e-mail: a.b@c.de
+year 2026
+٢٠٢٦ سنة
+१२३ संख्या
+一二三 番号
+½ and ⅓ and Ⅻ
