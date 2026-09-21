@@ -45,6 +45,20 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --verbose
 
+      # ⛔ RUN BEFORE THE SUITE, BECAUSE A GREEN SUITE IS NOT EVIDENCE IF A TEST CANNOT FAIL.
+      # ferric-tokenizer shipped `marks_join_the_letter_run_under_qwen35_and_not_under_qwen2` with no
+      # `#[test]` attribute — the single assertion proving the real \p{M} tables changed user-visible
+      # tokenization, which was the entire point of the commit that landed them. The body had just
+      # been rewritten from asserting the OLD behaviour, and the attribute went with the old body: the
+      # tripwire was disarmed by the act of responding to it. `--list` showed two tests in a module
+      # whose source reads like three, and `cargo test --workspace` was green throughout.
+      # rustc reported it as `function ... is never used`; nothing grepped for that. This does.
+      # Linux only — it is pure text analysis with no platform dependence, so a second run buys nothing.
+      - name: Gate — no disarmed tests
+        run: |
+          ./scripts/disarmed_tests.sh --self-test   # prove the detector can fail, every run
+          ./scripts/disarmed_tests.sh
+
       # The unit + integration suites. These were absent from CI entirely, which meant the
       # placement-invariance test, the prefix-hash guards, the interval-arithmetic soundness check and
       # every other assertion in the workspace ran only on a developer's machine. They take ~1.5s.

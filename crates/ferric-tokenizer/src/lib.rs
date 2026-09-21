@@ -150,16 +150,19 @@ impl Pre {
             // ⛔ Qwen 3.5 declares `qwen35` and llama.cpp gives it its OWN pre-type
             // (LLAMA_VOCAB_PRE_TYPE_QWEN35, llama-vocab.cpp:2223) — NOT qwen2's. Its regex is qwen2's
             // with combining marks folded into the letter run: `[\p{L}\p{M}]+` instead of `\p{L}+`
-            // (unicode.cpp:608-609). Ferric has no \p{M} predicate, so qwen2 is the closest rule it
-            // owns, and it is a MEASURED improvement rather than a guess — against `llama-tokenize`
-            // on apodex-1.1-mini (pre=qwen35), over a 20-string multi-script corpus:
-            //     Gpt2 (what this did before) 12/20 · Qwen2 19/20 · Hyv4 17/20
-            // ⚠ THE RESIDUAL IS NAMED, NOT HIDDEN: the single miss is Devanagari, because Rust's
-            // `char::is_alphabetic()` is TRUE for Other_Alphabetic marks (U+0947 vowel sign) and
-            // FALSE for the virama (U+094D), so a letter run breaks mid-syllable. Closing it needs a
-            // real \p{M} table (321 Mn/Mc/Me ranges); `pretokenizer_conformance` is the gate that
-            // would show it closing. Until then this is right for Latin/Cyrillic/Greek/CJK and
-            // imperfect for Indic — stated here so nobody has to rediscover it.
+            // (unicode.cpp:608-609).
+            //
+            // ✅ CLOSED, and the history is kept because the SHAPE of the mistake recurs. This arm
+            // used to fall open to `Pre::Gpt2` while the registry called the architecture Verified.
+            // Against `llama-tokenize` on apodex-1.1-mini (pre=qwen35), 20-string multi-script corpus:
+            //     Gpt2 (what this did) 12/20 · Qwen2 19/20 · Hyv4 17/20 · Qwen35 (now) 20/20
+            // ⚠ The tempting fix was `=> Pre::Qwen2` at 19/20 — a HIGH SCORE ON THE WRONG RULE. Its
+            // one miss was Devanagari: Rust's `char::is_alphabetic()` is TRUE for Other_Alphabetic
+            // marks (U+0947) and FALSE for the virama (U+094D), so a letter run broke mid-syllable.
+            // `Pre::Qwen35` now folds marks in using a real \p{M} table generated from llama.cpp's
+            // own unicode-data.cpp (`unicode_classes::MARK_RANGES`, 310 ranges — LETTER 660,
+            // NUMBER 137). Pinned by `marks_join_the_letter_run_under_qwen35_and_not_under_qwen2`,
+            // which also pins that Qwen2 must STILL split it.
             Some("qwen35") => Pre::Qwen35,
             Some("laguna") => Pre::Laguna,
             // The eight values llama.cpp folds into LLAMA_VOCAB_PRE_TYPE_LLAMA3 — verified in
@@ -1036,6 +1039,13 @@ mod qwen35_pretokenizer_tests {
     /// Both halves matter. `Qwen35` folds marks into the letter run, so a Devanagari syllable stays
     /// whole. `Qwen2` must STILL split it — its regex is `\p{L}+` with no `\p{M}`, so "fixing" it
     /// too would be a new divergence, not a repair.
+    ///
+    /// ⛔⛔ **THIS TEST SHIPPED WITHOUT ITS `#[test]` ATTRIBUTE.** Rewriting the body to assert the
+    /// NEW behaviour dropped the attribute with it, so the tripwire fired and was then disarmed in
+    /// the same edit — the one assertion that proves the `\p{M}` fix changed user-visible
+    /// tokenization could not fail, and `--list` showed two tests in this module, not three.
+    /// `rustc` DID say so (`function ... is never used`); the workspace gate grepped only `^error`.
+    #[test]
     fn marks_join_the_letter_run_under_qwen35_and_not_under_qwen2() {
         assert_eq!(pretokenize_with("नमस्ते", Pre::Qwen35), vec!["नमस्ते"],
                    "qwen35 folds \\p{{M}} into the letter run");
