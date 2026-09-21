@@ -337,6 +337,12 @@ impl Engine {
                 panic!("{e}");
             }
         }
+        // ⛔ Say something when the pre-tokenizer is unimplemented. llama.cpp throws here; Ferric
+        // falls back to GPT-2, and the four defects found on 2026-09-20 all hid in that silence.
+        if let Some(w) = ferric_tokenizer::Pre::fall_open_warning(
+            match g.metadata.get("tokenizer.ggml.pre") { Some(Meta::Str(p)) => p.as_str(), _ => "" }) {
+            eprintln!("{w}");
+        }
         let spm = match g.metadata.get("tokenizer.ggml.model") {
             Some(Meta::Str(s)) if ferric_tokenizer::is_sentencepiece_model(s) => {
                 let scores: Vec<f32> = match g.metadata.get("tokenizer.ggml.scores") {

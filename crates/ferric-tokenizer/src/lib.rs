@@ -104,6 +104,27 @@ pub enum Pre {
 impl Pre {
     /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
     /// tree did unconditionally before this existed.
+    /// The warning for a `tokenizer.ggml.pre` value Ferric does not implement — or `None` if it does.
+    ///
+    /// ⛔⛔ **llama.cpp HAS NO FALL-OPEN.** An unrecognised pre value THROWS "unknown pre-tokenizer
+    /// type" (llama-vocab.cpp:2376); every value it accepts has its own arm. Ferric's `_ => Pre::Gpt2`
+    /// is a deliberate divergence, and it is the mechanism that kept four shipped defects silent —
+    /// `qwen35` ran on GPT-2's rule at 12/20 against the reference while the registry called that
+    /// architecture Verified, because nothing anywhere said a word.
+    ///
+    /// ⚠ Ferric still falls open rather than refusing, on purpose: a runtime that will not load a
+    /// checkpoint serves nobody, and an imperfect tokenization is usually still useful. What is NOT
+    /// acceptable is doing it quietly. ONE definition of the message, called from every front end,
+    /// because "the same rule in two places" is the bug this whole area keeps producing.
+    pub fn fall_open_warning(pre: &str) -> Option<String> {
+        if Pre::is_mapped(pre) { return None; }
+        Some(format!(
+            "⚠ tokenizer.ggml.pre = {pre:?} has no rule in Ferric; falling back to GPT-2's \
+             pre-tokenizer. Tokenization WILL differ from llama.cpp for this checkpoint and the \
+             output will still look fluent. Port the rule llama.cpp names for {pre:?} and verify with \
+             scripts/tokenizer_conformance.sh — do NOT adopt whichever existing rule scores highest."))
+    }
+
     /// Does this rule emit a pre-token verbatim when the vocabulary already holds it, skipping the
     /// merge loop? llama.cpp calls this `ignore_merges` and sets it for the LLAMA3 family.
     ///
@@ -1083,5 +1104,45 @@ mod laguna_tests {
                    "a carriage return is NOT a segment boundary");
         assert_eq!(pretokenize_with("a\u{2028}b", Pre::Laguna), pretokenize_with("a\u{2028}b", Pre::Qwen2),
                    "U+2028 LINE SEPARATOR is NOT a segment boundary");
+    }
+}
+
+#[cfg(test)]
+mod fall_open_tests {
+    use super::*;
+
+    /// ⛔ The silence was the bug. llama.cpp THROWS on an unknown pre value; Ferric falls back to
+    /// GPT-2, which is a defensible choice (a runtime that will not load serves nobody) and an
+    /// indefensible one to make quietly.
+    #[test]
+    fn an_unimplemented_pre_tokenizer_says_so() {
+        let w = Pre::fall_open_warning("deepseek-llm").expect("this one is genuinely unimplemented");
+        assert!(w.contains("deepseek-llm"), "name the value: {w}");
+        assert!(w.contains("GPT-2"), "name what it fell back to: {w}");
+        assert!(w.contains("tokenizer_conformance"), "name how to check the fix: {w}");
+        // ⚠ and it must warn about the FAILURE MODE, not just the fact — fluent wrong output is the
+        // thing a reader has to be told, because nothing else will tell them.
+        assert!(w.contains("fluent"), "name the failure mode: {w}");
+    }
+
+    #[test]
+    fn an_implemented_pre_tokenizer_is_silent() {
+        for p in ["gpt2", "qwen2", "qwen35", "laguna", "lfm2", "pixtral", "llama-bpe", "hyv4"] {
+            assert!(Pre::fall_open_warning(p).is_none(), "{p} is implemented — it must not warn");
+        }
+    }
+
+    /// ⚠ The warning list and the routing MUST be the same list. They were separate once for
+    /// `is_spm` and the two front ends drifted, which is how Gemma-4 came to be tokenized two
+    /// different ways by one project.
+    #[test]
+    fn warning_and_routing_agree() {
+        for p in ["qwen2", "qwen35", "laguna", "lfm2", "gpt2", "deepseek-llm", "default", "llama4",
+                  "no-such-pretokenizer-v9"] {
+            assert_eq!(Pre::fall_open_warning(p).is_none(), Pre::is_mapped(p),
+                       "{p}: warning and is_mapped disagree");
+            // and anything that warns must actually be the fallback
+            if !Pre::is_mapped(p) { assert_eq!(Pre::from_gguf(Some(p)), Pre::Gpt2, "{p}"); }
+        }
     }
 }
