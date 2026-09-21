@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>PINN in the browser</title>
+<style>body{font:14px ui-monospace,monospace;margin:2rem;max-width:44rem}#log{white-space:pre-wrap}</style>
+<h1>A physics-informed net, trained in this tab</h1>
+<p>Solves <code>u'' + &omega;&sup2;u = 0</code>, <code>u(0)=1</code>, <code>u'(0)=0</code> from the PDE
+residual alone — no solution data. The answer is <code>cos &omega;t</code>, and the error below is measured
+against it on 100 points the training never saw. Every derivative comes from the fabric's own second-order
+<code>grad()</code>, on this tab's WebGPU.</p>
+<button id="go">train</button> <span id="status"></span>
+<pre id="log"></pre>
+<script type="module">
+// ⛔ This page is the only thing in web/ that reaches `sciml`. Before `ferric_pinn_demo` existed, the
+// bundle contained no PINN at all: ferric-web referenced none of it, so the linker stripped every byte.
+// Linking it in grew the wasm from 1,314,282 to 1,346,855 bytes — that delta, not a successful build, is
+// what says the code is really here.
+const log = (s) => { document.getElementById('log').textContent += s + '\n'; };
+window.runPinn = async (steps = 2500) => {
+  const m = await import('/pkg/ferric_web.js'); await m.default();
+  if (!navigator.gpu) return 'NO_WEBGPU';
+  const t0 = performance.now();
+  const out = await m.ferric_pinn_demo(steps);           // "backend|steps|max_err|loss"
+  const [backend, n, err, loss] = out.split('|');
+  return JSON.stringify({ backend, steps: +n, max_err: err, loss, seconds: ((performance.now() - t0) / 1000).toFixed(1) });
+};
+document.getElementById('go').onclick = async () => {
+  const s = document.getElementById('status');
+  s.textContent = 'training…';
+  try {
+    const r = await window.runPinn(2500);
+    log(r);
+    s.textContent = r === 'NO_WEBGPU' ? 'this browser exposes no WebGPU adapter' : 'done';
+  } catch (e) { s.textContent = 'failed'; log(String(e)); }
+};
+</script>

@@ -691,9 +691,18 @@ plausible-looking step that descends the wrong direction, and nothing downstream
   `sciml::harness`, which uses `std::time::Instant` — that panics on wasm32. The browser surface and the
   benchmark harness are not the same subset of this stack.
 
-  ⚠ What none of this is: **a run in a browser.** Every fact above is native. They say the crate type-checks
+  **And there is now a page.** `web/pinn.html` calls it: `./web/build.sh && ./web/serve.sh`, then open
+  `/pinn.html` and press *train*. Served locally the whole chain resolves — the page returns 200 at 1,947
+  bytes, `/pkg/ferric_web.js` returns 200 at 69,921 bytes with `export function ferric_pinn_demo` in the
+  body, and `/pkg/ferric_web_bg.wasm` returns 200 at 1,346,855 bytes. ⚠ `web/pkg/` is a **gitignored build
+  artefact** and the copy in this tree predated the surface, so `build.sh` must run first; a stale bundle
+  fails at the import with the page itself perfectly correct.
+
+  ⚠ What none of this is: **a run in a browser.** Every fact above is native or HTTP wiring. They say the crate type-checks
   for wasm, that its footprint fits the browser's memory baseline, that the bundle builds, and that the PINN
   surface is really in it — not that the WebGPU compute path, the tape, or second-order `grad()` behave
-  there. In-browser *training* remains unproven and still needs a spike with real browser automation;
+  there. In-browser *training* remains unproven: what is left untested is exactly what a browser supplies —
+  a WebGPU adapter, the tape, and second-order `grad()` under wasm. That is now one human action away (open
+  the page) rather than a build task; automating it needs browser tooling this review did not set up;
   ⛔ there is no CPU backend to fall back on, because `Context::new` requires a wgpu adapter, so
   `wasm32-wasip1` under `wasmtime` is not a route to running this.
