@@ -579,7 +579,8 @@ impl FerricModel {
                 Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
                 _ => Vec::new(),
             };
-            (Bpe::new(vocab, &[]), Some(Spm::new(toks.clone(), scores)))
+            (Bpe::new(vocab, &[]), Some(Spm::with_types(toks.clone(), scores,
+                &ferric_gguf::token_types(g.metadata().get("tokenizer.ggml.token_type")))))
         } else {
             let merges: Vec<(String, String)> = match g.metadata().get("tokenizer.ggml.merges") {
                 Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.into(), y.into())) } else { None }).collect(),

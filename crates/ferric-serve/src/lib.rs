@@ -349,7 +349,8 @@ impl Engine {
                     Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::F(v) = m { *v as f32 } else { 0.0 }).collect(),
                     _ => Vec::new(),
                 };
-                Some(Spm::new(tokens.clone(), scores))
+                // USER_DEFINED entries are matched verbatim — see ferric_gguf::token_types
+                Some(Spm::with_types(tokens.clone(), scores, &ferric_gguf::token_types(g.metadata.get("tokenizer.ggml.token_type"))))
             }
             _ => None,
         };

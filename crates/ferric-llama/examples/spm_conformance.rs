@@ -30,7 +30,15 @@ fn main() {
     println!("{}  model={model}  {} tokens  add_space_prefix={add_space_prefix}",
              path.rsplit('/').next().unwrap_or(&path), tokens.len());
 
-    let spm = Spm::new(tokens, scores);
+    // ⛔ types matter: llama.cpp matches USER_DEFINED verbatim BEFORE the merge, and Gemma uses 140
+    // of them for whitespace runs. Without the type array those tokens are unreachable.
+    let types: Vec<i32> = match get("tokenizer.ggml.token_type") {
+        Some(Meta::Arr(x)) => x.iter().map(|v| match v {
+            Meta::I(n) => *n as i32, Meta::U(n) => *n as i32, _ => 1 }).collect(),
+        _ => Vec::new(),
+    };
+    let spm = if types.is_empty() { Spm::new(tokens, scores) } else { Spm::with_types(tokens, scores, &types) };
+    println!("  USER_DEFINED entries matched verbatim: {}", spm.user_defined_count());
     let txt = std::fs::read_to_string(&refp).expect("ref file");
     let (mut ok, mut n) = (0usize, 0usize);
     let mut misses: Vec<String> = Vec::new();

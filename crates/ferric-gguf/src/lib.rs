@@ -45,6 +45,26 @@ const STQ1_0: u32 = 43; // Tencent hyv4 ternary: {−1,0,+1}·d with ONE FORCED 
 #[derive(Debug, Clone)]
 pub enum Meta { U(u64), I(i64), F(f64), Bool(bool), Str(String), Arr(Vec<Meta>) }
 
+/// `tokenizer.ggml.token_type` decoded to llama.cpp's `llama_token_type` numbers, or empty if absent.
+///
+/// ⛔ ONE decoder, because this is read at three construction sites (ferric-serve, ferric-web,
+/// ferric-llama's reranker) and "the same rule in three places" is the defect this tokenizer work
+/// keeps uncovering. The values matter: **4 == USER_DEFINED**, which llama.cpp matches VERBATIM
+/// before the SentencePiece merge runs. Gemma-2 has 140 such tokens and Gemma-3 has 163, nearly all
+/// runs of literal spaces — unreachable by any tokenizer that escapes spaces to `▁` first.
+pub fn token_types(m: Option<&Meta>) -> Vec<i32> {
+    match m {
+        Some(Meta::Arr(a)) => a.iter().map(|v| match v {
+            Meta::I(n) => *n as i32,
+            Meta::U(n) => *n as i32,
+            // ⚠ 1 == NORMAL. An unexpected shape must not silently become USER_DEFINED(4), which
+            // would make every token match verbatim and defeat the merge entirely.
+            _ => 1,
+        }).collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,

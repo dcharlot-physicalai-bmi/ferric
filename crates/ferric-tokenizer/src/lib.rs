@@ -336,14 +336,42 @@ pub struct Spm {
     vocab: HashMap<String, u32>,
     scores: Vec<f32>,
     byte_tok: Vec<Option<u32>>, // byte value → `<0xXX>` id
+    /// USER_DEFINED entries, longest first — matched VERBATIM before the merge runs.
+    ///
+    /// ⛔ Without these, Gemma's whitespace-run tokens are UNREACHABLE. `encode_piece` escapes every
+    /// space to `▁` before merging, and gemma2's ids 139/140/141 are literal U+0020 runs ("  ",
+    /// "   ", "    ") of type USER_DEFINED — 140 such tokens in that vocabulary. Measured: llama.cpp
+    /// emits `141` for four spaces where Ferric emitted `235248` three times. llama.cpp groups
+    /// USER_DEFINED with CONTROL for exactly this reason (llama-vocab.cpp:2934).
+    user_defined: Vec<(String, u32)>,
 }
 
 impl Spm {
     pub fn new(tokens: Vec<String>, scores: Vec<f32>) -> Spm {
         let vocab: HashMap<String, u32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
         let byte_tok = (0..256u32).map(|b| vocab.get(&format!("<0x{b:02X}>")).copied()).collect();
-        Spm { tokens, vocab, scores, byte_tok }
+        Spm { tokens, vocab, scores, byte_tok, user_defined: Vec::new() }
     }
+
+    /// Build with `tokenizer.ggml.token_type`, so USER_DEFINED entries are matched verbatim.
+    ///
+    /// ⚠ Prefer this over [`Spm::new`] whenever the GGUF carries a type array. `new` keeps the old
+    /// behaviour rather than guessing types from the strings, because "looks like whitespace" is not
+    /// the same claim as "the checkpoint declared it USER_DEFINED".
+    pub fn with_types(tokens: Vec<String>, scores: Vec<f32>, types: &[i32]) -> Spm {
+        let mut me = Spm::new(tokens, scores);
+        // llama_token_type: 4 == USER_DEFINED
+        me.user_defined = me.tokens.iter().enumerate()
+            .filter(|(i, t)| !t.is_empty() && types.get(*i).copied() == Some(4))
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        // longest first: leftmost-longest is the match rule, and a shorter run would otherwise win
+        me.user_defined.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        me
+    }
+
+    /// How many USER_DEFINED entries this tokenizer will match verbatim.
+    pub fn user_defined_count(&self) -> usize { self.user_defined.len() }
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
     pub fn id_of(&self, s: &str) -> Option<u32> { self.vocab.get(s).copied() }
     fn score_of(&self, s: &str) -> Option<f32> { self.vocab.get(s).map(|&id| self.scores.get(id as usize).copied().unwrap_or(0.0)) }
@@ -351,6 +379,31 @@ impl Spm {
     /// Encode one raw-text fragment. `prefix` requests SentencePiece's leading-space (▁) — true only for
     /// text at the very start of the sequence (text following a special token gets none).
     pub fn encode_piece(&self, text: &str, prefix: bool) -> Vec<u32> {
+        if self.user_defined.is_empty() { return self.encode_merge(text, prefix); }
+        // Leftmost-longest verbatim match, then merge whatever lies between.
+        let (mut out, mut rest, mut at_start) = (Vec::new(), text, prefix);
+        while !rest.is_empty() {
+            let mut hit: Option<(usize, usize, u32)> = None; // (pos, len, id)
+            for (t, id) in &self.user_defined {
+                if let Some(pos) = rest.find(t.as_str()) {
+                    let better = hit.is_none_or(|(hp, hl, _)| pos < hp || (pos == hp && t.len() > hl));
+                    if better { hit = Some((pos, t.len(), *id)); }
+                }
+            }
+            match hit {
+                Some((pos, len, id)) => {
+                    if pos > 0 { out.extend(self.encode_merge(&rest[..pos], at_start)); }
+                    at_start = false;
+                    out.push(id);
+                    rest = &rest[pos + len..];
+                }
+                None => { out.extend(self.encode_merge(rest, at_start)); break; }
+            }
+        }
+        out
+    }
+
+    fn encode_merge(&self, text: &str, prefix: bool) -> Vec<u32> {
         if text.is_empty() { return Vec::new(); }
         // Escape whitespace to ▁ and optionally prepend the leading ▁.
         let mut esc = String::new();
@@ -1144,5 +1197,68 @@ mod fall_open_tests {
             // and anything that warns must actually be the fallback
             if !Pre::is_mapped(p) { assert_eq!(Pre::from_gguf(Some(p)), Pre::Gpt2, "{p}"); }
         }
+    }
+}
+
+#[cfg(test)]
+mod spm_user_defined_tests {
+    use super::*;
+
+    /// A vocabulary shaped like Gemma's: `▁`-convention pieces PLUS literal-space runs declared
+    /// USER_DEFINED. Ids: 0 `▁`, 1 `a`, 2 `b`, 3 `▁a`, 4 "  " (2 spaces), 5 "   " (3 spaces).
+    fn vocab() -> (Vec<String>, Vec<f32>, Vec<i32>) {
+        let toks: Vec<String> = ["\u{2581}", "a", "b", "\u{2581}a", "  ", "   "]
+            .iter().map(|s| s.to_string()).collect();
+        let scores = vec![-1.0, -1.0, -1.0, -0.5, 0.0, 0.0];
+        //                NORMAL x4                    USER_DEFINED x2
+        let types = vec![1, 1, 1, 1, 4, 4];
+        (toks, scores, types)
+    }
+
+    #[test]
+    fn user_defined_entries_are_matched_verbatim_not_escaped() {
+        let (t, s, ty) = vocab();
+        let spm = Spm::with_types(t, s, &ty);
+        assert_eq!(spm.user_defined_count(), 2);
+        // "a  b": the two literal spaces must come back as id 4, NOT as `▁` twice
+        let ids = spm.encode_piece("a  b", false);
+        assert!(ids.contains(&4), "the USER_DEFINED run token must be used: {ids:?}");
+        assert!(!ids.iter().any(|&i| i == 0), "no bare `▁` should survive: {ids:?}");
+    }
+
+    /// ⛔ Leftmost-LONGEST. A three-space run must take id 5, not id 4 followed by a stray space —
+    /// the shorter entry matches too, and sorting the table the other way would silently prefer it.
+    #[test]
+    fn the_longest_match_wins() {
+        let (t, s, ty) = vocab();
+        let spm = Spm::with_types(t, s, &ty);
+        let ids = spm.encode_piece("a   b", false);
+        assert!(ids.contains(&5), "three spaces must be the 3-space token: {ids:?}");
+        assert!(!ids.contains(&4), "not the 2-space token plus a remainder: {ids:?}");
+    }
+
+    /// ⚠ `Spm::new` keeps the OLD behaviour rather than inferring types from the strings. "Looks like
+    /// whitespace" is a different claim from "the checkpoint declared it USER_DEFINED", and a
+    /// tokenizer that guesses is the thing this whole area keeps getting wrong.
+    #[test]
+    fn without_types_nothing_is_matched_verbatim() {
+        let (t, s, _) = vocab();
+        let spm = Spm::new(t, s);
+        assert_eq!(spm.user_defined_count(), 0);
+        assert!(!spm.encode_piece("a  b", false).contains(&4),
+                "new() must not start matching USER_DEFINED by itself");
+    }
+
+    /// ⛔ An unexpected entry shape must default to NORMAL. Defaulting to 4 would make EVERY token
+    /// match verbatim and defeat the merge entirely — fluent output, completely wrong ids.
+    #[test]
+    fn an_unreadable_type_entry_is_normal_not_user_defined() {
+        let got = ferric_gguf_token_types_like(&[Meta1::Str, Meta1::I(4), Meta1::Bool]);
+        assert_eq!(got, vec![1, 4, 1], "only a real integer 4 may mean USER_DEFINED");
+    }
+    // a tiny stand-in so this crate need not depend on ferric-gguf just to assert the rule
+    enum Meta1 { Str, Bool, I(i32) }
+    fn ferric_gguf_token_types_like(v: &[Meta1]) -> Vec<i32> {
+        v.iter().map(|m| match m { Meta1::I(n) => *n, _ => 1 }).collect()
     }
 }

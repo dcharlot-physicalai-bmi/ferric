@@ -372,7 +372,8 @@ impl Reranker {
                         .map(|x| if let Meta::F(f) = x { *f as f32 } else { 0.0 }).collect(),
                     _ => Vec::new(),
                 };
-                RerankTok::Spm(ferric_tokenizer::Spm::new(toks.clone(), scores))
+                RerankTok::Spm(ferric_tokenizer::Spm::with_types(toks.clone(), scores,
+                    &ferric_gguf::token_types(g.metadata().get("tokenizer.ggml.token_type"))))
             }
         };
         Ok(Reranker {
