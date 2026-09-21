@@ -660,8 +660,18 @@ plausible-looking step that descends the wrong direction, and nothing downstream
 - **Remaining:** an FFT primitive (the separable plan took the 2-D transform from `n⁴` to `2n³`; an FFT
   would take it to `n² log n`, and needs a butterfly built from gather/scatter, neither of which carries a
   differentiable VJP here), the **energy** natural gradient (attempted, three configurations measured, none
-  convergent — see above), and a WebGPU **in-browser** build. On the last: `cargo check -p ferric-tensor --target
+  convergent — see above), and a WebGPU **in-browser** build.
+
+  On the last, two things are now measured and one is not. `cargo check -p ferric-tensor --target
   wasm32-unknown-unknown` is **clean**, so nothing in the tensor crate — `sciml` included — is host-only at
-  the type level. That is a compile, not a run: it says nothing about whether the WebGPU compute path, the
-  tape, or second-order `grad()` behave in a browser, and in-browser *training* remains unproven and still
-  needs a de-risking spike.
+  the type level. And the whole `sciml` lane passes under **`FERRIC_MAX_BINDING=134217728`**, the 128 MiB
+  `max_storage_buffer_binding_size` that the WebGPU baseline (and lavapipe) enforce and that this repo treats
+  as the limit which must pass first: 27 tests green, plus the heaviest single case — the separable-residual
+  sweep at 32,768 collocation points — also green under the clamp. Nothing in this stack allocates near that
+  ceiling; the largest buffer it builds is the `n = 16` Kronecker DFT at 262 kB.
+
+  ⚠ What that is **not**: a run in a browser. Both facts are native, one with a clamped limit. They say the
+  crate type-checks for wasm and that its memory footprint fits the browser's baseline — not that the WebGPU
+  compute path, the tape, or second-order `grad()` behave there. In-browser *training* remains unproven and
+  still needs a de-risking spike; ⛔ there is no CPU backend to fall back on, because `Context::new` requires
+  a wgpu adapter, so `wasm32-wasip1` under `wasmtime` is not a route to running this.
