@@ -47,8 +47,8 @@ fn main() {
     // ⛔ EVERY variant must be listed, or a model whose rule is missing here reports NO "(current)"
     // row and the sweep quietly files it as "not BPE". That happened the moment Pre::Qwen35 landed:
     // the three checkpoints the fix was FOR vanished from the results it was meant to prove.
-    let variants: [(&str, Pre); 5] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2),
-                                      ("Qwen35", Pre::Qwen35), ("Llama3", Pre::Llama3), ("Hyv4", Pre::Hyv4)];
+    let variants: [(&str, Pre); 6] = [("Gpt2", Pre::Gpt2), ("Qwen2", Pre::Qwen2), ("Qwen35", Pre::Qwen35),
+                                      ("Llama3", Pre::Llama3), ("Laguna", Pre::Laguna), ("Hyv4", Pre::Hyv4)];
     let mut best = ("", 0usize);
     for (name, p) in variants {
         let b = Bpe::new_with_pre(vocab.clone(), &merges, p);
@@ -62,12 +62,20 @@ fn main() {
         println!("  {:<18} {ok:>2}/{} exact", format!("{name}{tag}"), cases.len());
         if !fails.is_empty() { println!("      misses: {}", fails.join(" · ")); }
     }
-    // ⛔ NO "best available" RECOMMENDATION. An earlier version printed the highest-scoring rule,
-    // and on a `laguna` checkpoint that was Qwen2 at 20/20 — while llama.cpp's LAGUNA regex is
-    // `[^\n]+|[\n]+`, a NEWLINE SPLITTER with nothing in common with Qwen2. It won only because a
-    // 20-string corpus is mostly newline-free. A conformance score ranks rules on the corpus you
-    // happened to write; it is not evidence about which rule is correct, and printing it as advice
-    // invites exactly the family-inference mistake that `qwen35` already demonstrated.
+    // ⛔ NO "best available" RECOMMENDATION. An earlier version printed the highest-scoring rule, and
+    // on a `laguna` checkpoint that was Qwen2 at 20/20. A conformance score ranks rules against the
+    // corpus you happened to write; it is not evidence about which rule is correct.
+    //
+    // ⚠⚠ CORRECTION TO WHAT THIS COMMENT USED TO SAY. It claimed laguna's regex is `[^\n]+|[\n]+`,
+    // "a NEWLINE SPLITTER with nothing in common with Qwen2". BOTH HALVES WERE WRONG, and the error
+    // was in how I read the source: `regex_exprs` for LAGUNA has TWO entries (llama-vocab.cpp:505-508)
+    // and I extracted it with a first-match grep, which returns one entry of a list and looks
+    // complete. The second entry is BYTE-IDENTICAL to Qwen2's, and llama.cpp applies the list
+    // SEQUENTIALLY — so laguna IS Qwen2, run inside each run of '\n' and each run of non-'\n'.
+    //
+    // The conclusion survives, for a better reason: Qwen2 scored 20/20 not by coincidence but because
+    // laguna differs from it ONLY where a pre-token would span a newline — and `-p` takes one line,
+    // so the corpus could not contain one. ⭐ The blind spot was in the HARNESS, not the scoring.
     if !mapped {
         println!("\n  ⛔ this checkpoint's pre-tokenizer is NOT implemented — the score above is the");
         println!("     GPT-2 fallback's, and the fix is to port the rule llama.cpp names for {declared:?},");

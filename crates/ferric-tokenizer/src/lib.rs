@@ -58,6 +58,17 @@ pub enum Pre {
     Gpt2,
     /// Qwen2/Qwen3, and anything else declaring `qwen2`.
     Qwen2,
+    /// Poolside Laguna (`laguna`) — **Qwen2's rule, applied inside newline segments.**
+    ///
+    /// ⛔ Its `regex_exprs` has TWO entries, and the second is BYTE-IDENTICAL to Qwen2's. llama.cpp
+    /// applies the list SEQUENTIALLY, each pass subdividing the previous one's spans, so the first
+    /// entry `[^\n]+|[\n]+` is a PRE-SPLIT into runs of U+000A and runs of everything else, and
+    /// Qwen2 then runs inside each. The delta is exactly: a pre-token may never span a '\n'.
+    ///
+    /// ⚠ It must be a PRE-pass, not a post-pass. Laguna is not a refinement of Qwen2 — it can MERGE
+    /// what Qwen2 splits: on `";\n\r \r"` Qwen2 gives `[";\n\r", " \r"]` and Laguna gives
+    /// `[";", "\n", "\r \r"]`. Splitting Qwen2's output at newlines afterwards would not reproduce it.
+    Laguna,
     /// Llama 3.x and the family that shares its regex — `llama-v3`, `llama-bpe`, `falcon3`,
     /// `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano`.
     ///
@@ -107,7 +118,7 @@ impl Pre {
     /// `Pre::Gpt2` either way. This is what lets a caller — or a conformance sweep — tell "we chose
     /// GPT-2" from "we defaulted to GPT-2 because nobody taught us this one".
     pub fn is_mapped(pre: &str) -> bool {
-        matches!(pre, "gpt2" | "qwen2" | "qwen35" | "hyv4" | "deepseek3-llm" | "hunyuan-dense"
+        matches!(pre, "gpt2" | "qwen2" | "qwen35" | "laguna" | "hyv4" | "deepseek3-llm" | "hunyuan-dense"
                       | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
                       | "midm-2.0" | "lfm2" | "jina-v5-nano")
     }
@@ -129,6 +140,7 @@ impl Pre {
             // would show it closing. Until then this is right for Latin/Cyrillic/Greek/CJK and
             // imperfect for Indic — stated here so nobody has to rediscover it.
             Some("qwen35") => Pre::Qwen35,
+            Some("laguna") => Pre::Laguna,
             // The eight values llama.cpp folds into LLAMA_VOCAB_PRE_TYPE_LLAMA3 — verified in
             // llama-vocab.cpp, not inferred from the names.
             Some("llama-v3") | Some("llama-bpe") | Some("falcon3") | Some("falcon-h1")
@@ -477,8 +489,30 @@ fn pretokenize_hyv4(text: &str) -> Vec<String> {
     out
 }
 
+/// Test/diagnostic access to the pre-tokenizer split. The split, not the ids, is where
+/// boundary rules are argued about.
+pub fn pretokenize_pub(text: &str, pre: Pre) -> Vec<String> { pretokenize_with(text, pre) }
+
 fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
     if pre == Pre::Hyv4 { return pretokenize_hyv4(text) }
+    if pre == Pre::Laguna {
+        // ⛔ ONLY U+000A counts here. '\r', U+000B, U+000C, U+0085, U+2028 and U+2029 are all
+        // "not a newline" to this stage and group with the surrounding text — so a
+        // `char::is_whitespace()` or any line-break predicate would be a different tokenizer.
+        let cs: Vec<char> = text.chars().collect();
+        let (mut out, mut i) = (Vec::new(), 0usize);
+        while i < cs.len() {
+            let nl = cs[i] == '\n';
+            let mut j = i;
+            while j < cs.len() && (cs[j] == '\n') == nl { j += 1 }
+            let seg: String = cs[i..j].iter().collect();
+            // the segment edge is a hard wall: the inner walk is already fragment-scoped, so a
+            // lookahead cannot see across it.
+            out.extend(pretokenize_with(&seg, Pre::Qwen2));
+            i = j;
+        }
+        return out;
+    }
     // Digits step: isolate each digit; group consecutive non-digits.
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
@@ -982,5 +1016,72 @@ mod unicode_class_tests {
         assert!(unicode_classes::LETTER_RANGES.len() > 500, "letter table looks truncated");
         assert!(unicode_classes::MARK_RANGES.len() > 200, "mark table looks truncated");
         assert!(unicode_classes::NUMBER_RANGES.len() > 100, "number table looks truncated");
+    }
+}
+
+#[cfg(test)]
+mod laguna_tests {
+    use super::*;
+
+    #[test]
+    fn laguna_is_qwen2_inside_newline_segments() {
+        assert_eq!(Pre::from_gguf(Some("laguna")), Pre::Laguna);
+        // identical wherever no pre-token would span a '\n' — which is MOST text, and is why a
+        // single-line corpus cannot tell these two apart
+        for t in ["Hello-Reyes", "the year 2026", "a b c", "café déjà-vu"] {
+            assert_eq!(pretokenize_with(t, Pre::Laguna), pretokenize_with(t, Pre::Qwen2), "{t:?}");
+        }
+    }
+
+    /// ⛔ The case that discriminates them, verified against `llama-tokenize` on a real laguna
+    /// checkpoint: Qwen2 gives `[96, 97710, 290, 271]`, Laguna and llama.cpp give
+    /// `[96, 268, 271, 290, 271]`.
+    #[test]
+    fn a_pre_token_may_never_span_a_newline() {
+        let lag = pretokenize_with(";\n\r \r", Pre::Laguna);
+        let qw = pretokenize_with(";\n\r \r", Pre::Qwen2);
+        assert_ne!(lag, qw, "these must differ or the rule is not implemented");
+        assert!(lag.iter().all(|p| !(p.contains('\n') && p.chars().any(|c| c != '\n'))),
+                "no Laguna pre-token may mix '\\n' with anything else: {lag:?}");
+        assert!(qw.iter().any(|p| p.contains('\n') && p.chars().any(|c| c != '\n')),
+                "Qwen2 MUST produce such a token here, or this case does not discriminate: {qw:?}");
+    }
+
+    /// ⛔⛔ It is a PRE-pass, not a post-pass — Laguna can MERGE what a post-cut would split, so
+    /// "run Qwen2 then cut the output at newlines" does NOT reproduce it.
+    ///
+    /// ⚠ The witness matters and mine was wrong first. The porting spec offered `";\n\r \r"`, where
+    /// llama.cpp's qwen2 gives `[";\n\r", " \r"]` — but FERRIC's Qwen2 gives `[";", "\n\r \r"]`, and
+    /// post-cutting that DOES reproduce Laguna, so the test failed on a true claim with a witness
+    /// that does not transfer. Found a real one by exhaustive search instead: 162 of 19,607 strings
+    /// over `{' ', '\n', '\r', '\t', 'a', '1', ';'}` up to length 5 differ (`examples/prepass_search`).
+    #[test]
+    fn laguna_can_merge_what_a_post_cut_would_split() {
+        // verified witness: the segment boundary changes what the leading-punctuation rule may attach
+        // to, so `\t` binds to `a` inside the segment and cannot across it.
+        assert_eq!(pretokenize_with("\n\ta ", Pre::Laguna), vec!["\n", "\ta", " "]);
+        let post: Vec<String> = pretokenize_with("\n\ta ", Pre::Qwen2).iter().flat_map(|p| {
+            let (mut v, mut cur, mut prev) = (Vec::new(), String::new(), None::<bool>);
+            for c in p.chars() {
+                let nl = c == '\n';
+                if prev.is_some_and(|q| q != nl) { v.push(std::mem::take(&mut cur)); }
+                cur.push(c); prev = Some(nl);
+            }
+            if !cur.is_empty() { v.push(cur) }
+            v
+        }).collect();
+        assert_ne!(post, pretokenize_with("\n\ta ", Pre::Laguna),
+                   "a post-cut reproduced Laguna on the one witness this test has — find another \
+                    (examples/prepass_search) or the pre-pass distinction is undefended");
+    }
+
+    /// ⚠ Only U+000A segments. '\r' and the other line breaks group with surrounding text; using a
+    /// whitespace or line-break predicate here would be a different tokenizer.
+    #[test]
+    fn only_line_feed_segments_the_text() {
+        assert_eq!(pretokenize_with("a\rb", Pre::Laguna), pretokenize_with("a\rb", Pre::Qwen2),
+                   "a carriage return is NOT a segment boundary");
+        assert_eq!(pretokenize_with("a\u{2028}b", Pre::Laguna), pretokenize_with("a\u{2028}b", Pre::Qwen2),
+                   "U+2028 LINE SEPARATOR is NOT a segment boundary");
     }
 }
