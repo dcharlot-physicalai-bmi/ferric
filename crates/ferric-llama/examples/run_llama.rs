@@ -7,6 +7,17 @@ use ferric_llama::{Config, Llama};
 fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
 fn main() { pollster::block_on(run()); }
 async fn run() {
+    // ⛔ THIS EXAMPLE TAKES NO ARGUMENTS, AND SAYING SO IS THE POINT. It runs a FIXED 2-layer
+    // synthetic safetensors fixture from `testdata/`. Verifying an unrelated change on 2026-09-22 I
+    // ran `run_llama -- gemma-3-1b.gguf` and `-- gemma2-2b.gguf`, got the identical `1.431e-6` from
+    // both, and believed I had regression-tested two real checkpoints. A nonexistent path prints the
+    // same number. An example that silently ignores an argument reports on a model you did not test.
+    let extra: Vec<String> = std::env::args().skip(1).collect();
+    assert!(extra.is_empty(),
+            "run_llama takes NO arguments — it validates a fixed synthetic fixture in testdata/ and \
+             would have ignored {extra:?}, printing a number that says nothing about it. \
+             To exercise a real GGUF use `--example generate`, `--example swa_probe` (per-layer \
+             sliding-window schedule) or `--example cls_head` (classifier head).");
     let ctx = Context::new().await.unwrap();
     let dir = env!("CARGO_MANIFEST_DIR");
     let cfg = Config { n_layers: 2, d: 64, n_heads: 8, n_kv_heads: 2, head_dim: 8, hidden: 128, vocab: 32, rope_theta: 10000.0, eps: 1e-5 };
