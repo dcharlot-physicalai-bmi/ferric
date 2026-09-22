@@ -842,24 +842,11 @@ impl FerricModel {
 
 /// Pool a `[t, n]` hidden-state buffer into one `n`-vector, the way the CHECKPOINT declares.
 ///
-/// llama.cpp's `pooling_type`: 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK. Extracted as a free function
-/// because the arithmetic is the part that can be wrong quietly — a MEAN that strides rows instead of
-/// columns produces a vector of exactly the right length, exactly the right magnitude, and no
-/// meaning, and no caller can tell.
-pub(crate) fn pool(v: &[f32], t: usize, n: usize, kind: u32) -> Result<Vec<f32>, String> {
-    if n == 0 || t == 0 || v.len() < t * n {
-        return Err(format!("hidden state is {} floats, too short for {t}x{n}", v.len()));
-    }
-    match kind {
-        1 => Ok((0..n).map(|c| (0..t).map(|r| v[r * n + c]).sum::<f32>() / t as f32).collect()),
-        2 => Ok(v[0..n].to_vec()),
-        3 => Ok(v[(t - 1) * n..t * n].to_vec()),
-        other => Err(format!(
-            "this checkpoint declares pooling_type {other}, which embed() does not implement. \
-             Refusing rather than pooling the wrong position and returning cosine scores that look \
-             ordinary and rank arbitrarily (0 = NONE, 4 = RANK need a reranker head).")),
-    }
-}
+/// ⛔ THIS USED TO BE A SECOND COPY OF THE RULE. `ferric-serve`'s `/v1/embeddings` had the other
+/// one and it was wrong — it hardcoded LAST and never read `<arch>.pooling_type`, so BGE/E5/GTE
+/// embedded through the wrong position with no error. The rule now lives once, in
+/// [`ferric_llama::pooling`], and both front ends call it. See that module for why.
+pub(crate) use ferric_llama::pooling::pool;
 
 #[cfg(test)]
 mod preflight_tests {
@@ -892,40 +879,6 @@ mod preflight_tests {
     }
 }
 
-#[cfg(test)]
-mod pool_tests {
-
-    use super::pool;
-
-    #[test]
-    fn mean_pooling_averages_down_COLUMNS_not_along_rows() {
-        // Rows are tokens, columns are channels. The transposed version of this loop returns a vector
-        // of the right length and the right magnitude and no meaning — which is why it is worth a
-        // test with an asymmetric shape, where the two readings cannot coincide.
-        let v = vec![1.0, 2.0, 3.0,
-                     5.0, 6.0, 7.0];              // t = 2, n = 3
-        assert_eq!(pool(&v, 2, 3, 1).unwrap(), vec![3.0, 4.0, 5.0]);
-        assert_eq!(pool(&v, 2, 3, 2).unwrap(), vec![1.0, 2.0, 3.0], "CLS is the FIRST token");
-        assert_eq!(pool(&v, 2, 3, 3).unwrap(), vec![5.0, 6.0, 7.0], "LAST is the final token");
-    }
-
-    #[test]
-    fn a_pooling_type_we_cannot_honour_is_an_error_not_a_guess() {
-        // The whole point. Falling back to LAST for a MEAN checkpoint is precisely the defect this
-        // change exists to remove, so an unknown type must refuse rather than default.
-        for bad in [0u32, 4, 9] {
-            let e = pool(&[1.0, 2.0], 1, 2, bad).unwrap_err();
-            assert!(e.contains(&bad.to_string()), "the error must name the type it refused: {e}");
-        }
-    }
-
-    #[test]
-    fn a_hidden_state_too_short_for_its_shape_is_refused_before_it_panics() {
-        assert!(pool(&[1.0, 2.0], 4, 3, 3).is_err(), "would slice out of bounds");
-        assert!(pool(&[], 1, 1, 3).is_err());
-        assert!(pool(&[1.0], 0, 1, 3).is_err(), "zero tokens has no last token to pool");
-    }
-}
 
 #[wasm_bindgen]
 impl FerricModel {

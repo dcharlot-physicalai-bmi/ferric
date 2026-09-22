@@ -266,6 +266,16 @@ pub(crate) struct Engine {
     /// and pool ITS hidden state (pooling_type=LAST), so `embed` must append it to match the reference.
     eos_id: Option<u32>,
     add_eos: bool,
+    /// GGUF `<arch>.pooling_type` — 0 NONE, 1 MEAN, 2 CLS, 3 LAST, 4 RANK.
+    ///
+    /// ⛔ THIS KEY WAS NEVER READ HERE. `/v1/embeddings` hardcoded last-token pooling, which is
+    /// right for Qwen3-Embedding (it declares 3) and silently WRONG for the MEAN family — BGE,
+    /// E5, GTE, most sentence-transformer exports — where the final position of a
+    /// bidirectionally-trained encoder carries no trained meaning. `ferric-web` read it
+    /// correctly the whole time; the same rule lived in two crates and one of them was wrong,
+    /// which is the `is_spm` defect over again. The rule now lives once, in
+    /// `ferric_llama::pooling`, and both front ends call it.
+    pooling: Option<u32>,
     eos: Vec<u32>,
     name: String,
     /// Raw bytes each token decodes to (for guided decoding); `None` for special/non-text tokens,
@@ -359,6 +369,9 @@ impl Engine {
         let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
         let eos_id = match g.metadata.get("tokenizer.ggml.eos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
         let add_eos = matches!(g.metadata.get("tokenizer.ggml.add_eos_token"), Some(Meta::Bool(true)));
+        // Architecture-prefixed (`bert.pooling_type`, `qwen3.pooling_type`, …), so it is looked up
+        // by SUFFIX rather than by guessing the arch name. One reader serves every family.
+        let pooling = ferric_llama::pooling::declared_pooling(g.metadata.iter());
         let mut eos: Vec<u32> = Vec::new();
         if let Some(e) = eos_id { eos.push(e); }
         let im_end = vocab.get("<|im_end|>").copied();
@@ -457,7 +470,7 @@ impl Engine {
         // The break-even is `E_draft / E_main`, estimated from shape: one MTP block against the main
         // model's `n_layer`. A structural estimate, not a measurement — see `specgate`.
         let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -547,19 +560,28 @@ impl Engine {
     /// Embed one text → an L2-normalized vector. Runs the transformer, takes the last token's hidden
     /// state (Qwen3-Embedding's last-token pooling, pooling_type=3), and normalizes. Same model code as
     /// generation — this is just the pre-lm_head hidden state, pooled.
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
         let n = self.model.n_embd();
         let mut ids = self.enc(text, true);
         // Qwen3-Embedding (add_eos_token) appends EOS and pools ITS hidden state; append it to match.
         if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } }
         // Empty input: keep the response's vectors equal-length (a zero vector), not a []; some clients
         // build a matrix over a batch and a ragged row breaks them.
-        if ids.is_empty() { return vec![0.0; n]; }
+        if ids.is_empty() { return Ok(vec![0.0; n]); }
         let v = pollster::block_on(self.model.forward_hidden(&ids).to_vec()); // [T·n_embd]
         let t = (v.len() / n).max(1);
-        let last = &v[(t - 1) * n..t * n]; // last-token pool (the appended EOS when present)
-        let norm = last.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        last.iter().map(|x| x / norm).collect()
+        // ⭐ The checkpoint's declared rule, not a hardcoded one. `unwrap_or(3)` keeps the old
+        // behaviour for files that declare nothing — it changes the answer only where the file
+        // said so and this endpoint was ignoring it. A type we cannot honour (NONE, RANK) refuses
+        // inside `pool`; returning a zero vector here would be a silently-wrong embedding, which is
+        // the failure this whole change exists to remove.
+        // ⛔ A type we cannot honour (NONE, RANK) REFUSES. It must not fall back here: this function
+        // already returns a zero vector to mean "empty input", so reusing it for "wrong pooling"
+        // would hand the client a well-formed embedding that ranks arbitrarily — the exact defect
+        // this change removes, reintroduced one line below the fix.
+        let pooled = ferric_llama::pooling::pool(&v, t, n, self.pooling.unwrap_or(3))?;
+        let norm = pooled.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        Ok(pooled.iter().map(|x| x / norm).collect())
     }
 
     /// Whether **this server** may put this engine's requests in a shared decode batch.
@@ -1065,10 +1087,17 @@ fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         _ => return bad(stream, "`input` must be a string or array of strings"),
     };
     let mut total = 0usize;
-    let data: Vec<Value> = inputs.iter().enumerate().map(|(i, text)| {
+    let mut data: Vec<Value> = Vec::with_capacity(inputs.len());
+    for (i, text) in inputs.iter().enumerate() {
         total += eng.enc(text, true).len();
-        json!({"object": "embedding", "index": i, "embedding": eng.embed(text)})
-    }).collect();
+        // A checkpoint whose pooling this build cannot honour is a 400, not a 200 carrying a vector
+        // of the right length and no meaning. The client can act on an error; it cannot act on a
+        // cosine score that looks ordinary.
+        match eng.embed(text) {
+            Ok(e) => data.push(json!({"object": "embedding", "index": i, "embedding": e})),
+            Err(m) => return bad(stream, &m),
+        }
+    }
     write_json(stream, 200, &json!({
         "object": "list", "data": data, "model": eng.name,
         "usage": {"prompt_tokens": total, "total_tokens": total}

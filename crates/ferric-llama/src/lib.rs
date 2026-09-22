@@ -107,6 +107,8 @@ pub mod unipc;
 
 pub mod arch;
 pub mod bert;
+pub mod pooling;      // <arch>.pooling_type -> one vector; ONE copy, because it was written twice
+
 pub mod nemotron_h; // general.architecture registry: what runs, and the refusal for what does not
 
 pub mod gemma4; // Google Gemma 4 (E2B/E4B): per-layer embeddings, shared KV, two head widths
