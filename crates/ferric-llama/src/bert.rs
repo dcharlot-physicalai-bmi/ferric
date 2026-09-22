@@ -314,14 +314,48 @@ impl Bert {
     /// reports the logit, ordering is invariant to any monotone squash, and a sigmoid here would make
     /// scores from two implementations incomparable for no gain.
     pub async fn score(&self, ids: &[u32]) -> Result<f32, String> {
+        let out = self.score_all(ids).await?;
+        out.first().copied().ok_or_else(|| "empty score output".into())
+    }
+
+    /// **Every logit the head produces**, not just the first.
+    ///
+    /// ⛔⛔ THIS ARITHMETIC WAS ALREADY RUNNING AND THE RESULT WAS BEING DISCARDED. `score` computed
+    /// the full `cls.output` vector and returned `out.first()`. For a reranker that is right —
+    /// `n_cls_out` is 1 and the vector has one element. For every OTHER checkpoint that carries the
+    /// same `cls.*` tensors it silently returned the first class's logit as if it were "the score":
+    /// a guardrail head's `safe` logit with the unsafe classes dropped, an NLI head's `entailment`
+    /// with `neutral` and `contradiction` dropped. Nothing errored; the number was real and answered
+    /// a question nobody asked.
+    ///
+    /// GGUF already carries the width and the names — `cls.output.weight` is `{n_embd, n_cls_out}`
+    /// and llama.cpp reads `%s.classifier.output_labels` (`llama-arch.cpp:311`) alongside
+    /// `llama_model_n_cls_out` (`llama.h:589-591`). This returns the vector; [`Reranker::labels`]
+    /// returns the names when the file declares them.
+    ///
+    /// The order is the file's own — index `i` is the class at index `i` of `output_labels`. This
+    /// function does NOT softmax: the caller decides, because a cross-encoder's single logit is
+    /// consumed raw and monotonically (see the note on [`Self::score`]) while a k-way head is
+    /// normally softmaxed, and doing it here would make the two incomparable.
+    pub async fn score_all(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
         let c = self.cls.as_ref().ok_or(
             "this checkpoint has no cls.* head, so it embeds but cannot score a pair;              reranking needs a cross-encoder such as bge-reranker")?;
         let h = self.forward(ids)?;
         // CLS is position 0 for every cross-encoder in this family.
         let pooled = h.narrow(0, 0, 1).reshape(&[1, self.cfg.d]);
         let z = pooled.matmul_bt(&c.w).add(&c.b).tanh();
-        let out = z.matmul_bt(&c.ow).add(&c.ob).to_vec().await;
-        out.first().copied().ok_or_else(|| "empty score output".into())
+        Ok(z.matmul_bt(&c.ow).add(&c.ob).to_vec().await)
+    }
+
+    /// How many classes this checkpoint's head emits — llama.cpp's `n_cls_out`.
+    ///
+    /// Read from `cls.output.weight`'s own shape rather than from metadata, so it cannot disagree
+    /// with the tensor the arithmetic actually uses. `None` when there is no `cls.*` head at all.
+    pub fn n_cls_out(&self) -> Option<usize> {
+        // `matmul_bt(&ow)` maps [1, d] -> [1, n_cls_out], so `ow` is [n_cls_out, d] in this
+        // layout and the CLASS COUNT is the leading dim. Read from the tensor rather than from
+        // metadata so it cannot disagree with the matmul that actually runs.
+        self.cls.as_ref().map(|c| c.ow.shape.first().copied().unwrap_or(1))
     }
 }
 
@@ -390,7 +424,10 @@ impl Reranker {
     /// for two pairs of 6 query and 10/11 doc content tokens, and of the three candidate layouts only
     /// this one gives 19 + 20 = 39. Two wrong layouts were tried first and BOTH kept the correct
     /// ordering, which is exactly why a ranking benchmark cannot catch this.
-    fn pair(&self, query: &str, doc: &str) -> Vec<u32> {
+    /// The cross-encoder pair encoding — `[CLS] query [SEP] doc [SEP]` in this family's own
+    /// tokenizer. Public because a caller reaching [`Bert::score_all`] for a k-way head needs the
+    /// SAME ids the reranker would build; rebuilding them by hand is how two paths drift.
+    pub fn pair(&self, query: &str, doc: &str) -> Vec<u32> {
         let enc = |s: &str| match &self.tok {
             // WordPiece adds its own [CLS]/[SEP]; strip them so the pair layout supplies the wrapping.
             RerankTok::Wordpiece(w) => { let v = w.encode(s); v[1..v.len().saturating_sub(1)].to_vec() }
