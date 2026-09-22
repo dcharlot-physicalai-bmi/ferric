@@ -107,6 +107,7 @@ pub mod unipc;
 
 pub mod arch;
 pub mod bert;
+pub mod modern_bert;  // ModernBERT: RoPE + symmetric-band SWA + GeGLU, two rope bases
 pub mod pooling;      // <arch>.pooling_type -> one vector; ONE copy, because it was written twice
 
 pub mod nemotron_h; // general.architecture registry: what runs, and the refusal for what does not

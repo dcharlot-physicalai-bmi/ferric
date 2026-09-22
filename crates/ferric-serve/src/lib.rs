@@ -63,6 +63,9 @@ impl Model {
             R::Dense | R::Hybrid | R::Lfm2 | R::Gemma4 | R::DeepSeek2 | R::NemotronH | R::Hyv4 => Ok(()),
             R::Bert => Err("a BERT encoder: no KV cache and no LM head, so it cannot serve chat or \
                             completions. Point FERRIC_RERANK_MODEL at it instead"),
+            R::ModernBert => Err("a ModernBERT encoder: RoPE, symmetric-band local attention and \
+                                  GeGLU, but still no KV cache and no LM head, so it cannot serve \
+                                  chat or completions. It is an embedding/decision encoder"),
             R::Cosmos => Err("loads from safetensors, not GGUF; ferric-serve takes a GGUF"),
             R::Parakeet => Err("a speech recogniser: it takes a WAVEFORM and returns text, and has \
                                 no KV cache, no LM head and no token input. Use the parakeet \
@@ -427,6 +430,8 @@ impl Engine {
             }
             ferric_llama::arch::Runtime::Bert =>
                 unreachable!("Bert is refused by Model::dispatchable before this match"),
+            ferric_llama::arch::Runtime::ModernBert =>
+                unreachable!("ModernBert is refused by Model::dispatchable before this match"),
         };
         eprintln!("arch {arch:?} -> {} runtime ({}) — {}",
                   entry.runtime.label(), entry.status.label(), entry.note);
@@ -1597,10 +1602,13 @@ mod batching_support {
                 // Non-generative runtimes are legitimately un-loadable HERE, but only the two that
                 // are non-generative by nature. Anything else is drift.
                 // The refusable set: runtimes that are non-generative BY NATURE. `Parakeet` joined
-                // it when speech landed — it takes a waveform, not tokens. Adding a runtime here
-                // must be a deliberate edit, which is the whole point: this test went red the moment
-                // parakeet was registered, rather than letting a third refusal in unnoticed.
+                // it when speech landed — it takes a waveform, not tokens. `ModernBert` joined it on
+                // 2026-09-22: a second encoder family, structurally unlike `Bert` but with the same
+                // answer — no KV cache, no LM head. Adding a runtime here must be a deliberate edit,
+                // which is the whole point: this test went red the moment each was registered,
+                // rather than letting a refusal in unnoticed.
                 assert!(matches!(a.runtime, ferric_llama::arch::Runtime::Bert
+                                          | ferric_llama::arch::Runtime::ModernBert
                                           | ferric_llama::arch::Runtime::Cosmos
                                           | ferric_llama::arch::Runtime::Parakeet),
                         "{} is Status::Verified but this server refuses it: {why}", a.name);
@@ -1623,7 +1631,8 @@ mod batching_support {
         // rather than a silent loss of support.
         let mut expect: Vec<&str> = REGISTRY.iter()
             .filter(|a| a.status.runnable()
-                        && matches!(a.runtime, Runtime::Bert | Runtime::Cosmos | Runtime::Parakeet))
+                        && matches!(a.runtime, Runtime::Bert | Runtime::ModernBert
+                                               | Runtime::Cosmos | Runtime::Parakeet))
             .map(|a| a.name).collect();
         refused.sort(); expect.sort();
         assert_eq!(refused, expect,

@@ -148,7 +148,7 @@ struct ClsHead { w: Tensor, b: Tensor, ow: Tensor, ob: Tensor }
 
 /// Load a `[rows, cols]` tensor as f32. GGUF dims are reversed relative to row-major, so a weight
 /// listed `[in, out]` is `[out, in]` in memory — which is exactly `matmul_bt`'s expected layout.
-fn t2(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, String> {
+pub(crate) fn t2(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, String> {
     let i = g.tensor(name).ok_or_else(|| format!("no {name}"))?;
     let (a, b) = (i.dims[0] as usize, *i.dims.get(1).unwrap_or(&1) as usize);
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[b, a]))
@@ -164,7 +164,7 @@ fn stats(v: &[f32]) -> String {
     format!("sum {sum:+.6}  mean {mean:+.6}  mean|v| {absmean:.6}  max|v| {mx:.6}")
 }
 
-fn t1(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, String> {
+pub(crate) fn t1(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Tensor, String> {
     let i = g.tensor(name).ok_or_else(|| format!("no {name}"))?;
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[1, i.dims[0] as usize]))
 }

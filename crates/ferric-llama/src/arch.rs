@@ -51,6 +51,9 @@ pub enum Runtime {
     Cosmos,
     /// [`crate::bert`] — encoder-only. Embeddings and rerankers, not generation.
     Bert,
+    /// [`crate::modern_bert`] — encoder-only, but structurally unlike [`Runtime::Bert`]: RoPE with
+    /// TWO bases, alternating symmetric-band / global attention, pre-LayerNorm without bias, GeGLU.
+    ModernBert,
     /// [`crate::nemotron_h`] — Mamba-2 state-space mixers with a few attention layers.
     NemotronH,
     /// [`crate::parakeet`] — Conformer encoder + RNN-T decoder. SPEECH: waveform in, text out.
@@ -70,6 +73,7 @@ impl Runtime {
     pub fn label(self) -> &'static str {
         match self {
             Runtime::Bert => "bert",
+            Runtime::ModernBert => "modern_bert",
             Runtime::NemotronH => "nemotron_h",
             Runtime::Parakeet => "parakeet",
             Runtime::Dense => "dense",
@@ -185,6 +189,23 @@ pub const REGISTRY: &[Arch] = &[
                   d=1024 Q4_K_M) at 0.999995-1.000000, over 3-to-39-token inputs. Cross-encoder \
                   scoring matches the reference to 0.24%. EMBEDS AND SCORES — generation is refused, \
                   there is no LM head to generate from" },
+    Arch { name: "modern-bert", runtime: Runtime::ModernBert, status: Status::Verified,
+           note: "encoder-only and NOT the BERT above: RoPE (NeoX) instead of learned positions, \
+                  PRE-LayerNorm with no bias instead of post-LN with bias, GeGLU over a fused \
+                  {d, 2*n_ff} up, one fused qkv, layer 0's attn_norm absent (identity), and \
+                  alternating SYMMETRIC-band / global attention on a dense-first 1-in-3 schedule. \
+                  Reference-checked against llama-embedding on gte-reranker-modernbert-base F16 at \
+                  cosine 0.99999965 (max|diff| 2.0e-5) over 222 tokens — long enough that the \
+                  129-wide band actually masks. ⭐ BOTH hard mechanisms are proved load-bearing by \
+                  negative control: disabling the window gives 0.9927 (800x worse) and reading ONE \
+                  rope base gives 0.9997 (257x worse). ⛔⛔ TWO ROPE BASES: global 160000, sliding \
+                  10000 here and on ModernBERT-large, but IDENTICAL on mmBERT-base — so a one-base \
+                  port is bit-exact on mmBERT and silently wrong on the others, and 0.9997 cosine is \
+                  what that looks like from outside. ⚠ NOT YET COVERED: the cls.* classifier head is \
+                  not wired (embeddings only, no scoring), and one checkpoint has been diffed. EMBEDS ONLY — \
+                  generation is refused, there is no LM head to generate from. \
+                  Gate: scripts/modern_bert_conformance.sh"
+    },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
@@ -511,6 +532,8 @@ mod tests {
                     | Runtime::Hyv4 => true,
                 // Encoder: embeddings and cross-encoder scores, no LM head.
                 Runtime::Bert => false,
+                // Encoder too — a different one, but the same answer: no LM head to generate from.
+                Runtime::ModernBert => false,
                 // Speech: takes a WAVEFORM, not tokens.
                 Runtime::Parakeet => false,
             };
