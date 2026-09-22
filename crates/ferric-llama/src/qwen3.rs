@@ -215,6 +215,20 @@ pub struct Cfg {
     pub mrope_interleaved: bool,
 }
 
+/// Does this architecture pass `dense_first = true` to `set_swa_pattern`?
+///
+/// Per-architecture in the reference, so it is a list here too rather than a heuristic. Transcribed
+/// from the `set_swa_pattern(` call sites in `.reference/llama.cpp/src/models/`: `modern-bert.cpp:10`,
+/// `laguna.cpp:41`, `smallthinker.cpp:11` and `cohere2moe.cpp:33` pass `true`; every other call site
+/// (gemma2/3/3n, gemma-embedding, cohere2, olmo2, phi3, llama4, afmoe, exaone4, exaone-moe, mellum,
+/// plamo3, openai-moe, deepseek4) takes the `false` default.
+///
+/// ⚠ Adding an architecture here CHANGES ITS SCHEDULE. Check the reference's own call site before
+/// adding one — the two arms differ only in phase and both look reasonable at a glance.
+pub(crate) fn dense_first_swa(arch: &str) -> bool {
+    matches!(arch, "modern-bert" | "laguna" | "smallthinker" | "cohere2moe")
+}
+
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         // The metadata keys are prefixed by the architecture (qwen2.*, qwen3.*, llama.*, …). Read it
@@ -263,9 +277,29 @@ impl Cfg {
                         _ => false,
                     }).collect(),
                     _ => {
-                        let p = u("attention.sliding_window_pattern")
-                            .unwrap_or(if gemma2 { 2 } else if is_gemma { 6 } else { 0 });
-                        (0..n).map(|il| is_gemma && p > 0 && il % p != p - 1).collect()
+                        // ⛔⛔ THIS WAS WRONG IN TWO WAYS AND BOTH FAILED SILENTLY.
+                        //
+                        // (1) It was gated on `is_gemma`, so ANY other architecture carrying a scalar
+                        //     sliding-window pattern collapsed to all-global. A model that should run
+                        //     2-in-3 local layers ran 0 — plausible output, degraded long range.
+                        // (2) It implemented only llama.cpp's `dense_first = false` arm. ModernBERT
+                        //     (`modern-bert.cpp:10`) and Laguna (`laguna.cpp:41`) pass `true`, which
+                        //     makes the FIRST layer of each group global rather than the last. At
+                        //     p = 3 that is layer 0 vs layer 2 — the same NUMBER of global layers in
+                        //     a different phase, which no count-based check can catch.
+                        //
+                        // `Option` rather than an integer because `None` (no pattern declared) and
+                        // `Some(0)` are OPPOSITES in the reference: it says "no SWA" by never calling
+                        // `set_swa_pattern`, while `set_swa_pattern(0)` short-circuits every layer to
+                        // windowed. The old `p > 0 &&` conflated them.
+                        //
+                        // ⚠ Provably inert on every checkpoint on this machine: no local GGUF declares
+                        // a SCALAR pattern. Gemma-2/3 and Phi-3.5 declare only `sliding_window`, and
+                        // Gemma-4 and Muse-Glimmer take the array arm above. The Gemma defaults below
+                        // reproduce the old schedule exactly (`il % p != p-1` == `il % p < p-1`).
+                        let declared = u("attention.sliding_window_pattern").ok();
+                        let p = declared.or(if gemma2 { Some(2) } else if is_gemma { Some(6) } else { None });
+                        ferric_tensor::nn::swa_schedule(n, p, dense_first_swa(&arch))
                     }
                 }
             },

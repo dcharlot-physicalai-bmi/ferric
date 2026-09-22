@@ -190,6 +190,75 @@ fn sliding_causal_mask_off(like: &Tensor, t: usize, s: usize, off: usize, window
     Tensor::from_vec(&like.ctx_arc(), &m, &[t, s])
 }
 
+/// **Symmetric (bidirectional) band mask** — llama.cpp's `LLAMA_SWA_TYPE_SYMMETRIC`.
+///
+/// Query at absolute position `off + i` may attend key at position `j` iff `|(off+i) - j| <= n_swa/2`.
+/// Unlike [`sliding_causal_mask_off`] there is **no causal half**: a bidirectional encoder's local
+/// layers see a window centred on the query, not a window trailing behind it.
+///
+/// ⛔ `half = n_swa / 2` is INTEGER division, and the window is therefore `2*half + 1` positions
+/// wide, not `n_swa`. For ModernBERT's `local_attention = 128` that is 64 either side, 129 total.
+/// Transcribed from `.reference/llama.cpp/src/llama-hparams.h` (`LLAMA_SWA_TYPE_SYMMETRIC`):
+/// `const int32_t half_n_swa = (int32_t) n_swa / 2; const int32_t pos_diff = p1 - p0;`
+/// `if (pos_diff < -half_n_swa || pos_diff > half_n_swa) { return true; }`
+///
+/// `n_swa == 0` means no windowing — every position is visible.
+pub fn symmetric_band_mask(like: &Tensor, t: usize, s: usize, off: usize, n_swa: usize) -> Tensor {
+    let mut m = vec![0.0f32; t * s];
+    for i in 0..t {
+        for j in 0..s {
+            if symmetric_band_masked(off + i, j, n_swa) { m[i * s + j] = -1e30; }
+        }
+    }
+    Tensor::from_vec(&like.ctx_arc(), &m, &[t, s])
+}
+
+/// The symmetric-band PREDICATE: is key `kj` hidden from query `qi` under a window of `n_swa`?
+///
+/// ⭐ Split out from [`symmetric_band_mask`] on purpose. Building the tensor needs a GPU `Context`;
+/// the *rule* is the part that can be wrong quietly, and it is pure integer arithmetic. Keeping them
+/// separate is what lets the rule be pinned by a table test that runs anywhere, including on a
+/// machine with no adapter.
+#[inline]
+pub fn symmetric_band_masked(qi: usize, kj: usize, n_swa: usize) -> bool {
+    if n_swa == 0 { return false; }
+    let half = (n_swa / 2) as i64;
+    let d = qi as i64 - kj as i64;
+    d < -half || d > half
+}
+
+/// **Which layers use the sliding window** — llama.cpp's `llama_hparams::set_swa_pattern`, both arms.
+///
+/// `pattern` is `None` when the file declares no scalar pattern. That is NOT the same as `Some(0)`:
+/// llama.cpp expresses "this architecture has no SWA" by never calling `set_swa_pattern` at all,
+/// leaving every flag false, while an explicit `set_swa_pattern(0)` means the opposite — **every**
+/// layer windowed (`n_pattern == 0 ||` short-circuits to true). Conflating the two inverts the whole
+/// schedule, so the two cases are different values here rather than one integer.
+///
+/// `dense_first` picks the arm, and it is per-architecture in the reference:
+/// - `false` (the default; Gemma-2/3, Cohere2, OLMo2, Phi-3, Llama-4, …):
+///   `is_swa[il] = n_pattern == 0 || (il % n_pattern < n_pattern - 1)` — the **last** layer of each
+///   group is global.
+/// - `true` (ModernBERT `modern-bert.cpp:10`, Laguna `laguna.cpp:41`, SmallThinker, Cohere2-MoE):
+///   `is_swa[il] = n_pattern == 0 || (il % n_pattern != 0)` — the **first** layer of each group is
+///   global.
+///
+/// ⛔⛔ THE TWO ARMS DIFFER BY EXACTLY ONE LAYER'S PHASE AND NOTHING ELSE. At `n_pattern = 3` the
+/// dense-first arm makes layer **0** global and the other makes layer **2** global. Both produce a
+/// plausible schedule with the right *number* of global layers, both run, and the wrong one degrades
+/// long-range behaviour without erroring. Ferric previously implemented only the `false` arm — and
+/// gated it on `is_gemma`, so any non-Gemma architecture carrying a scalar pattern collapsed to
+/// all-global.
+///
+/// ⚠ `il % p != p - 1` (Ferric's old spelling) and `il % p < p - 1` (the reference's) are the same
+/// function on `0..p-1`; that arm was arithmetically correct. The gate and the missing arm were not.
+pub fn swa_schedule(n_layer: usize, pattern: Option<usize>, dense_first: bool) -> Vec<bool> {
+    let Some(p) = pattern else { return vec![false; n_layer] };
+    (0..n_layer)
+        .map(|il| p == 0 || if dense_first { il % p != 0 } else { il % p < p - 1 })
+        .collect()
+}
+
 /// Incremental-decode attention against a KV cache (one new query token vs all cached keys/values).
 /// q is [1, n_heads·dh]; k/v are the cache [S, n_kv_heads·dh]. No mask (cache precedes the query).
 /// Composed from general ops — the KV-cache decode path, no bespoke kernel.
@@ -778,5 +847,79 @@ mod sink_tests {
         let mass: Vec<f32> = (0..NH).map(|h| 1.0 - (0..S).map(|j| p[h * T * S + j]).sum::<f32>()).collect();
         assert!(mass[0] < 1e-5, "head 0 has no sink and should keep all its mass, lost {}", mass[0]);
         assert!(mass[2] > 0.5, "head 2's sink should take most of the mass, took {}", mass[2]);
+    }
+}
+
+#[cfg(test)]
+mod swa_rule_tests {
+    use super::{swa_schedule, symmetric_band_masked};
+
+    /// ⛔⛔ THE WHOLE POINT OF G2. The two `set_swa_pattern` arms produce schedules with the SAME
+    /// NUMBER of global layers and a different PHASE. A check that counts globals cannot tell them
+    /// apart; only one that looks at *which* layer is global can. This is the negative control.
+    #[test]
+    fn the_two_swa_arms_differ_only_in_phase_so_a_count_cannot_distinguish_them() {
+        let dense = swa_schedule(6, Some(3), true);   // ModernBERT, laguna: FIRST of each group global
+        let last  = swa_schedule(6, Some(3), false);  // Gemma &c.:          LAST of each group global
+
+        assert_eq!(dense, vec![false, true, true, false, true, true], "dense_first: layer 0 is global");
+        assert_eq!(last,  vec![true, true, false, true, true, false], "default:     layer 2 is global");
+
+        // ⭐ Same count, different schedule — so "2 global layers, looks right" proves nothing.
+        assert_eq!(dense.iter().filter(|b| !**b).count(), last.iter().filter(|b| !**b).count());
+        assert_ne!(dense, last, "if these ever coincide the fixture cannot detect the bug it exists for");
+
+        // And Ferric's OLD spelling of the default arm was arithmetically right — pin that, so the
+        // change is provably a pure addition for every architecture already using it.
+        let old_spelling: Vec<bool> = (0..6).map(|il| 3 > 0 && il % 3 != 3 - 1).collect();
+        assert_eq!(old_spelling, last, "`il % p != p-1` and `il % p < p-1` are the same function");
+    }
+
+    /// ⛔ `None` (no pattern declared) and `Some(0)` (a pattern of zero) are OPPOSITES, and the
+    /// reference expresses the first by never calling `set_swa_pattern` at all. Collapsing them to
+    /// one integer inverts every flag.
+    #[test]
+    fn no_declared_pattern_is_the_opposite_of_a_declared_zero() {
+        assert_eq!(swa_schedule(4, None, false), vec![false; 4], "undeclared = no windowing anywhere");
+        assert_eq!(swa_schedule(4, Some(0), false), vec![true; 4], "declared 0 = EVERY layer windowed");
+        assert_eq!(swa_schedule(4, Some(0), true), vec![true; 4], "…on both arms");
+    }
+
+    /// Phi-3 calls `set_swa_pattern(1)`, which the reference resolves to all-global on both arms.
+    #[test]
+    fn a_pattern_of_one_is_all_global_on_both_arms() {
+        assert_eq!(swa_schedule(5, Some(1), false), vec![false; 5]);
+        assert_eq!(swa_schedule(5, Some(1), true), vec![false; 5]);
+    }
+
+    /// ⛔ The band is BIDIRECTIONAL. A causal band — the only kind this crate had — hides every key
+    /// ahead of the query, which is exactly the wrong-but-plausible alternative for an encoder.
+    #[test]
+    fn the_band_is_symmetric_and_a_causal_band_is_the_negative_control() {
+        let n_swa = 4;                       // half = 2
+        let causal = |qi: usize, kj: usize| kj > qi || (qi.saturating_sub(kj) >= n_swa);
+
+        // Looking BACKWARD the two agree in spirit; looking FORWARD they must not.
+        assert!(!symmetric_band_masked(5, 7, n_swa), "key 2 ahead of the query is INSIDE a symmetric band");
+        assert!(causal(5, 7), "...and a causal band hides it — the two rules are distinguishable");
+
+        assert!(symmetric_band_masked(5, 8, n_swa), "3 ahead is outside half=2");
+        assert!(symmetric_band_masked(5, 2, n_swa), "3 behind is outside half=2");
+        assert!(!symmetric_band_masked(5, 3, n_swa), "exactly half behind is INSIDE (>, not >=)");
+        assert!(!symmetric_band_masked(5, 7, n_swa), "exactly half ahead is INSIDE");
+    }
+
+    /// ⛔ `half = n_swa / 2` is integer division, so the visible span is `2*half + 1` — an ODD number,
+    /// and NOT `n_swa`. ModernBERT declares `local_attention = 128`, which is 64 either side, 129
+    /// total. Reading it as "128 wide" is off by one at each edge.
+    #[test]
+    fn the_visible_span_is_two_halves_plus_one_not_n_swa() {
+        for n_swa in [4usize, 5, 128, 129] {
+            let half = n_swa / 2;
+            let visible = (0..=2 * half + 4).filter(|&kj| !symmetric_band_masked(half + 2, kj, n_swa)).count();
+            assert_eq!(visible, 2 * half + 1, "n_swa={n_swa}: span must be 2*({half})+1, not {n_swa}");
+        }
+        assert_eq!(0usize, (0..10).filter(|&kj| symmetric_band_masked(5, kj, 0)).count(),
+                   "n_swa = 0 means no windowing at all");
     }
 }
