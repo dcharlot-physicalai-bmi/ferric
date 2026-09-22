@@ -101,6 +101,28 @@ pub enum Pre {
     Hyv4,
 }
 
+/// The `tokenizer.ggml.pre` values llama.cpp resolves to `LLAMA_VOCAB_PRE_TYPE_GPT2` — i.e. GPT-2's
+/// rule EXACTLY, not something near it.
+///
+/// ⭐ Mapping these changes NO behaviour: they already reached `Pre::Gpt2` through the fall-open.
+/// What it changes is what Ferric KNOWS. A fall-open is a value nobody has checked, and it prints a
+/// warning telling the operator the tokenization will differ from llama.cpp — which for these
+/// fourteen is false. Turning "accidentally right" into "verified right" removes fourteen wrong
+/// warnings and shrinks the set of genuinely unmapped values to the three that really are unmapped.
+///
+/// ⛔ Transcribed from the reference's own arms, not inferred from the names — the rule this file
+/// keeps relearning. `.reference/llama.cpp/src/llama-vocab.cpp` at `0cea36222`:
+/// lines 2174-2184 (gpt-2 … modern-bert), 2201 (roberta-bpe group), 2277 (exaone4). Each was
+/// followed forward to its own `pre_type = LLAMA_VOCAB_PRE_TYPE_GPT2;` rather than assumed from
+/// sharing an `else if` chain.
+///
+/// ⚠ `gpt-2` is HYPHENATED in the reference. Ferric's own `"gpt2"` spelling is a different string,
+/// so a file declaring the reference's spelling was warning about a rule Ferric had all along.
+pub(crate) const GPT2_ALIASES: &[&str] = &[
+    "gpt-2", "phi-2", "jina-es", "jina-de", "gigachat", "jina-v2-es", "jina-v2-de",
+    "a.x-4.0", "mellum", "modern-bert", "jina-v1-en", "jina-v2-code", "roberta-bpe", "exaone4",
+];
+
 impl Pre {
     /// Map a GGUF `tokenizer.ggml.pre` value. Unknown values fall back to GPT-2, which is what the
     /// tree did unconditionally before this existed.
@@ -142,10 +164,14 @@ impl Pre {
         matches!(pre, "gpt2" | "qwen2" | "qwen35" | "laguna" | "hyv4" | "deepseek3-llm" | "hunyuan-dense"
                       | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
                       | "midm-2.0" | "lfm2" | "jina-v5-nano")
+            || GPT2_ALIASES.contains(&pre)
     }
 
     pub fn from_gguf(pre: Option<&str>) -> Pre {
         match pre {
+            // Verified-equivalent aliases: llama.cpp gives each of these GPT-2's own
+            // pre-type. See GPT2_ALIASES for the line numbers each was read from.
+            Some(p) if GPT2_ALIASES.contains(&p) => Pre::Gpt2,
             Some("qwen2") => Pre::Qwen2,
             // ⛔ Qwen 3.5 declares `qwen35` and llama.cpp gives it its OWN pre-type
             // (LLAMA_VOCAB_PRE_TYPE_QWEN35, llama-vocab.cpp:2223) — NOT qwen2's. Its regex is qwen2's
@@ -1270,5 +1296,67 @@ mod spm_user_defined_tests {
     enum Meta1 { Str, Bool, I(i32) }
     fn ferric_gguf_token_types_like(v: &[Meta1]) -> Vec<i32> {
         v.iter().map(|m| match m { Meta1::I(n) => *n, _ => 1 }).collect()
+    }
+}
+
+#[cfg(test)]
+mod gpt2_alias_tests {
+    use super::*;
+
+    /// ⭐ THE CHANGE IS PROVABLY INERT. Every alias already reached `Pre::Gpt2` through the
+    /// fall-open, so mapping it must not move a single token — only the warning and the
+    /// "is this verified?" answer change.
+    #[test]
+    fn every_alias_resolves_to_gpt2_and_tokenizes_identically_to_it() {
+        let corpus = ["Hello-Reyes", "2026 was a year", "  leading space", "naïve café",
+                      "print(\"x\");\n\treturn 0", "не знаю", "日本語テキスト"];
+        for alias in GPT2_ALIASES {
+            assert_eq!(Pre::from_gguf(Some(alias)), Pre::Gpt2, "{alias} must resolve to GPT-2");
+            assert!(Pre::is_mapped(alias), "{alias} must no longer count as a fall-open");
+            assert!(Pre::fall_open_warning(alias).is_none(),
+                    "{alias} must not warn — the warning claims tokenization WILL differ from \
+                     llama.cpp, which for a verified GPT-2 alias is false");
+            for text in corpus {
+                assert_eq!(pretokenize_with(text, Pre::from_gguf(Some(alias))),
+                           pretokenize_with(text, Pre::Gpt2),
+                           "{alias} changed the tokenization of {text:?} — it must not");
+            }
+        }
+    }
+
+    /// ⛔ THE NEGATIVE CONTROL, and the reason this list is a list rather than a wildcard. Values
+    /// llama.cpp does NOT give GPT-2's pre-type must still fall open AND still warn. If this ever
+    /// passes for one of them, someone widened the table without reading the reference.
+    #[test]
+    fn genuinely_unmapped_values_still_fall_open_and_still_warn() {
+        for unmapped in ["deepseek-llm", "default", "llama4"] {
+            assert!(!Pre::is_mapped(unmapped),
+                    "{unmapped} has its OWN pre-type in llama.cpp — it is not a GPT-2 alias, and \
+                     silencing its warning would hide a real divergence");
+            assert!(Pre::fall_open_warning(unmapped).is_some(), "{unmapped} must still warn");
+        }
+        // And a value nobody has ever seen must still warn — the fall-open itself is intact.
+        assert!(Pre::fall_open_warning("not-a-real-pretokenizer-zzz").is_some());
+    }
+
+    /// ⚠ `gpt-2` (the reference's spelling) and `gpt2` (Ferric's) are DIFFERENT STRINGS. A file
+    /// using the reference's spelling used to warn about a rule Ferric already had.
+    #[test]
+    fn the_hyphenated_reference_spelling_is_covered_too() {
+        assert!(GPT2_ALIASES.contains(&"gpt-2"), "the reference writes it hyphenated");
+        assert!(Pre::is_mapped("gpt-2") && Pre::is_mapped("gpt2"));
+        assert_eq!(Pre::from_gguf(Some("gpt-2")), Pre::from_gguf(Some("gpt2")));
+    }
+
+    /// The table must not silently gain duplicates or lose entries.
+    #[test]
+    fn the_alias_table_is_the_size_the_reference_arms_hold() {
+        let mut v: Vec<&str> = GPT2_ALIASES.to_vec();
+        v.sort_unstable(); v.dedup();
+        assert_eq!(v.len(), GPT2_ALIASES.len(), "duplicate entry in GPT2_ALIASES");
+        assert_eq!(GPT2_ALIASES.len(), 14,
+                   "llama-vocab.cpp @0cea36222 lists 14 values resolving to PRE_TYPE_GPT2 \
+                    (10 at 2174-2184, 3 at 2201, 1 at 2277). Changing this count means re-reading \
+                    the reference, not adjusting the number.");
     }
 }
