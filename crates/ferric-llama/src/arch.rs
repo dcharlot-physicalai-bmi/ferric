@@ -201,9 +201,15 @@ pub const REGISTRY: &[Arch] = &[
                   rope base gives 0.9997 (257x worse). ⛔⛔ TWO ROPE BASES: global 160000, sliding \
                   10000 here and on ModernBERT-large, but IDENTICAL on mmBERT-base — so a one-base \
                   port is bit-exact on mmBERT and silently wrong on the others, and 0.9997 cosine is \
-                  what that looks like from outside. ⚠ NOT YET COVERED: the cls.* classifier head is \
-                  not wired (embeddings only, no scoring), and one checkpoint has been diffed. EMBEDS ONLY — \
-                  generation is refused, there is no LM head to generate from. \
+                  what that looks like from outside. ⭐ The cls.* head is wired too — and it is NOT \
+                  the BERT head: ModernBERT applies GELU where every other BERT applies tanh, and carries \
+                  a head LayerNorm classic BERT lacks (llama-graph.cpp:3366). Cross-encoder scores track \
+                  llama-embedding --pooling rank to 0.033-0.099 absolute on a [-2.2,+2.4] range, ranking \
+                  preserved. ⛔⛔ THAT IS 1000x LOOSER THAN THE EMBEDDING COSINE AND THE COSINE CANNOT SEE \
+                  IT: cosine is scale-invariant, the head is not, so the encoder's 3.4e-3 ABSOLUTE error \
+                  (at cosine 0.99999964) is amplified ~10x by the pooler+norm+projection. A gate stopping \
+                  at the embedding would call this path verified to 1e-5. ⚠ One checkpoint diffed. \
+                  EMBEDS AND SCORES — generation is refused, there is no LM head to generate from. \
                   Gate: scripts/modern_bert_conformance.sh"
     },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,

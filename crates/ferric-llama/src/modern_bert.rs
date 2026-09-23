@@ -141,6 +141,23 @@ struct Block {
     down: Tensor,
 }
 
+/// The sequence-classification head — `cls.*` in GGUF.
+///
+/// ⛔⛔ NOT the same head as [`crate::bert`]'s, and llama.cpp branches on the architecture to say so
+/// (`llama-graph.cpp:3366`): ModernBERT applies **GELU** where every other BERT applies **tanh**, and
+/// it carries a **head LayerNorm** (`cls.norm.weight`) that classic BERT does not have. Either
+/// difference alone produces a finite, plausible, wrong score.
+struct ClsHead {
+    /// `cls.weight` — the pooler. `cls.bias` is absent on ModernBERT, hence `Option`.
+    w: Tensor,
+    b: Option<Tensor>,
+    /// `cls.norm.weight` — the head norm, after the activation. Absent on classic BERT.
+    norm: Option<Tensor>,
+    /// `cls.output.weight` `{d, n_cls_out}` and its bias.
+    ow: Tensor,
+    ob: Option<Tensor>,
+}
+
 pub struct ModernBert {
     ctx: Arc<Context>,
     pub cfg: Cfg,
@@ -149,6 +166,7 @@ pub struct ModernBert {
     out_norm: Tensor,
     zeros_d: Tensor,
     blocks: Vec<Block>,
+    cls: Option<ClsHead>,
 }
 
 impl ModernBert {
@@ -169,7 +187,15 @@ impl ModernBert {
                 down: t2(ctx, g, &format!("blk.{il}.ffn_down.weight"))?,
             });
         }
-        Ok(ModernBert { ctx: ctx.clone(), cfg, tok_embd, tok_norm, out_norm, zeros_d, blocks })
+        // The head is optional: an embedding checkpoint has no `cls.*` at all.
+        let cls = t2(ctx, g, "cls.weight").ok().map(|w| ClsHead {
+            w,
+            b: t1(ctx, g, "cls.bias").ok(),
+            norm: t1(ctx, g, "cls.norm.weight").ok(),
+            ow: t2(ctx, g, "cls.output.weight").expect("cls.weight without cls.output.weight"),
+            ob: t1(ctx, g, "cls.output.bias").ok(),
+        });
+        Ok(ModernBert { ctx: ctx.clone(), cfg, tok_embd, tok_norm, out_norm, zeros_d, blocks, cls })
     }
 
     /// LayerNorm with weight and NO bias — what `build_norm(x, w, nullptr, LLM_NORM, il)` does.
@@ -272,6 +298,55 @@ impl ModernBert {
         let out = self.ln(&inp, &self.out_norm);
         if trace { tr.push(("final_norm_out".into(), out.clone())); }
         Ok((out, tr))
+    }
+}
+
+impl ModernBert {
+    /// Does this checkpoint carry a classification head?
+    pub fn is_classifier(&self) -> bool { self.cls.is_some() }
+
+    /// How many classes the head emits — llama.cpp's `n_cls_out`.
+    ///
+    /// Read from `cls.output.weight`'s leading dim, from the TENSOR rather than from metadata, so it
+    /// cannot disagree with the matmul that actually runs. Compare against
+    /// [`Cfg::labels`](Cfg#structfield.labels), which is what the FILE says.
+    pub fn n_cls_out(&self) -> Option<usize> {
+        self.cls.as_ref().map(|c| c.ow.shape.first().copied().unwrap_or(1))
+    }
+
+    /// **Every logit the classification head produces**, from the CLS position.
+    ///
+    /// The graph, transcribed from `.reference/llama.cpp/src/llama-graph.cpp:3358-3385`:
+    ///
+    /// ```text
+    ///   cur = hidden[0]                     CLS row
+    ///   cur = cls @ cur  (+ cls_b)
+    ///   cur = GELU(cur)                     ⛔ MODERN_BERT ONLY — every other BERT uses tanh
+    ///   cur = LayerNorm(cur, cls_norm)      ⛔ MODERN_BERT ONLY — classic BERT has no head norm
+    ///   cur = cls_out @ cur  (+ cls_out_b)
+    /// ```
+    ///
+    /// NOT softmaxed: the reference softmaxes only for the Qwen3 reranker (`llama-graph.cpp:3388`),
+    /// and a cross-encoder's single logit is consumed raw and monotonically. The caller decides.
+    pub async fn score_all(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let c = self.cls.as_ref().ok_or(
+            "this checkpoint has no cls.* head: it embeds but cannot classify or score a pair")?;
+        let h = self.forward(ids)?;
+        let pooled = h.narrow(0, 0, 1).reshape(&[1, self.cfg.d]);
+        let mut z = pooled.matmul_bt(&c.w);
+        if let Some(b) = &c.b { z = z.add(b); }
+        // ggml's `gelu` is the TANH approximation via an fp16 table, which `gelu_tanh` matches in math.
+        z = z.gelu_tanh();
+        if let Some(n) = &c.norm { z = z.layernorm(n, &self.zeros_d, self.cfg.eps); }
+        let mut o = z.matmul_bt(&c.ow);
+        if let Some(b) = &c.ob { o = o.add(b); }
+        Ok(o.to_vec().await)
+    }
+
+    /// The scalar a cross-encoder reranker reports — `score_all()[0]`.
+    pub async fn score(&self, ids: &[u32]) -> Result<f32, String> {
+        self.score_all(ids).await?.first().copied()
+            .ok_or_else(|| "empty score output".into())
     }
 }
 

@@ -37,6 +37,19 @@ async fn run() {
     let d = c.d;
     let cls = &v[0..d];
     let n = cls.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    // If the checkpoint carries a classification head, report it too — this is the path
+    // `llama-embedding --pooling rank` exercises.
+    if m.is_classifier() {
+        let logits = m.score_all(&ids).await.expect("score_all");
+        eprintln!("n_cls_out: {:?}  logits: {:?}", m.n_cls_out(), logits);
+        let one = m.score(&ids).await.expect("score");
+        assert_eq!(one.to_bits(), logits[0].to_bits(),
+                   "score() must be BIT-IDENTICAL to score_all()[0] — same matmul, one more call");
+        assert_eq!(Some(logits.len()), m.n_cls_out(),
+                   "n_cls_out() reads cls.output.weight's leading dim; it MUST equal the vector the \
+                    matmul produced, or one of the two is reading the wrong axis");
+        println!("RANK {}", logits.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(" "));
+    }
     println!("RAW {}", cls.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(" "));
     println!("NRM {}", cls.iter().map(|x| format!("{:.6}", x / n)).collect::<Vec<_>>().join(" "));
 }
