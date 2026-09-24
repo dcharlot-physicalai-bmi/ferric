@@ -77,6 +77,102 @@ pub struct Cfg {
     pub naming: Naming,
     /// `ctc` files have no predictor or joint — one linear from encoder states to vocab.
     pub ctc: bool,
+    /// Negative controls for the conformance harness — all off unless `FERRIC_ASR_NEG_*` is set.
+    pub neg: Neg,
+}
+
+/// **Negative controls.** Each one re-introduces ONE known-wrong convention at ONE site, so the
+/// stage-by-stage comparison against NeMo can prove it is able to fail there. A gate that has never
+/// failed has not shown it can; every flag below names a convention some earlier version of this
+/// file, or some other port, actually got wrong, and that still produced a fluent transcript.
+///
+/// Read ONCE, at load, from `FERRIC_ASR_NEG_<NAME>=<value>` — never in a hot loop, and never on
+/// wasm32, where the environment is empty. With none set every field is off and the forward pass is
+/// exactly the default one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Neg {
+    pub mel_htk: bool,              // MEL=htk: 2595·log10(1 + f/700) instead of Slaney
+    pub fbnorm_peak: bool,          // FBNORM=peak: unit-peak triangles, no area normalisation
+    pub window_periodic: bool,      // WINDOW=periodic: Hann over N, not N-1
+    pub pad_reflect: bool,          // PAD=reflect: reflect the STFT centre pad (NeMo 1.x)
+    pub power_magnitude: bool,      // POWER=magnitude: |X|, not |X|²
+    pub no_preemph: bool,           // PREEMPH=0
+    pub log_guard: Option<f32>,     // LOGGUARD=<v> instead of 2^-24
+    pub norm_biased: bool,          // NORM=biased: variance over n, not n-1
+    pub validlen_all_frames: bool,  // VALIDLEN=all_frames: every STFT frame valid (the old rule)
+    pub flatten_freq_major: bool,   // FLATTEN=freq_major: [t, f·c+ch] instead of [t, c·F+f]
+    pub preconv_swap_axes: bool,    // PRECONV=swap_axes: time and frequency kernel taps transposed
+    pub dw1d_flip: bool,            // DW1D=flip: convolution instead of cross-correlation
+    pub relu_after_dw: bool,        // RELU=dw: ReLU after the first depthwise, not its pointwise
+    pub xscale_flip: bool,          // XSCALE=flip
+    pub pe_ascending: bool,         // PE=ascending
+    pub relshift_none: bool,        // RELSHIFT=none: read bd columns T-1.. unshifted
+    pub posbias_swap_uv: bool,      // POSBIAS=swap_uv
+    pub conv_causal: Option<bool>,  // CONVPAD=causal (Some(true)) | symmetric (Some(false))
+    pub bn_eps: Option<f32>,        // CONVNORM=bn_eps1e-3
+    pub glu_swap: bool,             // GLU=swap: gate the second half by the first
+    pub macaron: Option<f32>,       // MACARON=<factor> instead of ½
+    pub lstm_ifog: bool,            // LSTM_GATES=ifog
+    pub sos_no_step: bool,          // SOS=no_step: zero predictor output, LSTM never run on SOS
+    pub blank_updates_state: bool,  // BLANK=update_state
+    pub max_symbols: Option<usize>, // MAXSYM=<n> instead of 10
+    pub joint_tanh: bool,           // JOINT_ACT=tanh
+    pub ctc_tie_last: bool,         // CTC_TIE=last: last maximum on a tie (the old rule)
+    /// `NAME=value` of every control in force, for the load receipt.
+    pub active: Vec<String>,
+}
+
+impl Neg {
+    /// Every `FERRIC_ASR_NEG_*` variable, read once. An unknown name or value is REFUSED: a typo
+    /// would otherwise run the clean model under a control's name, and the harness would record a
+    /// control that "could not fail" when it was never applied at all.
+    pub fn from_env() -> Result<Neg, String> {
+        let mut n = Neg::default();
+        for (k, v) in std::env::vars_os() {
+            let Some(k) = k.to_str() else { continue };
+            let Some(name) = k.strip_prefix("FERRIC_ASR_NEG_") else { continue };
+            let v = v.to_str().ok_or_else(|| format!("{k}: value is not UTF-8"))?;
+            let bad = || format!("{k}={v}: not a negative control this runtime implements");
+            let num = || v.parse::<f32>().map_err(|_| bad());
+            match (name, v) {
+                ("MEL", "htk") => n.mel_htk = true,
+                ("FBNORM", "peak") => n.fbnorm_peak = true,
+                ("WINDOW", "periodic") => n.window_periodic = true,
+                ("PAD", "reflect") => n.pad_reflect = true,
+                ("POWER", "magnitude") => n.power_magnitude = true,
+                ("PREEMPH", "0") => n.no_preemph = true,
+                ("LOGGUARD", _) => n.log_guard = Some(num()?),
+                ("NORM", "biased") => n.norm_biased = true,
+                ("VALIDLEN", "all_frames") => n.validlen_all_frames = true,
+                ("FLATTEN", "freq_major") => n.flatten_freq_major = true,
+                ("PRECONV", "swap_axes") => n.preconv_swap_axes = true,
+                ("DW1D", "flip") => n.dw1d_flip = true,
+                ("RELU", "dw") => n.relu_after_dw = true,
+                ("XSCALE", "flip") => n.xscale_flip = true,
+                ("PE", "ascending") => n.pe_ascending = true,
+                ("RELSHIFT", "none") => n.relshift_none = true,
+                ("POSBIAS", "swap_uv") => n.posbias_swap_uv = true,
+                ("CONVPAD", "causal") => n.conv_causal = Some(true),
+                ("CONVPAD", "symmetric") => n.conv_causal = Some(false),
+                ("CONVNORM", "bn_eps1e-3") => n.bn_eps = Some(1e-3),
+                ("GLU", "swap") => n.glu_swap = true,
+                ("MACARON", _) => n.macaron = Some(num()?),
+                ("LSTM_GATES", "ifog") => n.lstm_ifog = true,
+                ("SOS", "no_step") => n.sos_no_step = true,
+                ("BLANK", "update_state") => n.blank_updates_state = true,
+                ("MAXSYM", _) => match v.parse::<usize>() {
+                    Ok(s) if s > 0 => n.max_symbols = Some(s),
+                    _ => return Err(bad()),
+                },
+                ("JOINT_ACT", "tanh") => n.joint_tanh = true,
+                ("CTC_TIE", "last") => n.ctc_tie_last = true,
+                _ => return Err(bad()),
+            }
+            n.active.push(format!("{name}={v}"));
+        }
+        n.active.sort();
+        Ok(n)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -151,9 +247,6 @@ impl Cfg {
         };
         let f = |k: &str, d: f32| -> f32 {
             match md.get(k) { Some(Meta::F(v)) => *v as f32, _ => d }
-        };
-        let b = |k: &str, d: bool| -> bool {
-            match md.get(k) { Some(Meta::Bool(v)) => *v, _ => d }
         };
         // ⛔ REFUSE THE VARIANTS THIS FORWARD PASS DOES NOT IMPLEMENT.
         //
@@ -241,6 +334,7 @@ impl Cfg {
         let vocab = if ctc { u("asr.ctc.num_classes")? + 1 } else { u("stt.parakeet.predictor.vocab")? };
         Ok(Cfg {
             naming, ctc, sample_rate, win_length, hop_length, att_ctx, conv_layernorm,
+            neg: Neg::from_env()?,
             conv_right: if conv_right == usize::MAX {
                 ua("stt.parakeet.encoder.conv_kernel", "asr.encoder.conv_kernel_size")? / 2
             } else { conv_right },
@@ -322,7 +416,7 @@ impl Norm {
 pub struct RelPosAttn {
     pub q: Linear, pub k: Linear, pub v: Linear, pub out: Linear,
     pub pos: Linear,                       // no bias in the checkpoint
-    pub bias_u: Tensor, pub bias_v: Tensor, // [head_dim, n_heads]
+    pub bias_u: Tensor, pub bias_v: Tensor, // [n_heads, head_dim], the checkpoint's own (8, 128)
 }
 
 /// The Conformer convolution module: pointwise → GLU → depthwise (SYMMETRIC, not causal:
@@ -350,7 +444,8 @@ pub struct Block {
 }
 
 /// The RNN-T predictor: an embedding over the output vocab plus `n_layers` LSTMs. `Wx`/`Wh` are
-/// `[hidden, 4·hidden]` — the four gates (i, f, g, o) concatenated, in that order.
+/// `[4·hidden, hidden]` row-major (torch's `weight_ih`/`weight_hh`) — the four gates (i, f, g, o)
+/// stacked, in that order — and `b` is `bias_ih + bias_hh`, summed by the converter.
 pub struct Predictor { pub embed: Tensor, pub lstm: Vec<LstmLayer> }
 pub struct LstmLayer { pub wx: Tensor, pub wh: Tensor, pub b: Tensor }
 
@@ -456,7 +551,8 @@ impl Parakeet {
             // the differential check against the CPU path measured a RELATIVE error of 21x. Build it
             // in memory order, then permute once, at load.
             let mem = [dims[3], dims[2], dims[0], dims[1]];            // [c_out, c_in, kh, kw]
-            let wt = Tensor::from_vec(ctx, &w, &mem).permute(&[2, 3, 1, 0]).contiguous();
+            let perm = if cfg.neg.preconv_swap_axes { [3, 2, 1, 0] } else { [2, 3, 1, 0] };
+            let wt = Tensor::from_vec(ctx, &w, &mem).permute(&perm).contiguous();
             let bt = Tensor::from_vec(ctx, &b, &[o]);
             pre_conv.push(PreConv { w, b, dims, wt, bt });
         }
@@ -491,12 +587,16 @@ impl Parakeet {
                     // nothing to fold, so they pass through as the norm's own parameters.
                     let (scale, shift) = if cfg.conv_layernorm { (bw, bb) } else {
                         let (bm, bv) = (g.dequant(&b("conv.bn.running_mean"))?, g.dequant(&b("conv.bn.running_var"))?);
-                        let scale: Vec<f32> = bw.iter().zip(&bv).map(|(w, v)| w / (v + 1e-5).sqrt()).collect();
+                        let eps = cfg.neg.bn_eps.unwrap_or(1e-5);   // nn.BatchNorm1d's default
+                        let scale: Vec<f32> = bw.iter().zip(&bv).map(|(w, v)| w / (v + eps).sqrt()).collect();
                         let shift: Vec<f32> = bb.iter().zip(bm.iter().zip(&scale)).map(|(b0, (m, s0))| b0 - m * s0).collect();
                         (scale, shift)
                     };
                     // dw weights are stored [C, L] already (ne0 = 9 is INNERMOST); no transpose.
-                    let dwv = g.dequant(&b("conv.depthwise.weight"))?;
+                    let mut dwv = g.dequant(&b("conv.depthwise.weight"))?;
+                    if cfg.neg.dw1d_flip {
+                        dwv.chunks_mut(cfg.conv_kernel).for_each(|row| row.reverse());
+                    }
                     ConvModule {
                         pw1: Linear::load(ctx, g, &b("conv.pointwise1.weight"), true)?,
                         dw_w_ck: Tensor::from_vec(ctx, &dwv, &[d, cfg.conv_kernel]),
@@ -560,14 +660,17 @@ impl Parakeet {
     /// A load-time receipt. A schedule that silently collapsed shows up here rather than as a wrong
     /// transcript later — the same reason `nemotron_h::schedule` exists.
     pub fn describe(&self) -> String {
-        format!("parakeet · {} conformer blocks · d_model {} · {} heads · d_ff {} · conv_k {} \
+        let s = format!("parakeet · {} conformer blocks · d_model {} · {} heads · d_ff {} · conv_k {} \
                  · subsample {}x · {} mels @ {} Hz · {} {}L LSTM h{} · joint h{} · vocab {} (blank {})",
                 self.blocks.len(), self.cfg.d_model, self.cfg.n_heads, self.cfg.d_ff,
                 self.cfg.conv_kernel, self.cfg.subsampling_factor, self.cfg.num_mels,
-                if self.cfg.ctc { "CTC" } else { "RNN-T" },
                 self.cfg.sample_rate,
+                if self.cfg.ctc { "CTC" } else { "RNN-T" },
                 self.rnnt.as_ref().map_or(0, |(p, _)| p.lstm.len()), self.cfg.pred_hidden,
-                self.cfg.joint_hidden, self.cfg.vocab, self.cfg.blank_id)
+                self.cfg.joint_hidden, self.cfg.vocab, self.cfg.blank_id);
+        // A run under a negative control must not be mistakable for a clean one in any log.
+        if self.cfg.neg.active.is_empty() { s }
+        else { format!("{s} · ⚠ NEGATIVE CONTROLS: {}", self.cfg.neg.active.join(" ")) }
     }
 }
 
@@ -623,10 +726,13 @@ pub mod frontend {
 
     fn logstep() -> f32 { (6.4f32).ln() / 27.0 }
 
-    fn hz_to_mel(f: f32) -> f32 {
+    // `htk` is the MEL=htk negative control, and nothing else.
+    fn hz_to_mel(f: f32, htk: bool) -> f32 {
+        if htk { return 2595.0 * (1.0 + f / 700.0).log10(); }
         if f < MIN_LOG_HZ { f / F_SP } else { MIN_LOG_MEL + (f / MIN_LOG_HZ).ln() / logstep() }
     }
-    fn mel_to_hz(m: f32) -> f32 {
+    fn mel_to_hz(m: f32, htk: bool) -> f32 {
+        if htk { return 700.0 * (10f32.powf(m / 2595.0) - 1.0); }
         if m < MIN_LOG_MEL { F_SP * m } else { MIN_LOG_HZ * (logstep() * (m - MIN_LOG_MEL)).exp() }
     }
 
@@ -636,13 +742,14 @@ pub mod frontend {
     /// the encoder a spectrum tilted towards high frequencies.
     pub fn filterbank(cfg: &Cfg) -> Vec<Vec<f32>> {
         let n_bins = cfg.n_fft / 2 + 1;
-        let (lo, hi) = (hz_to_mel(cfg.f_min), hz_to_mel(cfg.f_max));
+        let htk = cfg.neg.mel_htk;
+        let (lo, hi) = (hz_to_mel(cfg.f_min, htk), hz_to_mel(cfg.f_max, htk));
         let edges: Vec<f32> = (0..cfg.num_mels + 2)
-            .map(|i| mel_to_hz(lo + (hi - lo) * i as f32 / (cfg.num_mels + 1) as f32))
+            .map(|i| mel_to_hz(lo + (hi - lo) * i as f32 / (cfg.num_mels + 1) as f32, htk))
             .collect();
         let bin_hz = cfg.sample_rate as f32 / cfg.n_fft as f32;
         (0..cfg.num_mels).map(|m| {
-            let enorm = 2.0 / (edges[m + 2] - edges[m]).max(1e-9);
+            let enorm = if cfg.neg.fbnorm_peak { 1.0 } else { 2.0 / (edges[m + 2] - edges[m]).max(1e-9) };
             (0..n_bins).map(|b| {
                 let f = b as f32 * bin_hz;
                 let (l, c, r) = (edges[m], edges[m + 1], edges[m + 2]);
@@ -654,12 +761,19 @@ pub mod frontend {
         }).collect()
     }
 
-    /// `[frames, num_mels]` log-mel, row-major. `pcm` is mono f32 at `cfg.sample_rate`.
+    /// `[frames, num_mels]` log-mel, row-major, for EVERY frame of the centred STFT: `1 + n/hop`.
+    /// `pcm` is mono f32 at `cfg.sample_rate`.
+    ///
+    /// ⚠ NOT EVERY FRAME RETURNED HERE IS VALID. The last one straddles the end of the audio, and
+    /// the reference counts only [`valid_frames`] of them — see there.
     pub fn log_mel(pcm: &[f32], cfg: &Cfg) -> (Vec<f32>, usize) {
+        let neg = &cfg.neg;
         // Pre-emphasis first: y[0] = x[0]; y[t] = x[t] - a·x[t-1].
         let mut x = Vec::with_capacity(pcm.len());
-        x.push(pcm.first().copied().unwrap_or(0.0));
-        for t in 1..pcm.len() { x.push(pcm[t] - cfg.pre_emphasis * pcm[t - 1]); }
+        if neg.no_preemph { x.extend_from_slice(pcm); } else {
+            x.push(pcm.first().copied().unwrap_or(0.0));
+            for t in 1..pcm.len() { x.push(pcm[t] - cfg.pre_emphasis * pcm[t - 1]); }
+        }
 
         // ⚠ CENTRED, like `torch.stft(center=True)`: zero-pad n_fft/2 at BOTH ends. Without it every
         // frame is offset by half a window against what the encoder was trained on.
@@ -667,12 +781,22 @@ pub mod frontend {
         let mut padded = vec![0f32; half];
         padded.extend_from_slice(&x);
         padded.extend(std::iter::repeat(0.0).take(half));
+        // PAD=reflect: torch's `pad_mode="reflect"`, NeMo 1.x's STFT — x[half]..x[1] on the left,
+        // x[n-2]..x[n-1-half] on the right. Only frames within half a window of an end see it.
+        if neg.pad_reflect && x.len() > half {
+            let n = x.len();
+            for i in 0..half {
+                padded[i] = x[half - i];
+                padded[half + n + i] = x[n - 2 - i];
+            }
+        }
 
         // ⚠ SYMMETRIC Hann (`periodic=False`): divide by (N-1), not N.
+        let wden = if neg.window_periodic { cfg.win_length } else { cfg.win_length - 1 };
         let win: Vec<f32> = (0..cfg.win_length)
-            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32
-                                  / (cfg.win_length - 1) as f32).cos())
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / wden as f32).cos())
             .collect();
+        let guard = neg.log_guard.unwrap_or(LOG_ZERO_GUARD);
         let fb = filterbank(cfg);
         let n_bins = cfg.n_fft / 2 + 1;
         let frames = 1 + (padded.len().saturating_sub(cfg.n_fft)) / cfg.hop_length;
@@ -688,12 +812,15 @@ pub mod frontend {
                 if s + woff + i < padded.len() { re[woff + i] = padded[s + woff + i] * win[i]; }
             }
             fft(&mut re, &mut im);
-            let power: Vec<f32> = (0..n_bins).map(|b| re[b] * re[b] + im[b] * im[b]).collect();
+            let power: Vec<f32> = (0..n_bins).map(|b| {
+                let p = re[b] * re[b] + im[b] * im[b];
+                if neg.power_magnitude { p.sqrt() } else { p }
+            }).collect();
             for m in 0..cfg.num_mels {
                 let e: f32 = fb[m].iter().zip(&power).map(|(w, p)| w * p).sum();
                 // ⚠ 2^-24, the reference's LOG_ZERO_GUARD_VALUE — not 1e-9. It sets the floor for
                 // silent bins, which per-feature normalisation then spreads across the whole range.
-                out[f * cfg.num_mels + m] = (e + LOG_ZERO_GUARD).ln();
+                out[f * cfg.num_mels + m] = (e + guard).ln();
             }
         }
         (out, frames)
@@ -702,16 +829,37 @@ pub mod frontend {
     /// The reference's `LOG_ZERO_GUARD_VALUE`.
     pub const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;   // 2^-24
 
+    /// How many of [`log_mel`]'s frames are VALID for `n_samples` of audio: NeMo's `get_seq_len`,
+    /// `(n + 2·(n_fft/2) − n_fft) / hop` — `n / hop` for an even `n_fft`.
+    ///
+    /// ⚠ ONE FEWER THAN THE STFT PRODUCES. The centred STFT emits `1 + n/hop` frames; NeMo (since
+    /// 2.5) treats the last one as padding: it computes the per-feature statistics over the first
+    /// `n/hop` only, zeroes the rest, and masks every length-dependent stage after it. Counting the
+    /// extra frame as audio shifted every normalised value by up to 1.9e-3, fed the encoder a real
+    /// frame where the reference feeds zero, and — for 1 utterance in 8, where `n/hop ≡ 0 mod 8` —
+    /// gave the encoder a whole extra output frame that was attended to and DECODED. On test-clean
+    /// 908-31957-0025 NeMo says "with the love"; the old rule — in Ferric, and inside NeMo alike —
+    /// says "with a love", plus three capitalisation/punctuation changes. (The human transcript also
+    /// says "a love": matching the authors cost one word there. The target is the model's output, not
+    /// the transcript.) Cut to 19 lengths, one clip changed its transcript at 5 of them under the old
+    /// rule. Every transcript on the samples then in use was right, so nothing here noticed.
+    pub fn valid_frames(n_samples: usize, cfg: &Cfg) -> usize {
+        (n_samples + cfg.n_fft / 2 * 2).saturating_sub(cfg.n_fft) / cfg.hop_length
+    }
+
     /// `per_feature` normalisation — zero mean, unit variance PER MEL BIN across time, which is what
     /// `stt.frontend.normalize` selects. Normalising across the whole matrix instead would leave a
     /// per-bin offset the encoder was never trained to see.
-    pub fn normalize_per_feature(mel: &mut [f32], frames: usize, n_mels: usize) {
+    ///
+    /// `frames` must be the VALID frames only ([`valid_frames`]): the statistics are over those.
+    pub fn normalize_per_feature(mel: &mut [f32], frames: usize, cfg: &Cfg) {
+        let n_mels = cfg.num_mels;
         if frames == 0 { return; }
         for m in 0..n_mels {
             let mean: f32 = (0..frames).map(|f| mel[f * n_mels + m]).sum::<f32>() / frames as f32;
             // ⚠ BESSEL: the reference divides by (n-1), and adds EPSILON to the STD after the sqrt
             // rather than to the variance inside it. Both differ from the obvious form.
-            let denom = (frames.saturating_sub(1)).max(1) as f32;
+            let denom = if cfg.neg.norm_biased { frames } else { frames.saturating_sub(1).max(1) } as f32;
             let var: f32 = (0..frames).map(|f| { let d = mel[f * n_mels + m] - mean; d * d })
                            .sum::<f32>() / denom;
             let sd = var.sqrt() + 1e-5;
@@ -832,12 +980,19 @@ impl Parakeet {
                 }.add(&pc.bt.reshape(&[1, 1, 1, cout]).broadcast_to(&[1, oh, ow, cout]));
                 h = oh; w = ow; ch = cout;
             }
-            if idx == 0 || idx == 2 || idx == 4 { cur = cur.relu(); }
+            if self.relu_after(idx) { cur = cur.relu(); }
         }
         // [1,h,w,ch] -> [h, ch*w], CHANNEL-MAJOR. NeMo does `transpose(1,2).reshape(b,t,-1)`, so the
         // channel index is the OUTER one. The other order has the same element count.
-        let flat = cur.reshape(&[h, w, ch]).permute(&[0, 2, 1]).contiguous().reshape(&[h, ch * w]);
+        let flat = if self.cfg.neg.flatten_freq_major { cur.reshape(&[h, w * ch]) }
+                   else { cur.reshape(&[h, w, ch]).permute(&[0, 2, 1]).contiguous().reshape(&[h, ch * w]) };
         (flat, h, ch * w)
+    }
+
+    /// dw_striding's activations: after the full conv and after each POINTWISE — vec indices
+    /// 0, 2, 4. RELU=dw moves the middle one onto the depthwise before it, the first version's bug.
+    fn relu_after(&self, idx: usize) -> bool {
+        idx == 0 || idx == 4 || idx == if self.cfg.neg.relu_after_dw { 1 } else { 2 }
     }
 
     fn pre_encode(&self, mel: &[f32], frames: usize) -> (Vec<f32>, usize, usize) {
@@ -867,6 +1022,7 @@ impl Parakeet {
                 let depthwise = cin == 1 && ch > 1;
                 let (oh, ow) = ((h + 1) / 2, (w + 1) / 2);
                 let mut out = vec![0f32; oh * ow * cout];
+                let swap = self.cfg.neg.preconv_swap_axes;
                 for y in 0..oh { for x in 0..ow {
                     for o in 0..cout {
                         let mut a = bv[o];
@@ -874,10 +1030,11 @@ impl Parakeet {
                             let (sy, sx) = (y as isize * 2 + i as isize - 1, x as isize * 2 + j as isize - 1);
                             if sy < 0 || sx < 0 || sy >= h as isize || sx >= w as isize { continue; }
                             let base = (sy as usize * w + sx as usize) * ch;
+                            let (ti, tj) = if swap { (j, i) } else { (i, j) };   // PRECONV=swap_axes
                             if depthwise {
-                                a += wv[((o * cin) * kh + i) * kw + j] * cur[base + o];
+                                a += wv[((o * cin) * kh + ti) * kw + tj] * cur[base + o];
                             } else {
-                                for k in 0..cin { a += wv[((o * cin + k) * kh + i) * kw + j] * cur[base + k]; }
+                                for k in 0..cin { a += wv[((o * cin + k) * kh + ti) * kw + tj] * cur[base + k]; }
                             }
                         }}
                         out[(y * ow + x) * cout + o] = a;
@@ -892,9 +1049,11 @@ impl Parakeet {
             //
             // dw_striding is [full] [dw, pw] [dw, pw], with the activation after the full conv and
             // after each pointwise — vec indices 0, 2, 4.
-            if idx == 0 || idx == 2 || idx == 4 { relu(&mut cur); }
+            if self.relu_after(idx) { relu(&mut cur); }
         }
-        // [h][w][ch] → [h][ch * w], channel-major (see the warning above).
+        // [h][w][ch] → [h][ch * w], channel-major (see the warning above). FLATTEN=freq_major keeps
+        // the [h][w][ch] order as it is.
+        if self.cfg.neg.flatten_freq_major { return (cur, h, ch * w); }
         let mut flat = vec![0f32; h * ch * w];
         for t in 0..h { for k in 0..ch { for f in 0..w {
             flat[t * ch * w + k * w + f] = cur[(t * w + f) * ch + k];
@@ -923,9 +1082,9 @@ impl Parakeet {
     /// The **halves are not decoration** — Conformer's macaron FFNs each contribute 0.5·output to
     /// the residual, and using 1.0 doubles the FFN's influence on every one of 24 blocks.
     fn block(&self, x: &Tensor, b: &Block, pos: &Tensor, mask: Option<&Tensor>) -> Tensor {
-        let d = self.cfg.d_model;
         // No scalar-multiply op on Tensor; `scalar` makes a [1] tensor to broadcast against.
-        let half = |t: &Tensor| t.mul(&t.scalar(0.5).broadcast_to(&t.shape));
+        let fc = self.cfg.neg.macaron.unwrap_or(0.5);
+        let half = |t: &Tensor| t.mul(&t.scalar(fc).broadcast_to(&t.shape));
 
         // ---- macaron FF1 ----
         let h = b.norm_ff1.apply(x, Self::EPS);
@@ -1034,8 +1193,9 @@ impl Parakeet {
         let np = p.shape[0];
         let p = p.reshape(&[np, nh, hd]);
 
-        let u = a.bias_u.reshape(&[1, nh, hd]).broadcast_to(&[t, nh, hd]);
-        let v_b = a.bias_v.reshape(&[1, nh, hd]).broadcast_to(&[t, nh, hd]);
+        let (bu, bv) = if self.cfg.neg.posbias_swap_uv { (&a.bias_v, &a.bias_u) } else { (&a.bias_u, &a.bias_v) };
+        let u = bu.reshape(&[1, nh, hd]).broadcast_to(&[t, nh, hd]);
+        let v_b = bv.reshape(&[1, nh, hd]).broadcast_to(&[t, nh, hd]);
         let qu = q.add(&u);
         let qv = q.add(&v_b);
 
@@ -1054,7 +1214,8 @@ impl Parakeet {
             // 42-layer 8-head encoder, the native latency ceiling and an absolute wasm blocker
             // (a browser cannot block on a readback). `Tensor::rel_shift` does the same gather,
             // `out[i,j] = bd[i, (T-1)-i+j]`, without leaving the device.
-            let bd = bd.rel_shift();
+            let bd = if self.cfg.neg.relshift_none { bd.narrow(1, t - 1, t).contiguous() }
+                     else { bd.rel_shift() };
             let sum = ac.add(&bd);
             let scaled = sum.mul(&sum.scalar(scale).broadcast_to(&sum.shape));
             // The reference scales the position term and then fills -inf, so the mask lands on the
@@ -1074,8 +1235,9 @@ impl Parakeet {
         // GLU on-device: the first half gates on the sigmoid of the second. `narrow` + `sigmoid` +
         // `mul` are all GPU ops, so no readback — the host loop this replaces ran once per layer.
         let y = c.pw1.apply(x);                                     // [t, 2d]
-        let g = y.narrow(1, 0, d).contiguous()
-                 .mul(&y.narrow(1, d, d).contiguous().sigmoid());   // [t, d]
+        let (lin, gate) = if self.cfg.neg.glu_swap { (d, 0) } else { (0, d) };
+        let g = y.narrow(1, lin, d).contiguous()
+                 .mul(&y.narrow(1, gate, d).contiguous().sigmoid()); // [t, d]
 
         // ⚠ SYMMETRIC, not causal. conv_context_left == conv_context_right == k/2, so the window is
         // centred. Ferric has only a CAUSAL depthwise conv1d, and y_sym[t] = y_causal[t+k/2] once
@@ -1084,7 +1246,13 @@ impl Parakeet {
         // Symmetric: right-pad by k/2 and drop the first k/2 outputs, so the causal kernel's window
         // lands centred. Causal (streaming): the kernel is ALREADY what the model wants — no pad, no
         // shift. Same kernel, two framings; the file says which.
-        let pad = self.cfg.conv_right;
+        //
+        // ⚠ NO PAD MASK, AND NONE IS NEEDED. NeMo zeroes padded frames before this conv; here the
+        // tensor holds only valid frames (`encode` truncates to them), so the frames past the end
+        // are this zero pad — the same zeros, in the same place.
+        let pad = match self.cfg.neg.conv_causal {
+            Some(true) => 0, Some(false) => k / 2, None => self.cfg.conv_right,
+        };
         let conv = if pad == 0 {
             g.depthwise_conv1d_causal(&c.dw_w_ck, k)
         } else {
@@ -1117,17 +1285,103 @@ impl Parakeet {
 // Encoder entry point + RNN-T decoding
 // ============================================================================================
 
+/// One recorded intermediate, `rows × cols` row-major on the host — what the conformance fixture
+/// samples. Rows are frames, numbered as the reference numbers them.
+pub struct Stage { pub name: String, pub rows: usize, pub cols: usize, pub data: Vec<f32> }
+
+/// The stages `encode_stages` records, by name: `logmel` (every STFT frame, before normalisation),
+/// `mel` (normalised, valid frames only), `pre_conv` (the subsampling stack, flattened, before its
+/// projection), `pre_out` (after the projection and x-scaling), `pe` (`[2T-1, d]`, offsets +(T-1)
+/// down to -(T-1)), `block.<i>` (each Conformer layer's output) and `enc`.
+///
+/// Device tensors are HELD, not read, until the forward pass is complete: a readback mid-encode
+/// would flush the per-block batch, and a tap must not be able to change what it records.
+struct Taps<'a> { want: &'a dyn Fn(&str) -> bool, got: Vec<(String, usize, usize, Tap)> }
+enum Tap { Host(Vec<f32>), Dev(Tensor) }
+
+impl Taps<'_> {
+    fn host(&mut self, name: &str, rows: usize, cols: usize, v: &[f32]) {
+        if (self.want)(name) { self.got.push((name.into(), rows, cols, Tap::Host(v.to_vec()))); }
+    }
+    fn dev(&mut self, name: &str, t: &Tensor) {
+        if (self.want)(name) {
+            let rows = t.shape[0];
+            self.got.push((name.into(), rows, t.numel() / rows.max(1), Tap::Dev(t.clone())));
+        }
+    }
+}
+
+fn no_stage(_: &str) -> bool { false }
+
+/// The predictor between joint calls: each LSTM layer's `(h, c)` and the top layer's output.
+#[derive(Clone)]
+pub struct PredState { pub h: Vec<Vec<f32>>, pub c: Vec<Vec<f32>>, pub out: Vec<f32> }
+
+/// A free-running greedy RNN-T decode: every joint call as `(t, u, argmax)` in visiting order —
+/// `u` counts the tokens emitted before that call — and the emitted ids.
+pub struct RnntDecode { pub steps: Vec<(usize, usize, u32)>, pub tokens: Vec<u32> }
+
+/// NeMo's `max_symbols` for both published RNN-T parakeets: emissions per encoder frame before time
+/// is forced forward. There is no GGUF key for it.
+const MAX_SYMBOLS: usize = 10;
+
+/// Index of the FIRST maximum, as `torch.max`/`torch.argmax` return it.
+///
+/// ⚠ `Iterator::max_by` returns the LAST of equal maxima. The CTC path used it, and because the
+/// blank is the LAST id, every exact tie between a token and blank went to blank — a deletion where
+/// NeMo emits the token. Real audio almost never ties, so only a crafted row shows it.
+pub fn argmax_first(row: &[f32]) -> usize {
+    let mut best = 0;
+    for i in 1..row.len() { if row[i] > row[best] { best = i; } }
+    best
+}
+
+/// Greedy CTC over raw logits `[t, nv]` row-major: the argmax of EVERY frame, and the collapsed ids
+/// (consecutive repeats merged, then blanks dropped).
+///
+/// The collapse is over CONSECUTIVE frames, not the whole sequence — a genuine repeated letter is
+/// separated by a blank frame, which is exactly what the blank is for. Deduplicating globally would
+/// turn "little" into "litle". `last_on_tie` is the CTC_TIE=last negative control, and nothing else.
+pub fn ctc_greedy(v: &[f32], t: usize, nv: usize, blank: u32, last_on_tie: bool) -> (Vec<u32>, Vec<u32>) {
+    let mut frames = Vec::with_capacity(t);
+    let mut out: Vec<u32> = Vec::new();
+    let mut prev = u32::MAX;
+    for i in 0..t {
+        let row = &v[i * nv..(i + 1) * nv];
+        let best = if last_on_tie {
+            row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
+        } else { argmax_first(row) } as u32;
+        if best != prev && best != blank { out.push(best); }
+        prev = best;
+        frames.push(best);
+    }
+    (frames, out)
+}
+
+/// `x · wᵀ + b` on the host, `w` row-major `[out, in]`: the decoder's matrix-vector products.
+fn host_linear(w: &[f32], b: &[f32], x: &[f32]) -> Vec<f32> {
+    let n = x.len();
+    b.iter().enumerate().map(|(r, &br)| {
+        let mut a = 0f32;
+        for k in 0..n { a += w[r * n + k] * x[k]; }
+        a + br
+    }).collect()
+}
+
 impl Parakeet {
-    /// Sinusoidal relative positional encoding for offsets `+(T-1) … -(T-1)`, `[2T-1, d]`.
+    /// Sinusoidal relative positional encoding for offsets `+(T-1) … -(T-1)`, `[2T-1, d]`, on the
+    /// host.
     ///
     /// ⚠ DESCENDING. NeMo builds positions from `+(T-1)` down to `-(T-1)`, and `rel_shift` reads
     /// column `T-1+i-j` on that assumption. Building it ascending flips every relative offset — the
     /// model then attends backwards, fluently.
-    fn rel_pos_encoding(&self, t: usize) -> Tensor {
+    fn rel_pos_table(&self, t: usize) -> Vec<f32> {
         let d = self.cfg.d_model;
         let n = 2 * t - 1;
         let mut v = vec![0f32; n * d];
-        for (r, p) in (0..n).map(|r| (r, (t as isize - 1) - r as isize)) {
+        let asc = self.cfg.neg.pe_ascending;
+        for (r, p) in (0..n).map(|r| (r, if asc { r as isize - (t as isize - 1) }
+                                           else { (t as isize - 1) - r as isize })) {
             for i in (0..d).step_by(2) {
                 let div = (-(i as f32) * (10000f32).ln() / d as f32).exp();
                 let a = p as f32 * div;
@@ -1135,14 +1389,57 @@ impl Parakeet {
                 if i + 1 < d { v[r * d + i + 1] = a.cos(); }
             }
         }
-        Tensor::from_vec(&self.ctx, &v, &[n, d])
+        v
     }
 
-    /// Waveform → encoder states `[T/8, d_model]`.
+    /// Waveform → encoder states `[T, d_model]`, one row per VALID encoder frame.
     pub fn encode(&self, pcm: &[f32]) -> Result<Tensor, String> {
+        self.encode_tapped(pcm, &mut Taps { want: &no_stage, got: Vec::new() })
+    }
+
+    /// `encode`, also returning every stage `want` names (see [`Stage`] for the names), read back
+    /// once the forward pass is complete. The encoder output is the same tensor `encode` returns:
+    /// the taps hold tensors, they never read one mid-pass.
+    pub async fn encode_stages(&self, pcm: &[f32], want: &dyn Fn(&str) -> bool)
+                               -> Result<(Tensor, Vec<Stage>), String> {
+        let mut taps = Taps { want, got: Vec::new() };
+        let enc = self.encode_tapped(pcm, &mut taps)?;
+        let mut out = Vec::with_capacity(taps.got.len());
+        for (name, rows, cols, tap) in taps.got {
+            let data = match tap { Tap::Host(v) => v, Tap::Dev(t) => t.to_vec().await };
+            out.push(Stage { name, rows, cols, data });
+        }
+        Ok((enc, out))
+    }
+
+    fn encode_tapped(&self, pcm: &[f32], taps: &mut Taps) -> Result<Tensor, String> {
+        let nm = self.cfg.num_mels;
         let (mut mel, frames) = frontend::log_mel(pcm, &self.cfg);
-        if frames == 0 { return Err("audio shorter than one analysis window".into()); }
-        frontend::normalize_per_feature(&mut mel, frames, self.cfg.num_mels);
+        taps.host("logmel", frames, nm, &mel);
+        // ⭐ VALID FRAMES ONLY, AND THEN NO MASKS ANYWHERE. NeMo keeps all `1 + n/hop` STFT frames
+        // in its tensors and carries a valid LENGTH of `n/hop` beside them: it zeroes the frames
+        // past it, masks them before every subsampling conv, masks them out of attention (keys and
+        // queries) and out of the conv module, and decodes only `encoded_len` frames. For one
+        // utterance that is exactly equivalent to CUTTING the mel to the valid frames and running
+        // everything unmasked, because each mask writes zeros precisely where the cut sequence's own
+        // zero padding already sits:
+        //   · subsampling, stride 2, pad 1, per stage: a valid output y < ceil(len/2) reads inputs
+        //     2y-1..2y+1 ≤ len. Input `len` is masked to zero there and is the right zero pad here;
+        //     input -1 is the left pad in both. The running lengths agree: (len+2-3)/2+1 = ceil(len/2),
+        //     which is this stack's own `(h+1)/2`. Frequency is never masked on either side.
+        //   · attention: a masked key scores -10000 and its weight is zeroed after the softmax, so a
+        //     valid query's softmax runs over the valid keys only — which is all this tensor has.
+        //     Positional terms depend only on the offset i-j, never on the tensor length.
+        //   · conv module: padded frames are zeroed before the depthwise conv; here they are its zero
+        //     pad. Everything else in a block (LayerNorm, FF, GLU, BatchNorm, SiLU) is per frame.
+        //   · decode: `encoded_len` = ceil³(n/hop) = this tensor's T.
+        // Measured, not only argued: see `examples/parakeet_stages.rs` against NeMo 3.0.0.
+        let valid = if self.cfg.neg.validlen_all_frames { frames }
+                    else { frontend::valid_frames(pcm.len(), &self.cfg) };
+        if valid == 0 { return Err("audio shorter than one hop".into()); }
+        mel.truncate(valid * nm);
+        frontend::normalize_per_feature(&mut mel, valid, &self.cfg);
+        taps.host("mel", valid, nm, &mel);
         // ⚠ NATIVE ONLY. `Instant::now()` PANICS on wasm32 ("time not implemented on this
         // platform") — it is not a no-op and not a zero. This probe, added to attribute encode time,
         // is what broke browser speech while every native test stayed green: the tab panicked before
@@ -1153,11 +1450,14 @@ impl Parakeet {
         // GPU by default; `FERRIC_ASR_CPU_PRE=1` selects the host implementation it was ported from,
         // which stays as the differential reference (`examples/pre_encode_ab.rs`).
         let cpu_pre = cfg!(not(target_arch = "wasm32")) && std::env::var("FERRIC_ASR_CPU_PRE").is_ok();
-        let (x, t, width) = if cpu_pre {
-            let (flat, t, width) = self.pre_encode(&mel, frames);
-            (Tensor::from_vec(&self.ctx, &flat, &[t, width]), t, width)
+        let (x, t) = if cpu_pre {
+            let (flat, t, width) = self.pre_encode(&mel, valid);
+            taps.host("pre_conv", t, width, &flat);
+            (Tensor::from_vec(&self.ctx, &flat, &[t, width]), t)
         } else {
-            self.pre_encode_gpu(&mel, frames)
+            let (x, t, _) = self.pre_encode_gpu(&mel, valid);
+            taps.dev("pre_conv", &x);
+            (x, t)
         };
         // Attribute the encode: the subsampling stack used to run on the CPU and scale with
         // num_mels, which was 38-65% of total encode time — 255-299 ms of 739 ms at 80 mels,
@@ -1165,19 +1465,21 @@ impl Parakeet {
         #[cfg(not(target_arch = "wasm32"))]
         let pre_ms = _t_pre.elapsed().as_secs_f64() * 1000.0;
         if t == 0 { return Err("audio too short to survive 8x subsampling".into()); }
-        let _ = width;
         let mut x = self.pre_out.apply(&x);
-        if self.cfg.xscaling {
+        if self.cfg.xscaling != self.cfg.neg.xscale_flip {
             let s = (self.cfg.d_model as f32).sqrt();
             x = x.mul(&x.scalar(s).broadcast_to(&x.shape));
         }
-        let pos = self.rel_pos_encoding(t);
+        taps.dev("pre_out", &x);
+        let pe = self.rel_pos_table(t);
+        taps.host("pe", 2 * t - 1, self.cfg.d_model, &pe);
+        let pos = Tensor::from_vec(&self.ctx, &pe, &[2 * t - 1, self.cfg.d_model]);
         // Once per encode, not per layer: it depends only on T and the declared context.
         let mask = self.att_mask(t);
         let dbg = std::env::var("FERRIC_ASR_DEBUG").is_ok();
         #[cfg(not(target_arch = "wasm32"))]
         if std::env::var("FERRIC_ASR_TIME").is_ok() {
-            eprintln!("       pre_encode({}) {pre_ms:.0} ms for {frames} frames x {} mels -> t={t}",
+            eprintln!("       pre_encode({}) {pre_ms:.0} ms for {valid} of {frames} frames x {} mels -> t={t}",
                       if cpu_pre { "CPU" } else { "GPU" }, self.cfg.num_mels);
         }
         let rms = |t: &Tensor| { let v = block_on(t.to_vec());
@@ -1196,6 +1498,7 @@ impl Parakeet {
             // an allocation failure reported at an unrelated call, several ops later.
             x = if self.batch_blocks { ferric_tensor::batch(&self.ctx, || self.block(&x, b, &pos, mask.as_ref())) }
                 else { self.block(&x, b, &pos, mask.as_ref()) };
+            taps.dev(&format!("block.{i}"), &x);
             // Where does the signal die? LayerNorm's eps floors any block whose residual variance
             // falls below ~1e-5, so a collapse shows as a step change here, not a gradual decay.
             if dbg {
@@ -1206,13 +1509,14 @@ impl Parakeet {
                 eprintln!("       block {i:>2} out rms={:.4}  norm_out w rms={wr:.4}", rms(&x));
             }
         }
+        taps.dev("enc", &x);
         Ok(x)
     }
 
-    /// One LSTM step. `Wx`/`Wh` are `[4h, h]` with gates concatenated **i, f, g, o** — the PyTorch
-    /// order. A different gate order still produces a running model with a broken memory cell.
-    fn lstm_step(&self, l: &LstmLayer, x: &[f32], h: &mut [f32], c: &mut [f32],
-                 wx: &[f32], wh: &[f32], b: &[f32]) {
+    /// One LSTM step, in place on `(h, c)`. `Wx`/`Wh` are `[4h, h]` with gates concatenated
+    /// **i, f, g, o** — the PyTorch order. A different gate order still produces a running model
+    /// with a broken memory cell.
+    fn lstm_step(&self, x: &[f32], h: &mut [f32], c: &mut [f32], wx: &[f32], wh: &[f32], b: &[f32]) {
         let n = h.len();
         let mut g = vec![0f32; 4 * n];
         for r in 0..4 * n {
@@ -1221,12 +1525,12 @@ impl Parakeet {
             g[r] = a;
         }
         let sig = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let (gi, oi) = if self.cfg.neg.lstm_ifog { (3, 2) } else { (2, 3) };
         for j in 0..n {
-            let (i, f, gg, o) = (sig(g[j]), sig(g[n + j]), g[2 * n + j].tanh(), sig(g[3 * n + j]));
+            let (i, f, gg, o) = (sig(g[j]), sig(g[n + j]), g[gi * n + j].tanh(), sig(g[oi * n + j]));
             c[j] = f * c[j] + i * gg;
             h[j] = o * c[j].tanh();
         }
-        let _ = l;
     }
 
     /// **RNN-T greedy decode.** For each encoder frame, emit non-blank tokens until the joint
@@ -1238,43 +1542,42 @@ impl Parakeet {
         self.decode_rnnt(&enc)
     }
 
+    /// Token ids to text: `▁` marks a word start. Shared by both heads.
+    pub fn detok(&self, ids: &[u32]) -> String {
+        ids.iter()
+           .map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default().replace('▁', " "))
+           .collect::<String>().trim().to_string()
+    }
+
     /// **CTC greedy decode**: argmax per frame, collapse runs of the same id, drop blanks.
-    ///
-    /// The collapse is over CONSECUTIVE frames, not the whole sequence — a genuine repeated letter
-    /// is separated by a blank frame, which is exactly what the blank is for. Deduplicating
-    /// globally would turn "little" into "litle".
     fn decode_ctc(&self, enc: &Tensor, head: &Linear) -> Result<String, String> {
-        let logits = head.apply(enc);
-        let v = block_on(logits.to_vec());
-        self.collapse_ctc(&v, enc.shape[0])
+        let v = block_on(head.apply(enc).to_vec());
+        Ok(self.detok(&self.ctc_ids(&v, enc.shape[0]).1))
     }
 
     /// The async half of the CTC path, for wasm — where `block_on` is not merely slow but illegal
     /// on the main thread. The encoder itself no longer reads anything back, so this ONE await is
     /// the entire GPU→CPU boundary of browser speech recognition.
     pub async fn transcribe_ctc_async(&self, pcm: &[f32]) -> Result<String, String> {
-        let head = self.ctc_head.as_ref().ok_or("this model has no CTC head")?;
+        if self.ctc_head.is_none() { return Err("this model has no CTC head".into()); }
         let enc = self.encode(pcm)?;
-        let v = head.apply(&enc).to_vec().await;
-        self.collapse_ctc(&v, enc.shape[0])
+        let v = self.ctc_logits(&enc).await?;
+        Ok(self.detok(&self.ctc_ids(&v, enc.shape[0]).1))
     }
 
-    /// Greedy argmax + run collapse. Shared by the sync and async entry points so there is exactly
-    /// one implementation of the decode rule — two copies would be free to drift apart silently,
-    /// and only one of them is exercised by the native tests.
-    fn collapse_ctc(&self, v: &[f32], t: usize) -> Result<String, String> {
-        let nv = self.cfg.vocab;
-        let mut out: Vec<u32> = Vec::new();
-        let mut prev = u32::MAX;
-        for i in 0..t {
-            let row = &v[i * nv..(i + 1) * nv];
-            let best = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
-            if best != prev && best != self.cfg.blank_id { out.push(best); }
-            prev = best;
-        }
-        Ok(out.iter()
-            .map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default().replace('▁', " "))
-            .collect::<String>().trim().to_string())
+    /// The CTC head's RAW logits, `[T, vocab]` row-major with blank last — BEFORE the log-softmax
+    /// NeMo's decoder applies, which moves every value and no argmax.
+    pub async fn ctc_logits(&self, enc: &Tensor) -> Result<Vec<f32>, String> {
+        let head = self.ctc_head.as_ref().ok_or("this model has no CTC head")?;
+        Ok(head.apply(enc).to_vec().await)
+    }
+
+    /// Greedy CTC ids for `t` frames of raw logits: every frame's argmax, and the collapsed ids.
+    /// Shared by the sync and async entry points so there is exactly one implementation of the
+    /// decode rule — two copies would be free to drift apart silently, and only one of them is
+    /// exercised by the native tests.
+    pub fn ctc_ids(&self, logits: &[f32], t: usize) -> (Vec<u32>, Vec<u32>) {
+        ctc_greedy(logits, t, self.cfg.vocab, self.cfg.blank_id, self.cfg.neg.ctc_tie_last)
     }
 
     fn decode_rnnt(&self, enc: &Tensor) -> Result<String, String> {
@@ -1288,7 +1591,7 @@ impl Parakeet {
     /// thing standing between it and a browser was `block_on`, which deadlocks the event loop it is
     /// waiting on. Splitting the reads out makes the same decode reachable from an async caller
     /// without duplicating a line of the decode rule.
-    async fn rnnt_host(&self, enc: &Tensor) -> Result<RnntHost, String> {
+    pub async fn rnnt_host(&self, enc: &Tensor) -> Result<RnntHost, String> {
         let (pred_w, joint_w) = self.rnnt.as_ref().ok_or("no RNN-T head")?;
         let encv = enc.to_vec().await;
         let mut lw = Vec::with_capacity(pred_w.lstm.len());
@@ -1314,15 +1617,131 @@ impl Parakeet {
         self.decode_rnnt_with(&host)
     }
 
-    fn decode_rnnt_with(&self, host: &RnntHost) -> Result<String, String> {
-        let (pred_w, joint_w) = self.rnnt.as_ref().ok_or("no RNN-T head")?;
-        let d = self.cfg.d_model;
-        let RnntHost { encv, lw, emb, je: (je_w, je_b), jp: (jp_w, jp_b), jo: (jo_w, jo_b) } = host;
-        let t = encv.len() / d;
-        let h = self.cfg.pred_hidden;
-        let nl = pred_w.lstm.len();
-        let jh = self.cfg.joint_hidden;
+    /// The predictor before anything is emitted.
+    ///
+    /// ⚠ NeMo's `predict()` feeds ZEROS before anything is emitted, not the blank embedding —
+    /// `if y is not None: y = self.embed(y) else: y = torch.zeros(...)` — THROUGH the LSTM, from a
+    /// zero state. I asserted blank-init as "the RNN-T convention" without checking; it is a real
+    /// fork between implementations and this checkpoint follows NeMo. (Both published files store
+    /// embed[blank] as exactly 0, so that fork cannot be seen here; not running the LSTM can.)
+    pub fn pred_start(&self, host: &RnntHost) -> PredState {
+        let (h, nl) = (self.cfg.pred_hidden, host.lw.len());
+        let mut st = PredState { h: vec![vec![0f32; h]; nl], c: vec![vec![0f32; h]; nl], out: vec![0f32; h] };
+        if !self.cfg.neg.sos_no_step { self.pred_feed(host, &mut st, &vec![0f32; h]); }
+        st
+    }
 
+    /// Advance the predictor by one token: its embedding through every LSTM layer.
+    pub fn pred_advance(&self, host: &RnntHost, st: &mut PredState, token: u32) {
+        let h = self.cfg.pred_hidden;
+        let x = host.emb[token as usize * h..(token as usize + 1) * h].to_vec();
+        self.pred_feed(host, st, &x);
+    }
+
+    fn pred_feed(&self, host: &RnntHost, st: &mut PredState, x: &[f32]) {
+        let mut inp = x.to_vec();
+        for (li, (wx, wh, b)) in host.lw.iter().enumerate() {
+            self.lstm_step(&inp, &mut st.h[li], &mut st.c[li], wx, wh, b);
+            inp = st.h[li].clone();
+        }
+        st.out = inp;
+    }
+
+    /// The joint's encoder projection of frame `t`, bias included: NeMo's `joint.enc(f)`, computed
+    /// once per frame rather than once per joint call.
+    pub fn joint_enc(&self, host: &RnntHost, t: usize) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        host_linear(&host.je.0, &host.je.1, &host.encv[t * d..(t + 1) * d])
+    }
+
+    /// The joint's predictor projection, bias included: NeMo's `joint.pred(g)`.
+    pub fn joint_pred(&self, host: &RnntHost, g: &[f32]) -> Vec<f32> {
+        host_linear(&host.jp.0, &host.jp.1, g)
+    }
+
+    /// RAW joint logits over the vocab, blank last: `W_o · relu(enc_proj + pred_proj) + b_o`.
+    /// No log-softmax — NeMo applies one only on CPU, and it moves every logit and no argmax.
+    pub fn joint_logits(&self, host: &RnntHost, enc_proj: &[f32], pred_proj: &[f32]) -> Vec<f32> {
+        let z: Vec<f32> = enc_proj.iter().zip(pred_proj).map(|(e, p)| {
+            let a = e + p;
+            if self.cfg.neg.joint_tanh { a.tanh() } else if a > 0.0 { a } else { 0.0 }
+        }).collect();
+        host_linear(&host.jo.0, &host.jo.1, &z)
+    }
+
+    /// **Greedy RNN-T**, NeMo's rule: at each frame, call the joint; on blank, advance time and
+    /// KEEP the predictor state; on a token, emit it and advance the predictor; after `max_symbols`
+    /// (10) emissions at one frame, force time forward with the state the 10th token left.
+    pub fn rnnt_greedy(&self, host: &RnntHost) -> RnntDecode {
+        let t_n = host.encv.len() / self.cfg.d_model;
+        let (blank, neg) = (self.cfg.blank_id, &self.cfg.neg);
+        let max_symbols = neg.max_symbols.unwrap_or(MAX_SYMBOLS);
+        // Diagnostics, read once — not per joint call.
+        let (dbg, noblank) = (std::env::var("FERRIC_ASR_DEBUG").is_ok(), std::env::var("FERRIC_ASR_NOBLANK").is_ok());
+        let mut st = self.pred_start(host);
+        let mut pp = self.joint_pred(host, &st.out);
+        let (mut steps, mut tokens) = (Vec::new(), Vec::new());
+        for t in 0..t_n {
+            let ep = self.joint_enc(host, t);
+            let mut emitted = 0;
+            loop {
+                let logits = self.joint_logits(host, &ep, &pp);
+                if emitted == 0 && (dbg || noblank) { self.joint_diagnostics(host, t, &ep, &pp, &logits, dbg, noblank); }
+                let k = argmax_first(&logits) as u32;
+                steps.push((t, tokens.len(), k));
+                if k == blank {
+                    if neg.blank_updates_state {
+                        self.pred_advance(host, &mut st, blank);
+                        pp = self.joint_pred(host, &st.out);
+                    }
+                    break;
+                }
+                tokens.push(k);
+                self.pred_advance(host, &mut st, k);
+                pp = self.joint_pred(host, &st.out);
+                emitted += 1;
+                // NeMo caps symbols per frame; without it a wrong blank id loops forever.
+                if emitted >= max_symbols { break; }
+            }
+        }
+        RnntDecode { steps, tokens }
+    }
+
+    /// Raw joint logits TEACHER-FORCED along a reference decode, one row per step.
+    ///
+    /// `steps` are the reference's own joint calls in its visiting order, `(t, u, its argmax)`. At
+    /// each step the joint sees frame `t` and the predictor state that the REFERENCE's decisions so
+    /// far produced — replayed through this runtime's own state rules — so a logit gap localises to
+    /// one step instead of compounding through a diverged prefix. A reference `u` that disagrees
+    /// with the tokens its own steps emitted is refused: that is a broken fixture, not a result.
+    pub fn rnnt_teacher_forced(&self, host: &RnntHost, steps: &[(usize, usize, u32)])
+                               -> Result<Vec<Vec<f32>>, String> {
+        let t_n = host.encv.len() / self.cfg.d_model;
+        let blank = self.cfg.blank_id;
+        let mut st = self.pred_start(host);
+        let mut pp = self.joint_pred(host, &st.out);
+        let (mut u, mut ep) = (0usize, (usize::MAX, Vec::new()));
+        let mut out = Vec::with_capacity(steps.len());
+        for (k, &(t, u_ref, id)) in steps.iter().enumerate() {
+            if t >= t_n { return Err(format!("step {k}: frame {t}, but the encoder has {t_n}")); }
+            if u_ref != u {
+                return Err(format!("step {k}: the reference says u={u_ref}, but its own steps emitted {u}"));
+            }
+            if ep.0 != t { ep = (t, self.joint_enc(host, t)); }
+            out.push(self.joint_logits(host, &ep.1, &pp));
+            if id != blank || self.cfg.neg.blank_updates_state {
+                self.pred_advance(host, &mut st, id);
+                pp = self.joint_pred(host, &st.out);
+            }
+            if id != blank { u += 1; }
+        }
+        Ok(out)
+    }
+
+    fn decode_rnnt_with(&self, host: &RnntHost) -> Result<String, String> {
+        let d = self.cfg.d_model;
+        let encv = &host.encv;
+        let t = encv.len() / d;
         if std::env::var("FERRIC_ASR_DEBUG").is_ok() {
             let rms = (encv.iter().map(|x| x * x).sum::<f32>() / encv.len() as f32).sqrt();
             let nf = encv.iter().filter(|x| !x.is_finite()).count();
@@ -1338,108 +1757,99 @@ impl Parakeet {
             }).collect();
             let (fmin, fmax) = (fr.iter().cloned().fold(f32::MAX, f32::min),
                                 fr.iter().cloned().fold(f32::MIN, f32::max));
-            // Cosine between the first two frames: ~1.0 means the encoder emits one vector.
-            let (a, b) = (&encv[0..d], &encv[d..2 * d]);
-            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-            let (na, nb) = (a.iter().map(|x| x * x).sum::<f32>().sqrt(),
-                            b.iter().map(|x| x * x).sum::<f32>().sqrt());
             eprintln!("  enc: {t} frames x {d}  rms={rms:.4}  non-finite={nf}");
             eprintln!("       final norm_out weight rms={lnr:.4}  (enc rms should track this)");
-            eprintln!("       per-frame rms {fmin:.4}..{fmax:.4}   cos(f0,f1)={:.4}",
-                      dot / (na * nb).max(1e-9));
-        }
-        let mut hs = vec![vec![0f32; h]; nl];
-        let mut cs = vec![vec![0f32; h]; nl];
-        // The predictor starts from the BLANK embedding, which is the RNN-T convention for "nothing
-        // emitted yet" — starting from zeros gives the first token a state the model never saw.
-        let mut last = self.cfg.blank_id as usize;
-        let mut started = false;
-        let mut pred_out = vec![0f32; h];
-        let mut refresh = true;
-        let mut out: Vec<u32> = Vec::new();
-
-        for ti in 0..t {
-            let mut emitted = 0;
-            loop {
-                if refresh {
-                    // ⚠ NeMo's `predict()` feeds ZEROS before anything is emitted, not the blank
-                    // embedding — `if y is not None: y = self.embed(y) else: y = torch.zeros(...)`.
-                    // I asserted blank-init as "the RNN-T convention" without checking; it is a real
-                    // fork between implementations and this checkpoint follows NeMo.
-                    let mut inp: Vec<f32> = if started {
-                        emb[last * h..(last + 1) * h].to_vec()
-                    } else { vec![0f32; h] };
-                    for li in 0..nl {
-                        let (wx, wh, b) = &lw[li];
-                        let (mut hh, mut cc) = (hs[li].clone(), cs[li].clone());
-                        self.lstm_step(&pred_w.lstm[li], &inp, &mut hh, &mut cc, wx, wh, b);
-                        hs[li] = hh.clone(); cs[li] = cc; inp = hh;
-                    }
-                    pred_out = inp; refresh = false;
-                }
-                // joint: relu(W_e·enc + W_p·pred) → W_o → argmax
-                let mut z = vec![0f32; jh];
-                let (mut se, mut sp, mut sb) = (0f32, 0f32, 0f32);
-                for r in 0..jh {
-                    let mut e = 0f32;
-                    for k in 0..d { e += je_w[r * d + k] * encv[ti * d + k]; }
-                    let mut pp = 0f32;
-                    for k in 0..h { pp += jp_w[r * h + k] * pred_out[k]; }
-                    se += e * e; sp += pp * pp; sb += (je_b[r] + jp_b[r]) * (je_b[r] + jp_b[r]);
-                    let a = e + pp + je_b[r] + jp_b[r];
-                    z[r] = if a > 0.0 { a } else { 0.0 };
-                }
-                if std::env::var("FERRIC_ASR_DEBUG").is_ok() && ti < 2 && emitted == 0 {
-                    // WHICH TERM DECIDES? If the encoder term is negligible beside the predictor and
-                    // bias, the joint is a constant prior and blank wins at every frame regardless
-                    // of the audio — which is exactly the observed symptom.
-                    eprintln!("  t={ti} joint terms rms: enc={:.4} pred={:.4} bias={:.4}",
-                              (se / jh as f32).sqrt(), (sp / jh as f32).sqrt(), (sb / jh as f32).sqrt());
-                }
-                let mut best = (0usize, f32::NEG_INFINITY);
-                for o in 0..self.cfg.vocab {
-                    let mut a = jo_b[o];
-                    for k in 0..jh { a += jo_w[o * jh + k] * z[k]; }
-                    if a > best.1 { best = (o, a); }
-                }
-                if std::env::var("FERRIC_ASR_DEBUG").is_ok() && ti < 3 && emitted == 0 {
-                    // The SHAPE of the distribution is the diagnostic: blank winning by a hair means
-                    // the encoder is roughly right and something small is off; blank winning by
-                    // orders of magnitude means the encoder output is not speech-like at all.
-                    let mut all: Vec<(usize, f32)> = (0..self.cfg.vocab).map(|o| {
-                        let mut a = jo_b[o];
-                        for k in 0..jh { a += jo_w[o * jh + k] * z[k]; }
-                        (o, a)
-                    }).collect();
-                    all.sort_by(|x, y| y.1.total_cmp(&x.1));
-                    let top: Vec<String> = all.iter().take(5)
-                        .map(|(o, v)| format!("{}={v:.2}", if *o as u32 == self.cfg.blank_id {
-                            "<blk>".to_string() } else { self.tokens[*o].clone() })).collect();
-                    eprintln!("  t={ti} top5: {}", top.join(" "));
-                }
-                if std::env::var("FERRIC_ASR_NOBLANK").is_ok() && emitted == 0 {
-                    // Diagnostic: the best NON-blank token per frame. If these spell the utterance,
-                    // the encoder/joint are right and only the blank calibration is off — a very
-                    // different bug from "the encoder learned nothing".
-                    let mut bb = (0usize, f32::NEG_INFINITY);
-                    for o in 0..self.cfg.vocab {
-                        if o as u32 == self.cfg.blank_id { continue; }
-                        let mut a = jo_b[o];
-                        for k in 0..jh { a += jo_w[o * jh + k] * z[k]; }
-                        if a > bb.1 { bb = (o, a); }
-                    }
-                    eprint!("{}", self.tokens[bb.0].replace('▁', " "));
-                }
-                if best.0 as u32 == self.cfg.blank_id { break; }
-                out.push(best.0 as u32);
-                last = best.0; refresh = true; started = true;
-                emitted += 1;
-                // NeMo caps symbols per frame; without it a wrong blank id loops forever.
-                if emitted >= 10 { break; }
+            if t >= 2 {
+                // Cosine between the first two frames: ~1.0 means the encoder emits one vector.
+                let (a, b) = (&encv[0..d], &encv[d..2 * d]);
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let (na, nb) = (a.iter().map(|x| x * x).sum::<f32>().sqrt(),
+                                b.iter().map(|x| x * x).sum::<f32>().sqrt());
+                eprintln!("       per-frame rms {fmin:.4}..{fmax:.4}   cos(f0,f1)={:.4}",
+                          dot / (na * nb).max(1e-9));
             }
         }
-        Ok(out.iter()
-            .map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default().replace('▁', " "))
-            .collect::<String>().trim().to_string())
+        Ok(self.detok(&self.rnnt_greedy(host).tokens))
+    }
+
+    /// `FERRIC_ASR_DEBUG` / `FERRIC_ASR_NOBLANK` output for the first joint call at frame `t`.
+    fn joint_diagnostics(&self, host: &RnntHost, t: usize, ep: &[f32], pp: &[f32], logits: &[f32],
+                         dbg: bool, noblank: bool) {
+        let jh = self.cfg.joint_hidden;
+        let (je_b, jp_b) = (&host.je.1, &host.jp.1);
+        if dbg && t < 2 {
+            // WHICH TERM DECIDES? If the encoder term is negligible beside the predictor and
+            // bias, the joint is a constant prior and blank wins at every frame regardless
+            // of the audio — which is exactly the observed symptom.
+            let ms = |f: &dyn Fn(usize) -> f32| ((0..jh).map(|r| f(r) * f(r)).sum::<f32>() / jh as f32).sqrt();
+            eprintln!("  t={t} joint terms rms: enc={:.4} pred={:.4} bias={:.4}",
+                      ms(&|r| ep[r] - je_b[r]), ms(&|r| pp[r] - jp_b[r]), ms(&|r| je_b[r] + jp_b[r]));
+        }
+        if dbg && t < 3 {
+            // The SHAPE of the distribution is the diagnostic: blank winning by a hair means
+            // the encoder is roughly right and something small is off; blank winning by
+            // orders of magnitude means the encoder output is not speech-like at all.
+            let mut all: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            all.sort_by(|x, y| y.1.total_cmp(&x.1));
+            let top: Vec<String> = all.iter().take(5)
+                .map(|(o, v)| format!("{}={v:.2}", if *o as u32 == self.cfg.blank_id {
+                    "<blk>".to_string() } else { self.tokens[*o].clone() })).collect();
+            eprintln!("  t={t} top5: {}", top.join(" "));
+        }
+        if noblank {
+            // Diagnostic: the best NON-blank token per frame. If these spell the utterance,
+            // the encoder/joint are right and only the blank calibration is off — a very
+            // different bug from "the encoder learned nothing".
+            let mut bb = (0usize, f32::NEG_INFINITY);
+            for (o, &a) in logits.iter().enumerate() {
+                if o as u32 != self.cfg.blank_id && a > bb.1 { bb = (o, a); }
+            }
+            eprint!("{}", self.tokens[bb.0].replace('▁', " "));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two exact ties, one of them against blank (the LAST id). torch's `max` keeps the first
+    /// maximum; the old `max_by` kept the last, which on a blank tie DELETES the token.
+    #[test]
+    fn ctc_argmax_keeps_the_first_maximum_on_a_tie() {
+        let (nv, blank) = (5usize, 4u32);
+        #[rustfmt::skip]
+        let v = [
+            0.0, 3.0, 3.0, 1.0, 0.0,    // 1 ties 2        → 1
+            0.0, 0.0, 0.0, 0.0, 9.0,    // blank           → 4
+            7.0, 0.0, 0.0, 0.0, 7.0,    // 0 ties blank    → 0
+            2.0, 2.0, 2.0, 2.0, 2.0,    // all tie         → 0, a repeat: collapsed
+        ];
+        let (frames, ids) = ctc_greedy(&v, 4, nv, blank, false);
+        assert_eq!(frames, vec![1, 4, 0, 0]);
+        assert_eq!(ids, vec![1, 0]);
+        // The same logits under the old rule, which this test exists to refuse.
+        let (frames_last, ids_last) = ctc_greedy(&v, 4, nv, blank, true);
+        assert_eq!(frames_last, vec![2, 4, 4, 4]);
+        assert_eq!(ids_last, vec![2]);
+        assert_ne!(ids, ids_last, "the test cannot tell the two tie rules apart");
+    }
+
+    #[test]
+    fn argmax_first_matches_torch_on_ties_and_non_finite_rows() {
+        assert_eq!(argmax_first(&[1.0, 3.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax_first(&[5.0, 5.0, 5.0]), 0);
+        assert_eq!(argmax_first(&[f32::NEG_INFINITY; 3]), 0);
+        assert_eq!(argmax_first(&[-1.0, f32::INFINITY, 0.0]), 1);
+    }
+
+    /// The negative controls are all OFF unless a `FERRIC_ASR_NEG_*` variable is set, and the test
+    /// process sets none — so this is the default a clean run gets. A new field defaulting to ON
+    /// would silently put every run under a control.
+    #[test]
+    fn negative_controls_default_off() {
+        if std::env::vars().any(|(k, _)| k.starts_with("FERRIC_ASR_NEG_")) { return; }
+        assert_eq!(Neg::from_env().unwrap(), Neg::default());
+        assert!(Neg::default().active.is_empty());
     }
 }

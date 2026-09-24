@@ -178,15 +178,38 @@ pub const REGISTRY: &[Arch] = &[
     // NVIDIA's own converter emits `asr`; the community one emits `parakeet`. Same architecture,
     // different tensor names and key namespace — one `Naming` map holds every difference so this
     // stays one runtime rather than two loaders.
-    Arch { name: "asr", runtime: Runtime::Parakeet, status: Status::Loads,
+    Arch { name: "asr", runtime: Runtime::Parakeet, status: Status::Verified,
            note: "NVIDIA NeMo ASR export (parakeet-ctc-1.1b): the same Conformer encoder with a CTC \
-                  head instead of RNN-T. Ships its own mel filterbank (preprocessor.fb) and \
-                  precomputed positional encoding. Waveform in, text out — NOT a chat model" },
+                  head instead of RNN-T. Waveform in, text out — NOT a chat model. ⭐ Verified against \
+                  the MODEL AUTHORS' implementation, NVIDIA NeMo 3.0.0, STAGE BY STAGE (log-mel, mel, \
+                  subsampling, projection, positional table, every one of 42 blocks, encoder, raw head \
+                  logits, tokens) on 4 LibriSpeech clips, NeMo running this file's own dequantised \
+                  weights: encoder within 1.6e-4 of its rms, head logits within 9.2e-4, argmax equal on \
+                  every frame. Every tensor audited by value: all 33,112,064 Q8_0 blocks are ggml's \
+                  Q8_0 of the authors' fp32 checkpoint, bit for bit. ⚠ That rounding is not small: it \
+                  moves the encoder by 0.10-0.38 of its rms against the authors' own weights (tokens \
+                  unchanged on the 4 clips). ⚠ The checkpoint was trained under NeMo 1.19 (reflect STFT \
+                  padding, n/hop+1 frames); the reference is the NeMo NVIDIA ships today, and the 1.19 \
+                  frontend is reported, not gated. The file's precomputed pos_enc.pe and preprocessor.fb \
+                  are not read: Ferric builds both, as NeMo does. \
+                  Gate: scripts/parakeet_conformance.sh vs tests/fixtures/parakeet/" },
     Arch { name: "parakeet", runtime: Runtime::Parakeet, status: Status::Verified,
-           note: "NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T. TRANSCRIBES — every \
-                  word correct on three LibriSpeech utterances (residual WER is punctuation the \
-                  references do not carry). Waveform in, text out: NOT a chat model, and \
-                  ferric-serve refuses it the way it refuses bert" },
+           note: "NVIDIA Parakeet: Conformer encoder + RNN-T. Waveform in, text out: NOT a chat model, \
+                  and ferric-serve refuses it the way it refuses bert. ⭐ Verified against the MODEL \
+                  AUTHORS' implementation, NVIDIA NeMo 3.0.0, STAGE BY STAGE on \
+                  parakeet-unified-en-0.6b (F16, every tensor bit-exact f16 of the authors' checkpoint) \
+                  over 4 LibriSpeech clips: encoder within 1.5e-5 of its rms (NeMo's own fp32-vs-fp64 \
+                  floor is 4e-5 to 6.5e-5), joint logits TEACHER-FORCED along NeMo's own greedy path \
+                  within 1.0e-4, argmax equal at all 1,392 joint calls, tokens identical. It used to be \
+                  'Verified' on transcripts alone, and the transcripts were right while the frame \
+                  semantics were not: Ferric counted every STFT frame where NeMo counts n/hop, \
+                  normalised over the extra one, masked nothing and decoded an encoder frame NeMo \
+                  treats as padding — 0.13-1.4x the encoder rms inside NeMo, tokens unchanged. Fixed. \
+                  26 negative controls (mel scale, window, padding, rel_shift, LSTM gate order, SOS, \
+                  blank rule, ...) each fail first at the stage their mechanism lives in. ⛔ \
+                  nemotron-3.5-asr-streaming-0.6b shares this arch string and is REFUSED at load: its \
+                  language-prompt MLP, causal subsampling and normalize=none are not implemented. \
+                  Gate: scripts/parakeet_conformance.sh vs tests/fixtures/parakeet/" },
 
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
            note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV cache and no LM \
