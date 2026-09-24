@@ -13,6 +13,12 @@ reference is recorded at every stage, and the gate compares numbers, not words.
 
 Run (NeMo 3.0.0 on CPU; the 1.1B CTC model needs ~25 GB of RAM):
     <nemo-venv>/bin/python parakeet_ref.py <model.gguf> <model.nemo> <audio_root> <out_dir> [clip-id ...]
+        [--att-context L,R] [--prompt ID] [--tag NAME]
+--att-context pins a limited-context model to one of its TRAINED contexts on both sides; without it the
+fixture records NeMo's own default (the first entry of its config list — for nemotron-3.5-asr-streaming
+that is (56,3), while the GGUF declares (56,13); both are the model, and they give different transcripts).
+--prompt sets a prompt-conditioned model's language index (default: NeMo's `auto`). --tag suffixes the
+fixture names so several settings of one model can coexist.
 e.g. parakeet_ref.py ~/.cache/ferric/parakeet-0.6b-f16.gguf .../parakeet-unified-en-0.6b.nemo .../audio out/
 `audio_root` holds LibriSpeech/test-clean/... (OpenSLR, CC-BY 4.0) and dev-clean-dummy/1272-128104-0000.wav
 (PCM16 from hf-internal-testing/librispeech_asr_dummy). Each clip's int16 PCM sha256 goes into the fixture, and
@@ -110,7 +116,8 @@ LADDER = [
 # (xscale 32 makes pre_out reach 1128 against an rms of 89): 6 digits would round by 5.6e-5 x rms there, so 8.
 # Blocks/enc (max/rms <= 1e-4 stage-local, max/rms ~40) and logmel (|v| to 16.6) get 7; CTC logits reach ~500
 # against a 5e-3 gate, 7. mel (|v| <= ~5, p99 <= 1e-4), pe (|v| <= 1) and RNN-T logits (1e-2) are fine at 6.
-DIGITS = {"logmel": 7, "mel": 6, "pre_conv": 8, "pre_out": 8, "pe": 6, "block": 7, "enc": 7, "rnnt": 6, "ctc": 7}
+DIGITS = {"logmel": 7, "mel": 6, "pre_conv": 8, "pre_out": 8, "pe": 6, "block": 7, "enc": 7, "prompt": 7, "rnnt": 6,
+          "ctc": 7}
 PLAN0 = {"cols": 32, "vocab_cols": 32, "block_cols": 32, "pe_rows": 128, "mel_stride": 8, "pre_conv_stride": 1,
          "pre_out_stride": 1, "enc_stride": 1, "block_stride": 4}
 
@@ -173,7 +180,7 @@ def _reflect_stft(fz):
     return stft
 
 
-def run_stages(m, pcm, *, plus1=False, reflect=False, dtype=torch.float32, blocks=False):
+def run_stages(m, pcm, *, plus1=False, reflect=False, dtype=torch.float32, blocks=False, prompt_id=None):
     """One forward through NeMo's own modules, with every fixture stage captured by hooks.
     plus1/reflect select arm B / V119. Returns float64 arrays over the WHOLE tensors, plus the lengths."""
     from nemo.collections.asr.parts.preprocessing import features
@@ -221,7 +228,21 @@ def run_stages(m, pcm, *, plus1=False, reflect=False, dtype=torch.float32, block
     try:
         assert_eval(m)
         with torch.no_grad():
-            enc, el = enc_mod(audio_signal=mel.to(dtype), length=ml)
+            if prompt_id is None:
+                enc, el = enc_mod(audio_signal=mel.to(dtype), length=ml)
+            else:
+                # A prompt model through its OWN forward (rnnt_bpe_models_prompt.py): encoder, then the
+                # one-hot concat and prompt_kernel. The encoder's output is taken by a hook; what the
+                # joint sees is what forward returns.
+                cap_enc = {}
+                h = enc_mod.register_forward_hook(lambda mod, i, o: cap_enc.update(enc=o[0].clone(), el=o[1].clone()))
+                hooks.append(h)
+                post, el = m.forward(processed_signal=mel.to(dtype), processed_signal_length=ml,
+                                     prompt_indices=torch.tensor([prompt_id]))
+                enc = cap_enc["enc"]
+                if not torch.equal(cap_enc["el"], el):
+                    raise SystemExit("the prompt model's forward changed encoded_len; refusing")
+                got["prompt"] = post[0].T.double().clone()
     finally:
         for h in hooks:
             h.remove()
@@ -229,7 +250,7 @@ def run_stages(m, pcm, *, plus1=False, reflect=False, dtype=torch.float32, block
     if pcm_hash(pcm) != before:
         raise SystemExit("the caller's PCM changed during the forward — an in-place dither ran; refusing")
     got.update(mel=mel[0].T.double().clone(), mel_len=int(ml[0]), enc=enc[0].T.double().clone(), enc_len=int(el[0]),
-               enc_t=enc.clone(), enc_len_t=el.clone())
+               enc_t=(post if prompt_id is not None else enc).clone(), enc_len_t=el.clone())
     if got["valid_after_masks"] != got["enc_len"]:
         raise SystemExit(f"pad mask keeps {got['valid_after_masks']} frames, encoded_len is {got['enc_len']}")
     return got
@@ -361,6 +382,8 @@ def stage_domains(cap, T, L):
     for k in sorted((k for k in cap if k.startswith("block.")), key=lambda s: int(s.split(".")[1])):
         d[k] = cap[k][:T]
     d["enc"] = cap["enc"][:T]
+    if "prompt" in cap:
+        d["prompt"] = cap["prompt"][:T]
     return d
 
 
@@ -424,7 +447,8 @@ def build_fixture(head, ref, plan):
         elif k.startswith("block."):
             rows, cols = _rows(n, plan["block_stride"], 4), _cols(k, w, plan["block_cols"])
         else:
-            stride = {"pre_conv": plan["pre_conv_stride"], "pre_out": plan["pre_out_stride"], "enc": plan["enc_stride"]}[k]
+            stride = {"pre_conv": plan["pre_conv_stride"], "pre_out": plan["pre_out_stride"], "enc": plan["enc_stride"],
+                      "prompt": plan["enc_stride"]}[k]
             rows, cols = _rows(n, stride, 8 if stride > 1 else 0), _cols(k, w, plan["cols"])
         st[k] = _stage(full, rows, cols, DIGITS[k.split(".")[0]], {"pos_first": T - 1} if k == "pe" else None)
     fx = {"stages": st}
@@ -471,7 +495,14 @@ def fit(head, ref, header, tail):
 
 # ------------------------------------------------------------------------------------------------ main
 def main():
-    gguf_path, nemo_path, audio_root, out_dir, *only = sys.argv[1:]
+    args, opts, it = [], {}, iter(sys.argv[1:])
+    for a in it:
+        if a.startswith("--"):
+            opts[a[2:]] = next(it)
+        else:
+            args.append(a)
+    gguf_path, nemo_path, audio_root, out_dir, *only = args
+    tag = ("__" + opts["tag"]) if "tag" in opts else ""
     os.makedirs(os.path.join(out_dir, "full"), exist_ok=True)
     clips = only or list(CLIPS)
     t0 = time.time()
@@ -485,6 +516,21 @@ def main():
         "transcribe() leaves encoder/decoder/joint in train mode (unfreeze -> module.train()); never in a dump process"))
     head = "rnnt" if hasattr(m, "joint") else "ctc"
     repo = "nvidia/" + os.path.basename(nemo_path)[: -len(".nemo")]
+    # ---- the settings both sides must share, recorded in every fixture
+    enc_cfg = m.cfg.encoder
+    if "att-context" in opts:
+        m.encoder.set_default_att_context_size([int(v) for v in opts["att-context"].split(",")])
+    att = [int(v) for v in m.encoder.att_context_size]
+    prompt_id = None
+    if getattr(m, "concat", False):
+        pd = m.cfg.model_defaults.get("prompt_dictionary")
+        prompt_id = int(opts["prompt"]) if "prompt" in opts else int(pd["auto"])
+    config = {"att_context": att if min(att) >= 0 else None, "prompt_id": prompt_id,
+              "causal_subsampling": bool(enc_cfg.get("causal_downsampling", False)),
+              "conv_norm": str(enc_cfg.get("conv_norm_type", "batch_norm")),
+              "conv_context": str(enc_cfg.get("conv_context_size", None)),
+              "normalize": str(m.cfg.preprocessor.get("normalize", "per_feature"))}
+    print(f"config: {config}", flush=True)
     print(f"[{time.time() - t0:.0f}s] restored {type(m).__name__} ({head}) from {nemo_path}", flush=True)
 
     # ---- weights: checkpoint file == restored model; GGUF == checkpoint under each storage rule
@@ -538,7 +584,7 @@ def main():
         sf.write(wav, x16, 16000, subtype="PCM_16")
         if not np.array_equal(sf.read(wav, dtype="int16")[0], x16):
             raise SystemExit(f"{wav} does not read back as the same int16 samples")
-        cap = run_stages(m, pcm, blocks=(cid == BLOCK_CLIP))
+        cap = run_stages(m, pcm, blocks=(cid == BLOCK_CLIP), prompt_id=prompt_id)
         T, L = cap["enc_len"], cap["mel_len"]
         if L != len(pcm) // 160 or cap["logmel"].shape[0] != 1 + len(pcm) // 160:
             raise SystemExit(f"{cid}: NeMo gave {L} valid / {cap['logmel'].shape[0]} frames, not N//160 / 1+N//160")
@@ -550,7 +596,7 @@ def main():
 
     def arm(name, mdl, dtype=torch.float32, **kw):
         for cid, ref in refs.items():
-            cap = run_stages(mdl, ref["pcm"], dtype=dtype, blocks=(cid == BLOCK_CLIP), **kw)
+            cap = run_stages(mdl, ref["pcm"], dtype=dtype, blocks=(cid == BLOCK_CLIP), prompt_id=prompt_id, **kw)
             a = compare_arm(ref, cap, ref["T"], ref["L"])
             if head == "rnnt":
                 r = ref["rnnt"]
@@ -622,7 +668,8 @@ def main():
     for cid, ref in refs.items():
         r = ref[head]
         header = {"format": "parakeet-conformance/1", "model": repo, "gguf": os.path.basename(gguf_path),
-                  "reference": "NeMo-G", "nemo": nemo.__version__, "torch": torch.__version__, "weights_audit": summary,
+                  "reference": "NeMo-G", "nemo": nemo.__version__, "torch": torch.__version__, "config": config,
+                  "weights_audit": summary,
                   "guards": guards,
                   "clip": {"id": cid, "path_hint": ref["hint"], "wav": os.path.basename(ref["wav"]),
                            "n_samples": len(ref["pcm"]), "pcm_sha256": ref["sha"]},
@@ -633,9 +680,9 @@ def main():
                                     "raw_argmax_equals_logprob_argmax") if k in r}
         tail = {"decode_checks": checks, "arms": ref["arms"]}
         s, applied = fit(head, ref, header, tail)
-        path = os.path.join(out_dir, f"{repo.split('/')[1]}__{cid}.json")
+        path = os.path.join(out_dir, f"{repo.split('/')[1]}__{cid}{tag}.json")
         open(path, "w").write(s)
-        np.savez(os.path.join(out_dir, "full", f"{repo.split('/')[1]}__{cid}.npz"),
+        np.savez(os.path.join(out_dir, "full", f"{repo.split('/')[1]}__{cid}{tag}.npz"),
                  **{k: v.float().numpy() for k, v in stage_domains(ref["cap"], ref["T"], ref["L"]).items()},
                  **({"rnnt_logits": r["tf"].float().numpy(), "rnnt_steps": np.array(r["steps"])} if head == "rnnt"
                     else {"ctc_logits": r["raw"].float().numpy()}))

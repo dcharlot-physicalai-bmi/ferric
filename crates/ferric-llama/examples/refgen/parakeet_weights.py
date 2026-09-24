@@ -89,6 +89,7 @@ _UNIFIED = [
     (r"pred\.lstm\.(\d+)\.Wh", r"decoder.prediction.dec_rnn.lstm.weight_hh_l\1"),
     (r"joint\.(enc|pred)\.(.*)", r"joint.\1.\2"),
     (r"joint\.out\.(.*)", r"joint.joint_net.2.\1"),
+    (r"prompt\.mlp\.(\d+)\.(.*)", r"prompt_kernel.\1.\2"),      # nemotron's language-prompt MLP
 ]
 _LSTM_BIAS = re.compile(r"pred\.lstm\.(\d+)\.bias")
 # GGUF tensors that are not checkpoint parameters. Compared too, and never injected: NeMo's pe is a

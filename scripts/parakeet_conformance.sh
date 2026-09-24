@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Parakeet speech (arch "parakeet" = Conformer + RNN-T, arch "asr" = Conformer + CTC): Ferric vs THE MODEL
 # AUTHORS' OWN IMPLEMENTATION, NVIDIA NeMo, at every stage — with every silent-failure mechanism proved
-# load-bearing by a negative control.
+# load-bearing by a negative control. Three checkpoints: parakeet-unified-en-0.6b (RNN-T, offline),
+# parakeet-ctc-1.1b (CTC) and nemotron-3.5-asr-streaming-0.6b (RNN-T; limited-context attention, causal
+# conv and subsampling, raw log-mel, and a language PROMPT — fixtures at both its declared context (56,13)
+# and NeMo's default (56,3), and with prompt en-US as well as auto).
 #
 # ⛔⛔ A TRANSCRIPT IS THE LEAST SENSITIVE PLACE TO LOOK. `parakeet` was Verified on "every word correct on
 # three LibriSpeech utterances" and a 1.77% corpus WER. Checked against NeMo stage by stage, Ferric counted
@@ -21,7 +24,8 @@
 #   scripts/parakeet_conformance.sh <model.gguf> <fixture.json[.gz]> <audio.wav|flac> [--no-controls]
 #
 # The audio is the LibriSpeech utterance the fixture names (clip.path_hint; OpenSLR test-clean, CC-BY 4.0)
-# or the 16-bit WAV of exactly those samples the generator writes. The int16 PCM hash must match.
+# or the 16-bit WAV of exactly those samples the generator writes. The int16 PCM hash must match. The
+# fixture's "config" (attention context, prompt index) is applied to Ferric before it runs.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-}"; FX="${2:-}"; AUDIO="${3:-}"; OPT="${4:-}"
@@ -62,6 +66,14 @@ def arch(path):
 ARCH = arch(M)
 if ARCH not in ("parakeet", "asr"):
     print(f"⛔ {os.path.basename(M)} is arch {ARCH!r}, not a parakeet speech model"); sys.exit(2)
+# The settings the reference ran at — which also say which mechanisms this model HAS, and so which
+# controls can apply. Required: a fixture without them would have the gate assume a configuration.
+CFG = ref.get("config")
+if CFG is None:
+    print("⛔ fixture has no \"config\" (attention context, prompt, subsampling, norms) — regenerate it"); sys.exit(2)
+PROMPT = CFG.get("prompt_id") is not None
+CAUSAL_CONV = str(CFG.get("conv_context")) == "causal"
+RAW_MEL = str(CFG.get("normalize")) in ("NA", "none")
 
 # ⭐ TOLERANCES, per stage family: (max|d| over the sampled values / the stage's rms, worst relative
 # difference in a recorded row's sum of squares over its FULL width). Each is ~3x the worst CLEAN residual
@@ -72,6 +84,14 @@ if ARCH not in ("parakeet", "asr"):
 #   ctc (Q8_0):     logmel 1.7e-5 / 6.8e-6, mel 8.6e-5 / 6.7e-6, pre_conv 2.1e-4 / 1.0e-5,
 #                   pre_out 6.2e-5 / 3.7e-6, pe 1.3e-6 / 1.5e-8, block 7.5e-5 / 1.9e-6, enc 1.6e-4 / 1.9e-5
 #                   (42 layers); head logits 9.2e-4 abs
+#   nemotron-3.5-asr-streaming (F16, prompt model): encoder 2.3e-5 / 2.5e-6, then the language-prompt MLP
+#                   amplifies: prompt 1.3e-4 / 3.3e-5 — and NeMo's OWN fp32-vs-fp64 floor there is 1.5e-4..8.0e-4
+#                   of the prompt rms. Ferric sits at or below it; the looser pair is the model's arithmetic.
+# HEAD LOGITS are compared RELATIVE TO EACH ROW'S SCALE, max|d| / max(1, |row max|): measured 9.7e-5 (unified),
+# 1.8e-5 (ctc), 7.1e-5 (nemotron). ⚠ An absolute tolerance was the wrong measure: nemotron's third joint call
+# on a 33 s clip (a near-silent opening frame) has logits near -783, and its 1.67e-2 absolute gap — 3x NeMo's
+# own fp32-vs-fp64 gap on that FIXTURE — is 2.1e-5 of that row, like every other row. Absolute, the tolerance
+# had to be wide enough for that row, and was then 60x loose on the ordinary ones.
 # NeMo's own fp32-vs-fp64 floor at the encoder is 4e-5 to 6.5e-5 (unified) and 1e-5 to 2e-5 (ctc) of the
 # rms, so Ferric sits at or below the reference's own arithmetic on the unified model.
 # ⚠ The SUM-OF-SQUARES term is not decoration: a pure scale error — population instead of Bessel variance
@@ -80,12 +100,15 @@ TOL = {
   "parakeet": {"logmel": (2e-4, 3e-5), "mel": (1e-3, 3e-5), "pre_conv": (1e-3, 2e-5), "pre_out": (3e-4, 1.5e-5),
                "pe": (1e-5, 1e-7), "block": (2e-4, 5e-6), "enc": (5e-5, 1.5e-5), "logits": 3e-4},
   "asr":      {"logmel": (6e-5, 2e-5), "mel": (3e-4, 2e-5), "pre_conv": (7e-4, 3e-5), "pre_out": (2e-4, 1.5e-5),
-               "pe": (1e-5, 1e-7), "block": (3e-4, 6e-6), "enc": (5e-4, 6e-5), "logits": 3e-3},
-}[ARCH]
+               "pe": (1e-5, 1e-7), "block": (3e-4, 6e-6), "enc": (5e-4, 6e-5), "logits": 6e-5},
+  "prompt":   {"logmel": (2e-4, 3e-5), "mel": (1e-3, 3e-5), "pre_conv": (1e-3, 2e-5), "pre_out": (3e-4, 1.5e-5),
+               "pe": (1e-5, 1e-7), "block": (2e-4, 5e-6), "enc": (6e-5, 1.5e-5), "prompt": (4e-4, 1e-4),
+               "logits": 2.5e-4},
+}["prompt" if PROMPT else ARCH]
 fam = lambda s: "block" if s.startswith("block.") else s
 ORDER = [s for s in ["logmel", "mel", "pre_conv", "pre_out", "pe"] if s in ref["stages"]] + \
         sorted([s for s in ref["stages"] if s.startswith("block.")], key=lambda s: int(s.split(".")[1])) + \
-        [s for s in ["enc"] if s in ref["stages"]]
+        [s for s in ["enc", "prompt"] if s in ref["stages"]]
 
 def run(env_extra=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("FERRIC_ASR_NEG_")}
@@ -132,9 +155,9 @@ def checks(o):
             out.append(("rnnt logits", "head", float("inf"), f"{len(o['steps'])} of {len(R['steps'])} steps", False))
         else:
             w = max(max(abs(a - b) if not (bad(a) or bad(b)) else float("inf") for a, b in zip(v, R["vals"][k]))
-                    for k, (_, v) in enumerate(o["steps"]))
+                    / max(1.0, abs(R["row_max"][k])) for k, (_, v) in enumerate(o["steps"]))
             am = sum(a == R["steps"][k][2] for k, (a, _) in enumerate(o["steps"]))
-            out.append(("rnnt logits", "head", w / TOL["logits"], f"{w:.2e} abs", w <= TOL["logits"]))
+            out.append(("rnnt logits", "head", w / TOL["logits"], f"{w:.2e} of row", w <= TOL["logits"]))
             out.append(("rnnt argmax", "head", float(len(R["steps"]) - am), f"{am}/{len(R['steps'])}", am == len(R["steps"])))
         out.append(("tokens", "tokens", 0.0 if o["tokens"] == R["tokens"] else float("inf"),
                     f"{len(o['tokens'] or [])} vs {len(R['tokens'])}", o["tokens"] == R["tokens"]))
@@ -144,15 +167,16 @@ def checks(o):
             out.append(("ctc logits", "head", float("inf"), f"{len(o['ctc'])} of {len(C['argmax'])} frames", False))
         else:
             w = max((max(abs(a - b) if not (bad(a) or bad(b)) else float("inf") for a, b in zip(o["ctc"][t][1], C["vals"][i]))
-                     for t, i in rows.items()), default=float("inf"))
+                     / max(1.0, abs(C["row_max"][t])) for t, i in rows.items()), default=float("inf"))
             am = sum(o["ctc"][t][0] == a for t, a in enumerate(C["argmax"]))
-            out.append(("ctc logits", "head", w / TOL["logits"], f"{w:.2e} abs", w <= TOL["logits"]))
+            out.append(("ctc logits", "head", w / TOL["logits"], f"{w:.2e} of row", w <= TOL["logits"]))
             out.append(("ctc argmax", "head", float(len(C["argmax"]) - am), f"{am}/{len(C['argmax'])}", am == len(C["argmax"])))
         out.append(("tokens", "tokens", 0.0 if o["tokens"] == C["tokens"] else float("inf"),
                     f"{len(o['tokens'] or [])} vs {len(C['tokens'])}", o["tokens"] == C["tokens"]))
     return out
 
 print(f"reference: {ref['model']} — {ref['reference']} (NeMo {ref['nemo']}, torch {ref['torch']}) on {ref['gguf']}")
+print(f"config:    {json.dumps(CFG)}")
 print(f"clip:      {ref['clip']['id']}  {ref['clip']['n_samples']} samples  valid {ref['valid']['mel_frames']} mel / "
       f"{ref['valid']['enc_frames']} encoder frames   weights audit: {json.dumps(ref['weights_audit'].get('rules', {}))}")
 o, err = run()
@@ -179,14 +203,23 @@ if first:
 # which a control that broke an unrelated upstream stage would also do. Every one names a convention some
 # version of this port, or another port, actually got wrong while the transcript stayed fluent.
 ENC = "encoder"
+# `where` is the family the control must fail FIRST in. VALIDLEN's extra frame is invisible in the mel of a
+# RAW-log-mel model (no statistics to shift, and the fixture records only valid rows), so there it first
+# shows wherever the frame reaches a valid row downstream — which depends on the length class. When it adds
+# a whole ENCODER frame (causal subsampling, n/hop ≡ 1 mod 8), the first thing it changes is `pe`: the
+# relative-position table is built for T frames, and T is now one more.
 CONTROLS = [
     ("MEL", "htk", "logmel"), ("FBNORM", "peak", "logmel"), ("WINDOW", "periodic", "logmel"),
     ("PAD", "reflect", "logmel"), ("POWER", "magnitude", "logmel"), ("PREEMPH", "0", "logmel"),
-    ("LOGGUARD", "1e-9", "logmel"), ("NORM", "biased", "mel"), ("VALIDLEN", "all_frames", "mel"),
+    ("LOGGUARD", "1e-9", "logmel"), ("NORM", "biased", "mel"), ("NORMALIZE", "flip", "mel"),
+    ("VALIDLEN", "all_frames", ("pre_conv", "pre_out", "pe", ENC, "prompt") if RAW_MEL else "mel"),
     ("FLATTEN", "freq_major", "pre_conv"), ("PRECONV", "swap_axes", "pre_conv"), ("RELU", "dw", "pre_conv"),
+    ("SUBPAD", "time_symmetric", "pre_conv"),
     ("XSCALE", "flip", "pre_out"), ("PE", "ascending", "pe"),
-    ("RELSHIFT", "none", ENC), ("POSBIAS", "swap_uv", ENC), ("CONVPAD", "causal", ENC),
-    ("CONVNORM", "bn_eps1e-3", ENC), ("GLU", "swap", ENC), ("MACARON", "1.0", ENC), ("DW1D", "flip", ENC),
+    ("RELSHIFT", "none", ENC), ("POSBIAS", "swap_uv", ENC), ("CONVPAD", "symmetric" if CAUSAL_CONV else "causal", ENC),
+    ("CONVNORM", "bn_eps1e-3", ENC), ("CONVNORM", "ln_affine", ENC), ("ATTCTX", "full", ENC),
+    ("GLU", "swap", ENC), ("MACARON", "1.0", ENC), ("DW1D", "flip", ENC),
+    ("PROMPT", "off", "prompt"), ("PROMPT", "concat_first", "prompt"), ("PROMPT", "id0", "prompt"),
     ("LSTM_GATES", "ifog", "head"), ("SOS", "no_step", "head"), ("BLANK", "update_state", "head"),
     ("JOINT_ACT", "tanh", "head"), ("MAXSYM", "1", "tokens"), ("CTC_TIE", "last", "head"),
 ]
@@ -195,7 +228,16 @@ CONTROLS = [
 # clip by arithmetic alone, and proves nothing either way. The weakest measured is CONVNORM=bn_eps1e-3
 # (the TF/Keras BatchNorm default) at ~x3 on the unified model: real, and the smallest one here.
 MARGIN = 2.0
-def not_applicable(name):
+def not_applicable(name, val):
+    if name == "NORM" and RAW_MEL: return "the model takes the RAW log-mel: there is no variance to compute"
+    if name == "SUBPAD" and not CFG.get("causal_subsampling"): return "symmetric subsampling has no causal padding to move"
+    if name == "CONVNORM" and val == "bn_eps1e-3" and CFG.get("conv_norm") == "layer_norm":
+        return "the conv module is LayerNorm: no BatchNorm eps"
+    if name == "CONVNORM" and val == "ln_affine" and CFG.get("conv_norm") != "layer_norm":
+        return "the conv module is BatchNorm, folded to an affine by construction"
+    if name == "ATTCTX" and not CFG.get("att_context"): return "full-context attention: there is no mask to remove"
+    if name == "PROMPT" and not PROMPT: return "this model takes no language prompt"
+    if name == "PROMPT" and val == "id0" and CFG.get("prompt_id") == 0: return "the fixture already uses index 0"
     rnnt_only = {"LSTM_GATES", "SOS", "BLANK", "JOINT_ACT", "MAXSYM"}
     if name in rnnt_only and "rnnt" not in ref: return "a CTC model has no predictor or joint"
     if name == "MAXSYM" and ref.get("decode_checks", {}).get("max_emissions_at_one_frame", 0) < 2:
@@ -212,7 +254,7 @@ if OPT != "--no-controls":
     print(f"\nnegative controls (each must fail FIRST where its mechanism lives):")
     applied = 0
     for name, val, where in CONTROLS:
-        na = not_applicable(name)
+        na = not_applicable(name, val)
         if na:
             print(f"  {name + '=' + val:<22} not applicable: {na}"); continue
         applied += 1
@@ -222,9 +264,10 @@ if OPT != "--no-controls":
         cf = next((c for c in checks(co) if not c[4]), None)
         fam_of = lambda c: ENC if c[1] in ("block", "enc") else c[1]
         lab = f"{name}={val}"
+        wheres = where if isinstance(where, tuple) else (where,)
         if cf is None:
             print(f"  {lab:<22} ⛔ PASSES THE GATE — this gate cannot see that mechanism"); ok = False
-        elif fam_of(cf) != where:
+        elif fam_of(cf) not in wheres:
             print(f"  {lab:<22} ⛔ fails first at {cf[0]}, not at {where} — it is not testing what it names"); ok = False
         elif cf[2] < MARGIN:
             print(f"  {lab:<22} ⛔ fails at {cf[0]} by only x{cf[2]:.1f} tol — too close to the clean residual to "

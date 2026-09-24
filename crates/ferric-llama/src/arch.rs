@@ -194,7 +194,7 @@ pub const REGISTRY: &[Arch] = &[
                   are not read: Ferric builds both, as NeMo does. \
                   Gate: scripts/parakeet_conformance.sh vs tests/fixtures/parakeet/" },
     Arch { name: "parakeet", runtime: Runtime::Parakeet, status: Status::Verified,
-           note: "NVIDIA Parakeet: Conformer encoder + RNN-T. Waveform in, text out: NOT a chat model, \
+           note: "NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T. Waveform in, text out: NOT a chat model, \
                   and ferric-serve refuses it the way it refuses bert. ⭐ Verified against the MODEL \
                   AUTHORS' implementation, NVIDIA NeMo 3.0.0, STAGE BY STAGE on \
                   parakeet-unified-en-0.6b (F16, every tensor bit-exact f16 of the authors' checkpoint) \
@@ -206,9 +206,19 @@ pub const REGISTRY: &[Arch] = &[
                   normalised over the extra one, masked nothing and decoded an encoder frame NeMo \
                   treats as padding — 0.13-1.4x the encoder rms inside NeMo, tokens unchanged. Fixed. \
                   26 negative controls (mel scale, window, padding, rel_shift, LSTM gate order, SOS, \
-                  blank rule, ...) each fail first at the stage their mechanism lives in. ⛔ \
-                  nemotron-3.5-asr-streaming-0.6b shares this arch string and is REFUSED at load: its \
-                  language-prompt MLP, causal subsampling and normalize=none are not implemented. \
+                  blank rule, ...) each fail first at the stage their mechanism lives in. \
+                  ⭐ nemotron-3.5-asr-streaming-0.6b (same arch string; 13088-token multilingual) is \
+                  Verified the same way: limited-context attention (the file declares (56,13); NeMo \
+                  restores at (56,3) — both checked, set_att_context selects), causal conv and causal \
+                  SUBSAMPLING (CausalConv2D pads 2 left / 1 right on both axes: 128 mels -> 17 bins, a \
+                  4352-wide projection), LayerNorm conv module, the RAW log-mel (NeMo's normalize: NA) \
+                  and the language PROMPT (one-hot after the encoder, Linear-ReLU-Linear; auto = 101, \
+                  set_target_lang). Encoder within 2.3e-5 of rms; the prompt output at or below \
+                  NeMo's own fp32-vs-fp64 floor there; joint logits within 7.1e-5 of each row's scale; \
+                  argmax equal at all 2,851 joint calls and tokens identical on 7 fixtures, incl. \
+                  (56,3) and en-US. 30-31 controls each, incl. the prompt (off / first / wrong \
+                  index), the context mask and causal subsampling. Offline only: streaming needs the \
+                  cache-aware encoder, which NeMo shows gives the same tokens. \
                   Gate: scripts/parakeet_conformance.sh vs tests/fixtures/parakeet/" },
 
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,

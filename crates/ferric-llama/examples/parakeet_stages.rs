@@ -23,6 +23,11 @@
 //! TEXT <transcript>
 //! TAPS_INERT <max |encode() − encode_stages()| at the encoder output>
 //! ```
+//! Stages run `logmel`, `mel`, `pre_conv`, `pre_out`, `pe`, `block.<i>`, `enc` and — for a
+//! prompt-conditioned model — `prompt`, the MLP output the joint actually sees. The fixture's
+//! `config` (attention context, prompt index) is applied before anything runs.
+//! ```text
+//! ```
 //! Run with `FERRIC_METAL4` and `FERRIC_COOP` unset: both switch in reduced-precision kernels.
 use ferric_gguf::GgufFile;
 use ferric_llama::parakeet::Parakeet;
@@ -102,7 +107,19 @@ async fn run() {
 
     let g = GgufFile::open(model).expect("open gguf");
     let ctx = Arc::new(ferric_core::Context::new().await.expect("gpu"));
-    let m = Parakeet::load(&ctx, &g).expect("load");
+    let mut m = Parakeet::load(&ctx, &g).expect("load");
+    // The settings the reference ran at, when the fixture pins them: a limited-context model's
+    // attention context, and a prompt model's language index. Both sides must share them — each
+    // is a different transcript.
+    let cfg = &fx["config"];
+    if let Some(a) = cfg["att_context"].as_array() {
+        let v: Vec<usize> = a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+        m.set_att_context(v[0], v[1]).expect("the fixture's attention context");
+    }
+    if let Some(id) = cfg["prompt_id"].as_u64() {
+        assert!(m.prompt.is_some(), "the fixture sets a prompt index; this model takes none");
+        m.prompt_id = Some(id as usize);
+    }
     eprintln!("{}", m.describe());
 
     let (pcm16, rate) = read_audio(audio);
@@ -122,7 +139,7 @@ async fn run() {
     let recorded: Vec<String> = fx["stages"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
     let order: Vec<String> = ["logmel", "mel", "pre_conv", "pre_out", "pe"].iter().map(|s| s.to_string())
         .chain((0..m.blocks.len()).map(|i| format!("block.{i}")))
-        .chain(std::iter::once("enc".to_string()))
+        .chain(["enc", "prompt"].iter().map(|s| s.to_string()))
         .collect();
     for r in &recorded {
         if !order.contains(r) { eprintln!("fixture stage {r:?} is not one this runtime taps"); }

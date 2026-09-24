@@ -64,6 +64,22 @@ pub struct Cfg {
     /// The conv module's normaliser. Offline parakeet ships BatchNorm (folded to affine at load);
     /// the streaming encoder ships LayerNorm, which is a different op over a different axis.
     pub conv_layernorm: bool,
+    /// Every `(left, right)` context the checkpoint was TRAINED to run at
+    /// (`att_context_size_choices`), the declared `att_ctx` among them. Selecting another one is
+    /// [`Parakeet::set_att_context`]; anything outside this list is refused.
+    pub att_ctx_choices: Vec<(usize, usize)>,
+    /// Per-feature (per mel bin) normalisation of the log-mel — `stt.frontend.normalize`. The
+    /// streaming model is trained on the RAW log-mel (NeMo's config: `normalize: NA`); normalising it
+    /// anyway measured 0 tokens instead of 177 on a 33 s clip. Read, never assumed.
+    pub normalize: bool,
+    /// CAUSAL subsampling (NeMo `causal_downsampling`): every strided 3x3 conv pads (2 left, 1 right)
+    /// on BOTH axes — `CausalConv2D` — instead of (1, 1), so 128 mel bins become 65, 33, 17 and the
+    /// projection reads 256·17 = 4352. No key records it; the projection's input width does, and
+    /// `from_gguf` accepts only the two widths the two paddings produce.
+    pub causal_sub: bool,
+    /// The language prompt of a prompt-conditioned checkpoint (see [`PromptCfg`]); `None` for the
+    /// single-language models.
+    pub prompt: Option<PromptCfg>,
     // ---- decoder ----
     pub pred_hidden: usize,
     pub pred_layers: usize,
@@ -79,6 +95,17 @@ pub struct Cfg {
     pub ctc: bool,
     /// Negative controls for the conformance harness — all off unless `FERRIC_ASR_NEG_*` is set.
     pub neg: Neg,
+}
+
+/// A prompt-conditioned model's language prompt (`stt.parakeet.prompt.*`), NeMo's
+/// `EncDecRNNTBPEModelWithPrompt`: a one-hot over `num_prompts` is concatenated AFTER the encoder
+/// output, and `prompt.mlp` (Linear → ReLU → Linear) maps the `d_model + num_prompts` row back to
+/// `d_model`. What the joint sees is that, not the encoder output. `locales` maps a language tag to
+/// its index; `auto_id` is the one NeMo uses when none is given (`target_lang = "auto"`).
+#[derive(Clone, Debug)]
+pub struct PromptCfg {
+    pub num_prompts: usize, pub hidden: usize, pub auto_id: usize,
+    pub locales: Vec<(String, usize)>,
 }
 
 /// **Negative controls.** Each one re-introduces ONE known-wrong convention at ONE site, so the
@@ -118,6 +145,13 @@ pub struct Neg {
     pub max_symbols: Option<usize>, // MAXSYM=<n> instead of 10
     pub joint_tanh: bool,           // JOINT_ACT=tanh
     pub ctc_tie_last: bool,         // CTC_TIE=last: last maximum on a tie (the old rule)
+    pub normalize_flip: bool,       // NORMALIZE=flip: normalise a raw-log-mel model, or not a per_feature one
+    pub subpad_time_symmetric: bool,// SUBPAD=time_symmetric: causal subsampling padded (1,1) in time
+    pub attctx_full: bool,          // ATTCTX=full: no limited-context mask
+    pub prompt_off: bool,           // PROMPT=off: skip the prompt MLP
+    pub prompt_first: bool,         // PROMPT=concat_first: one-hot BEFORE the encoder features
+    pub prompt_id0: bool,           // PROMPT=id0: index 0 (en-US) whatever the selected language
+    pub conv_ln_affine: bool,       // CONVNORM=ln_affine: LayerNorm params applied without normalising
     /// `NAME=value` of every control in force, for the load receipt.
     pub active: Vec<String>,
 }
@@ -166,6 +200,13 @@ impl Neg {
                 },
                 ("JOINT_ACT", "tanh") => n.joint_tanh = true,
                 ("CTC_TIE", "last") => n.ctc_tie_last = true,
+                ("NORMALIZE", "flip") => n.normalize_flip = true,
+                ("SUBPAD", "time_symmetric") => n.subpad_time_symmetric = true,
+                ("ATTCTX", "full") => n.attctx_full = true,
+                ("PROMPT", "off") => n.prompt_off = true,
+                ("PROMPT", "concat_first") => n.prompt_first = true,
+                ("PROMPT", "id0") => n.prompt_id0 = true,
+                ("CONVNORM", "ln_affine") => n.conv_ln_affine = true,
                 _ => return Err(bad()),
             }
             n.active.push(format!("{name}={v}"));
@@ -251,13 +292,14 @@ impl Cfg {
         // ⛔ REFUSE THE VARIANTS THIS FORWARD PASS DOES NOT IMPLEMENT.
         //
         // `general.architecture = "parakeet"` names a FAMILY, not a configuration.
-        // nemotron-3.5-asr-streaming-0.6b shares the arch string and differs in six ways at once —
+        // nemotron-3.5-asr-streaming-0.6b shares the arch string and differs in seven ways at once —
         // chunked-limited attention (left 56 / right 13, not full context), a CAUSAL depthwise conv
-        // (conv_context_right = 0, not symmetric), LayerNorm in the conv module instead of
-        // BatchNorm, no input scaling, no per-feature normalisation, and a prompt-conditioned
-        // multilingual head (13088 tokens, prompt.field = target_lang).
+        // (conv_context_right = 0, not symmetric), CAUSAL subsampling, LayerNorm in the conv module
+        // instead of BatchNorm, no input scaling, no per-feature normalisation, and a
+        // prompt-conditioned multilingual head (13088 tokens, prompt.field = target_lang). Each is
+        // now read from the file and implemented; each was checked against NeMo on its own.
         //
-        // Loading it anyway would produce a transcript. The wrong one. `arch::resolve` guards
+        // Loading a variant anyway would produce a transcript. The wrong one. `arch::resolve` guards
         // against near-miss ARCHITECTURES; nothing guarded against near-miss VARIANTS WITHIN one.
         // ⚠ GUARD ON THE CONTEXT VALUES, NOT THE STYLE STRING. parakeet-unified ALSO declares
         // `att_context_style = "chunked_limited_with_rc"` — with left = right = -1, meaning
@@ -311,10 +353,55 @@ impl Cfg {
                 }
                 _ => {}
             }
-            if md.get("stt.parakeet.prompt.field").is_some() {
-                return Err("prompt-conditioned (multilingual) parakeet: the decoder needs a \
-                            language prompt token this runtime does not supply".into());
+        // The language prompt. Only the one scheme read from the reference is accepted: a
+        // `target_lang` one-hot through a ReLU MLP. A different field or activation is a model this
+        // forward pass has never been checked against, and refuses.
+        let prompt = match md.get("stt.parakeet.prompt.field") {
+            None => None,
+            Some(Meta::Str(f)) if f == "target_lang" => {
+                if !matches!(md.get("stt.parakeet.prompt.activation"), Some(Meta::Str(a)) if a == "relu") {
+                    return Err("stt.parakeet.prompt.activation is not relu: unimplemented prompt MLP".into());
+                }
+                let strs = |k: &str| -> Vec<String> { match md.get(k) {
+                    Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { Some(s.clone()) } else { None }).collect(),
+                    _ => Vec::new() } };
+                let nums = |k: &str| -> Vec<usize> { match md.get(k) {
+                    Some(Meta::Arr(a)) => a.iter().filter_map(|m| match m { Meta::U(v) => Some(*v as usize),
+                                                                            Meta::I(v) => Some(*v as usize), _ => None }).collect(),
+                    _ => Vec::new() } };
+                let (names, idx) = (strs("stt.parakeet.prompt.dictionary.locales"), nums("stt.parakeet.prompt.dictionary.indices"));
+                if names.is_empty() || names.len() != idx.len() {
+                    return Err(format!("prompt dictionary: {} locales but {} indices", names.len(), idx.len()));
+                }
+                let p = PromptCfg {
+                    num_prompts: u("stt.parakeet.prompt.num_prompts")?, hidden: u("stt.parakeet.prompt.hidden")?,
+                    auto_id: u("stt.parakeet.prompt.auto_id")?, locales: names.into_iter().zip(idx).collect(),
+                };
+                if p.auto_id >= p.num_prompts || p.locales.iter().any(|(_, i)| *i >= p.num_prompts) {
+                    return Err("a prompt index is outside num_prompts".into());
+                }
+                Some(p)
             }
+            Some(other) => return Err(format!("stt.parakeet.prompt.field {other:?}: only a target_lang \
+                                                prompt is implemented")),
+        };
+        // Per-feature normalisation, or none. `NA` is how NeMo's own config spells "none" — its
+        // `normalize_batch` has no branch for it and returns the log-mel untouched.
+        let normalize = match alt("stt.frontend.normalize", "asr.preprocessor.normalize") {
+            None => true,
+            Some(Meta::Str(v)) if v == "per_feature" => true,
+            Some(Meta::Str(v)) if ["none", "NA", "na"].contains(&v.as_str()) => false,
+            Some(v) => return Err(format!("frontend normalize {v:?}: this runtime implements per_feature and none")),
+        };
+        // The trained attention contexts, as flat (left, right) pairs.
+        let mut att_ctx_choices: Vec<(usize, usize)> = match md.get("stt.parakeet.encoder.att_context_size_choices") {
+            Some(Meta::Arr(a)) => {
+                let v: Vec<i64> = a.iter().filter_map(|m| match m { Meta::U(x) => Some(*x as i64), Meta::I(x) => Some(*x), _ => None }).collect();
+                v.chunks_exact(2).filter(|c| c[0] >= 0 && c[1] >= 0).map(|c| (c[0] as usize, c[1] as usize)).collect()
+            }
+            _ => Vec::new(),
+        };
+        if let Some(c) = att_ctx { if !att_ctx_choices.contains(&c) { att_ctx_choices.push(c); } }
 
         let sample_rate = ua("stt.frontend.sample_rate", "asr.preprocessor.sample_rate")?;
         // asr states window/stride in SECONDS; parakeet in SAMPLES. Convert once, here.
@@ -332,14 +419,35 @@ impl Cfg {
         };
         // asr.ctc.num_classes EXCLUDES the blank; the head emits num_classes + 1.
         let vocab = if ctc { u("asr.ctc.num_classes")? + 1 } else { u("stt.parakeet.predictor.vocab")? };
+        let num_mels = ua("stt.frontend.num_mels", "asr.preprocessor.features")?;
+        let subsampling_factor = ua("stt.parakeet.encoder.subsampling_factor", "asr.encoder.subsampling_factor")?;
+        let subsampling_channels = ua("stt.parakeet.encoder.subsampling_channels", "asr.encoder.subsampling_conv_channels")?;
+        // ⚠ CAUSAL OR SYMMETRIC SUBSAMPLING, from the one place the file records it: the width the
+        // projection reads. Symmetric padding maps f bins to ceil(f/2) per stage, causal to f/2 + 1,
+        // so 128 mels give 256·16 = 4096 or 256·17 = 4352. Anything else is a third scheme, refused.
+        // (Loading the causal file as symmetric used to panic in `matmul_bt` on the width; had the
+        // widths happened to agree, it would have run shifted by one frame per stage.)
+        let causal_sub = {
+            let stages = subsampling_factor.trailing_zeros();
+            let (mut fs, mut fc) = (num_mels, num_mels);
+            for _ in 0..stages { fs = (fs + 1) / 2; fc = fc / 2 + 1; }
+            let w = g.tensor(naming.pre_out()).map(|t| t.dims[0] as usize).ok_or("missing the pre_encode projection")?;
+            if w == subsampling_channels * fs { false }
+            else if w == subsampling_channels * fc { true }
+            else {
+                return Err(format!("pre_encode projection reads {w}: neither symmetric ({}) nor causal ({}) \
+                                    subsampling of {num_mels} mels", subsampling_channels * fs, subsampling_channels * fc));
+            }
+        };
         Ok(Cfg {
             naming, ctc, sample_rate, win_length, hop_length, att_ctx, conv_layernorm,
+            att_ctx_choices, normalize, causal_sub, prompt,
             neg: Neg::from_env()?,
             conv_right: if conv_right == usize::MAX {
                 ua("stt.parakeet.encoder.conv_kernel", "asr.encoder.conv_kernel_size")? / 2
             } else { conv_right },
             n_fft: ua("stt.frontend.n_fft", "asr.preprocessor.n_fft")?,
-            num_mels: ua("stt.frontend.num_mels", "asr.preprocessor.features")?,
+            num_mels,
             f_min: f("stt.frontend.f_min", 0.0),
             f_max: fa("stt.frontend.f_max", "", sample_rate as f32 / 2.0),
             pre_emphasis: fa("stt.frontend.pre_emphasis", "asr.preprocessor.preemph", 0.97),
@@ -348,8 +456,7 @@ impl Cfg {
             n_heads: ua("stt.parakeet.encoder.n_heads", "asr.encoder.n_heads")?,
             d_ff: ua("stt.parakeet.encoder.d_ff", "asr.encoder.d_ff")?,
             conv_kernel: ua("stt.parakeet.encoder.conv_kernel", "asr.encoder.conv_kernel_size")?,
-            subsampling_factor: ua("stt.parakeet.encoder.subsampling_factor", "asr.encoder.subsampling_factor")?,
-            subsampling_channels: ua("stt.parakeet.encoder.subsampling_channels", "asr.encoder.subsampling_conv_channels")?,
+            subsampling_factor, subsampling_channels,
             xscaling: ba("stt.parakeet.encoder.xscaling", "asr.encoder.xscaling", true),
             pred_hidden, pred_layers, joint_hidden, vocab,
             blank_id: match alt("tokenizer.ggml.blank_token_id", "asr.ctc.blank_id") {
@@ -504,6 +611,11 @@ pub struct Parakeet {
     /// Conv1d (`decoder.decoder_layers.0`, dims [1, d, vocab]), which `Linear::load` reads as a
     /// matmul — the same rank-3 case as the conv module's pointwise layers.
     pub ctc_head: Option<Linear>,
+    /// The language-prompt MLP (`prompt.mlp.0`, `prompt.mlp.2`) of a prompt-conditioned model.
+    pub prompt: Option<(Linear, Linear)>,
+    /// The prompt index in force: `Cfg::prompt.auto_id` at load, as NeMo's default `target_lang =
+    /// "auto"`; [`Parakeet::set_target_lang`] selects another.
+    pub prompt_id: Option<usize>,
     /// The mel filterbank as SHIPPED (`preprocessor.fb`), when the file carries one. The `asr`
     /// converter embeds it, which removes the Slaney-vs-HTK and area-normalisation guesswork
     /// entirely — six frontend conventions I had to recover from a reference for the other format.
@@ -634,6 +746,18 @@ impl Parakeet {
         let ctc_head = if cfg.ctc {
             Some(Linear::load(ctx, g, "decoder.decoder_layers.0.weight", true)?)
         } else { None };
+        let (prompt, prompt_id) = match &cfg.prompt {
+            None => (None, None),
+            Some(pc) => {
+                let (l0, l2) = (Linear::load(ctx, g, "prompt.mlp.0.weight", true)?, Linear::load(ctx, g, "prompt.mlp.2.weight", true)?);
+                // [out, in]: d+n → hidden → d. A mismatch is a different prompt scheme, not a typo.
+                if l0.w.shape != [pc.hidden, d + pc.num_prompts] || l2.w.shape != [d, pc.hidden] {
+                    return Err(format!("prompt.mlp shapes {:?} / {:?} do not match d_model {d} + {} prompts -> {}",
+                                       l0.w.shape, l2.w.shape, pc.num_prompts, pc.hidden));
+                }
+                (Some((l0, l2)), Some(pc.auto_id))
+            }
+        };
         // The shipped filterbank, [n_bins, n_mels] on disk → [n_mels][n_bins] to match `filterbank`.
         let fb = match g.tensor("preprocessor.fb") {
             Some(t) => {
@@ -653,8 +777,32 @@ impl Parakeet {
         if tokens.len() != want {
             return Err(format!("{} tokens but the config implies {want}", tokens.len()));
         }
-        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, rnnt, ctc_head, fb, tokens,
+        Ok(Parakeet { ctx: ctx.clone(), cfg, pre_conv, pre_out, blocks, rnnt, ctc_head, prompt, prompt_id, fb, tokens,
                       batch_blocks: cfg!(target_arch = "wasm32") || std::env::var("FERRIC_ASR_NOBATCH").is_err() })
+    }
+
+    /// Select the language prompt by tag (`en-US`, `de`, `auto`, …) through the file's own
+    /// dictionary — the mapping NeMo's `transcribe(target_lang=…)` uses.
+    pub fn set_target_lang(&mut self, lang: &str) -> Result<(), String> {
+        let p = self.cfg.prompt.as_ref().ok_or("this model takes no language prompt")?;
+        let id = if lang == "auto" { p.auto_id } else {
+            p.locales.iter().find(|(l, _)| l == lang).map(|(_, i)| *i)
+                .ok_or_else(|| format!("unknown target language {lang:?}"))?
+        };
+        self.prompt_id = Some(id);
+        Ok(())
+    }
+
+    /// Select one of the attention contexts the checkpoint was trained at. The file declares one;
+    /// NeMo's own default is the FIRST entry of its config list, which need not be the same one
+    /// (nemotron-3.5-asr-streaming: the file says (56,13), NeMo restores at (56,3)). Both are the
+    /// model; they are not the same transcript.
+    pub fn set_att_context(&mut self, left: usize, right: usize) -> Result<(), String> {
+        if !self.cfg.att_ctx_choices.contains(&(left, right)) {
+            return Err(format!("({left},{right}) is not among the trained contexts {:?}", self.cfg.att_ctx_choices));
+        }
+        self.cfg.att_ctx = Some((left, right));
+        Ok(())
     }
 
     /// A load-time receipt. A schedule that silently collapsed shows up here rather than as a wrong
@@ -668,6 +816,14 @@ impl Parakeet {
                 if self.cfg.ctc { "CTC" } else { "RNN-T" },
                 self.rnnt.as_ref().map_or(0, |(p, _)| p.lstm.len()), self.cfg.pred_hidden,
                 self.cfg.joint_hidden, self.cfg.vocab, self.cfg.blank_id);
+        let c = &self.cfg;
+        let mut s = s;
+        if let Some((l, r)) = c.att_ctx { s.push_str(&format!(" · context ({l},{r}) of {:?}", c.att_ctx_choices)); }
+        if c.causal_sub { s.push_str(" · causal subsampling"); }
+        if !c.normalize { s.push_str(" · raw log-mel"); }
+        if let (Some(p), Some(id)) = (&c.prompt, self.prompt_id) {
+            s.push_str(&format!(" · prompt {id} of {} ({} locales)", p.num_prompts, p.locales.len()));
+        }
         // A run under a negative control must not be mistakable for a clean one in any log.
         if self.cfg.neg.active.is_empty() { s }
         else { format!("{s} · ⚠ NEGATIVE CONTROLS: {}", self.cfg.neg.active.join(" ")) }
@@ -972,11 +1128,21 @@ impl Parakeet {
             } else {
                 // `c_in == 1` with multi-channel activations marks DEPTHWISE; `c_in == ch` is the
                 // ordinary full convolution (the first stage, 1 -> 256).
-                let (oh, ow) = ((h + 1) / 2, (w + 1) / 2);
+                let ((tl, tr), (fl, fr)) = self.sub_pad();
+                let (oh, ow) = ((h + tl + tr - 3) / 2 + 1, (w + fl + fr - 3) / 2 + 1);
+                // Symmetric (1,1) is the conv's own padding. CAUSAL (2,1) is not symmetric, so the
+                // zeros go in explicitly, exactly as `CausalConv2D` does with `F.pad` before an
+                // unpadded conv.
+                let (src, pad) = if (tl, tr, fl, fr) == (1, 1, 1, 1) { (cur.clone(), (1, 1)) } else {
+                    let z = |sh: &[usize]| Tensor::zeros(&self.ctx, sh);
+                    let t = z(&[1, tl, w, ch]).cat(&cur, 1).cat(&z(&[1, tr, w, ch]), 1);
+                    let hp = h + tl + tr;
+                    (z(&[1, hp, fl, ch]).cat(&t, 2).cat(&z(&[1, hp, fr, ch]), 2), (0, 0))
+                };
                 cur = if cin == 1 && ch > 1 {
-                    cur.depthwise_conv2d(&pc.wt, (2, 2), (1, 1))
+                    src.depthwise_conv2d(&pc.wt, (2, 2), pad)
                 } else {
-                    cur.conv2d(&pc.wt, (2, 2), (1, 1))
+                    src.conv2d(&pc.wt, (2, 2), pad)
                 }.add(&pc.bt.reshape(&[1, 1, 1, cout]).broadcast_to(&[1, oh, ow, cout]));
                 h = oh; w = ow; ch = cout;
             }
@@ -987,6 +1153,14 @@ impl Parakeet {
         let flat = if self.cfg.neg.flatten_freq_major { cur.reshape(&[h, w * ch]) }
                    else { cur.reshape(&[h, w, ch]).permute(&[0, 2, 1]).contiguous().reshape(&[h, ch * w]) };
         (flat, h, ch * w)
+    }
+
+    /// The strided convs' `((time left, right), (freq left, right))` zero padding: (1,1) each for
+    /// the offline model, (2,1) each for CAUSAL subsampling. SUBPAD=time_symmetric keeps the causal
+    /// frequency padding and centres time — the frequency width still matches, so nothing asserts.
+    fn sub_pad(&self) -> ((usize, usize), (usize, usize)) {
+        if !self.cfg.causal_sub { return ((1, 1), (1, 1)); }
+        (if self.cfg.neg.subpad_time_symmetric { (1, 1) } else { (2, 1) }, (2, 1))
     }
 
     /// dw_striding's activations: after the full conv and after each POINTWISE — vec indices
@@ -1017,17 +1191,19 @@ impl Parakeet {
                 }
                 cur = out; ch = cout;
             } else {
-                // 3x3, stride 2, pad 1. `cin == 1` marks DEPTHWISE: output channel o reads input
+                // 3x3, stride 2, pad (1,1) — or (2,1) when CAUSAL. `cin == 1` marks DEPTHWISE: output channel o reads input
                 // channel o. `cin == ch` is the ordinary full convolution (the first stage, 1→256).
                 let depthwise = cin == 1 && ch > 1;
-                let (oh, ow) = ((h + 1) / 2, (w + 1) / 2);
+                let ((tl, tr), (fl, fr)) = self.sub_pad();
+                let (oh, ow) = ((h + tl + tr - 3) / 2 + 1, (w + fl + fr - 3) / 2 + 1);
                 let mut out = vec![0f32; oh * ow * cout];
                 let swap = self.cfg.neg.preconv_swap_axes;
                 for y in 0..oh { for x in 0..ow {
                     for o in 0..cout {
                         let mut a = bv[o];
                         for i in 0..kh { for j in 0..kw {
-                            let (sy, sx) = (y as isize * 2 + i as isize - 1, x as isize * 2 + j as isize - 1);
+                            let (sy, sx) = (y as isize * 2 + i as isize - tl as isize,
+                                            x as isize * 2 + j as isize - fl as isize);
                             if sy < 0 || sx < 0 || sy >= h as isize || sx >= w as isize { continue; }
                             let base = (sy as usize * w + sx as usize) * ch;
                             let (ti, tj) = if swap { (j, i) } else { (i, j) };   // PRECONV=swap_axes
@@ -1176,6 +1352,7 @@ impl Parakeet {
     /// Every row keeps its own chunk (`chunk_diff == 0` is always allowed), so no row is fully
     /// masked — but a finite floor costs nothing and removes the failure mode entirely.
     fn att_mask(&self, t: usize) -> Option<Tensor> {
+        if self.cfg.neg.attctx_full { return None; }
         let (left, right) = self.cfg.att_ctx?;
         Some(Tensor::from_vec(&self.ctx, &chunked_limited_mask(t, left, right), &[t, t]))
     }
@@ -1271,7 +1448,7 @@ impl Parakeet {
         // LayerNorm is NOT that affine with different numbers: it first centres and scales each
         // frame across channels. Applying the folded-BatchNorm path to a LayerNorm checkpoint would
         // run, and be wrong.
-        let n = if self.cfg.conv_layernorm {
+        let n = if self.cfg.conv_layernorm && !self.cfg.neg.conv_ln_affine {
             Norm { w: c.bn_scale.clone(), b: c.bn_shift.clone() }.apply(&z, Self::EPS)
         } else {
             z.mul(&row(&c.bn_scale))         // inv_std * w
@@ -1438,7 +1615,9 @@ impl Parakeet {
                     else { frontend::valid_frames(pcm.len(), &self.cfg) };
         if valid == 0 { return Err("audio shorter than one hop".into()); }
         mel.truncate(valid * nm);
-        frontend::normalize_per_feature(&mut mel, valid, &self.cfg);
+        if self.cfg.normalize != self.cfg.neg.normalize_flip {
+            frontend::normalize_per_feature(&mut mel, valid, &self.cfg);
+        }
         taps.host("mel", valid, nm, &mel);
         // ⚠ NATIVE ONLY. `Instant::now()` PANICS on wasm32 ("time not implemented on this
         // platform") — it is not a no-op and not a zero. This probe, added to attribute encode time,
@@ -1510,6 +1689,24 @@ impl Parakeet {
             }
         }
         taps.dev("enc", &x);
+        // ⭐ THE LANGUAGE PROMPT, when the model has one: NeMo's forward concatenates a one-hot of the
+        // prompt index AFTER the encoder output, for every frame, and maps it back through the MLP.
+        // What the joint sees is that — so `encode` returns it, and the raw encoder output is the
+        // `enc` tap. Same prompt on every frame; no mask is involved (this tensor holds only valid
+        // frames, as everywhere above).
+        if let (Some((l0, l2)), Some(pid), Some(pc)) = (&self.prompt, self.prompt_id, &self.cfg.prompt) {
+            let neg = &self.cfg.neg;
+            if !neg.prompt_off {
+                let (t, n) = (x.shape[0], pc.num_prompts);
+                let id = if neg.prompt_id0 { 0 } else { pid };
+                let mut oh = vec![0f32; t * n];
+                for r in 0..t { oh[r * n + id] = 1.0; }
+                let oh = Tensor::from_vec(&self.ctx, &oh, &[t, n]);
+                let cat = if neg.prompt_first { oh.cat(&x, 1) } else { x.cat(&oh, 1) };
+                x = l2.apply(&l0.apply(&cat).relu());
+            }
+            taps.dev("prompt", &x);
+        }
         Ok(x)
     }
 
