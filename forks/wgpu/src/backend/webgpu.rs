@@ -1007,13 +1007,23 @@ fn future_request_adapter(
 ) -> Result<dispatch::DispatchAdapter, wgt::RequestAdapterError> {
     result
         .map_err(|_| request_adapter_null_error(requested_backends))
-        .and_then(|adapter| match adapter.into_option() {
-            Some(adapter) => Ok(WebAdapter {
-                inner: adapter,
-                ident: crate::cmp::Identifier::create(),
+        .and_then(|adapter| {
+            // ⛔ `requestAdapter()` resolves to NULL when there is no adapter, and
+            // `JsOption::into_option` maps only `undefined` to `None` (wasm-bindgen 0.2.126). A
+            // null therefore became `Some(null)`, the caller's first `get_info()` read `.info` on
+            // it, and the TypeError escaped the future: the JS promise never settled, so a page
+            // waiting to fall back to CPU hung instead. Null is absent, checked explicitly.
+            if wasm_bindgen::JsValue::is_null(&adapter) {
+                return Err(request_adapter_null_error(requested_backends));
             }
-            .into()),
-            None => Err(request_adapter_null_error(requested_backends)),
+            match adapter.into_option() {
+                Some(adapter) => Ok(WebAdapter {
+                    inner: adapter,
+                    ident: crate::cmp::Identifier::create(),
+                }
+                .into()),
+                None => Err(request_adapter_null_error(requested_backends)),
+            }
         })
 }
 
@@ -1067,7 +1077,14 @@ fn future_request_device(
 fn future_pop_error_scope(
     result: Result<js_sys::JsOption<webgpu_sys::GpuError>, wasm_bindgen::JsValue>,
 ) -> Option<crate::Error> {
-    Some(crate::Error::from_js(result.ok()?.into_option()?.into()))
+    let error = result.ok()?;
+    // `popErrorScope()` resolves to NULL when the scope captured no error, and `into_option` keeps
+    // a null as `Some` (see `future_request_adapter`): that reached `Error::from_js`, which panics
+    // on anything that is not a validation or out-of-memory error. A clean scope is `None`.
+    if wasm_bindgen::JsValue::is_null(&error) {
+        return None;
+    }
+    Some(crate::Error::from_js(error.into_option()?.into()))
 }
 
 fn future_compilation_info(
