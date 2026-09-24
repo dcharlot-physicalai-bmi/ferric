@@ -5,12 +5,13 @@
 //!
 //! Reads the authors' token ids and their fixed vocabulary sample from the fixture, runs ONE
 //! stateless prefill (`Qwen3::forward` for llama / qwen2 / qwen3 / gemma3, `Qwen35::forward` for the
-//! gated-delta-net hybrids, `Lfm2::forward` from an empty cache for the short-conv hybrids —
+//! gated-delta-net hybrids, `Lfm2::forward` from an empty cache for the short-conv hybrids, `NemotronH::forward` for the
+//! Mamba-2 hybrid —
 //! dispatched on the file's `general.architecture`), and prints per
 //! position: the sampled logits, the argmax, and the sum and sum-of-squares of the FULL row — so a
 //! defect anywhere in the vocabulary moves a number even though only 128 ids are compared directly.
 use ferric_gguf::{GgufFile, GgufSource, Meta};
-use ferric_llama::{lfm2::{self, Lfm2}, qwen3::Qwen3, qwen35::Qwen35};
+use ferric_llama::{lfm2::{self, Lfm2}, nemotron_h::NemotronH, qwen3::Qwen3, qwen35::Qwen35};
 use std::sync::Arc;
 
 fn field<'a>(s: &'a str, key: &str) -> &'a str {
@@ -38,6 +39,8 @@ async fn run() {
     eprintln!("arch: {arch}");
     let lg = if arch.starts_with("qwen35") {
         Qwen35::load(&ctx, &g).expect("load qwen35").forward(&ids).to_vec().await
+    } else if arch == "nemotron_h" {
+        NemotronH::load(&ctx, &g).expect("load nemotron_h").forward(&ids).expect("forward").to_vec().await
     } else if arch.starts_with("lfm2") {
         let m = Lfm2::load(&ctx, &g).expect("load lfm2");
         let mut cache = lfm2::Cache::new(&m.cfg);

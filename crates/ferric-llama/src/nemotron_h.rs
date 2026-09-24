@@ -516,6 +516,9 @@ impl NemotronH {
         // slice for seven groups out of eight; measured, that put block 0 at -175.8 against the
         // reference's -2.73.
         let gw = b.gnorm.broadcast_to(&[t, inner]);
+        // `FERRIC_SSM_ONE_GROUP` normalises the whole row as ONE group — the negative control
+        // `scripts/lm_conformance.sh` runs to show it can see the grouping at all. Stateless path only.
+        let ng = if std::env::var("FERRIC_SSM_ONE_GROUP").is_ok() { 1 } else { ng };
         let normed = gated.reshape(&[t * ng, inner / ng])
             .rmsnorm_weightless(c.eps)
             .reshape(&[t, inner])

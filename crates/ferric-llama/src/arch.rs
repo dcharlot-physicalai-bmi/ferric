@@ -148,18 +148,24 @@ pub const REGISTRY: &[Arch] = &[
     // ---- dense GQA family ----------------------------------------------------------------
     Arch { name: "nemotron_h", runtime: Runtime::NemotronH, status: Status::Verified,
            note: "Mamba-2 / attention / MLP hybrid — the FIRST non-transformer runtime here. 42 blocks: \
-                  21 state-space mixers, 17 ReLU^2 MLPs, 4 attention. RUNS and reproduces the \
-                  reference: from 'The capital of France is' it generates ' Paris.', matching \
-                  llama.cpp. Embedding sum is exact and block 0 agrees to 0.10%. REFERENCE-CHECKED at the \
-                  distribution, which is the level that settles it: on the same 8-token prompt the \
-                  top-10 match the reference token for token IN THE SAME ORDER, logprobs agreeing to \
-                  ~0.01 (-0.7843 vs -0.7757, -2.4986 vs -2.5101, -3.1770 vs -3.1766, -3.3060 vs \
-                  -3.3102). An earlier greedy run diverged after ' Paris.' and that was a different \
-                  token PATH, not a different distribution — the leader there holds under half the \
-                  mass, so which of several near-ties wins is not a fidelity test. Per-block sums are \
-                  not one either: their error tracks the cancellation ratio |sum|/max|v| (5.18 gives \
-                  0.10%, 0.14 gives 13.85%), so they localise a gross defect and cannot grade \
-                  fidelity. INCREMENTAL STATE WORKS and is the architecture's whole argument: 85.4 MB of \
+                  21 state-space mixers, 17 ReLU^2 MLPs, 4 attention, and NO rotary anywhere. \
+                  ⭐ Verified against the MODEL AUTHORS' OWN FILE — the modeling_nemotron_h.py NVIDIA ships \
+                  in nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 (transformers 5.7.0, float32, eager), on F32 \
+                  converted from their weights: max |logit diff| 4.0e-5 over 138 positions x 128 sampled \
+                  ids, argmax 138/138, full-row sum of squares within 8.2e-6. Normalising the SSM output \
+                  over one group instead of 8 is 204,353x worse. It was first checked against llama.cpp \
+                  on a Q4_K_M file, logprobs to ~0.01, which could not have seen what follows. \
+                  ⛔⛔ THE REFERENCE SIDE HAD THREE DEFECTS, each of which first read as Ferric's: \
+                  (1) transformers' BUILT-IN port floors dt at time_step_min (0.001, an init range) where \
+                  the authors clamp to (0, inf): 0.27 off; (2) the authors' own CPU fallback TILES heads \
+                  over B/C groups where their CUDA kernels index them contiguously (pid_h // ratio), \
+                  corrected in the generator by --fix-group-tiling; (3) under transformers 5.x their \
+                  remote code re-initialises dt_bias and out_proj in all 21 mixers AFTER loading (42 \
+                  tensors, 0 'missing keys'), so every reference parameter is now checked BY VALUE \
+                  against the file. Corrected, the authors' file and the built-in port (floor removed) \
+                  agree to 5.0e-5: two paths, one documented correction each. \
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/nemotron3-nano-4b.json. \
+                  INCREMENTAL STATE WORKS and is the architecture's whole argument: 85.4 MB of \
                   conv+SSM+KV that does NOT grow with the conversation, against a transformer's KV \
                   cache that does. Verified by EQUALITY — a cache bug drifts rather than raising, so \
                   the reference-checked stateless path stays and the cached one must reproduce it \

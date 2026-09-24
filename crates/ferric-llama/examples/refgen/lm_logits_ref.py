@@ -18,7 +18,32 @@ Per position the fixture records what a full-vocabulary comparison needs, compac
 The input is ~150 tokens of the authors' own tokenizer output, so RoPE is exercised well past the
 first handful of positions where a wrong rotation is nearly invisible.
 
-Run in float32, eager:  <python> lm_logits_ref.py <model_id> [min_tokens] > fixture.json
+Run in float32, eager:  <python> lm_logits_ref.py <model_id> [min_tokens] [--remote-code] > fixture.json
+
+`--remote-code` runs the modeling file the AUTHORS SHIP IN THEIR REPO (trust_remote_code) instead of
+transformers' built-in port of it — NVIDIA's Nemotron-H repo carries its own `modeling_nemotron_h.py`,
+and that file is the authors' implementation in the most literal sense. The fixture records which ran.
+
+⛔⛔ THE BUILT-IN PORT IS NOT THE AUTHORS' CODE, and on Nemotron-H they disagree by 0.27 in the logits.
+transformers' NemotronH torch path floors dt at `time_step_min` (0.001, an INITIALISATION range), where
+the authors' file, and transformers' own kernel path, clamp to `time_step_limit` = (0, inf): no floor.
+Ferric matched the built-in to 0.27 and the built-in-without-the-floor to 3.6e-5.
+
+`--restore-from-file` re-copies every parameter from the checkpoint file after loading, for a loader known
+to overwrite them (the Nemotron-H remote code under transformers 5.x: see refload.py). The count is
+recorded; the by-value check then runs again and must find nothing.
+
+`--fix-group-tiling` corrects ONE line of the authors' Nemotron-H CPU fallback, and refuses to run if it
+finds nothing to correct. That fallback maps heads onto B/C groups with `B.repeat(1, 1, heads_per_group, 1)`,
+which TILES them (head h -> group h mod 8). The authors' own CUDA kernels, which is how the model is
+trained and served, index `pid_h // nheads_ngroups_ratio`, CONTIGUOUS groups (head h -> group h // 12;
+state-spaces/mamba `ssd_chunk_state.py`, and its reference `"b l g d -> b l (g h) d"`). Corrected, the
+authors' file agrees with transformers' built-in port (its dt floor removed) to 5.0e-5 over the full
+vocabulary: two independent paths, one documented correction each, one answer.
+
+`--mamba-ref-shim` lets the authors' Nemotron-H file run without CUDA: it imports mamba_ssm's Triton
+`rmsnorm_fn` even on its torch path, and `shims/mamba_ssm` supplies the kernel authors' own pure-torch
+`rms_norm_ref` in its place (see that file). Recorded in the fixture's `shims`.
 
 ⛔ A SLIDING WINDOW IS INVISIBLE BELOW ITS WIDTH. Gemma 3's local layers see the last 512 tokens, and at
 ~140 tokens they see everything — a port with no window at all matches exactly. Pass `min_tokens` above
@@ -33,40 +58,28 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ⛔⛔ LOAD AT FULL PRECISION, AND CHECK IT *AS LOADED* — NEVER AFTER A CAST.
-#
-# Two failures, found in order on Qwen/Qwen3.5-0.8B under transformers 5.7.0, both of which produced
-# a "reference" that read as a defect in Ferric:
-#   1. `from_pretrained(dtype=torch.float32)` is IGNORED for a COMPOSITE config (a multimodal checkpoint
-#      whose text model carries `text_config.dtype = bfloat16`). The model loads in bf16 and every one
-#      of the checkpoint's 36 F32-STORED tensors (the norms, the gate parameters) is ROUNDED on load —
-#      the gated-norm weight arrived 3.9e-3 away from the file. Ferric, reading the file, was right.
-#   2. The first guard written for (1) was VACUOUS: it called `.to(float32)` and THEN asserted float32,
-#      which is always true. It checked the LABEL; the values had been rounded before the cast.
-# So: set float32 on the config AND every sub-config, pass it in, and assert on the parameters exactly
-# as `from_pretrained` returned them.
-from transformers import AutoConfig
-
-def _f32_config(model_id):
-    cfg = AutoConfig.from_pretrained(model_id)
-    def walk(c, seen):
-        if id(c) in seen: return
-        seen.add(id(c)); c.dtype = torch.float32
-        for name in list(getattr(type(c), "sub_configs", {}) or {}) + ["text_config", "vision_config", "audio_config"]:
-            sub = getattr(c, name, None)
-            if sub is not None and hasattr(sub, "to_dict"): walk(sub, seen)
-    walk(cfg, set())
-    return cfg
-
-def load_f32(cls, model_id, **kw):
-    m = cls.from_pretrained(model_id, config=_f32_config(model_id), dtype=torch.float32, **kw)
-    bad = sorted({str(p.dtype) for p in m.parameters() if p.dtype != torch.float32})   # AS LOADED
-    if bad:
-        raise SystemExit(f"{model_id} loaded as {bad}, not float32 — refusing to emit a fixture")
-    return m
+# The loader, its float32 handling and its by-value check against the checkpoint file: refload.py.
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from refload import LOAD_REPORT, _f32_config, load_f32  # noqa: E402
 
 
-MODEL = sys.argv[1]
+POS_ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+REMOTE = "--remote-code" in sys.argv[1:]
+SHIMS = []
+if "--mamba-ref-shim" in sys.argv[1:]:
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "shims"))
+    SHIMS.append("mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn -> rms_norm_ref (the kernel authors' "
+                 "pure-torch reference, state-spaces/mamba)")
+    if not torch.cuda.is_available():
+        # The authors' block forward runs inside `torch.cuda.stream(...)`, which a CPU build refuses. A
+        # stream ORDERS GPU work and changes no arithmetic; with no GPU there is nothing to order.
+        import contextlib
+        torch.cuda.stream = lambda *a, **k: contextlib.nullcontext()
+        torch.cuda.default_stream = lambda *a, **k: None
+        SHIMS.append("torch.cuda.stream -> nullcontext (CPU build: a stream orders GPU work, no arithmetic)")
+MODEL = POS_ARGS[0]
 TEXT = ("The heron stood motionless in the shallows while the tide turned. A fisherman on the far bank "
         "counted his nets twice, then a third time, because the numbers never agreed. Measurements, he "
         "thought, are only as honest as the instrument and the person reading it. In 1854 John Snow "
@@ -74,10 +87,34 @@ TEXT = ("The heron stood motionless in the shallows while the tide turned. A fis
         "points were on paper. def mean(xs): return sum(xs) / len(xs)  # an empty list divides by zero. "
         "Über den Wolken muss die Freiheit wohl grenzenlos sein. 月が綺麗ですね。 The answer is 42.")
 
-MIN_T = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+MIN_T = int(POS_ARGS[1]) if len(POS_ARGS) > 1 else 0
 
 tok = AutoTokenizer.from_pretrained(MODEL)
-model = load_f32(AutoModelForCausalLM, MODEL, attn_implementation="eager").eval()
+model = load_f32(AutoModelForCausalLM, MODEL, attn_implementation="eager",
+                 restore_from_file="--restore-from-file" in sys.argv[1:],
+                 **({"trust_remote_code": True} if REMOTE else {})).eval()
+CORRECTIONS = []
+if "--fix-group-tiling" in sys.argv[1:]:
+    import inspect, textwrap
+    fixed = set()
+    for mod in model.modules():
+        cls = type(mod)
+        if cls in fixed or not hasattr(cls, "torch_forward"): continue
+        code = textwrap.dedent(inspect.getsource(cls.torch_forward))
+        n = 0
+        for v in ("B", "C"):
+            tiled = f"{v}.repeat(1, 1, self.num_heads // self.n_groups, 1)"
+            n += code.count(tiled)
+            code = code.replace(tiled, f"{v}.repeat_interleave(self.num_heads // self.n_groups, dim=2)")
+        if n:
+            ns = {}; exec(compile(code, f"<{cls.__name__}.torch_forward, contiguous groups>", "exec"),
+                          sys.modules[cls.__module__].__dict__, ns)
+            cls.torch_forward = ns["torch_forward"]; fixed.add(cls)
+            CORRECTIONS.append(f"{cls.__name__}.torch_forward: {n} x B/C `repeat` (tiled heads) -> "
+                               f"`repeat_interleave` (contiguous), as the authors' CUDA kernels index")
+    if not CORRECTIONS:
+        raise SystemExit("--fix-group-tiling found no tiled group mapping to correct — refusing, the flag "
+                         "would otherwise be recorded while changing nothing")
 text = TEXT
 while MIN_T and len(tok(text, add_special_tokens=True)["input_ids"]) < MIN_T:
     text += " " + TEXT
@@ -107,6 +144,11 @@ for t in positions:
 json.dump({
     "model": MODEL,
     "model_type": model.config.model_type,
+    "code": (f"the authors' repo: {type(model).__module__}" if REMOTE
+             else f"transformers built-in: {type(model).__module__}"),
+    "shims": SHIMS,
+    "corrections": CORRECTIONS,
+    "load": LOAD_REPORT,   # parameters compared BY VALUE to the checkpoint file, as loaded
     "architectures": model.config.architectures,
     "transformers": __import__("transformers").__version__,
     "torch": torch.__version__,

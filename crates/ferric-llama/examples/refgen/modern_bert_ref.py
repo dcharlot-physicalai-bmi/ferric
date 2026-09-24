@@ -29,37 +29,10 @@ import sys
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# ⛔⛔ LOAD AT FULL PRECISION, AND CHECK IT *AS LOADED* — NEVER AFTER A CAST.
-#
-# Two failures, found in order on Qwen/Qwen3.5-0.8B under transformers 5.7.0, both of which produced
-# a "reference" that read as a defect in Ferric:
-#   1. `from_pretrained(dtype=torch.float32)` is IGNORED for a COMPOSITE config (a multimodal checkpoint
-#      whose text model carries `text_config.dtype = bfloat16`). The model loads in bf16 and every one
-#      of the checkpoint's 36 F32-STORED tensors (the norms, the gate parameters) is ROUNDED on load —
-#      the gated-norm weight arrived 3.9e-3 away from the file. Ferric, reading the file, was right.
-#   2. The first guard written for (1) was VACUOUS: it called `.to(float32)` and THEN asserted float32,
-#      which is always true. It checked the LABEL; the values had been rounded before the cast.
-# So: set float32 on the config AND every sub-config, pass it in, and assert on the parameters exactly
-# as `from_pretrained` returned them.
-from transformers import AutoConfig
-
-def _f32_config(model_id):
-    cfg = AutoConfig.from_pretrained(model_id)
-    def walk(c, seen):
-        if id(c) in seen: return
-        seen.add(id(c)); c.dtype = torch.float32
-        for name in list(getattr(type(c), "sub_configs", {}) or {}) + ["text_config", "vision_config", "audio_config"]:
-            sub = getattr(c, name, None)
-            if sub is not None and hasattr(sub, "to_dict"): walk(sub, seen)
-    walk(cfg, set())
-    return cfg
-
-def load_f32(cls, model_id, **kw):
-    m = cls.from_pretrained(model_id, config=_f32_config(model_id), dtype=torch.float32, **kw)
-    bad = sorted({str(p.dtype) for p in m.parameters() if p.dtype != torch.float32})   # AS LOADED
-    if bad:
-        raise SystemExit(f"{model_id} loaded as {bad}, not float32 — refusing to emit a fixture")
-    return m
+# The loader, its float32 handling and its by-value check against the checkpoint file: refload.py.
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from refload import LOAD_REPORT, _f32_config, load_f32  # noqa: E402
 
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "Alibaba-NLP/gte-reranker-modernbert-base"
@@ -130,4 +103,5 @@ with torch.no_grad():
         "mean_hidden": ((h * m).sum(0) / m.sum()).tolist(),
     }
 
+out["load"] = LOAD_REPORT   # every parameter compared BY VALUE to the checkpoint file
 json.dump(out, sys.stdout)
