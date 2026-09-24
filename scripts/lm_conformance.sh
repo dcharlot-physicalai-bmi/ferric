@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Causal LMs (llama / qwen2 / qwen3 dense, qwen35 gated-delta-net hybrid): Ferric vs THE MODEL AUTHORS'
-# OWN IMPLEMENTATION, every position.
+# Causal LMs (llama / qwen2 / qwen3 / gemma3 dense, qwen35 gated-delta-net and lfm2 short-conv hybrids):
+# Ferric vs THE MODEL AUTHORS' OWN IMPLEMENTATION, every recorded position.
 #
 # ⛔⛔ THE REFERENCE IS THE AUTHORS' CODE. These architectures were marked Verified against llama.cpp
 # (`scripts/validate_vs_llamacpp.sh`, which called llama.cpp "the reference") or against a reference the
@@ -48,6 +48,9 @@ def header(path):
             k = rstr(f); t = u32(f)
             if k == 'general.file_type' and t in (4, 5): out['ft'] = u32(f)
             elif k == 'general.architecture' and t == 8: out['arch'] = rstr(f)
+            elif k.endswith('.attention.sliding_window') and t in (4, 5): out['window'] = u32(f)
+            elif k.endswith('.rope.freq_base_swa') and t == 6: out['base_swa'] = struct.unpack('<f', f.read(4))[0]
+            elif k.endswith('.rope.freq_base') and t == 6: out['base'] = struct.unpack('<f', f.read(4))[0]
             else: skip(f, t)
     return out
 
@@ -55,32 +58,36 @@ H = header(M); FT = H.get('ft'); ARCH = H.get('arch', '?')
 if FT not in (0, 1, 32):
     print(f"⛔ {os.path.basename(M)} is quantised (file_type {FT}) — it cannot verify the math; convert the "
           f"authors' weights at F32"); sys.exit(2)
-# Measured on F32 weights converted from the authors' own files (max |logit diff|): Qwen3-0.6B 7.0e-5,
-# Llama-3.2-1B 1.1e-4, Qwen2.5-0.5B 2.6e-4, Qwen3.5-0.8B 7.5e-4 — the hybrid sits at 3/4 of the band, so
-# a regression there has little room. F16/BF16 files add weight rounding, so they get a looser band.
+# Measured on F32 weights converted from the authors' own files (max |logit diff|): LFM2-350M 5.0e-5,
+# Qwen3-0.6B 7.0e-5, Llama-3.2-1B 1.1e-4, Gemma-3-1B 1.2e-4, Qwen2.5-0.5B 2.6e-4, Qwen3.5-0.8B 7.5e-4 —
+# the gated-delta-net hybrid sits at 3/4 of the band, so a regression there has little room. F16/BF16 files add weight rounding, so they get a looser band.
 LOGIT_TOL, SSQ_TOL = (1e-3, 1e-4) if FT == 0 else (5e-2, 5e-3)
 
 def measure(env_extra=None):
     env = dict(os.environ)
-    for k in ("FERRIC_ROPE_NORM", "FERRIC_NEOX"): env.pop(k, None)
+    for k in ("FERRIC_ROPE_NORM", "FERRIC_NEOX", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA"): env.pop(k, None)
     env.update(env_extra or {})
     r = subprocess.run([BIN, M, FX], capture_output=True, text=True, env=env)
     if r.returncode:
         print(r.stderr[-1500:]); sys.exit(1)
     rows = [l.split(" ") for l in r.stdout.splitlines() if l.startswith("ROW ")]
-    if len(rows) != len(ref["rows"]):
-        print(f"⛔ Ferric produced {len(rows)} rows for {len(ref['rows'])} positions"); sys.exit(1)
+    if len(rows) != len(ref["ids"]):
+        print(f"⛔ Ferric produced {len(rows)} rows for {len(ref['ids'])} tokens"); sys.exit(1)
     worst = worst_t = 0; argmax = 0; ssq = 0.0
-    for t, (row, rr) in enumerate(zip(rows, ref["rows"])):
+    for t, rr in zip(POS, ref["rows"]):
+        row = rows[t]
         best = int(row[2]); q = float(row[4]); vals = [float(x) for x in row[5:]]
         d = max(abs(a - b) for a, b in zip(vals, rr["sample"]))
         if d > worst: worst, worst_t = d, t
         argmax += best == rr["top"][0][0]
         ssq = max(ssq, abs(q - rr["ssq"]) / rr["ssq"])
-    return worst, worst_t, argmax, ssq, len(rows)
+    return worst, worst_t, argmax, ssq, len(POS)
 
+# A long fixture records a stride of positions plus the tail; a short one records every position.
+POS = ref.get("positions") or list(range(len(ref["ids"])))
+if len(POS) != len(ref["rows"]):
+    print(f"⛔ fixture lists {len(POS)} positions and {len(ref['rows'])} rows"); sys.exit(1)
 worst, worst_t, argmax, ssq, n = measure()
-rows = [None] * n
 # ⭐ NEGATIVE CONTROL: the WRONG rotary pairing — the classic silent RoPE failure, which still produces
 # fluent text. llama's GGUF weights are permuted for interleaved (NORM) pairing; the Qwen family uses
 # split-half (NEOX). Flip whichever this architecture uses; if the gate cannot see that, it sees nothing.
@@ -91,8 +98,9 @@ c_worst, _, c_argmax, _, _ = measure(flip)
 
 print(f"reference: {ref['model']} ({ref['model_type']}) — transformers {ref['transformers']}, torch "
       f"{ref['torch']}, float32, eager")
-print(f"weights:   {os.path.basename(M)} ({ {0:'F32',1:'F16',32:'BF16'}[FT] }, arch {ARCH})   positions {n}   vocab {ref['vocab']}")
-print(f"  max |logit diff|, {len(rows)} x {len(ref['sample_ids'])} sampled   {worst:.3e}  (at position {worst_t}; tol {LOGIT_TOL:g})")
+print(f"weights:   {os.path.basename(M)} ({ {0:'F32',1:'F16',32:'BF16'}[FT] }, arch {ARCH})   tokens {len(ref['ids'])}, "
+      f"positions compared {n}   vocab {ref['vocab']}")
+print(f"  max |logit diff|, {n} x {len(ref['sample_ids'])} sampled   {worst:.3e}  (at position {worst_t}; tol {LOGIT_TOL:g})")
 print(f"  argmax agreement                          {argmax}/{n}")
 print(f"  full-row sum of squares, worst rel diff   {ssq:.3e}  (tol {SSQ_TOL:g})")
 print(f"  control: wrong rope pairing ({list(flip)[0]})     max |logit diff| {c_worst:.3e}  "
@@ -100,6 +108,26 @@ print(f"  control: wrong rope pairing ({list(flip)[0]})     max |logit diff| {c_
 ok = worst <= LOGIT_TOL and ssq <= SSQ_TOL and argmax == n
 if c_worst < 20 * worst:
     print("  ⛔ the wrong-rope control is not ≥20x worse — this gate cannot see a rotary error"); ok = False
+
+# ⭐ MECHANISM CONTROLS, run whenever the FILE declares the mechanism (a gate that decides from the arch
+# name would skip the next architecture that has one).
+extra = []
+if H.get('base_swa') and H.get('base') and H['base_swa'] != H['base']:
+    extra.append((f"one rope base ({H['base']:g} on the local layers, not {H['base_swa']:g})", {"FERRIC_ONE_ROPE": "1"}))
+W = H.get('window', 0)
+if W:
+    if len(ref["ids"]) > W:
+        extra.append((f"sliding window {W} disabled", {"FERRIC_NO_SWA": "1"}))
+    else:
+        # Not a failure — this input cannot exercise it — but never silent: a window is invisible below
+        # its width, and a port with NO window matches exactly here.
+        print(f"  ⚠ sliding window {W} NOT exercised: {len(ref['ids'])} tokens ≤ {W}. Pair this with a fixture "
+              f"generated with min_tokens > {W}")
+for label, env in extra:
+    e_worst, _, e_argmax, _, _ = measure(env)
+    print(f"  control: {label}   max |logit diff| {e_worst:.3e}  = {e_worst / max(worst, 1e-9):,.0f}x   argmax {e_argmax}/{n}")
+    if e_worst < 20 * worst:
+        print(f"  ⛔ not ≥20x worse — this gate cannot see that mechanism on this input"); ok = False
 print("✅ agrees with the authors at every position" if ok else "⛔ LM conformance FAILED")
 sys.exit(0 if ok else 1)
 PY

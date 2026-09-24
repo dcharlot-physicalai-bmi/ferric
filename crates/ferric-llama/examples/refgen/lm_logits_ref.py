@@ -18,7 +18,13 @@ Per position the fixture records what a full-vocabulary comparison needs, compac
 The input is ~150 tokens of the authors' own tokenizer output, so RoPE is exercised well past the
 first handful of positions where a wrong rotation is nearly invisible.
 
-Run in float32, eager:  <python> lm_logits_ref.py <model_id> > fixture.json
+Run in float32, eager:  <python> lm_logits_ref.py <model_id> [min_tokens] > fixture.json
+
+⛔ A SLIDING WINDOW IS INVISIBLE BELOW ITS WIDTH. Gemma 3's local layers see the last 512 tokens, and at
+~140 tokens they see everything — a port with no window at all matches exactly. Pass `min_tokens` above
+the window: the text repeats until it is that long, so the global layers can copy from a repetition
+the local ones can no longer reach. A long input records a stride of positions plus the whole tail
+(listed in `positions`), not every row, to keep the fixture small.
 """
 import json
 import random
@@ -68,9 +74,16 @@ TEXT = ("The heron stood motionless in the shallows while the tide turned. A fis
         "points were on paper. def mean(xs): return sum(xs) / len(xs)  # an empty list divides by zero. "
         "Über den Wolken muss die Freiheit wohl grenzenlos sein. 月が綺麗ですね。 The answer is 42.")
 
+MIN_T = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
 tok = AutoTokenizer.from_pretrained(MODEL)
 model = load_f32(AutoModelForCausalLM, MODEL, attn_implementation="eager").eval()
-ids = tok(TEXT, add_special_tokens=True)["input_ids"]
+text = TEXT
+while MIN_T and len(tok(text, add_special_tokens=True)["input_ids"]) < MIN_T:
+    text += " " + TEXT
+ids = tok(text, add_special_tokens=True)["input_ids"]
+positions = (list(range(len(ids))) if not MIN_T
+             else sorted(set(range(0, len(ids), 8)) | set(range(len(ids) - 64, len(ids)))))
 V = model.config.vocab_size
 rng = random.Random(20260924)
 sample = sorted(rng.sample(range(min(V, model.get_output_embeddings().weight.shape[0])), 128))
@@ -79,7 +92,7 @@ with torch.no_grad():
     logits = model(input_ids=torch.tensor([ids])).logits[0].float()   # [T, V]
 
 rows = []
-for t in range(logits.shape[0]):
+for t in positions:
     r = logits[t]
     top = torch.topk(r, 10)
     rows.append({
@@ -100,6 +113,7 @@ json.dump({
     "dtype": str(next(model.parameters()).dtype),   # asserted float32 AS LOADED by load_f32, recorded anyway
     "vocab": int(logits.shape[1]),
     "ids": ids,
+    "positions": positions,
     "sample_ids": sample,
     "rows": rows,
 }, sys.stdout)

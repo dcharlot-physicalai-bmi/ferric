@@ -67,6 +67,21 @@ struct Block {
     norm: Tensor, mixer: Mixer, ffn_norm: Tensor, ffn: Ffn,
 }
 
+/// The solo path's rotary: split-half (NeoX) pairing at absolute position `pos`.
+///
+/// `FERRIC_ROPE_NORM` forces the WRONG (interleaved) pairing — the negative control
+/// `scripts/lm_conformance.sh` runs, as the dense and qwen35 runtimes honour it. A gate whose control
+/// cannot move the output cannot show that it would see a rotary error. Only this path reads the flag;
+/// the batched decode path does not.
+fn rope_solo(x: &Tensor, n_heads: usize, head_dim: usize, base: f32, pos: usize) -> Tensor {
+    if std::env::var("FERRIC_ROPE_NORM").is_ok() {
+        let p: Vec<u32> = (pos as u32..(pos + x.shape[0]) as u32).collect();
+        x.rope_at_ex(n_heads, head_dim, base, &p, None, true)
+    } else {
+        x.rope(n_heads, head_dim, base, pos)
+    }
+}
+
 /// Per-sequence decode state: KV for attention blocks, a rolling window for conv blocks.
 pub struct Cache {
     pub pos: usize,
@@ -392,10 +407,10 @@ impl Lfm2 {
             let op = match &blk.mixer {
                 Mixer::Attn { q, k, v, o, q_norm, k_norm, n_kv } => {
                     // RoPE at the ABSOLUTE position, so a cached decode step rotates by `pos`, not 0.
-                    let qh = h.matmul_q(q).reshape(&[t * n_head, head_dim]).rmsnorm(q_norm, eps)
-                        .reshape(&[t, n_head * head_dim]).rope(n_head, head_dim, self.cfg.rope_base, pos);
-                    let kh = h.matmul_q(k).reshape(&[t * n_kv, head_dim]).rmsnorm(k_norm, eps)
-                        .reshape(&[t, n_kv * head_dim]).rope(*n_kv, head_dim, self.cfg.rope_base, pos);
+                    let qh = rope_solo(&h.matmul_q(q).reshape(&[t * n_head, head_dim]).rmsnorm(q_norm, eps)
+                        .reshape(&[t, n_head * head_dim]), n_head, head_dim, self.cfg.rope_base, pos);
+                    let kh = rope_solo(&h.matmul_q(k).reshape(&[t * n_kv, head_dim]).rmsnorm(k_norm, eps)
+                        .reshape(&[t, n_kv * head_dim]), *n_kv, head_dim, self.cfg.rope_base, pos);
                     let vh = h.matmul_q(v);
                     // One `&mut` to the tuple, then split into its two disjoint fields: the borrow
                     // checker cannot see that .0 and .1 do not alias when reached through two separate

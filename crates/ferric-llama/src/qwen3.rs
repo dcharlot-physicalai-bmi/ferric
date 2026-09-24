@@ -729,8 +729,23 @@ pub fn build_layer(
             // every other windowed architecture silently had its theta replaced by 10000. Muse Glimmer
             // rotates its local layers at rope_base = 500000; at 1e4 the model loads, produces finite
             // logits, and emits newlines forever.
-            let rope_base = if cfg.is_gemma && !cfg.gemma2 && is_local { 10000.0 } else { cfg.rope_base };
-            let window = if is_local { cfg.sliding_window } else { 0 };
+            //
+            // The local θ is DECLARED by current converters as `rope.freq_base_swa` (from the authors'
+            // `rope_local_base_freq`, 10000 on every released Gemma 3) and is read from there; a file
+            // without the key gets the authors' 10000. ModernBERT is the reason not to hardcode it: two
+            // bases that happen to match on one checkpoint make a one-base port exact there and wrong
+            // on the next.
+            //
+            // Negative controls for `scripts/lm_conformance.sh`: `FERRIC_ONE_ROPE` rotates the local
+            // layers at the global base, `FERRIC_NO_SWA` lets them see the whole sequence. Each must
+            // move the logits, or the gate has not shown it can see that mechanism.
+            let local_base = || -> f32 {
+                let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => String::new() };
+                match g.metadata().get(&format!("{arch}.rope.freq_base_swa")) { Some(Meta::F(v)) => *v as f32, _ => 10000.0 }
+            };
+            let one_rope = std::env::var("FERRIC_ONE_ROPE").is_ok();
+            let rope_base = if cfg.is_gemma && !cfg.gemma2 && is_local && !one_rope { local_base() } else { cfg.rope_base };
+            let window = if is_local && std::env::var("FERRIC_NO_SWA").is_err() { cfg.sliding_window } else { 0 };
             Ok(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
                 ffn_norm: nrm(&b("ffn_norm.weight"), cfg.n_embd)?,

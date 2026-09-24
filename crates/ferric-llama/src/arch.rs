@@ -258,7 +258,16 @@ pub const REGISTRY: &[Arch] = &[
     Arch { name: "gemma2", runtime: Runtime::Dense, status: Status::Loads,
            note: "alternating SWA (pattern 2) + attn/final logit softcapping" },
     Arch { name: "gemma3", runtime: Runtime::Dense, status: Status::Verified,
-           note: "reference-checked; 1-in-6 global attention, local rope base 10000" },
+           note: "1-in-6 global attention; local layers use a 512 window and their own rope base \
+                  (rope.freq_base_swa, 10000; global 1e6). ⭐ Verified against the MODEL AUTHORS' \
+                  implementation (transformers 5.7.0, float32, eager) on google/gemma-3-1b-it, F32 \
+                  converted from their files: max |logit diff| 1.2e-4 over 134 positions and 1.1e-4 \
+                  over 666 tokens (140 positions compared), argmax agreeing everywhere, full-row sum of \
+                  squares within 8.0e-6. On the 666-token input: wrong rope pairing 278,363x worse, ONE \
+                  rope base 237,961x, window disabled 236,359x. So all three mechanisms are \
+                  load-bearing. ⛔ The window is INVISIBLE below 512 tokens: on the short input a port \
+                  with no window matches exactly, which is why the long fixture exists. \
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/gemma-3-1b{,-long}.json" },
 
     // ---- Muse Glimmer (2026-08-09) --------------------------------------------------------
     //
@@ -363,7 +372,13 @@ pub const REGISTRY: &[Arch] = &[
 
     // ---- short-conv hybrid ---------------------------------------------------------------
     Arch { name: "lfm2", runtime: Runtime::Lfm2, status: Status::Verified,
-           note: "Liquid LFM2/LFM2.5; per-layer kv array marks conv blocks, conv state is PRE-conv" },
+           note: "Liquid LFM2/LFM2.5; per-layer kv array marks conv blocks, conv state is PRE-conv. \
+                  ⭐ Verified against the MODEL AUTHORS' implementation (transformers 5.7.0, float32, \
+                  eager) on LiquidAI/LFM2-350M, F32 converted from their files: max |logit diff| 5.0e-5 \
+                  over 138 positions x 128 sampled ids, argmax 138/138, full-row sum of squares within \
+                  9.9e-6; the wrong rope pairing is 206,465x worse. ⚠ That is ONE PREFILL: cached \
+                  decode, where the conv state matters, is compared with a full re-prefill by token ids \
+                  (examples/run_lfm2_cached.rs, run by hand), not against the authors. Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     Arch { name: "lfm2moe", runtime: Runtime::Lfm2, status: Status::Loads,
            note: "LFM2.5-8B-A1B: the same conv/attention schedule as lfm2, with the FFN made a \
                   mixture after `leading_dense_block_count` dense blocks (2 of 24). 32 experts, \
