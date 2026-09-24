@@ -80,7 +80,7 @@ pub trait Problem {
     /// by hand.
     ///
     /// ⭐ This is what solves the advection and burgers rows: `sciml::hardbc` measures **0.0251** and
-    /// **0.0142** with it, against 0.9712 and 0.2434 for the best recipe with soft conditions.
+    /// **0.0142** with it, against 0.9712 and 0.2434 for the full recipe with soft conditions (the vanilla row is better on both).
     fn marched_constraint(&self, _ctx: &Arc<Context>, _x: &Var, _t0: f64, _start: &dyn Fn(&Var) -> Var, _raw: &Var) -> Option<Var> {
         None
     }

@@ -255,7 +255,7 @@ the residual landscape.
 |---|---|---|---|
 | heat | **0.0082** | — | the recipe already reaches it |
 | helmholtz | 0.3066 | **0.0091** matched (0.0059 at 15k steps) | configuration 12.6× **×** hard constraints 2.7× — decomposed below |
-| advection | 0.9712 | **0.0251** | marching × hard conditions, 36× |
+| advection | 0.9144 | **0.0251** | marching × hard conditions, 36× |
 | burgers | 0.2079 | **0.0142** | marching × hard conditions, 14× |
 
 Burgers is the row where the obvious suspect was wrong twice over. The shock at `ν = 0.01/π` is genuinely
