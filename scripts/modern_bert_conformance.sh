@@ -1,177 +1,117 @@
 #!/usr/bin/env bash
-# ModernBERT: Ferric vs llama.cpp on the SAME ids, with the two hard mechanisms proved load-bearing.
+# ModernBERT: Ferric vs THE MODEL AUTHORS' OWN IMPLEMENTATION, with the hard mechanisms proved
+# load-bearing.
 #
-# ⛔ WHY THE NEGATIVE CONTROLS ARE NOT OPTIONAL. ModernBERT has exactly two places a port fails
-# silently, and "it matches the reference" says nothing about either unless disabling them makes the
-# number visibly worse:
-#   1. the SYMMETRIC sliding-window band (two layers in three), and
-#   2. TWO rope bases — global 160000, sliding 10000 on ModernBERT-large and
-#      gte-reranker-modernbert-base, but IDENTICAL on mmBERT-base. A port that reads one base is
-#      bit-exact on mmBERT and wrong on the others.
-# Measured on 222 tokens, gte-reranker-modernbert-base-F16:
-#   as implemented         cosine 0.99999965  max|diff| 2.0e-05
-#   window disabled        cosine 0.99272915  max|diff| 1.6e-02   (~800x worse)
-#   one rope base          cosine 0.99971104  max|diff| 5.1e-03   (~257x worse)
-# ⚠ Note the last row READS AS FINE. 0.9997 cosine is what the trap looks like from the outside.
+# ⛔⛔ THE REFERENCE IS THE AUTHORS' CODE, NOT ANOTHER PORT. This gate first compared against
+# `llama-embedding`. That caught a real disagreement on the classifier head (0.03-0.10) — and the
+# disagreement was then explained away as "F16 precision amplified by the head", because llama.cpp was
+# being treated as the gold standard it is not. Checked against the authors' `transformers` instead:
+# Ferric's head matched THEIR HEAD FED THE FIRST TOKEN, and llama.cpp matched their real output. The
+# checkpoint's config says `classifier_pooling: "mean"`; the GGUF converter drops that key; llama.cpp
+# gets it right only by HARDCODING mean for every modern-bert reranker. A peer implementation is a
+# cross-check. It is never the arbiter.
 #
-# ⛔ USE -f ON BOTH SIDES. `llama-tokenize -p` takes one line; mixing `-p` for the ids and `-f` for
-# the embedding compares the answer on two DIFFERENT inputs. That mistake moved a number from 2e-5
-# to 3e-3 here and read as a regression in the port.
+# The reference numbers are COMMITTED (tests/fixtures/modern_bert/gte_reranker_hf.json), produced by
+# crates/ferric-llama/examples/refgen/modern_bert_ref.py in float32 with eager attention. So this gate
+# needs only the GGUF — no Python, no llama.cpp. Regenerate the fixture with any Python that has
+# `transformers` + `torch` and keep the generator in the repo: a reference that lives in scratch is a
+# verification nobody can repeat.
 #
-#   scripts/modern_bert_conformance.sh <model.gguf> [prompt-file]
+# ⛔ WHY THE NEGATIVE CONTROLS ARE NOT OPTIONAL. ModernBERT has two places a port fails silently, and a
+# match proves nothing about a mechanism unless disabling it breaks the match:
+#   1. the SYMMETRIC sliding-window band (two layers in three) — only visible past ~130 tokens, which
+#      is why the controls run on the fixture's 222-token input and never on the short pairs;
+#   2. TWO rope bases — global 160000, sliding 10000 here and on ModernBERT-large, but IDENTICAL on
+#      mmBERT-base, so a one-base port is exact on mmBERT and wrong on the others.
+#
+#   scripts/modern_bert_conformance.sh <gte-reranker-modernbert-base .gguf> [fixture.json]
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-}"
-[ -f "$M" ] || { echo "usage: $0 <modern-bert.gguf> [prompt-file]"; exit 2; }
-LT="$(command -v llama-tokenize || true)"; LE="$(command -v llama-embedding || true)"
-[ -z "$LT" ] || [ -z "$LE" ] && { echo "needs llama-tokenize AND llama-embedding on PATH — the \
-reference is the point of this gate, so this is a hard exit, never a silent pass"; exit 2; }
-
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-P="${2:-}"
-if [ -z "$P" ]; then
-  P="$TMP/p.txt"
-  python3 - "$P" <<'PY'
-import sys
-w=['the','quick','brown','fox','jumps','over','lazy','dog','while','seven','ships','sail','past',
-   'harbour','lights','before','dawn','breaks','across','water']
-# >129 tokens, or the 129-wide band masks nothing and the window is never exercised.
-open(sys.argv[1],'w').write(' '.join(w[i%20] for i in range(220)))
-PY
-fi
-
-IDS="$($LT -m "$M" -f "$P" --ids 2>/dev/null | tail -1 | tr -d '[] ')"
-N="$(echo "$IDS" | tr ',' '\n' | wc -l | tr -d ' ')"
-[ "$N" -lt 130 ] && echo "⚠ only $N tokens — under 130 the symmetric band masks NOTHING and this run \
-does not exercise the sliding window at all"
-$LE -m "$M" -f "$P" --pooling cls -ngl 0 --embd-normalize 2 2>/dev/null \
-  | grep "^embedding 0:" | sed 's/^embedding 0: *//' > "$TMP/ref.txt"
-[ -s "$TMP/ref.txt" ] || { echo "llama-embedding produced no vector"; exit 2; }
+FX="${2:-$ROOT/crates/ferric-llama/tests/fixtures/modern_bert/gte_reranker_hf.json}"
+[ -f "$M" ] || { echo "usage: $0 <gte-reranker-modernbert-base .gguf> [fixture.json]"; exit 2; }
+[ -f "$FX" ] || { echo "no authors' reference at $FX — regenerate it with examples/refgen/modern_bert_ref.py"; exit 2; }
 
 BIN="$ROOT/target/release/examples/modern_bert_ref"
 [ -x "$BIN" ] || cargo build -q -p ferric-llama --release --example modern_bert_ref || exit 2
 
-echo "model: $(basename "$M")   tokens: $N"
-run_one () {
-  env $2 "$BIN" "$M" "$IDS" 2>/dev/null > "$TMP/o.txt"
-  python3 - "$1" "$TMP/ref.txt" "$TMP/o.txt" <<'PY'
-import sys
-ref=[float(x) for x in open(sys.argv[2]).read().split()]
-got=[float(x) for ln in open(sys.argv[3]) if ln.startswith("NRM ") for x in ln[4:].split()]
-if not ref or len(ref)!=len(got):
-    print(f"  {sys.argv[1]:<36} MISMATCH ref={len(ref)} ferric={len(got)}"); sys.exit(3)
-md=max(abs(a-b) for a,b in zip(ref,got)); dot=sum(a*b for a,b in zip(ref,got))
-print(f"  {sys.argv[1]:<36} cosine {dot:.8f}   max|diff| {md:.3e}")
-open("/tmp/.mb_md","a").write(f"{sys.argv[1]}\t{md}\n")
-PY
-}
-rm -f /tmp/.mb_md
-run_one "as implemented"                 ""                      || exit 1
-run_one "control: window disabled"       "FERRIC_MB_NO_SWA=1"    || exit 1
-run_one "control: one rope base"         "FERRIC_MB_ONE_ROPE=1"  || exit 1
+python3 - "$BIN" "$M" "$FX" <<'PY'
+import json, math, os, subprocess, sys
+BIN, M, FX = sys.argv[1:4]
+ref = json.load(open(FX))
 
-# ── the CLASSIFIER head, if this checkpoint has one ──────────────────────────
-# ⛔⛔ THE EMBEDDING COSINE DOES NOT COVER THIS, AND THAT IS THE POINT. On the pair below the
-# encoder's CLS row matches the reference at cosine 0.99999964 — and max|diff| 3.4e-3 in ABSOLUTE
-# terms, because cosine is scale-invariant. The head is not: a 768-term pooler, a LayerNorm and a
-# projection amplify that absolute error about 10x, to ~0.03-0.10 on scores spanning [-2.2, +2.4].
-# A gate that stopped at the embedding cosine would report this path as verified to 1e-5.
-#
-# ⛔ And the pair must be built the way the reference builds it: `cls_sep` ("\t") splits query from
-# document, then it concatenates query + EOS_TEXT + document and tokenizes THAT with specials
-# (examples/embedding/embedding.cpp:187-208). Tokenizing the tab itself puts a TAB TOKEN where the
-# separator belongs and moved a score from -2.16 to +0.24 here — a sign flip that looks like a
-# broken head.
-HAS_HEAD="$(python3 - "$M" <<'PYH'
-import struct,sys
-def u32(f): return struct.unpack('<I', f.read(4))[0]
-def u64(f): return struct.unpack('<Q', f.read(8))[0]
-def rstr(f): return f.read(u64(f)).decode('utf-8','replace')
-def val(f,t):
-    if t in (0,1): return struct.unpack('<b' if t==0 else '<B', f.read(1))[0]
-    if t in (2,3): return struct.unpack('<h' if t==2 else '<H', f.read(2))[0]
-    if t in (4,5): return struct.unpack('<i' if t==4 else '<I', f.read(4))[0]
-    if t==6: return struct.unpack('<f', f.read(4))[0]
-    if t==7: return struct.unpack('<?', f.read(1))[0]
-    if t==8: return rstr(f)
-    if t==9:
-        et=u32(f); n=u64(f); return [val(f,et) for _ in range(n)]
-    if t in (10,11): return struct.unpack('<q' if t==10 else '<Q', f.read(8))[0]
-    if t==12: return struct.unpack('<d', f.read(8))[0]
-f=open(sys.argv[1],'rb'); f.read(4); u32(f); nt=u64(f); nkv=u64(f)
-for _ in range(nkv): rstr(f); t=u32(f); val(f,t)
-names=[]
-for _ in range(nt):
-    n=rstr(f); nd=u32(f); [u64(f) for _ in range(nd)]; u32(f); u64(f); names.append(n)
-print("yes" if "cls.output.weight" in names else "no")
-PYH
-)"
-if [ "$HAS_HEAD" = "yes" ]; then
-  echo
-  echo "  classifier head (rerank):"
-  SEPTXT="$(python3 - "$M" <<'PY2'
-import struct,sys
-def u32(f): return struct.unpack('<I', f.read(4))[0]
-def u64(f): return struct.unpack('<Q', f.read(8))[0]
-def rstr(f): return f.read(u64(f)).decode('utf-8','replace')
-def val(f,t):
-    if t in (0,1): return struct.unpack('<b' if t==0 else '<B', f.read(1))[0]
-    if t in (2,3): return struct.unpack('<h' if t==2 else '<H', f.read(2))[0]
-    if t in (4,5): return struct.unpack('<i' if t==4 else '<I', f.read(4))[0]
-    if t==6: return struct.unpack('<f', f.read(4))[0]
-    if t==7: return struct.unpack('<?', f.read(1))[0]
-    if t==8: return rstr(f)
-    if t==9:
-        et=u32(f); n=u64(f); return [val(f,et) for _ in range(n)]
-    if t in (10,11): return struct.unpack('<q' if t==10 else '<Q', f.read(8))[0]
-    if t==12: return struct.unpack('<d', f.read(8))[0]
-f=open(sys.argv[1],'rb'); f.read(4); u32(f); u64(f); nkv=u64(f)
-toks=None; sep=None
-for _ in range(nkv):
-    k=rstr(f); t=u32(f); v=val(f,t)
-    if k=="tokenizer.ggml.tokens": toks=v
-    if k.endswith("seperator_token_id") or k.endswith("eos_token_id"):
-        if sep is None: sep=v
-print(toks[sep])
-PY2
-)"
-  RANK_OK=1
-  score_pair () {   # $1 query  $2 doc  $3 expect-sign (pos|neg)
-    printf '%s%s%s' "$1" "$SEPTXT" "$2" > "$TMP/pp.txt"
-    printf '%s\t%s' "$1" "$2" > "$TMP/pp_tab.txt"
-    local ids ref fer
-    ids="$($LT -m "$M" -f "$TMP/pp.txt" --ids 2>/dev/null | tail -1 | tr -d '[] ')"
-    ref="$($LE -m "$M" -f "$TMP/pp_tab.txt" --pooling rank -ngl 0 --embd-normalize -1 2>/dev/null \
-          | grep -i 'rerank score' | awk '{print $NF}')"
-    fer="$("$BIN" "$M" "$ids" 2>/dev/null | grep '^RANK' | awk '{print $2}')"
-    python3 - "$3" "$ref" "$fer" <<'PY3'
-import sys
-want,ref,fer=sys.argv[1],float(sys.argv[2]),float(sys.argv[3])
-d=abs(ref-fer)
-ok_sign = (ref>0)==(fer>0)
-ok_mag  = d <= 0.15
-flag = "" if (ok_sign and ok_mag) else "   <-- FAIL"
-print(f"    {want:<10} ref {ref:+8.3f}   ferric {fer:+8.3f}   |diff| {d:.3f}{flag}")
-sys.exit(0 if (ok_sign and ok_mag) else 1)
-PY3
-  }
-  score_pair "what is panda?" "The giant panda is a bear species endemic to China." "relevant"   || RANK_OK=0
-  score_pair "what is panda?" "The Eiffel Tower is a wrought-iron lattice tower in Paris." "irrelevant" || RANK_OK=0
-  [ "$RANK_OK" = "1" ] && echo "    ✅ sign and magnitude agree with the reference (tol 0.15 absolute)" \
-                       || { echo "    ⛔ classifier head disagrees with the reference"; exit 1; }
-fi
+def run(ids, env_extra=None):
+    env = dict(os.environ, **(env_extra or {}))
+    r = subprocess.run([BIN, M, ",".join(map(str, ids))], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        print(r.stderr[-800:]); sys.exit(1)
+    return {ln.split(" ", 1)[0]: ln.split(" ", 1)[1] for ln in r.stdout.splitlines() if " " in ln}
 
-python3 - <<'PY'
-import sys
-rows=dict(l.split('\t') for l in open('/tmp/.mb_md').read().strip().split('\n'))
-base=float(rows['as implemented'])
-ok=True
-for k,mult in (('control: window disabled',20.0),('control: one rope base',20.0)):
-    r=float(rows[k])
-    if r < base*mult:
-        print(f"⛔ {k}: {r:.3e} is not >= {mult:g}x the implemented {base:.3e} — that mechanism is NOT "
-              f"load-bearing here, so the conformance number proves nothing about it")
-        ok=False
-print("✅ both mechanisms are load-bearing; the match is about the hard parts" if ok else "")
+def vec(s): return [float(x) for x in s.split()]
+def cos(a, b): return sum(x*y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a) * sum(y*y for y in b))
+def mad(a, b): return max(abs(x - y) for x, y in zip(a, b))
+
+print(f"reference: {ref['model']} — transformers {ref['transformers']}, torch {ref['torch']}, "
+      f"float32, eager; classifier_pooling={ref['classifier_pooling']!r}")
+ok = True
+
+# ── 1. the encoder, long enough that the window actually masks ──────────────────────────────
+L = ref["long"]
+print(f"\nencoder, {len(L['ids'])} tokens (the band masks past ~130), vs the authors' mean hidden state:")
+rows = {}
+for label, env in (("as implemented", None),
+                   ("control: window disabled", {"FERRIC_MB_NO_SWA": "1"}),
+                   ("control: one rope base", {"FERRIC_MB_ONE_ROPE": "1"})):
+    o = run(L["ids"], env)
+    got = vec(o["MEAN"])
+    rows[label] = mad(got, L["mean_hidden"])
+    print(f"  {label:<26} cosine {cos(got, L['mean_hidden']):.8f}   max|diff| {rows[label]:.3e}")
+base = rows["as implemented"]
+for k in ("control: window disabled", "control: one rope base"):
+    if rows[k] < 20 * base:
+        print(f"  ⛔ {k}: {rows[k]:.3e} is not ≥20x the implemented {base:.3e} — that mechanism is NOT "
+              f"load-bearing on this input, so the match proves nothing about it"); ok = False
+if base > 5e-2:
+    print(f"  ⛔ the implemented encoder is {base:.3e} from the authors — beyond F16 weight rounding"); ok = False
+
+# ── 2. the classifier head, on the authors' own pair tokenization ────────────────────────────
+print("\nclassifier head vs the authors' score (their tokenizer, their pooling):")
+worst = 0.0
+for p in ref["pairs"]:
+    o = run(p["ids"])
+    got = float(o["RANK"].split()[0])
+    want = p["logit_configured"][0]
+    d = abs(got - want); worst = max(worst, d)
+    flag = "" if (d <= 0.03 and (got > 0) == (want > 0)) else "   <-- FAIL"
+    print(f"  {p['query'][:16]:<16} | {p['doc'][:26]:<26} authors {want:+8.4f}  ferric {got:+8.4f}  |diff| {d:.4f}{flag}")
+    if flag: ok = False
+    # The first-token pooling this head used to have is a DIFFERENT function; it must be visibly worse.
+    wrong = p["logit_cls"][0]
+    if abs(wrong - want) < d:
+        print(f"    ⛔ the authors' head fed the FIRST token ({wrong:+.4f}) is closer than Ferric — "
+              f"the pooling check cannot tell the two rules apart on this pair"); ok = False
+print(f"  worst |diff| {worst:.4f}  (tol 0.03: the GGUF is F16, the reference ran float32)")
+
+print("\n" + ("✅ encoder and head agree with the authors; both hard mechanisms are load-bearing"
+              if ok else "⛔ conformance FAILED"))
 sys.exit(0 if ok else 1)
 PY
+rc=$?
+
+# ── optional peer cross-check: reported, never gating ─────────────────────────────────────────
+LE="$(command -v llama-embedding || true)"
+if [ "$rc" = "0" ] && [ -n "$LE" ]; then
+  echo
+  echo "peer cross-check (llama.cpp $(llama-embedding --version 2>&1 | head -1 | awk '{print $2, $4}')) — informational only:"
+  python3 - "$FX" <<'PY' > /tmp/.mb_pairs.tsv
+import json, sys
+for p in json.load(open(sys.argv[1]))["pairs"]: print(p["query"] + "\t" + p["doc"] + "\t" + str(p["logit_configured"][0]))
+PY
+  while IFS=$'\t' read -r q d want; do
+    printf '%s\t%s' "$q" "$d" > /tmp/.mb_pair.txt
+    got=$("$LE" -m "$M" -f /tmp/.mb_pair.txt --pooling rank -ngl 0 --embd-normalize -1 2>/dev/null \
+          | grep -i "rerank score" | awk '{print $NF}')
+    printf "  %-16s authors %+8.4f  llama.cpp %+8.3f\n" "${q:0:16}" "$want" "${got:-nan}"
+  done < /tmp/.mb_pairs.tsv
+fi
+exit $rc

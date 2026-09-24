@@ -30,6 +30,8 @@ async fn run() {
     eprintln!("n_swa={} rope_base={} rope_base_swa={}", c.n_swa, c.rope_base, c.rope_base_swa);
     eprintln!("global layers: {:?}", c.swa.iter().enumerate().filter(|(_, s)| !**s).map(|(i, _)| i).collect::<Vec<_>>());
     eprintln!("labels: {:?}", c.labels);
+    eprintln!("head pooling: {} ({})", match c.pooling { 1 => "MEAN", 2 => "CLS", _ => "other" },
+              if c.pooling_declared { "declared by the file" } else { "NOT declared — documented default" });
     eprintln!("ids ({}): {:?}", ids.len(), ids);
 
     let h = m.forward(&ids).expect("forward");
@@ -51,5 +53,10 @@ async fn run() {
         println!("RANK {}", logits.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(" "));
     }
     println!("RAW {}", cls.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(" "));
+    // The masked mean of every row — pooling-independent evidence about the ENCODER, comparable to
+    // the authors' `mean_hidden` without trusting any runtime's pooling rule.
+    let t = ids.len();
+    let mean: Vec<f32> = (0..d).map(|j| (0..t).map(|r| v[r * d + j]).sum::<f32>() / t as f32).collect();
+    println!("MEAN {}", mean.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(" "));
     println!("NRM {}", cls.iter().map(|x| format!("{:.6}", x / n)).collect::<Vec<_>>().join(" "));
 }

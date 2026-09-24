@@ -71,6 +71,29 @@ pub struct Cfg {
     pub swa: Vec<bool>,
     /// `classifier.output_labels`, when the file declares them.
     pub labels: Vec<String>,
+    /// How the classification head pools the encoder output — llama.cpp's `pooling_type` values:
+    /// 1 MEAN over the attention mask, 2 CLS (the first token).
+    ///
+    /// ⛔⛔ THIS IS A PROPERTY OF THE CHECKPOINT, AND THE GGUF CONVERTER THROWS IT AWAY. The authors
+    /// state it as `classifier_pooling` in config.json — `"mean"` for Alibaba-NLP/gte-reranker-
+    /// modernbert-base, while `transformers`' own ModernBertConfig DEFAULTS to `"cls"`. llama.cpp's
+    /// `conversion/bert.py` never reads the key, so no GGUF of this family carries it, and llama.cpp
+    /// compensates by HARDCODING mean for every modern-bert reranker (`llama-graph.cpp`, RANK arm,
+    /// commented as the gte reranker's behaviour). That is right for gte and would be wrong for a
+    /// ModernBERT classifier trained with CLS pooling.
+    ///
+    /// Read from `<arch>.pooling_type` when the file declares it. When it does not, MEAN — the only
+    /// modern-bert reranker in the open record is mean-pooled — and the default is reported by
+    /// [`Cfg::pooling_declared`] so a caller can see it was assumed, not read.
+    ///
+    /// ⚠ How this was found: Ferric first pooled CLS and was checked against llama.cpp, whose
+    /// scores it missed by 0.03-0.10 — diagnosed at the time as F16 precision amplified by the head.
+    /// It was the pooling. Checked against the AUTHORS' implementation instead, Ferric matched their
+    /// head fed the first token and llama.cpp matched their real output. A peer implementation is a
+    /// cross-check, never the reference.
+    pub pooling: u32,
+    /// Did the file declare `pooling_type`, or is [`Cfg::pooling`] the documented default?
+    pub pooling_declared: bool,
 }
 
 /// The sliding layers' rope base, given what the file stated and the global base.
@@ -120,7 +143,10 @@ impl Cfg {
             Some(Meta::Arr(a)) => a.iter().filter_map(|m| match m { Meta::Str(s) => Some(s.clone()), _ => None }).collect(),
             _ => Vec::new(),
         };
-        Ok(Cfg { d, n_layer, n_head, n_ff, eps, n_swa, rope_base, rope_base_swa, swa, labels })
+        let declared = crate::pooling::declared_pooling(md.iter());
+        let pooling = declared.unwrap_or(1);
+        Ok(Cfg { d, n_layer, n_head, n_ff, eps, n_swa, rope_base, rope_base_swa, swa, labels,
+                 pooling, pooling_declared: declared.is_some() })
     }
 
     /// The rope base layer `il` uses — the per-layer lookup `get_rope_freq_base(cparams, il)`.
@@ -332,7 +358,14 @@ impl ModernBert {
         let c = self.cls.as_ref().ok_or(
             "this checkpoint has no cls.* head: it embeds but cannot classify or score a pair")?;
         let h = self.forward(ids)?;
-        let pooled = h.narrow(0, 0, 1).reshape(&[1, self.cfg.d]);
+        // The checkpoint's pooling, through the ONE shared rule (`crate::pooling::pool`) rather than
+        // a second copy of it here — the rule was already written twice once today and one copy was
+        // wrong. A type the head cannot use (NONE, LAST, RANK) refuses inside `pool`.
+        let t = ids.len();
+        let v = h.to_vec().await;
+        let p = crate::pooling::pool(&v, t, self.cfg.d, self.cfg.pooling)
+            .map_err(|e| format!("classifier head: {e}"))?;
+        let pooled = Tensor::from_vec(&self.ctx, &p, &[1, self.cfg.d]);
         let mut z = pooled.matmul_bt(&c.w);
         if let Some(b) = &c.b { z = z.add(b); }
         // ggml's `gelu` is the TANH approximation via an fp16 table, which `gelu_tanh` matches in math.
@@ -356,7 +389,8 @@ mod cfg_tests {
 
     fn cfg(n_layer: usize, swa: Vec<bool>, base: f32, base_swa: f32) -> Cfg {
         Cfg { d: 768, n_layer, n_head: 12, n_ff: 1152, eps: 1e-5, n_swa: 128,
-              rope_base: base, rope_base_swa: base_swa, swa, labels: vec![] }
+              rope_base: base, rope_base_swa: base_swa, swa, labels: vec![],
+              pooling: 1, pooling_declared: false }
     }
 
     /// ⛔⛔ THE TRAP THIS ARCHITECTURE HIDES, AND THE ONLY GUARD ON IT THAT RUNS IN CI.

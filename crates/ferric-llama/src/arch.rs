@@ -190,28 +190,22 @@ pub const REGISTRY: &[Arch] = &[
                   scoring matches the reference to 0.24%. EMBEDS AND SCORES — generation is refused, \
                   there is no LM head to generate from" },
     Arch { name: "modern-bert", runtime: Runtime::ModernBert, status: Status::Verified,
-           note: "encoder-only and NOT the BERT above: RoPE (NeoX) instead of learned positions, \
-                  PRE-LayerNorm with no bias instead of post-LN with bias, GeGLU over a fused \
-                  {d, 2*n_ff} up, one fused qkv, layer 0's attn_norm absent (identity), and \
+           note: "encoder-only and NOT the BERT above: RoPE (NeoX), PRE-LayerNorm with no bias, GeGLU \
+                  over a fused {d, 2*n_ff} up, one fused qkv, layer 0's attn_norm absent (identity), and \
                   alternating SYMMETRIC-band / global attention on a dense-first 1-in-3 schedule. \
-                  Reference-checked against llama-embedding on gte-reranker-modernbert-base F16 at \
-                  cosine 0.99999965 (max|diff| 2.0e-5) over 222 tokens — long enough that the \
-                  129-wide band actually masks. ⭐ BOTH hard mechanisms are proved load-bearing by \
-                  negative control: disabling the window gives 0.9927 (800x worse) and reading ONE \
-                  rope base gives 0.9997 (257x worse). ⛔⛔ TWO ROPE BASES: global 160000, sliding \
-                  10000 here and on ModernBERT-large, but IDENTICAL on mmBERT-base — so a one-base \
-                  port is bit-exact on mmBERT and silently wrong on the others, and 0.9997 cosine is \
-                  what that looks like from outside. ⭐ The cls.* head is wired too — and it is NOT \
-                  the BERT head: ModernBERT applies GELU where every other BERT applies tanh, and carries \
-                  a head LayerNorm classic BERT lacks (llama-graph.cpp:3366). Cross-encoder scores track \
-                  llama-embedding --pooling rank to 0.033-0.099 absolute on a [-2.2,+2.4] range, ranking \
-                  preserved. ⛔⛔ THAT IS 1000x LOOSER THAN THE EMBEDDING COSINE AND THE COSINE CANNOT SEE \
-                  IT: cosine is scale-invariant, the head is not, so the encoder's 3.4e-3 ABSOLUTE error \
-                  (at cosine 0.99999964) is amplified ~10x by the pooler+norm+projection. A gate stopping \
-                  at the embedding would call this path verified to 1e-5. ⚠ One checkpoint diffed. \
-                  EMBEDS AND SCORES — generation is refused, there is no LM head to generate from. \
-                  Gate: scripts/modern_bert_conformance.sh"
-    },
+                  ⭐ Verified against the MODEL AUTHORS' implementation (transformers 5.7.0, float32, \
+                  eager) on Alibaba-NLP/gte-reranker-modernbert-base — NOT against llama.cpp: encoder \
+                  cosine 0.99999997 over 222 tokens; classifier scores within 0.0081. Disabling the \
+                  window is 297x worse and reading ONE rope base 74x worse, so both mechanisms are \
+                  load-bearing. ⛔⛔ The head POOLS PER THE CHECKPOINT: this one's config says \
+                  classifier_pooling=mean, the GGUF converter drops the key, and transformers' own \
+                  default is cls. Ferric first pooled the first token, matched llama.cpp to 0.03-0.10, \
+                  and that gap was misread as F16 precision; against the authors it was the pooling. \
+                  llama.cpp is right here only by hardcoding mean for every modern-bert reranker. \
+                  Head GELU (not tanh) + head LayerNorm, as the authors' ModernBertPredictionHead. \
+                  ⛔⛔ TWO ROPE BASES (160000 global / 10000 sliding here; identical on mmBERT-base). \
+                  Gate: scripts/modern_bert_conformance.sh vs tests/fixtures/modern_bert/. \
+                  EMBEDS AND SCORES — generation is refused, there is no LM head to generate from." },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
            note: "reference-checked; the family this runtime was written against" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
