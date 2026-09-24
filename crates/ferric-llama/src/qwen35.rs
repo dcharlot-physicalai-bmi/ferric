@@ -143,6 +143,12 @@ impl Cfg {
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
     pub fn head_v_dim(&self) -> usize { if self.n_v_heads == 0 { 0 } else { self.d_inner / self.n_v_heads } }
     pub fn key_dim(&self) -> usize { self.head_k_dim * self.n_k_heads }
+    /// The delta rule's query scale: 1/√d_KEY. The authors (`transformers`' `torch_chunk_gated_delta_rule`,
+    /// `1 / query.shape[-1] ** 0.5`) and llama.cpp (`delta-net-base.cpp`, `1.0f / sqrtf(S_k)`) agree.
+    /// ⛔ This runtime used 1/√d_VALUE at both call sites. Every shipped Qwen3.5 checkpoint has
+    /// d_k = d_v = 128, so no comparison against any real file could see it; a checkpoint with
+    /// d_k != d_v would have run with the wrong temperature on every recurrent layer and no error.
+    pub fn q_scale(&self) -> f32 { 1.0 / (self.head_k_dim as f32).sqrt() }
     /// llama.cpp: layer is recurrent (linear attention) unless it's every `interval`-th one.
     pub fn is_recurrent(&self, il: usize) -> bool { (il + 1) % self.full_attention_interval != 0 }
 }
@@ -1008,9 +1014,17 @@ impl Qwen35 {
     fn rope_partial(&self, x: &Tensor, n_heads: usize, offset: usize) -> Tensor {
         let (t, hd, n_rot) = (x.shape[0], self.cfg.head_dim, self.cfg.n_rot);
         let x3 = x.reshape(&[t, n_heads, hd]);
-        let rot = x3.narrow(2, 0, n_rot).contiguous().reshape(&[t, n_heads * n_rot])
-            .rope(n_heads, n_rot, self.cfg.rope_base, offset)
-            .reshape(&[t, n_heads, n_rot]);
+        let r_in = x3.narrow(2, 0, n_rot).contiguous().reshape(&[t, n_heads * n_rot]);
+        // `FERRIC_ROPE_NORM` forces the WRONG (interleaved) pairing, exactly as it does in the dense
+        // runtime — the negative control `scripts/lm_conformance.sh` needs. Without it this runtime
+        // ignored the flag, the control measured 1x, and the gate could not show it would see a
+        // rotary error on the one architecture whose rotary is partial.
+        let rot = if std::env::var("FERRIC_ROPE_NORM").is_ok() {
+            let pos: Vec<u32> = (offset as u32..(offset + t) as u32).collect();
+            r_in.rope_at_ex(n_heads, n_rot, self.cfg.rope_base, &pos, None, true)
+        } else {
+            r_in.rope(n_heads, n_rot, self.cfg.rope_base, offset)
+        }.reshape(&[t, n_heads, n_rot]);
         rot.cat(&x3.narrow(2, n_rot, hd - n_rot), 2).reshape(&[t, n_heads * hd])
     }
 
@@ -1107,10 +1121,10 @@ impl Qwen35 {
         // sigmoid/cat) that dominated hybrid decode:
         //   gdn_conv — silu(depthwise conv) + carried tail + V slice
         //   gdn_gate — g = ssm_a·softplus(alpha+dt_bias), β = sigmoid(beta), packed [T, nv, 2]
-        //   gdn_qk   — per-head l2norm, 1/√dv folded into q, tiled across v heads (head % nk)
+        //   gdn_qk   — per-head l2norm, 1/√dk folded into q (Cfg::q_scale), tiled across v heads (head % nk)
         let (conv, conv_tail, v) = nn::gdn_conv(&proj, &prev_conv, &w.conv1d, qo, c.conv_kernel, c.d_inner, 2 * kd);
         let gb = nn::gdn_gate(&proj, &w.dt_bias, &w.a, nv, qo + zo);
-        let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, 1.0 / (dv as f32).sqrt(), c.eps);
+        let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, c.q_scale(), c.eps);
         let v = v.reshape(&[t, nv, dv]);
 
         let (o, state) = q.gated_delta_rule_stateful(&k, &v, &gb, nv, dk, dv, prev_state.as_ref());
@@ -1686,7 +1700,7 @@ impl Qwen35 {
 
         // Back to one dispatch: gdn_qk is per-row (`base = r·cd + …`), so stacking is exact.
         let conv = Self::stack_rows(conv_rows);                        // [N, qo]
-        let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, 1.0 / (dv as f32).sqrt(), c.eps);
+        let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, c.q_scale(), c.eps);
         let v = Self::stack_rows(v_rows).reshape(&[n, nv, dv]);        // [N, nv, dv]
 
         // Per-sequence again: one recurrent state per row, advanced by exactly one step.
@@ -1763,6 +1777,24 @@ impl Qwen35 {
 #[cfg(test)]
 mod kvq_tests {
     use super::*;
+
+    /// The delta-rule query scale follows the KEY head width, as the authors' code does. Built with
+    /// d_k != d_v on purpose: on every shipped checkpoint the two are equal (128), which is exactly
+    /// why the 1/√d_v this runtime used was invisible to every real-weights comparison.
+    #[test]
+    fn the_delta_rule_query_scale_is_one_over_root_d_key_not_d_value() {
+        let c = Cfg {
+            n_embd: 1024, n_layer: 4, n_head: 8, n_head_kv: 2, head_dim: 256, n_ff: 3584, n_vocab: 16,
+            eps: 1e-6, rope_base: 1e7, n_rot: 64, full_attention_interval: 4,
+            conv_kernel: 4, n_k_heads: 16, n_v_heads: 16, head_k_dim: 64, d_inner: 16 * 256,
+            n_expert: 0, n_expert_used: 0, expert_ff: 0, shared_ff: 0, arch: "qwen35".into(),
+            n_head_arr: vec![8; 4], sliding_window: 0, freq_base_swa: 0.0, n_rot_swa: 0,
+            yarn_factor: 0.0, yarn_orig: 0, yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
+            yarn_attn_factor: 1.0, gating_sigmoid: false, expert_scale: 1.0, n_dense_lead: 0, n_nextn: 0,
+        };
+        assert_eq!((c.head_k_dim, c.head_v_dim()), (64, 256), "the fixture must separate d_k from d_v");
+        assert_eq!(c.q_scale(), 1.0 / 8.0, "1/√d_k = 1/8; 1/√d_v would be 1/16");
+    }
 
     /// A quantized qwen35 cache must still be `Clone`, and that clone must be a real copy.
     ///

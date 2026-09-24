@@ -272,14 +272,23 @@ impl Bert {
             // POST-norm: normalise the residual sum, not the input to the sublayer.
             h = h.add(&attn).layernorm(&b.attn_norm_w, &b.attn_norm_b, self.cfg.eps);
             if trace { tr.push((format!("l{_il}.attn_out_norm"), h.clone())); }
-            // ggml's `ggml_gelu` is the TANH approximation, not the exact erf form, and llama.cpp's
-            // BERT graph uses LLM_FFN_GELU which maps to it. Selectable while this is being pinned
-            // down; the default follows ggml.
+            // ⛔⛔ GELU IS THE AUTHORS' EXACT ERF FORM, NOT ggml's TANH APPROXIMATION.
+            //
+            // This defaulted to `gelu_tanh()` because "ggml's `ggml_gelu` is the tanh approximation
+            // and llama.cpp's BERT graph uses it" — a choice made to match a port, not the model. The
+            // authors' configs say `hidden_act: "gelu"`, which in `transformers` is the exact erf form.
+            // Checked against the authors (transformers 5.7.0, float32, eager):
+            //     bge-small-en-v1.5 F16    tanh max|diff| 1.4e-3 – 2.8e-3    erf 1.2e-6 – 1.4e-6
+            //     bge-reranker-v2-m3 F16   tanh scores off by up to 0.0151   erf exact to 4 dp
+            // — about 1000x closer. The GGUF records no activation key for BERT (the converter drops
+            // `hidden_act`), so the authors' default is the only honest default. A checkpoint trained
+            // with the tanh form ("gelu_new" / "gelu_pytorch_tanh") cannot be told apart from the file;
+            // `FERRIC_BERT_GELU_TANH=1` selects it, and reproduces llama.cpp for comparison.
             let up = h.matmul_bt(&b.up).add(&b.upb);
-            let act = if std::env::var("FERRIC_BERT_GELU_ERF").ok().as_deref() == Some("1") {
-                up.gelu()
-            } else {
+            let act = if std::env::var("FERRIC_BERT_GELU_TANH").ok().as_deref() == Some("1") {
                 up.gelu_tanh()
+            } else {
+                up.gelu()
             };
             let ff = act.matmul_bt(&b.down).add(&b.downb);
             h = h.add(&ff).layernorm(&b.out_norm_w, &b.out_norm_b, self.cfg.eps);

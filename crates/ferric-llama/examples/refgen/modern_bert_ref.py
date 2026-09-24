@@ -29,6 +29,39 @@ import sys
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+# ⛔⛔ LOAD AT FULL PRECISION, AND CHECK IT *AS LOADED* — NEVER AFTER A CAST.
+#
+# Two failures, found in order on Qwen/Qwen3.5-0.8B under transformers 5.7.0, both of which produced
+# a "reference" that read as a defect in Ferric:
+#   1. `from_pretrained(dtype=torch.float32)` is IGNORED for a COMPOSITE config (a multimodal checkpoint
+#      whose text model carries `text_config.dtype = bfloat16`). The model loads in bf16 and every one
+#      of the checkpoint's 36 F32-STORED tensors (the norms, the gate parameters) is ROUNDED on load —
+#      the gated-norm weight arrived 3.9e-3 away from the file. Ferric, reading the file, was right.
+#   2. The first guard written for (1) was VACUOUS: it called `.to(float32)` and THEN asserted float32,
+#      which is always true. It checked the LABEL; the values had been rounded before the cast.
+# So: set float32 on the config AND every sub-config, pass it in, and assert on the parameters exactly
+# as `from_pretrained` returned them.
+from transformers import AutoConfig
+
+def _f32_config(model_id):
+    cfg = AutoConfig.from_pretrained(model_id)
+    def walk(c, seen):
+        if id(c) in seen: return
+        seen.add(id(c)); c.dtype = torch.float32
+        for name in list(getattr(type(c), "sub_configs", {}) or {}) + ["text_config", "vision_config", "audio_config"]:
+            sub = getattr(c, name, None)
+            if sub is not None and hasattr(sub, "to_dict"): walk(sub, seen)
+    walk(cfg, set())
+    return cfg
+
+def load_f32(cls, model_id, **kw):
+    m = cls.from_pretrained(model_id, config=_f32_config(model_id), dtype=torch.float32, **kw)
+    bad = sorted({str(p.dtype) for p in m.parameters() if p.dtype != torch.float32})   # AS LOADED
+    if bad:
+        raise SystemExit(f"{model_id} loaded as {bad}, not float32 — refusing to emit a fixture")
+    return m
+
+
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "Alibaba-NLP/gte-reranker-modernbert-base"
 PAIRS = [
     ("what is panda?", "The giant panda is a bear species endemic to China."),
@@ -41,9 +74,7 @@ torch.manual_seed(0)
 tok = AutoTokenizer.from_pretrained(MODEL)
 # float32 and eager attention: the reference should be the model's math, not a fused kernel's
 # accumulation order. (transformers 5.x removed ModernBERT's `reference_compile` kwarg.)
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL, dtype=torch.float32, attn_implementation="eager"
-).eval()
+model = load_f32(AutoModelForSequenceClassification, MODEL, attn_implementation="eager").eval()
 cfg = model.config
 
 

@@ -51,8 +51,37 @@ def vec(s): return [float(x) for x in s.split()]
 def cos(a, b): return sum(x*y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a) * sum(y*y for y in b))
 def mad(a, b): return max(abs(x - y) for x, y in zip(a, b))
 
+def file_type(path):
+    import struct
+    def u32(f): return struct.unpack('<I', f.read(4))[0]
+    def u64(f): return struct.unpack('<Q', f.read(8))[0]
+    def rstr(f): return f.read(u64(f)).decode('utf-8', 'replace')
+    def skip(f, t):
+        sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+        if t in sizes: f.read(sizes[t]); return
+        if t == 8: rstr(f); return
+        if t == 9:
+            et = u32(f); n = u64(f)
+            for _ in range(n): skip(f, et)
+    with open(path, 'rb') as f:
+        f.read(4); u32(f); u64(f); nkv = u64(f)
+        for _ in range(nkv):
+            k = rstr(f); t = u32(f)
+            if k == 'general.file_type' and t in (4, 5): return u32(f)
+            skip(f, t)
+
+# ⛔ The tolerance follows the WEIGHTS. A fixed 0.03 would pass a revert to tanh GELU (0.0081 on the
+# F16 file) — the exact defect this gate exists to catch. Measured with the authors' erf GELU:
+#   F32 weights (converted from the authors' own F32 safetensors): encoder 2.5e-6, head 0.0000
+#   F16 weights (third-party file, authors' F32 rounded):           encoder 1.1e-3, head 0.0003
+FT = file_type(M)
+if FT not in (0, 1):
+    print(f"⛔ {os.path.basename(M)} is quantised (file_type {FT}) — it cannot verify the math; use F16/F32")
+    sys.exit(2)
+ENC_TOL, HEAD_TOL = (1e-4, 1e-3) if FT == 0 else (5e-3, 3e-3)
 print(f"reference: {ref['model']} — transformers {ref['transformers']}, torch {ref['torch']}, "
       f"float32, eager; classifier_pooling={ref['classifier_pooling']!r}")
+print(f"weights: {os.path.basename(M)} ({'F32' if FT == 0 else 'F16'}) — tolerances encoder {ENC_TOL:g}, head {HEAD_TOL:g}")
 ok = True
 
 # ── 1. the encoder, long enough that the window actually masks ──────────────────────────────
@@ -71,8 +100,8 @@ for k in ("control: window disabled", "control: one rope base"):
     if rows[k] < 20 * base:
         print(f"  ⛔ {k}: {rows[k]:.3e} is not ≥20x the implemented {base:.3e} — that mechanism is NOT "
               f"load-bearing on this input, so the match proves nothing about it"); ok = False
-if base > 5e-2:
-    print(f"  ⛔ the implemented encoder is {base:.3e} from the authors — beyond F16 weight rounding"); ok = False
+if base > ENC_TOL:
+    print(f"  ⛔ the implemented encoder is {base:.3e} from the authors — beyond tol {ENC_TOL:g}"); ok = False
 
 # ── 2. the classifier head, on the authors' own pair tokenization ────────────────────────────
 print("\nclassifier head vs the authors' score (their tokenizer, their pooling):")
@@ -82,7 +111,7 @@ for p in ref["pairs"]:
     got = float(o["RANK"].split()[0])
     want = p["logit_configured"][0]
     d = abs(got - want); worst = max(worst, d)
-    flag = "" if (d <= 0.03 and (got > 0) == (want > 0)) else "   <-- FAIL"
+    flag = "" if (d <= HEAD_TOL and (got > 0) == (want > 0)) else "   <-- FAIL"
     print(f"  {p['query'][:16]:<16} | {p['doc'][:26]:<26} authors {want:+8.4f}  ferric {got:+8.4f}  |diff| {d:.4f}{flag}")
     if flag: ok = False
     # The first-token pooling this head used to have is a DIFFERENT function; it must be visibly worse.
@@ -90,9 +119,16 @@ for p in ref["pairs"]:
     if abs(wrong - want) < d:
         print(f"    ⛔ the authors' head fed the FIRST token ({wrong:+.4f}) is closer than Ferric — "
               f"the pooling check cannot tell the two rules apart on this pair"); ok = False
-print(f"  worst |diff| {worst:.4f}  (tol 0.03: the GGUF is F16, the reference ran float32)")
+print(f"  worst |diff| {worst:.4f}  (tol {HEAD_TOL:g})")
+# ⭐ NEGATIVE CONTROL: ggml's tanh GELU — what this port used until checked against the authors.
+tanh_worst = max(abs(float(run(p["ids"], {"FERRIC_MB_GELU_TANH": "1"})["RANK"].split()[0]) - p["logit_configured"][0])
+                 for p in ref["pairs"])
+ratio = tanh_worst / max(worst, 1e-9)
+print(f"  control: tanh GELU  worst |diff| {tanh_worst:.4f}  = {ratio:,.0f}x the implemented")
+if ratio < 5:
+    print("  ⛔ the tanh control is not ≥5x worse — this gate cannot see the activation"); ok = False
 
-print("\n" + ("✅ encoder and head agree with the authors; both hard mechanisms are load-bearing"
+print("\n" + ("✅ encoder and head agree with the authors; window, rope bases and GELU are all load-bearing"
               if ok else "⛔ conformance FAILED"))
 sys.exit(0 if ok else 1)
 PY

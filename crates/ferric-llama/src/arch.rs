@@ -183,33 +183,48 @@ pub const REGISTRY: &[Arch] = &[
                   ferric-serve refuses it the way it refuses bert" },
 
     Arch { name: "bert", runtime: Runtime::Bert, status: Status::Verified,
-           note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV \
-                  cache and no LM head. Reference-checked against llama-embedding on bge-small-en-v1.5 \
-                  at cosine 0.999999 (F16) and 0.999996 (Q4_K_M), AND XLM-RoBERTa (bge-reranker-v2-m3, 24L \
-                  d=1024 Q4_K_M) at 0.999995-1.000000, over 3-to-39-token inputs. Cross-encoder \
-                  scoring matches the reference to 0.24%. EMBEDS AND SCORES — generation is refused, \
-                  there is no LM head to generate from" },
+           note: "encoder-only: bidirectional, learned positions, post-LayerNorm, GELU FFN, no KV cache and no LM \
+                  head. ⭐ Verified against the MODEL AUTHORS' implementation (transformers 5.7.0, float32, \
+                  eager), NOT llama.cpp: bge-small-en-v1.5 F16 first-token row within 1.2e-6 to 1.4e-6 over \
+                  9-254 tokens; XLM-R cross-encoder bge-reranker-v2-m3 (F16 converted from the authors' \
+                  weights) scores EXACT to 4 dp. ⛔⛔ GELU is the authors' exact erf form: it defaulted to \
+                  ggml's tanh approximation to match llama.cpp, which was ~1000x further from the model \
+                  (1.4e-3 to 2.8e-3). The GGUF records no activation, so a tanh-trained checkpoint needs \
+                  FERRIC_BERT_GELU_TANH=1. ⚠ A Q4_K_M file cannot verify the math — the reranker at 4 bits \
+                  differs by 0.04-0.31 with either GELU. Gate: scripts/bert_conformance.sh vs \
+                  tests/fixtures/bert/. EMBEDS AND SCORES — generation is refused, there is no LM head" },
     Arch { name: "modern-bert", runtime: Runtime::ModernBert, status: Status::Verified,
            note: "encoder-only and NOT the BERT above: RoPE (NeoX), PRE-LayerNorm with no bias, GeGLU \
                   over a fused {d, 2*n_ff} up, one fused qkv, layer 0's attn_norm absent (identity), and \
                   alternating SYMMETRIC-band / global attention on a dense-first 1-in-3 schedule. \
                   ⭐ Verified against the MODEL AUTHORS' implementation (transformers 5.7.0, float32, \
                   eager) on Alibaba-NLP/gte-reranker-modernbert-base — NOT against llama.cpp: encoder \
-                  cosine 0.99999997 over 222 tokens; classifier scores within 0.0081. Disabling the \
+                  within 2.5e-6 over 222 tokens and head scores EXACT to 4 dp on F32 weights converted \
+                  from the authors' own F32 files (1.1e-3 / 0.0003 on the third-party F16 file = rounding). Disabling the \
                   window is 297x worse and reading ONE rope base 74x worse, so both mechanisms are \
                   load-bearing. ⛔⛔ The head POOLS PER THE CHECKPOINT: this one's config says \
                   classifier_pooling=mean, the GGUF converter drops the key, and transformers' own \
                   default is cls. Ferric first pooled the first token, matched llama.cpp to 0.03-0.10, \
                   and that gap was misread as F16 precision; against the authors it was the pooling. \
                   llama.cpp is right here only by hardcoding mean for every modern-bert reranker. \
-                  Head GELU (not tanh) + head LayerNorm, as the authors' ModernBertPredictionHead. \
+                  GELU is the authors' exact erf form in the encoder AND the head — tanh (llama.cpp's choice) was \
+                  ~3800x further on F32. Head LayerNorm, as the authors' ModernBertPredictionHead. \
                   ⛔⛔ TWO ROPE BASES (160000 global / 10000 sliding here; identical on mmBERT-base). \
                   Gate: scripts/modern_bert_conformance.sh vs tests/fixtures/modern_bert/. \
                   EMBEDS AND SCORES — generation is refused, there is no LM head to generate from." },
     Arch { name: "qwen2", runtime: Runtime::Dense, status: Status::Verified,
-           note: "reference-checked; the family this runtime was written against" },
+           note: "the family this runtime was written against. ⭐ Verified against the MODEL AUTHORS' \
+                  implementation (transformers 5.7.0, float32, eager) on Qwen/Qwen2.5-0.5B-Instruct, F32 \
+                  converted from their files: max |logit diff| 2.6e-4 over 139 positions x 128 sampled \
+                  ids, argmax 139/139, full-row sum of squares within 1.3e-5. The wrong rope pairing is \
+                  52,151x worse. The earlier check compared greedy tokens only, which a small logit \
+                  error almost never moves. Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
-           note: "reference-checked, incl. per-head QK RMSNorm" },
+           note: "per-head QK RMSNorm. ⭐ Verified against the MODEL AUTHORS' implementation \
+                  (transformers 5.7.0, float32, eager) on Qwen/Qwen3-0.6B, F32 converted from their \
+                  files: max |logit diff| 7.0e-5 over 139 positions x 128 sampled ids, argmax 139/139, \
+                  full-row sum of squares within 4.3e-6. The wrong rope pairing is 222,647x worse. \
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     // Qwen3-VL-8B-Instruct is the #2 most-downloaded model on Hugging Face (18.4M/30d, 2026-09).
     // ⚠ TEXT-ONLY, and that is not a hedge — it is what llama.cpp does. `n_embd_inp` is
     // `n_embd * (1 + n_deepstack_layers)`, but the token path ZERO-PADS to that width
@@ -228,8 +243,14 @@ pub const REGISTRY: &[Arch] = &[
            note: "the mrope and text path are shared with qwen3vl, but the MoE FFN is not wired to \
                   this arch's tensor names; refused rather than run half-configured" },
     Arch { name: "llama", runtime: Runtime::Dense, status: Status::Verified,
-           note: "reference-checked against llama-cli on Llama-3.2-1B-Instruct. NORM (interleaved) \
-                  rope, unlike the Qwen family sharing this loader" },
+           note: "NORM (interleaved) rope in the GGUF, unlike the Qwen family sharing this loader. \
+                  ⭐ Verified against the MODEL AUTHORS' implementation (transformers 5.7.0, float32, \
+                  eager; LlamaForCausalLM) on Llama-3.2-1B-Instruct, F32 converted from the same \
+                  files: max |logit diff| 1.1e-4 over 136 positions x 128 sampled ids, argmax 136/136, \
+                  full-row sum of squares within 1.6e-5. The wrong (NeoX) pairing is 114,914x worse. \
+                  It was first checked against llama-cli, greedy tokens only. ⚠ The weights are \
+                  unsloth/Llama-3.2-1B-Instruct, an ungated re-upload, not Meta's gated repo. \
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     Arch { name: "phi3", runtime: Runtime::Dense, status: Status::Loads,
            note: "shares the dense path and the SPM vocab; not diffed against the reference" },
     Arch { name: "gemma", runtime: Runtime::Dense, status: Status::Loads,
@@ -302,9 +323,21 @@ pub const REGISTRY: &[Arch] = &[
 
     // ---- gated-delta-net hybrids ---------------------------------------------------------
     Arch { name: "qwen35", runtime: Runtime::Hybrid, status: Status::Verified,
-           note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order. ⚠ the YaRN long-rope \
-                  SUB-PATH is unverified: it ran through rope_scaled, which applied no rotation at \
-                  all until 2026-08-15, so any earlier check passed without exercising it" },
+           note: "3-in-4 gated delta net; ssm_a pre-negated, tiled head order. ⭐ Verified against the \
+                  MODEL AUTHORS' implementation (transformers 5.7.0, float32, eager) on Qwen/Qwen3.5-0.8B, \
+                  F32 converted from their files: max |logit diff| 7.5e-4 over 135 positions x 128 \
+                  sampled ids, argmax 135/135, full-row sum of squares within 6.3e-5. That residual is \
+                  ~10x the dense rows'; the authors run a CHUNKED delta rule and Ferric a recurrent one, \
+                  which is the leading hypothesis and is UNMEASURED. The wrong rope pairing is 2,908x \
+                  worse (argmax 121/135: rotary covers 64 of 256 dims on 1 layer in 4). ⛔⛔ Two traps \
+                  in the REFERENCE, each of which first read as a Ferric defect: transformers ignores \
+                  dtype=float32 for this composite config and loads bf16, rounding the checkpoint's 36 \
+                  F32 tensors; and a guard that casts THEN asserts float32 cannot see it. The generator \
+                  asserts as loaded. ⛔ The delta-rule query scale was 1/sqrt(d_v); the authors and \
+                  llama.cpp use 1/sqrt(d_k). Equal on every shipped checkpoint, so no real file could \
+                  show it; fixed (Cfg::q_scale). ⚠ the YaRN long-rope SUB-PATH is unverified: it ran \
+                  through rope_scaled, which applied no rotation at all until 2026-08-15. \
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     // ---- Qwen3-era MoE -------------------------------------------------------------------
     //
     // ⚠ THE MOST-DOWNLOADED GGUF ON HUGGING FACE (Qwen3-Coder-30B-A3B, 12.5M) and this runtime
@@ -319,7 +352,9 @@ pub const REGISTRY: &[Arch] = &[
                   softmax router straight through moe_topk. head_dim comes from attention.key_length \
                   (128), which is NOT n_embd/n_head (64). Not diffed against a reference" },
     Arch { name: "qwen35moe", runtime: Runtime::Hybrid, status: Status::Verified,
-           note: "as qwen35 with an MoE FFN" },
+           note: "as qwen35 with an MoE FFN. ⚠ The shared hybrid path is verified against the authors \
+                  (see qwen35); the MoE FFN has NOT yet been compared against the authors' code, only \
+                  against the earlier reference" },
     Arch { name: "laguna", runtime: Runtime::Hybrid, status: Status::Loads,
            note: "shares the qwen35 runtime; uses YaRN (factor 32, orig ctx 8192) so it DOES exercise \
                   the rope_scaled path fixed on 2026-08-15. ⚠ NO REFERENCE AVAILABLE: llama.cpp \

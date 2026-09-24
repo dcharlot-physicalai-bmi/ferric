@@ -109,6 +109,18 @@ pub(crate) fn resolve_swa_base(stated: Option<f32>, global_base: f32) -> f32 {
     stated.unwrap_or(global_base)
 }
 
+/// GELU as the AUTHORS define it: `hidden_activation: "gelu"` / `classifier_activation: "gelu"`, which in
+/// `transformers` is the EXACT erf form.
+///
+/// ⛔ This was `gelu_tanh()` at both sites, justified as "ggml's gelu is the tanh approximation" — i.e.
+/// chosen to match llama.cpp, not the model. Checked against the authors' `transformers`, that choice
+/// WAS the residual: it is what "F16 GGUF vs float32 reference" had been blamed for. The GGUF records no
+/// activation key for this checkpoint, so the authors' default is the only honest default.
+/// `FERRIC_MB_GELU_TANH=1` reproduces the llama.cpp choice for comparison.
+fn gelu(x: &Tensor) -> Tensor {
+    if std::env::var("FERRIC_MB_GELU_TANH").is_ok() { x.gelu_tanh() } else { x.gelu() }
+}
+
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         let md = g.metadata();
@@ -316,8 +328,8 @@ impl ModernBert {
             let nf = self.cfg.n_ff;
             let gate = ff.narrow(1, 0, nf).contiguous();
             let lin = ff.narrow(1, nf, nf).contiguous();
-            // ggml's `gelu` is the TANH approximation (via an fp16 table), not the exact erf form.
-            let act = gate.gelu_tanh().mul(&lin);
+            // GeGLU with the authors' erf GELU (see `gelu`), not ggml's tanh approximation.
+            let act = gelu(&gate).mul(&lin);
             inp = act.matmul_bt(&b.down).add(&ffn_inp);
             if trace { tr.push((format!("l{il}.layer_out"), inp.clone())); }
         }
@@ -368,8 +380,7 @@ impl ModernBert {
         let pooled = Tensor::from_vec(&self.ctx, &p, &[1, self.cfg.d]);
         let mut z = pooled.matmul_bt(&c.w);
         if let Some(b) = &c.b { z = z.add(b); }
-        // ggml's `gelu` is the TANH approximation via an fp16 table, which `gelu_tanh` matches in math.
-        z = z.gelu_tanh();
+        z = gelu(&z);
         if let Some(n) = &c.norm { z = z.layernorm(n, &self.zeros_d, self.cfg.eps); }
         let mut o = z.matmul_bt(&c.ow);
         if let Some(b) = &c.ob { o = o.add(b); }
