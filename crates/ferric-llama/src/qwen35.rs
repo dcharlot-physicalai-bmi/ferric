@@ -1125,6 +1125,18 @@ impl Qwen35 {
         let (conv, conv_tail, v) = nn::gdn_conv(&proj, &prev_conv, &w.conv1d, qo, c.conv_kernel, c.d_inner, 2 * kd);
         let gb = nn::gdn_gate(&proj, &w.dt_bias, &w.a, nv, qo + zo);
         let (q, k) = nn::gdn_qk(&conv, nk, dk, nv / nk, qo, c.q_scale(), c.eps);
+        // `FERRIC_Q35_HEADMAP=grouped` is the negative control for the head mapping: value head h reads
+        // key head h / r (GROUPED, the HF weights' order) instead of h % nk (TILED — what the converter
+        // reorders the V heads into, and what `gdn_qk` builds). Only a checkpoint with more value heads
+        // than key heads can tell the two apart; Qwen3.5-0.8B (nv = nk) never could.
+        let (q, k) = if nv != nk && std::env::var("FERRIC_Q35_HEADMAP").as_deref() == Ok("grouped") {
+            let r = nv / nk;
+            let regroup = |x: &Tensor| {
+                let x = x.reshape(&[t, nv, dk]);
+                (1..nv).fold(x.narrow(1, 0, 1).contiguous(), |acc, h| acc.cat(&x.narrow(1, h / r, 1).contiguous(), 1))
+            };
+            (regroup(&q), regroup(&k))
+        } else { (q, k) };
         let v = v.reshape(&[t, nv, dv]);
 
         let (o, state) = q.gated_delta_rule_stateful(&k, &v, &gb, nv, dk, dv, prev_state.as_ref());

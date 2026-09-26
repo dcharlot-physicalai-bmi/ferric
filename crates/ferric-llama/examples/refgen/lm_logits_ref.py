@@ -89,12 +89,24 @@ TEXT = ("The heron stood motionless in the shallows while the tide turned. A fis
 
 MIN_T = int(POS_ARGS[1]) if len(POS_ARGS) > 1 else 0
 
+# The dtype the AUTHORS stored the weights in — so the gate can tell a GGUF that holds them exactly (a
+# BF16 file of a bf16 checkpoint) from one that rounded them, and pick its tolerance accordingly.
+from transformers import AutoConfig as _AutoConfig
+_cfg = _AutoConfig.from_pretrained(MODEL, **({"trust_remote_code": True} if REMOTE else {}))
+_tcfg = getattr(_cfg, "text_config", None) or _cfg
+CHECKPOINT_DTYPE = str(getattr(_tcfg, "dtype", None) or getattr(_cfg, "dtype", None) or "unknown").replace("torch.", "")
+
 tok = AutoTokenizer.from_pretrained(MODEL)
-model = load_f32(AutoModelForCausalLM, MODEL, attn_implementation="eager",
-                 restore_from_file="--restore-from-file" in sys.argv[1:],
-                 **({"trust_remote_code": True} if REMOTE else {})).eval()
+# `--stream`: the authors' model with ONE decoder layer resident at a time (stream.py) — for checkpoints
+# whose float32 reference does not fit beside the runtime under test. Same forward, same fixture.
+STREAM = "--stream" in sys.argv[1:]
+model = None
+if not STREAM:
+    model = load_f32(AutoModelForCausalLM, MODEL, attn_implementation="eager",
+                     restore_from_file="--restore-from-file" in sys.argv[1:],
+                     **({"trust_remote_code": True} if REMOTE else {})).eval()
 CORRECTIONS = []
-if "--fix-group-tiling" in sys.argv[1:]:
+if "--fix-group-tiling" in sys.argv[1:] and model is not None:
     import inspect, textwrap
     fixed = set()
     for mod in model.modules():
@@ -121,12 +133,22 @@ while MIN_T and len(tok(text, add_special_tokens=True)["input_ids"]) < MIN_T:
 ids = tok(text, add_special_tokens=True)["input_ids"]
 positions = (list(range(len(ids))) if not MIN_T
              else sorted(set(range(0, len(ids), 8)) | set(range(len(ids) - 64, len(ids)))))
-V = model.config.vocab_size
+if STREAM:
+    import stream
+    from huggingface_hub import snapshot_download
+    _snap = snapshot_download(MODEL, allow_patterns=["*.json", "*.safetensors"])
+    _f32 = _f32_config(MODEL, **({"trust_remote_code": True} if REMOTE else {}))
+    _text = getattr(_f32, "text_config", None) or _f32
+    logits, _rep, skel = stream.streamed_logits(AutoModelForCausalLM, _text, _snap, ids)
+    LOAD_REPORT[MODEL] = _rep
+    mcfg, mod_name, param_dtype = skel.config, type(skel).__module__, "torch.float32"
+else:
+    with torch.no_grad():
+        logits = model(input_ids=torch.tensor([ids])).logits[0].float()   # [T, V]
+    mcfg, mod_name, param_dtype = model.config, type(model).__module__, str(next(model.parameters()).dtype)
+V = int(logits.shape[1])
 rng = random.Random(20260924)
-sample = sorted(rng.sample(range(min(V, model.get_output_embeddings().weight.shape[0])), 128))
-
-with torch.no_grad():
-    logits = model(input_ids=torch.tensor([ids])).logits[0].float()   # [T, V]
+sample = sorted(rng.sample(range(min(V, mcfg.vocab_size)), 128))
 
 rows = []
 for t in positions:
@@ -143,16 +165,17 @@ for t in positions:
 
 json.dump({
     "model": MODEL,
-    "model_type": model.config.model_type,
-    "code": (f"the authors' repo: {type(model).__module__}" if REMOTE
-             else f"transformers built-in: {type(model).__module__}"),
+    "model_type": mcfg.model_type,
+    "code": (f"the authors' repo: {mod_name}" if REMOTE else f"transformers built-in: {mod_name}")
+            + (" — STREAMED one decoder layer at a time (refgen/stream.py)" if STREAM else ""),
     "shims": SHIMS,
     "corrections": CORRECTIONS,
     "load": LOAD_REPORT,   # parameters compared BY VALUE to the checkpoint file, as loaded
-    "architectures": model.config.architectures,
+    "architectures": mcfg.architectures,
     "transformers": __import__("transformers").__version__,
     "torch": torch.__version__,
-    "dtype": str(next(model.parameters()).dtype),   # asserted float32 AS LOADED by load_f32, recorded anyway
+    "dtype": param_dtype,   # float32: asserted AS LOADED by load_f32, or per layer by stream.py
+    "checkpoint_dtype": CHECKPOINT_DTYPE,
     "vocab": int(logits.shape[1]),
     "ids": ids,
     "positions": positions,

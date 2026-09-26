@@ -51,6 +51,7 @@ def header(path):
             elif k.endswith('.attention.sliding_window') and t in (4, 5): out['window'] = u32(f)
             elif k.endswith('.rope.freq_base_swa') and t == 6: out['base_swa'] = struct.unpack('<f', f.read(4))[0]
             elif k.endswith('.rope.freq_base') and t == 6: out['base'] = struct.unpack('<f', f.read(4))[0]
+            elif k.endswith('.ssm.time_step_rank') and t in (4, 5): out['ssm_v_heads'] = u32(f)
             elif k.endswith('.ssm.group_count') and t in (4, 5): out['ssm_groups'] = u32(f)
             else: skip(f, t)
     return out
@@ -63,11 +64,17 @@ if FT not in (0, 1, 32):
 # 4.0e-5, LFM2-350M 5.0e-5, Qwen3-0.6B 7.0e-5, Llama-3.2-1B 1.1e-4, Gemma-3-1B 1.2e-4, Qwen2.5-0.5B
 # 2.6e-4, Qwen3.5-0.8B 7.5e-4 — the gated-delta-net hybrid sits at 3/4 of the band, so a regression there
 # has little room. F16/BF16 files add weight rounding, so they get a looser band.
-LOGIT_TOL, SSQ_TOL = (1e-3, 1e-4) if FT == 0 else (5e-2, 5e-3)
+# ⭐ A BF16 (or F16) FILE OF A BF16 (or F16) CHECKPOINT IS THE AUTHORS' WEIGHTS EXACTLY: the conversion
+# stores the same 16 bits, and the float32 reference upcasts them without rounding (the generator records
+# the checkpoint's own dtype). Only a file that ROUNDED the weights gets the looser band. Loosening for BF16
+# alone would hand a 50x wider tolerance to every bf16-native model, where there is no rounding to excuse.
+EXACT = FT == 0 or (FT == 32 and ref.get("checkpoint_dtype") == "bfloat16") or (FT == 1 and ref.get("checkpoint_dtype") == "float16")
+LOGIT_TOL, SSQ_TOL = (1e-3, 1e-4) if EXACT else (5e-2, 5e-3)
 
 def measure(env_extra=None):
     env = dict(os.environ)
-    for k in ("FERRIC_ROPE_NORM", "FERRIC_NEOX", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA", "FERRIC_SSM_ONE_GROUP"):
+    for k in ("FERRIC_ROPE_NORM", "FERRIC_NEOX", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA", "FERRIC_SSM_ONE_GROUP",
+              "FERRIC_Q35_HEADMAP"):
         env.pop(k, None)
     env.update(env_extra or {})
     r = subprocess.run([BIN, M, FX], capture_output=True, text=True, env=env)
@@ -93,7 +100,8 @@ if len(POS) != len(ref["rows"]):
 worst, worst_t, argmax, ssq, n = measure()
 print(f"reference: {ref['model']} ({ref['model_type']}) — {ref.get('code', 'transformers built-in')}, transformers "
       f"{ref['transformers']}, torch {ref['torch']}, float32, eager")
-print(f"weights:   {os.path.basename(M)} ({ {0:'F32',1:'F16',32:'BF16'}[FT] }, arch {ARCH})   tokens {len(ref['ids'])}, "
+print(f"weights:   {os.path.basename(M)} ({ {0:'F32',1:'F16',32:'BF16'}[FT] }, arch {ARCH}; "
+      f"{'the authors weights exactly' if EXACT else 'ROUNDED from the ' + str(ref.get('checkpoint_dtype', '?')) + ' checkpoint'})   tokens {len(ref['ids'])}, "
       f"positions compared {n}   vocab {ref['vocab']}")
 print(f"  max |logit diff|, {n} x {len(ref['sample_ids'])} sampled   {worst:.3e}  (at position {worst_t}; tol {LOGIT_TOL:g})")
 print(f"  argmax agreement                          {argmax}/{n}")
@@ -133,6 +141,12 @@ if W:
 MAMBA2_GROUPED_NORM = {"nemotron_h"}
 if ARCH in MAMBA2_GROUPED_NORM and H.get('ssm_groups', 0) > 1:
     controls.append((f"SSM norm over one group, not {H['ssm_groups']}", {"FERRIC_SSM_ONE_GROUP": "1"}))
+# The delta net's VALUE-head -> KEY-head mapping. The converter reorders V heads into TILED order and the
+# runtime reads them that way; the authors' weights are GROUPED. Visible only when a file has more value
+# heads than key heads — Qwen3.5-0.8B has 16 and 16, so it could never show this; its 9B relatives, 32 and 16.
+if ARCH.startswith("qwen35") and H.get('ssm_groups') and H.get('ssm_v_heads') and H['ssm_v_heads'] != H['ssm_groups']:
+    controls.append((f"grouped V-head mapping ({H['ssm_v_heads']} value heads on {H['ssm_groups']} key heads)",
+                     {"FERRIC_Q35_HEADMAP": "grouped"}))
 if not controls:
     print("  ⛔ no negative control applies to this file — a match with nothing shown load-bearing proves little"); ok = False
 for label, env in controls:

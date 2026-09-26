@@ -1043,6 +1043,8 @@ pub enum QShard {
     Iq4Nl(Iq4NlWeights),
     Mxfp4(Mxfp4Weights),
     Nvfp4(Nvfp4Weights),
+    /// 16-bit weights (F16 / BF16) kept 16-bit on the device — see [`HalfWeights`].
+    Half(HalfWeights),
     /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_NL): the weight
     /// is dequantized to f32 on load and run through a plain matmul. Correct and format-complete, at
     /// the cost of f32 weight memory — a native kernel can replace it later purely as a speed/size win.
@@ -1069,8 +1071,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::Half(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::Half(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -1091,6 +1093,14 @@ impl QShard {
             43 => QShard::Stq1_0(Stq1_0Weights::from_bytes(ctx, bytes, rows, cols)),
             16 => QShard::Iq2Xxs(Iq2XxsWeights::from_bytes(ctx, bytes, rows, cols)),
             18 => QShard::Iq3Xxs(Iq3XxsWeights::from_bytes(ctx, bytes, rows, cols)),
+            1 | 30 if cols % 4 == 0 => QShard::Half(HalfWeights::from_bytes(ctx, bytes, rows, cols, ggml_type == 30)),
+            // The kernel reads four input values per step. A 16-bit weight too narrow for that is widened
+            // here instead — the old path, for the rare shape that needs it — rather than refused.
+            1 | 30 => {
+                let w: Vec<f32> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .map(|h| if ggml_type == 30 { f32::from_bits((h as u32) << 16) } else { f16_bits_to_f32(h) }).collect();
+                QShard::Dense(DenseWeight::from_f32(ctx, &w, rows, cols))
+            }
             // Types with no native packed kernel take the dense fallback via `QMatrix::from_dense`
             // (the loader dequantizes them), so they never reach this packed-build path.
             other => return Err(format!("QMatrix: no native matmul for ggml type {other}")),
@@ -1162,6 +1172,10 @@ impl QMatrix {
             39 => Some((32, 17)),  // MXFP4
             40 => Some((64, 36)),  // NVFP4: d[4] UE4M3 + qs[32] E2M1 = 4.5 bpw
             42 => Some((128, 34)), // Q2_0
+            // F16 / BF16: one value, two bytes, KEPT 16-bit on the device (`HalfWeights`) unless
+            // FERRIC_HALF_DENSE asks for the old widening. Widening doubled every 16-bit model's footprint:
+            // a 9B bf16 checkpoint became 36 GB resident and did not fit a 48 GB machine at all.
+            1 | 30 if std::env::var("FERRIC_HALF_DENSE").is_err() => Some((1, 2)),
             43 => Some((256, 42)), // STQ1_0
             16 => Some((256, 66)), // IQ2_XXS
             18 => Some((256, 98)), // IQ3_XXS
@@ -1290,6 +1304,7 @@ impl Tensor {
             QShard::Iq4Nl(w) => self.matmul_iq4_nl(w),
             QShard::Mxfp4(w) => self.matmul_mxfp4(w),
             QShard::Nvfp4(w) => self.matmul_nvfp4(w),
+            QShard::Half(w) => self.matmul_half(w),
             QShard::Dense(w) => self.matmul(&w.wt),
         }
     }
@@ -1772,6 +1787,130 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// **Q8_0** weights held packed on the GPU — llama.cpp's 8-bit format (blocks of 32: `f16 scale` +
 /// 32 int8; value = int8·scale). Common for high-quality quants and for the embedding/output tensors
 /// even inside mixed-precision models. Native packed matmul, dequant in-kernel.
+/// IEEE binary16 bits to f32, exactly (subnormals, infinities and NaN included). Only the narrow-shape
+/// fallback in `QShard::build` needs it; the kernels widen on the device.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let (sign, exp, man) = (((h >> 15) as u32) << 31, ((h >> 10) & 0x1f) as u32, (h & 0x3ff) as u32);
+    let bits = match (exp, man) {
+        (0, 0) => sign,
+        (0, m) => {                                   // subnormal: renormalise
+            let s = m.leading_zeros() - 21;           // shifts to bring the top set bit to bit 10
+            sign | ((127 - 15 - s + 1) << 23) | (((m << s) & 0x3ff) << 13)
+        }
+        (0x1f, m) => sign | 0x7f80_0000 | (m << 13),  // inf / NaN
+        (e, m) => sign | ((e + 127 - 15) << 23) | (m << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// **16-bit weights held 16-bit on the GPU** — F16 or BF16, two values per u32 with element `2i` in
+/// the low half, exactly as a GGUF (and a safetensors file) stores them — and widened to f32 inside the
+/// matmul, which accumulates in f32. The arithmetic is the widened path's; only the residency differs.
+///
+/// ⭐ Why it exists: the loader used to widen every F16/BF16 weight to f32 ("widening IS the whole
+/// conversion"). That doubled the footprint of every 16-bit model — the format most checkpoints ship
+/// in — and a 9B bf16 model became 36 GB resident. Kept 16-bit it is 18 GB, and the weights in memory
+/// are the authors' own, bit for bit, which is what a conformance check against them needs.
+pub struct HalfWeights {
+    ctx: Arc<Context>,
+    words: Arc<wgpu::Buffer>,
+    pub rows: usize,
+    pub cols: usize,     // multiple of 4
+    pub bf16: bool,
+}
+
+impl HalfWeights {
+    pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], rows: usize, cols: usize, bf16: bool) -> HalfWeights {
+        assert_eq!(cols % 4, 0, "16-bit packed weights need cols % 4 == 0");
+        assert_eq!(bytes.len(), rows * cols * 2, "unexpected 16-bit byte length");
+        // Little-endian u16 pairs ARE the u32 words the kernel reads (low half = the earlier element).
+        let words = Arc::new(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("half_w"), contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        }));
+        HalfWeights { ctx: ctx.clone(), words, rows, cols, bf16 }
+    }
+    pub fn nbytes(&self) -> usize { self.rows * self.cols * 2 }
+}
+
+impl Tensor {
+    /// `x[rows, cols] · Wᵀ` for a 16-bit `W[out, cols]` — the same shape rule and the same flat /
+    /// split-K choice as the Q8_0 kernel, so decode (few rows) and prefill take the parallelism that fits.
+    pub fn matmul_half(&self, w: &HalfWeights) -> Tensor {
+        let x = self.contiguous();
+        let (rows, inn) = (x.shape[0], x.shape[1]);
+        assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        let out = empty(&self.ctx, rows * w.rows);
+        let n = rows * w.rows;
+        let (grid, rs, base, label) = if q2_0_split_k(rows, w.rows, inn) {
+            let gw = n.min(32768);
+            (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_HALF_SPLITK_WGSL, "matmul_half_splitk")
+        } else {
+            let wg = n.div_ceil(64); let gw = wg.min(32768);
+            (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_HALF_FLAT_WGSL, "matmul_half_flat")
+        };
+        // One source, two widenings. F16 is WGSL's own unpack; BF16 is f32's top half, so it widens by a
+        // shift — no rounding in either direction.
+        let unpack = if w.bf16 { "return vec2<f32>(bitcast<f32>(word << 16u), bitcast<f32>(word & 0xffff0000u));" }
+                     else { "return unpack2x16float(word);" };
+        let wgsl = base.replace("UNPACK", unpack);
+        let src = if use_subgroup(&self.ctx) { sg_reduce(&wgsl) } else { wgsl };
+        let label = if w.bf16 { format!("{label}_bf16") } else { format!("{label}_f16") };
+        run(&self.ctx, &src, &label,
+            &[x.buf.as_ref(), w.words.as_ref(), &out,
+              &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
+        Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
+    }
+}
+
+const MATMUL_HALF_FLAT_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        w:      array<u32>;     // W [out, in], 2 x 16-bit per word
+@group(0) @binding(2) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(3) var<uniform>             info:   vec4<u32>;      // rows, out, in, row_stride
+fn widen(word: u32) -> vec2<f32> { UNPACK }
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * info.w; let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    if (idx >= rows * o_dim) { return; }
+    let o = idx % o_dim; let r = idx / o_dim;
+    let nq = in_dim / 4u; let wrow = o * (in_dim / 2u);
+    var acc = 0.0;
+    for (var q: u32 = 0u; q < nq; q = q + 1u) {
+        let lo = widen(w[wrow + 2u * q]); let hi = widen(w[wrow + 2u * q + 1u]);
+        acc = acc + dot(x[r * nq + q], vec4<f32>(lo.x, lo.y, hi.x, hi.y));
+    }
+    out[idx] = acc;
+}
+"#;
+
+const MATMUL_HALF_SPLITK_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
+@group(0) @binding(1) var<storage,read>        w:      array<u32>;
+@group(0) @binding(2) var<storage,read_write>  out:    array<f32>;
+@group(0) @binding(3) var<uniform>             info:   vec4<u32>;      // rows, out, in, grid_w
+var<workgroup> partial: array<f32, 64>;
+fn widen(word: u32) -> vec2<f32> { UNPACK }
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let rows = info.x; let o_dim = info.y; let in_dim = info.z;
+    let idx = wg.x + wg.y * info.w; let t = lid.x;
+    if (idx < rows * o_dim) {
+        let o = idx % o_dim; let r = idx / o_dim;
+        let nq = in_dim / 4u; let wrow = o * (in_dim / 2u);
+        var acc = 0.0;
+        for (var q: u32 = t; q < nq; q = q + 64u) {
+            let lo = widen(w[wrow + 2u * q]); let hi = widen(w[wrow + 2u * q + 1u]);
+            acc = acc + dot(x[r * nq + q], vec4<f32>(lo.x, lo.y, hi.x, hi.y));
+        }
+        partial[t] = acc;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) { if (t < s) { partial[t] = partial[t] + partial[t + s]; } workgroupBarrier(); }
+        if (t == 0u) { out[idx] = partial[0]; }
+    }
+}
+"#;
+
 pub struct Q8_0Weights {
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 8 u32 per block (32 int8)
@@ -5348,6 +5487,7 @@ mod format_reachability {
         (20, "IQ4_NL"), (23, "IQ4_XS"),
         (39, "MXFP4"),
         (42, "Q2_0"),
+        (1, "F16"), (30, "BF16"),
         (43, "STQ1_0"),
         (16, "IQ2_XXS"),
         (18, "IQ3_XXS"),
@@ -5357,8 +5497,6 @@ mod format_reachability {
     /// `block_bytes` — an entry here that gains a kernel has to move to `PACKED`.
     const DENSE_BY_DESIGN: &[(u32, &str, &str)] = &[
         (0,  "F32",   "not a block quant; f32 already is the dense representation"),
-        (1,  "F16",   "not a block quant; widening to f32 is the whole conversion"),
-        (30, "BF16",  "not a block quant; widening to f32 is the whole conversion"),
         (35, "TQ2_0", "llama.cpp ternary: no packed kernel written (Q2_0/42 is the PrismML one that has one)"),
         (41, "Q1_0",  "PrismML 1-bit: no packed kernel written"),
     ];
@@ -5397,6 +5535,56 @@ mod format_reachability {
             assert!(QMatrix::block_bytes(ty).is_none(),
                 "{name} (ggml type {ty}) is listed as dense-by-design ({why}) but block_bytes claims a \
                  packed kernel. One of the two is wrong.");
+        }
+    }
+
+    /// The CPU widening the narrow-shape fallback uses, against the `half` crate on EVERY bit pattern.
+    #[test]
+    fn f16_widening_is_exact_on_every_bit_pattern() {
+        for h in 0..=u16::MAX {
+            let (got, want) = (f16_bits_to_f32(h), half::f16::from_bits(h).to_f32());
+            assert!(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                    "f16 bits {h:#06x}: {got:e} vs {want:e}");
+        }
+    }
+
+    /// `HalfWeights` must compute what widening to f32 computes: the same numbers in, f32 accumulation.
+    /// Both kernels (split-K at decode, flat for a wide prefill head), both widenings, against f64 on the
+    /// host. The control reads BF16 bits as F16 — the one mistake the two share a buffer layout for.
+    #[test]
+    fn sixteen_bit_weights_match_their_widened_matmul() {
+        let ctx = match pollster::block_on(ferric_core::Context::new()) {
+            Ok(c) => Arc::new(c),
+            Err(e) => { eprintln!("SKIPPED sixteen_bit_weights_match_their_widened_matmul: no GPU ({e:?})"); return; }
+        };
+        // splitk: rows <= 2. flat: rows > 2 and >= 16384 outputs (see q2_0_split_k).
+        for &(rows, n_out, cols) in &[(1usize, 96usize, 256usize), (2, 40, 1024), (3, 16384, 12)] {
+            let mut seed = 0x9e37_79b9u32 ^ (rows * 7919 + n_out * 31 + cols) as u32;
+            let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; (seed as f32 / u32::MAX as f32) * 2.0 - 1.0 };
+            let x: Vec<f32> = (0..rows * cols).map(|_| rnd()).collect();
+            let wf: Vec<f32> = (0..n_out * cols).map(|_| rnd() * 0.5).collect();
+            for bf16 in [false, true] {
+                let bits: Vec<u16> = wf.iter().map(|&v| if bf16 { half::bf16::from_f32(v).to_bits() } else { half::f16::from_f32(v).to_bits() }).collect();
+                let widened: Vec<f32> = bits.iter().map(|&h| if bf16 { f32::from_bits((h as u32) << 16) } else { half::f16::from_bits(h).to_f32() }).collect();
+                let bytes: Vec<u8> = bits.iter().flat_map(|h| h.to_le_bytes()).collect();
+                let hw = HalfWeights::from_bytes(&ctx, &bytes, n_out, cols, bf16);
+                let got = pollster::block_on(Tensor::from_vec(&ctx, &x, &[rows, cols]).matmul_half(&hw).to_vec());
+                let mut worst = 0f64;
+                for r in 0..rows { for o in 0..n_out {
+                    let want: f64 = (0..cols).map(|k| x[r * cols + k] as f64 * widened[o * cols + k] as f64).sum();
+                    worst = worst.max((got[r * n_out + o] as f64 - want).abs());
+                }}
+                // f32 accumulation over `cols` terms of magnitude <= 0.5: a few ulps of the running sum.
+                let tol = 1e-6 * cols as f64;
+                assert!(worst <= tol, "{} {rows}x{n_out}x{cols}: max |diff| {worst:e} > {tol:e}",
+                        if bf16 { "BF16" } else { "F16" });
+                if bf16 {
+                    let wrong = HalfWeights::from_bytes(&ctx, &bytes, n_out, cols, false);
+                    let bad = pollster::block_on(Tensor::from_vec(&ctx, &x, &[rows, cols]).matmul_half(&wrong).to_vec());
+                    let dev = bad.iter().zip(&got).map(|(a, b)| (a - b).abs() as f64).fold(0f64, f64::max);
+                    assert!(dev > 1000.0 * tol, "reading BF16 bits as F16 moved the output by only {dev:e}");
+                }
+            }
         }
     }
 

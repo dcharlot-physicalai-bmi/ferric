@@ -383,7 +383,13 @@ pub const REGISTRY: &[Arch] = &[
                   F32 tensors; and a guard that casts THEN asserts float32 cannot see it. The generator \
                   asserts as loaded. ⛔ The delta-rule query scale was 1/sqrt(d_v); the authors and \
                   llama.cpp use 1/sqrt(d_k). Equal on every shipped checkpoint, so no real file could \
-                  show it; fixed (Cfg::q_scale). ⚠ the YaRN long-rope SUB-PATH is unverified: it ran \
+                  show it; fixed (Cfg::q_scale). ⭐ Also verified on MiMo-V2.6-Distill-Qwen-9B (Xiaomi's \
+                  fine-tune of Qwen3.5-9B) on the authors' bf16 weights EXACTLY — a BF16 file held 16-bit \
+                  (18 GB, not 36), against the authors' model run one layer at a time (refgen/stream.py, \
+                  identical to the whole-model run on 0.8B): 4.0e-4, argmax 135/135. It has 32 value \
+                  heads on 16 key heads, so the converter's grouped-to-TILED V-head reorder is checked \
+                  for the first time — reading them grouped is 33,804x worse; 0.8B (16 on 16) could \
+                  never show it. ⚠ the YaRN long-rope SUB-PATH is unverified: it ran \
                   through rope_scaled, which applied no rotation at all until 2026-08-15. \
                   Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
     // ---- Qwen3-era MoE -------------------------------------------------------------------
