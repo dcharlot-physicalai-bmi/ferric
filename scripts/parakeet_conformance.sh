@@ -223,10 +223,16 @@ CONTROLS = [
     ("LSTM_GATES", "ifog", "head"), ("SOS", "no_step", "head"), ("BLANK", "update_state", "head"),
     ("JOINT_ACT", "tanh", "head"), ("MAXSYM", "1", "tokens"), ("CTC_TIE", "last", "head"),
 ]
-# A control must clear its stage's tolerance by this factor. The tolerance is ~3x the clean residual, so
+# A control must clear its family's tolerance by this factor. The tolerance is ~3x the clean residual, so
 # this asks for ~6x the residual: a control that lands just over the line could pass or fail on the next
-# clip by arithmetic alone, and proves nothing either way. The weakest measured is CONVNORM=bn_eps1e-3
-# (the TF/Keras BatchNorm default) at ~x3 on the unified model: real, and the smallest one here.
+# clip by arithmetic alone, and proves nothing either way.
+# ⚠ THE MARGIN IS THE STRONGEST EVIDENCE WITHIN THE FAMILY, not the first failing check's. Localisation and
+# strength are different questions: "fails FIRST in its family" proves the control breaks what it names;
+# "by how much" is answered where the mechanism is most visible. Measured at the first failure alone,
+# CONVNORM=bn_eps1e-3 (the TF/Keras BatchNorm default) read x3.2 — at block 0, whose running variances are
+# large (median 2.71, min 0.071), so eps 1e-3 vs 1e-5 moves its scales by a median 1.8e-4. Late blocks carry
+# small variances (block 23: median 0.295, min 2e-3, up to 18%) and the error compounds: x35 by block 2,
+# x968 by block 23, x323 at the encoder output. The control was never weak; the place it was measured was.
 MARGIN = 2.0
 def not_applicable(name, val):
     if name == "NORM" and RAW_MEL: return "the model takes the RAW log-mel: there is no variance to compute"
@@ -261,7 +267,8 @@ if OPT != "--no-controls":
         co, err = run({f"FERRIC_ASR_NEG_{name}": val})
         if co is None:
             print(f"  {name + '=' + val:<22} ⛔ Ferric failed to run: {err.strip().splitlines()[-1] if err.strip() else '?'}"); ok = False; continue
-        cf = next((c for c in checks(co) if not c[4]), None)
+        cc = checks(co)
+        cf = next((c for c in cc if not c[4]), None)
         fam_of = lambda c: ENC if c[1] in ("block", "enc") else c[1]
         lab = f"{name}={val}"
         wheres = where if isinstance(where, tuple) else (where,)
@@ -269,11 +276,15 @@ if OPT != "--no-controls":
             print(f"  {lab:<22} ⛔ PASSES THE GATE — this gate cannot see that mechanism"); ok = False
         elif fam_of(cf) not in wheres:
             print(f"  {lab:<22} ⛔ fails first at {cf[0]}, not at {where} — it is not testing what it names"); ok = False
-        elif cf[2] < MARGIN:
-            print(f"  {lab:<22} ⛔ fails at {cf[0]} by only x{cf[2]:.1f} tol — too close to the clean residual to "
-                  f"count"); ok = False
         else:
-            print(f"  {lab:<22} fails at {cf[0]:<12} {cf[3]:>22}  (x{cf[2]:,.0f} tol)")
+            # The strongest evidence in the family it first failed in (see MARGIN).
+            peak = max((c for c in cc if fam_of(c) == fam_of(cf)), key=lambda c: c[2])
+            if peak[2] < MARGIN:
+                print(f"  {lab:<22} ⛔ fails at {cf[0]}, and nowhere in its family by more than x{peak[2]:.1f} tol — "
+                      f"too close to the clean residual to count"); ok = False
+            else:
+                at = f"x{cf[2]:,.0f} tol" if peak is cf else f"x{cf[2]:,.1f}; x{peak[2]:,.0f} at {peak[0]}"
+                print(f"  {lab:<22} fails at {cf[0]:<12} {cf[3]:>22}  ({at})")
     if applied == 0:
         print("  ⛔ no negative control applies — a match with nothing shown load-bearing proves little"); ok = False
 
