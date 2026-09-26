@@ -73,6 +73,7 @@ impl HfCheckpoint {
         let (meta, name_map) = match model_type.as_str() {
             "lfm2" => lfm2_map(&cfg, &st)?,
             "qwen3_vl" => qwen3vl_map(&cfg, &st)?,
+            "qwen2_5_vl" => qwen25vl_map(&cfg, &st)?,
             other => return Err(format!(
                 "no HF mapping for model_type '{other}'. Adding one is a table of metadata keys and \
                  tensor names — see `lfm2_map` — but it is only worth adding alongside something \
@@ -202,6 +203,104 @@ fn qwen3vl_map(cfg: &serde_json::Value, st: &SafeTensors)
     // than here where the mapping is visible.
     if let Some((g, h)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
         return Err(format!("mapping points {g} at {h}, which the checkpoint does not contain"));
+    }
+    Ok((m, n))
+}
+
+/// **Qwen2.5-VL, text side** — MiMo-Embodied-7B's language model: a Qwen2 decoder (q/k/v biases, no
+/// QK-norm) under CHUNKED multimodal rope, `mrope_section` `[16, 24, 24]`. The vision tower is loaded
+/// separately (`ferric_llama::qwen25vl_vision`) from the same directory.
+///
+/// ⚠ Two key layouts exist for the same class, and both are real: checkpoints saved before
+/// transformers 5 (MiMo-Embodied-7B, Qwen2.5-VL-7B-Instruct) keep the text model at `model.layers.N`,
+/// the 5.x layout nests it at `model.language_model.layers.N`. Whichever the file holds is used;
+/// a file holding both is refused rather than resolved by guessing.
+///
+/// ⚠ `sliding_window` is in the config and is NOT mapped: `use_sliding_window` is false, and the
+/// authors' code then makes every layer `full_attention`. Mapping the width alone would window a
+/// model that never windows.
+fn qwen25vl_map(cfg: &serde_json::Value, st: &SafeTensors)
+    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+{
+    // 4.x configs are flat; 5.x ones nest under `text_config`. Read whichever carries the keys.
+    let t = match cfg.get("text_config") { Some(tc) if tc.get("hidden_size").is_some() => tc, _ => cfg };
+    let need_u = |k: &str| cfg_u(t, k).ok_or_else(|| format!("config.json: missing {k}"));
+    let need_f = |k: &str| cfg_f(t, k).ok_or_else(|| format!("config.json: missing {k}"));
+    let n_layer = need_u("num_hidden_layers")? as usize;
+    let n_vocab = need_u("vocab_size")? as usize;
+    if t["use_sliding_window"].as_bool() == Some(true) {
+        return Err("use_sliding_window is true: the windowed layers are not mapped here".into());
+    }
+    let sections: Vec<u64> = t.pointer("/rope_scaling/mrope_section")
+        .or_else(|| t.pointer("/rope_parameters/mrope_section"))
+        .and_then(|v| v.as_array())
+        .ok_or("config.json: qwen2_5_vl needs mrope_section; without it the model would silently \
+                take ordinary RoPE")?
+        .iter().filter_map(|x| x.as_u64()).collect();
+    if sections.len() != 3 || sections.iter().sum::<u64>() == 0 {
+        return Err(format!("mrope_section {sections:?} is not three non-empty sections"));
+    }
+    let theta = need_f("rope_theta")
+        .or_else(|_| t.pointer("/rope_parameters/rope_theta").and_then(|x| x.as_f64())
+            .ok_or_else(|| "config.json: missing rope_theta".to_string()))?;
+    let (h, nh) = (need_u("hidden_size")?, need_u("num_attention_heads")?);
+    // The sections cover head_dim/2 frequencies exactly; anything else leaves some unrotated or
+    // rotates past the head, and neither fails.
+    if sections.iter().sum::<u64>() * 2 != h / nh {
+        return Err(format!("mrope_section {sections:?} does not cover head_dim {} / 2", h / nh));
+    }
+    let root = match (st.info("model.embed_tokens.weight"), st.info("model.language_model.embed_tokens.weight")) {
+        (Some(_), None) => "model",
+        (None, Some(_)) => "model.language_model",
+        (Some(_), Some(_)) => return Err("checkpoint holds the text model under BOTH model.* and \
+                                          model.language_model.* — refusing to pick one".into()),
+        (None, None) => return Err("no embed_tokens in the checkpoint".into()),
+    };
+
+    let mut m = HashMap::new();
+    m.insert("general.architecture".into(), Meta::Str("qwen2vl".into()));
+    m.insert("qwen2vl.block_count".into(), Meta::U(n_layer as u64));
+    m.insert("qwen2vl.embedding_length".into(), Meta::U(h));
+    m.insert("qwen2vl.feed_forward_length".into(), Meta::U(need_u("intermediate_size")?));
+    m.insert("qwen2vl.attention.head_count".into(), Meta::U(nh));
+    m.insert("qwen2vl.attention.head_count_kv".into(), Meta::U(need_u("num_key_value_heads")?));
+    m.insert("qwen2vl.attention.layer_norm_rms_epsilon".into(), Meta::F(need_f("rms_norm_eps")?));
+    m.insert("qwen2vl.rope.freq_base".into(), Meta::F(theta));
+    m.insert("qwen2vl.rope.dimension_sections".into(),
+             Meta::Arr(sections.iter().map(|s| Meta::U(*s)).chain([Meta::U(0)]).collect()));
+    // Only the COUNT is load-bearing: this path is fed token ids, never text. See qwen3vl_map.
+    m.insert("tokenizer.ggml.tokens".into(), Meta::Arr(vec![Meta::Str(String::new()); n_vocab]));
+
+    let mut n: Vec<(String, String)> = vec![
+        ("token_embd.weight".into(), format!("{root}.embed_tokens.weight")),
+        ("output_norm.weight".into(), format!("{root}.norm.weight")),
+    ];
+    if st.info("lm_head.weight").is_some() {
+        n.push(("output.weight".into(), "lm_head.weight".into()));
+    } else if t["tie_word_embeddings"].as_bool() != Some(true) {
+        return Err("no lm_head.weight and tie_word_embeddings is not set — refusing to tie silently".into());
+    }
+    for il in 0..n_layer {
+        let p = format!("{root}.layers.{il}");
+        for (suffix, hf) in [
+            ("attn_norm.weight", format!("{p}.input_layernorm.weight")),
+            ("attn_q.weight", format!("{p}.self_attn.q_proj.weight")),
+            ("attn_q.bias", format!("{p}.self_attn.q_proj.bias")),
+            ("attn_k.weight", format!("{p}.self_attn.k_proj.weight")),
+            ("attn_k.bias", format!("{p}.self_attn.k_proj.bias")),
+            ("attn_v.weight", format!("{p}.self_attn.v_proj.weight")),
+            ("attn_v.bias", format!("{p}.self_attn.v_proj.bias")),
+            ("attn_output.weight", format!("{p}.self_attn.o_proj.weight")),
+            ("ffn_norm.weight", format!("{p}.post_attention_layernorm.weight")),
+            ("ffn_gate.weight", format!("{p}.mlp.gate_proj.weight")),
+            ("ffn_up.weight", format!("{p}.mlp.up_proj.weight")),
+            ("ffn_down.weight", format!("{p}.mlp.down_proj.weight")),
+        ] {
+            n.push((format!("blk.{il}.{suffix}"), hf));
+        }
+    }
+    if let Some((g, hf)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
+        return Err(format!("mapping points {g} at {hf}, which the checkpoint does not contain"));
     }
     Ok((m, n))
 }

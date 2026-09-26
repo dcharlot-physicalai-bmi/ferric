@@ -278,6 +278,26 @@ pub const REGISTRY: &[Arch] = &[
                   identical, not approximate. ⛔ No vision tower yet: images are unsupported. \
                   ⚠ Ferric follows llama.cpp's sector rule, which leaves sectors 61/62 unrotated \
                   where HF rotates them (~4e-4 rad @pos 1000) — see Tensor::rope_mrope" },
+    // MiMo-Embodied-7B (Xiaomi, MIT): driving + embodied-robotics VLM, arch Qwen2_5_VLForConditionalGeneration.
+    // Served straight from the authors' safetensors (ferric_load::hf maps model_type qwen2_5_vl -> qwen2vl);
+    // the vision tower is crate::qwen25vl_vision. The name is llama.cpp's for the same text model.
+    Arch { name: "qwen2vl", runtime: Runtime::Dense, status: Status::Verified,
+           note: "qwen2 (q/k/v biases) + CHUNKED multimodal rope (mrope_section [16,24,24]) + the \
+                  Qwen2.5-VL vision tower: 28 of 32 blocks attend in 112-px windows, rows reordered into \
+                  window order and back, RMSNorm, SwiGLU with biases, one merger. ⭐ Verified against the \
+                  MODEL AUTHORS' implementation (transformers 5.7.0 modeling_qwen2_5_vl, float32, eager) \
+                  on XiaomiMiMo/MiMo-Embodied-7B from the image FILE to the logits, on the authors' exact \
+                  weights (tower F32, text BF16 kept 16-bit): pixels 5e-7, window order and mRoPE positions \
+                  identical, vision blocks 0-8 within 4e-6, logits within 4x the authors' OWN float32 \
+                  distance from float64 at every one of 83 positions, argmax 83/83, and a 64-token greedy \
+                  decode identical to the authors' argmax chain. ⛔ From block 17 a few tokens carry \
+                  massive activations (5e4) from cancelling sums: at block 31 the authors' f32 run is 7e-4 \
+                  (ssq) from float64 and Ferric 1.7e-3 — rounding on both sides, so the gate measures against \
+                  float64, not against f32. Controls: no windows 32,415x, all windowed 92,672x, rope \
+                  row/col swap 6,299x, no reverse 10,103x, 1-D image positions 1,780x, interleaved \
+                  sectors 1,449x; decode by cache index diverges at step 56. ⚠ tanh-vs-erf GELU in the \
+                  merger is below the drift (1.4x) and rests on the code. ONE still image per prompt; \
+                  video refused. Gate: scripts/vl_conformance.sh vs tests/fixtures/qwen25vl/" },
     Arch { name: "qwen3vlmoe", runtime: Runtime::Dense, status: Status::Parts,
            note: "the mrope and text path are shared with qwen3vl, but the MoE FFN is not wired to \
                   this arch's tensor names; refused rather than run half-configured" },

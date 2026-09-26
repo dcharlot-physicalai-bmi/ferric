@@ -68,19 +68,20 @@ class Checkpoint:
 class StreamedLayer(torch.nn.Module):
     """Stands in for decoder layer `i`: builds the authors' layer, loads it, runs it, frees it."""
 
-    def __init__(self, cls, config, i, prefix, ckpt, report):
+    def __init__(self, cls, config, i, prefix, ckpt, report, dtype=torch.float32):
         super().__init__()
         self._cls, self._config, self._i, self._prefix, self._ckpt, self._report = cls, config, i, prefix, ckpt, report
+        self._dtype = dtype   # float64 for a noise-floor run (qwen25vl_ref.py); the upcast is exact either way
 
     def forward(self, *args, **kwargs):
-        layer = self._cls(self._config, self._i).to(torch.float32)
+        layer = self._cls(self._config, self._i).to(self._dtype)
         sd = {}
         for name, t in layer.state_dict().items():
             key = self._ckpt.resolve(self._prefix + name)
             v = self._ckpt.get(key)
             if tuple(v.shape) != tuple(t.shape):
                 raise SystemExit(f"{key}: checkpoint shape {tuple(v.shape)} != layer's {tuple(t.shape)} — refusing")
-            sd[name] = v.to(torch.float32)
+            sd[name] = v.to(self._dtype)
         layer.load_state_dict(sd, strict=True)
         # By value, AS LOADED — after load_state_dict, before the forward (the lesson in refload.py).
         live = layer.state_dict()

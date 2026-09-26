@@ -1065,11 +1065,7 @@ impl Qwen3 {
     /// llama.cpp's order is `ggml_scale(cur, f_logit_scale)` and then the tanh cap, so scaling after
     /// the cap — the easy mistake when bolting it on — would saturate against the wrong bound.
     fn head(&self, x: &Tensor) -> Tensor {
-        let lg = x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head);
-        let lg = if self.cfg.logit_scale != 1.0 && std::env::var("FERRIC_NOLOGITSCALE").is_err() {
-            lg.mul(&lg.scalar(self.cfg.logit_scale))
-        } else { lg };
-        if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
+        self.logits_from_normed(&x.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 
     fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize,
@@ -1611,6 +1607,17 @@ impl Qwen3 {
         batch(&self.ctx, || h.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 
+    /// Logits from the POST-norm hidden state [`Self::forward_embeds_mm`] returns — the LM head and
+    /// whatever this architecture applies after it (logit scale, final softcap), without the final
+    /// norm, which that hidden state already carries.
+    pub fn logits_from_normed(&self, normed: &Tensor) -> Tensor {
+        let lg = normed.matmul_q(&self.lm_head);
+        let lg = if self.cfg.logit_scale != 1.0 && std::env::var("FERRIC_NOLOGITSCALE").is_err() {
+            lg.mul(&lg.scalar(self.cfg.logit_scale))
+        } else { lg };
+        if self.cfg.final_softcap > 0.0 { lg.softcap(self.cfg.final_softcap) } else { lg }
+    }
+
     /// **Raw** embedding rows for `tokens` — deliberately WITHOUT the weightless embedding norm.
     ///
     /// The norm belongs after the splice, applied once to text and image rows together, because that
@@ -1795,7 +1802,7 @@ mod rope_type_tests {
     // which partner it pairs with — so they belong here, and the multimodal rule is carried by
     // `Cfg::mrope_sections` instead.
     const NEOX_ARCHES: &[&str] = &["qwen2", "qwen3", "phi3", "gemma", "gemma2", "gemma3", "gemma4",
-                                   "lfm2", "qwen3vl", "qwen3vlmoe"];
+                                   "lfm2", "qwen3vl", "qwen3vlmoe", "qwen2vl"];
 
     #[test]
     fn every_norm_arch_is_interleaved_and_every_neox_arch_is_not() {
@@ -1814,14 +1821,25 @@ mod rope_type_tests {
     /// position rule are independent, and the registry's note is the only place that says so. This
     /// asserts the two stay in step — that every arch whose note claims multimodal rope is one the
     /// loader would actually give multimodal rope to, by NAME, using the shipped predicate.
+    ///
+    /// ⚠ There are TWO multimodal rules, so a note must say which: "interleaved" (qwen3vl) or "CHUNKED"
+    /// (qwen2vl). The first version of this test read any claim as interleaved, and would have failed
+    /// the moment a chunked arch was registered — or, worse, been "fixed" by making qwen2vl interleaved.
     #[test]
     fn every_arch_claiming_multimodal_rope_is_one_the_loader_treats_that_way() {
-        let claims: Vec<&str> = crate::arch::REGISTRY.iter()
-            .filter(|e| e.note.contains("multimodal rope")).map(|e| e.name).collect();
-        assert!(!claims.is_empty(), "no arch claims multimodal rope — this test would check nothing");
-        for name in claims {
-            assert!(mrope_is_interleaved_arch(name),
-                    "{name}'s note claims multimodal rope but the loader would not apply it");
+        let claims: Vec<(&str, &str)> = crate::arch::REGISTRY.iter()
+            .filter(|e| e.note.contains("multimodal rope")).map(|e| (e.name, e.note)).collect();
+        assert!(claims.iter().any(|(_, n)| n.contains("interleaved multimodal rope")),
+                "no arch claims the interleaved rule — half of this test would check nothing");
+        assert!(claims.iter().any(|(_, n)| n.contains("CHUNKED multimodal rope")),
+                "no arch claims the chunked rule — half of this test would check nothing");
+        for (name, note) in claims {
+            let interleaved = note.contains("interleaved multimodal rope");
+            let chunked = note.contains("CHUNKED multimodal rope");
+            assert!(interleaved != chunked, "{name}'s note must name exactly one multimodal rule");
+            assert_eq!(mrope_is_interleaved_arch(name), interleaved,
+                       "{name}'s note claims the {} rule but the loader applies the other",
+                       if interleaved { "interleaved" } else { "chunked" });
         }
         // The control: an ordinary arch must NOT be treated as multimodal.
         assert!(!mrope_is_interleaved_arch("qwen3"), "plain qwen3 must not take the multimodal path");

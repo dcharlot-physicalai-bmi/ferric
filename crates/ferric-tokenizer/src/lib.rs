@@ -292,7 +292,16 @@ impl Bpe {
     }
 
     /// Load from an HF `tokenizer.json` (the single-file format) — reads `model.vocab` + `model.merges`.
+    ///
+    /// ⚠ GPT-2's pre-tokenizer. A Qwen-family file needs [`Bpe::from_tokenizer_json_with_pre`] with
+    /// [`Pre::Qwen2`]: the vocabulary loads either way and the split differs silently — Qwen2 cuts
+    /// numbers into single digits where GPT-2 keeps runs of them.
     pub fn from_tokenizer_json(bytes: &[u8]) -> Result<Bpe, String> {
+        Self::from_tokenizer_json_with_pre(bytes, Pre::Gpt2)
+    }
+
+    /// [`Bpe::from_tokenizer_json`] with an explicit pre-tokenizer.
+    pub fn from_tokenizer_json_with_pre(bytes: &[u8], pre: Pre) -> Result<Bpe, String> {
         let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         let model = &v["model"];
         let vocab: HashMap<String, u32> = model["vocab"].as_object().ok_or("no model.vocab")?
@@ -302,7 +311,7 @@ impl Bpe {
             else if let Some(a) = m.as_array() { Some((a[0].as_str()?.to_string(), a[1].as_str()?.to_string())) }
             else { None }
         }).collect();
-        Ok(Bpe::new(vocab, &merges))
+        Ok(Bpe::new_with_pre(vocab, &merges, pre))
     }
 
     pub fn vocab_size(&self) -> usize { self.encoder.len() }
