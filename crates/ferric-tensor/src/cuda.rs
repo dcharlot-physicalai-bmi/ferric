@@ -267,8 +267,8 @@ impl Driver {
     /// 2-D grid launch, same contract as [`Driver::launch`].
     unsafe fn launch2(&self, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
-        let r = (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(),
-                                        params.as_mut_ptr(), std::ptr::null_mut());
+        let r = unsafe { (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(),
+                                                 params.as_mut_ptr(), std::ptr::null_mut()) };
         if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
         true
     }
@@ -407,8 +407,6 @@ impl NativeWeight<'_> {
     pub fn cols(&self) -> usize { self.cols }
     pub fn fmt(&self) -> QFmt { self.dev.fmt }
     fn dw(&self) -> DW { DW { codes: self.dev.codes, aux: self.dev.aux, fmt: self.dev.fmt, rows: self.rows, cols: self.cols } }
-    #[cfg(test)]
-    fn ptrs(&self) -> (CUdeviceptr, CUdeviceptr) { (self.dev.codes, self.dev.aux) }
 }
 /// A weight by raw handle: what the graph stores (no borrow of the `QMatrix` it came from).
 #[derive(Clone, Copy)]
@@ -419,7 +417,7 @@ macro_rules! p { ($($e:expr),*) => { [$( &mut $e as *mut _ as *mut c_void ),*] }
 /// Quantise `x[n]` (f32, device) into `xq` (4 int8 per u32) + `xs` (n/32 scales), n % 32 == 0.
 unsafe fn quant_x(d: &Driver, k: &DecodeK, x: CUdeviceptr, xq: CUdeviceptr, xs: CUdeviceptr, n: usize) -> bool {
     let (mut xp, mut qp, mut sp, mut n32) = (x, xq, xs, n as u32);
-    d.launch(k.quant_x_q8, ((n / 32) as u32).div_ceil(4), 128, &mut p!(xp, qp, sp, n32))
+    unsafe { d.launch(k.quant_x_q8, ((n / 32) as u32).div_ceil(4), 128, &mut p!(xp, qp, sp, n32)) }
 }
 /// `out[w.rows] = W · x` for one activation row, any format. `q8 = Some((xq, xs))` routes a Q5_K weight
 /// through the int8-activation dp4a kernel (the FERRIC_CUDA_Q8X numerics trade); other formats ignore it.
@@ -427,12 +425,12 @@ unsafe fn launch_gemv(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdev
                       q8: Option<(CUdeviceptr, CUdeviceptr)>) -> bool {
     let (mut cp, mut ap, mut op, mut o32, mut i32_) = (w.codes, w.aux, out, w.rows as u32, w.cols as u32);
     if let (QFmt::Q5K, Some((xq, xs))) = (w.fmt, q8) {
-        if !quant_x(d, k, x, xq, xs, w.cols) { return false; }
+        if !unsafe { quant_x(d, k, x, xq, xs, w.cols) } { return false; }
         let (mut qp, mut sp) = (xq, xs);
-        return d.launch(k.q5k_gemv_q8, (w.rows as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, o32, i32_));
+        return unsafe { d.launch(k.q5k_gemv_q8, (w.rows as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, o32, i32_)) };
     }
     let mut xp = x;
-    d.launch(k.gemv[w.fmt as usize], (w.rows as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, o32, i32_))
+    unsafe { d.launch(k.gemv[w.fmt as usize], (w.rows as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, o32, i32_)) }
 }
 /// Fused gate|up + SwiGLU: `out[o] = silu(W[o]·x) · W[o + n_ff]·x`, `w.rows == 2·n_ff`. Any format.
 unsafe fn launch_swiglu(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdeviceptr,
@@ -440,12 +438,12 @@ unsafe fn launch_swiglu(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUd
     let n_ff = w.rows / 2;
     let (mut cp, mut ap, mut op, mut nff, mut din) = (w.codes, w.aux, out, n_ff as u32, w.cols as u32);
     if let (QFmt::Q5K, Some((xq, xs))) = (w.fmt, q8) {
-        if !quant_x(d, k, x, xq, xs, w.cols) { return false; }
+        if !unsafe { quant_x(d, k, x, xq, xs, w.cols) } { return false; }
         let (mut qp, mut sp) = (xq, xs);
-        return d.launch(k.q5k_swiglu_gemv_q8, (n_ff as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, nff, din));
+        return unsafe { d.launch(k.q5k_swiglu_gemv_q8, (n_ff as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, nff, din)) };
     }
     let mut xp = x;
-    d.launch(k.swiglu[w.fmt as usize], (n_ff as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, nff, din))
+    unsafe { d.launch(k.swiglu[w.fmt as usize], (n_ff as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, nff, din)) }
 }
 
 /// `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores (f16 in, f32 accumulate; see cuda_prefill.cu).
@@ -456,8 +454,8 @@ unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: 
                       m: usize, ovf: CUdeviceptr) -> bool {
     let (mut ap, mut la, mut cp, mut xp, mut cc, mut lc) = (a, lda as u32, w.codes, w.aux, c, ldc as u32);
     let (mut mm, mut nn, mut kk, mut of) = (m as u32, w.rows as u32, w.cols as u32, ovf);
-    d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128,
-              &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of))
+    unsafe { d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128,
+                       &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of)) }
 }
 
 /// **The K/V cache on the device — one per SEQUENCE, owned by the caller's cache, not by the graph.**
@@ -1156,7 +1154,7 @@ mod tests {
         let inv = 1.0 / (ms + eps as f64).sqrt();
         x.iter().zip(w).map(|(&v, &ww)| ((v as f64) * inv * (ww as f64)) as f32).collect()
     }
-    fn rnd(n: usize, seed: u64) -> Vec<f32> { (0..n).map(|i| (((i as u64 * 2654435761 + seed) % 1000) as f32 / 500.0 - 1.0)).collect() }
+    fn rnd(n: usize, seed: u64) -> Vec<f32> { (0..n).map(|i| ((i as u64 * 2654435761 + seed) % 1000) as f32 / 500.0 - 1.0).collect() }
 
     /// Launch `qk_norm_rope` for one row and return (q, k, k-cache row, v-cache row).
     #[allow(clippy::too_many_arguments)]
