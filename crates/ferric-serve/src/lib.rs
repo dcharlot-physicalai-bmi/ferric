@@ -282,6 +282,11 @@ pub(crate) struct Engine {
     responses: dialects::ResponseStore,
     /// Counters for `/metrics`.
     pub(crate) metrics: Metrics,
+    /// **Prompt caching across requests** (dense runtime): the K/V of recent sequences, keyed by their
+    /// tokens. A multi-turn chat resends the whole conversation, and every turn used to prefill all of it;
+    /// now the longest cached whole-chunk prefix is copied and only the rest is computed. `FERRIC_PREFIX_CACHE`
+    /// = sequences kept (default 8; 0 = off).
+    prefix_cache: Option<std::cell::RefCell<ferric_llama::prefix::PrefixCache>>,
     /// A speech recogniser for `/v1/audio/transcriptions`, from `--asr` / FERRIC_ASR_MODEL.
     pub(crate) asr: Option<(String, ferric_llama::parakeet::Parakeet)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
@@ -599,7 +604,12 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), metrics: Default::default(), asr, rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), metrics: Default::default(),
+                 prefix_cache: {
+                     let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                     (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
+                 },
+                 asr, rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -828,6 +838,27 @@ impl Engine {
         ids
     }
 
+    /// A fresh cache for `prompt`, seeded from the prefix cache when this is the dense runtime and a
+    /// previous sequence shares a whole-chunk prefix. Returns the cache and how many prompt tokens it
+    /// already holds. Never the WHOLE prompt: the last token must be fed to produce the next logits.
+    pub(crate) fn seeded_cache(&self, prompt: &[u32]) -> (ModelCache, usize) {
+        if let (Model::Dense(m), Some(pc)) = (&self.model, &self.prefix_cache) {
+            if prompt.len() > 1 {
+                let (c, n) = pc.borrow_mut().cache_for(&self.ctx, &m.cfg, &prompt[..prompt.len() - 1]);
+                if n > 0 { return (ModelCache::Dense(c), n); }
+            }
+        }
+        (self.model.new_cache(), 0)
+    }
+
+    /// Keep `tokens` (exactly the ones this cache has consumed) for later requests to reuse.
+    pub(crate) fn remember(&self, tokens: &[u32], cache: &ModelCache) {
+        if let (ModelCache::Dense(c), Some(pc)) = (cache, &self.prefix_cache) {
+            let n = c.pos.min(tokens.len());
+            pc.borrow_mut().insert(&self.ctx, &tokens[..n], c);
+        }
+    }
+
     /// A token's text and bytes, for `logprobs`.
     pub(crate) fn piece(&self, tok: u32) -> (String, Vec<u8>) {
         let b = self.token_bytes.get(tok as usize).cloned().flatten().unwrap_or_default();
@@ -890,7 +921,7 @@ impl Engine {
                 }
             }
         }
-        let mut cache = self.model.new_cache();
+        let (mut cache, skip) = self.seeded_cache(prompt);
         let n_vocab = self.model.n_vocab();
         let mut rng: u64 = opts.rng; // fixed default seed → reproducible sampling; `seed` overrides it
         let mut r#gen: Vec<u32> = Vec::new();
@@ -898,7 +929,7 @@ impl Engine {
         let (mut lps, mut lp_sent) = (Vec::new(), 0usize);
         let mut finish = "length";
         for step in 0..max_tokens {
-            let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*r#gen.last().unwrap()] };
+            let input: Vec<u32> = if step == 0 { prompt[skip..].to_vec() } else { vec![*r#gen.last().unwrap()] };
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
             let row = &v[v.len() - n_vocab..];
@@ -912,6 +943,8 @@ impl Engine {
             if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
             if em.hit_stop { finish = "stop"; break; }
         }
+        let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
+        self.remember(&fed, &cache);
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
