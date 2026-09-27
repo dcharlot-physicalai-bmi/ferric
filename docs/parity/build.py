@@ -45,7 +45,7 @@ UPDATES = {
     "S23": ("implemented", "da736c9: lists every loaded model (chat + embedder)"),
     "S28": ("implemented", "3f6089f: query strings no longer 404 (/health?x=1)"),
     "S35": ("implemented", "3f6089f: a prompt past <arch>.context_length is a 400 naming both numbers; no max_tokens = until EOS or the context"),
-    "E19": ("partial", "87c1f6b: linear applied; any declared type a runtime does not apply is REFUSED (was silently unscaled); longrope/NTK absent"),
+    "E19": ("partial", "87c1f6b linear + 210382c: Phi-3 LongRoPE (short/long tables switched at the authors' rule, attn_factor, cache recomputed across the switch) = the authors within 1.5-2.3x their f32 floor; decoder angles built on the host, 30k-position error 18-109x → 1.6-2.3x the floor; dynamic NTK still refused by name"),
     "M06": ("verified", "361cddb: nomic-bert (nomic-embed-text) verified against its authors at every stage; registry row added"),
     "S07": ("verified", "d185918: /v1/completions streams; tool calls stream as an SSE delta"),
     "S17": ("verified", "b0b4448: the GGUF's own Jinja template via minijinja = HF apply_chat_template — 23/23 templates byte-identical; token ids equal on Qwen2.5, Gemma-3, Phi-3.5, Llama-3.2 (scripts/chat_template_conformance.py, chat_ids_conformance.sh)"),
