@@ -10,6 +10,23 @@
 //!
 //! Env: `BENCH_TOKENS` decode steps (default 64), `BENCH_REPS` (default 3).
 //!
+//! Measured 2026-09-27, Apple M-series / Metal, load average 20-68 (other sessions), taronklm r=4 on all 7
+//! projections of 24 layers; median (min..max) over 12 interleaved reps of 32 tokens:
+//!
+//!   Qwen2.5-0.5B-Instruct Q4_K_M   tok/s              dispatch/tok   SoC J/token
+//!   base                           57.9 (38.1..99.8)  314            0.37 (0.22..0.57)
+//!   unmerged (adapter per request) 34.9 (8.7..68.0)   602            0.56 (0.29..1.61)
+//!   merged F32 (exact)             15.4 (9.3..17.4)   290            1.30 (0.89..1.90)
+//!   merged F16 (rounded)           81.2 (35.0..170)   290            0.25 (0.03..0.66)
+//!   batch 4, base                  113 (50..286)      156 per row    0.17 (0.13..0.37)
+//!   batch 4, rows a|b|a|b          69.8 (38..128)     300 per row    0.32 (0.16..0.51)
+//!
+//! Unmerged costs ~1.5-1.7x a token here: +12 dispatches per layer (A, B and an add on each of q|k|v, o,
+//! gate|up, down; the adapted FFN also loses the fused SwiGLU), on a model small enough to be
+//! dispatch-bound. On the F32 base every arm but merged-F16 sits at 12-15 tok/s (8 reps): Ferric's dense
+//! f32 weight path is one thread per output at decode, and a 16-bit copy of the same weights decodes
+//! ~6x faster (96 tok/s median) — which is also why merged F32 is slow on a quantized base.
+//!
 //! ⚠ Dispatches are counted exactly on the host and do not depend on load. Wall time and joules DO: the
 //! SoC counters `macmon` reads are system-wide, so every figure includes whatever else the machine was
 //! doing; the per-arm RATIO is the claim, the absolute joules are an upper bound.

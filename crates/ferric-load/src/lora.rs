@@ -611,9 +611,14 @@ fn write_safetensors(path: &Path, entries: &[(String, Vec<usize>, &[f32])]) -> R
 /// How [`LoraMerged`] stores a merged weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeDtype {
-    /// Exact up to float32 rounding of `W + scale·B·A` — the default, and what the conformance gate checks.
+    /// Exact up to float32 rounding of `W + scale·B·A` — what the conformance gate checks (0.43-1.48x
+    /// PEFT's own float32 floor). ⚠ On a quantized base this WIDENS every adapted weight to 4 bytes, and
+    /// Ferric's dense f32 weights decode slowly: 15 tok/s vs 58 for the Q4_K_M base (Qwen2.5-0.5B, all
+    /// seven projections adapted; `examples/lora_decode_bench.rs`).
     F32,
-    /// Half the memory; rounds the merged weight to float16 (round to nearest even).
+    /// Half of F32's memory, and fast at decode (81 tok/s median on the same run — the 16-bit kernels
+    /// split the reduction); rounds the merged weight to float16 (nearest even): 3.2e-3 max logit error on
+    /// the gate's adapter, 25x the floor. Use it when that rounding is acceptable.
     F16,
 }
 

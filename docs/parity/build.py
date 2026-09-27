@@ -59,6 +59,10 @@ UPDATES = {
     "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
     "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
     "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without)"),
+    "E25": ("verified", "8a42c8b: forward_batch applies EACH ROW's LoRA selection; rows a/b/none match PEFT's adapter_names mixed batch at 0.77x its float32 floor (scripts/lora_conformance.sh; crossed-rows control 26k x). Dense runtime only; not yet exposed by ferric-serve"),
+    "S37": ("partial", "8a42c8b: engine API only — Qwen3::upload_lora(PEFT dir or llama.cpp GGUF) + Cache::set_adapters per request, merged or unmerged, 0.4-1.5x PEFT's floor on 4 adapters incl. a published one; ferric-serve does not expose it yet"),
+    "T09": ("verified", "8a42c8b: examples/finetune_lora_peft trains LoRA pairs and writes a PEFT adapter (+ GGUF); PEFT loading only the files reproduces Ferric's in-memory logits at 0.93x its float32 floor (scripts/lora_roundtrip.sh)"),
+    "T01": ("partial", "8a42c8b: genuine LoRA A/B on q_proj/v_proj with PEFT's scaling, exported as a PEFT adapter; still example-level (qwen2/qwen3 blocks reconstructed by hand)"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})
