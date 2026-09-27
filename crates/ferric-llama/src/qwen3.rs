@@ -1207,8 +1207,10 @@ impl Qwen3 {
             else { nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win, sc) }
         } else if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv, sc)
-        } else if t == s && s <= 65535 && hd <= 128 && sc == 0.0 {
-            q.flash_attention_prefill(&kc, &vc, nh, nkv, hd)
+        } else if t <= s && t <= 65535 && hd <= 128 && sc == 0.0 {
+            // A block continuing the cache (prefix-cache suffix, prefill chunk) too: its queries start at
+            // position s - t.
+            q.flash_attention_prefill_at(&kc, &vc, nh, nkv, hd, s - t)
         } else {
             // chunked_attention delegates to causal_attention when q covers the whole history, so
             // this one call serves full prefill, prefix-cached suffixes and chunked prefill alike.

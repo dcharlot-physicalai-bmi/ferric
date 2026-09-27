@@ -78,14 +78,17 @@ pub(crate) trait ServeModel {
     /// Tokenize a `/v1/completions` prompt string.
     fn encode_text(&self, text: &str) -> Vec<u32>;
 
-    /// Prefill a prompt into a fresh state. Returns the state and the **last** row of logits — the
-    /// row the first sampled token comes from.
+    /// Start a sequence: a fresh state (or one seeded from the prompt cache) and how many of the
+    /// prompt's tokens it already holds — never all of them, since the last must be fed to give logits.
+    fn begin(&self, prompt: &[u32]) -> (Self::State, usize);
+
+    /// Feed the next run of prompt tokens. `last` = they end the prompt: return the **last** row of
+    /// logits, the row the first sampled token comes from.
     ///
     /// Prefill is per-sequence on purpose: `forward_batch` is the DECODE step (one token per
     /// sequence), so a newly admitted request builds its cache alone and joins the batch from its
-    /// second token onward. Chunked prefill interleaved into the decode batch is the next lever and
-    /// is not attempted here.
-    fn prefill(&self, prompt: &[u32]) -> (Self::State, Vec<f32>);
+    /// second token onward — fed in chunks while others decode (see `step`).
+    fn feed(&self, state: &mut Self::State, toks: &[u32], last: bool) -> Option<Vec<f32>>;
 
     /// One decode step for N sequences: `toks[i]` advances `states[i]`. Returns N × `n_vocab`
     /// logits, row `i` belonging to sequence `i`.
@@ -205,6 +208,10 @@ struct Gen<S> {
     /// The client went away: stop generating for it and free the slot on the next step.
     gone: bool,
     state: Option<S>,
+    /// Prompt tokens its state holds so far (chunked prefill), and whether its first token is out —
+    /// only then does it join the decode batch.
+    fed: usize,
+    ready: bool,
     /// The token to feed on the next decode step.
     next: u32,
 }
@@ -392,7 +399,7 @@ fn route<M: ServeModel>(
             em: Emitter::new(&gopts.stop),
             include_usage: req["stream_options"]["include_usage"].as_bool() == Some(true),
             opts: gopts,
-            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, gone: false, state: None, next: 0,
+            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, gone: false, state: None, fed: 0, ready: false, next: 0,
         });
         return;
     }
@@ -699,6 +706,13 @@ impl<S: Source> Pool<S> {
     }
 }
 
+/// Prompt tokens fed per step while other sequences decode (`FERRIC_PREFILL_CHUNK`, default 512 — llama.cpp's
+/// default micro-batch). Smaller = smoother streams for everyone else, larger = the new request's first token
+/// sooner.
+fn prefill_chunk() -> usize {
+    std::env::var("FERRIC_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(512)
+}
+
 /// One scheduler step: admit + prefill new arrivals, decode everything running in ONE forward,
 /// then flush whatever retired.
 fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State>>) {
@@ -706,12 +720,31 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
     let live: HashSet<SeqId> = batch.iter().copied().collect();
 
     // --- admission: prefill alone, because `decode` is the DECODE step ---
+    //
+    // ⭐ CHUNKED while anything is decoding: at most `chunk` prompt tokens per step, so a long prompt
+    // arriving costs every in-flight stream one chunk's latency per token instead of its whole prefill
+    // (a 4k-token prompt at ~500 tok/s froze every stream ~8 s). With nothing decoding there is no one to
+    // stall, and the prompt goes in whole — one forward, the old path exactly.
+    let decoding = gens.iter().any(|g| g.ready && live.contains(&g.id));
+    let mut budget = if decoding { prefill_chunk() } else { usize::MAX };
     let mut first: Vec<(SeqId, u32, bool)> = Vec::new();
     for g in gens.iter_mut() {
-        if !live.contains(&g.id) || g.state.is_some() { continue; }
-        g.ticket = m.energy_begin();
-        let (st, row) = m.prefill(&g.prompt);
-        g.state = Some(st);
+        if !live.contains(&g.id) || g.ready { continue; }
+        if budget == 0 { break; }
+        if g.state.is_none() {
+            g.ticket = m.energy_begin();
+            let (st, skip) = m.begin(&g.prompt);
+            g.state = Some(st);
+            g.fed = skip;
+        }
+        let to = g.prompt.len().min(g.fed.saturating_add(budget));
+        let last = to == g.prompt.len();
+        let Some(st) = g.state.as_mut() else { continue };
+        let row = m.feed(st, &g.prompt[g.fed..to], last);
+        budget -= to - g.fed;
+        g.fed = to;
+        let Some(row) = row else { continue };
+        g.ready = true;
         match m.pick(&row, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
             Some(t) if !m.is_stop(t) => { g.next = t; let hit = g.commit(m, t, &row); first.push((g.id, t, hit)); }
             // Stop token (or a dead guide) on the very first sampled token: the serial path emits
@@ -730,7 +763,8 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
         // can take `gens` mutably again.
         let mut states: Vec<&mut M::State> = Vec::new();
         for (i, g) in gens.iter_mut().enumerate() {
-            if !running.contains(&g.id) { continue; }
+            // A sequence still mid-prefill has no token to feed yet.
+            if !running.contains(&g.id) || !g.ready { continue; }
             let t = g.next;
             let Some(st) = g.state.as_mut() else { continue };
             idxs.push(i);
@@ -839,12 +873,14 @@ impl ServeModel for Engine {
         ids
     }
 
-    fn prefill(&self, prompt: &[u32]) -> (ModelCache, Vec<f32>) {
-        let (mut c, skip) = self.seeded_cache(prompt);
-        let v = pollster::block_on(self.model.forward_cached_last(&prompt[skip..], &mut c).to_vec());
+    fn begin(&self, prompt: &[u32]) -> (ModelCache, usize) { self.seeded_cache(prompt) }
+
+    /// A chunk continues the cache exactly as a prompt-cache hit does (the suffix after a seeded prefix),
+    /// so chunked and whole prefill feed the same tokens through the same cached forward.
+    fn feed(&self, c: &mut ModelCache, toks: &[u32], last: bool) -> Option<Vec<f32>> {
+        let v = pollster::block_on(self.model.forward_cached_last(toks, c).to_vec());
         let nv = self.model.n_vocab();
-        let row = v[v.len() - nv..].to_vec();
-        (c, row)
+        last.then(|| v[v.len() - nv..].to_vec())
     }
 
     fn decode(&self, toks: &[u32], states: &mut [&mut ModelCache]) -> Vec<f32> {
@@ -920,6 +956,9 @@ mod tests {
         /// differently and a request run on the wrong one is visible in its text.
         name: String,
         salt: u32,
+        /// Prefill cost per prompt token (the physical fact chunking trades on), and chunks fed so far.
+        prefill_per_token: Duration,
+        prefills: Arc<AtomicUsize>,
     }
 
     /// A sequence's whole visible history. Keeping the full history (rather than a rolling hash)
@@ -939,7 +978,7 @@ mod tests {
         fn new(batchable: bool) -> Mock {
             Mock { batchable, step_delay: Duration::ZERO,
                    widest: Arc::new(AtomicUsize::new(0)), calls: Arc::new(AtomicUsize::new(0)), stop: 0,
-                   name: "mock".to_string(), salt: 0 }
+                   name: "mock".to_string(), salt: 0, prefill_per_token: Duration::ZERO, prefills: Arc::new(AtomicUsize::new(0)) }
         }
     }
 
@@ -954,9 +993,12 @@ mod tests {
             Ok(out)
         }
         fn encode_text(&self, text: &str) -> Vec<u32> { text.bytes().map(|b| b as u32).collect() }
-        fn prefill(&self, prompt: &[u32]) -> (MockState, Vec<f32>) {
-            let st = MockState { fed: prompt.to_vec() };
-            (st.clone(), onehot(hash_salted(&st.fed, self.salt), self.n_vocab()))
+        fn begin(&self, _prompt: &[u32]) -> (MockState, usize) { (MockState { fed: Vec::new() }, 0) }
+        fn feed(&self, st: &mut MockState, toks: &[u32], last: bool) -> Option<Vec<f32>> {
+            self.prefills.fetch_add(1, Ordering::SeqCst);
+            if !self.prefill_per_token.is_zero() { std::thread::sleep(self.prefill_per_token * toks.len() as u32); }
+            st.fed.extend_from_slice(toks);
+            last.then(|| onehot(hash_salted(&st.fed, self.salt), self.n_vocab()))
         }
         fn decode(&self, toks: &[u32], states: &mut [&mut MockState]) -> Vec<f32> {
             assert_eq!(toks.len(), states.len(), "one token per sequence");
@@ -1351,6 +1393,43 @@ mod tests {
     /// a tautology. Deleting the call and returning `true` is a mutation that COMPILES, so this
     /// assertion is not subsumed by the compiler.
     // ---- several models ----------------------------------------------------------------------
+
+    #[test]
+    fn a_long_prompt_is_prefilled_in_chunks_while_others_stream() {
+        // 1 ms per prompt token: a 2,000-token prompt prefilled whole freezes every stream for ~2 s.
+        let mk = || { let mut m = Mock::new(true); m.step_delay = Duration::from_millis(2); m.prefill_per_token = Duration::from_millis(1); m };
+        let long: String = (0..2000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let want = { let addr = spawn(mk(), 4); text_of(&post(&addr, "/v1/completions", &json!({"prompt": long, "max_tokens": 6}).to_string())) };
+        let m = mk();
+        let prefills = m.prefills.clone();
+        let addr = spawn(m, 4);
+        // A streams; its deltas are timestamped as they arrive.
+        let a = {
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let mut s = TcpStream::connect(&addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                let body = json!({"messages": [{"role": "user", "content": "go"}], "max_tokens": 700, "stream": true}).to_string();
+                s.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+                let mut times = Vec::new();
+                for line in BufReader::new(s).lines() {
+                    let Ok(line) = line else { break };
+                    if line.starts_with("data: {") { times.push(Instant::now()); }
+                    if line == "data: [DONE]" { break; }
+                }
+                times
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200)); // A is decoding
+        let before = prefills.load(Ordering::SeqCst);
+        let got = text_of(&post(&addr, "/v1/completions", &json!({"prompt": long, "max_tokens": 6}).to_string()));
+        let chunks = prefills.load(Ordering::SeqCst) - before;
+        let times = a.join().unwrap();
+        let gap = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert_eq!(got, want, "a prompt fed in chunks must answer exactly as one fed whole");
+        assert!(chunks >= 4, "2,000 tokens at 512 per step is 4 chunks, saw {chunks}");
+        assert!(gap < Duration::from_millis(1000), "the stream froze for {gap:?} while the long prompt prefilled");
+    }
 
     #[test]
     fn keep_alive_reads_ollamas_spellings() {

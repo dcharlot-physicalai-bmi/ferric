@@ -837,14 +837,25 @@ impl Tensor {
     /// instead of O(T²). `self`=q [T, nh·dh], k/v [T, nkv·dh]. Any T (keys are streamed in 2048-key
     /// chunks with online softmax); T ≤ 65535 for the dispatch grid. Same math as `causal_attention`.
     pub fn flash_attention_prefill(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize) -> Tensor {
+        self.flash_attention_prefill_at(k, v, nh, nkv, dh, 0)
+    }
+
+    /// [`Self::flash_attention_prefill`] for a query block that CONTINUES a cache: `self` holds the
+    /// queries at positions `off..off+T`, `k`/`v` all `off + T` keys, and query `i` attends keys
+    /// `0..=off+i`. That is a prefix-cache hit's suffix and each chunk of a chunked prefill; before it they
+    /// fell to the composed `chunked_attention`, and a 6,587-token prompt fed in 512-token chunks took 2.4x
+    /// as long as the same prompt prefilled whole. `off = 0` is the full-prefill kernel instruction for
+    /// instruction (plus one add), so full prefill is unchanged bit for bit.
+    pub fn flash_attention_prefill_at(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize, off: usize) -> Tensor {
         let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
         let t = q.shape[0];
         assert!(dh <= 128 && t <= 65535, "flash prefill: head_dim ≤ 128, T ≤ 65535");
+        assert_eq!(k.numel(), (off + t) * nkv * dh, "flash prefill: keys must be the {off} cached + {t} new rows");
         let out = empty(&self.ctx, t * nh * dh);
         let scale = 1.0 / (dh as f32).sqrt();
         run(&self.ctx, FLASH_ATTN_PREFILL_WGSL, "flash_prefill",
             &[q.buf.as_ref(), k.buf.as_ref(), v.buf.as_ref(), &out,
-              &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, t as u32, scale.to_bits(), 0, 0, 0])],
+              &unibuf(&self.ctx, &[nh as u32, nkv as u32, dh as u32, t as u32, scale.to_bits(), off as u32, 0, 0])],
             (nh as u32, t as u32, 1));
         Tensor::from_parts(&self.ctx, out, vec![t, nh * dh])
     }
@@ -3194,7 +3205,7 @@ const FLASH_ATTN_PREFILL_WGSL: &str = r#"
 @group(0) @binding(1) var<storage,read>        k:   array<f32>;   // [T, nkv·dh]
 @group(0) @binding(2) var<storage,read>        v:   array<f32>;   // [T, nkv·dh]
 @group(0) @binding(3) var<storage,read_write>  out: array<f32>;   // [T, nh·dh]
-struct Info { a: vec4<u32>, b: vec4<u32> }         // a = (nh,nkv,dh,T); b.x = scale bits
+struct Info { a: vec4<u32>, b: vec4<u32> }         // a = (nh,nkv,dh,T); b.x = scale bits, b.y = key offset
 @group(0) @binding(4) var<uniform>             info: Info;
 var<workgroup> qs: array<f32, 128>;
 var<workgroup> sc: array<f32, 2048>;
@@ -3205,7 +3216,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let scale = bitcast<f32>(info.b.x);
     let head = wg.x; let qi = wg.y; let t = lid.x;
     let g = nh / nkv; let kvh = head / g;
-    let s = qi + 1u;                          // causal: keys 0..=qi
+    let s = info.b.y + qi + 1u;               // causal: query qi sits at position off+qi, keys 0..=off+qi
     let qbase = qi * nh * dh + head * dh; let kvbase = kvh * dh;
     if (t < dh) { qs[t] = q[qbase + t]; }
     workgroupBarrier();
@@ -4742,5 +4753,47 @@ mod gemm_agreement_tests {
         assert!(probe.iter().any(|&v| v > 0.0) && probe.iter().any(|&v| v < 0.0),
                 "the generator must be two-signed or cancellation is never exercised");
         assert!(checked > 100_000, "only {checked} elements compared — the shape list shrank");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod flash_offset_tests {
+    use super::*;
+
+    /// Causal attention for queries at positions `off..off+t` over `off+t` keys, in float64 on the host.
+    fn reference(q: &[f32], k: &[f32], v: &[f32], t: usize, off: usize, nh: usize, nkv: usize, dh: usize) -> Vec<f64> {
+        let (g, scale) = (nh / nkv, 1.0 / (dh as f64).sqrt());
+        let mut out = vec![0f64; t * nh * dh];
+        for i in 0..t {
+            for h in 0..nh {
+                let kh = h / g;
+                let s: Vec<f64> = (0..=off + i).map(|j| (0..dh).map(|d| q[(i * nh + h) * dh + d] as f64 * k[(j * nkv + kh) * dh + d] as f64).sum::<f64>() * scale).collect();
+                let m = s.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for d in 0..dh { out[(i * nh + h) * dh + d] = e.iter().enumerate().map(|(j, w)| w * v[(j * nkv + kh) * dh + d] as f64).sum::<f64>() / z; }
+            }
+        }
+        out
+    }
+
+    /// A query block continuing a cache — a prompt-cache suffix, a prefill chunk — against float64. The
+    /// offsets cross the kernel's 2048-key chunk; 0 is the full-prefill case the kernel always served.
+    #[test]
+    fn flash_prefill_continues_a_cache_at_any_offset() {
+        let Ok(ctx) = pollster::block_on(Context::new()) else { eprintln!("no GPU — skipping"); return; };
+        let ctx = std::sync::Arc::new(ctx);
+        let (nh, nkv, dh) = (4usize, 2usize, 64usize);
+        let wave = |n: usize, s: f32| -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.37 + s).sin()) * 0.8).collect() };
+        for (t, off) in [(37usize, 0usize), (37, 100), (40, 2100), (1, 511), (300, 1900)] {
+            let q = wave(t * nh * dh, 1.0);
+            let (k, v) = (wave((off + t) * nkv * dh, 2.0), wave((off + t) * nkv * dh, 3.0));
+            let got = pollster::block_on(Tensor::from_vec(&ctx, &q, &[t, nh * dh])
+                .flash_attention_prefill_at(&Tensor::from_vec(&ctx, &k, &[off + t, nkv * dh]),
+                                            &Tensor::from_vec(&ctx, &v, &[off + t, nkv * dh]), nh, nkv, dh, off).to_vec());
+            let want = reference(&q, &k, &v, t, off, nh, nkv, dh);
+            let err = got.iter().zip(&want).map(|(a, b)| (*a as f64 - b).abs()).fold(0f64, f64::max);
+            assert!(err < 2e-5, "T={t} off={off}: max |Δ| vs float64 {err:.2e}");
+        }
     }
 }
