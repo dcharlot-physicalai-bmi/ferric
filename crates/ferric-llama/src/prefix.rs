@@ -40,6 +40,10 @@ pub const CHUNK: usize = 16;
 struct Entry {
     tokens: Vec<u32>,
     kv: EntryKv,
+    /// The LongRoPE table the rows were rotated with (`Cache::rope_long`). Seeding restores it, so a
+    /// Phi-3 request on the other side of `original_max_position_embeddings` recomputes the prefix
+    /// instead of attending to keys from the wrong table.
+    rope_long: Option<bool>,
 }
 
 /// A cached prefix's KV, in whichever representation the cache that produced it uses.
@@ -138,7 +142,7 @@ impl PrefixCache {
         // block addressing, so the "block id" is just the chunk's ordinal.
         let chunks: Vec<u32> = (0..(keep / CHUNK) as u32).collect();
         self.index.insert(&tokens[..keep], &chunks, id);
-        self.entries.insert(id, Entry { tokens: tokens[..keep].to_vec(), kv });
+        self.entries.insert(id, Entry { tokens: tokens[..keep].to_vec(), kv, rope_long: cache.rope_long() });
     }
 
     /// Seed `cache` with the longest cached prefix of `tokens`.
@@ -188,6 +192,7 @@ impl PrefixCache {
             _ => { self.misses += 1; return None }
         }
         cache.pos = m.tokens;
+        cache.set_history(&tokens[..m.tokens], e.rope_long);
         self.hits += 1;
         self.tokens_saved += m.tokens as u64;
         Some(Hit { tokens: m.tokens, seq: m.seq })
