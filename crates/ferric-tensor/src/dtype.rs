@@ -916,6 +916,9 @@ pub struct Q5_0Weights {
     scales: Arc<wgpu::Buffer>, // [qh (u32), d (f16 in low 16 bits)] per block
     pub rows: usize,           // out features
     pub cols: usize,           // in features (multiple of 32)
+    /// NVIDIA-tier mirror of `codes`/`scales` (4 + 2 words per block), from the same host words.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub cuda: Option<crate::cuda::QDev>,
 }
 
 impl Q5_0Weights {
@@ -943,7 +946,10 @@ impl Q5_0Weights {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             }))
         };
-        Q5_0Weights { ctx: ctx.clone(), codes: mk("q5_0.codes", &codes), scales: mk("q5_0.scales", &scales), rows, cols }
+        Q5_0Weights {
+            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+            cuda: crate::cuda::QDev::upload(crate::cuda::QFmt::Q5_0, &codes, &scales),
+            ctx: ctx.clone(), codes: mk("q5_0.codes", &codes), scales: mk("q5_0.scales", &scales), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 22 }
     /// Overwrite `n` consecutive rows in place. See [`Q4_KWeights::write_rows`].
@@ -973,6 +979,12 @@ impl Q5_0Weights {
         }
         self.ctx.queue.write_buffer(&self.codes, (blk0 * 4 * 4) as u64, bytemuck::cast_slice(&codes));
         self.ctx.queue.write_buffer(&self.scales, (blk0 * 2 * 4) as u64, bytemuck::cast_slice(&scales));
+        // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
+        // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(dev) = &self.cuda {
+            if !dev.write_words(blk0 * 4, &codes, blk0 * 2, &scales) { return Err("cuda mirror write failed".into()); }
+        }
         Ok(())
     }
 
@@ -1144,15 +1156,19 @@ impl QMatrix {
         let [QShard::Q6_K(w)] = &self.shards[..] else { return None };
         Some(x.matmul_q6_k_cfg(w, false))
     }
-    /// Native-tier view of a single-shard Q5_K / Q6_K matrix: the device mirror plus [rows, cols].
-    /// `None` for any other format, for multi-shard weights, or when the tier is off.
+    /// Native-tier view of a single-shard Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 matrix: the device mirror
+    /// plus [rows, cols]. `None` for any other format, for multi-shard weights, or when the tier is off.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     pub fn native_weight(&self) -> Option<crate::cuda::NativeWeight<'_>> {
-        match &self.shards[..] {
-            [QShard::Q5_K(w)] => w.cuda.as_ref().map(|d| crate::cuda::NativeWeight::Q5K { dev: d, rows: w.rows, cols: w.cols }),
-            [QShard::Q6_K(w)] => w.cuda.as_ref().map(|d| crate::cuda::NativeWeight::Q6K { dev: d, rows: w.rows, cols: w.cols }),
-            _ => None,
-        }
+        let (dev, rows, cols) = match &self.shards[..] {
+            [QShard::Q4_K(w)] => (w.cuda.as_ref()?, w.rows, w.cols),
+            [QShard::Q5_K(w)] => (w.cuda.as_ref()?, w.rows, w.cols),
+            [QShard::Q6_K(w)] => (w.cuda.as_ref()?, w.rows, w.cols),
+            [QShard::Q8_0(w)] => (w.cuda.as_ref()?, w.rows, w.cols),
+            [QShard::Q5_0(w)] => (w.cuda.as_ref()?, w.rows, w.cols),
+            _ => return None,
+        };
+        Some(crate::cuda::NativeWeight { dev, rows, cols })
     }
     /// ggml block-size in bytes for a supported type, or None if we have no native matmul for it.
     pub fn block_bytes(ggml_type: u32) -> Option<(usize, usize)> {
@@ -1346,7 +1362,7 @@ impl Q5_KWeights {
         }));
         Q5_KWeights {
             #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-            cuda: crate::cuda::Q5KDev::upload(&codes, &aux),
+            cuda: crate::cuda::QDev::upload(crate::cuda::QFmt::Q5K, &codes, &aux),
             ctx: ctx.clone(), codes: mk("q5k.codes", &codes), aux: mk("q5k.aux", &aux), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 176 }
@@ -1641,7 +1657,7 @@ impl Q6_KWeights {
         }));
         Q6_KWeights {
             #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-            cuda: crate::cuda::Q6KDev::upload(&codes, &aux),
+            cuda: crate::cuda::QDev::upload(crate::cuda::QFmt::Q6K, &codes, &aux),
             ctx: ctx.clone(), codes: mk("q6k.codes", &codes), aux: mk("q6k.aux", &aux), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 210 }
@@ -1678,6 +1694,12 @@ impl Q6_KWeights {
         let blk0 = row0 * bpr;
         self.ctx.queue.write_buffer(&self.codes, (blk0 * 48 * 4) as u64, bytemuck::cast_slice(&codes));
         self.ctx.queue.write_buffer(&self.aux, (blk0 * 5 * 4) as u64, bytemuck::cast_slice(&aux));
+        // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
+        // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(dev) = &self.cuda {
+            if !dev.write_words(blk0 * 48, &codes, blk0 * 5, &aux) { return Err("cuda mirror write failed".into()); }
+        }
         Ok(())
     }
 
@@ -1973,6 +1995,9 @@ pub struct Q8_0Weights {
     scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
     pub rows: usize,
     pub cols: usize,           // multiple of 32
+    /// NVIDIA-tier mirror of `codes`/`scales` (8 words per block; scales two per word), same host words.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub cuda: Option<crate::cuda::QDev>,
 }
 
 impl Q8_0Weights {
@@ -1991,7 +2016,10 @@ impl Q8_0Weights {
             label: Some(label), contents: bytemuck::cast_slice(data),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         }));
-        Q8_0Weights { ctx: ctx.clone(), codes: mk("q8_0.codes", &codes), scales: mk("q8_0.scales", &scales), rows, cols }
+        Q8_0Weights {
+            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+            cuda: crate::cuda::QDev::upload(crate::cuda::QFmt::Q8_0, &codes, &scales),
+            ctx: ctx.clone(), codes: mk("q8_0.codes", &codes), scales: mk("q8_0.scales", &scales), rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 32) * 34 }
     /// Overwrite `n` consecutive rows in place. See [`Q4_KWeights::write_rows`].
@@ -2028,6 +2056,12 @@ impl Q8_0Weights {
         }
         self.ctx.queue.write_buffer(&self.codes, (blk0 * 8 * 4) as u64, bytemuck::cast_slice(&codes));
         self.ctx.queue.write_buffer(&self.scales, (blk0 / 2 * 4) as u64, bytemuck::cast_slice(&scales));
+        // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
+        // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(dev) = &self.cuda {
+            if !dev.write_words(blk0 * 8, &codes, blk0 / 2, &scales) { return Err("cuda mirror write failed".into()); }
+        }
         Ok(())
     }
 
@@ -2128,6 +2162,9 @@ pub struct Q4_KWeights {
     aux_t: Option<Arc<wgpu::Buffer>>,   // [block][k][output]
     pub rows: usize,
     pub cols: usize,          // multiple of 256
+    /// NVIDIA-tier mirror of `codes`/`aux` (32 + 4 words per block), from the same host words.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    pub cuda: Option<crate::cuda::QDev>,
 }
 
 impl Q4_KWeights {
@@ -2162,7 +2199,10 @@ impl Q4_KWeights {
             }
             (Some(mk("q4k.codes_t", &ct)), Some(mk("q4k.aux_t", &at)))
         } else { (None, None) };
-        Q4_KWeights { ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), codes_t, aux_t, rows, cols }
+        Q4_KWeights {
+            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+            cuda: crate::cuda::QDev::upload(crate::cuda::QFmt::Q4K, &codes, &aux),
+            ctx: ctx.clone(), codes: mk("q4k.codes", &codes), aux: mk("q4k.aux", &aux), codes_t, aux_t, rows, cols }
     }
     pub fn nbytes(&self) -> usize { self.rows * (self.cols / 256) * 144 }
 
@@ -2210,6 +2250,12 @@ impl Q4_KWeights {
         let blk0 = row0 * bpr;
         self.ctx.queue.write_buffer(&self.codes, (blk0 * 32 * 4) as u64, bytemuck::cast_slice(&codes));
         self.ctx.queue.write_buffer(&self.aux, (blk0 * 4 * 4) as u64, bytemuck::cast_slice(&aux));
+        // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
+        // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(dev) = &self.cuda {
+            if !dev.write_words(blk0 * 32, &codes, blk0 * 4, &aux) { return Err("cuda mirror write failed".into()); }
+        }
         Ok(())
     }
 

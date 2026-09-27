@@ -257,7 +257,10 @@ impl Cfg {
             // Gemma-2 omits rope.freq_base (uniform 10000 default); other arches require it.
             rope_base: f("rope.freq_base").unwrap_or(10000.0),
             has_qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
-            qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
+            // `FERRIC_NO_QKV_BIAS` drops Qwen2's q/k/v biases on EVERY path — a negative control only:
+            // `scripts/cuda_conformance.sh` must see it move the native tier's logits, or that gate has
+            // not shown it can see the bias at all.
+            qkv_bias: g.tensor("blk.0.attn_q.bias").is_some() && std::env::var("FERRIC_NO_QKV_BIAS").is_err(),
             is_gemma,
             embd_scale: if is_gemma { (n_embd as f32).sqrt() } else { 1.0 },
             sliding_window: u("attention.sliding_window").unwrap_or(0),
@@ -451,7 +454,18 @@ pub struct Cache {
     /// would spend the memory the quantization exists to save.
     q: Vec<(KvStore, KvStore)>,
     fmt: Option<KvqFmt>,
+    /// NVIDIA tier: THIS sequence's K/V on the device. `None` until a native step runs on it.
+    ///
+    /// Rows `[0, min(device, wgsl))` are identical in both stores; the longer one holds the rest and
+    /// is brought over lazily — device → `kv` in [`Cache::layer_kv`] / [`Cache::kv_mut`] before any
+    /// WGSL forward reads it, `kv` → device at the start of a native step. So either path can run
+    /// next, in any order, and neither ever reads a stale row.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    native: Option<NativeKv>,
 }
+/// The device half of a [`Cache`] (see its `native` field) and the context its rows are pulled with.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+struct NativeKv { kv: ferric_tensor::cuda::DevKv, ctx: Arc<Context> }
 impl Cache {
     /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise. See [`Cache::with_kvq`].
     pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, kvq_from_env()) }
@@ -484,13 +498,17 @@ impl Cache {
                     .map(|_| (if grouped_k { KvStore::grouped(f) } else { KvStore::block(f) }, KvStore::block(f)))
                     .collect(),
                 fmt: Some(f),
+                #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+                native: None,
             },
         }
     }
 
     pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
         match fmt {
-            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None },
+            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None,
+                            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+                            native: None },
             Some(f) => Cache {
                 pos: 0,
                 kv: Vec::new(),
@@ -505,7 +523,39 @@ impl Cache {
                 // that makes a regression impossible to attribute.
                 q: (0..cfg.n_layer).map(|_| (k_store(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
+                #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+                native: None,
             },
+        }
+    }
+
+    /// Rows the NVIDIA tier holds that the WGSL store does not yet — `0` off-tier.
+    pub fn native_ahead(&self) -> usize {
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(n) = &self.native { return n.kv.len.saturating_sub(self.kv.first().map_or(0, |p| p.0.len())); }
+        0
+    }
+    /// Bring every row that exists only on the NVIDIA device into the WGSL store, so the cache can be
+    /// read or copied as a whole. A no-op off-tier or when nothing is pending. Forward passes do this
+    /// themselves; call it before [`Cache::layers`] (e.g. a prefix-cache snapshot).
+    pub fn sync_native(&mut self) {
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        {
+            let Some(n) = &self.native else { return };
+            if self.fmt.is_some() { return; }
+            let have = self.kv.first().map_or(0, |p| p.0.len());
+            let dev = n.kv.len;
+            if dev <= have { return; }
+            let (cnt, w) = (dev - have, n.kv.width());
+            for il in 0..self.kv.len() {
+                // ⛔ A failed readback cannot be papered over: the WGSL store would be missing rows the
+                // sequence has already attended to. Panic with the reason rather than continue on a hole.
+                let (k, v) = n.kv.read_rows(il, have, cnt)
+                    .unwrap_or_else(|| panic!("native tier: could not read back K/V rows {have}..{dev} of layer {il}"));
+                let (kb, vb) = &mut self.kv[il];
+                kb.append(&n.ctx, &Tensor::from_vec(&n.ctx, &k, &[cnt, w]));
+                vb.append(&n.ctx, &Tensor::from_vec(&n.ctx, &v, &[cnt, w]));
+            }
         }
     }
 
@@ -553,15 +603,23 @@ impl Cache {
     pub fn layers(&self) -> &[(KvBuf, KvBuf)] {
         assert!(self.fmt.is_none(), "Cache::layers() on a KV-quantized cache: the f32 buffers are empty. \
                                      Use Cache::layers_q().");
+        // ⛔ With the NVIDIA tier on, the newest rows can live only on the device. `KvBuf::clone_prefix`
+        // CLAMPS to what it holds, so a prefix-cache snapshot taken here would store a silently SHORTER
+        // prefix than it is indexed under, and every later hit would attend to a hole. Refuse instead.
+        assert!(self.native_ahead() == 0,
+                "Cache::layers(): {} rows live only on the NVIDIA device — call Cache::sync_native() first",
+                self.native_ahead());
         &self.kv
     }
     /// Mutable access to layer `il`'s (K, V) — used by batched decode, which walks N caches per layer.
     pub fn kv_mut(&mut self, il: usize) -> &mut (KvBuf, KvBuf) {
         assert!(self.fmt.is_none(), "Cache::kv_mut() on a KV-quantized cache; use Cache::layer_kv()");
+        self.sync_native();
         &mut self.kv[il]
     }
     /// Layer `il`'s K/V store, whichever kind this cache holds. The one place the two differ.
     fn layer_kv(&mut self, il: usize) -> LayerKv<'_> {
+        self.sync_native();
         match self.fmt {
             None => LayerKv::F32(&mut self.kv[il]),
             Some(_) => LayerKv::Quant(&mut self.q[il]),
@@ -604,6 +662,10 @@ impl Cache {
         assert!(self.fmt.is_none(), "Cache::set_layers() on a KV-quantized cache would install f32 rows \
                                      the attention path will not read. Use Cache::set_layers_q().");
         self.kv = kv;
+        // The device rows described the OLD history. Keep the allocation, forget the rows: the next
+        // native step pushes the new ones over.
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(n) = &mut self.native { n.kv.len = 0; }
     }
 }
 
@@ -682,8 +744,14 @@ pub struct Qwen3 {
     pub cap: std::cell::RefCell<Option<Vec<(String, Tensor)>>>,
     /// NVIDIA tier 2: the resident decode graph, built lazily on the first eligible decode step.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    native: std::cell::RefCell<Option<ferric_tensor::cuda::DecodeGraph>>,
+    native: std::cell::RefCell<NativeSlot>,
 }
+/// The NVIDIA decode graph's lifecycle on one model: built on the first eligible step, or refused
+/// ONCE with the reason printed — a refusal used to retry (and re-read every norm from the GPU) on
+/// every token.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+#[derive(Default)]
+enum NativeSlot { #[default] Untried, Refused, Ready(ferric_tensor::cuda::DecodeGraph) }
 /// Build one transformer layer from a weight source.
 ///
 /// Extracted from `Qwen3::load` unchanged, so a layer can also be built **on demand** from bytes a tier
@@ -894,7 +962,7 @@ impl Qwen3 {
         Ok(Qwen3 {
             cap: std::cell::RefCell::new(None),
             #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-            native: std::cell::RefCell::new(None),
+            native: std::cell::RefCell::new(NativeSlot::Untried),
             tok_embd: match &embd {
                 Some((b, base)) => EmbdTable::Streamed { backing: Arc::clone(b), base: *base },
                 None => EmbdTable::Resident(g.raw("token_embd.weight")?),
@@ -1657,7 +1725,7 @@ impl Qwen3 {
         use ferric_tensor::{batch, prof};
         // NVIDIA tier 2 (opt-in, FERRIC_CUDA): one resident decode step per token after a WGSL prefill.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if tokens.len() == 1 && cache.pos > 0 {
+        if tokens.len() == 1 {
             if let Some(lg) = self.native_step(tokens[0], cache) { return lg; }
         }
         let x = self.run_layers(tokens, cache);
@@ -1681,6 +1749,114 @@ impl Qwen3 {
         out
     }
 
+    /// **Tier 2 decode step on the NVIDIA native path.** Builds the resident graph on first use from
+    /// the WGSL-side weights (their CUDA mirrors were uploaded at load), brings this sequence's device
+    /// K/V up to `cache.pos` (pushing only the rows the WGSL path wrote since), then runs the whole step
+    /// on the device: one `[d]` row in, one `[n_vocab]` row out.
+    ///
+    /// `None` = not eligible or not available; the caller falls back to WGSL, which is always correct —
+    /// and is now always SAFE: a failed step leaves the device K/V untouched, and the WGSL path pulls
+    /// any device-only rows before it reads the cache (`Cache::sync_native`). This used to panic
+    /// ("the WGSL cache is stale") once a native step had run.
+    ///
+    /// Eligibility is exactly what the kernels implement, and each refusal names what it lacks:
+    /// dense layers, full RoPE in NEOX or NORM pairing, optionally scaled per frequency (Llama-3
+    /// `rope_freqs`, linear), optional q/k/v bias (Qwen2) and QK-norm (Qwen3), f32 KV, resident
+    /// single-shard Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 weights, head_dim a multiple of 32 up to 128.
+    /// Everything else (YaRN's attention factor, softcaps, windows, logit scale, Gemma's norms,
+    /// multimodal rope) stays on the portable path rather than being approximated.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    fn native_step(&self, token: u32, cache: &mut Cache) -> Option<Tensor> {
+        use ferric_tensor::cuda::DecodeGraph;
+        ferric_tensor::cuda::driver()?;
+        if cache.fmt.is_some() { return None; }
+        let mut slot = self.native.borrow_mut();
+        if let NativeSlot::Untried = *slot {
+            *slot = match self.native_graph_spec() {
+                Err(why) => { eprintln!("cuda: native decode NOT used for this model — {why}"); NativeSlot::Refused }
+                Ok(spec) => match DecodeGraph::build(&spec) {
+                    None => { eprintln!("cuda: native decode graph could not be built (a shape the kernels do not cover, \
+                                         or no PTX/memory) — WGSL runs"); NativeSlot::Refused }
+                    Some(g) => {
+                        eprintln!("cuda: tier-2 resident decode graph built on {} ({} layers, KV grows on demand)",
+                                  ferric_tensor::cuda::device_name().unwrap_or_default(), self.layers.len());
+                        NativeSlot::Ready(g)
+                    }
+                },
+            };
+        }
+        let NativeSlot::Ready(g) = &mut *slot else { return None };
+        if cache.native.is_none() {
+            cache.native = Some(NativeKv { kv: g.new_kv()?, ctx: self.ctx.clone() });
+        }
+        let n = cache.native.as_mut().unwrap();
+        let pos = cache.pos;
+        if n.kv.len > pos { n.kv.len = pos; }          // the caller rewound `pos`: rows past it are dead
+        if n.kv.len < pos {
+            // Rows the WGSL path wrote since the device last saw this sequence (a WGSL prefill, a
+            // prefix-cache seed, a batched step). They must ALL be there, or the push has nothing to copy.
+            let have = cache.kv.first().map_or(0, |p| p.0.len());
+            if have < pos || !n.kv.reserve(pos + 1) { return None; }
+            let (from, cnt) = (n.kv.len, pos - n.kv.len);
+            for il in 0..self.cfg.n_layer {
+                let (kb, vb) = &cache.kv[il];
+                let rows = |b: &KvBuf| pollster::block_on(b.view(&self.ctx).narrow(0, from, cnt).contiguous().to_vec());
+                if !n.kv.write_rows(il, from, &rows(kb), &rows(vb)) { return None; }
+            }
+            n.kv.len = pos;
+        }
+        let row = self.embed_rows(&[token], true);
+        let logits = g.step(&mut n.kv, &row)?;
+        cache.pos += 1;
+        Some(Tensor::from_vec(&self.ctx, &logits, &[1, self.cfg.n_vocab]))
+    }
+
+    /// The host-side description of this model for [`ferric_tensor::cuda::DecodeGraph::build`], or the
+    /// reason it cannot have one. The rotation is taken from the SAME `rope_plan` the WGSL path uses,
+    /// with the same `FERRIC_NEOX` override, so a negative control that flips the pairing flips it on
+    /// both paths and a conformance gate can see the native one move.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    fn native_graph_spec(&self) -> Result<ferric_tensor::cuda::GraphSpec<'_>, String> {
+        use ferric_tensor::cuda::{GraphSpec, LayerSpec};
+        let c = &self.cfg;
+        if self.stream.is_some() { return Err("layers are streamed".into()); }
+        let norm_pairs = match rope_plan(c, self.rope_freqs.is_some(), std::env::var("FERRIC_NEOX").is_ok()) {
+            RopePlan::Neox | RopePlan::ScaledNeox => false,
+            RopePlan::Norm | RopePlan::ScaledNorm => true,
+            RopePlan::Mrope(..) => return Err("multimodal rope".into()),
+        };
+        for (bad, why) in [(c.is_gemma, "Gemma norms/scaling"), (c.yarn_factor > 1.0, "YaRN attention factor"),
+                           (c.logit_scale != 1.0, "logit scale"), (c.final_softcap > 0.0, "final softcap"),
+                           (c.attn_softcap > 0.0, "attention softcap"), (c.sliding_window > 0, "sliding window")] {
+            if bad { return Err(why.into()); }
+        }
+        let tv = |t: &Tensor| pollster::block_on(t.to_vec());
+        fn nw<'a>(w: &'a QMatrix, what: &str) -> Result<ferric_tensor::cuda::NativeWeight<'a>, String> {
+            w.native_weight().ok_or_else(|| format!("{what} is not a single-shard Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 weight"))
+        }
+        let qk_norm = self.layers[0].q_norm.is_some();
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (il, l) in self.layers.iter().enumerate() {
+            if l.attn_gate.is_some() || l.post_attn_norm.is_some() || l.post_ffn_norm.is_some() { return Err(format!("layer {il}: gated attention / post-norms")); }
+            if l.window != 0 || !l.rope || l.rope_base != c.rope_base { return Err(format!("layer {il}: window / NoPE / its own rope base")); }
+            if l.q_norm.is_some() != qk_norm || l.k_norm.is_some() != qk_norm { return Err(format!("layer {il}: QK-norm differs from layer 0")); }
+            let parts: Vec<&QMatrix> = match &l.wqkv { Proj::Fused(w) => vec![w], Proj::Split(ws) => ws.iter().collect() };
+            let qkv_parts = parts.iter().map(|w| nw(w, "qkv")).collect::<Result<Vec<_>, _>>()?;
+            let gate_up = match &l.ffn_gate_up { Proj::Fused(w) => nw(w, "gate|up")?, Proj::Split(_) => return Err(format!("layer {il}: gate and up differ in format")) };
+            layers.push(LayerSpec {
+                attn_norm: tv(&l.attn_norm), ffn_norm: tv(&l.ffn_norm),
+                q_norm: l.q_norm.as_ref().map(tv), k_norm: l.k_norm.as_ref().map(tv),
+                qkv_bias: l.qkv_bias.as_ref().map(tv),
+                qkv_parts, wo: nw(&l.wo, "attn_output")?, gate_up, down: nw(&l.ffn_down, "ffn_down")?,
+            });
+        }
+        Ok(GraphSpec {
+            d: c.n_embd, nh: c.n_head, nkv: c.n_head_kv, dh: c.head_dim, n_ff: c.n_ff, n_vocab: c.n_vocab,
+            eps: c.eps, rope_base: c.rope_base, has_qk_norm: qk_norm,
+            rope_ff: self.rope_freqs.as_ref().map(tv), norm_pairs,
+            layers, out_norm: tv(&self.out_norm), lm_head: nw(&self.lm_head, "the LM head")?,
+        })
+    }
     /// Fetch embedding rows on demand instead of holding the whole table.
     ///
     /// `base` is the table's absolute byte offset. Frees the resident copy, so peak drops by the table's
@@ -1689,72 +1865,6 @@ impl Qwen3 {
     ///
     /// The caller owns availability: with a `StagedBacking` the rows for the current tokens must be
     /// staged first, and a miss is `NotStaged` naming the range rather than a wrong embedding.
-    /// **Tier 2 decode step on the NVIDIA native path.** Builds the resident graph on first use from
-    /// the WGSL-side weights (their CUDA mirrors were uploaded at load), seeds the device K/V cache
-    /// from the WGSL cache whenever the two disagree on length (i.e. after any WGSL prefill), then runs
-    /// the whole step on the device: one `[d]` row in, one `[n_vocab]` row out.
-    ///
-    /// `None` = not eligible or not available; the caller falls back to WGSL, which is always correct.
-    /// Eligibility is deliberately narrow (dense, RoPE-NEOX, no biases/softcaps/windows, f32 cache,
-    /// resident layers, Q5_K/Q6_K weights, Q5_K fused gate|up) — everything else stays on the
-    /// portable path rather than being approximated.
-    ///
-    /// ⚠ Once a native step has advanced the device cache, the WGSL `KvBuf` is BEHIND it. A later
-    /// WGSL decode on the same `Cache` would be wrong, so a failure after that point panics with the
-    /// reason instead of silently returning `None` into a stale cache.
-    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    fn native_step(&self, token: u32, cache: &mut Cache) -> Option<Tensor> {
-        use ferric_tensor::cuda::{DecodeGraph, GraphSpec, LayerSpec};
-        const NATIVE_CAP: usize = 2048;
-        let c = &self.cfg;
-        if self.stream.is_some() || cache.fmt.is_some() || self.rope_freqs.is_some() { return None; }
-        if c.is_gemma || c.qkv_bias || c.rope_interleaved || c.yarn_factor > 1.0 || c.logit_scale != 1.0
-            || c.final_softcap > 0.0 || c.attn_softcap > 0.0 || c.sliding_window > 0 || cache.pos + 1 > NATIVE_CAP { return None; }
-        let mut slot = self.native.borrow_mut();
-        if slot.is_none() {
-            let tv = |t: &Tensor| pollster::block_on(t.to_vec());
-            let mut layers = Vec::with_capacity(self.layers.len());
-            for l in &self.layers {
-                if l.attn_gate.is_some() || l.post_attn_norm.is_some() || l.post_ffn_norm.is_some()
-                    || l.window != 0 || !l.rope || l.qkv_bias.is_some() { return None; }
-                let parts: Vec<&ferric_tensor::QMatrix> = match &l.wqkv { Proj::Fused(w) => vec![w], Proj::Split(ws) => ws.iter().collect() };
-                let qkv_parts = parts.iter().map(|w| w.native_weight()).collect::<Option<Vec<_>>>()?;
-                let gate_up = match &l.ffn_gate_up { Proj::Fused(w) => w.native_weight()?, Proj::Split(_) => return None };
-                layers.push(LayerSpec {
-                    attn_norm: tv(&l.attn_norm), ffn_norm: tv(&l.ffn_norm),
-                    q_norm: l.q_norm.as_ref().map(tv), k_norm: l.k_norm.as_ref().map(tv),
-                    qkv_parts, wo: l.wo.native_weight()?, gate_up, down: l.ffn_down.native_weight()?,
-                });
-            }
-            let spec = GraphSpec {
-                d: c.n_embd, nh: c.n_head, nkv: c.n_head_kv, dh: c.head_dim, n_ff: c.n_ff, n_vocab: c.n_vocab,
-                eps: c.eps, rope_base: c.rope_base, has_qk_norm: self.layers[0].q_norm.is_some(), cap: NATIVE_CAP,
-                layers, out_norm: tv(&self.out_norm), lm_head: self.lm_head.native_weight()?,
-            };
-            *slot = Some(DecodeGraph::build(&spec)?);
-            eprintln!("cuda: tier-2 resident decode graph built on {} ({} layers, cap {NATIVE_CAP})",
-                      ferric_tensor::cuda::device_name().unwrap_or_default(), self.layers.len());
-        }
-        let g = slot.as_mut().unwrap();
-        let advanced = g.len > cache.kv[0].0.len();
-        if g.len != cache.pos {
-            if advanced { panic!("native tier: device cache ({}) is ahead of the WGSL cache ({}) and they now disagree", g.len, cache.pos); }
-            for il in 0..c.n_layer {
-                let (kb, vb) = &cache.kv[il];
-                if kb.len() != cache.pos { return None; }
-                let (k, v) = (pollster::block_on(kb.view(&self.ctx).to_vec()), pollster::block_on(vb.view(&self.ctx).to_vec()));
-                if !g.seed_cache(il, &k, &v, cache.pos) { return None; }
-            }
-        }
-        let row = self.embed_rows(&[token], true);
-        let logits = match g.step(&row) {
-            Some(l) => l,
-            None if advanced => panic!("native tier failed after advancing the device cache; the WGSL cache is stale"),
-            None => return None,
-        };
-        cache.pos += 1;
-        Some(Tensor::from_vec(&self.ctx, &logits, &[1, c.n_vocab]))
-    }
     pub fn stream_embeddings(&mut self, backing: Arc<dyn ferric_tier::Backing + Send + Sync>, base: u64) {
         self.tok_embd = EmbdTable::Streamed { backing, base };
     }

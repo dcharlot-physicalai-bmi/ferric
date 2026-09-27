@@ -65,7 +65,9 @@ extern "C" __global__ void vadd(const float* __restrict__ a, const float* __rest
 }
 
 // ── Q6_K GEMV. codes: 48 u32/block = ql[32 words] qh[16 words]; aux: 5 u32/block = [d f16][16 i8 scales].
-//    Mirrors WGSL Q6_K_BODY (dtype.rs) exactly: element order hf x l, four products per l. ──
+//    Mirrors WGSL Q6_K_BODY (dtype.rs) exactly: element order hf x l, four products per l.
+//    The per-lane dot is `q6k_dot_lane` below so the fused SwiGLU kernel can share it; `q6k_gemv`'s
+//    arithmetic is unchanged by that move (same expressions, same order). ──
 __device__ __forceinline__ unsigned q6_qlb(const unsigned* __restrict__ codes, unsigned cb, unsigned i) {
     return (codes[cb + (i >> 2u)] >> (8u * (i & 3u))) & 0xffu;
 }
@@ -85,13 +87,9 @@ __device__ __forceinline__ float q6_scb(const unsigned* __restrict__ aux, unsign
 // is = l>>4 constant; q1&q3 if sub<2 (l0 = 16sub) else q2&q4 (l0 = 16(sub-2)); qh uint4 = bytes
 // [32hf + l0, +16). One uint4 of ql + one of qh + 32 x floats per lane per block; 8 lanes cover the
 // block's 128 B of ql contiguously.
-extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,
-                                    const unsigned* __restrict__ aux, float* __restrict__ out,
-                                    unsigned o_dim, unsigned in_dim) {
-    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
-    const unsigned o = blockIdx.x * 4u + warp;
-    if (o >= o_dim) return;                          // warp-uniform
-    const unsigned nblk = in_dim / 256u;
+__device__ __forceinline__ float q6k_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                              const unsigned* __restrict__ aux, unsigned o, unsigned nblk,
+                                              unsigned lane) {
     const unsigned sl = lane & 7u, bl = lane >> 3u;
     const unsigned hf = sl >> 2u, sub = sl & 3u;
     const bool second = sub >= 2u;                   // q2&q4 instead of q1&q3
@@ -129,6 +127,15 @@ extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned*
         }
         acc += sA * accA + sB * accB;
     }
+    return acc;
+}
+extern "C" __global__ void q6k_gemv(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                    const unsigned* __restrict__ aux, float* __restrict__ out,
+                                    unsigned o_dim, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= o_dim) return;                          // warp-uniform
+    float acc = q6k_dot_lane(x, codes, aux, o, in_dim / 256u, lane);
     acc = warp_sum(acc);
     if (lane == 0u) out[o] = acc;
 }
@@ -216,29 +223,203 @@ extern "C" __global__ void q5k_swiglu_gemv(const float* __restrict__ x, const un
     if (lane == 0u) out[o] = (g / (1.f + expf(-g))) * u;
 }
 
+// ═══════════ Q4_K, Q8_0, Q5_0 — the formats a Q4_K_M file is actually made of ═══════════
+// A "Q4_K_M" file is not all Q4_K: llama.cpp bumps attn_v / ffn_down / the head to Q6_K, and any row
+// whose width is not a multiple of 256 falls back to a 32-wide format — Qwen2.5-0.5B (d = 896) ships
+// Q5_0 for q/k/v/o/gate/up and Q8_0 for half its attn_v and the output head. Each kernel reads the
+// SAME repacked words its WGSL twin reads (dtype.rs `from_bytes`), and keeps the tier's contract:
+// one warp per output row, 4 rows per 128-thread block, 16-byte coalesced weight loads, shuffle reduce.
+
+// Q4_K: aux = [d|dmin f16x2][12 scale bytes] (4 u32/block, identical to Q5_K); codes = 32 u32 of qs.
+// Lane plan is q5k_dot_lane's minus the qh plane: lane j owns positions [16(j&1), +16) of sub-blocks
+// 2c and 2c+1 (c = j>>1) — one uint4 of qs, low nibbles -> 2c, high -> 2c+1; 8 lanes read a block's
+// 128 B contiguously, 4 block-lanes stride the blocks.
+__device__ __forceinline__ float q4k_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                              const unsigned* __restrict__ aux, unsigned o, unsigned nblk,
+                                              unsigned lane) {
+    const unsigned bl = lane >> 3u, j = lane & 7u;
+    const unsigned c = j >> 1u, half = j & 1u, s0 = 2u * c, s1 = s0 + 1u;
+    float acc = 0.f;
+    for (unsigned blk = bl; blk < nblk; blk += 4u) {
+        const unsigned bi = o * nblk + blk, ab = bi * 4u, cb32 = bi * 32u;
+        const unsigned dd = aux[ab];
+        const float d = f16_to_f32(dd & 0xffffu), dmin = f16_to_f32(dd >> 16u);
+        float ds0, mm0, ds1, mm1;
+        q5_scmin(aux, ab, s0, d, dmin, ds0, mm0);
+        q5_scmin(aux, ab, s1, d, dmin, ds1, mm1);
+        const uint4 q = *reinterpret_cast<const uint4*>(codes + cb32 + 8u * c + 4u * half);
+        const float* x0 = x + blk * 256u + 32u * s0 + 16u * half;
+        const float* x1 = x + blk * 256u + 32u * s1 + 16u * half;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        float a0 = 0.f, sx0 = 0.f, a1 = 0.f, sx1 = 0.f;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xa = *reinterpret_cast<const float4*>(x0 + 4u * w);
+            const float4 xb = *reinterpret_cast<const float4*>(x1 + 4u * w);
+            const unsigned word = qw[w];
+            a0 += xa.x * (float)(word & 0xfu) + xa.y * (float)((word >> 8u) & 0xfu)
+                + xa.z * (float)((word >> 16u) & 0xfu) + xa.w * (float)((word >> 24u) & 0xfu);
+            a1 += xb.x * (float)((word >> 4u) & 0xfu) + xb.y * (float)((word >> 12u) & 0xfu)
+                + xb.z * (float)((word >> 20u) & 0xfu) + xb.w * (float)((word >> 28u) & 0xfu);
+            sx0 += xa.x + xa.y + xa.z + xa.w;
+            sx1 += xb.x + xb.y + xb.z + xb.w;
+        }
+        acc += ds0 * a0 - mm0 * sx0 + ds1 * a1 - mm1 * sx1;
+    }
+    return acc;
+}
+
+// Q8_0: codes = 8 u32/block (32 int8); scales = one f16 per block, TWO PACKED PER u32
+// (`scales[b/2] >> 16(b%2)`, dtype.rs). Two lanes per block, each one uint4 = 16 int8 (a block's 32 B
+// read by a lane pair; 16 blocks = 512 B contiguous per warp step).
+__device__ __forceinline__ float q8_0_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                               const unsigned* __restrict__ scales, unsigned o, unsigned nblk,
+                                               unsigned lane) {
+    const unsigned half = lane & 1u;
+    float acc = 0.f;
+    for (unsigned blk = lane >> 1u; blk < nblk; blk += 16u) {
+        const unsigned bi = o * nblk + blk;
+        const unsigned sw = scales[bi >> 1u];
+        const float d = f16_to_f32((bi & 1u) ? (sw >> 16u) : (sw & 0xffffu));
+        const uint4 q = *reinterpret_cast<const uint4*>(codes + bi * 8u + 4u * half);
+        const float* xp = x + blk * 32u + 16u * half;
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        float s = 0.f;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w) {
+            const float4 xv = *reinterpret_cast<const float4*>(xp + 4u * w);
+            const unsigned word = qw[w];
+            s += xv.x * (float)((int)(word << 24u) >> 24) + xv.y * (float)((int)(word << 16u) >> 24)
+               + xv.z * (float)((int)(word << 8u) >> 24)  + xv.w * (float)((int)word >> 24);
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+
+// Q5_0: codes = 4 u32/block (16 bytes: byte i low nibble -> element i, high nibble -> element i+16);
+// scales = [qh u32, d f16] per block (2 u32). value = ((nibble | qh_bit << 4) - 16) * d.
+// Two lanes per block; lane half h owns bytes [8h, 8h+8): elements [8h, +8) and [16+8h, +8).
+__device__ __forceinline__ float q5_0_dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                               const unsigned* __restrict__ scales, unsigned o, unsigned nblk,
+                                               unsigned lane) {
+    const unsigned h = lane & 1u;
+    float acc = 0.f;
+    for (unsigned blk = lane >> 1u; blk < nblk; blk += 16u) {
+        const unsigned bi = o * nblk + blk;
+        const uint2 sc = *reinterpret_cast<const uint2*>(scales + bi * 2u);
+        const unsigned qh = sc.x;
+        const float d = f16_to_f32(sc.y & 0xffffu);
+        const uint2 q = *reinterpret_cast<const uint2*>(codes + bi * 4u + 2u * h);
+        const float* xl = x + blk * 32u + 8u * h;          // low-nibble elements
+        const float* xh = xl + 16u;                        // high-nibble elements
+        const unsigned qw[2] = {q.x, q.y};
+        float s = 0.f;
+        #pragma unroll
+        for (unsigned w = 0u; w < 2u; ++w) {
+            const float4 a = *reinterpret_cast<const float4*>(xl + 4u * w);
+            const float4 b = *reinterpret_cast<const float4*>(xh + 4u * w);
+            const unsigned word = qw[w], e = 8u * h + 4u * w;   // element index of this word's byte 0
+            #define LO(k) (float)((int)(((word >> (8u * (k))) & 0xfu) | (((qh >> (e + (k))) & 1u) << 4u)) - 16)
+            #define HI(k) (float)((int)(((word >> (8u * (k) + 4u)) & 0xfu) | (((qh >> (e + 16u + (k))) & 1u) << 4u)) - 16)
+            s += a.x * LO(0u) + a.y * LO(1u) + a.z * LO(2u) + a.w * LO(3u)
+               + b.x * HI(0u) + b.y * HI(1u) + b.z * HI(2u) + b.w * HI(3u);
+            #undef LO
+            #undef HI
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+
+// One GEMV and one fused gate|up + SwiGLU entry point per format, all through `dot_lane<F>`.
+// F: 0 = Q4_K, 1 = Q5_K, 2 = Q6_K, 3 = Q8_0, 4 = Q5_0 — the order of `QFmt` in cuda.rs.
+// (Q5_K and Q6_K already have their own q5k_gemv / q6k_gemv / q5k_swiglu_gemv entries above, which the
+// host keeps using so their recorded numerics cannot move; q6k_swiglu_gemv is new.)
+template <int F>
+__device__ __forceinline__ float dot_lane(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                          const unsigned* __restrict__ aux, unsigned o, unsigned in_dim,
+                                          unsigned lane) {
+    if (F == 0) return q4k_dot_lane(x, codes, aux, o, in_dim / 256u, lane);
+    if (F == 1) return q5k_dot_lane(x, codes, aux, o, in_dim / 256u, lane >> 3u, lane & 7u);
+    if (F == 2) return q6k_dot_lane(x, codes, aux, o, in_dim / 256u, lane);
+    if (F == 3) return q8_0_dot_lane(x, codes, aux, o, in_dim / 32u, lane);
+    return q5_0_dot_lane(x, codes, aux, o, in_dim / 32u, lane);
+}
+template <int F>
+__device__ __forceinline__ void gemv_t(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                       const unsigned* __restrict__ aux, float* __restrict__ out,
+                                       unsigned o_dim, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= o_dim) return;                          // warp-uniform
+    float acc = dot_lane<F>(x, codes, aux, o, in_dim, lane);
+    acc = warp_sum(acc);
+    if (lane == 0u) out[o] = acc;
+}
+template <int F>
+__device__ __forceinline__ void swiglu_t(const float* __restrict__ x, const unsigned* __restrict__ codes,
+                                         const unsigned* __restrict__ aux, float* __restrict__ out,
+                                         unsigned n_ff, unsigned in_dim) {
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    const unsigned o = blockIdx.x * 4u + warp;
+    if (o >= n_ff) return;
+    float g = dot_lane<F>(x, codes, aux, o, in_dim, lane);
+    float u = dot_lane<F>(x, codes, aux, o + n_ff, in_dim, lane);
+    g = warp_sum(g); u = warp_sum(u);
+    if (lane == 0u) out[o] = (g / (1.f + expf(-g))) * u;
+}
+// ⚠ Spelled out, not macro-generated: tests/ptx_artifact.rs finds the kernel list by parsing
+// `extern "C" __global__ void NAME(` lines, and a macro would hide these from that stale-PTX gate.
+#define GEMV_ARGS const float* __restrict__ x, const unsigned* __restrict__ codes, \
+                  const unsigned* __restrict__ aux, float* __restrict__ out, unsigned n_out, unsigned in_dim
+extern "C" __global__ void q4k_gemv(GEMV_ARGS)         { gemv_t<0>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q8_0_gemv(GEMV_ARGS)        { gemv_t<3>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q5_0_gemv(GEMV_ARGS)        { gemv_t<4>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q4k_swiglu_gemv(GEMV_ARGS)  { swiglu_t<0>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q6k_swiglu_gemv(GEMV_ARGS)  { swiglu_t<2>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q8_0_swiglu_gemv(GEMV_ARGS) { swiglu_t<3>(x, codes, aux, out, n_out, in_dim); }
+extern "C" __global__ void q5_0_swiglu_gemv(GEMV_ARGS) { swiglu_t<4>(x, codes, aux, out, n_out, in_dim); }
+#undef GEMV_ARGS
+
 // ── QK-norm (optional) + NEOX RoPE for ONE row (decode): ONE BLOCK PER HEAD, dh threads.
 //    ⛔ The first version was one THREAD per head — 24 threads doing 128 serial sinf/cosf/expf — and the
 //    profiler put it at 0.71 ms/tok, 13% of the step, for trivial math. Now: block-reduced sum of
 //    squares, then thread c handles the pair (c, c+half). K heads also write their roped row straight
 //    into the K cache at `kc_row` and copy this head's V slice into the V cache at `vc_row`, which
 //    removes the two cuMemcpyDtoD per layer (56 per token). Pass kc_row = vc_row = 0 to skip that.
-//    Mirrors QK_NORM_ROPE_WGSL's math; blocks: [0, nh) are q heads, [nh, nh+nkv) are k heads. ──
+//    Mirrors QK_NORM_ROPE_WGSL's math; blocks: [0, nh) are q heads, [nh, nh+nkv) are k heads.
+//
+//    Three optional inputs widen it past Qwen3 without touching Qwen3's arithmetic (every one of them,
+//    when absent, removes an operation rather than adding a neutral one, so the NEOX/no-bias path is
+//    the SAME float ops in the same order as before):
+//      bias       [q_out + 2 kv_out] added to q, k AND v before anything else — Qwen2's q/k/v biases
+//                 (WGSL: `qkv.add(bias)` right after the projection). Null = no bias.
+//      ff         [dh/2] per-frequency MULTIPLIER on the inverse frequency — Llama-3 `rope_freqs`
+//                 (already inverted at load; see qwen3.rs) or a linear factor. Mirrors ROPE_SCALED_WGSL:
+//                 `exp(-2c/dh * ln base) * scale[c]`. Null = plain rope.
+//      norm_pairs 1 = ggml NORM pairing, partners (2c, 2c+1) — `llama`'s GGUF rows are permuted for it;
+//                 0 = NEOX split-half, partners (c, c + dh/2). The frequency index is c in both.
+//                 ⛔ The wrong pairing is the classic silent RoPE failure: finite logits, fluent text. ──
 extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
                                         const float* __restrict__ kw, float* __restrict__ qo,
                                         float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
                                         float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
                                         unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
-                                        unsigned v_off) {
+                                        unsigned v_off, const float* __restrict__ bias,
+                                        const float* __restrict__ ff, unsigned norm_pairs) {
     __shared__ float red[4]; __shared__ float s_inv;
     const unsigned id = blockIdx.x, t = threadIdx.x;
     const bool is_k = id >= nh;
     const unsigned head = is_k ? id - nh : id;
-    const float* src = qkv + (is_k ? k_off : q_off) + head * dh;
+    const unsigned so = (is_k ? k_off : q_off) + head * dh;
+    const float* src = qkv + so;
+    const float* bsrc = bias != 0 ? bias + so : 0;
     float* dst = (is_k ? ko : qo) + head * dh;
     const float* w = is_k ? kw : qw;
     float inv = 1.f;
     if (has_norm) {
-        float v = (t < dh) ? src[t] : 0.f;
+        float v = (t < dh) ? (bsrc != 0 ? src[t] + bsrc[t] : src[t]) : 0.f;
         float ms = warp_sum(v * v);
         if ((t & 31u) == 0u) red[t >> 5u] = ms;
         __syncthreads();
@@ -250,15 +431,22 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
     const unsigned half = dh / 2u;
     if (t < half) {
         const unsigned c = t;
-        const float fr = expf(-2.f * (float)c / (float)dh * logf(base));
+        const unsigned p0 = norm_pairs ? 2u * c : c, p1 = norm_pairs ? 2u * c + 1u : c + half;
+        float fr = expf(-2.f * (float)c / (float)dh * logf(base));
+        if (ff != 0) fr = fr * ff[c];
         const float ang = (float)pos * fr, cs = cosf(ang), sn = sinf(ang);
-        const float w1 = has_norm ? w[c] : 1.f, w2 = has_norm ? w[c + half] : 1.f;
-        const float x1 = src[c] * inv * w1, x2 = src[c + half] * inv * w2;
+        const float w1 = has_norm ? w[p0] : 1.f, w2 = has_norm ? w[p1] : 1.f;
+        const float a = bsrc != 0 ? src[p0] + bsrc[p0] : src[p0];
+        const float b = bsrc != 0 ? src[p1] + bsrc[p1] : src[p1];
+        const float x1 = a * inv * w1, x2 = b * inv * w2;
         const float r1 = x1 * cs - x2 * sn, r2 = x2 * cs + x1 * sn;
-        dst[c] = r1; dst[c + half] = r2;
-        if (is_k && kc_row != 0) { kc_row[head * dh + c] = r1; kc_row[head * dh + c + half] = r2; }
+        dst[p0] = r1; dst[p1] = r2;
+        if (is_k && kc_row != 0) { kc_row[head * dh + p0] = r1; kc_row[head * dh + p1] = r2; }
     }
-    if (is_k && vc_row != 0 && t < dh) vc_row[head * dh + t] = qkv[v_off + head * dh + t];
+    if (is_k && vc_row != 0 && t < dh) {
+        const unsigned vi = v_off + head * dh + t;
+        vc_row[head * dh + t] = bias != 0 ? qkv[vi] + bias[vi] : qkv[vi];
+    }
 }
 
 // ── Fused single-query attention over an [S, nkv*dh] K/V cache: one block (128 threads = 4 warps)
