@@ -4,14 +4,14 @@
 //!   asr_corpus parakeet <model.gguf>                     <corpus-dir>
 //!   asr_corpus mimo     <asr-dir> <tokenizer-dir>        <corpus-dir>
 //!
-//! `<corpus-dir>` holds `<id>.wav` (16 kHz mono 16-bit) and `refs.txt` (`<id> <TRANSCRIPT>` per line) —
+//! `<corpus-dir>` holds `<id>.wav` (16 kHz mono, 16-bit PCM or 32-bit float) and `refs.txt` (`<id> <TRANSCRIPT>` per line) —
 //! prepared ONCE, so no decoder runs inside the measured window. The model loads, every WAV is read
 //! into memory, and then the corpus runs in `ASR_CHUNKS` chunks (default 4) with an idle gap of
 //! `ASR_IDLE_S` seconds (default 10) before each chunk and after the last:
 //!
 //! ```text
-//! IDLE <t0> <t1>     the process sleeps: the machine's draw WITHOUT this work, measured next to it
-//! RUN  <t0> <t1> <s> a chunk of utterances back to back, nothing else; <s> seconds of audio in it
+//! IDLE <t0> <t1>           the process sleeps: the machine's draw WITHOUT this work, measured next to it
+//! RUN  <t0> <t1> <s> <n>   a chunk of <n> utterances back to back, nothing else; <s> seconds of audio
 //! ```
 //!
 //! ⭐ WHY INTERLEAVED. This machine is shared: other sessions start and stop CPU and GPU work at will, so
@@ -28,17 +28,32 @@ use ferric_llama::parakeet::Parakeet;
 use ferric_tokenizer::{Bpe, Pre};
 use std::sync::Arc;
 
+/// Mono 16-bit PCM or 32-bit IEEE float — the Open ASR Leaderboard's ESB parquet stores float WAV — and
+/// nothing else: a float file read as int16 pairs is noise that still "transcribes".
 fn read_wav(path: &std::path::Path) -> (Vec<f32>, usize) {
     let b = std::fs::read(path).expect("read wav");
-    let (mut i, mut rate, mut pcm) = (12usize, 0usize, Vec::new());
+    assert!(b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE", "{}: not a RIFF/WAVE file", path.display());
+    let (mut i, mut fmt, mut data) = (12usize, None, None);
     while i + 8 <= b.len() {
         let id = &b[i..i + 4];
         let sz = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
         let d = &b[i + 8..(i + 8 + sz).min(b.len())];
-        if id == b"fmt " { rate = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize; }
-        if id == b"data" { pcm = d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(); }
+        if id == b"fmt " {
+            let u16at = |k: usize| u16::from_le_bytes([d[k], d[k + 1]]);
+            // WAVE_FORMAT_EXTENSIBLE carries the real format tag at the head of its sub-format GUID.
+            let tag = if u16at(0) == 0xFFFE { u16at(24) } else { u16at(0) };
+            fmt = Some((tag, u16at(2), u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize, u16at(14)));
+        }
+        if id == b"data" { data = Some(d); }
         i += 8 + sz + (sz & 1);
     }
+    let ((tag, ch, rate, bits), d) = (fmt.expect("no fmt chunk"), data.expect("no data chunk"));
+    assert_eq!(ch, 1, "{}: {ch} channels, mono only", path.display());
+    let pcm = match (tag, bits) {
+        (1, 16) => d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
+        (3, 32) => d.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        _ => panic!("{}: WAV format tag {tag}, {bits} bits — only 16-bit PCM and 32-bit float are read", path.display()),
+    };
     (pcm, rate)
 }
 
@@ -101,7 +116,7 @@ async fn run() {
                 }
                 let b = now();
                 let secs: f64 = block.iter().map(|(p, r)| p.len() as f64 / *r as f64).sum();
-                println!("RUN {a:.3} {b:.3} {secs:.3}");
+                println!("RUN {a:.3} {b:.3} {secs:.3} {}", block.len());
                 t1 += b - a;
             }
             idle();
@@ -124,7 +139,7 @@ async fn run() {
                 }
                 let b = now();
                 let secs: f64 = block.iter().map(|(p, r)| p.len() as f64 / *r as f64).sum();
-                println!("RUN {a:.3} {b:.3} {secs:.3}");
+                println!("RUN {a:.3} {b:.3} {secs:.3} {}", block.len());
                 t1 += b - a;
             }
             idle();

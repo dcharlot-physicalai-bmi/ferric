@@ -25,8 +25,15 @@
 #
 # ⚠ WHAT THE GUARDS CAN AND CANNOT SEE. (1) Drift: the two idle gaps around a chunk must agree within 25%
 # of the work between them. (2) A burst inside one chunk: every chunk's joules per second of audio must lie
-# within 2x of the median chunk's — foreign load that lands inside one run window shows up as an outlier
-# there (the first MiMo run's SYSTEM rail had three chunks at 4-7x the rest; the GPU rail none). Load that
+# within 2x of the median chunk's. That comparison only means something when the chunks are ALIKE, so the
+# run is refused unless every chunk's mean clip length is within 2x of the median chunk's: a corpus in
+# length order (the ESB parquet shards are sorted longest-first) made one chunk 0.5x the median on clip
+# length alone. (3) The meter itself: `macmon` has returned a single sample of 18,779 W CPU / 5,314 W RAM /
+# 18,788 W SYSTEM on a machine that cannot draw 1 kW, and rails that read exactly 0 in every sample but
+# that one — so a sample above $ASR_JOULES_CEILING_W (default 1000) refuses its chunk, and a rail that
+# reads 0 in most samples WHILE THE MODEL WORKS has dropped out (the GPU reads 0 between clips and at
+# idle; that is real). The first MiMo run's SYSTEM rail had three chunks at 4-7x the rest, blamed at the
+# time on other sessions — a glitch sample would look the same, and those samples were not kept. Load that
 # is spread evenly over every run window and absent from every gap cannot be told apart from the model.
 #
 # ⭐ TWO DENOMINATORS. "Correct words" = reference words minus edits, under LibriSpeech's own normalisation
@@ -56,8 +63,9 @@ sleep 1
 kill $MM 2>/dev/null; wait $MM 2>/dev/null
 [ $RC -eq 0 ] || { tail -20 "$TMP/err.txt"; exit 1; }
 ASR_WER_SCRIPT="$ROOT/scripts/asr_wer_normalized.py" ASR_CORPUS="$CORPUS" python3 - "$TMP" "$L0" "$*" <<'PY'
-import json, sys, datetime
+import json, os, sys, datetime
 tmp, l0, args = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+CEIL = float(os.environ.get("ASR_JOULES_CEILING_W", "1000"))
 samples = []
 for line in open(f"{tmp}/run.json"):
     try: d = json.loads(line)
@@ -68,12 +76,19 @@ o = open(f"{tmp}/out.txt").read().splitlines()
 idles = [tuple(map(float, l.split()[1:3])) for l in o if l.startswith("IDLE ")]
 runs = [tuple(map(float, l.split()[1:3])) for l in o if l.startswith("RUN ")]
 run_audio = [float(l.split()[3]) for l in o if l.startswith("RUN ")]
+run_utts = [int(l.split()[4]) for l in o if l.startswith("RUN ")]
 summ = dict(zip(*[iter(next(l for l in o if l.startswith("SUMMARY ")).split()[1:])] * 2))
 if len(idles) != len(runs) + 1:
     print(f"⛔ {len(idles)} idle gaps for {len(runs)} chunks"); sys.exit(1)
-def mean_in(a, b, k, settle=0.0):
-    xs = [s[k] for s in samples if a + settle <= s[0] <= b]
-    return (sum(xs) / len(xs), len(xs)) if xs else (float("nan"), 0)
+clip = [s / n for s, n in zip(run_audio, run_utts)]
+mc = sorted(clip)[len(clip) // 2]
+if any(not (0.5 * mc <= c <= 2.0 * mc) for c in clip):
+    print("⛔ the chunks are not alike — mean clip length per chunk: " + ", ".join(f"{c:.2f} s" for c in clip)
+          + ". The corpus is in some order (length?); the per-chunk guard compares chunks, so shuffle refs.txt.")
+    sys.exit(1)
+def vals(a, b, k, settle=0.0):
+    return [s[k] for s in samples if a + settle <= s[0] <= b]
+def mean(xs): return sum(xs) / len(xs) if xs else float("nan")
 correct, words, audio = int(summ["correct"]), int(summ["words"]), float(summ["audio_s"])
 run_s = sum(b - a for a, b in runs)
 print(f"model      {args}")
@@ -86,36 +101,50 @@ for name, k in [("GPU", 1), ("CPU", 3), ("RAM", 4), ("SYSTEM", 2)]:
         print(f"{name:7s}    ⚠ reads 0 throughout this run — unseen by macmon here, not free"); continue
     total, rows, ok, per_s = 0.0, [], True, []
     for i, (a, b) in enumerate(runs):
-        (p_run, n_run) = mean_in(a, b, k)
-        (p_i0, n0) = mean_in(*idles[i], k, settle=2.0)       # the first 2 s let the rails fall back
-        (p_i1, n1) = mean_in(*idles[i + 1], k, settle=2.0)
+        xr = vals(a, b, k)
+        x0, x1 = vals(*idles[i], k, settle=2.0), vals(*idles[i + 1], k, settle=2.0)   # 2 s for the rails to fall back
+        p_run, p_i0, p_i1 = mean(xr), mean(x0), mean(x1)
         base = (p_i0 + p_i1) / 2
         j = (p_run - base) * (b - a)
-        spread = abs(p_i0 - p_i1)
-        good = n_run >= 8 and n0 >= 8 and n1 >= 8 and spread <= 0.25 * max(p_run - base, 1e-9)
-        ok &= good
+        why = []
+        if min(len(xr), len(x0), len(x1)) < 8:
+            why.append("fewer than 8 samples in a window")
+        else:
+            top = max(xr + x0 + x1)
+            if top > CEIL:
+                why.append(f"one sample reads {top:,.0f} W, above the {CEIL:.0f} W ceiling — a meter glitch, not power")
+            if 2 * sum(v == 0 for v in xr) > len(xr):
+                why.append("reads exactly 0 W in most samples while the model works — the rail dropped out")
+            if not p_run > base:
+                why.append("the work does not exceed idle")
+            elif abs(p_i0 - p_i1) > 0.25 * (p_run - base):
+                why.append("the gaps disagree by more than 25% of the work")
+        ok &= not why
         total += j
         per_s.append(j / run_audio[i])
         rows.append(f"      chunk {i}: {b - a:6.1f} s  work {p_run:6.2f} W  idle {p_i0:6.2f} / {p_i1:6.2f} W  -> {j:8.1f} J"
-                    f"{'' if good else '   ⛔ the gaps disagree by more than 25% of the work'}")
+                    + "".join(f"   ⛔ {w}" for w in why))
     med = sorted(per_s)[len(per_s) // 2]
-    for i, v in enumerate(per_s):
-        if med > 0 and not (0.5 * med <= v <= 2.0 * med):
-            ok = False
-            rows[i] += f"   ⛔ {v:.2f} J per audio second, {v / med:.1f}x the median chunk"
+    if not med > 0:
+        ok = False
+        rows.append(f"      ⛔ the median chunk has no positive marginal — nothing to compare the chunks against")
+    else:
+        for i, v in enumerate(per_s):
+            if not (0.5 * med <= v <= 2.0 * med):
+                ok = False
+                rows[i] += f"   ⛔ {v:.2f} J per audio second, {v / med:.1f}x the median chunk"
     verdict[name] = ok
     totals[name] = total
     print(f"{name:7s}    marginal {total:9.1f} J   {total / correct * 1e3:8.2f} mJ per correct word   "
           f"{total / audio:6.3f} J per audio second   {'✅ attributable' if ok else '⛔ NOT attributable'}")
     print("\n".join(rows))
-# Each rail stands or falls on its own gaps: the GPU is often quiet while other sessions load the CPU,
-# and then the GPU figure is attributable while the system figure is not. A rail that fails is printed
-# with its reason and must not be quoted; the run fails only if NEITHER rail is attributable.
+# Each rail stands or falls on its own chunks: the GPU is often clean while the meter's CPU rail drops out
+# or other sessions load the system. A rail that fails is printed with its reasons and must not be
+# quoted; the run fails only if NO rail is attributable.
 for name, good in verdict.items():
     if not good:
-        print(f"⛔ {name}: the machine's draw changed around at least one chunk by more than the work itself — "
-              f"another session's load; do not quote this rail from this run")
-import os, subprocess
+        print(f"⛔ {name}: refused on at least one chunk for the reasons above — do not quote this rail from this run")
+import subprocess
 npy, njs = os.environ.get("ASR_NORMALIZER_PY"), os.environ.get("ASR_NORMALIZER_JSON")
 if npy and njs:
     r = subprocess.run([npy, os.environ["ASR_WER_SCRIPT"], njs, os.environ["ASR_CORPUS"] + "/refs.txt", f"{tmp}/out.txt"],

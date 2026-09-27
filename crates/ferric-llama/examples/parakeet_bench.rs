@@ -18,7 +18,12 @@ fn read_wav(path: &str) -> (Vec<f32>, usize) {
         let id = &b[i..i + 4];
         let sz = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
         let d = &b[i + 8..(i + 8 + sz).min(b.len())];
-        if id == b"fmt " { rate = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize; }
+        if id == b"fmt " {
+            assert_eq!(u16::from_le_bytes([d[0], d[1]]), 1, "16-bit PCM only (format tag 1)");
+            assert_eq!(u16::from_le_bytes([d[2], d[3]]), 1, "mono only");
+            assert_eq!(u16::from_le_bytes([d[14], d[15]]), 16, "16-bit PCM only");
+            rate = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
+        }
         if id == b"data" {
             pcm = d.chunks_exact(2)
                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
