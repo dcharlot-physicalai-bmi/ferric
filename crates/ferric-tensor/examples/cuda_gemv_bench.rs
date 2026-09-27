@@ -18,14 +18,24 @@ fn main() {
         for x in b.iter_mut() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; *x = (seed >> 40) as u8; }
         for (i, c) in b.chunks_exact_mut(bpb).enumerate() {
             let d = half::f16::from_f32(0.01 + 0.003 * (i % 7) as f32).to_le_bytes();
-            if ty == 14 { c[208..210].copy_from_slice(&d); } else { c[0..2].copy_from_slice(&d); c[2..4].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes()); }
+            match ty {
+                14 => c[208..210].copy_from_slice(&d),
+                6 | 8 => c[0..2].copy_from_slice(&d),   // Q5_0 / Q8_0: d is the only f16 (Q5_0's qh follows it)
+                _ => { c[0..2].copy_from_slice(&d); c[2..4].copy_from_slice(&half::f16::from_f32(0.002).to_le_bytes()); }
+            }
         }
         b
     };
-    // qwen3-0.6b Q5_K_M decode shapes (after consecutive-format grouping): (label, in, out, ggml type)
-    let shapes: [(&str, usize, usize, u32); 6] = [
+    // Decode shapes (after consecutive-format grouping): (label, in, out, ggml type).
+    // qwen3-0.6b Q5_K_M, then the Q4_K_M files the tier now runs whole: Llama-3.2-1B (Q4_K + Q6_K) and
+    // Qwen2.5-0.5B, whose d = 896 is not a multiple of 256 so llama.cpp stored it as Q5_0 + Q8_0.
+    let shapes: [(&str, usize, usize, u32); 15] = [
         ("attn q+k  (Q5_K)", 1024, 3072, 13), ("attn v    (Q6_K)", 1024, 1024, 14), ("attn wo   (Q5_K)", 2048, 1024, 13),
         ("ffn gate|up swiglu (Q5_K)", 1024, 6144, 13), ("ffn down  (Q6_K)", 3072, 1024, 14), ("lm_head   (Q6_K)", 1024, 151936, 14),
+        ("L1B q+k   (Q4_K)", 2048, 2560, 12), ("L1B wo    (Q4_K)", 2048, 2048, 12), ("L1B gate|up swiglu (Q4_K)", 2048, 16384, 12),
+        ("L1B down  (Q4_K)", 8192, 2048, 12), ("L1B lm_head (Q6_K)", 2048, 128256, 14),
+        ("Q2.5 q+k+v (Q5_0)", 896, 1152, 6), ("Q2.5 gate|up swiglu (Q5_0)", 896, 9728, 6), ("Q2.5 v    (Q8_0)", 896, 128, 8),
+        ("Q2.5 lm_head (Q8_0)", 896, 151936, 8),
     ];
     println!("{:<28} {:>9} {:>10} {:>9}   (floor: bytes / 192.0 GB/s DRAM; weights rotated past L2)", "shape", "MiB", "us/call", "GB/s");
     for (label, inn, out, ty) in shapes {
