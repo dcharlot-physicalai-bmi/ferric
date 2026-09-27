@@ -532,7 +532,7 @@ impl Cache {
     /// Rows the NVIDIA tier holds that the WGSL store does not yet — `0` off-tier.
     pub fn native_ahead(&self) -> usize {
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(n) = &self.native { return n.kv.len.saturating_sub(self.kv.first().map_or(0, |p| p.0.len())); }
+        if let Some(n) = &self.native { return n.kv.len.min(self.pos).saturating_sub(self.kv.first().map_or(0, |p| p.0.len())); }
         0
     }
     /// Bring every row that exists only on the NVIDIA device into the WGSL store, so the cache can be
@@ -541,7 +541,12 @@ impl Cache {
     pub fn sync_native(&mut self) {
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
         {
-            let Some(n) = &self.native else { return };
+            let Some(n) = &mut self.native else { return };
+            // ⚠ Rows past `pos` are DEAD — a caller that rewinds (a speculative step dropping rejected
+            // drafts, `pos` set back by hand) leaves them on the device. Pulling them would hand the WGSL
+            // path history the sequence never kept.
+            if n.kv.len > self.pos { n.kv.len = self.pos; }
+            let n = &*n;
             if self.fmt.is_some() { return; }
             let have = self.kv.first().map_or(0, |p| p.0.len());
             let dev = n.kv.len;
