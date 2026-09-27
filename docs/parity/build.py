@@ -47,6 +47,18 @@ UPDATES = {
     "S35": ("implemented", "3f6089f: a prompt past <arch>.context_length is a 400 naming both numbers; no max_tokens = until EOS or the context"),
     "E19": ("partial", "87c1f6b: linear applied; any declared type a runtime does not apply is REFUSED (was silently unscaled); longrope/NTK absent"),
     "M06": ("verified", "361cddb: nomic-bert (nomic-embed-text) verified against its authors at every stage; registry row added"),
+    "S07": ("verified", "d185918: /v1/completions streams; tool calls stream as an SSE delta"),
+    "S17": ("verified", "b0b4448: the GGUF's own Jinja template via minijinja = HF apply_chat_template — 23/23 templates byte-identical; token ids equal on Qwen2.5, Gemma-3, Phi-3.5, Llama-3.2 (scripts/chat_template_conformance.py, chat_ids_conformance.sh)"),
+    "S08": ("verified", "dda7557: each family's own tool-call syntax (Hermes, Qwen3.5 XML, Gemma-4, LFM2, Mistral, DeepSeek, Llama python_tag); live: 5 families return the same call"),
+    "S11": ("verified", "1c3fe7c: reasoning_content / Ollama thinking from the template's markers; streamed"),
+    "O01": ("verified", "944f580: joules per request on every route, ∫(P−P_idle)/n(t) on the accelerator rails; unit-tested attribution; live batching −40% J/token"),
+    "S05": ("verified", "d3adbe1: Anthropic /v1/messages + count_tokens; the official anthropic SDK works unmodified (tools, round trip, stream, stop_sequence)"),
+    "S04": ("verified", "d3adbe1: OpenAI Responses API incl. previous_response_id and streaming; the official openai SDK works unmodified"),
+    "S19": ("verified", "64d495c: /v1/audio/transcriptions over the NeMo-verified Parakeet (WAV; json/text/verbose_json); OpenAI SDK checked"),
+    "S26": ("verified", "64d495c: --api-key (Bearer or x-api-key); 401 otherwise"),
+    "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
+    "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
+    "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without)"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})
