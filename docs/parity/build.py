@@ -58,6 +58,7 @@ UPDATES = {
     "S26": ("verified", "64d495c: --api-key (Bearer or x-api-key); 401 otherwise"),
     "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
     "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
+    "E09": ("implemented", "5154e47: + prompt-lookup (n-gram) drafts on any dense model, FERRIC_LOOKUP=k; answers identical 6/6, 7.3 tokens/forward on copying — ⚠ not yet faster: a few-row verify forward runs the prefill matmul path (~34 ms vs ~10 ms decode)"),
     "E04": ("verified", "64e4b06: chunked prefill interleaved with decode (512 tokens/step while others stream); live 6,587-token prompt: worst stream stall 88.5 s → 2.6 s, answer identical; socket test mutation-checked"),
     "S24": ("verified", "e0bf215: any GGUF in the model directory loads when a request names it (stem, owner/repo:tag, path); per-model batches, one shared meter; Ollama keep_alive/ttl, LRU eviction under --max-models and a memory budget, command-line model pinned; 10 socket tests, 8 mutation-checked; live: 4 models by 3 name forms, concurrent two-model answers equal solo"),
     "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without); 5667ff5: serial streams too — hang up at 1 s → 2-60 tokens instead of 800 on four routes, counted"),
