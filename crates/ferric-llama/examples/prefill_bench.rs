@@ -32,10 +32,25 @@ async fn run() {
     let am = |r: &[f32]| (0..r.len()).max_by(|&x, &y| r[x].partial_cmp(&r[y]).unwrap()).unwrap();
     println!("  last-row head vs the full head's last row: max|diff| {md:.2e} of max|logit| {scale:.1}; argmax {} vs {}; bit-identical {}",
              am(fr), am(&last), fr == &last[..]);
-    let mut c = Cache::new(&m.cfg);
-    let t0 = Instant::now();
-    let v = if std::env::var("FULL_HEAD").is_ok() { m.forward_cached(&prompt, &mut c).to_vec().await } else { m.forward_cached_last(&prompt, &mut c).to_vec().await };
-    let tp = t0.elapsed().as_secs_f64();
+    // PREFILL_REPS=n times n fresh prefills and reports the median (a single wall-clock sample on a
+    // shared machine is one draw from a wide distribution); the last one's cache feeds the decode.
+    let reps: usize = std::env::var("PREFILL_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let mut times = Vec::with_capacity(reps);
+    let (mut c, mut v) = (Cache::new(&m.cfg), Vec::new());
+    for _ in 0..reps {
+        c = Cache::new(&m.cfg);
+        let t0 = Instant::now();
+        v = if std::env::var("FULL_HEAD").is_ok() { m.forward_cached(&prompt, &mut c).to_vec().await } else { m.forward_cached_last(&prompt, &mut c).to_vec().await };
+        times.push(t0.elapsed().as_secs_f64());
+    }
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let tp = sorted[reps / 2];
+    if reps > 1 {
+        println!("  prefill {n} tokens x{reps}: min {:.1} / median {:.1} / max {:.1} ms = {:.0} / {:.0} / {:.0} tok/s",
+                 sorted[0] * 1e3, tp * 1e3, sorted[reps - 1] * 1e3,
+                 n as f64 / sorted[0], n as f64 / tp, n as f64 / sorted[reps - 1]);
+    }
     ferric_tensor::prof_report(); // FERRIC_PROFILE=1: where the prefill went, by category
     let nv = m.cfg.n_vocab;
     let mut tok = (0..nv).max_by(|&x, &y| v[v.len() - nv + x].partial_cmp(&v[v.len() - nv + y]).unwrap()).unwrap() as u32;

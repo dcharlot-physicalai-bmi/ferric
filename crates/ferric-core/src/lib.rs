@@ -45,6 +45,12 @@ pub struct Context {
     /// tensor-core coop path: the RTX 4050 (and Intel) enumerate only f16-input cooperative-matrix
     /// configs (A/B = f16, C = f32), never f32×f32, so mixed-precision coop needs native f16 storage.
     pub shader_f16: bool,
+    /// Whether `PASSTHROUGH_SHADERS` is enabled on a **Metal** device — hand-written MSL compiled by
+    /// the driver and dispatched as an ordinary wgpu compute pipeline (same bind groups, same queue,
+    /// same batched pass as every WGSL kernel). It is how the Metal-4 tensor-unit quantized GEMMs
+    /// (`ferric_tensor::native_qgemm`) reach the M5 matrix hardware without a second command queue
+    /// or a host round trip per GEMM. Metal-only on purpose: nothing else ships MSL.
+    pub native_msl: bool,
 }
 
 /// An f32 tensor living in GPU memory. Ops chain Tensor→Tensor with no host readback until `to_vec`,
@@ -127,6 +133,7 @@ impl Context {
         let subgroups = af.contains(wgpu::Features::SUBGROUP);
         let coop_matrix = af.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
         let shader_f16 = af.contains(wgpu::Features::SHADER_F16);
+        let native_msl = af.contains(wgpu::Features::PASSTHROUGH_SHADERS) && info.backend == wgpu::Backend::Metal;
         // ⭐ GPU TIMESTAMPS: per-dispatch device time with NO host synchronisation. Every attribution
         // instrument in this repo so far either synced at the boundary it was attributing — which
         // inflated the smaller category and produced a retracted "attention is 52%" claim — or
@@ -153,6 +160,8 @@ impl Context {
         if subgroups { want |= wgpu::Features::SUBGROUP; }
         if coop_matrix { want |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX; }
         if shader_f16 { want |= wgpu::Features::SHADER_F16; }
+        // Requesting it changes no existing kernel: it only permits `create_shader_module_passthrough`.
+        if native_msl { want |= wgpu::Features::PASSTHROUGH_SHADERS; }
         // Only when asked: a query set costs memory and some drivers slow down with it enabled.
         if timestamps && std::env::var("FERRIC_GPUPROF").is_ok() {
             want |= wgpu::Features::TIMESTAMP_QUERY;
@@ -182,7 +191,7 @@ impl Context {
         let ts_on = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let period = queue.get_timestamp_period();
         Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding,
-                  timestamps: ts_on, timestamp_period: period, coop_matrix, shader_f16 })
+                  timestamps: ts_on, timestamp_period: period, coop_matrix, shader_f16, native_msl })
     }
 
     /// Enumerate EVERY compute adapter present (all GPUs across all backends + software/CPU adapters),
@@ -216,7 +225,7 @@ impl Context {
             .await
             .map_err(|e| format!("no compute device: {e:?}"))?;
         Ok(Self { device, queue, backend: info.backend, adapter_name: info.name, subgroups, max_binding,
-                  timestamps: false, timestamp_period: 1.0, coop_matrix: false, shader_f16: false })
+                  timestamps: false, timestamp_period: 1.0, coop_matrix: false, shader_f16: false, native_msl: false })
     }
 
     pub(crate) fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {

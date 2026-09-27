@@ -29,6 +29,8 @@ pub mod nn; // transformer blocks expressed on the general runtime
 pub mod optim; // optimizers (Adam)
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 pub mod metal4;
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+pub mod native_qgemm;
 /// NVIDIA native tier (driver API over dlopen; linux/windows only). See `cuda.rs`.
 pub mod cuda;
 /// Tenstorrent native tier, host side (tt-kmd ioctl UAPI; linux only). See `tenstorrent.rs`.
@@ -1937,6 +1939,9 @@ pub fn op_census() -> Vec<(String, u64)> {
     CENSUS.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect())
 }
 pub fn reset_op_census() { CENSUS.with(|c| c.borrow_mut().clear()); }
+/// Count one dispatch of `label` in the census — for kernels that bypass [`run`].
+#[allow(dead_code)]
+pub(crate) fn census_bump(label: &str) { CENSUS.with(|c| *c.borrow_mut().entry(label.to_string()).or_insert(0) += 1); }
 pub fn reset_op_counters() { DISPATCHES.with(|c| c.set(0)); SUBMITS.with(|c| c.set(0)); }
 
 /// Every backend caps workgroups-per-dimension; WebGPU's floor is 65,535 and wgpu enforces it.
@@ -1989,11 +1994,20 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
     let _t = profclock::now();
     let (pipe, bgl) = pipeline_for(ctx, wgsl, label);
     add_ns(0, profclock::elapsed_ns(&_t));
+    record_dispatch(ctx, label, &pipe, &bgl, binds, g);
+}
+
+/// Bind `binds` (as bindings 0..n of group 0) and dispatch `pipe` — into the open batch's compute
+/// pass when batching, else as its own submit. Shared by [`run`] (WGSL) and the passthrough-MSL
+/// native kernels ([`native_qgemm`]), so a native kernel is ordered, batched and kept alive exactly
+/// like every portable one: same encoder, same pass, same submit.
+pub(crate) fn record_dispatch(ctx: &Context, label: &str, pipe: &wgpu::ComputePipeline, bgl: &wgpu::BindGroupLayout,
+                              binds: &[&wgpu::Buffer], g: (u32, u32, u32)) {
     let _t = profclock::now();
     let entries: Vec<wgpu::BindGroupEntry> = binds.iter().enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label), layout: &bgl, entries: &entries,
+        label: Some(label), layout: bgl, entries: &entries,
     });
     add_ns(1, profclock::elapsed_ns(&_t));
     DISPATCHES.with(|c| c.set(c.get() + 1));
@@ -2016,7 +2030,7 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
         }
         {
             let pass = slot.as_mut().expect("just opened");
-            pass.set_pipeline(&pipe);
+            pass.set_pipeline(pipe);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(g.0, g.1, g.2);
         }
@@ -2035,7 +2049,7 @@ fn run(ctx: &Context, wgsl: &str, label: &str, binds: &[&wgpu::Buffer], g: (u32,
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let _t = profclock::now();
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
-        pass.set_pipeline(&pipe);
+        pass.set_pipeline(pipe);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
         drop(pass);
