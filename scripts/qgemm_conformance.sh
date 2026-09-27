@@ -26,8 +26,8 @@
 # ⛔ VACUITY GUARDS. A route that never fires returns the portable logits and passes every band check,
 # so the run must show tensor-unit dispatches (FERRIC_TRACE_KERNELS) and logits that DIFFER from the
 # portable run. ⭐ NEGATIVE CONTROL: FERRIC_QGEMM_FAULT plants one plausible decoding error per format
-# (the neighbouring Q8_0 block's scale, the Q4_K sub-block minimum dropped, Q6_K high bits from the
-# wrong position); it must move the model by ≥ 20x the band tolerance or this gate cannot see a defect.
+# (the neighbouring Q8_0 block's scale, Q5_0's fifth bit dropped, the Q4_K sub-block minimum dropped,
+# Q6_K high bits from the wrong position); it must move the model by ≥ 20x the band tolerance or this gate cannot see a defect.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-}"; FX="${2:-}"

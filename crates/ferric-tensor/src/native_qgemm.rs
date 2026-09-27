@@ -1,4 +1,4 @@
-//! **Metal-4 tensor-unit quantized GEMM** — prefill's `x·Wᵀ` over Q8_0 / Q4_K / Q6_K weights on the
+//! **Metal-4 tensor-unit quantized GEMM** — prefill's `x·Wᵀ` over Q8_0 / Q5_0 / Q4_K / Q6_K weights on the
 //! M5's matrix units, reading the packed blocks directly. Opt-in: `FERRIC_QGEMM=1`.
 //!
 //! # Why the existing tensor-unit path never ran for a quantized model
@@ -71,6 +71,7 @@ const THREADS: u32 = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QFmt {
     Q8_0,
+    Q5_0,
     Q4K,
     Q6K,
 }
@@ -79,6 +80,8 @@ impl QFmt {
     fn entry(self, swiglu: bool) -> &'static str {
         match (self, swiglu) {
             (QFmt::Q8_0, false) => "qmm_q8_0",
+            (QFmt::Q5_0, false) => "qmm_q5_0",
+            (QFmt::Q5_0, true) => "qmm_swiglu_q5_0",
             (QFmt::Q4K, false) => "qmm_q4_k",
             (QFmt::Q6K, false) => "qmm_q6_k",
             (QFmt::Q8_0, true) => "qmm_swiglu_q8_0",
@@ -89,7 +92,7 @@ impl QFmt {
     /// K must be a whole number of blocks (and of the kernel's 32-wide K slice).
     fn k_multiple(self) -> usize {
         match self {
-            QFmt::Q8_0 => 32,
+            QFmt::Q8_0 | QFmt::Q5_0 => 32,
             QFmt::Q4K | QFmt::Q6K => 256,
         }
     }
@@ -227,7 +230,7 @@ pub(crate) fn qmm_unchecked(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer
 
 #[cfg(test)]
 mod tests {
-    use crate::dtype::{Q4_KWeights, Q6_KWeights, Q8_0Weights};
+    use crate::dtype::{Q4_KWeights, Q5_0Weights, Q6_KWeights, Q8_0Weights};
     use crate::Tensor;
     use std::sync::Arc;
 
@@ -253,6 +256,21 @@ mod tests {
         for (b, blk) in raw.chunks(34).enumerate() {
             let d = h(blk, 0);
             for l in 0..32 { w[b * 32 + l] = d * (blk[2 + l] as i8) as f64; }
+        }
+        w
+    }
+    /// `no_fifth_bit` is the negative control: qh ignored, as if the format were Q4_0 with an offset.
+    fn deq_q5_0(raw: &[u8], n: usize, k: usize, no_fifth_bit: bool) -> Vec<f64> {
+        let mut w = vec![0.0; n * k];
+        for (b, blk) in raw.chunks(22).enumerate() {
+            let d = h(blk, 0);
+            let qh = if no_fifth_bit { 0 } else { u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]) };
+            for j in 0..16 {
+                let x0 = ((blk[6 + j] & 0xF) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+                let x1 = ((blk[6 + j] >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+                w[b * 32 + j] = d * x0 as f64;
+                w[b * 32 + j + 16] = d * x1 as f64;
+            }
         }
         w
     }
@@ -312,6 +330,10 @@ mod tests {
                     raw.extend(f16le(0.002 + 0.002 * rng.unit()));
                     for _ in 0..32 { raw.push(rng.byte()); }
                 }
+                "q5_0" => {
+                    raw.extend(f16le(0.004 + 0.002 * rng.unit()));
+                    for _ in 0..20 { raw.push(rng.byte()); }
+                }
                 "q4_k" => {
                     raw.extend(f16le(0.004 + 0.002 * rng.unit()));
                     raw.extend(f16le(0.002 + 0.001 * rng.unit()));
@@ -361,15 +383,16 @@ mod tests {
     /// (neither a tile multiple) and K spanning several blocks. The pass bar is the fp16-INPUT
     /// reference to fp32-accumulation noise (1e-6 of Σ|x·w|); the exact-f64 distance is reported and
     /// bounded by the fp16 rounding it is made of. Negative controls: each plausible wrong decoding
-    /// (neighbour block's Q8_0 scale, swapped Q4_K nibbles, mis-shifted Q6_K high bits) must miss by
+    /// (neighbour block's Q8_0 scale, Q5_0's fifth bit dropped, swapped Q4_K nibbles, mis-shifted Q6_K
+    /// high bits) must miss by
     /// ≥ 20x the tolerance, or this test could not see that defect.
     #[test]
     fn tensor_unit_qgemm_matches_the_format_definition() {
         let Some(ctx) = ctx() else { return };
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for (fmt, m, n, k) in [("q8_0", 100, 200, 224), ("q8_0", 64, 64, 896), ("q4_k", 100, 200, 1024),
+        for (fmt, m, n, k) in [("q8_0", 100, 200, 224), ("q8_0", 64, 64, 896), ("q5_0", 100, 200, 224), ("q4_k", 100, 200, 1024),
                                ("q4_k", 64, 128, 512), ("q6_k", 100, 200, 1024), ("q6_k", 70, 96, 256)] {
-            let bs = match fmt { "q8_0" => 32, _ => 256 };
+            let bs = match fmt { "q8_0" | "q5_0" => 32, _ => 256 };
             let raw = rand_blocks(&mut rng, n * k / bs, fmt);
             let x: Vec<f32> = (0..m * k).map(|_| rng.unit() as f32).collect();
             let xt = Tensor::from_vec(&ctx, &x, &[m, k]);
@@ -382,6 +405,10 @@ mod tests {
                     let nb = n * k / 32;
                     for b in 0..nb { let o = ((b + 1) % nb) * 34; raw2[b * 34] = raw[o]; raw2[b * 34 + 1] = raw[o + 1]; }
                     (g, deq_q8_0(&raw, n, k), deq_q8_0(&raw2, n, k))
+                }
+                "q5_0" => {
+                    let wq = Q5_0Weights::from_bytes(&ctx, &raw, n, k);
+                    (xt.native_qmm_q5_0(&wq).expect("kernel"), deq_q5_0(&raw, n, k, false), deq_q5_0(&raw, n, k, true))
                 }
                 "q4_k" => {
                     let wq = Q4_KWeights::from_bytes(&ctx, &raw, n, k);
@@ -413,14 +440,15 @@ mod tests {
     fn tensor_unit_swiglu_epilogue_matches_the_format_definition() {
         let Some(ctx) = ctx() else { return };
         let mut rng = Rng(0x0dd_ba11);
-        for (fmt, m, n_ff, k) in [("q8_0", 100, 100, 224), ("q4_k", 70, 100, 512), ("q6_k", 64, 64, 256)] {
+        for (fmt, m, n_ff, k) in [("q8_0", 100, 100, 224), ("q5_0", 64, 40, 96), ("q4_k", 70, 100, 512), ("q6_k", 64, 64, 256)] {
             let n = 2 * n_ff;
-            let bs = if fmt == "q8_0" { 32 } else { 256 };
+            let bs = if fmt == "q8_0" || fmt == "q5_0" { 32 } else { 256 };
             let raw = rand_blocks(&mut rng, n * k / bs, fmt);
             let x: Vec<f32> = (0..m * k).map(|_| rng.unit() as f32).collect();
             let xt = Tensor::from_vec(&ctx, &x, &[m, k]);
             let (got, w) = match fmt {
                 "q8_0" => (xt.native_qmm_swiglu_q8_0(&Q8_0Weights::from_bytes(&ctx, &raw, n, k)), deq_q8_0(&raw, n, k)),
+                "q5_0" => (xt.native_qmm_swiglu_q5_0(&Q5_0Weights::from_bytes(&ctx, &raw, n, k)), deq_q5_0(&raw, n, k, false)),
                 "q4_k" => (xt.native_qmm_swiglu_q4_k(&Q4_KWeights::from_bytes(&ctx, &raw, n, k)), deq_q4_k(&raw, n, k, false)),
                 _ => (xt.native_qmm_swiglu_q6_k(&Q6_KWeights::from_bytes(&ctx, &raw, n, k)), deq_q6_k(&raw, n, k, false)),
             };
@@ -461,8 +489,8 @@ mod tests {
         let Some(ctx) = ctx() else { return };
         let mut rng = Rng(0xfeed_f00d);
         let (m, n, k) = (100, 130, 512);
-        for fmt in ["q8_0", "q4_k", "q6_k"] {
-            let bs = if fmt == "q8_0" { 32 } else { 256 };
+        for fmt in ["q8_0", "q5_0", "q4_k", "q6_k"] {
+            let bs = if fmt == "q8_0" || fmt == "q5_0" { 32 } else { 256 };
             let raw = rand_blocks(&mut rng, n * k / bs, fmt);
             let x: Vec<f32> = (0..m * k).map(|_| rng.unit() as f32).collect();
             let run = |rows: &[f32]| -> Vec<f32> {
@@ -470,6 +498,7 @@ mod tests {
                 let xt = Tensor::from_vec(&ctx, rows, &[r, k]);
                 let y = match fmt {
                     "q8_0" => xt.native_qmm_q8_0(&Q8_0Weights::from_bytes(&ctx, &raw, n, k)),
+                    "q5_0" => xt.native_qmm_q5_0(&Q5_0Weights::from_bytes(&ctx, &raw, n, k)),
                     "q4_k" => xt.native_qmm_q4_k(&Q4_KWeights::from_bytes(&ctx, &raw, n, k)),
                     _ => xt.native_qmm_q6_k(&Q6_KWeights::from_bytes(&ctx, &raw, n, k)),
                 };

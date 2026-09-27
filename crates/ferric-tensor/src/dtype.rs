@@ -1267,6 +1267,12 @@ impl Tensor {
                         return Some(y);
                     }
                 }
+                #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+                QShard::Q5_0(sh) => {
+                    if let Some(y) = crate::native_qgemm::qmm_swiglu(self, &sh.codes, &sh.scales, sh.rows, sh.cols, crate::native_qgemm::QFmt::Q5_0) {
+                        return Some(y);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2737,6 +2743,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        native_qgemm_route!(x, w.codes, w.scales, w, Q5_0);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
@@ -6929,6 +6936,12 @@ mod shader_valid {
 impl Tensor {
     pub(crate) fn native_qmm_q8_0(&self, w: &Q8_0Weights) -> Option<Tensor> {
         crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.scales, w.rows, w.cols, crate::native_qgemm::QFmt::Q8_0, false)
+    }
+    pub(crate) fn native_qmm_q5_0(&self, w: &Q5_0Weights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.scales, w.rows, w.cols, crate::native_qgemm::QFmt::Q5_0, false)
+    }
+    pub(crate) fn native_qmm_swiglu_q5_0(&self, w: &Q5_0Weights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.scales, w.rows, w.cols, crate::native_qgemm::QFmt::Q5_0, true)
     }
     pub(crate) fn native_qmm_q4_k(&self, w: &Q4_KWeights) -> Option<Tensor> {
         crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q4K, false)

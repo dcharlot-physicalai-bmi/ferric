@@ -1,4 +1,5 @@
-// Metal-4 tensor-unit GEMM over Ferric's packed quantized weights: y[M,N] = x[M,K] · W[N,K]ᵀ.
+// Metal-4 tensor-unit GEMM over Ferric's packed quantized weights (Q8_0, Q5_0, Q4_K, Q6_K):
+// y[M,N] = x[M,K] · W[N,K]ᵀ.
 //
 // Dispatched through wgpu as a PASSTHROUGH compute pipeline (see `native_qgemm.rs`), so it binds the
 // same wgpu buffers every WGSL kernel binds and records into the same batched compute pass — no
@@ -51,6 +52,26 @@ static inline void dq16_q8_0(device const uint* codes, device const uint* aux, u
     for (uint w = 0; w < 4; ++w) {
         char4 q = as_type<char4>(codes[w0 + w]);
         *((threadgroup half4*)dst + w) = half4(float4(q) * dsc);
+    }
+}
+
+// Q5_0: codes = 4 words (16 bytes of nibble pairs) per 32-block, aux = [qh, d] per block. Value j
+// (0..15) is the low nibble of byte j with bit j of qh as its 5th bit; value 16+j the high nibble with
+// bit 16+j; both minus 16, times d.
+static inline void dq16_q5_0(device const uint* codes, device const uint* aux, uint n, uint k, uint K,
+                             threadgroup half* dst) {
+    uint blk = n * (K / 32) + k / 32;
+    uint hh = (k & 31) >> 4;
+    uint qh = aux[2 * blk] >> (16 * hh);
+#ifdef QGEMM_FAULT
+    qh = 0; // NEGATIVE CONTROL ONLY: the fifth bit dropped
+#endif
+    float d = float(as_type<half2>(aux[2 * blk + 1]).x);
+    for (uint w = 0; w < 4; ++w) {
+        uint word = codes[blk * 4 + w] >> (4 * hh), hb = qh >> (4 * w);
+        int4 q = int4((word & 0xF) | ((hb & 1) << 4), ((word >> 8) & 0xF) | (((hb >> 1) & 1) << 4),
+                      ((word >> 16) & 0xF) | (((hb >> 2) & 1) << 4), ((word >> 24) & 0xF) | (((hb >> 3) & 1) << 4)) - 16;
+        *((threadgroup half4*)dst + w) = half4(float4(q) * d);
     }
 }
 
@@ -172,6 +193,8 @@ kernel void NAME(device const float* x     [[buffer(0)]],                       
 QMM_KERNEL(qmm_q8_0, dq16_q8_0, 0)
 QMM_KERNEL(qmm_q4_k, dq16_q4_k, 0)
 QMM_KERNEL(qmm_q6_k, dq16_q6_k, 0)
+QMM_KERNEL(qmm_q5_0, dq16_q5_0, 0)
 QMM_KERNEL(qmm_swiglu_q8_0, dq16_q8_0, 1)
+QMM_KERNEL(qmm_swiglu_q5_0, dq16_q5_0, 1)
 QMM_KERNEL(qmm_swiglu_q4_k, dq16_q4_k, 1)
 QMM_KERNEL(qmm_swiglu_q6_k, dq16_q6_k, 1)
