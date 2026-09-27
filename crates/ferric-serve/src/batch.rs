@@ -102,6 +102,10 @@ pub(crate) trait ServeModel {
     /// This model generates better on its own serial loop than in the scheduler — a hybrid with an MTP
     /// draft block, whose `generate_spec` (and one-slot prefix cache) the batched step cannot run.
     fn serial_generation(&self) -> bool { false }
+    /// Open a request's energy window (see `energy`); the default meters nothing.
+    fn energy_begin(&self) -> Option<crate::energy::Ticket> { None }
+    /// Close it and attribute its joules.
+    fn energy_end(&self, _t: Option<crate::energy::Ticket>, _tokens: usize) -> Value { Value::Null }
 }
 
 /// One HTTP request, parsed off its socket by a reader thread and handed to the engine thread.
@@ -169,6 +173,8 @@ struct Gen<S> {
     logprobs: Vec<Value>,
     lp_sent: usize,
     include_usage: bool,
+    /// Energy window, opened when the sequence is admitted (prefill) and closed when it retires.
+    ticket: Option<crate::energy::Ticket>,
     state: Option<S>,
     /// The token to feed on the next decode step.
     next: u32,
@@ -323,7 +329,7 @@ fn route<M: ServeModel>(
             em: Emitter::new(&gopts.stop),
             include_usage: req["stream_options"]["include_usage"].as_bool() == Some(true),
             opts: gopts,
-            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, state: None, next: 0,
+            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, state: None, next: 0,
         });
         return;
     }
@@ -342,6 +348,7 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
     let mut first: Vec<(SeqId, u32, bool)> = Vec::new();
     for g in gens.iter_mut() {
         if !live.contains(&g.id) || g.state.is_some() { continue; }
+        g.ticket = m.energy_begin();
         let (st, row) = m.prefill(&g.prompt);
         g.state = Some(st);
         match m.pick(&row, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
@@ -404,11 +411,12 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
     if let Some(d) = g.em.flush() { g.send_delta(m, &d); }
     let (ptok, gtok) = (g.prompt.len(), g.r#gen.len());
     let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
+    let energy = m.energy_end(g.ticket.take(), gtok);
     if g.streaming {
         send_sse(&mut g.stream, &json!({
             "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
             "model": m.name(),
-            "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}));
+            "choices": [{"index": 0, "delta": {}, "finish_reason": reason}], "energy": energy}));
         if g.include_usage {
             send_sse(&mut g.stream, &json!({"id": "chatcmpl-ferric", "object": "chat.completion.chunk",
                 "created": now_unix(), "model": m.name(), "choices": [], "usage": usage}));
@@ -426,10 +434,10 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
     if g.opts.logprobs { choice["logprobs"] = crate::logprobs_field(g.chat, &g.logprobs); }
     let body = if g.chat {
         json!({"id": "chatcmpl-ferric", "object": "chat.completion", "created": now_unix(), "model": m.name(),
-               "choices": [choice], "usage": usage})
+               "choices": [choice], "usage": usage, "energy": energy})
     } else {
         json!({"id": format!("cmpl-ferric-{ptok}"), "object": "text_completion", "created": now_unix(), "model": m.name(),
-               "choices": [choice], "usage": usage})
+               "choices": [choice], "usage": usage, "energy": energy})
     };
     write_json(&mut g.stream, 200, &body);
 }
@@ -491,6 +499,8 @@ impl ServeModel for Engine {
     fn serial_generation(&self) -> bool {
         matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err()
     }
+    fn energy_begin(&self) -> Option<crate::energy::Ticket> { self.energy.begin() }
+    fn energy_end(&self, t: Option<crate::energy::Ticket>, tokens: usize) -> Value { self.energy.end(t, tokens) }
 }
 
 // ---------------------------------------------------------------------------------------------

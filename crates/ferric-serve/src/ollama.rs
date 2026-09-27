@@ -190,7 +190,9 @@ fn durations(t0: Instant, first: Option<Instant>, r: &ChatResult) -> Value {
     let first = first.unwrap_or(end);
     json!({"total_duration": (end - t0).as_nanos() as u64, "load_duration": 0u64,
            "prompt_eval_count": r.prompt_tokens, "prompt_eval_duration": (first - t0).as_nanos() as u64,
-           "eval_count": r.gen_tokens, "eval_duration": (end - first).as_nanos() as u64})
+           "eval_count": r.gen_tokens, "eval_duration": (end - first).as_nanos() as u64,
+           // Not part of Ollama's API: the joules this answer cost (see ferric-serve's `energy` module).
+           "energy": r.energy})
 }
 
 /// OpenAI-shaped tool calls → Ollama's (arguments as an object, an `id` on each).
@@ -354,7 +356,7 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
             let max = eng.budget(ids.len(), opts.max_tokens)?;
             let out = eng.generate(&ids, max, &opts, None, |d, _| on_delta(d));
             Ok(ChatResult { text: out.text, reasoning: String::new(), tool_calls: vec![], prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
-                            finish: out.finish, logprobs: vec![] })
+                            finish: out.finish, logprobs: vec![], energy: out.energy })
         } else {
             let mut messages = Vec::new();
             if let Some(sys) = req["system"].as_str() { messages.push(json!({"role": "system", "content": sys})); }

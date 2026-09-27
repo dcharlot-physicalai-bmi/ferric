@@ -675,12 +675,20 @@ struct MacmonState {
     last: Option<Instant>,
     first: Option<Instant>,
     all: Vec<MacmonSample>,
+    /// Keep only the samples of the last this-many seconds (0 = keep everything). A benchmark wants the
+    /// whole trace; a server running for days must not grow a sample per 100 ms forever.
+    keep_secs: f64,
 }
 
 impl Macmon {
     /// Start sampling. Returns `None` if `macmon` is not installed or produced no usable line
     /// within a short window — never a meter that silently reports zero.
-    pub fn start(scope: MacmonScope, interval_ms: u64) -> Option<Self> {
+    pub fn start(scope: MacmonScope, interval_ms: u64) -> Option<Self> { Self::start_window(scope, interval_ms, 0.0) }
+
+    /// [`Macmon::start`] keeping only the last `keep_secs` of samples (0 = all) — for a long-lived
+    /// process such as a server, which attributes energy to recent windows only. The running joule total
+    /// is unaffected; [`Macmon::energy_over`] works on any window still inside the kept span.
+    pub fn start_window(scope: MacmonScope, interval_ms: u64, keep_secs: f64) -> Option<Self> {
         let mut child = std::process::Command::new("macmon")
             .args(["pipe", "-i", &interval_ms.to_string(), "-s", "0"])
             .stdout(std::process::Stdio::piped())
@@ -688,7 +696,7 @@ impl Macmon {
             .spawn()
             .ok()?;
         let stdout = child.stdout.take()?;
-        let state = std::sync::Arc::new(std::sync::Mutex::new(MacmonState::default()));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MacmonState { keep_secs, ..Default::default() }));
         let worker = std::sync::Arc::clone(&state);
         std::thread::spawn(move || {
             use std::io::BufRead;
@@ -724,6 +732,11 @@ impl Macmon {
                 st.last = Some(now);
                 st.watt_sum += w;
                 st.all.push(sample);
+                if st.keep_secs > 0.0 {
+                    let cut = sample.t - st.keep_secs;
+                    let n = st.all.iter().take_while(|s| s.t < cut).count();
+                    if n > 64 { st.all.drain(..n); }
+                }
             }
         });
         let me = Self {
@@ -827,6 +840,14 @@ impl Macmon {
 impl Drop for Macmon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl Macmon {
+    /// Seconds since this meter's first sample, on the same clock as [`MacmonSample::t`] — for callers
+    /// that mark windows to integrate later.
+    pub fn now_t(&self) -> Option<f64> {
+        self.state.lock().ok()?.first.map(|f| f.elapsed().as_secs_f64())
     }
 }
 

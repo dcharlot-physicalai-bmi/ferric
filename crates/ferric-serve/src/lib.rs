@@ -39,6 +39,7 @@
 mod mcp;
 mod batch;
 mod genopts;
+mod energy;
 mod ollama;
 pub mod template;
 mod specgate;
@@ -273,6 +274,8 @@ pub(crate) struct Engine {
     /// This model's reasoning markers, read from its chat template: `<think>`/`</think>` or Gemma 4's
     /// `<|channel>thought`/`<channel|>`. `None` = not a thinking model.
     reasoning_markers: Option<(String, String)>,
+    /// The long-lived power sampler every generation's joules are attributed from.
+    pub(crate) energy: energy::Energy,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -341,6 +344,9 @@ pub(crate) struct GenOut {
     /// The generated token ids — decoded WITH special tokens for tool-call parsing (Gemma 4's argument
     /// delimiters are specials, which the visible text drops).
     pub ids: Vec<u32>,
+    /// Joules attributed to this generation (see `energy`): `{"joules", "joules_per_token", …}`, or
+    /// `{"joules": null, "why": …}` when the machine has no meter or the window was unmeasurable.
+    pub energy: Value,
 }
 
 /// See `Engine::prefix`. `fed` is exactly the token sequence the main cache has consumed —
@@ -554,7 +560,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -798,7 +804,14 @@ impl Engine {
     /// with a **fixed-seed** RNG, so even sampled output is reproducible (on-brand for the moat).
     /// Guided decoding always stays argmax (deterministic structured output). Calls `on_delta` per
     /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str, &[Value])) -> GenOut {
+    fn generate(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, guide: Option<ferric_agent::guide::Guide>, on_delta: impl FnMut(&str, &[Value])) -> GenOut {
+        let ticket = self.energy.begin();
+        let mut out = self.generate_inner(prompt, max_tokens, opts, guide, on_delta);
+        out.energy = self.energy.end(ticket, out.gen_tokens);
+        out
+    }
+
+    fn generate_inner(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str, &[Value])) -> GenOut {
         // Speculative fast path: a hybrid model shipping its own MTP draft block self-drafts.
         // Emits IDENTICAL tokens (drafts are only accepted when they equal what the sampler picks
         // from the true logits, and the fixed-seed RNG advances once per emitted token either way)
@@ -860,7 +873,7 @@ impl Engine {
             if em.hit_stop { finish = "stop"; break; }
         }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen }
+        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null }
     }
 
     /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
@@ -948,13 +961,13 @@ impl Engine {
         let first = self.select_token(row0, &guide, sm, prompt, &r#gen, &mut rng);
         let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else {
             save_slot!();
-            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps, ids: Vec::new() }, drafted, accepted)
+            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps, ids: Vec::new(), energy: Value::Null }, drafted, accepted)
         };
         if commit!(pend0, row0) || max_tokens <= 1 {
             save_slot!();
             if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
             let fin = if em.hit_stop { "stop" } else { "length" };
-            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps, ids: r#gen }, drafted, accepted)
+            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps, ids: r#gen, energy: Value::Null }, drafted, accepted)
         }
         let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
         // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
@@ -1065,7 +1078,7 @@ impl Engine {
         }
         save_slot!();
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen }, drafted, accepted)
+        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null }, drafted, accepted)
     }
 }
 
@@ -1403,6 +1416,21 @@ pub(crate) struct ChatResult {
     pub gen_tokens: usize,
     pub finish: &'static str,
     pub logprobs: Vec<Value>,
+    /// Joules for the whole turn (every tool-loop round summed).
+    pub energy: Value,
+}
+
+/// Several generations' energy as one: joules summed, the rest from the last.
+fn sum_energy(parts: &[Value]) -> Value {
+    let Some(last) = parts.last() else { return Value::Null };
+    if parts.len() == 1 { return last.clone(); }
+    let mut v = last.clone();
+    for k in ["joules", "window_joules", "seconds"] {
+        let xs: Vec<f64> = parts.iter().filter_map(|p| p[k].as_f64()).collect();
+        v[k] = if xs.len() == parts.len() { json!((xs.iter().sum::<f64>() * 1000.0).round() / 1000.0) } else { Value::Null };
+    }
+    v["rounds"] = json!(parts.len());
+    v
 }
 
 /// **The chat core both API dialects share** (OpenAI `/v1/chat/completions`, Ollama `/api/chat`), so they
@@ -1435,11 +1463,13 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         // Server-side agent loop: generate → parse tool_calls → execute the MCP-owned ones and feed
         // results back → repeat. Non-MCP tool calls are returned to the client (standard OpenAI flow).
         let (mut ptok, mut gtok) = (0usize, 0usize);
+        let mut energies: Vec<Value> = Vec::new();
         for _round in 0..4 {
             let prompt = eng.chat_ids_with(&messages, tools_arg, &kwargs)?;
             let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
+            energies.push(out.energy.clone());
             // Reasoning first (a thinking model reasons before it calls), then the answer part is parsed:
             // each model writes tool calls in its own template's format, in the decode that keeps special
             // tokens, with the tools' schemas for argument types.
@@ -1459,7 +1489,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
                     for sp in special { t = t.replace(sp, ""); }
                     t.trim().to_string()
                 };
-                return Ok(ChatResult { text, reasoning, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new() });
+                return Ok(ChatResult { text, reasoning, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new(), energy: sum_energy(&energies) });
             }
             messages.push(json!({"role": "assistant", "content": out.text}));
             for c in &mcp_calls {
@@ -1500,7 +1530,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         None => (out.text, String::new()),
     };
     Ok(ChatResult { text, reasoning, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
-                    finish: out.finish, logprobs: out.logprobs })
+                    finish: out.finish, logprobs: out.logprobs, energy: out.energy })
 }
 
 fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
@@ -1533,7 +1563,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
             Ok(r) => send_sse(stream, &chunk(json!({"content": r.text}), Value::Null)),
         }
         let finish = r.as_ref().map(|r| r.finish).unwrap_or("stop");
-        send_sse(stream, &chunk(json!({}), json!(finish)));
+        let mut last = chunk(json!({}), json!(finish));
+        if let Ok(r) = &r { last["energy"] = r.energy.clone(); }
+        send_sse(stream, &last);
         if let (Ok(r), true) = (&r, req["stream_options"]["include_usage"].as_bool() == Some(true)) {
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [], "usage": usage(r)}));
         }
@@ -1551,8 +1583,10 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         });
         let (finish, u) = match &r { Ok(r) => (r.finish, Some(usage(r))), Err(_) => ("stop", None) };
         if let Err(e) = &r { send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})); }
-        send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}));
+        let mut last = json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]});
+        if let Ok(r) = &r { last["energy"] = r.energy.clone(); }
+        send_sse(stream, &last);
         if let (Some(u), true) = (u, req["stream_options"]["include_usage"].as_bool() == Some(true)) {
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [], "usage": u}));
         }
@@ -1568,7 +1602,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
             let mut choice = json!({"index": 0, "message": message, "finish_reason": r.finish});
             if opts.logprobs { choice["logprobs"] = logprobs_field(true, &r.logprobs); }
             write_json(stream, 200, &json!({"id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-                "choices": [choice], "usage": usage(&r)}));
+                "choices": [choice], "usage": usage(&r), "energy": r.energy}));
         }
     }
 }
@@ -1592,7 +1626,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
             send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name, "choices": [ch]}));
         });
         send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "text": "", "finish_reason": out.finish}]}));
+            "choices": [{"index": 0, "text": "", "finish_reason": out.finish}], "energy": out.energy}));
         if req["stream_options"]["include_usage"].as_bool() == Some(true) {
             send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name, "choices": [],
                 "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}}));
@@ -1606,7 +1640,8 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     write_json(stream, 200, &json!({
         "id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name,
         "choices": [choice],
-        "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}
+        "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens},
+        "energy": out.energy
     }));
 }
 
