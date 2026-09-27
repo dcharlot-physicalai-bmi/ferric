@@ -865,12 +865,9 @@ impl Engine {
     /// Keep `tokens` (exactly the ones this cache has consumed) for later requests to reuse.
     ///
     /// `&mut` because with the NVIDIA tier on (FERRIC_CUDA) the newest K/V rows can live only on the
-    /// device; they are brought into the WGSL store first. A snapshot without that would store a
-    /// SHORTER prefix than it is indexed under (`KvBuf::clone_prefix` clamps), and every later hit
-    /// would attend to a hole — `Cache::layers` now refuses rather than allow it.
+    /// device; `PrefixCache::insert` brings them into the WGSL store before it copies.
     pub(crate) fn remember(&self, tokens: &[u32], cache: &mut ModelCache) {
         if let (ModelCache::Dense(c), Some(pc)) = (cache, &self.prefix_cache) {
-            c.sync_native();
             let n = c.pos.min(tokens.len());
             pc.borrow_mut().insert(&self.ctx, &tokens[..n], c);
         }
