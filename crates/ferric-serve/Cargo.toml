@@ -37,10 +37,12 @@ minijinja = { version = "2.24", default-features = false, features = ["builtins"
 minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
 # Images a client sends (PNG, JPEG): decoded here, the one crate that receives them, so ferric-tensor stays
 # codec-free (see its image.rs). Pure Rust, vendored; checked against the pixels transformers' load_image gives.
+# JPEG is src/images/jpeg.rs (libjpeg-turbo's decode path, translated): a general decoder is not enough.
 png = "0.18"
-zune-jpeg = "0.5"
-zune-core = "0.5"
 
 [dev-dependencies]
 # Reads the gzipped reference pixels in tests/fixtures/images (already vendored as a dependency of png).
 flate2 = "1"
+# Only for the ignored timing test `jpeg_decode_time` (the decoder this replaced; vendored).
+zune-jpeg = "0.5"
+zune-core = "0.5"
