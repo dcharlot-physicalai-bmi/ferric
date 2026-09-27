@@ -1001,6 +1001,10 @@ impl Engine {
                 }
             }
         }
+        // Prompt-lookup speculation (opt-in): dense runtime, f32 cache, no constraint, no image.
+        if let (Some(k), true, None, Model::Dense(_)) = (lookup_k(), guide.is_none(), opts.image.as_ref(), &self.model) {
+            if crate::qwen3_cache_is_f32() { return self.generate_lookup(prompt, max_tokens, opts, k, on_delta); }
+        }
         // ⛔ An image prompt never touches the prefix cache: two images of one size are the SAME ids.
         let mm = opts.image.clone();
         let (mut cache, skip) = if mm.is_some() { (self.model.new_cache(), 0) } else { self.seeded_cache(prompt) };
@@ -1037,6 +1041,79 @@ impl Engine {
         }
         let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
         if mm.is_none() { self.remember(&fed, &cache); }
+        if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
+        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
+    }
+
+    /// **Prompt-lookup decoding** (`FERRIC_LOOKUP=k`): each step feeds the pending token plus up to `k`
+    /// tokens that followed the current n-gram earlier in the context, in ONE forward, and reads a token from
+    /// every row until the model disagrees with a draft. A draft is kept only if it EQUALS what the sampler
+    /// picks from that row, with the RNG advanced once per emitted token as the plain loop advances it — so
+    /// the output is the plain loop's, up to the rounding of a multi-row forward against single-row decode.
+    /// Rejected drafts leave the cache (`Cache::truncate`). Where an answer copies its input it yields many
+    /// tokens per forward — measured on Qwen2.5-0.5B: a verbatim repeat 7.3, a code edit 3.8, free verse 1.1,
+    /// answers identical to the plain loop in all 6 runs.
+    ///
+    /// ⚠ NOT YET FASTER, and opt-in for that reason. A verify forward of 2-9 rows runs the PREFILL matmul
+    /// path (~34 ms per forward measured) where a batched decode step takes ~10 ms, so the forwards it saves
+    /// cost more each. It pays once a few-row forward reads the weights once, as a decode step does.
+    fn generate_lookup(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, k: usize, mut on_delta: impl FnMut(&str, &[Value])) -> GenOut {
+        let (mut cache, skip) = self.seeded_cache(prompt);
+        let n_vocab = self.model.n_vocab();
+        let mut rng: u64 = opts.rng;
+        let mut r#gen: Vec<u32> = Vec::new();
+        let mut em = Emitter::new(&opts.stop);
+        let (mut lps, mut lp_sent) = (Vec::new(), 0usize);
+        let mut finish = "length";
+        let (mut steps, mut drafted, mut kept) = (1usize, 0usize, 0usize);
+        let (t0, mut t_fwd) = (std::time::Instant::now(), 0f64);
+        let v = pollster::block_on(self.model.forward_cached_last(&prompt[skip..], &mut cache).to_vec());
+        let mut rows: Vec<Vec<f32>> = vec![v[v.len() - n_vocab..].to_vec()];
+        let mut draft: Vec<u32> = Vec::new();
+        let mut base = match &cache { ModelCache::Dense(c) => c.pos, _ => unreachable!() };
+        'run: loop {
+            // Emit from each row in turn while the drafts hold. Row i predicts the token after feed[..=i].
+            let mut held = 0usize;
+            for (i, row) in rows.iter().enumerate() {
+                let Some(next) = self.select_token(row, &None, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break 'run };
+                if self.eos.contains(&next) { finish = "stop"; break 'run; }
+                if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
+                r#gen.push(next);
+                let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
+                if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
+                if em.hit_stop || peer_gone() { finish = "stop"; break 'run; }
+                if r#gen.len() >= max_tokens { break 'run; }
+                if i < draft.len() && next == draft[i] { held += 1; continue; }
+                break;
+            }
+            // Keep what the model confirmed: the pending token and the drafts it agreed with.
+            if !draft.is_empty() {
+                kept += held;
+                if let ModelCache::Dense(c) = &mut cache { c.truncate(base + 1 + held); }
+            }
+            let ctx: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
+            draft = lookup_draft(&ctx, k);
+            drafted += draft.len();
+            let feed: Vec<u32> = std::iter::once(*r#gen.last().unwrap()).chain(draft.iter().copied()).collect();
+            base = match &cache { ModelCache::Dense(c) => c.pos, _ => unreachable!() };
+            let tf = std::time::Instant::now();
+            let v = pollster::block_on(self.model.forward_cached(&feed, &mut cache).to_vec());
+            t_fwd += tf.elapsed().as_secs_f64();
+            steps += 1;
+            rows = v.chunks(n_vocab).map(|r| r.to_vec()).collect();
+        }
+        // Leave the cache holding exactly what it verified — the prompt and every emitted token but the
+        // last (never fed) — so the prompt cache is offered no rejected draft.
+        if let ModelCache::Dense(c) = &mut cache {
+            let verified = prompt.len() + r#gen.len().saturating_sub(1);
+            if c.pos > verified { c.truncate(verified); }
+        }
+        if std::env::var("FERRIC_LOOKUP_TRACE").is_ok() {
+            eprintln!("lookup: {} tokens in {steps} forwards ({:.2} per forward); drafted {drafted}, kept {kept}; {:.3} s total, {:.3} s in verify forwards",
+                      r#gen.len(), r#gen.len() as f64 / steps as f64, t0.elapsed().as_secs_f64(), t_fwd);
+        }
+        let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
+        self.remember(&fed, &cache);
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
@@ -1308,6 +1385,30 @@ fn pick_gguf(repo: &str) -> String {
     let ggufs: Vec<&String> = files.iter().filter(|f| f.to_lowercase().ends_with(".gguf")).collect();
     let pick = ggufs.iter().find(|f| f.contains("Q4_K_M")).or_else(|| ggufs.first()).cloned();
     match pick { Some(f) => { eprintln!("ferric-serve: picked {f} from {repo}"); f.clone() } None => { eprintln!("ferric-serve: no .gguf found in {repo} (specify owner/repo:file.gguf)"); std::process::exit(1); } }
+}
+
+/// `FERRIC_LOOKUP=k`: draft up to `k` tokens by prompt lookup (off when unset or 0).
+fn lookup_k() -> Option<usize> { std::env::var("FERRIC_LOOKUP").ok().and_then(|v| v.parse().ok()).filter(|&k: &usize| k > 0) }
+
+/// Whether dense caches are f32 — prompt lookup truncates rejected drafts, which a block-quantized store cannot.
+fn qwen3_cache_is_f32() -> bool { std::env::var("FERRIC_KVQ").map_or(true, |v| v.is_empty() || v == "off" || v == "f32") }
+
+/// The drafts prompt lookup proposes: the tokens that followed the most recent earlier occurrence of the
+/// context's last `n` tokens, longest `n` (4 down to 2) first, at most `k` of them. Empty = no match; the
+/// step is then a plain one-token decode.
+fn lookup_draft(ctx: &[u32], k: usize) -> Vec<u32> {
+    for n in (2..=4usize).rev() {
+        if ctx.len() <= n { continue; }
+        let pat = &ctx[ctx.len() - n..];
+        for start in (0..ctx.len() - n).rev() {
+            if &ctx[start..start + n] == pat {
+                let from = start + n;
+                let to = (from + k).min(ctx.len());
+                if from < to { return ctx[from..to].to_vec(); }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Physical memory in bytes: `hw.memsize` on macOS, `MemTotal` on Linux. `None` elsewhere (no budget).
@@ -2034,6 +2135,17 @@ mod tests {
     /// output, which is exactly the failure class that survives "curl it and look".
     /// `encoding_format: "base64"` is what the official OpenAI Python client asks for by default; a
     /// wrong encoder returns vectors that decode to different floats with no error.
+    #[test]
+    fn prompt_lookup_drafts_what_followed_the_longest_recent_match() {
+        use super::lookup_draft;
+        // "... 5 6 7 8 9 ... 5 6 7" → the 3-gram 5 6 7 was followed by 8 9 before.
+        assert_eq!(lookup_draft(&[1, 5, 6, 7, 8, 9, 2, 3, 5, 6, 7], 4), vec![8, 9, 2, 3]);
+        // The MOST RECENT occurrence wins: 4 4 was followed by 1 first, then by 2.
+        assert_eq!(lookup_draft(&[4, 4, 1, 4, 4, 2, 9, 4, 4], 1), vec![2]);
+        assert!(lookup_draft(&[1, 2, 3, 4], 8).is_empty(), "no repeated n-gram, no draft");
+        assert_eq!(lookup_draft(&[7, 8, 7, 8], 8), vec![7, 8], "never drafts past the end of the context");
+    }
+
     #[test]
     fn preparing_a_message_for_the_template_adds_no_key() {
         let m = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});

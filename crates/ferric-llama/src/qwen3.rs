@@ -453,6 +453,15 @@ pub struct Cache {
     fmt: Option<KvqFmt>,
 }
 impl Cache {
+    /// Forget every position from `n` on — a speculative step's rejected drafts. f32 caches only (a
+    /// quantized store packs rows in blocks); `false` = not done, and the caller must not speculate.
+    pub fn truncate(&mut self, n: usize) -> bool {
+        if self.fmt.is_some() || !self.q.is_empty() || n > self.pos { return false; }
+        for (k, v) in &mut self.kv { let m = n.min(k.len()); k.truncate(m); v.truncate(m.min(v.len())); }
+        self.pos = n;
+        true
+    }
+
     /// Default (f32) cache, unless `FERRIC_KVQ` asks otherwise. See [`Cache::with_kvq`].
     pub fn new(cfg: &Cfg) -> Cache { Cache::with_kvq(cfg, kvq_from_env()) }
 

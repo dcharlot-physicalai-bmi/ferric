@@ -1455,6 +1455,9 @@ pub struct KvBuf {
 }
 impl KvBuf {
     pub fn len(&self) -> usize { self.len }
+    /// Keep the first `n` rows (the buffer stays; later appends overwrite the rest). How a speculative
+    /// step forgets the drafts it rejected.
+    pub fn truncate(&mut self, n: usize) { assert!(n <= self.len, "KvBuf::truncate({n}) past {} rows", self.len); self.len = n; }
     /// Append `src` ([t, width]) rows in place, growing (doubling) if needed, and return a contiguous
     /// [len, width] view over the cache buffer covering all rows so far.
     pub fn append(&mut self, ctx: &Arc<Context>, src: &Tensor) -> Tensor {

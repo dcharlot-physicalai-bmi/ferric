@@ -911,7 +911,10 @@ impl ServeModel for Engine {
     /// draft — so speculative decoding, its energy gate and the one-slot prefix cache ran only for
     /// `response_format` and tool requests. Such a model keeps its own serial loop.
     fn serial_generation(&self) -> bool {
-        matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err()
+        (matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err())
+            // Prompt lookup (FERRIC_LOOKUP) speculates on the serial loop; a dense model that asked for it
+            // takes that loop for every request, trading batching for tokens per forward.
+            || (matches!(&self.model, crate::Model::Dense(_)) && crate::lookup_k().is_some() && crate::qwen3_cache_is_f32())
     }
     fn energy_begin(&self) -> Option<crate::energy::Ticket> { self.energy.begin() }
     fn cancelled(&self) { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
