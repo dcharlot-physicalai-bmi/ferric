@@ -20,6 +20,15 @@
 //! magnitude-bounded yet, so a small model can loop digits until `max_tokens` — use an `integer` with
 //! bounds where possible, set `maxLength`/`maxItems`, or use adequate `max_tokens`.
 //!
+//! **Request parameters honoured** (chat and completions, serial and batched paths alike — see `genopts`):
+//! `max_tokens` / `max_completion_tokens` (absent = until a stop token or the context runs out),
+//! `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repeat_penalty` /
+//! `repeat_last_n`, `seed`, `stop` (string or array; the text is cut before it), `logprobs` /
+//! `top_logprobs`, `stream_options.include_usage`. `finish_reason` is `"length"` at the budget, `"stop"`
+//! otherwise. Message `content` may be a string or an array of text parts. `n > 1`, image and audio parts,
+//! and malformed values are a 400 naming the field — never silently ignored. `--host` sets the bind
+//! address (default 127.0.0.1); CORS preflight is answered.
+//!
 //! **Continuous batching.** Concurrent requests share one decode step: `forward_batch` advances every
 //! in-flight sequence by one token in a single forward, so the weight set is read once for the whole
 //! batch instead of once per request. Arrivals join mid-flight and a finished sequence's slot is
@@ -29,7 +38,9 @@
 //! as do guided-decoding and tool-calling requests, which keep the untouched single-request path.
 mod mcp;
 mod batch;
+mod genopts;
 mod specgate;
+use genopts::{GenOpts, Emitter};
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::{qwen3, qwen35};
@@ -295,6 +306,20 @@ pub(crate) struct Engine {
     /// to a full prefill (cached-decode ≡ re-prefill, the invariant `--verify-cache` proves) —
     /// the conversation just stops being re-paid every turn. RefCell: the server is single-threaded.
     prefix: std::cell::RefCell<Option<PrefixSlot>>,
+    /// `<arch>.context_length`: the prompt plus everything generated must fit. A request with no
+    /// `max_tokens` generates until a stop token or this limit, as OpenAI, llama-server and Ollama do.
+    n_ctx: usize,
+}
+
+/// One finished generation.
+pub(crate) struct GenOut {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub gen_tokens: usize,
+    /// `"stop"` (a stop token, a stop string, or a guide with nowhere left to go) or `"length"`.
+    pub finish: &'static str,
+    /// Chat-format `logprobs.content` entries, one per generated token, when the request asked.
+    pub logprobs: Vec<Value>,
 }
 
 /// See `Engine::prefix`. `fed` is exactly the token sequence the main cache has consumed —
@@ -475,7 +500,10 @@ impl Engine {
         // The break-even is `E_draft / E_main`, estimated from shape: one MTP block against the main
         // model's `n_layer`. A structural estimate, not a measurement — see `specgate`.
         let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker }
+        // Absent is not "unlimited": 4096 is a conservative bound for a file that does not say, and the
+        // error it produces names the number so a caller can see why.
+        let n_ctx = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -522,7 +550,8 @@ impl Engine {
     /// Render the chat template to a string (special tokens as literal text), family-detected from the
     /// vocab. Covers ChatML (Qwen/Yi/…), Llama-3, Gemma, Phi-3; else a generic fallback.
     fn render_chat(&self, messages: &[Value]) -> String {
-        let m = |v: &Value| (v["role"].as_str().unwrap_or("user").to_string(), v["content"].as_str().unwrap_or("").to_string());
+        // Content was validated by `chat_ids` (string, null or text parts); an unreadable one is empty here.
+        let m = |v: &Value| (v["role"].as_str().unwrap_or("user").to_string(), genopts::content_text(&v["content"]).unwrap_or_default());
         if self.has("<|start_header_id|>") { // Llama-3
             let mut s = String::from("<|begin_of_text|>");
             for v in messages { let (r, c) = m(v); s.push_str(&format!("<|start_header_id|>{r}<|end_header_id|>\n\n{c}<|eot_id|>")); }
@@ -611,14 +640,20 @@ impl Engine {
         true
     }
 
-    fn chat_ids(&self, messages: &[Value]) -> Vec<u32> {
+    fn chat_ids(&self, messages: &[Value]) -> Result<Vec<u32>, String> {
+        // ⛔ An OpenAI content-part array used to read as "" here (`as_str()` on an array), so the model
+        // answered a prompt with the user's words missing. Parts are read, and a part this path cannot
+        // feed (an image) is refused by name.
+        for (i, m) in messages.iter().enumerate() {
+            genopts::content_text(&m["content"]).map_err(|e| format!("messages[{i}]: {e}"))?;
+        }
         if !self.has_chat_family() {
             // No recognized chat family in the vocab → a base model — plain concatenation.
-            let text: String = messages.iter().map(|m| format!("{}: {}\n", m["role"].as_str().unwrap_or("user"), m["content"].as_str().unwrap_or(""))).collect();
+            let text: String = messages.iter().map(|m| format!("{}: {}\n", m["role"].as_str().unwrap_or("user"), genopts::content_text(&m["content"]).unwrap_or_default())).collect();
             let mut ids = Vec::new();
             if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
             ids.extend(self.enc(&text, true));
-            return ids;
+            return Ok(ids);
         }
         let mut ids = self.encode_special(&self.render_chat(messages));
         // SentencePiece templates (Phi-3/Mistral) don't embed BOS; add_bos prepends it. (BPE templates
@@ -626,14 +661,35 @@ impl Engine {
         if self.spm.is_some() && self.add_bos {
             if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
         }
-        ids
+        Ok(ids)
+    }
+
+    /// How many tokens this request may generate: its own limit, capped by what is left of the context.
+    /// A prompt that does not fit is an error naming both numbers, never a silent truncation.
+    pub(crate) fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String> {
+        if prompt_len >= self.n_ctx {
+            return Err(format!("the prompt is {prompt_len} tokens and this model's context is {} — \
+                                shorten the conversation", self.n_ctx));
+        }
+        Ok(want.unwrap_or(usize::MAX).min(self.n_ctx - prompt_len))
+    }
+
+    /// A token's text and bytes, for `logprobs`.
+    pub(crate) fn piece(&self, tok: u32) -> (String, Vec<u8>) {
+        let b = self.token_bytes.get(tok as usize).cloned().flatten().unwrap_or_default();
+        (String::from_utf8_lossy(&b).into_owned(), b)
+    }
+
+    fn lp_entry(&self, row: &[f32], tok: u32, opts: &GenOpts) -> Value {
+        let (lp, alts) = genopts::logprobs_of(row, tok, opts.top_logprobs);
+        genopts::logprob_entry(&|t| self.piece(t), tok, lp, &alts)
     }
 
     /// Decode. `temperature` 0 → greedy argmax (deterministic — the default). >0 → top-p sampling
     /// with a **fixed-seed** RNG, so even sampled output is reproducible (on-brand for the moat).
     /// Guided decoding always stays argmax (deterministic structured output). Calls `on_delta` per
     /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
-    fn generate(&self, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize) {
+    fn generate(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str, &[Value])) -> GenOut {
         // Speculative fast path: a hybrid model shipping its own MTP draft block self-drafts.
         // Emits IDENTICAL tokens (drafts are only accepted when they equal what the sampler picks
         // from the true logits, and the fixed-seed RNG advances once per emitted token either way)
@@ -660,49 +716,49 @@ impl Engine {
                     take
                 };
                 if speculate {
-                    let (text, p, n, drafted, accepted) =
-                        self.generate_spec(m, prompt, max_tokens, temperature, guide, on_delta);
+                    let (out, drafted, accepted) =
+                        self.generate_spec(m, prompt, max_tokens, opts, guide, on_delta);
                     // Only ATTEMPTED drafts are recorded. A step that did not draft has no outcome, and
                     // inventing one would let the gate confirm its own decisions.
                     if drafted > 0 {
                         let mut g = self.spec_gate.lock().expect("spec gate poisoned");
                         for i in 0..drafted { g.observe(prompt.len(), i < accepted); }
                     }
-                    return (text, p, n);
+                    return out;
                 }
             }
         }
         let mut cache = self.model.new_cache();
         let n_vocab = self.model.n_vocab();
-        let mut rng: u64 = 0x2545_F491_4F6C_DD1D; // deterministic seed → reproducible sampling
+        let mut rng: u64 = opts.rng; // fixed default seed → reproducible sampling; `seed` overrides it
         let mut r#gen: Vec<u32> = Vec::new();
-        let mut emitted = String::new();
+        let mut em = Emitter::new(&opts.stop);
+        let (mut lps, mut lp_sent) = (Vec::new(), 0usize);
+        let mut finish = "length";
         for step in 0..max_tokens {
             let input: Vec<u32> = if step == 0 { prompt.to_vec() } else { vec![*r#gen.last().unwrap()] };
             let logits = self.model.forward_cached(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
-            let Some(next) = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng) else { break };
-            if self.eos.contains(&next) { break; }
+            let row = &v[v.len() - n_vocab..];
+            let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };
+            if self.eos.contains(&next) { finish = "stop"; break; }
             if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
+            if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
             r#gen.push(next);
-            // Re-detok the whole generation and emit only the new suffix (handles multi-byte UTF-8).
-            let full = self.detok(&r#gen);
-            if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
-                let delta = full[emitted.len()..].to_string();
-                on_delta(&delta);
-                emitted = full;
-            }
+            // Re-detok the whole generation and release only what is safe (multi-byte UTF-8, stop strings).
+            if let Some(d) = em.update(&self.detok(&r#gen)) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
+            if em.hit_stop { finish = "stop"; break; }
         }
-        (emitted, prompt.len(), r#gen.len())
+        if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
+        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps }
     }
 
     /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
     /// -inf (EOS legal only once the value is complete), then `temperature` is honored over the
     /// legal set — temp 0 stays argmax (deterministic). Returns `None` when the guide leaves no
     /// legal continuation (stop cleanly). Most tokens reject on their first byte, so the scan is cheap.
-    fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, temperature: f32, rng: &mut u64) -> Option<u32> {
+    fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, s: &genopts::Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
         let n_vocab = row.len();
-        let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
         if let Some(g) = guide.as_ref() {
             let can_stop = g.can_stop();
             let mut masked = vec![f32::NEG_INFINITY; n_vocab];
@@ -713,8 +769,12 @@ impl Engine {
                 if ok { masked[i] = row[i]; any = true; }
             }
             if !any { return None; } // no legal continuation (shouldn't happen for a valid schema)
-            Some(if temperature > 0.0 { sample_top_p(&masked, temperature, 0.95, rng) } else { argmax(&masked) })
-        } else if temperature > 0.0 { Some(sample_top_p(row, temperature, 0.95, rng)) } else { Some(argmax(row)) }
+            let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
+            Some(genopts::sample(&masked, s, tail, generated, rng))
+        } else {
+            let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
+            Some(genopts::sample(row, s, tail, generated, rng))
+        }
     }
 
     /// Speculative decoding with the model's own MTP ("nextn") draft block. Every emitted token is
@@ -727,16 +787,19 @@ impl Engine {
     /// class of shift as any kernel-fusion change. The draft only decides how many tokens each
     /// main forward yields (~80% acceptance ⇒ ~2 per forward). Rollback on rejection is O(1):
     /// caches are Arc-handle snapshots, never GPU copies.
-    fn generate_spec(&self, m: &Qwen35, prompt: &[u32], max_tokens: usize, temperature: f32, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str)) -> (String, usize, usize, u32, u32) {
+    fn generate_spec(&self, m: &Qwen35, prompt: &[u32], max_tokens: usize, opts: &GenOpts, mut guide: Option<ferric_agent::guide::Guide>, mut on_delta: impl FnMut(&str, &[Value])) -> (GenOut, u32, u32) {
         // Draft accounting, returned so the caller can feed `SpecGate`. The doc above this function
         // asserts "~80% acceptance"; nothing measured it until now, and a gate that decides on an
         // assumed rate is a heuristic wearing a derivation's clothes.
         let (mut drafted, mut accepted) = (0u32, 0u32);
         let n_vocab = self.model.n_vocab();
         let argmax = |r: &[f32]| (0..n_vocab).max_by(|&a, &b| r[a].partial_cmp(&r[b]).unwrap()).unwrap() as u32;
-        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng: u64 = opts.rng;
         let mut r#gen: Vec<u32> = Vec::new();
-        let mut emitted = String::new();
+        let mut em = Emitter::new(&opts.stop);
+        let (mut lps, mut lp_sent): (Vec<Value>, usize) = (Vec::new(), 0);
+        let mut finish = "length";
+        let sm = &opts.sampling;
         // One-slot prompt-prefix reuse: when this prompt extends the cached conversation, resume
         // its caches and prefill only the new suffix.
         let (mut fed, mut cache, mut mc) = match self.prefix.borrow_mut().take() {
@@ -747,17 +810,17 @@ impl Engine {
                 (Vec::new(), qwen35::Cache::new(&m.cfg), mc)
             }
         };
-        // Commit one token: advance the guide, then stream the newly-decoded suffix.
+        // Commit one token: advance the guide, record its logprob, release what is safe to stream.
+        // Evaluates to `true` when a stop string just completed — the caller then stops exactly as it
+        // would on a stop token, rolling back any cache entry this step's verify left unconfirmed.
         macro_rules! commit {
-            ($tok:expr_2021) => {{
+            ($tok:expr_2021, $row:expr_2021) => {{
                 if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[$tok as usize].as_ref()) { for &c in b { g.step(c); } }
+                if opts.logprobs { lps.push(self.lp_entry($row, $tok, opts)); }
                 r#gen.push($tok);
-                let full = self.detok(&r#gen);
-                if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
-                    let delta = full[emitted.len()..].to_string();
-                    on_delta(&delta);
-                    emitted = full;
-                }
+                if let Some(d) = em.update(&self.detok(&r#gen)) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
+                if em.hit_stop { finish = "stop"; }
+                em.hit_stop
             }};
         }
         macro_rules! save_slot {
@@ -770,9 +833,18 @@ impl Engine {
         let (lg, hid) = m.forward_spec(&suffix, &mut cache, m.cfg.n_layer);
         fed.extend_from_slice(&suffix);
         let v = pollster::block_on(lg.to_vec());
-        let first = self.select_token(&v[v.len() - n_vocab..], &guide, temperature, &mut rng);
-        let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else { save_slot!(); return (emitted, prompt.len(), 0, drafted, accepted) };
-        commit!(pend0);
+        let row0 = &v[v.len() - n_vocab..];
+        let first = self.select_token(row0, &guide, sm, prompt, &r#gen, &mut rng);
+        let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else {
+            save_slot!();
+            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps }, drafted, accepted)
+        };
+        if commit!(pend0, row0) || max_tokens <= 1 {
+            save_slot!();
+            if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
+            let fin = if em.hit_stop { "stop" } else { "length" };
+            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps }, drafted, accepted)
+        }
         let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
         // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
         // first position whose predecessor hidden we have. A positional gap in the draft cache
@@ -801,9 +873,9 @@ impl Engine {
                 let toks: Vec<u32> = unfed.iter().copied().chain([d1, d2]).collect();
                 let (lg, hid2) = m.forward_spec_k(&toks, &mut cache, m.cfg.n_layer, 3);
                 let v = pollster::block_on(lg.to_vec()); // rows: 0=→d1, 1=→d2, 2=→pend
-                let t1 = self.select_token(&v[0..n_vocab], &guide, temperature, &mut rng);
-                let Some(t1) = t1.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
-                commit!(t1);
+                let t1 = self.select_token(&v[0..n_vocab], &guide, sm, prompt, &r#gen, &mut rng);
+                let Some(t1) = t1.filter(|t| !self.eos.contains(t)) else { finish = "stop"; cache = snap; break; };
+                if commit!(t1, &v[0..n_vocab]) { cache = snap; break; }
                 // Two drafts were proposed this step; each is one observation for the gate. Counted
                 // where the decision is ALREADY made rather than re-derived, so the tally cannot drift
                 // from the branch it describes.
@@ -817,9 +889,9 @@ impl Engine {
                     continue;
                 }
                 // d1 accepted — check the 2nd draft against the true token after d1.
-                let t2 = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
-                let Some(t2) = t2.filter(|t| !self.eos.contains(t)) else { cache = snap; break; };
-                commit!(t2);
+                let t2 = self.select_token(&v[n_vocab..2 * n_vocab], &guide, sm, prompt, &r#gen, &mut rng);
+                let Some(t2) = t2.filter(|t| !self.eos.contains(t)) else { finish = "stop"; cache = snap; break; };
+                if commit!(t2, &v[n_vocab..2 * n_vocab]) { cache = snap; break; }
                 accepted += 1;   // d1 matched
                 if t2 != d2 || r#gen.len() >= max_tokens {
                     // Accept d1 only: d2's cache entry is wrong → discard forward, re-feed [d1, t2].
@@ -832,9 +904,9 @@ impl Engine {
                 accepted += 1;   // d2 matched too
                 // Accept both: the cache validly holds [unfed…, d1, d2]; emit pend from row 2.
                 fed.extend_from_slice(&toks);
-                let pend = self.select_token(&v[2 * n_vocab..3 * n_vocab], &guide, temperature, &mut rng);
-                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { break };
-                commit!(pend);
+                let pend = self.select_token(&v[2 * n_vocab..3 * n_vocab], &guide, sm, prompt, &r#gen, &mut rng);
+                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { finish = "stop"; break };
+                if commit!(pend, &v[2 * n_vocab..3 * n_vocab]) { break; }
                 ptoks = vec![d1, d2, pend];
                 phid = hid2.narrow(0, k - 1, 3).contiguous();
                 unfed = vec![pend];
@@ -852,18 +924,19 @@ impl Engine {
             let (lg, hid2) = m.forward_spec(&toks, &mut cache, m.cfg.n_layer);
             // forward_spec heads only the last two positions: row 0 = last unfed (truth), row 1 = draft.
             let v = pollster::block_on(lg.to_vec());
-            let truth = self.select_token(&v[0..n_vocab], &guide, temperature, &mut rng);
+            let truth = self.select_token(&v[0..n_vocab], &guide, sm, prompt, &r#gen, &mut rng);
             let Some(truth) = truth.filter(|t| !self.eos.contains(t)) else {
+                finish = "stop";
                 cache = snap; // this forward's entries include the unverified draft — discard
                 break;
             };
-            commit!(truth);
+            if commit!(truth, &v[0..n_vocab]) { cache = snap; break; }
             if truth == d && r#gen.len() < max_tokens {
                 fed.extend_from_slice(&toks); // everything this forward fed is now known-valid
                 // Accepted: the draft's own logits row is valid too — take the next token from it.
-                let pend = self.select_token(&v[n_vocab..2 * n_vocab], &guide, temperature, &mut rng);
-                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { break };
-                commit!(pend);
+                let pend = self.select_token(&v[n_vocab..2 * n_vocab], &guide, sm, prompt, &r#gen, &mut rng);
+                let Some(pend) = pend.filter(|t| !self.eos.contains(t)) else { finish = "stop"; break };
+                if commit!(pend, &v[n_vocab..2 * n_vocab]) { break; }
                 ptoks = vec![d, pend];
                 phid = hid2.narrow(0, k - 1, 2).contiguous(); // hiddens at d's and pend's predecessors
                 unfed = vec![pend];
@@ -880,30 +953,12 @@ impl Engine {
             }
         }
         save_slot!();
-        (emitted, prompt.len(), r#gen.len(), drafted, accepted)
+        if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
+        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps }, drafted, accepted)
     }
 }
 
 fn now_unix() -> u64 { 1_700_000_000 } // static stamp (no wall clock needed for the API contract)
-
-/// Top-p (nucleus) sampling from `row` at `temperature`, using a xorshift RNG. Small models loop badly
-/// at temperature 0; this makes them usable while staying reproducible (the RNG is fixed-seeded).
-fn sample_top_p(row: &[f32], temp: f32, top_p: f32, rng: &mut u64) -> u32 {
-    let maxl = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let probs: Vec<f32> = row.iter().map(|&l| ((l - maxl) / temp).exp()).collect();
-    let sum: f32 = probs.iter().sum();
-    let mut idx: Vec<usize> = (0..row.len()).collect();
-    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-    // nucleus: smallest set whose probability mass ≥ top_p
-    let (mut cum, mut cut) = (0.0f32, idx.len());
-    for (k, &i) in idx.iter().enumerate() { cum += probs[i] / sum; if cum >= top_p { cut = k + 1; break; } }
-    // xorshift64 → r in [0, nucleus mass)
-    *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
-    let r = (*rng >> 11) as f32 / (1u64 << 53) as f32 * cum;
-    let (mut acc, mut pick) = (0.0f32, idx[0]);
-    for &i in &idx[..cut] { acc += probs[i] / sum; if acc >= r { pick = i; break; } }
-    pick as u32
-}
 
 /// Resolve a model spec to a local GGUF path. Accepts a local file, or a HuggingFace ref
 /// `owner/repo[:file.gguf]` — downloads (and caches under ~/.cache/ferric/hub) via `curl` so
@@ -940,8 +995,10 @@ fn pick_gguf(repo: &str) -> String {
 /// server does stays reachable from tests — see the crate docs.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--port N] [--name S]"); std::process::exit(1); });
+    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--host H] [--port N] [--name S]"); std::process::exit(1); });
     let mut port = 8080u16;
+    // 127.0.0.1 by default: a model server is not exposed to the network unless someone says so.
+    let mut host = "127.0.0.1".to_string();
     let mut name = "ferric".to_string();
     let mut mcp_cmds: Vec<(String, String)> = Vec::new();
     // How many sequences may share one decode step. 8 is a starting point, not a measured optimum:
@@ -951,6 +1008,7 @@ pub fn run() {
     while i < args.len() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
+            "--host" => { host = args.get(i + 1).cloned().unwrap_or(host); i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -990,19 +1048,19 @@ pub fn run() {
     if args.iter().any(|a| a == "--once") {
         // Smoke test: one chat turn straight through the pipeline, no HTTP.
         let msgs = vec![json!({"role": "user", "content": "Hi"})];
-        let (t, p, g) = eng.generate(&eng.chat_ids(&msgs), 16, 0.0, None, |d| eprint!("{d}"));
-        eprintln!("\nferric-serve: --once ok ({p} prompt + {g} gen tokens): {t:?}");
+        let out = eng.generate(&eng.chat_ids(&msgs).expect("chat ids"), 16, &GenOpts::default(), None, |d, _| eprint!("{d}"));
+        eprintln!("\nferric-serve: --once ok ({} prompt + {} gen tokens, {}): {:?}", out.prompt_tokens, out.gen_tokens, out.finish, out.text);
         return;
     }
     let mcps = std::cell::RefCell::new(mcps);
     let any_mcp_tools = !mcps.borrow().openai_tools().is_empty();
     let batching = eng.batchable();
-    eprintln!("ferric-serve: {} ({} layers, vocab {}) on {:?}{} — http://127.0.0.1:{port}/v1",
-        name, eng.model.n_layer(), eng.model.n_vocab(), eng.ctx.backend,
+    eprintln!("ferric-serve: {} ({} layers, vocab {}, context {}) on {:?}{} — http://{host}:{port}/v1",
+        name, eng.model.n_layer(), eng.model.n_vocab(), eng.n_ctx, eng.ctx.backend,
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
     eprintln!("ferric-serve: continuous batching {}",
         if batching { format!("ON, max_batch {max_batch}") } else { "OFF (serial) — this model has no solo-equivalent batched decode, or it was disabled".to_string() });
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| panic!("bind :{port}: {e}"));
+    let listener = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
     // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
     // loop, embeddings, unknown paths) goes to the untouched serial handler below.
     batch::serve_loop(eng, listener, batch::ServeOpts { max_batch, any_mcp_tools },
@@ -1120,12 +1178,35 @@ fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {
     }
 }
 
+fn bad_request(stream: &mut TcpStream, m: &str) {
+    write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}))
+}
+
+/// The `logprobs` field of a choice: chat format, or completions' parallel arrays.
+fn logprobs_field(chat: bool, lps: &[Value]) -> Value {
+    if chat { return json!({"content": lps}); }
+    let mut offset = 0usize;
+    let mut offs = Vec::with_capacity(lps.len());
+    for e in lps { offs.push(offset); offset += e["token"].as_str().map(str::len).unwrap_or(0); }
+    json!({
+        "tokens": lps.iter().map(|e| e["token"].clone()).collect::<Vec<_>>(),
+        "token_logprobs": lps.iter().map(|e| e["logprob"].clone()).collect::<Vec<_>>(),
+        "top_logprobs": lps.iter().map(|e| {
+            let mut m = serde_json::Map::new();
+            for a in e["top_logprobs"].as_array().into_iter().flatten() {
+                if let Some(t) = a["token"].as_str() { m.insert(t.to_string(), a["logprob"].clone()); }
+            }
+            Value::Object(m)
+        }).collect::<Vec<_>>(),
+        "text_offset": offs,
+    })
+}
+
 fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
-    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
     let empty = vec![];
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
-    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+    let opts = match GenOpts::from_req(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let streaming = req["stream"].as_bool().unwrap_or(false);
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
@@ -1138,15 +1219,16 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         // Server-side agent loop: generate → parse tool_calls → execute the MCP-owned ones and feed
         // results back → repeat. Non-MCP tool calls are returned to the client (standard OpenAI flow).
         let (mut ptok, mut gtok) = (0usize, 0usize);
-        let (mut out_text, mut out_calls) = (String::new(), Vec::new());
+        let (mut out_text, mut out_calls, mut out_finish) = (String::new(), Vec::new(), "stop");
         for _round in 0..4 {
-            let prompt = eng.chat_ids(&messages);
-            let (text, p, g) = eng.generate(&prompt, max_tokens, temperature, None, |_| {});
-            ptok += p; gtok += g;
-            let calls = ferric_agent::tools::parse_tool_calls(&text);
+            let prompt = match eng.chat_ids(&messages) { Ok(p) => p, Err(e) => return bad_request(stream, &e) };
+            let max = match eng.budget(prompt.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+            let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
+            ptok += out.prompt_tokens; gtok += out.gen_tokens;
+            let calls = ferric_agent::tools::parse_tool_calls(&out.text);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
-            if mcp_calls.is_empty() { out_text = text; out_calls = calls; break; }
-            messages.push(json!({"role": "assistant", "content": text}));
+            if mcp_calls.is_empty() { out_text = out.text; out_calls = calls; out_finish = out.finish; break; }
+            messages.push(json!({"role": "assistant", "content": out.text}));
             for c in &mcp_calls {
                 let name = c["function"]["name"].as_str().unwrap_or("");
                 let args: Value = serde_json::from_str(c["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_else(|_| json!({}));
@@ -1158,7 +1240,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         let (message, finish) = if !out_calls.is_empty() {
             (json!({"role": "assistant", "content": Value::Null, "tool_calls": out_calls}), "tool_calls")
         } else {
-            (json!({"role": "assistant", "content": out_text}), "stop")
+            (json!({"role": "assistant", "content": out_text}), out_finish)
         };
         return write_json(stream, 200, &json!({
             "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
@@ -1173,41 +1255,53 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
         else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
         else { None };
-    let prompt = eng.chat_ids(&messages);
+    let prompt = match eng.chat_ids(&messages) { Ok(p) => p, Err(e) => return bad_request(stream, &e) };
+    let max = match eng.budget(prompt.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
     if streaming {
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
-        eng.generate(&prompt, max_tokens, temperature, guide, |delta| {
-            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]}));
+        let out = eng.generate(&prompt, max, &opts, guide, |delta, lps| {
+            let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
+            if opts.logprobs { ch["logprobs"] = json!({"content": lps}); }
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [ch]}));
         });
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+            "choices": [{"index": 0, "delta": {}, "finish_reason": out.finish}]}));
+        if req["stream_options"]["include_usage"].as_bool() == Some(true) {
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [],
+                "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}}));
+        }
         let _ = stream.write_all(b"data: [DONE]\n\n");
     } else {
-        let (text, ptok, gtok) = eng.generate(&prompt, max_tokens, temperature, guide, |_| {});
+        let out = eng.generate(&prompt, max, &opts, guide, |_, _| {});
+        let mut choice = json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": out.finish});
+        if opts.logprobs { choice["logprobs"] = logprobs_field(true, &out.logprobs); }
         write_json(stream, 200, &json!({
             "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
+            "choices": [choice],
+            "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}
         }));
     }
 }
 
 fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
-    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return write_json(stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})) };
-    let prompt_text = req["prompt"].as_str().unwrap_or("");
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
-    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
+    let Some(prompt_text) = req["prompt"].as_str() else {
+        return bad_request(stream, "`prompt` must be a string (arrays of prompts and token arrays are not accepted here)")
+    };
+    let opts = match GenOpts::from_req(&req, false) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.enc(prompt_text, true));
-    let (text, ptok, gtok) = eng.generate(&ids, max_tokens, temperature, None, |_| {});
+    let max = match eng.budget(ids.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+    let out = eng.generate(&ids, max, &opts, None, |_, _| {});
+    let mut choice = json!({"index": 0, "text": out.text, "finish_reason": out.finish});
+    if opts.logprobs { choice["logprobs"] = logprobs_field(false, &out.logprobs); }
     write_json(stream, 200, &json!({
         "id": format!("cmpl-ferric-{}", ids.len()), "object": "text_completion", "created": now_unix(), "model": eng.name,
-        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
+        "choices": [choice],
+        "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}
     }));
 }
 
@@ -1218,7 +1312,8 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
     if reader.read_line(&mut line).ok()? == 0 { return None; }
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
+    // The query string is not part of the route: `/health?x=1` used to 404.
+    let path = parts.next()?.split('?').next().unwrap_or("").to_string();
     let mut content_length = 0usize;
     loop {
         let mut h = String::new();
@@ -1237,6 +1332,13 @@ fn write_json(stream: &mut TcpStream, status: u16, v: &Value) {
         if status == 200 { "OK" } else { "ERR" }, body.len());
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+/// CORS preflight. A browser front-end (a web chat UI calling this server directly) sends OPTIONS before
+/// every JSON POST; answering it 404 made every such request fail before it was sent.
+pub(crate) fn write_preflight(stream: &mut TcpStream) {
+    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = stream.flush();
 }
 

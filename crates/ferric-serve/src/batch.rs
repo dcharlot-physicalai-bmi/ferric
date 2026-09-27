@@ -46,8 +46,9 @@
 //! they block the batch while they run. Keeping them on the untouched path also means structured
 //! output cannot regress as a side effect of this change.
 
-use crate::{Engine, ModelCache, write_json, write_sse_headers, send_sse, now_unix, read_request};
-use ferric_llama::sched::{Scheduler, SeqId};
+use crate::{Engine, ModelCache, write_json, write_sse_headers, write_preflight, send_sse, now_unix, read_request};
+use crate::genopts::{Emitter, GenOpts, Sampling};
+use ferric_llama::sched::{Done, Scheduler, SeqId};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::net::{TcpListener, TcpStream};
@@ -72,8 +73,8 @@ pub(crate) trait ServeModel {
     /// loop below runs with `max_batch == 1` and never calls `decode` with more than one sequence.
     fn can_batch(&self) -> bool;
 
-    /// Tokenize a chat request's `messages`.
-    fn encode_chat(&self, messages: &[Value]) -> Vec<u32>;
+    /// Tokenize a chat request's `messages`. `Err` = a message this path cannot feed (a 400).
+    fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String>;
     /// Tokenize a `/v1/completions` prompt string.
     fn encode_text(&self, text: &str) -> Vec<u32>;
 
@@ -91,9 +92,16 @@ pub(crate) trait ServeModel {
     fn decode(&self, toks: &[u32], states: &mut [&mut Self::State]) -> Vec<f32>;
 
     /// Sample one token from one row. `None` = stop with nothing further emitted.
-    fn pick(&self, row: &[f32], temperature: f32, rng: &mut u64) -> Option<u32>;
+    fn pick(&self, row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32>;
     fn is_stop(&self, tok: u32) -> bool;
     fn text_of(&self, ids: &[u32]) -> String;
+    /// A token's text and bytes, for `logprobs`.
+    fn piece(&self, tok: u32) -> (String, Vec<u8>);
+    /// Tokens this request may generate given its prompt: its own `max_tokens`, capped by the context.
+    fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String>;
+    /// This model generates better on its own serial loop than in the scheduler — a hybrid with an MTP
+    /// draft block, whose `generate_spec` (and one-slot prefix cache) the batched step cannot run.
+    fn serial_generation(&self) -> bool { false }
 }
 
 /// One HTTP request, parsed off its socket by a reader thread and handed to the engine thread.
@@ -149,7 +157,7 @@ struct Gen<S> {
     streaming: bool,
     /// `/v1/chat/completions` (true) vs `/v1/completions` (false) — decides the response envelope.
     chat: bool,
-    temperature: f32,
+    opts: GenOpts,
     /// Per-sequence RNG, seeded identically to the serial path so sampled output is reproducible
     /// **and** independent of what else happens to be in the batch. A shared RNG would make a
     /// request's output depend on its neighbours, which is exactly the cross-sequence coupling the
@@ -157,29 +165,38 @@ struct Gen<S> {
     rng: u64,
     prompt: Vec<u32>,
     r#gen: Vec<u32>,
-    emitted: String,
+    em: Emitter,
+    logprobs: Vec<Value>,
+    lp_sent: usize,
+    include_usage: bool,
     state: Option<S>,
     /// The token to feed on the next decode step.
     next: u32,
 }
 
 impl<S> Gen<S> {
-    /// Commit one token: record it, and stream the newly-decoded suffix if the client is streaming.
-    /// Byte-for-byte the same delta logic as the serial `Engine::generate`, including the
-    /// char-boundary guard that keeps multi-byte UTF-8 from being split across SSE frames.
-    fn commit<M: ServeModel<State = S>>(&mut self, m: &M, tok: u32) {
-        self.r#gen.push(tok);
-        let full = m.text_of(&self.r#gen);
-        if full.len() > self.emitted.len() && full.is_char_boundary(self.emitted.len()) {
-            let delta = full[self.emitted.len()..].to_string();
-            if self.streaming {
-                send_sse(&mut self.stream, &json!({
-                    "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
-                    "model": m.name(),
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null}]}));
-            }
-            self.emitted = full;
+    /// Commit one token: record it (and its logprob), and stream whatever is safe to release. The same
+    /// `Emitter` as the serial `Engine::generate`, so multi-byte UTF-8 and stop strings are handled one
+    /// way. Returns `true` when a stop string just completed — the sequence must retire.
+    fn commit<M: ServeModel<State = S>>(&mut self, m: &M, tok: u32, row: &[f32]) -> bool {
+        if self.opts.logprobs {
+            let (lp, alts) = crate::genopts::logprobs_of(row, tok, self.opts.top_logprobs);
+            self.logprobs.push(crate::genopts::logprob_entry(&|t| m.piece(t), tok, lp, &alts));
         }
+        self.r#gen.push(tok);
+        if let Some(d) = self.em.update(&m.text_of(&self.r#gen)) { self.send_delta(m, &d); }
+        self.em.hit_stop
+    }
+
+    fn send_delta<M: ServeModel<State = S>>(&mut self, m: &M, delta: &str) {
+        if self.streaming {
+            let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
+            if self.opts.logprobs { ch["logprobs"] = json!({"content": &self.logprobs[self.lp_sent..]}); }
+            send_sse(&mut self.stream, &json!({
+                "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
+                "model": m.name(), "choices": [ch]}));
+        }
+        self.lp_sent = self.logprobs.len();
     }
 }
 
@@ -194,6 +211,10 @@ pub(crate) struct ServeOpts {
 /// Requests the batch loop declines, and hands to the untouched serial path. See the module docs.
 fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
     if !req["response_format"]["type"].is_null() { return true; }
+    // Streaming completions is served by the serial path's SSE writer only for chat; completions
+    // here are non-streaming, so a streaming completions request is declined rather than answered as
+    // one JSON blob it did not ask for.
+    if !chat && req["stream"].as_bool() == Some(true) { return true; }
     if chat && (opts.any_mcp_tools || req["tools"].as_array().is_some_and(|t| !t.is_empty())) { return true; }
     false
 }
@@ -258,26 +279,32 @@ fn route<M: ServeModel>(
     opts: &ServeOpts,
     serial: &mut impl FnMut(&M, &str, &str, &[u8], &mut TcpStream) -> bool,
 ) {
+    if j.method == "OPTIONS" { return write_preflight(&mut j.stream); }
     let chat = j.path == "/v1/chat/completions";
     let is_gen = chat || j.path == "/v1/completions";
     if j.method == "POST" && is_gen {
+        let bad = |s: &mut TcpStream, m: &str| write_json(s, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
         let req: Value = match serde_json::from_slice(&j.body) {
             Ok(v) => v,
-            Err(e) => return write_json(&mut j.stream, 400, &json!({"error": {"message": format!("bad json: {e}")}})),
+            Err(e) => return bad(&mut j.stream, &format!("bad json: {e}")),
         };
-        if must_run_serial(&req, chat, opts) {
+        if must_run_serial(&req, chat, opts) || m.serial_generation() {
             if !serial(m, &j.method, &j.path, &j.body, &mut j.stream) {
                 write_json(&mut j.stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}}));
             }
             return;
         }
+        let gopts = match GenOpts::from_req(&req, chat) { Ok(o) => o, Err(e) => return bad(&mut j.stream, &e) };
         let prompt = if chat {
             let empty = vec![];
-            m.encode_chat(req["messages"].as_array().unwrap_or(&empty))
+            match m.encode_chat(req["messages"].as_array().unwrap_or(&empty)) { Ok(p) => p, Err(e) => return bad(&mut j.stream, &e) }
         } else {
-            m.encode_text(req["prompt"].as_str().unwrap_or(""))
+            match req["prompt"].as_str() {
+                Some(p) => m.encode_text(p),
+                None => return bad(&mut j.stream, "`prompt` must be a string (arrays of prompts and token arrays are not accepted here)"),
+            }
         };
-        let max_tokens = req["max_tokens"].as_u64().unwrap_or(256) as usize;
+        let max_tokens = match m.budget(prompt.len(), gopts.max_tokens) { Ok(n) => n, Err(e) => return bad(&mut j.stream, &e) };
         let streaming = chat && req["stream"].as_bool().unwrap_or(false);
         if streaming {
             write_sse_headers(&mut j.stream);
@@ -289,10 +316,12 @@ fn route<M: ServeModel>(
         let id = sched.submit(prompt.clone(), max_tokens);
         gens.push(Gen {
             id, stream: j.stream, streaming, chat,
-            temperature: req["temperature"].as_f64().unwrap_or(0.0) as f32,
-            // Same fixed seed as `Engine::generate`, per sequence.
-            rng: 0x2545_F491_4F6C_DD1D,
-            prompt, r#gen: Vec::new(), emitted: String::new(), state: None, next: 0,
+            // Same seed as `Engine::generate` (the fixed default, or the request's `seed`), per sequence.
+            rng: gopts.rng,
+            em: Emitter::new(&gopts.stop),
+            include_usage: req["stream_options"]["include_usage"].as_bool() == Some(true),
+            opts: gopts,
+            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, state: None, next: 0,
         });
         return;
     }
@@ -313,8 +342,8 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
         if !live.contains(&g.id) || g.state.is_some() { continue; }
         let (st, row) = m.prefill(&g.prompt);
         g.state = Some(st);
-        match m.pick(&row, g.temperature, &mut g.rng) {
-            Some(t) if !m.is_stop(t) => { g.next = t; g.commit(m, t); first.push((g.id, t, false)); }
+        match m.pick(&row, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
+            Some(t) if !m.is_stop(t) => { g.next = t; let hit = g.commit(m, t, &row); first.push((g.id, t, hit)); }
             // Stop token (or a dead guide) on the very first sampled token: the serial path emits
             // nothing at all in that case, so neither does this one.
             _ => first.push((g.id, 0, true)),
@@ -348,8 +377,9 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
         let mut rec: Vec<(SeqId, u32, bool)> = Vec::new();
         for (row, &i) in idxs.iter().enumerate() {
             let g = &mut gens[i];
-            match m.pick(&logits[row * nv..(row + 1) * nv], g.temperature, &mut g.rng) {
-                Some(t) if !m.is_stop(t) => { g.next = t; g.commit(m, t); rec.push((g.id, t, false)); }
+            let lrow = &logits[row * nv..(row + 1) * nv];
+            match m.pick(lrow, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
+                Some(t) if !m.is_stop(t) => { g.next = t; let hit = g.commit(m, t, lrow); rec.push((g.id, t, hit)); }
                 _ => rec.push((g.id, 0, true)),
             }
         }
@@ -357,45 +387,47 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
     }
 
     // --- retirement: free the slot's state and answer the client on the SAME step it finished ---
-    for (id, _why) in sched.take_retired() {
+    for (id, why) in sched.take_retired() {
         let Some(pos) = gens.iter().position(|g| g.id == id) else { continue };
         let g = gens.remove(pos);
-        finish(m, g);
+        finish(m, g, why);
     }
 }
 
-/// Write the final response for a retired sequence and drop its socket.
-///
-/// ⚠ `finish_reason` is hardcoded `"stop"` because **the serial path hardcodes it too**
-/// (`chat`/`completions` in `lib.rs`). It is wrong for a length-limited generation, which OpenAI
-/// spells `"length"` — but the property under test here is that a batched response is
-/// indistinguishable from a serial one, so this path mirrors the existing behaviour rather than
-/// diverging from it. Fixing it is a one-line change in three places and belongs in its own commit,
-/// where the change is visible instead of hidden inside a batching diff.
-fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>) {
+/// Write the final response for a retired sequence and drop its socket. `finish_reason` is `"length"`
+/// when the scheduler retired it at its token budget and `"stop"` for a stop token or stop string — the
+/// same rule as the serial path, so a batched response stays indistinguishable from a serial one.
+fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
+    let reason = if g.em.hit_stop || !matches!(why, Done::Length) { "stop" } else { "length" };
+    if let Some(d) = g.em.flush() { g.send_delta(m, &d); }
     let (ptok, gtok) = (g.prompt.len(), g.r#gen.len());
+    let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
     if g.streaming {
         send_sse(&mut g.stream, &json!({
             "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
             "model": m.name(),
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+            "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}));
+        if g.include_usage {
+            send_sse(&mut g.stream, &json!({"id": "chatcmpl-ferric", "object": "chat.completion.chunk",
+                "created": now_unix(), "model": m.name(), "choices": [], "usage": usage}));
+        }
         use std::io::Write;
         let _ = g.stream.write_all(b"data: [DONE]\n\n");
         let _ = g.stream.flush();
         return;
     }
-    let body = if g.chat {
-        json!({
-            "id": "chatcmpl-ferric", "object": "chat.completion", "created": now_unix(), "model": m.name(),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": g.emitted}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
-        })
+    let mut choice = if g.chat {
+        json!({"index": 0, "message": {"role": "assistant", "content": g.em.text}, "finish_reason": reason})
     } else {
-        json!({
-            "id": format!("cmpl-ferric-{ptok}"), "object": "text_completion", "created": now_unix(), "model": m.name(),
-            "choices": [{"index": 0, "text": g.emitted, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
-        })
+        json!({"index": 0, "text": g.em.text, "finish_reason": reason})
+    };
+    if g.opts.logprobs { choice["logprobs"] = crate::logprobs_field(g.chat, &g.logprobs); }
+    let body = if g.chat {
+        json!({"id": "chatcmpl-ferric", "object": "chat.completion", "created": now_unix(), "model": m.name(),
+               "choices": [choice], "usage": usage})
+    } else {
+        json!({"id": format!("cmpl-ferric-{ptok}"), "object": "text_completion", "created": now_unix(), "model": m.name(),
+               "choices": [choice], "usage": usage})
     };
     write_json(&mut g.stream, 200, &body);
 }
@@ -410,7 +442,7 @@ impl ServeModel for Engine {
     fn name(&self) -> &str { &self.name }
     fn n_vocab(&self) -> usize { self.model.n_vocab() }
     fn can_batch(&self) -> bool { self.batchable() }
-    fn encode_chat(&self, messages: &[Value]) -> Vec<u32> { self.chat_ids(messages) }
+    fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String> { self.chat_ids(messages) }
 
     fn encode_text(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
@@ -443,12 +475,20 @@ impl ServeModel for Engine {
         pollster::block_on(self.model.forward_batch(toks, states).to_vec())
     }
 
-    fn pick(&self, row: &[f32], temperature: f32, rng: &mut u64) -> Option<u32> {
-        self.select_token(row, &None, temperature, rng)
+    fn pick(&self, row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
+        self.select_token(row, &None, s, prompt, generated, rng)
     }
 
     fn is_stop(&self, tok: u32) -> bool { self.eos.contains(&tok) }
     fn text_of(&self, ids: &[u32]) -> String { self.detok(ids) }
+    fn piece(&self, tok: u32) -> (String, Vec<u8>) { Engine::piece(self, tok) }
+    fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String> { Engine::budget(self, prompt_len, want) }
+    /// ⛔ Wiring batching sent plain requests on an MTP hybrid through the scheduler, which cannot
+    /// draft — so speculative decoding, its energy gate and the one-slot prefix cache ran only for
+    /// `response_format` and tool requests. Such a model keeps its own serial loop.
+    fn serial_generation(&self) -> bool {
+        matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err()
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -506,8 +546,10 @@ mod tests {
         fn name(&self) -> &str { "mock" }
         fn n_vocab(&self) -> usize { 8192 }
         fn can_batch(&self) -> bool { self.batchable }
-        fn encode_chat(&self, messages: &[Value]) -> Vec<u32> {
-            messages.iter().flat_map(|v| self.encode_text(v["content"].as_str().unwrap_or(""))).collect()
+        fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String> {
+            let mut out = Vec::new();
+            for v in messages { out.extend(self.encode_text(&crate::genopts::content_text(&v["content"])?)); }
+            Ok(out)
         }
         fn encode_text(&self, text: &str) -> Vec<u32> { text.bytes().map(|b| b as u32).collect() }
         fn prefill(&self, prompt: &[u32]) -> (MockState, Vec<f32>) {
@@ -526,13 +568,15 @@ mod tests {
             }
             out
         }
-        fn pick(&self, row: &[f32], _t: f32, _rng: &mut u64) -> Option<u32> {
+        fn pick(&self, row: &[f32], _s: &Sampling, _p: &[u32], _g: &[u32], _rng: &mut u64) -> Option<u32> {
             Some(row.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32)
         }
         fn is_stop(&self, tok: u32) -> bool { self.stop != 0 && tok == self.stop }
         fn text_of(&self, ids: &[u32]) -> String {
             ids.iter().map(|i| format!("{i},")).collect()
         }
+        fn piece(&self, tok: u32) -> (String, Vec<u8>) { let t = format!("{tok},"); (t.clone(), t.into_bytes()) }
+        fn budget(&self, _p: usize, want: Option<usize>) -> Result<usize, String> { Ok(want.unwrap_or(256)) }
     }
 
     fn onehot(i: u32, n: usize) -> Vec<f32> {
@@ -575,6 +619,100 @@ mod tests {
         let v: Value = serde_json::from_str(resp).unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"));
         v["choices"][0]["text"].as_str().or_else(|| v["choices"][0]["message"]["content"].as_str())
             .unwrap_or_else(|| panic!("no text in {resp}")).to_string()
+    }
+
+    /// A raw request; returns (status code, body).
+    fn request(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len());
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status = String::new();
+        r.read_line(&mut status).unwrap();
+        let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 { break; }
+            if line.trim().is_empty() { break; }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") { len = v.trim().parse().unwrap_or(0); }
+        }
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf).unwrap();
+        (code, String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    fn finish_of(resp: &str) -> String {
+        let v: Value = serde_json::from_str(resp).unwrap();
+        v["choices"][0]["finish_reason"].as_str().unwrap_or("").to_string()
+    }
+
+    /// `finish_reason` says WHY it stopped: `"length"` at the token budget, `"stop"` on a stop token.
+    /// It was `"stop"` for both, so a client could not tell a complete answer from a truncated one.
+    #[test]
+    fn finish_reason_distinguishes_the_budget_from_a_stop_token() {
+        let addr = spawn(Mock::new(true), 4);
+        let r = post(&addr, "/v1/completions", &json!({"prompt": "alpha", "max_tokens": 5}).to_string());
+        assert_eq!(finish_of(&r), "length");
+        assert_eq!(text_of(&r).matches(',').count(), 5);
+        // Stop on the third token the mock would emit.
+        let third: u32 = text_of(&r).split(',').nth(2).unwrap().parse().unwrap();
+        let mut m = Mock::new(true);
+        m.stop = third;
+        let addr = spawn(m, 4);
+        let r = post(&addr, "/v1/completions", &json!({"prompt": "alpha", "max_tokens": 5}).to_string());
+        assert_eq!(finish_of(&r), "stop");
+        assert_eq!(text_of(&r).matches(',').count(), 2, "the stop token itself is not emitted");
+    }
+
+    /// A stop STRING cuts the text before it and ends the sequence, and the batched path cuts exactly
+    /// where the serial one does.
+    #[test]
+    fn a_stop_string_ends_generation_identically_batched_and_serial() {
+        let full = text_of(&post(&spawn(Mock::new(false), 1), "/v1/completions",
+                                 &json!({"prompt": "bravo bravo", "max_tokens": 8}).to_string()));
+        let toks: Vec<&str> = full.split(',').collect();
+        let stop = format!("{},{}", toks[3], toks[4]); // spans a token boundary
+        let body = json!({"prompt": "bravo bravo", "max_tokens": 8, "stop": [stop]}).to_string();
+        let serial = post(&spawn(Mock::new(false), 1), "/v1/completions", &body);
+        let batched = post(&spawn(Mock::new(true), 4), "/v1/completions", &body);
+        // Where it FIRST occurs — the mock can repeat a token, so that may be earlier than index 3.
+        let want = full[..full.find(&stop).expect("the stop string occurs in the full text")].to_string();
+        assert!(!want.is_empty() && want.len() < full.len(), "the cut must land strictly inside the text");
+        assert_eq!(text_of(&serial), want, "text must end right before the stop string");
+        assert_eq!(text_of(&batched), text_of(&serial));
+        assert_eq!(finish_of(&serial), "stop");
+        assert_eq!(finish_of(&batched), "stop");
+    }
+
+    /// Content-part arrays are read (they were silently dropped — the model saw an empty message), an
+    /// image part is refused by name, and a parameter this server cannot honour is a 400, not ignored.
+    #[test]
+    fn content_parts_are_read_and_unsupported_requests_are_refused() {
+        let addr = spawn(Mock::new(true), 4);
+        let plain = post(&addr, "/v1/chat/completions",
+                         &json!({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 4}).to_string());
+        let parts = post(&addr, "/v1/chat/completions",
+                         &json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}], "max_tokens": 4}).to_string());
+        assert_eq!(text_of(&parts), text_of(&plain), "a one-part array must mean the same as the string");
+        let empty = post(&addr, "/v1/chat/completions",
+                         &json!({"messages": [{"role": "user", "content": ""}], "max_tokens": 4}).to_string());
+        assert_ne!(text_of(&parts), text_of(&empty), "the parts must reach the model, not read as empty");
+        let (c, b) = request(&addr, "POST", "/v1/chat/completions", &json!({"messages": [{"role": "user", "content":
+            [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:x"}}]}]}).to_string());
+        assert_eq!(c, 400, "an image part must be refused: {b}");
+        assert!(b.contains("image_url"), "the refusal must name the part: {b}");
+        let (c, b) = request(&addr, "POST", "/v1/completions", &json!({"prompt": "x", "n": 3}).to_string());
+        assert_eq!(c, 400, "n=3 must be refused, not answered with one choice: {b}");
+    }
+
+    /// A browser front-end sends OPTIONS before every JSON POST. It used to 404.
+    #[test]
+    fn cors_preflight_is_answered() {
+        let addr = spawn(Mock::new(true), 4);
+        let (c, _) = request(&addr, "OPTIONS", "/v1/chat/completions", "");
+        assert_eq!(c, 204);
     }
 
     const PROMPTS: [&str; 4] = ["alpha", "bravo bravo", "c", "delta echo foxtrot"];
