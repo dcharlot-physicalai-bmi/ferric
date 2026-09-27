@@ -13,10 +13,17 @@
 //! reduction order and therefore its own recorded fingerprint — the same versioned-output rule the
 //! two-level K split follows. Opt-in via `FERRIC_CUDA`, like `FERRIC_METAL4`.
 //!
-//! Tier 1 is deliberately simple: weights are mirrored into device memory once at load, the
-//! [1, in] activation is copied in and the [1, out] result copied out per call. That is a few KB
-//! each way at decode and makes the kernel verifiable in isolation against the FLAT WGSL kernel.
-//! A whole-graph-resident path is tier 2.
+//! Three tiers, all behind `FERRIC_CUDA`:
+//!  1. `QDev::gemv` — one Q5_K GEMV per call (the `matmul_q5_k` hook), verifiable in isolation.
+//!  2. [`DecodeGraph::step`] — a whole dense decode step resident on the device: one `[d]` row in,
+//!     one `[n_vocab]` row out. Weights in Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 (a whole Q4_K_M, Q5_K_M or
+//!     Q8_0 file), q/k/v bias, QK-norm, NEOX or NORM rope with optional per-frequency factors.
+//!  3. [`DecodeGraph::prefill`] — a prompt's rows through every layer on the tensor cores
+//!     (`cuda_prefill.cu`), weights as exact integer codes and activations split hi/lo f16, so it
+//!     rounds nothing the f32 path does not; `FERRIC_CUDA_NO_PREFILL` keeps prompts on WGSL.
+//! The K/V rows live in a per-sequence [`DevKv`] owned by the caller's cache, grown on demand (no
+//! context cap), and the WGSL store is brought level lazily in either direction.
+//! `scripts/cuda_conformance.sh` gates all of it against WGSL and the models' authors.
 #![cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 
 use libloading::{Library, Symbol};

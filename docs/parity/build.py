@@ -59,6 +59,7 @@ UPDATES = {
     "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
     "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
     "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without)"),
+    "B01": ("partial", "branch feat/cuda: dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 (whole Q4_K_M/Q5_K_M/Q8_0 files), q/k/v bias, NORM + rope_freqs rope, KV grown on demand (was <= 2048); scripts/cuda_conformance.sh on Qwen2.5-0.5B Q4_K_M + Q8_0, Llama-3.2-1B Q4_K_M, Qwen3-0.6B Q5_K_M: logits within 1.4e-3 of WGSL to 2300 positions, greedy ids equal. Still opt-in (FERRIC_CUDA); MoE/hybrid runtimes, YaRN, softcaps, SWA, IQ/F16 weights stay on Vulkan"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})

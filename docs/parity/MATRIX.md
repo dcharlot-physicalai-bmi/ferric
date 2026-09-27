@@ -14,7 +14,7 @@ Every feature Ferric lacks or has only in part, most widely shipped first. Preva
 | E13 | Multi-host / RPC distributed inference | 6/6 | partial | Remote devices execute single ops (bmm, linear_relu) shipped as host buffers, not model shards. No LLM inference has run across hosts. Same gap as E12. |
 | S30 | Prompt cache reuse across requests (slot / prefix reuse for multi-turn chat) | 14/14 | partial | One slot, hybrid (qwen35) models with an MTP draft block only. After batch.rs was wired, only response_format or tool requests still reach generate_spec. Plain chat takes the scheduler's prefill/decode (batch.rs:422-444) |
 | O06 | Install via package manager (brew / pip / cargo / winget) | 13/14 | partial | `cargo install ferric-serve` works but installs a 6-week-old build: 2 of today's 7 runtimes, no continuous batching, no /v1/rerank. On PyPI the name 'ferric' belongs to an unrelated project (0.1.0rc5, 'a Rust-native quan |
-| B01 | NVIDIA CUDA | 16.5/18 | partial | Narrow eligibility (qwen3.rs:1686-1690): Dense runtime only, decode only (prefill on WGSL), Q5_K/Q6_K weights, NEOX rope, no biases/softcaps/windows/YaRN/rope_freqs, f32 KV, <=2048 tokens. Every other model and all MoE/h |
+| B01 | NVIDIA CUDA | 16.5/18 | partial | branch feat/cuda: dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 (whole Q4_K_M/Q5_K_M/Q8_0 files), q/k/v bias,  |
 | E04 | Chunked prefill | 16/18 | partial | The runtime can prefill in chunks and it is verified. What peers call chunked prefill (splitting long prompts and interleaving the chunks with decode steps in the scheduler) is NOT done: ferric-serve prefills each admitt |
 | E19 | Rope scaling for long context (YaRN, linear, NTK, LongRoPE) | 16/18 | partial | 87c1f6b: linear applied; any declared type a runtime does not apply is REFUSED (was silently unscaled); longrope/NTK absent |
 | S18 | Images in chat requests (image_url / base64) for VLMs | 12/14 | absent | VLM rows qwen3vl, qwen2vl and muse-glimmer load through ferric-serve TEXT-ONLY. An image_url part is dropped together with the text parts around it (see S01). |
@@ -206,7 +206,7 @@ Not on the feature list, and measured by the audit: **none of the 14 serving pee
 
 | id | feature | peers with it | Ferric | note |
 |---|---|---|---|---|
-| B01 | NVIDIA CUDA | 16.5/18 | partial | Narrow eligibility (qwen3.rs:1686-1690): Dense runtime only, decode only (prefill on WGSL), Q5_K/Q6_K weights, NEOX rope, no biases/softcaps/windows/YaRN/rope_f |
+| B01 | NVIDIA CUDA | 16.5/18 | partial | branch feat/cuda: dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q |
 | B02 | AMD ROCm / HIP | 8.5/18 | absent | docs/sota-feature-matrix.md §B: 'ROCm native ❌ / AMD via Vulkan; AITER/CK unused'. |
 | B03 | Apple Metal | 13/18 | verified | The primary fabric. Metal 4 and coop paths are not bit-identical to the portable path and are off by default. |
 | B04 | Vulkan | 6.5/18 | verified | The f32 8x8 coop kernel returns all zeros on NVIDIA Vulkan and is gated off there (lib.rs:69-80). |
