@@ -7,12 +7,16 @@
 // blockIdx.y), so both paths share one implementation of everything that is not a matmul.
 //
 // ⚠ NUMERICS. Tensor cores multiply f16 x f16 and accumulate in f32. Each weight tile is dequantised
-// from the SAME repacked words the GEMVs read straight into f16 in shared memory, and each activation
-// tile is rounded f32 -> f16 on the way in (round-to-nearest, 11 significant bits: <= 2^-12 relative
-// per element). That is a numerics change from the f32 decode path, measured and gated as such by
-// scripts/cuda_conformance.sh, not assumed away. An activation above f16's 65504 would become inf:
-// every A-tile load checks, and a hit raises `ovf` so the host throws the result away and runs the
-// f32 WGSL prefill instead — a fallback, never a silent inf.
+// from the SAME repacked words the GEMVs read straight into f16 in shared memory (<= 2^-12 relative
+// per weight). Each ACTIVATION is split into two f16 parts, hi = f16(a) and lo = f16(a - hi), and both
+// go through the tensor cores (two mma per fragment): a·w = hi·w + lo·w to ~2^-22, so the activation
+// is effectively f32. ⭐ Measured before choosing it: with a single f16 activation, Qwen3-0.6B Q5_K_M
+// over a 1000-row prompt sat 0.219 max |Δ logit| from the f32 WGSL path (argmax 1023/1024); with the
+// split, 0.028 (1024/1024) — activation rounding was 8x the error budget. It costs ~25% of prefill
+// throughput on the RTX 4050 (4218 -> 3245 tok/s on that model, 2964 -> 2162 on Llama-3.2-1B), and
+// is still a numerics change from the f32 decode path, gated as such by scripts/cuda_conformance.sh.
+// An activation above f16's 65504 would become inf: every A-tile load checks, and a hit raises `ovf`
+// so the host throws the result away and runs the f32 WGSL prefill instead — a fallback, never an inf.
 //
 // `mma.sync.aligned.m16n8k8` (not k16) keeps this loadable as compute_75 PTX like the decode module:
 // m16n8k16 needs sm_80, and the tier's contract is "the driver alone loads it on Turing and newer".
@@ -35,6 +39,10 @@ __device__ __forceinline__ unsigned f2h(float x) {
     unsigned short h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x)); return (unsigned)h;
 }
 __device__ __forceinline__ unsigned pack2(float lo, float hi) { return f2h(lo) | (f2h(hi) << 16u); }
+// The residual of a packed half2 against the two floats it rounded: the "lo" half of the split.
+__device__ __forceinline__ unsigned resid2(float x, float y, unsigned hi) {
+    return pack2(x - f16_to_f32(hi & 0xffffu), y - f16_to_f32(hi >> 16u));
+}
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (unsigned off = 16u; off > 0u; off >>= 1u) v += __shfl_xor_sync(0xffffffffu, v, off);
@@ -137,7 +145,8 @@ __device__ __forceinline__ void dequant16(const unsigned* __restrict__ codes, co
 }
 
 // ── C[M, N] (+)= A[M, K] · W[N, K]ᵀ with W quantised. A f32 row-major (lda), C f32 row-major (ldc).
-//    Tile 64x64x32, 128 threads = 2x2 warps of 32x32, each warp 2 (m16) x 4 (n8) mma tiles, k8 steps.
+//    Tile 64x64x32, 128 threads = 2x2 warps of 32x32, each warp 2 (m16) x 4 (n8) mma tiles, k8 steps;
+//    A is held twice (hi and lo halves of the split, see NUMERICS) and every fragment gets two mma.
 //    Shared rows are padded to 40 halves (80 B = 20 words): the fragment reads of rows g = 0..7 then
 //    start on banks 0,20,8,28,16,4,24,12 — conflict-free, where an unpadded 64 B stride is 4-way. ──
 #define BM 64u
@@ -153,7 +162,8 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
                                        const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
                                        float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, unsigned K,
                                        int* __restrict__ ovf) {
-    __shared__ __align__(16) unsigned short As[BM * LDS];
+    __shared__ __align__(16) unsigned short As[BM * LDS];      // activation, f16 hi part
+    __shared__ __align__(16) unsigned short Al[BM * LDS];      // activation, f16 lo part (a - hi)
     __shared__ __align__(16) unsigned short Ws[BN * LDS];
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
     const unsigned wm = warp >> 1u, wn = warp & 1u;
@@ -167,7 +177,7 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
     bool bad = false;
     const unsigned lr = tid >> 1u, lh = tid & 1u;    // the loaders: row lr of each tile, half lh of its 32 values
     for (unsigned k0 = 0u; k0 < K; k0 += BK) {
-        unsigned a[8], w[8];
+        unsigned a[8], al[8], w[8];
         if (m0 + lr < M) {
             const float* src = A + (size_t)(m0 + lr) * lda + k0 + 16u * lh;
             #pragma unroll
@@ -175,10 +185,11 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
                 const float4 v = *reinterpret_cast<const float4*>(src + 4u * j);
                 bad |= fabsf(v.x) > 65504.f || fabsf(v.y) > 65504.f || fabsf(v.z) > 65504.f || fabsf(v.w) > 65504.f;
                 a[2u * j] = pack2(v.x, v.y); a[2u * j + 1u] = pack2(v.z, v.w);
+                al[2u * j] = resid2(v.x, v.y, a[2u * j]); al[2u * j + 1u] = resid2(v.z, v.w, a[2u * j + 1u]);
             }
         } else {
             #pragma unroll
-            for (unsigned j = 0u; j < 8u; ++j) a[j] = 0u;
+            for (unsigned j = 0u; j < 8u; ++j) { a[j] = 0u; al[j] = 0u; }
         }
         if (n0 + lr < N) dequant16<F>(codes, aux, n0 + lr, K, k0 / 32u, lh, w);
         else {
@@ -188,16 +199,20 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
         uint4* as = reinterpret_cast<uint4*>(As + lr * LDS + 16u * lh);
         uint4* ws = reinterpret_cast<uint4*>(Ws + lr * LDS + 16u * lh);
         as[0] = make_uint4(a[0], a[1], a[2], a[3]); as[1] = make_uint4(a[4], a[5], a[6], a[7]);
+        uint4* als = reinterpret_cast<uint4*>(Al + lr * LDS + 16u * lh);
+        als[0] = make_uint4(al[0], al[1], al[2], al[3]); als[1] = make_uint4(al[4], al[5], al[6], al[7]);
         ws[0] = make_uint4(w[0], w[1], w[2], w[3]); ws[1] = make_uint4(w[4], w[5], w[6], w[7]);
         __syncthreads();
         #pragma unroll
         for (unsigned ks = 0u; ks < BK; ks += 8u) {
-            unsigned af[2][2], bf[4];
+            unsigned af[2][2], lf[2][2], bf[4];
             #pragma unroll
             for (unsigned mi = 0u; mi < 2u; ++mi) {
                 const unsigned r = wm * 32u + mi * 16u + g;
                 af[mi][0] = *reinterpret_cast<const unsigned*>(As + r * LDS + ks + 2u * t4);
                 af[mi][1] = *reinterpret_cast<const unsigned*>(As + (r + 8u) * LDS + ks + 2u * t4);
+                lf[mi][0] = *reinterpret_cast<const unsigned*>(Al + r * LDS + ks + 2u * t4);
+                lf[mi][1] = *reinterpret_cast<const unsigned*>(Al + (r + 8u) * LDS + ks + 2u * t4);
             }
             #pragma unroll
             for (unsigned ni = 0u; ni < 4u; ++ni)
@@ -205,7 +220,11 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
             #pragma unroll
             for (unsigned mi = 0u; mi < 2u; ++mi)
                 #pragma unroll
-                for (unsigned ni = 0u; ni < 4u; ++ni) mma16816(acc[mi][ni], af[mi][0], af[mi][1], bf[ni]);
+                for (unsigned ni = 0u; ni < 4u; ++ni) {
+                    // lo first: the small term accumulates before the large one lands on it.
+                    mma16816(acc[mi][ni], lf[mi][0], lf[mi][1], bf[ni]);
+                    mma16816(acc[mi][ni], af[mi][0], af[mi][1], bf[ni]);
+                }
         }
         __syncthreads();
     }
