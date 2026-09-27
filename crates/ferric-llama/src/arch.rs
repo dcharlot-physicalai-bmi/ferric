@@ -232,6 +232,21 @@ pub const REGISTRY: &[Arch] = &[
                   FERRIC_BERT_GELU_TANH=1. ⚠ A Q4_K_M file cannot verify the math — the reranker at 4 bits \
                   differs by 0.04-0.31 with either GELU. Gate: scripts/bert_conformance.sh vs \
                   tests/fixtures/bert/. EMBEDS AND SCORES — generation is refused, there is no LM head" },
+    Arch { name: "nomic-bert", runtime: Runtime::Bert, status: Status::Verified,
+           note: "nomic-embed-text (Ollama's default RAG embedder; 8.2% of all Ollama pulls, 13.8M HF \
+                  downloads/month for v1.5) — the BERT runtime with four differences DETECTED from the file: \
+                  RoPE on Q/K instead of a position table (NeoX halves, base 1000, REQUIRED from the file), \
+                  one fused Wqkv, a SwiGLU FFN `fc11(x) * silu(fc12(x))`, no biases. ⭐ Verified against the \
+                  MODEL AUTHORS' modeling_hf_nomic_bert.py (transformers 5.3, trust_remote_code), NOT \
+                  llama.cpp: every stage of 4 texts up to 926 tokens within 2.11x of the authors' own \
+                  float32-vs-float64 distance, sentence embedding within 1.19x; the authors' safetensors \
+                  (read directly, no conversion) and nomic's F32 GGUF give IDENTICAL numbers. Five controls \
+                  26,000x-7.3Mx. ⭐ The rotary table is built on the host the authors' way: the GPU kernel's \
+                  exp/log inv_freq put a 926-token input's row 822 at 4.48x. F16 GGUF (what Ollama ships): \
+                  cos >= 0.99999976. ⛔ nomic's own Q4_K_M costs cos 0.94-0.965 — quantisation, not Ferric \
+                  (the authors' code on the same dequantised weights gives the same cosines; Ferric \
+                  within 1.5e-7 of it). Refused: v2-moe, dynamic-NTK scaling. \
+                  Gate: scripts/nomic_bert_conformance.sh vs tests/fixtures/nomic_bert/. EMBEDS ONLY" },
     Arch { name: "modern-bert", runtime: Runtime::ModernBert, status: Status::Verified,
            note: "encoder-only and NOT the BERT above: RoPE (NeoX), PRE-LayerNorm with no bias, GeGLU \
                   over a fused {d, 2*n_ff} up, one fused qkv, layer 0's attn_norm absent (identity), and \

@@ -103,11 +103,29 @@ impl HfCheckpoint {
             "qwen3_vl" => qwen3vl_map(&cfg, &st)?,
             "qwen2_5_vl" => qwen25vl_map(&cfg, &st)?,
             "qwen2" => qwen2_map(&cfg, &st)?,
+            "nomic_bert" => nomic_bert_map(&cfg, &st)?,
             other => return Err(format!(
                 "no HF mapping for model_type '{other}'. Adding one is a table of metadata keys and \
                  tensor names — see `lfm2_map` — but it is only worth adding alongside something \
                  that checks the weights land where the runtime thinks they do")),
         };
+
+        // The pooling a sentence-transformers export ships is in `1_Pooling/config.json`, not in
+        // config.json. Read, never assumed: a mean-pooled model served with CLS pooling returns a
+        // plausible vector that answers a different question.
+        let mut meta = meta;
+        if let (Some(Meta::Str(arch)), Ok(txt)) = (meta.get("general.architecture").cloned(),
+                                                   std::fs::read_to_string(dir.join("1_Pooling/config.json"))) {
+            let pc: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("1_Pooling/config.json: {e}"))?;
+            let on: Vec<u64> = [("pooling_mode_mean_tokens", 1u64), ("pooling_mode_cls_token", 2), ("pooling_mode_lasttoken", 3)]
+                .iter().filter(|(k, _)| pc[*k].as_bool() == Some(true)).map(|(_, v)| *v).collect();
+            let other = ["pooling_mode_max_tokens", "pooling_mode_mean_sqrt_len_tokens", "pooling_mode_weightedmean_tokens"]
+                .iter().any(|k| pc[*k].as_bool() == Some(true));
+            match (on.as_slice(), other) {
+                ([p], false) => { meta.insert(format!("{arch}.pooling_type"), Meta::U(*p)); }
+                _ => return Err(format!("1_Pooling/config.json selects a pooling this runtime does not implement: {txt}")),
+            }
+        }
 
         // Reverse each shape and inherit the dtype. Offsets are meaningless here (bytes are fetched
         // by name), so they are left zero rather than faked into something a caller might trust.
@@ -407,6 +425,79 @@ fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
             pairs.extend([("attn_q.bias", format!("{p}.self_attn.q_proj.bias")),
                           ("attn_k.bias", format!("{p}.self_attn.k_proj.bias")),
                           ("attn_v.bias", format!("{p}.self_attn.v_proj.bias"))]);
+        }
+        n.extend(pairs.into_iter().map(|(g, hf)| (format!("blk.{il}.{g}"), hf)));
+    }
+    if let Some((g, hf)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
+        return Err(format!("mapping points {g} at {hf}, which the checkpoint does not contain"));
+    }
+    Ok((m, n))
+}
+
+/// **NomicBERT** — `model_type: nomic_bert` (nomic-embed-text v1 / v1.5), the authors' own
+/// `modeling_hf_nomic_bert.py` names. Maps onto the BERT runtime's names, which is where the variant is
+/// detected (fused `attn_qkv`, `ffn_gate`, no `position_embd`) — see `ferric_llama::bert`.
+///
+/// ⛔ Refused rather than half-mapped: dynamic-NTK rope scaling (`rotary_scaling_factor`), interleaved or
+/// partial rotary, pre-norm blocks, MoE layers (v2-moe), and any activation but SwiGLU — each is a
+/// different forward pass that would load and run and be wrong.
+/// ⚠ `fc11` is the UP projection and `fc12` the GATE: the authors compute `fc11(x) * silu(fc12(x))`.
+fn nomic_bert_map(cfg: &serde_json::Value, st: &SafeTensors)
+    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+{
+    let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    for (k, why) in [("rotary_scaling_factor", "dynamic-NTK rope scaling"), ("moe_every_n_layers", "MoE layers")] {
+        let v = &cfg[k];
+        if !(v.is_null() || v.as_f64() == Some(0.0)) { return Err(format!("{k} = {v}: {why} is not mapped")); }
+    }
+    let checks: [(&str, bool); 5] = [
+        ("rotary_emb_interleaved", cfg["rotary_emb_interleaved"].as_bool() != Some(true)),
+        ("rotary_emb_fraction", cfg_f(cfg, "rotary_emb_fraction") == Some(1.0)),
+        ("prenorm", cfg["prenorm"].as_bool() != Some(true)),
+        ("causal", cfg["causal"].as_bool() != Some(true)),
+        ("activation_function", cfg["activation_function"].as_str() == Some("swiglu")),
+    ];
+    if let Some((k, _)) = checks.iter().find(|(_, ok)| !ok) {
+        return Err(format!("config.json: {k} = {} is a variant this mapping does not implement", cfg[*k]));
+    }
+    let n_layer = need_u("n_layer")? as usize;
+    let a = "nomic-bert";
+    let mut m = HashMap::new();
+    m.insert("general.architecture".into(), Meta::Str(a.into()));
+    m.insert(format!("{a}.block_count"), Meta::U(n_layer as u64));
+    m.insert(format!("{a}.embedding_length"), Meta::U(need_u("n_embd")?));
+    m.insert(format!("{a}.feed_forward_length"), Meta::U(need_u("n_inner")?));
+    m.insert(format!("{a}.attention.head_count"), Meta::U(need_u("n_head")?));
+    m.insert(format!("{a}.attention.layer_norm_epsilon"), Meta::F(need_f("layer_norm_epsilon")?));
+    m.insert(format!("{a}.rope.freq_base"), Meta::F(need_f("rotary_emb_base")?));
+    // The authors' code has no position limit (RoPE); sentence-transformers truncates at n_positions.
+    m.insert(format!("{a}.context_length"), Meta::U(need_u("n_positions")?));
+    let mut n: Vec<(String, String)> = vec![
+        ("token_embd.weight".into(), "embeddings.word_embeddings.weight".into()),
+        ("token_embd_norm.weight".into(), "emb_ln.weight".into()),
+        ("token_embd_norm.bias".into(), "emb_ln.bias".into()),
+    ];
+    if st.info("embeddings.token_type_embeddings.weight").is_some() {
+        n.push(("token_types.weight".into(), "embeddings.token_type_embeddings.weight".into()));
+    }
+    for il in 0..n_layer {
+        let p = format!("encoder.layers.{il}");
+        let mut pairs = vec![
+            ("attn_qkv.weight", format!("{p}.attn.Wqkv.weight")),
+            ("attn_output.weight", format!("{p}.attn.out_proj.weight")),
+            ("attn_output_norm.weight", format!("{p}.norm1.weight")),
+            ("attn_output_norm.bias", format!("{p}.norm1.bias")),
+            ("ffn_up.weight", format!("{p}.mlp.fc11.weight")),
+            ("ffn_gate.weight", format!("{p}.mlp.fc12.weight")),
+            ("ffn_down.weight", format!("{p}.mlp.fc2.weight")),
+            ("layer_output_norm.weight", format!("{p}.norm2.weight")),
+            ("layer_output_norm.bias", format!("{p}.norm2.bias")),
+        ];
+        // Biases are whatever the checkpoint carries (v1.5: none) — the runtime looks each one up.
+        for (g, hf) in [("attn_qkv.bias", "attn.Wqkv.bias"), ("attn_output.bias", "attn.out_proj.bias"),
+                        ("ffn_up.bias", "mlp.fc11.bias"), ("ffn_gate.bias", "mlp.fc12.bias"), ("ffn_down.bias", "mlp.fc2.bias")] {
+            if st.info(&format!("{p}.{hf}")).is_some() { pairs.push((g, format!("{p}.{hf}"))); }
         }
         n.extend(pairs.into_iter().map(|(g, hf)| (format!("blk.{il}.{g}"), hf)));
     }

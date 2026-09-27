@@ -52,6 +52,24 @@
 //! `bert.attention.causal = false` is read rather than assumed, because an encoder run with a causal
 //! mask does not fail — it returns embeddings where every token saw only its left context, which is
 //! a different and worse vector that no test comparing Ferric to itself could catch.
+//! ## ⭐ nomic-bert — the same encoder with four differences, each DETECTED from the file
+//!
+//! `nomic-embed-text` (Ollama's default RAG embedder, 8.2% of all Ollama pulls; 13.8M HF downloads a
+//! month for v1.5) is `general.architecture = nomic-bert`. Against the authors' `modeling_hf_nomic_bert.py`
+//! (nomic-ai/nomic-bert-2048) it is this file's encoder with:
+//!
+//! | | BERT | nomic-bert | detected by |
+//! |---|---|---|---|
+//! | positions | learned table, added once | **RoPE on Q and K**, NeoX halves, base from the file | no `position_embd`; `<arch>.rope.freq_base` REQUIRED |
+//! | Q/K/V | three projections | **one fused `Wqkv`**, rows `(three h d)` | `attn_qkv.weight` present |
+//! | FFN | GELU(up) | **`fc11(x) * silu(fc12(x))`** — up times activated GATE | `ffn_gate.weight` present |
+//! | biases | everywhere | **none** on attention or FFN | each bias tensor looked up, absent = none |
+//!
+//! Post-LayerNorm with bias, bidirectional, token-type row 0 added: all as BERT. Every difference is
+//! read from the checkpoint, never from the architecture NAME, so a file that mixes them (a BERT with
+//! RoPE, a nomic-bert with biases) runs as what it is rather than as what its name suggests.
+//! ⛔ An absent `rope.freq_base` is an ERROR, not a default: nomic uses 1000, the common default is
+//! 10000, and a wrong base rotates every pair by the wrong angle with no error anywhere.
 use ferric_gguf::{GgufSource, Meta};
 use ferric_core::Context;
 use ferric_tensor::Tensor;
@@ -74,21 +92,32 @@ pub struct Cfg {
     /// bge-reranker declares 8192 rows for a 512-token context — so reading from 0 silently uses the
     /// wrong row for EVERY token and produces a plausible, wrong score.
     pub pos_offset: usize,
+    /// `general.architecture` — the prefix every other key is read under (`bert`, `nomic-bert`).
+    pub arch: String,
+    /// **RoPE base when the file has no learned position table** (nomic-bert). `None` = learned
+    /// positions. Required, never defaulted, when `position_embd` is absent — see the module note.
+    pub rope_base: Option<f32>,
 }
 
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         let md = g.metadata();
-        let u = |k: &str| match md.get(&format!("bert.{k}")) {
-            Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing bert.{k}")),
+        let arch = match md.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => "bert".into() };
+        let u = |k: &str| match md.get(&format!("{arch}.{k}")) {
+            Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {arch}.{k}")),
         };
-        let f = |k: &str| match md.get(&format!("bert.{k}")) {
-            Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing bert.{k}")),
+        let f = |k: &str| match md.get(&format!("{arch}.{k}")) {
+            Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {arch}.{k}")),
         };
-        let causal = matches!(md.get("bert.attention.causal"), Some(Meta::Bool(true)));
+        let causal = matches!(md.get(&format!("{arch}.attention.causal")), Some(Meta::Bool(true)));
         if causal {
-            return Err("bert.attention.causal is true; this runtime is bidirectional only".into());
+            return Err(format!("{arch}.attention.causal is true; this runtime is bidirectional only"));
         }
+        let rope_base = if g.tensor("position_embd.weight").is_some() { None } else {
+            Some(f("rope.freq_base").map_err(|_| format!(
+                "no position_embd table and no {arch}.rope.freq_base: an encoder without learned \
+                 positions must declare its RoPE base (nomic uses 1000, not the common 10000)"))?)
+        };
         let n_vocab = g.tensor("token_embd.weight").ok_or("no token_embd.weight")?.dims[1] as usize;
         Ok(Cfg {
             n_layer: u("block_count")?,
@@ -98,7 +127,7 @@ impl Cfg {
             n_ctx: u("context_length").unwrap_or(512),
             n_vocab,
             eps: f("attention.layer_norm_epsilon").unwrap_or(1e-12),
-            pooling: match md.get("bert.pooling_type") { Some(Meta::U(v)) => *v as u32, _ => 2 },
+            pooling: match md.get(&format!("{arch}.pooling_type")) { Some(Meta::U(v)) => *v as u32, _ => 2 },
             causal,
             // Inferred from the padding id, which is what the convention is actually keyed on:
             // RoBERTa sets pad=1 and starts positions at 2; BERT sets pad=0 and starts at 0.
@@ -114,27 +143,38 @@ impl Cfg {
             // it away from the reference. Only a per-op comparison can say which value is correct.
             pos_offset: std::env::var("FERRIC_BERT_POS_OFFSET").ok().and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            rope_base,
+            arch,
         })
     }
 }
 
+/// Q, K and V as three projections (BERT) or one fused `Wqkv` whose output rows are `(three h d)`.
+enum Qkv {
+    Split { q: Tensor, qb: Option<Tensor>, k: Tensor, kb: Option<Tensor>, v: Tensor, vb: Option<Tensor> },
+    Fused { w: Tensor, b: Option<Tensor> },
+}
+
 struct Block {
-    q: Tensor, qb: Tensor,
-    k: Tensor, kb: Tensor,
-    v: Tensor, vb: Tensor,
-    o: Tensor, ob: Tensor,
+    qkv: Qkv,
+    o: Tensor, ob: Option<Tensor>,
     attn_norm_w: Tensor, attn_norm_b: Tensor,
-    up: Tensor, upb: Tensor,
-    down: Tensor, downb: Tensor,
+    up: Tensor, upb: Option<Tensor>,
+    /// SwiGLU gate (`ffn_gate`, the authors' `fc12`): present → `up(x) * silu(gate(x))`, absent → GELU.
+    gate: Option<Tensor>, gateb: Option<Tensor>,
+    down: Tensor, downb: Option<Tensor>,
     out_norm_w: Tensor, out_norm_b: Tensor,
 }
+
+/// `x + b` when the checkpoint has the bias, `x` when it does not.
+fn bias(x: Tensor, b: &Option<Tensor>) -> Tensor { match b { Some(b) => x.add(b), None => x } }
 
 pub struct Bert {
     ctx: Arc<Context>,
     pub cfg: Cfg,
     tok_embd: Vec<f32>,      // [n_vocab, d], host-side: one row per lookup, no GPU gather needed
-    pos_embd: Vec<f32>,      // [n_ctx, d]
-    typ_embd: Vec<f32>,      // [n_type, d]
+    pos_embd: Option<Vec<f32>>, // [n_ctx, d]; None for a RoPE encoder
+    typ_embd: Option<Vec<f32>>, // [n_type, d]; row 0 is added
     embd_norm_w: Tensor, embd_norm_b: Tensor,
     blocks: Vec<Block>,
     /// The **classification head**, present only on cross-encoder rerankers. Its existence is what
@@ -168,30 +208,45 @@ pub(crate) fn t1(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<
     let i = g.tensor(name).ok_or_else(|| format!("no {name}"))?;
     Ok(Tensor::from_vec(ctx, &g.dequant(name)?, &[1, i.dims[0] as usize]))
 }
+fn t1o(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Option<Tensor>, String> {
+    if g.tensor(name).is_some() { t1(ctx, g, name).map(Some) } else { Ok(None) }
+}
 
 impl Bert {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Bert, String> {
         let cfg = Cfg::from_gguf(g)?;
         let blocks = (0..cfg.n_layer).map(|i| {
             let n = |s: &str| format!("blk.{i}.{s}");
+            let qkv = if g.tensor(&n("attn_qkv.weight")).is_some() {
+                Qkv::Fused { w: t2(ctx, g, &n("attn_qkv.weight"))?, b: t1o(ctx, g, &n("attn_qkv.bias"))? }
+            } else {
+                Qkv::Split {
+                    q: t2(ctx, g, &n("attn_q.weight"))?, qb: t1o(ctx, g, &n("attn_q.bias"))?,
+                    k: t2(ctx, g, &n("attn_k.weight"))?, kb: t1o(ctx, g, &n("attn_k.bias"))?,
+                    v: t2(ctx, g, &n("attn_v.weight"))?, vb: t1o(ctx, g, &n("attn_v.bias"))?,
+                }
+            };
+            let gate = if g.tensor(&n("ffn_gate.weight")).is_some() { Some(t2(ctx, g, &n("ffn_gate.weight"))?) } else { None };
             Ok(Block {
-                q: t2(ctx, g, &n("attn_q.weight"))?,  qb: t1(ctx, g, &n("attn_q.bias"))?,
-                k: t2(ctx, g, &n("attn_k.weight"))?,  kb: t1(ctx, g, &n("attn_k.bias"))?,
-                v: t2(ctx, g, &n("attn_v.weight"))?,  vb: t1(ctx, g, &n("attn_v.bias"))?,
-                o: t2(ctx, g, &n("attn_output.weight"))?, ob: t1(ctx, g, &n("attn_output.bias"))?,
+                qkv,
+                o: t2(ctx, g, &n("attn_output.weight"))?, ob: t1o(ctx, g, &n("attn_output.bias"))?,
                 attn_norm_w: t1(ctx, g, &n("attn_output_norm.weight"))?,
                 attn_norm_b: t1(ctx, g, &n("attn_output_norm.bias"))?,
-                up: t2(ctx, g, &n("ffn_up.weight"))?, upb: t1(ctx, g, &n("ffn_up.bias"))?,
-                down: t2(ctx, g, &n("ffn_down.weight"))?, downb: t1(ctx, g, &n("ffn_down.bias"))?,
+                up: t2(ctx, g, &n("ffn_up.weight"))?, upb: t1o(ctx, g, &n("ffn_up.bias"))?,
+                gate, gateb: t1o(ctx, g, &n("ffn_gate.bias"))?,
+                down: t2(ctx, g, &n("ffn_down.weight"))?, downb: t1o(ctx, g, &n("ffn_down.bias"))?,
                 out_norm_w: t1(ctx, g, &n("layer_output_norm.weight"))?,
                 out_norm_b: t1(ctx, g, &n("layer_output_norm.bias"))?,
             })
         }).collect::<Result<Vec<_>, String>>()?;
+        let opt = |name: &str| -> Result<Option<Vec<f32>>, String> {
+            if g.tensor(name).is_some() { g.dequant(name).map(Some) } else { Ok(None) }
+        };
         Ok(Bert {
             ctx: ctx.clone(),
             tok_embd: g.dequant("token_embd.weight")?,
-            pos_embd: g.dequant("position_embd.weight")?,
-            typ_embd: g.dequant("token_types.weight")?,
+            pos_embd: opt("position_embd.weight")?,
+            typ_embd: opt("token_types.weight")?,
             embd_norm_w: t1(ctx, g, "token_embd_norm.weight")?,
             embd_norm_b: t1(ctx, g, "token_embd_norm.bias")?,
             cls: match g.tensor("cls.weight") {
@@ -214,20 +269,43 @@ impl Bert {
     /// `llama-eval-callback`. Tensors are Arc-backed so collecting them is a handle copy, and the
     /// caller reads them asynchronously — which is why this returns them instead of printing.
     pub fn forward_traced(&self, ids: &[u32]) -> Result<(Tensor, Vec<(String, Tensor)>), String> {
+        self.forward_inner(ids, std::env::var("FERRIC_BERT_TRACE").ok().as_deref() == Some("1"))
+    }
+
+    /// `forward`, always returning the stage taps: the embedding LayerNorm (`inp_norm`) and each
+    /// block's two post-norm outputs. For conformance against a reference's hooks.
+    pub fn forward_taps(&self, ids: &[u32]) -> Result<(Tensor, Vec<(String, Tensor)>), String> {
+        self.forward_inner(ids, true)
+    }
+
+    fn forward_inner(&self, ids: &[u32], trace: bool) -> Result<(Tensor, Vec<(String, Tensor)>), String> {
+        // Negative controls for the conformance gate — each must make Ferric clearly WORSE against the
+        // authors, or the gate cannot see the defect it names.
+        let neg = std::env::var("FERRIC_BERT_NEG").unwrap_or_default();
         let (d, t) = (self.cfg.d, ids.len());
-        if t + self.cfg.pos_offset > self.pos_embd.len() / d {
-            return Err(format!("{t} tokens exceeds this encoder's {} position embeddings; BERT has \
-                                no RoPE to extrapolate with, so a longer input must be truncated by \
-                                the caller rather than silently wrapped", self.cfg.n_ctx));
+        match &self.pos_embd {
+            Some(pe) if t + self.cfg.pos_offset > pe.len() / d =>
+                return Err(format!("{t} tokens exceeds this encoder's {} position embeddings; BERT has \
+                                    no RoPE to extrapolate with, so a longer input must be truncated by \
+                                    the caller rather than silently wrapped", self.cfg.n_ctx)),
+            None if t > self.cfg.n_ctx =>
+                return Err(format!("{t} tokens exceeds this encoder's declared context of {}",
+                                   self.cfg.n_ctx)),
+            _ => {}
+        }
+        if let Some(&bad) = ids.iter().find(|&&i| i as usize >= self.cfg.n_vocab) {
+            return Err(format!("token id {bad} is outside this encoder's {}-row vocabulary", self.cfg.n_vocab));
         }
         // token + position + segment, summed on the host — three gathers over a 30k-row table are
-        // cheaper to index here than to dispatch.
+        // cheaper to index here than to dispatch. A RoPE encoder has no position row to add.
         let mut e = vec![0f32; t * d];
         for (p, &id) in ids.iter().enumerate() {
             let (tk, ps) = ((id as usize) * d, p * d);
-            let pe = (p + self.cfg.pos_offset) * d;
-            for j in 0..d {
-                e[ps + j] = self.tok_embd[tk + j] + self.pos_embd[pe + j] + self.typ_embd[j];
+            for j in 0..d { e[ps + j] = self.tok_embd[tk + j]; }
+            if let Some(ty) = &self.typ_embd { if neg != "no_type" { for j in 0..d { e[ps + j] += ty[j]; } } }
+            if let Some(pe) = &self.pos_embd {
+                let o = (p + self.cfg.pos_offset) * d;
+                for j in 0..d { e[ps + j] += pe[o + j]; }
             }
         }
         let mut tr: Vec<(String, Tensor)> = Vec::new();
@@ -239,17 +317,50 @@ impl Bert {
         let mut h = Tensor::from_vec(&self.ctx, &e, &[t, d])
             .layernorm(&self.embd_norm_w, &self.embd_norm_b, self.cfg.eps);
 
-        // Per-tensor trace, to be diffed against `llama-eval-callback`. Comparing whole-model
-        // outputs and guessing at parameters is an unbounded search — four wrong turns' worth of
-        // evidence for that. The first layer whose stats disagree localises the bug to one op.
-        let trace = std::env::var("FERRIC_BERT_TRACE").ok().as_deref() == Some("1");
+        // Per-tensor trace. Comparing whole-model outputs and guessing at parameters is an unbounded
+        // search — four wrong turns' worth of evidence for that. The first stage that disagrees
+        // localises the bug to one op.
         if trace { tr.push(("inp_norm".into(), h.clone())); }
         let (nh, dh) = (self.cfg.n_head, d / self.cfg.n_head);
         let scale = 1.0 / (dh as f32).sqrt();
+        // ⭐ The rotary table is built on the HOST, the way the authors build it: inv_freq in float32 as
+        // `1 / base^(2c/d)`, angle = float32(position) x inv_freq, then cos/sin. The GPU rope kernel
+        // derives inv_freq as `exp(-2c/d * ln base)` on the device, which lands an ulp away; position
+        // multiplies that, and at position 822 of a 926-token input it put one row at 10x the authors'
+        // own float32 error (their float64 run shares their float32 angles, so its floor cannot absorb
+        // a different angle formula). `examples/rope_precision.rs` measures the gap: 6e-5 rad below
+        // position 1024, 2e-3 rad at 32k — as large as either method's distance from exact angles.
+        let rope_tab = self.cfg.rope_base.map(|base| {
+            let base = if neg == "rope_base_10000" { 10000.0 } else { base };
+            let half = dh / 2;
+            let inv: Vec<f32> = (0..half).map(|c| 1.0 / ((base as f64).powf((2 * c) as f64 / dh as f64) as f32)).collect();
+            let (mut ct, mut st) = (vec![0f32; t * dh], vec![0f32; t * dh]);
+            for p in 0..t { for c in 0..half {
+                let a = p as f32 * inv[c];
+                ct[p * dh + c] = (a as f64).cos() as f32; st[p * dh + c] = (a as f64).sin() as f32;
+            } }
+            (Tensor::from_vec(&self.ctx, &ct, &[t, dh]), Tensor::from_vec(&self.ctx, &st, &[t, dh]))
+        });
         for (_il, b) in self.blocks.iter().enumerate() {
-            let q = h.matmul_bt(&b.q).add(&b.qb);
-            let k = h.matmul_bt(&b.k).add(&b.kb);
-            let v = h.matmul_bt(&b.v).add(&b.vb);
+            let (q, k, v) = match &b.qkv {
+                Qkv::Split { q, qb, k, kb, v, vb } =>
+                    (bias(h.matmul_bt(q), qb), bias(h.matmul_bt(k), kb), bias(h.matmul_bt(v), vb)),
+                // The authors' `rearrange(qkv, "... (three h d) -> ... three h d")`: the first d
+                // columns are Q for every head in order, then K, then V.
+                Qkv::Fused { w, b: bb } => {
+                    let x = bias(h.matmul_bt(w), bb);
+                    (x.narrow(1, 0, d).contiguous(), x.narrow(1, d, d).contiguous(), x.narrow(1, 2 * d, d).contiguous())
+                }
+            };
+            // RoPE on Q and K, NeoX halves (`rotary_emb_interleaved: false`), positions from 0.
+            let (q, k) = match (&rope_tab, neg.as_str()) {
+                (Some(_), "rope_interleaved") => { let b = self.cfg.rope_base.unwrap_or(0.0);
+                    (q.rope_interleaved(nh, dh, b, 0), k.rope_interleaved(nh, dh, b, 0)) }
+                (Some(_), "rope_device") => { let b = self.cfg.rope_base.unwrap_or(0.0); (q.rope(nh, dh, b, 0), k.rope(nh, dh, b, 0)) }
+                (Some(_), "no_rope") => (q, k),
+                (Some((c, s)), _) => (q.apply_rope_costable(c, s, nh, dh), k.apply_rope_costable(c, s, nh, dh)),
+                (None, _) => (q, k),
+            };
             // [t, nh, dh] → [nh, t, dh] so each head is a contiguous [t, dh] slab.
             let sh = |x: &Tensor| x.reshape(&[t, nh, dh]).permute(&[1, 0, 2]).contiguous();
             let (q, k, v) = (sh(&q), sh(&k), sh(&v));
@@ -268,7 +379,7 @@ impl Bert {
             }
             // Heads back to [t, d] in head order, which is the layout attn_output.weight expects.
             let cat = heads.iter().skip(1).fold(heads[0].clone(), |acc, x| acc.cat(x, 1));
-            let attn = cat.reshape(&[t, d]).matmul_bt(&b.o).add(&b.ob);
+            let attn = bias(cat.reshape(&[t, d]).matmul_bt(&b.o), &b.ob);
             // POST-norm: normalise the residual sum, not the input to the sublayer.
             h = h.add(&attn).layernorm(&b.attn_norm_w, &b.attn_norm_b, self.cfg.eps);
             if trace { tr.push((format!("l{_il}.attn_out_norm"), h.clone())); }
@@ -284,13 +395,16 @@ impl Bert {
             // `hidden_act`), so the authors' default is the only honest default. A checkpoint trained
             // with the tanh form ("gelu_new" / "gelu_pytorch_tanh") cannot be told apart from the file;
             // `FERRIC_BERT_GELU_TANH=1` selects it, and reproduces llama.cpp for comparison.
-            let up = h.matmul_bt(&b.up).add(&b.upb);
-            let act = if std::env::var("FERRIC_BERT_GELU_TANH").ok().as_deref() == Some("1") {
-                up.gelu_tanh()
-            } else {
-                up.gelu()
+            let up = bias(h.matmul_bt(&b.up), &b.upb);
+            let act = match &b.gate {
+                // The authors' NomciBertGatedMLP: `y = fc11(x); gate = fc12(x); y * silu(gate)` — the
+                // activation lands on the GATE (fc12, `ffn_gate`), and fc11 (`ffn_up`) is not activated.
+                Some(gw) if neg == "gate_swap" => up.silu().mul(&bias(h.matmul_bt(gw), &b.gateb)),
+                Some(gw) => up.mul(&bias(h.matmul_bt(gw), &b.gateb).silu()),
+                None if std::env::var("FERRIC_BERT_GELU_TANH").ok().as_deref() == Some("1") => up.gelu_tanh(),
+                None => up.gelu(),
             };
-            let ff = act.matmul_bt(&b.down).add(&b.downb);
+            let ff = bias(act.matmul_bt(&b.down), &b.downb);
             h = h.add(&ff).layernorm(&b.out_norm_w, &b.out_norm_b, self.cfg.eps);
             if trace { tr.push((format!("l{_il}.layer_out_norm"), h.clone())); }
         }
