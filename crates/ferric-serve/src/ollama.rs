@@ -356,7 +356,7 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
             let max = eng.budget(ids.len(), opts.max_tokens)?;
             let out = eng.generate(&ids, max, &opts, None, |d, _| on_delta(d));
             Ok(ChatResult { text: out.text, reasoning: String::new(), tool_calls: vec![], prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
-                            finish: out.finish, logprobs: vec![], energy: out.energy })
+                            finish: out.finish, logprobs: vec![], energy: out.energy, stop_seq: out.stop_seq })
         } else {
             let mut messages = Vec::new();
             if let Some(sys) = req["system"].as_str() { messages.push(json!({"role": "system", "content": sys})); }

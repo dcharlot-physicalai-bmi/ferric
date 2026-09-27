@@ -260,10 +260,12 @@ pub(crate) struct Emitter {
     /// Bytes of `text` already released to the client.
     sent: usize,
     pub hit_stop: bool,
+    /// Which stop string ended it (Anthropic's `stop_sequence` names it).
+    pub hit_str: Option<String>,
 }
 
 impl Emitter {
-    pub fn new(stop: &[String]) -> Emitter { Emitter { stop: stop.to_vec(), text: String::new(), sent: 0, hit_stop: false } }
+    pub fn new(stop: &[String]) -> Emitter { Emitter { stop: stop.to_vec(), text: String::new(), sent: 0, hit_stop: false, hit_str: None } }
 
     /// `full` is the decode of every accepted token so far. Returns the text that may be released now.
     /// Mirrors the old loop's guard: nothing is released until the decode grows on a char boundary, so a
@@ -278,9 +280,10 @@ impl Emitter {
         let longest = self.stop.iter().map(|s| s.len()).max().unwrap_or(0);
         let mut from = self.sent.saturating_sub(longest);
         while !self.text.is_char_boundary(from) { from -= 1; }
-        let hit = self.stop.iter().filter_map(|s| self.text[from..].find(s.as_str()).map(|p| from + p)).min();
-        if let Some(p) = hit {
+        let hit = self.stop.iter().filter_map(|s| self.text[from..].find(s.as_str()).map(|p| (from + p, s.clone()))).min_by_key(|(p, _)| *p);
+        if let Some((p, which)) = hit {
             self.hit_stop = true;
+            self.hit_str = Some(which);
             self.text.truncate(p);
             return self.release(p.max(self.sent));
         }

@@ -40,6 +40,7 @@ mod mcp;
 mod batch;
 mod genopts;
 mod energy;
+mod dialects;
 mod ollama;
 pub mod template;
 mod specgate;
@@ -276,6 +277,8 @@ pub(crate) struct Engine {
     reasoning_markers: Option<(String, String)>,
     /// The long-lived power sampler every generation's joules are attributed from.
     pub(crate) energy: energy::Energy,
+    /// Responses kept for the Responses API's `previous_response_id`.
+    responses: dialects::ResponseStore,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -347,6 +350,8 @@ pub(crate) struct GenOut {
     /// Joules attributed to this generation (see `energy`): `{"joules", "joules_per_token", …}`, or
     /// `{"joules": null, "why": …}` when the machine has no meter or the window was unmeasurable.
     pub energy: Value,
+    /// The stop string that ended it, if one did.
+    pub stop_seq: Option<String>,
 }
 
 /// See `Engine::prefix`. `fed` is exactly the token sequence the main cache has consumed —
@@ -560,7 +565,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -873,7 +878,7 @@ impl Engine {
             if em.hit_stop { finish = "stop"; break; }
         }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null }
+        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
 
     /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
@@ -961,13 +966,13 @@ impl Engine {
         let first = self.select_token(row0, &guide, sm, prompt, &r#gen, &mut rng);
         let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else {
             save_slot!();
-            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps, ids: Vec::new(), energy: Value::Null }, drafted, accepted)
+            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps, ids: Vec::new(), energy: Value::Null, stop_seq: None }, drafted, accepted)
         };
         if commit!(pend0, row0) || max_tokens <= 1 {
             save_slot!();
             if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
             let fin = if em.hit_stop { "stop" } else { "length" };
-            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps, ids: r#gen, energy: Value::Null }, drafted, accepted)
+            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }, drafted, accepted)
         }
         let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
         // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
@@ -1078,7 +1083,7 @@ impl Engine {
         }
         save_slot!();
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null }, drafted, accepted)
+        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }, drafted, accepted)
     }
 }
 
@@ -1242,6 +1247,10 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
         ("POST", "/v1/rerank") | ("POST", "/rerank") => rerank(eng, stream, body),
+        ("POST", "/v1/messages") => dialects::messages(eng, mcps, body, stream),
+        ("POST", "/v1/messages/count_tokens") => dialects::count_tokens(eng, body, stream),
+        ("POST", "/v1/responses") => dialects::responses(eng, mcps, &eng.responses, body, stream),
+        ("GET", p) if p.starts_with("/v1/responses/") => dialects::retrieve(&eng.responses, &p["/v1/responses/".len()..], stream),
         // The Ollama dialect, or unrecognised — then the caller answers, so there is one 404 writer.
         _ => return ollama::handle(eng, mcps, method, path, body, stream),
     }
@@ -1418,6 +1427,7 @@ pub(crate) struct ChatResult {
     pub logprobs: Vec<Value>,
     /// Joules for the whole turn (every tool-loop round summed).
     pub energy: Value,
+    pub stop_seq: Option<String>,
 }
 
 /// Several generations' energy as one: joules summed, the rest from the last.
@@ -1489,7 +1499,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
                     for sp in special { t = t.replace(sp, ""); }
                     t.trim().to_string()
                 };
-                return Ok(ChatResult { text, reasoning, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new(), energy: sum_energy(&energies) });
+                return Ok(ChatResult { text, reasoning, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new(), energy: sum_energy(&energies), stop_seq: out.stop_seq.clone() });
             }
             messages.push(json!({"role": "assistant", "content": out.text}));
             for c in &mcp_calls {
@@ -1530,7 +1540,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         None => (out.text, String::new()),
     };
     Ok(ChatResult { text, reasoning, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
-                    finish: out.finish, logprobs: out.logprobs, energy: out.energy })
+                    finish: out.finish, logprobs: out.logprobs, energy: out.energy, stop_seq: out.stop_seq })
 }
 
 fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
