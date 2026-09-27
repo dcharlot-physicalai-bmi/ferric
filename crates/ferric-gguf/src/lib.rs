@@ -574,6 +574,32 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
     })
 }
 
+/// The conventional upper-case name of a ggml tensor type (`Q4_K`, `Q8_0`, `BF16`, …), or `None`
+/// for an id this table does not know.
+///
+/// ⚠ This names a TENSOR type, not a file's quantisation recipe. `Q4_K_M` is a recipe that mixes
+/// types, and the mix is not what the name suggests: counted on this machine (an independent Python
+/// header parse agreeing with `ferric list`), bartowski's Llama-3.2-1B-Instruct-Q4_K_M is 67% Q4_K /
+/// 33% Q6_K by elements, while Qwen's own qwen2.5-0.5b-instruct-q4_k_m is 62% Q5_0, 22% Q8_0 and only
+/// 8% Q4_K. `general.file_type` would say `Q4_K_M` for both, and collides across forks. So what a file
+/// "is" is reported as the type holding the most elements — the rule `ferric-serve`'s `/api/tags` and
+/// the `ferric` CLI's `list` both use.
+///
+/// Before this there were four private copies of this table (ferric-serve, two ferric-llama
+/// examples, a ferric-gguf example), each covering a different subset. Id 42 is named for what the
+/// FILE says it is (PrismML `Q2_0`); [`resolve_type_42`] is what tells it apart from F8_E4M3 by stride.
+pub fn type_name(ty: u32) -> Option<&'static str> {
+    Some(match ty {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
+        10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS",
+        17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S",
+        23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M",
+        30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4", 40 => "NVFP4", 41 => "Q1_0", 42 => "Q2_0",
+        43 => "STQ1_0",
+        _ => return None,
+    })
+}
+
 /// Elements per block for a ggml type, or 1 for the unquantized ones.
 ///
 /// Kept beside [`type_size`] and asserted against it, so a new format cannot add a stride to one
@@ -2065,5 +2091,27 @@ mod block_size_tests {
         assert_eq!(type_size(43, 256).unwrap(), 42);
         // Unquantized types have no block, so any count is fine.
         assert_eq!(type_size(0, 7).unwrap(), 28);
+    }
+}
+
+#[cfg(test)]
+mod type_name_tests {
+    use super::*;
+
+    /// Every FILE-level id this crate can size must also have a name — otherwise a listing shows
+    /// `type41` for a checkpoint the loader reads fine. Internal ids (F8_E4M3_B128 = 1042) are not
+    /// file ids and are excluded by the range.
+    #[test]
+    fn every_sizable_file_type_has_a_name_and_the_names_match_the_constants() {
+        for ty in 0u32..64 {
+            if type_size(ty, 256 * 128).is_ok() {
+                assert!(type_name(ty).is_some(), "ggml type {ty} is readable but unnamed");
+            }
+        }
+        for (ty, n) in [(F32, "F32"), (F16T, "F16"), (BF16T, "BF16"), (Q8_0, "Q8_0"), (Q4_K, "Q4_K"),
+                        (Q6_K, "Q6_K"), (IQ4_XS, "IQ4_XS"), (MXFP4, "MXFP4"), (Q1_0, "Q1_0"), (STQ1_0, "STQ1_0")] {
+            assert_eq!(type_name(ty), Some(n));
+        }
+        assert_eq!(type_name(1042), None, "an internal id is not a file type");
     }
 }
