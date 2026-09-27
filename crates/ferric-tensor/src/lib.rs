@@ -1806,8 +1806,12 @@ fn decode_splits(s: usize, nh: usize) -> usize {
     if let Ok(v) = std::env::var("FERRIC_SPLITKV") {
         if let Ok(n) = v.parse::<usize>() { return n.max(1); }
     }
-    const MIN_KEYS_PER_SPLIT: usize = 512;
-    const MAX_WORKGROUPS: usize = 256;
+    // Measured on an M5 Max (Qwen2.5-0.5B Q8_0, 14 query heads, examples/prefill_bench.rs): one
+    // workgroup per head leaves a 40-core GPU mostly idle, and 512 keys per split kept it that way until
+    // 1024 keys. At ~64 keys per split and up to 512 workgroups, decode ran 112 → 177 tok/s at 384 keys
+    // of context, ~85 → 146 at 1780 and 89 → 126 at 4096; finer (128 splits at 4096) got slower again.
+    const MIN_KEYS_PER_SPLIT: usize = 64;
+    const MAX_WORKGROUPS: usize = 512;
     if nh == 0 || s < 2 * MIN_KEYS_PER_SPLIT { return 1; }
     (s / MIN_KEYS_PER_SPLIT).min(MAX_WORKGROUPS / nh.max(1)).max(1)
 }
