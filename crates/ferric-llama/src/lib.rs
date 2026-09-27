@@ -105,6 +105,7 @@ pub mod qwen3vl_rope;
 /// Qwen2.5-VL vision tower (MiMo-Embodied-7B) — windowed attention, RMSNorm, SwiGLU, one merger.
 pub mod qwen25vl_vision;
 pub mod parakeet;       // NVIDIA Parakeet / Nemotron-ASR: Conformer encoder + RNN-T decoder
+pub mod mimo_asr;       // Xiaomi MiMo-V2.5-ASR: audio tokenizer (RVQ) + patch encoder + Qwen2 LM
 pub mod unipc;
 
 pub mod arch;

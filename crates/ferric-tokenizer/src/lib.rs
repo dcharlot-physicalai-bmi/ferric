@@ -625,6 +625,7 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
         }
         return out;
     }
+    if matches!(pre, Pre::Qwen2 | Pre::Qwen35 | Pre::Llama3) { return pretokenize_qwen_family(text, pre) }
     // Digits step: isolate each digit; group consecutive non-digits.
     let mut frags: Vec<Vec<char>> = Vec::new();
     let mut cur: Vec<char> = Vec::new();
@@ -710,6 +711,91 @@ fn pretokenize_with(text: &str, pre: Pre) -> Vec<String> {
                 out.push(f[i..e].iter().collect()); i = e;
             }
         }
+    }
+    if out.is_empty() { out.push(String::new()); }
+    out
+}
+
+/// The Qwen2 / Qwen3.5 / Llama-3 split regex, alternative by alternative, leftmost first — as the
+/// authors' `tokenizer.json` states it:
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} | ' '?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+/// ```
+///
+/// Qwen3.5 reads `[\p{L}\p{M}]` where the others read `\p{L}` (also inside the punctuation class), and
+/// Llama-3 takes numbers `\p{N}{1,3}`.
+///
+/// ⛔⛔ TWO ALTERNATIVES ONLY FIRE ON A NEWLINE, and a corpus read one line at a time never contains one:
+/// punctuation KEEPS the newlines after it (`>\n\n` is one piece), and a whitespace run is cut after its
+/// LAST newline (`"  \n\t\n  y"` -> `"  \n\t\n" " " " y"`). The previous implementation had neither,
+/// and disagreed with the authors' files on 50 of 114 newline strings; a chat prompt's
+/// `<think>\n\n</think>\n` came out 2 ids longer than theirs. See `tests/pretok_newlines.rs`.
+fn pretokenize_qwen_family(text: &str, pre: Pre) -> Vec<String> {
+    let cs: Vec<char> = text.chars().collect();
+    let n = cs.len();
+    let marks = pre == Pre::Qwen35;
+    let is_l = |c: char| unicode_classes::is_letter(c) || (marks && unicode_classes::is_mark(c));
+    let is_n = |c: char| unicode_classes::is_number_cat(c);
+    let is_nl = |c: char| c == '\r' || c == '\n';
+    // `[^\s\p{L}\p{N}]` (with \p{M} excluded too for Qwen3.5)
+    let is_p = |c: char| !c.is_whitespace() && !is_l(c) && !is_n(c);
+    let max_digits = if pre == Pre::Llama3 { 3 } else { 1 };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = cs[i];
+        let piece = |a: usize, b: usize| cs[a..b].iter().collect::<String>();
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d) — case-insensitive, in that order
+        if c == '\'' {
+            // Case-FOLDED, as Oniguruma's (?i:) is: U+017F LONG S folds to 's' but LOWERCASES to itself,
+            // so `to_lowercase` alone made "'ſt" one piece where the authors' tokenizer cuts "'ſ" off.
+            let fold = |c: char| if c == '\u{17F}' { 's' } else { c.to_lowercase().next().unwrap_or(c) };
+            let at = |k: usize, want: char| i + k < n && fold(cs[i + k]) == want
+                && cs[i + k].to_lowercase().count() == 1;
+            let len = if at(1, 's') || at(1, 't') { 2 }
+                else if at(1, 'r') && at(2, 'e') { 3 }
+                else if at(1, 'v') && at(2, 'e') { 3 }
+                else if at(1, 'm') { 2 }
+                else if at(1, 'l') && at(2, 'l') { 3 }
+                else if at(1, 'd') { 2 }
+                else { 0 };
+            if len > 0 { out.push(piece(i, i + len)); i += len; continue; }
+        }
+        // [^\r\n\p{L}\p{N}]?\p{L}+ — the optional lead is tried first (the `?` is greedy)
+        let lead = !is_nl(c) && !unicode_classes::is_letter(c) && !is_n(c) && i + 1 < n && is_l(cs[i + 1]);
+        if lead || is_l(c) {
+            let mut e = i + 1;
+            while e < n && is_l(cs[e]) { e += 1; }
+            out.push(piece(i, e)); i = e; continue;
+        }
+        // \p{N} (Llama-3: \p{N}{1,3})
+        if is_n(c) {
+            let mut e = i + 1;
+            while e < n && e - i < max_digits && is_n(cs[e]) { e += 1; }
+            out.push(piece(i, e)); i = e; continue;
+        }
+        //  ?[^\s\p{L}\p{N}]+[\r\n]*
+        let j = i + usize::from(c == ' ' && i + 1 < n && is_p(cs[i + 1]));
+        if j < n && is_p(cs[j]) {
+            let mut e = j;
+            while e < n && is_p(cs[e]) { e += 1; }
+            while e < n && is_nl(cs[e]) { e += 1; }
+            out.push(piece(i, e)); i = e; continue;
+        }
+        // whitespace: the maximal run [i, e)
+        let mut e = i;
+        while e < n && cs[e].is_whitespace() { e += 1; }
+        if e == i { out.push(piece(i, i + 1)); i += 1; continue; }   // unreachable: every char is some class
+        // \s*[\r\n]+ — greedy \s*, then backtrack to the run's LAST newline
+        if let Some(k) = (i..e).rev().find(|&k| is_nl(cs[k])) {
+            out.push(piece(i, k + 1)); i = k + 1; continue;
+        }
+        // \s+(?!\S): the whole run at the end of the text; else all but its last char, if that leaves one
+        if e == n { out.push(piece(i, e)); i = e; continue; }
+        if e - i >= 2 { out.push(piece(i, e - 1)); i = e - 1; continue; }
+        // \s+
+        out.push(piece(i, e)); i = e;
     }
     if out.is_empty() { out.push(String::new()); }
     out
@@ -1169,17 +1255,19 @@ mod laguna_tests {
     /// ⛔⛔ It is a PRE-pass, not a post-pass — Laguna can MERGE what a post-cut would split, so
     /// "run Qwen2 then cut the output at newlines" does NOT reproduce it.
     ///
-    /// ⚠ The witness matters and mine was wrong first. The porting spec offered `";\n\r \r"`, where
-    /// llama.cpp's qwen2 gives `[";\n\r", " \r"]` — but FERRIC's Qwen2 gives `[";", "\n\r \r"]`, and
-    /// post-cutting that DOES reproduce Laguna, so the test failed on a true claim with a witness
-    /// that does not transfer. Found a real one by exhaustive search instead: 162 of 19,607 strings
-    /// over `{' ', '\n', '\r', '\t', 'a', '1', ';'}` up to length 5 differ (`examples/prepass_search`).
+    /// ⚠ The witness matters and it has changed twice. The porting spec offered `";\n\r \r"`, where
+    /// llama.cpp's qwen2 gives `[";\n\r", " \r"]` — but Ferric's Qwen2 then gave `[";", "\n\r \r"]`,
+    /// and that disagreement with llama.cpp was taken for a witness problem when it was a Ferric
+    /// DEFECT: the pre-tokenizer lacked the regex's two newline alternatives (fixed 2026-09-26 against
+    /// the authors' tokenizer files, `tests/pretok_newlines.rs`). The interim witness `"\n\ta "` stopped
+    /// discriminating with the fix. With Qwen2 now right, the original one works: Laguna keeps the
+    /// segment `"\r \r"` whole (one run ending in a newline), a post-cut of Qwen2's `" \r"` leaves
+    /// `"\r"` and `" \r"` apart.
     #[test]
     fn laguna_can_merge_what_a_post_cut_would_split() {
-        // verified witness: the segment boundary changes what the leading-punctuation rule may attach
-        // to, so `\t` binds to `a` inside the segment and cannot across it.
-        assert_eq!(pretokenize_with("\n\ta ", Pre::Laguna), vec!["\n", "\ta", " "]);
-        let post: Vec<String> = pretokenize_with("\n\ta ", Pre::Qwen2).iter().flat_map(|p| {
+        assert_eq!(pretokenize_with(";\n\r \r", Pre::Qwen2), vec![";\n\r", " \r"], "llama.cpp's qwen2 split");
+        assert_eq!(pretokenize_with(";\n\r \r", Pre::Laguna), vec![";", "\n", "\r \r"]);
+        let post: Vec<String> = pretokenize_with(";\n\r \r", Pre::Qwen2).iter().flat_map(|p| {
             let (mut v, mut cur, mut prev) = (Vec::new(), String::new(), None::<bool>);
             for c in p.chars() {
                 let nl = c == '\n';
@@ -1189,7 +1277,7 @@ mod laguna_tests {
             if !cur.is_empty() { v.push(cur) }
             v
         }).collect();
-        assert_ne!(post, pretokenize_with("\n\ta ", Pre::Laguna),
+        assert_ne!(post, pretokenize_with(";\n\r \r", Pre::Laguna),
                    "a post-cut reproduced Laguna on the one witness this test has — find another \
                     (examples/prepass_search) or the pre-pass distinction is undefended");
     }

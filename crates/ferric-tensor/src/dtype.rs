@@ -1842,6 +1842,22 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
+        let unpack = if w.bf16 { "return vec2<f32>(bitcast<f32>(word << 16u), bitcast<f32>(word & 0xffff0000u));" }
+                     else { "return unpack2x16float(word);" };
+        // ⭐ PREFILL: the flat and split-K kernels compute each output independently, so every row of `x`
+        // re-reads the whole weight matrix — a prompt of M rows moves M times the bytes of one decode
+        // step. The row-blocked kernel reads each weight once per 8 rows. `half_tiled_prefill_bench`.
+        if half_tiled(rows) {
+            let src = MATMUL_HALF_TILED_WGSL.replace("UNPACK", unpack);
+            let label = if w.bf16 { "matmul_half_rt8_bf16" } else { "matmul_half_rt8_f16" };
+            let threads = w.rows * rows.div_ceil(8);
+            let wg = threads.div_ceil(64); let gw = wg.min(32768);
+            run(&self.ctx, &src, label,
+                &[x.buf.as_ref(), w.words.as_ref(), &out,
+                  &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])],
+                (gw as u32, wg.div_ceil(gw) as u32, 1));
+            return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
+        }
         let (grid, rs, base, label) = if q2_0_split_k(rows, w.rows, inn) {
             let gw = n.min(32768);
             (((gw as u32), n.div_ceil(gw) as u32, 1u32), gw as u32, MATMUL_HALF_SPLITK_WGSL, "matmul_half_splitk")
@@ -1851,8 +1867,6 @@ impl Tensor {
         };
         // One source, two widenings. F16 is WGSL's own unpack; BF16 is f32's top half, so it widens by a
         // shift — no rounding in either direction.
-        let unpack = if w.bf16 { "return vec2<f32>(bitcast<f32>(word << 16u), bitcast<f32>(word & 0xffff0000u));" }
-                     else { "return unpack2x16float(word);" };
         let wgsl = base.replace("UNPACK", unpack);
         let src = if use_subgroup(&self.ctx) { sg_reduce(&wgsl) } else { wgsl };
         let label = if w.bf16 { format!("{label}_bf16") } else { format!("{label}_f16") };
@@ -1862,6 +1876,48 @@ impl Tensor {
         Tensor::from_parts(&self.ctx, out, vec![rows, w.rows])
     }
 }
+
+/// Rows at which the tiled kernel takes over from flat/split-K. `FERRIC_HALF_KERNEL=flat|tiled` pins
+/// one for an A/B in the same binary.
+fn half_tiled(rows: usize) -> bool {
+    match std::env::var("FERRIC_HALF_KERNEL").as_deref() {
+        Ok("tiled") => true,
+        Ok("flat") => false,
+        _ => rows >= 8,
+    }
+}
+
+/// `out[r, o] = sum_k x[r, k] * W[o, k]`, W packed two 16-bit values per word, `[out, in]` row-major.
+/// REGISTER-tiled: one thread per (output, block of 8 rows), so each weight word is read once per 8 rows
+/// and reused from registers, while the x rows come through the cache. ⚠ A shared-memory 64x64 tile (the
+/// f32 `TILED_MATMUL_WGSL` shape) was tried first and measured 3-30x SLOWER than the flat kernel here —
+/// the same finding `Tensor::matmul_rt` records for f32 on Apple Silicon.
+const MATMUL_HALF_TILED_WGSL: &str = r#"
+@group(0) @binding(0) var<storage,read>        x:    array<vec4<f32>>; // [M, K/4]
+@group(0) @binding(1) var<storage,read>        w:    array<u32>;       // [N, K/2] words
+@group(0) @binding(2) var<storage,read_write>  out:  array<f32>;       // [M, N]
+@group(0) @binding(3) var<uniform>             info: vec4<u32>;        // M, N, K, grid_w
+fn widen(word: u32) -> vec2<f32> { UNPACK }
+const RB = 8u;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let m = info.x; let n = info.y; let k = info.z;
+    let idx = gid.x + gid.y * info.w;
+    let blocks = (m + RB - 1u) / RB;
+    if (idx >= n * blocks) { return; }
+    let o = idx % n; let r0 = (idx / n) * RB;
+    let nq = k / 4u; let wrow = o * (k / 2u);
+    let nr = min(RB, m - r0);
+    var acc: array<f32, 8>;
+    for (var i = 0u; i < RB; i++) { acc[i] = 0.0; }
+    for (var q: u32 = 0u; q < nq; q = q + 1u) {
+        let lo = widen(w[wrow + 2u * q]); let hi = widen(w[wrow + 2u * q + 1u]);
+        let wv = vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+        for (var i = 0u; i < nr; i++) { acc[i] = acc[i] + dot(x[(r0 + i) * nq + q], wv); }
+    }
+    for (var i = 0u; i < nr; i++) { out[(r0 + i) * n + o] = acc[i]; }
+}
+"#;
 
 const MATMUL_HALF_FLAT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>        x:      array<vec4<f32>>;
@@ -5557,8 +5613,13 @@ mod format_reachability {
             Ok(c) => Arc::new(c),
             Err(e) => { eprintln!("SKIPPED sixteen_bit_weights_match_their_widened_matmul: no GPU ({e:?})"); return; }
         };
-        // splitk: rows <= 2. flat: rows > 2 and >= 16384 outputs (see q2_0_split_k).
-        for &(rows, n_out, cols) in &[(1usize, 96usize, 256usize), (2, 40, 1024), (3, 16384, 12)] {
+        // splitk: rows <= 2. flat: 3..7 rows (see q2_0_split_k). row-blocked: rows >= 8 — with row counts
+        // that leave a partial last block of 8 (37, 70, 129), and one shape wide enough (2,112,000
+        // threads > 32768 x 64) that the dispatch needs a SECOND grid row, so the `gid.y * info.w` index
+        // reconstruction is exercised rather than always multiplied by zero.
+        for &(rows, n_out, cols) in &[(1usize, 96usize, 256usize), (2, 40, 1024), (3, 16384, 12),
+                                      (8, 64, 16), (37, 130, 1028), (70, 200, 20), (129, 65, 516),
+                                      (9, 1_056_000, 4)] {
             let mut seed = 0x9e37_79b9u32 ^ (rows * 7919 + n_out * 31 + cols) as u32;
             let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; (seed as f32 / u32::MAX as f32) * 2.0 - 1.0 };
             let x: Vec<f32> = (0..rows * cols).map(|_| rnd()).collect();

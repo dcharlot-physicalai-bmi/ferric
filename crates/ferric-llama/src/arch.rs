@@ -257,7 +257,12 @@ pub const REGISTRY: &[Arch] = &[
                   converted from their files: max |logit diff| 2.6e-4 over 139 positions x 128 sampled \
                   ids, argmax 139/139, full-row sum of squares within 1.3e-5. The wrong rope pairing is \
                   52,151x worse. The earlier check compared greedy tokens only, which a small logit \
-                  error almost never moves. Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
+                  error almost never moves. Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/. \
+                  ⭐ Also the language model of MiMo-V2.5-ASR (crate::mimo_asr), read from the authors' \
+                  float32 safetensors rounded to bf16 as their loader rounds them: logits at all 62 \
+                  prompt positions within 4x the authors' own float32-vs-float64 distance (worst 0.58x), \
+                  waveform in, and the greedy transcript equal to their argmax chain. \
+                  Gate: scripts/mimo_asr_conformance.sh" },
     Arch { name: "qwen3", runtime: Runtime::Dense, status: Status::Verified,
            note: "per-head QK RMSNorm. ⭐ Verified against the MODEL AUTHORS' implementation \
                   (transformers 5.7.0, float32, eager) on Qwen/Qwen3-0.6B, F32 converted from their \

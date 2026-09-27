@@ -39,6 +39,29 @@ pub struct HfCheckpoint {
     /// GGUF name -> the safetensors name it actually lives under.
     src: HashMap<String, String>,
     pub arch: String,
+    /// Every F32 tensor is presented as BF16, rounded as `torch.Tensor.to(torch.bfloat16)` rounds.
+    narrow_bf16: bool,
+}
+
+/// How to present a checkpoint. The default is the file exactly as stored.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HfOptions {
+    /// Round every F32 tensor to BF16 (round to nearest, ties to even — `torch.Tensor.to(bfloat16)`).
+    ///
+    /// ⚠ Not a compression choice. It is for checkpoints STORED in float32 that their authors LOAD at
+    /// bfloat16 (`from_pretrained(torch_dtype=torch.bfloat16)`): the rounded values are the weights the
+    /// model is deployed with, and Ferric then keeps them 16-bit. MiMo-V2.5-ASR ships 30 GB of float32
+    /// and is run by its authors at bfloat16.
+    pub narrow_f32_to_bf16: bool,
+}
+
+/// `torch.Tensor.to(torch.bfloat16)` on one value: round to nearest, ties to even, on the f32 bits.
+/// NaN stays NaN (quietened), which no weight here is.
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() { return ((b >> 16) | 0x40) as u16; }
+    let lsb = (b >> 16) & 1;
+    (b.wrapping_add(0x7fff + lsb) >> 16) as u16
 }
 
 /// safetensors dtype -> ggml type id, for the types a weight can be stored in.
@@ -62,6 +85,11 @@ fn cfg_f(c: &serde_json::Value, k: &str) -> Option<f64> { c[k].as_f64() }
 impl HfCheckpoint {
     /// Open a checkpoint directory holding `config.json` and safetensors (sharded or not).
     pub fn open(dir: impl AsRef<Path>) -> Result<HfCheckpoint, String> {
+        Self::open_with(dir, HfOptions::default())
+    }
+
+    /// [`HfCheckpoint::open`] with presentation options — see [`HfOptions`].
+    pub fn open_with(dir: impl AsRef<Path>, opts: HfOptions) -> Result<HfCheckpoint, String> {
         let dir = dir.as_ref();
         let cfg_txt = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| format!("{}/config.json: {e}", dir.display()))?;
@@ -74,6 +102,7 @@ impl HfCheckpoint {
             "lfm2" => lfm2_map(&cfg, &st)?,
             "qwen3_vl" => qwen3vl_map(&cfg, &st)?,
             "qwen2_5_vl" => qwen25vl_map(&cfg, &st)?,
+            "qwen2" => qwen2_map(&cfg, &st)?,
             other => return Err(format!(
                 "no HF mapping for model_type '{other}'. Adding one is a table of metadata keys and \
                  tensor names — see `lfm2_map` — but it is only worth adding alongside something \
@@ -93,12 +122,14 @@ impl HfCheckpoint {
             // dims[0]/dims[1] reads correct. Guarded to rank > 2 so a genuine [1, N] weight, where
             // the 1 IS the shape, is left alone.
             if dims.len() > 2 { dims.retain(|&d| d != 1); }
+            let ty = ggml_type_of(&e.dtype)?;
+            let ty = if opts.narrow_f32_to_bf16 && ty == 0 { 30 } else { ty };
             infos.insert(gguf_name.clone(), TensorInfo {
-                name: gguf_name.clone(), dims, ggml_type: ggml_type_of(&e.dtype)?, offset: 0,
+                name: gguf_name.clone(), dims, ggml_type: ty, offset: 0,
             });
             src.insert(gguf_name, hf_name);
         }
-        Ok(HfCheckpoint { st, meta, infos, src, arch: model_type })
+        Ok(HfCheckpoint { st, meta, infos, src, arch: model_type, narrow_bf16: opts.narrow_f32_to_bf16 })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &String> { self.infos.keys() }
@@ -109,11 +140,21 @@ impl GgufSource for HfCheckpoint {
     fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.infos.get(name) }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
         let hf = self.src.get(name).ok_or_else(|| format!("no tensor '{name}'"))?;
-        self.st.raw(hf)
+        let bytes = self.st.raw(hf)?;
+        if self.narrow_bf16 && self.st.info(hf).is_some_and(|e| e.dtype == "F32") {
+            return Ok(bytes.chunks_exact(4)
+                .flat_map(|c| f32_to_bf16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes())
+                .collect());
+        }
+        Ok(bytes)
     }
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
         let hf = self.src.get(name).ok_or_else(|| format!("no tensor '{name}'"))?;
-        Ok(self.st.get(hf)?.data)
+        let mut v = self.st.get(hf)?.data;
+        if self.narrow_bf16 && self.st.info(hf).is_some_and(|e| e.dtype == "F32") {
+            for x in &mut v { *x = f32::from_bits((f32_to_bf16_bits(*x) as u32) << 16); }
+        }
+        Ok(v)
     }
 }
 
@@ -305,6 +346,76 @@ fn qwen25vl_map(cfg: &serde_json::Value, st: &SafeTensors)
     Ok((m, n))
 }
 
+/// **Qwen2, text model** — `model_type: qwen2`. Also the language model inside MiMo-V2.5-ASR, whose
+/// checkpoint carries its audio modules beside it under other prefixes (left unmapped here; the audio
+/// side is `ferric_llama::mimo_asr`).
+///
+/// ⚠ `use_sliding_window: true` is refused rather than half-mapped: Qwen2's window applies only to layers
+/// past `max_window_layers`, and a width without that schedule would window the wrong layers.
+fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
+    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+{
+    let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    if cfg["use_sliding_window"].as_bool() == Some(true) {
+        return Err("use_sliding_window is true: the windowed layers are not mapped here".into());
+    }
+    if !cfg["rope_scaling"].is_null() {
+        return Err(format!("rope_scaling {} is not mapped — refusing rather than run unscaled", cfg["rope_scaling"]));
+    }
+    let n_layer = need_u("num_hidden_layers")? as usize;
+    let (h, nh) = (need_u("hidden_size")?, need_u("num_attention_heads")?);
+    let mut m = HashMap::new();
+    m.insert("general.architecture".into(), Meta::Str("qwen2".into()));
+    m.insert("qwen2.block_count".into(), Meta::U(n_layer as u64));
+    m.insert("qwen2.embedding_length".into(), Meta::U(h));
+    m.insert("qwen2.feed_forward_length".into(), Meta::U(need_u("intermediate_size")?));
+    m.insert("qwen2.attention.head_count".into(), Meta::U(nh));
+    m.insert("qwen2.attention.head_count_kv".into(), Meta::U(need_u("num_key_value_heads")?));
+    // head_dim may be explicit; when it is, it must agree with hidden/heads, which is what the loader assumes
+    if let Some(hd) = cfg_u(cfg, "head_dim") {
+        if hd != h / nh { return Err(format!("head_dim {hd} != hidden {h} / heads {nh}")); }
+    }
+    m.insert("qwen2.attention.layer_norm_rms_epsilon".into(), Meta::F(need_f("rms_norm_eps")?));
+    m.insert("qwen2.rope.freq_base".into(), Meta::F(need_f("rope_theta")?));
+    m.insert("tokenizer.ggml.tokens".into(),
+             Meta::Arr(vec![Meta::Str(String::new()); need_u("vocab_size")? as usize]));
+    let mut n: Vec<(String, String)> = vec![
+        ("token_embd.weight".into(), "model.embed_tokens.weight".into()),
+        ("output_norm.weight".into(), "model.norm.weight".into()),
+    ];
+    if st.info("lm_head.weight").is_some() {
+        n.push(("output.weight".into(), "lm_head.weight".into()));
+    } else if cfg["tie_word_embeddings"].as_bool() != Some(true) {
+        return Err("no lm_head.weight and tie_word_embeddings is not set — refusing to tie silently".into());
+    }
+    let bias = st.info("model.layers.0.self_attn.q_proj.bias").is_some();
+    for il in 0..n_layer {
+        let p = format!("model.layers.{il}");
+        let mut pairs = vec![
+            ("attn_norm.weight", format!("{p}.input_layernorm.weight")),
+            ("attn_q.weight", format!("{p}.self_attn.q_proj.weight")),
+            ("attn_k.weight", format!("{p}.self_attn.k_proj.weight")),
+            ("attn_v.weight", format!("{p}.self_attn.v_proj.weight")),
+            ("attn_output.weight", format!("{p}.self_attn.o_proj.weight")),
+            ("ffn_norm.weight", format!("{p}.post_attention_layernorm.weight")),
+            ("ffn_gate.weight", format!("{p}.mlp.gate_proj.weight")),
+            ("ffn_up.weight", format!("{p}.mlp.up_proj.weight")),
+            ("ffn_down.weight", format!("{p}.mlp.down_proj.weight")),
+        ];
+        if bias {
+            pairs.extend([("attn_q.bias", format!("{p}.self_attn.q_proj.bias")),
+                          ("attn_k.bias", format!("{p}.self_attn.k_proj.bias")),
+                          ("attn_v.bias", format!("{p}.self_attn.v_proj.bias"))]);
+        }
+        n.extend(pairs.into_iter().map(|(g, hf)| (format!("blk.{il}.{g}"), hf)));
+    }
+    if let Some((g, hf)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
+        return Err(format!("mapping points {g} at {hf}, which the checkpoint does not contain"));
+    }
+    Ok((m, n))
+}
+
 fn lfm2_map(cfg: &serde_json::Value, st: &SafeTensors)
     -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
 {
@@ -374,4 +485,29 @@ fn lfm2_map(cfg: &serde_json::Value, st: &SafeTensors)
         for (suffix, hf) in pairs { n.push((format!("blk.{il}.{suffix}"), hf)); }
     }
     Ok((m, n))
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::f32_to_bf16_bits;
+
+    /// Against values whose bfloat16 rounding is known by hand — including both tie directions, which
+    /// is where a truncating or ties-away implementation differs from torch.
+    #[test]
+    fn rounding_is_torchs_nearest_even() {
+        let r = |x: f32| f32::from_bits((f32_to_bf16_bits(x) as u32) << 16);
+        assert_eq!(r(1.0), 1.0);
+        // 1 + 2^-8 is exactly half an ulp above 1.0 (bf16 ulp at 1 is 2^-7): ties to EVEN -> 1.0
+        assert_eq!(r(1.0 + 2f32.powi(-8)), 1.0);
+        // 1 + 3*2^-8 is half an ulp above 1 + 2^-7 (odd mantissa): ties to even -> 1 + 2^-6
+        assert_eq!(r(1.0 + 3.0 * 2f32.powi(-8)), 1.0 + 2f32.powi(-6));
+        // just above the tie rounds up; just below rounds down
+        assert_eq!(r(1.0 + 2f32.powi(-8) + 2f32.powi(-20)), 1.0 + 2f32.powi(-7));
+        assert_eq!(r(1.0 + 2f32.powi(-8) - 2f32.powi(-20)), 1.0);
+        assert_eq!(r(-2.5), -2.5);
+        // a carry through the whole mantissa bumps the exponent
+        assert_eq!(r(f32::from_bits(0x3fff_ffff)), 2.0);
+        // ⚠ and it is not truncation, which would keep 1 + 2^-7 for the value just above the tie
+        assert_ne!(f32_to_bf16_bits(1.0 + 3.0 * 2f32.powi(-8)), (((1.0f32 + 3.0 * 2f32.powi(-8)).to_bits()) >> 16) as u16);
+    }
 }

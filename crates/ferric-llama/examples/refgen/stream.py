@@ -68,10 +68,13 @@ class Checkpoint:
 class StreamedLayer(torch.nn.Module):
     """Stands in for decoder layer `i`: builds the authors' layer, loads it, runs it, frees it."""
 
-    def __init__(self, cls, config, i, prefix, ckpt, report, dtype=torch.float32):
+    def __init__(self, cls, config, i, prefix, ckpt, report, dtype=torch.float32, round_to=None):
         super().__init__()
         self._cls, self._config, self._i, self._prefix, self._ckpt, self._report = cls, config, i, prefix, ckpt, report
         self._dtype = dtype   # float64 for a noise-floor run (qwen25vl_ref.py); the upcast is exact either way
+        # Round each weight through this dtype first — for a checkpoint STORED in float32 that its authors
+        # load at bfloat16 (mimo_asr_ref.py): their deployed weights, at `dtype` arithmetic.
+        self._round = round_to
 
     def forward(self, *args, **kwargs):
         layer = self._cls(self._config, self._i).to(self._dtype)
@@ -81,7 +84,7 @@ class StreamedLayer(torch.nn.Module):
             v = self._ckpt.get(key)
             if tuple(v.shape) != tuple(t.shape):
                 raise SystemExit(f"{key}: checkpoint shape {tuple(v.shape)} != layer's {tuple(t.shape)} — refusing")
-            sd[name] = v.to(self._dtype)
+            sd[name] = (v.to(self._round) if self._round is not None else v).to(self._dtype)
         layer.load_state_dict(sd, strict=True)
         # By value, AS LOADED — after load_state_dict, before the forward (the lesson in refload.py).
         live = layer.state_dict()

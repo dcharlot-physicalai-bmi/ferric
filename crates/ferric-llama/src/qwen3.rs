@@ -1539,6 +1539,26 @@ impl Qwen3 {
         batch(&self.ctx, || self.head(&h))
     }
 
+    /// [`Self::forward_embeds`], returning the logits of the LAST row only: `[1, n_vocab]`.
+    ///
+    /// A prompt only ever needs its last row's logits to start decoding, and the head is the widest
+    /// matmul in the model (151,680 outputs on a Qwen vocabulary) — applying it to every prompt row
+    /// multiplies the single largest weight read by the prompt length for rows nobody reads.
+    pub fn forward_embeds_last(&self, x: &Tensor, cache: &mut Cache) -> Tensor {
+        use ferric_tensor::batch;
+        assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
+        let t = x.shape[0];
+        let pos = cache.pos;
+        let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
+        for il in 0..self.cfg.n_layer {
+            let l = self.layer_ref(il);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None);
+        }
+        cache.pos += t;
+        let last = h.narrow(0, t - 1, 1).contiguous();
+        batch(&self.ctx, || self.head(&last))
+    }
+
     /// Replace or add a CONTIGUOUS block of rows at `start`, without a scatter kernel.
     ///
     /// Qwen3-VL's image tokens are one unbroken run per image (the placeholder is repeated), so

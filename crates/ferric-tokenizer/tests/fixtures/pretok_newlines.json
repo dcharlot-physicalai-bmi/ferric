@@ -1,0 +1,1153 @@
+{
+ "note": "Pre-tokenization pieces from the MODEL AUTHORS' OWN tokenizer files, for strings WITH NEWLINES.",
+ "tokenizers": "0.22.2",
+ "rules": {
+  "qwen2": {
+   "source": "Qwen/Qwen3-0.6B",
+   "regex": [
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+   ],
+   "cases": [
+    {
+     "text": "<think>\n\n</think>\n",
+     "pieces": [
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n"
+     ]
+    },
+    {
+     "text": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+     "pieces": [
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "assistant",
+      "\n",
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n\n"
+     ]
+    },
+    {
+     "text": "a:\n",
+     "pieces": [
+      "a",
+      ":\n"
+     ]
+    },
+    {
+     "text": "x;\r\n",
+     "pieces": [
+      "x",
+      ";\r\n"
+     ]
+    },
+    {
+     "text": "\n  x",
+     "pieces": [
+      "\n",
+      " ",
+      " x"
+     ]
+    },
+    {
+     "text": "foo  \n bar",
+     "pieces": [
+      "foo",
+      "  \n",
+      " bar"
+     ]
+    },
+    {
+     "text": "\n\n\n",
+     "pieces": [
+      "\n\n\n"
+     ]
+    },
+    {
+     "text": "a \n",
+     "pieces": [
+      "a",
+      " \n"
+     ]
+    },
+    {
+     "text": "end.\n\nNext",
+     "pieces": [
+      "end",
+      ".\n\n",
+      "Next"
+     ]
+    },
+    {
+     "text": "  \n\t\n  y",
+     "pieces": [
+      "  \n\t\n",
+      " ",
+      " y"
+     ]
+    },
+    {
+     "text": "a\r\n\r\nb",
+     "pieces": [
+      "a",
+      "\r\n\r\n",
+      "b"
+     ]
+    },
+    {
+     "text": "\t(x)\n",
+     "pieces": [
+      "\t",
+      "(x",
+      ")\n"
+     ]
+    },
+    {
+     "text": "def f(x):\n    return x  # ok\n\n\nprint(f(1))\n",
+     "pieces": [
+      "def",
+      " f",
+      "(x",
+      "):\n",
+      "   ",
+      " return",
+      " x",
+      " ",
+      " #",
+      " ok",
+      "\n\n\n",
+      "print",
+      "(f",
+      "(",
+      "1",
+      "))\n"
+     ]
+    },
+    {
+     "text": "- item one\n- item two\n\n1. first\n2. second",
+     "pieces": [
+      "-",
+      " item",
+      " one",
+      "\n",
+      "-",
+      " item",
+      " two",
+      "\n\n",
+      "1",
+      ".",
+      " first",
+      "\n",
+      "2",
+      ".",
+      " second"
+     ]
+    },
+    {
+     "text": "key: value\r\nother:\tvalue2 \r\n",
+     "pieces": [
+      "key",
+      ":",
+      " value",
+      "\r\n",
+      "other",
+      ":",
+      "\tvalue",
+      "2",
+      " \r\n"
+     ]
+    },
+    {
+     "text": "line with trailing spaces   \nnext",
+     "pieces": [
+      "line",
+      " with",
+      " trailing",
+      " spaces",
+      "   \n",
+      "next"
+     ]
+    },
+    {
+     "text": " \n ",
+     "pieces": [
+      " \n",
+      " "
+     ]
+    },
+    {
+     "text": "\n",
+     "pieces": [
+      "\n"
+     ]
+    },
+    {
+     "text": " ",
+     "pieces": [
+      " "
+     ]
+    },
+    {
+     "text": "  ",
+     "pieces": [
+      "  "
+     ]
+    },
+    {
+     "text": "x \n\n y",
+     "pieces": [
+      "x",
+      " \n\n",
+      " y"
+     ]
+    },
+    {
+     "text": "}\n}\n",
+     "pieces": [
+      "}\n",
+      "}\n"
+     ]
+    },
+    {
+     "text": "!!\n\n??",
+     "pieces": [
+      "!!\n\n",
+      "??"
+     ]
+    },
+    {
+     "text": "a.\n b",
+     "pieces": [
+      "a",
+      ".\n",
+      " b"
+     ]
+    },
+    {
+     "text": "Q:\nA:\n",
+     "pieces": [
+      "Q",
+      ":\n",
+      "A",
+      ":\n"
+     ]
+    },
+    {
+     "text": "IT'S we'RE they'Ll",
+     "pieces": [
+      "IT",
+      "'S",
+      " we",
+      "'RE",
+      " they",
+      "'Ll"
+     ]
+    },
+    {
+     "text": "tab\tsep\tvalues\n",
+     "pieces": [
+      "tab",
+      "\tsep",
+      "\tvalues",
+      "\n"
+     ]
+    },
+    {
+     "text": "2026\n1999 12345",
+     "pieces": [
+      "2",
+      "0",
+      "2",
+      "6",
+      "\n",
+      "1",
+      "9",
+      "9",
+      "9",
+      " ",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+     ]
+    },
+    {
+     "text": "héllo\nwörld",
+     "pieces": [
+      "héllo",
+      "\n",
+      "wörld"
+     ]
+    },
+    {
+     "text": "こんにちは\n世界",
+     "pieces": [
+      "こんにちは",
+      "\n",
+      "世界"
+     ]
+    },
+    {
+     "text": "नमस्ते\nदुनिया",
+     "pieces": [
+      "नमस",
+      "्त",
+      "े\n",
+      "द",
+      "ुन",
+      "िय",
+      "ा"
+     ]
+    },
+    {
+     "text": "Hello-Reyes\n-Reyes",
+     "pieces": [
+      "Hello",
+      "-Reyes",
+      "\n",
+      "-Reyes"
+     ]
+    },
+    {
+     "text": "a--b\n--c",
+     "pieces": [
+      "a",
+      "--",
+      "b",
+      "\n",
+      "--",
+      "c"
+     ]
+    },
+    {
+     "text": "url: https://x.y/z?a=1\n",
+     "pieces": [
+      "url",
+      ":",
+      " https",
+      "://",
+      "x",
+      ".y",
+      "/z",
+      "?a",
+      "=",
+      "1",
+      "\n"
+     ]
+    },
+    {
+     "text": " \n x",
+     "pieces": [
+      " \n",
+      " x"
+     ]
+    },
+    {
+     "text": "   leading",
+     "pieces": [
+      "  ",
+      " leading"
+     ]
+    },
+    {
+     "text": "trailing   ",
+     "pieces": [
+      "trailing",
+      "   "
+     ]
+    },
+    {
+     "text": "mixed \t \n \t end",
+     "pieces": [
+      "mixed",
+      " \t \n",
+      " \t",
+      " end"
+     ]
+    },
+    {
+     "text": "'ſt it'ſelf o'ſtrich",
+     "pieces": [
+      "'ſ",
+      "t",
+      " it",
+      "'ſ",
+      "elf",
+      " o",
+      "'ſ",
+      "trich"
+     ]
+    }
+   ]
+  },
+  "qwen35": {
+   "source": "Qwen/Qwen3.5-0.8B",
+   "regex": [
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+   ],
+   "cases": [
+    {
+     "text": "<think>\n\n</think>\n",
+     "pieces": [
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n"
+     ]
+    },
+    {
+     "text": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+     "pieces": [
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "assistant",
+      "\n",
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n\n"
+     ]
+    },
+    {
+     "text": "a:\n",
+     "pieces": [
+      "a",
+      ":\n"
+     ]
+    },
+    {
+     "text": "x;\r\n",
+     "pieces": [
+      "x",
+      ";\r\n"
+     ]
+    },
+    {
+     "text": "\n  x",
+     "pieces": [
+      "\n",
+      " ",
+      " x"
+     ]
+    },
+    {
+     "text": "foo  \n bar",
+     "pieces": [
+      "foo",
+      "  \n",
+      " bar"
+     ]
+    },
+    {
+     "text": "\n\n\n",
+     "pieces": [
+      "\n\n\n"
+     ]
+    },
+    {
+     "text": "a \n",
+     "pieces": [
+      "a",
+      " \n"
+     ]
+    },
+    {
+     "text": "end.\n\nNext",
+     "pieces": [
+      "end",
+      ".\n\n",
+      "Next"
+     ]
+    },
+    {
+     "text": "  \n\t\n  y",
+     "pieces": [
+      "  \n\t\n",
+      " ",
+      " y"
+     ]
+    },
+    {
+     "text": "a\r\n\r\nb",
+     "pieces": [
+      "a",
+      "\r\n\r\n",
+      "b"
+     ]
+    },
+    {
+     "text": "\t(x)\n",
+     "pieces": [
+      "\t",
+      "(x",
+      ")\n"
+     ]
+    },
+    {
+     "text": "def f(x):\n    return x  # ok\n\n\nprint(f(1))\n",
+     "pieces": [
+      "def",
+      " f",
+      "(x",
+      "):\n",
+      "   ",
+      " return",
+      " x",
+      " ",
+      " #",
+      " ok",
+      "\n\n\n",
+      "print",
+      "(f",
+      "(",
+      "1",
+      "))\n"
+     ]
+    },
+    {
+     "text": "- item one\n- item two\n\n1. first\n2. second",
+     "pieces": [
+      "-",
+      " item",
+      " one",
+      "\n",
+      "-",
+      " item",
+      " two",
+      "\n\n",
+      "1",
+      ".",
+      " first",
+      "\n",
+      "2",
+      ".",
+      " second"
+     ]
+    },
+    {
+     "text": "key: value\r\nother:\tvalue2 \r\n",
+     "pieces": [
+      "key",
+      ":",
+      " value",
+      "\r\n",
+      "other",
+      ":",
+      "\tvalue",
+      "2",
+      " \r\n"
+     ]
+    },
+    {
+     "text": "line with trailing spaces   \nnext",
+     "pieces": [
+      "line",
+      " with",
+      " trailing",
+      " spaces",
+      "   \n",
+      "next"
+     ]
+    },
+    {
+     "text": " \n ",
+     "pieces": [
+      " \n",
+      " "
+     ]
+    },
+    {
+     "text": "\n",
+     "pieces": [
+      "\n"
+     ]
+    },
+    {
+     "text": " ",
+     "pieces": [
+      " "
+     ]
+    },
+    {
+     "text": "  ",
+     "pieces": [
+      "  "
+     ]
+    },
+    {
+     "text": "x \n\n y",
+     "pieces": [
+      "x",
+      " \n\n",
+      " y"
+     ]
+    },
+    {
+     "text": "}\n}\n",
+     "pieces": [
+      "}\n",
+      "}\n"
+     ]
+    },
+    {
+     "text": "!!\n\n??",
+     "pieces": [
+      "!!\n\n",
+      "??"
+     ]
+    },
+    {
+     "text": "a.\n b",
+     "pieces": [
+      "a",
+      ".\n",
+      " b"
+     ]
+    },
+    {
+     "text": "Q:\nA:\n",
+     "pieces": [
+      "Q",
+      ":\n",
+      "A",
+      ":\n"
+     ]
+    },
+    {
+     "text": "IT'S we'RE they'Ll",
+     "pieces": [
+      "IT",
+      "'S",
+      " we",
+      "'RE",
+      " they",
+      "'Ll"
+     ]
+    },
+    {
+     "text": "tab\tsep\tvalues\n",
+     "pieces": [
+      "tab",
+      "\tsep",
+      "\tvalues",
+      "\n"
+     ]
+    },
+    {
+     "text": "2026\n1999 12345",
+     "pieces": [
+      "2",
+      "0",
+      "2",
+      "6",
+      "\n",
+      "1",
+      "9",
+      "9",
+      "9",
+      " ",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+     ]
+    },
+    {
+     "text": "héllo\nwörld",
+     "pieces": [
+      "héllo",
+      "\n",
+      "wörld"
+     ]
+    },
+    {
+     "text": "こんにちは\n世界",
+     "pieces": [
+      "こんにちは",
+      "\n",
+      "世界"
+     ]
+    },
+    {
+     "text": "नमस्ते\nदुनिया",
+     "pieces": [
+      "नमस्ते",
+      "\n",
+      "दुनिया"
+     ]
+    },
+    {
+     "text": "Hello-Reyes\n-Reyes",
+     "pieces": [
+      "Hello",
+      "-Reyes",
+      "\n",
+      "-Reyes"
+     ]
+    },
+    {
+     "text": "a--b\n--c",
+     "pieces": [
+      "a",
+      "--",
+      "b",
+      "\n",
+      "--",
+      "c"
+     ]
+    },
+    {
+     "text": "url: https://x.y/z?a=1\n",
+     "pieces": [
+      "url",
+      ":",
+      " https",
+      "://",
+      "x",
+      ".y",
+      "/z",
+      "?a",
+      "=",
+      "1",
+      "\n"
+     ]
+    },
+    {
+     "text": " \n x",
+     "pieces": [
+      " \n",
+      " x"
+     ]
+    },
+    {
+     "text": "   leading",
+     "pieces": [
+      "  ",
+      " leading"
+     ]
+    },
+    {
+     "text": "trailing   ",
+     "pieces": [
+      "trailing",
+      "   "
+     ]
+    },
+    {
+     "text": "mixed \t \n \t end",
+     "pieces": [
+      "mixed",
+      " \t \n",
+      " \t",
+      " end"
+     ]
+    },
+    {
+     "text": "'ſt it'ſelf o'ſtrich",
+     "pieces": [
+      "'ſ",
+      "t",
+      " it",
+      "'ſ",
+      "elf",
+      " o",
+      "'ſ",
+      "trich"
+     ]
+    }
+   ]
+  },
+  "llama3": {
+   "source": "unsloth/Llama-3.2-1B-Instruct",
+   "regex": [
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+   ],
+   "cases": [
+    {
+     "text": "<think>\n\n</think>\n",
+     "pieces": [
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n"
+     ]
+    },
+    {
+     "text": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+     "pieces": [
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "assistant",
+      "\n",
+      "<think",
+      ">\n\n",
+      "</",
+      "think",
+      ">\n\n"
+     ]
+    },
+    {
+     "text": "a:\n",
+     "pieces": [
+      "a",
+      ":\n"
+     ]
+    },
+    {
+     "text": "x;\r\n",
+     "pieces": [
+      "x",
+      ";\r\n"
+     ]
+    },
+    {
+     "text": "\n  x",
+     "pieces": [
+      "\n",
+      " ",
+      " x"
+     ]
+    },
+    {
+     "text": "foo  \n bar",
+     "pieces": [
+      "foo",
+      "  \n",
+      " bar"
+     ]
+    },
+    {
+     "text": "\n\n\n",
+     "pieces": [
+      "\n\n\n"
+     ]
+    },
+    {
+     "text": "a \n",
+     "pieces": [
+      "a",
+      " \n"
+     ]
+    },
+    {
+     "text": "end.\n\nNext",
+     "pieces": [
+      "end",
+      ".\n\n",
+      "Next"
+     ]
+    },
+    {
+     "text": "  \n\t\n  y",
+     "pieces": [
+      "  \n\t\n",
+      " ",
+      " y"
+     ]
+    },
+    {
+     "text": "a\r\n\r\nb",
+     "pieces": [
+      "a",
+      "\r\n\r\n",
+      "b"
+     ]
+    },
+    {
+     "text": "\t(x)\n",
+     "pieces": [
+      "\t",
+      "(x",
+      ")\n"
+     ]
+    },
+    {
+     "text": "def f(x):\n    return x  # ok\n\n\nprint(f(1))\n",
+     "pieces": [
+      "def",
+      " f",
+      "(x",
+      "):\n",
+      "   ",
+      " return",
+      " x",
+      " ",
+      " #",
+      " ok",
+      "\n\n\n",
+      "print",
+      "(f",
+      "(",
+      "1",
+      "))\n"
+     ]
+    },
+    {
+     "text": "- item one\n- item two\n\n1. first\n2. second",
+     "pieces": [
+      "-",
+      " item",
+      " one",
+      "\n",
+      "-",
+      " item",
+      " two",
+      "\n\n",
+      "1",
+      ".",
+      " first",
+      "\n",
+      "2",
+      ".",
+      " second"
+     ]
+    },
+    {
+     "text": "key: value\r\nother:\tvalue2 \r\n",
+     "pieces": [
+      "key",
+      ":",
+      " value",
+      "\r\n",
+      "other",
+      ":",
+      "\tvalue",
+      "2",
+      " \r\n"
+     ]
+    },
+    {
+     "text": "line with trailing spaces   \nnext",
+     "pieces": [
+      "line",
+      " with",
+      " trailing",
+      " spaces",
+      "   \n",
+      "next"
+     ]
+    },
+    {
+     "text": " \n ",
+     "pieces": [
+      " \n",
+      " "
+     ]
+    },
+    {
+     "text": "\n",
+     "pieces": [
+      "\n"
+     ]
+    },
+    {
+     "text": " ",
+     "pieces": [
+      " "
+     ]
+    },
+    {
+     "text": "  ",
+     "pieces": [
+      "  "
+     ]
+    },
+    {
+     "text": "x \n\n y",
+     "pieces": [
+      "x",
+      " \n\n",
+      " y"
+     ]
+    },
+    {
+     "text": "}\n}\n",
+     "pieces": [
+      "}\n",
+      "}\n"
+     ]
+    },
+    {
+     "text": "!!\n\n??",
+     "pieces": [
+      "!!\n\n",
+      "??"
+     ]
+    },
+    {
+     "text": "a.\n b",
+     "pieces": [
+      "a",
+      ".\n",
+      " b"
+     ]
+    },
+    {
+     "text": "Q:\nA:\n",
+     "pieces": [
+      "Q",
+      ":\n",
+      "A",
+      ":\n"
+     ]
+    },
+    {
+     "text": "IT'S we'RE they'Ll",
+     "pieces": [
+      "IT",
+      "'S",
+      " we",
+      "'RE",
+      " they",
+      "'Ll"
+     ]
+    },
+    {
+     "text": "tab\tsep\tvalues\n",
+     "pieces": [
+      "tab",
+      "\tsep",
+      "\tvalues",
+      "\n"
+     ]
+    },
+    {
+     "text": "2026\n1999 12345",
+     "pieces": [
+      "202",
+      "6",
+      "\n",
+      "199",
+      "9",
+      " ",
+      "123",
+      "45"
+     ]
+    },
+    {
+     "text": "héllo\nwörld",
+     "pieces": [
+      "héllo",
+      "\n",
+      "wörld"
+     ]
+    },
+    {
+     "text": "こんにちは\n世界",
+     "pieces": [
+      "こんにちは",
+      "\n",
+      "世界"
+     ]
+    },
+    {
+     "text": "नमस्ते\nदुनिया",
+     "pieces": [
+      "नमस",
+      "्त",
+      "े\n",
+      "द",
+      "ुन",
+      "िय",
+      "ा"
+     ]
+    },
+    {
+     "text": "Hello-Reyes\n-Reyes",
+     "pieces": [
+      "Hello",
+      "-Reyes",
+      "\n",
+      "-Reyes"
+     ]
+    },
+    {
+     "text": "a--b\n--c",
+     "pieces": [
+      "a",
+      "--",
+      "b",
+      "\n",
+      "--",
+      "c"
+     ]
+    },
+    {
+     "text": "url: https://x.y/z?a=1\n",
+     "pieces": [
+      "url",
+      ":",
+      " https",
+      "://",
+      "x",
+      ".y",
+      "/z",
+      "?a",
+      "=",
+      "1",
+      "\n"
+     ]
+    },
+    {
+     "text": " \n x",
+     "pieces": [
+      " \n",
+      " x"
+     ]
+    },
+    {
+     "text": "   leading",
+     "pieces": [
+      "  ",
+      " leading"
+     ]
+    },
+    {
+     "text": "trailing   ",
+     "pieces": [
+      "trailing",
+      "   "
+     ]
+    },
+    {
+     "text": "mixed \t \n \t end",
+     "pieces": [
+      "mixed",
+      " \t \n",
+      " \t",
+      " end"
+     ]
+    },
+    {
+     "text": "'ſt it'ſelf o'ſtrich",
+     "pieces": [
+      "'ſ",
+      "t",
+      " it",
+      "'ſ",
+      "elf",
+      " o",
+      "'ſ",
+      "trich"
+     ]
+    }
+   ]
+  }
+ }
+}
