@@ -75,7 +75,7 @@ pub(crate) fn wav(b: &[u8]) -> Result<(Vec<f32>, usize), String> {
 
 pub(crate) fn transcriptions(eng: &Engine, body: &[u8], headers: &[(String, String)], stream: &mut TcpStream) {
     let bad = |s: &mut TcpStream, m: &str| write_json(s, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
-    let Some((name, asr)) = eng.asr.as_ref() else {
+    let Some((name, asr)) = eng.aux.asr.as_ref() else {
         return bad(stream, "no speech model loaded: start the server with --asr <parakeet.gguf> (or FERRIC_ASR_MODEL)");
     };
     let ct = headers.iter().find(|(k, _)| k == "content-type").map(|(_, v)| v.as_str()).unwrap_or("");

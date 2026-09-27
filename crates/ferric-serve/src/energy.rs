@@ -102,6 +102,10 @@ pub(crate) fn attribute(samples: &[ferric_joule::MacmonSample], windows: &[(f64,
     let mean = |v: &[&ferric_joule::MacmonSample], f: &dyn Fn(&ferric_joule::MacmonSample) -> f64|
         if v.is_empty() { None } else { Some(v.iter().map(|s| f(s)).sum::<f64>() / v.len() as f64) };
     let (idle_a, idle_s) = if idle.len() >= 8 { (mean(&idle, &accel), mean(&idle, &soc)) } else { (None, None) };
+    // How much the background itself moves between idle samples. On a shared machine another process's
+    // GPU work comes and goes; while it is in the baseline but not in the window (or the reverse), the
+    // difference is charged to — or credited against — the request.
+    let idle_sd = idle_a.map(|m| (idle.iter().map(|s| (accel(s) - m).powi(2)).sum::<f64>() / idle.len() as f64).sqrt());
     // Piecewise-linear power with held edges, integrated by trapezoid; each instant shared by n(t).
     let at = |t: f64, f: &dyn Fn(&ferric_joule::MacmonSample) -> f64| -> f64 {
         let i = span.iter().rposition(|s| s.t <= t);
@@ -135,19 +139,32 @@ pub(crate) fn attribute(samples: &[ferric_joule::MacmonSample], windows: &[(f64,
     // The SoC figure needs its CPU rail: this machine's macmon has reported it as exactly 0 throughout.
     let cpu_zero = span.iter().filter(|s| s.cpu == 0.0).count() * 2 > span.len();
     let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
-    let joules = idle_a.map(|_| r3(share_a));
+    // ⛔ Two refusals, found live with five other jobs compiling and benchmarking on the same GPU: four
+    // requests in a row came out at −0.12 to −5.1 J. Energy below idle is not physics, it is a baseline
+    // that moved. (1) a window that drew no more than the baseline says nothing; (2) a window whose excess
+    // over idle is within twice the idle samples' own spread cannot be told apart from the background.
+    let excess_w = idle_a.map(|i| gross_a / secs - i);
+    let unresolved = match (excess_w, idle_sd) {
+        (Some(x), _) if x <= 0.0 => Some(format!("the window averaged {:.2} W on the accelerator rails, no more than the idle baseline \
+            ({:.2} W): the background changed during it, so this request's energy cannot be separated", gross_a / secs, idle_a.unwrap_or(0.0))),
+        (Some(x), Some(sd)) if x < 2.0 * sd => Some(format!("this request drew {x:.2} W over idle but the idle samples themselves swing \
+            ±{sd:.2} W (another process's load): unresolvable while the machine is shared")),
+        _ => None,
+    };
+    let joules = if unresolved.is_some() { None } else { idle_a.map(|_| r3(share_a)) };
     json!({
         "joules": joules,
         "joules_per_token": joules.map(|j| if tokens > 0 { r3(j / tokens as f64) } else { 0.0 }),
         "window_joules": r3(gross_a),
         "idle_watts": idle_a.map(r3),
+        "idle_sd_watts": idle_sd.map(r3),
         "seconds": r3(secs),
         "concurrent_max": nmax,
         "soc_joules": if cpu_zero || idle_s.is_none() { Value::Null } else { json!(r3(share_s)) },
         "boundary": "accelerator: GPU + DRAM rails",
         "class": "derived",
         "meter": "macmon, 100 ms samples, trapezoid",
-        "why": if idle_a.is_none() { json!("no idle baseline yet (needs 8 samples with nothing in flight in the last 2 min): joules is null, window_joules is gross") }
+        "why": if let Some(u) = unresolved { json!(u) } else if idle_a.is_none() { json!("no idle baseline yet (needs 8 samples with nothing in flight in the last 2 min): joules is null, window_joules is gross") }
                else if cpu_zero { json!("the CPU rail read 0 in most samples, so the SoC figure is withheld") } else { Value::Null },
     })
 }
@@ -168,6 +185,7 @@ mod tests {
         tr.extend((0..=20).map(|i| s(10.0 + i as f64 * 0.1, 11.0)));             // work: 12 W
         tr.extend((1..=20).map(|i| s(12.0 + i as f64 * 0.1, 1.0)));
         let one = attribute(&tr, &[(10.0, 12.0)], 10.0, 12.0, 10);
+        assert_eq!(one["idle_sd_watts"].as_f64(), Some(0.0));
         assert!((one["joules"].as_f64().unwrap() - 20.0).abs() < 0.05, "{one}");
         assert_eq!(one["idle_watts"].as_f64().unwrap(), 2.0);
         assert!((one["joules_per_token"].as_f64().unwrap() - 2.0).abs() < 0.01);
@@ -193,5 +211,21 @@ mod tests {
         let fresh: Vec<_> = (0..14).map(|i| s(i as f64 * 0.1, 11.0)).collect();
         let v = attribute(&fresh, &[(0.05, 1.15)], 0.05, 1.15, 5);
         assert!(v["joules"].is_null() && v["window_joules"].as_f64().unwrap() > 0.0, "{v}");
+    }
+
+    /// The live failure: a baseline taken while another process loaded the GPU, then a request window
+    /// after it stopped — the request "saved" energy. And a background that swings more than the request.
+    #[test]
+    fn a_window_below_idle_or_inside_the_background_swing_is_refused_not_reported() {
+        let mut tr: Vec<_> = (0..100).map(|i| s(i as f64 * 0.1, 19.0)).collect(); // idle 20 W (a neighbour busy)
+        tr.extend((0..=20).map(|i| s(10.0 + i as f64 * 0.1, 9.0)));               // window 10 W
+        let v = attribute(&tr, &[(10.0, 12.0)], 10.0, 12.0, 10);
+        assert!(v["joules"].is_null() && v["why"].as_str().unwrap().contains("no more than the idle"), "{v}");
+        assert!(v["window_joules"].as_f64().unwrap() > 0.0, "the gross figure is still reported");
+        let mut tr: Vec<_> = (0..100).map(|i| s(i as f64 * 0.1, if i % 2 == 0 { 1.0 } else { 21.0 })).collect(); // 12 ± 10 W
+        tr.extend((0..=20).map(|i| s(10.0 + i as f64 * 0.1, 14.0)));             // 15 W: +3 W
+        let v = attribute(&tr, &[(10.0, 12.0)], 10.0, 12.0, 10);
+        assert!(v["joules"].is_null() && v["why"].as_str().unwrap().contains("swing"), "{v}");
+        assert!((v["idle_sd_watts"].as_f64().unwrap() - 10.0).abs() < 0.05, "{v}");
     }
 }

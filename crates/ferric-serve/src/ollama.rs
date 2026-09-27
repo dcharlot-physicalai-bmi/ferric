@@ -31,7 +31,7 @@ use std::time::Instant;
 
 /// The API level this server answers as. Clients gate features on it, so it is a real Ollama release
 /// number with a build tag rather than an invented one.
-const API_VERSION: &str = "0.12.0-ferric";
+pub(crate) const API_VERSION: &str = "0.12.0-ferric";
 
 /// What `/api/tags`, `/api/show` and `/api/ps` report about one loaded model, gathered once at load.
 #[derive(Clone, Debug)]
@@ -112,7 +112,7 @@ impl Card {
                "parameter_size": self.param_size(), "quantization_level": self.quant})
     }
 
-    fn tag_entry(&self) -> Value {
+    pub(crate) fn tag_entry(&self) -> Value {
         json!({"name": self.tagged(), "model": self.tagged(), "modified_at": rfc3339(self.modified),
                "size": self.size, "digest": self.digest(), "details": self.details()})
     }
@@ -144,7 +144,7 @@ pub(crate) fn rfc3339(t: std::time::SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z", rem / 3600, rem % 3600 / 60, rem % 60, d.subsec_nanos())
 }
 
-fn now() -> String { rfc3339(std::time::SystemTime::now()) }
+pub(crate) fn now() -> String { rfc3339(std::time::SystemTime::now()) }
 
 fn err(stream: &mut TcpStream, code: u16, m: &str) { write_json(stream, code, &json!({"error": m})) }
 
@@ -209,31 +209,16 @@ fn ollama_tool_calls(calls: &[Value]) -> Vec<Value> {
 pub(crate) fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8],
                      stream: &mut TcpStream) -> bool {
     match (method, path) {
-        ("GET", "/") | ("HEAD", "/") => {
-            let b = b"ferric-serve is running (OpenAI /v1 and Ollama /api)";
-            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", b.len()).as_bytes());
-            if method == "GET" { let _ = stream.write_all(b); }
-            let _ = stream.flush();
-        }
-        ("GET", "/api/version") => write_json(stream, 200, &json!({"version": API_VERSION})),
-        ("GET", "/api/tags") => write_json(stream, 200, &json!({"models": eng.cards().iter().map(Card::tag_entry).collect::<Vec<_>>()})),
-        ("GET", "/api/ps") => {
-            let models: Vec<Value> = eng.cards().iter().map(|c| {
-                let mut e = c.tag_entry();
-                e["expires_at"] = json!("2318-01-01T00:00:00Z"); // resident until the server stops
-                e["size_vram"] = json!(c.size);
-                e
-            }).collect();
-            write_json(stream, 200, &json!({"models": models}))
-        }
+        // `/`, `/api/version`, `/api/tags`, `/api/ps` and the load/unload requests are the pool's (batch.rs).
         ("POST", "/api/show") => show(eng, body, stream),
         ("POST", "/api/chat") => chat(eng, mcps, body, stream),
         ("POST", "/api/generate") => generate(eng, mcps, body, stream),
         ("POST", "/api/embed") => embed(eng, body, stream, false),
         ("POST", "/api/embeddings") => embed(eng, body, stream, true),
         ("POST", "/api/pull") | ("POST", "/api/push") | ("POST", "/api/create") | ("POST", "/api/copy") | ("DELETE", "/api/delete") =>
-            err(stream, 501, "ferric-serve serves the models it was started with; it does not manage a model store. \
-                              Start it with the GGUF path or an owner/repo[:file.gguf] Hugging Face reference"),
+            err(stream, 501, "ferric-serve loads any GGUF in its model directory on request, but does not download, \
+                              copy or delete files: use `ferric pull owner/repo` (or start the server with an \
+                              owner/repo[:file.gguf] Hugging Face reference)"),
         _ => return false,
     }
     true
@@ -250,16 +235,21 @@ fn show(eng: &Engine, body: &[u8], stream: &mut TcpStream) {
     let Some(c) = cards.iter().find(|c| c.matches(want)).or_else(|| if want.is_empty() { cards.first() } else { None }) else {
         return err(stream, 404, &format!("model '{want}' not found; loaded: {}", cards.iter().map(|c| c.tagged()).collect::<Vec<_>>().join(", ")));
     };
+    write_json(stream, 200, &show_body(c));
+}
+
+/// `/api/show` for one card — a loaded model's, or one read from a file's header without loading it.
+pub(crate) fn show_body(c: &Card) -> Value {
     let mut info = serde_json::Map::new();
     info.insert("general.architecture".into(), json!(c.arch));
     info.insert("general.parameter_count".into(), json!(c.params));
     info.insert(format!("{}.context_length", c.arch), json!(c.context));
     info.insert(format!("{}.embedding_length", c.arch), json!(c.dim));
-    write_json(stream, 200, &json!({
+    json!({
         "modelfile": format!("# served by ferric-serve\nFROM {}\n", c.path), "parameters": "",
         "template": c.template, "details": c.details(), "model_info": Value::Object(info),
         "capabilities": c.capabilities(), "modified_at": rfc3339(c.modified),
-    }));
+    })
 }
 
 /// Validate what the OpenAI path would refuse later, BEFORE a 200 goes out, so a bad request is a

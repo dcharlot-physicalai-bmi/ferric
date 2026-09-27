@@ -3,7 +3,20 @@
 //! `/v1/models`, and `/health` over the pure-Rust cross-fabric runtime. Any OpenAI client, agent
 //! framework (LangChain, LangGraph, the Vercel AI SDK, …), or `curl` points at it unchanged.
 //!
-//!   cargo run -p ferric-serve --release -- <model.gguf> [--port 8080] [--name my-model]
+//!   cargo run -p ferric-serve --release -- [model.gguf] [--port 8080] [--name my-model]
+//!
+//! **Several models** (`batch::Pool`, `models`). A request's `model` names any GGUF in `FERRIC_MODELS`
+//! (default `~/.cache/ferric/hub`) by file stem, `owner/repo[:tag]` or path, and it loads on first use —
+//! with no model argument the server answers for the whole directory, as `ollama serve` does. Each resident
+//! model keeps its own batch; they share one GPU context and ONE power meter, so concurrent requests on
+//! different models split each instant's watts. Ollama's `keep_alive` (and LM Studio's `ttl`) set how long
+//! a model stays after its last request (default `--keep-alive 5m`; 0 unloads; negative = until evicted);
+//! idle models are unloaded least-recently-used first to fit `--max-models` (3) and 75% of physical memory
+//! in model files (`FERRIC_MAX_MEMORY`, GiB). A model named on the command line is never evicted for room
+//! and answers requests naming a model nothing on disk matches (llama-server's behaviour); without one, that
+//! is a 404 naming what is on disk. `/v1/models` and `/api/tags` list everything loadable, `/api/ps` what is
+//! resident. ⚠ Loading runs on the engine thread: other models' generations pause for it (0.3–0.7 s for
+//! 0.5–1B models measured). Encoders (`--embed`, `--rerank`, `--asr`) are loaded from flags, not on demand.
 //!
 //! **Structured output** (`/v1/chat/completions` only). `response_format` constrains generation
 //! *in-runtime* by masking the sampler to the bytes that keep the output a valid JSON prefix — so the
@@ -43,6 +56,7 @@ mod energy;
 mod dialects;
 mod audio;
 mod ollama;
+mod models;
 pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};
@@ -264,9 +278,8 @@ fn byte_decoder() -> HashMap<char, u8> {
     m
 }
 
-pub(crate) struct Engine {
-    ctx: Arc<Context>,
-    model: Model,
+/// The encoder-side models, loaded once from flags and shared by every chat model the server loads.
+pub(crate) struct Aux {
     /// A cross-encoder reranker, loaded SEPARATELY from `FERRIC_RERANK_MODEL`.
     ///
     /// It is a second model, not a mode of the first: rerankers are encoders with a classification
@@ -279,6 +292,67 @@ pub(crate) struct Engine {
     /// last token is not what a RAG pipeline means by an embedding; when this is loaded, `/v1/embeddings`
     /// uses it unless the request names the chat model.
     embedder: Option<(String, ferric_llama::bert::Embedder, ollama::Card)>,
+    /// A speech recogniser for `/v1/audio/transcriptions`, from `--asr` / FERRIC_ASR_MODEL.
+    pub(crate) asr: Option<(String, ferric_llama::parakeet::Parakeet)>,
+}
+
+impl Aux {
+    fn load(ctx: &Arc<Context>) -> Aux {
+        // Loaded before any chat model so a bad path fails immediately rather than after a multi-GB
+        // load, and so the panic names which file was wrong.
+        let reranker = std::env::var("FERRIC_RERANK_MODEL").ok().map(|rp| {
+            let rg = GgufFile::open(&rp).unwrap_or_else(|e| panic!("open FERRIC_RERANK_MODEL {rp}: {e:?}"));
+            ferric_llama::bert::Reranker::load(ctx, &rg)
+                .unwrap_or_else(|e| panic!("load FERRIC_RERANK_MODEL {rp}: {e}"))
+        });
+        let embedder = std::env::var("FERRIC_EMBED_MODEL").ok().map(|ep| {
+            let eg = GgufFile::open(&ep).unwrap_or_else(|e| panic!("open FERRIC_EMBED_MODEL {ep}: {e:?}"));
+            let e = ferric_llama::bert::Embedder::load(ctx, &eg)
+                .unwrap_or_else(|e| panic!("load FERRIC_EMBED_MODEL {ep}: {e}"));
+            let name = std::path::Path::new(&ep).file_stem().and_then(|s| s.to_str()).unwrap_or("embed").to_string();
+            eprintln!("ferric-serve: embedding model {name} ({}, d {}, pooling {}, context {})",
+                      e.cfg().arch, e.cfg().d, e.cfg().pooling, e.cfg().n_ctx);
+            let card = ollama::Card::from_gguf(&name, &ep, &eg, true, e.cfg().d, e.cfg().n_ctx, "");
+            (name, e, card)
+        });
+        let asr = std::env::var("FERRIC_ASR_MODEL").ok().map(|ap| {
+            let ag = GgufFile::open(&ap).unwrap_or_else(|e| panic!("open FERRIC_ASR_MODEL {ap}: {e:?}"));
+            let m = ferric_llama::parakeet::Parakeet::load(ctx, &ag).unwrap_or_else(|e| panic!("load FERRIC_ASR_MODEL {ap}: {e}"));
+            let name = std::path::Path::new(&ap).file_stem().and_then(|s| s.to_str()).unwrap_or("asr").to_string();
+            eprintln!("ferric-serve: speech model {name} ({} Hz) — /v1/audio/transcriptions", m.cfg.sample_rate);
+            (name, m)
+        });
+        Aux { reranker, embedder, asr }
+    }
+}
+
+/// What every model in the process shares. One GPU context. The encoder-side models. ONE power meter,
+/// so that two requests running on DIFFERENT models at the same instant split its watts: `n(t)` in
+/// the attribution counts every request in flight, and a meter per model would charge each of them
+/// the whole instant. The counters `/metrics` sums, and the Responses store (a `previous_response_id`
+/// may continue on another model).
+#[derive(Clone)]
+pub(crate) struct Shared {
+    ctx: Arc<Context>,
+    aux: Arc<Aux>,
+    energy: Arc<energy::Energy>,
+    metrics: Arc<Metrics>,
+    responses: Arc<dialects::ResponseStore>,
+}
+
+impl Shared {
+    pub(crate) fn new() -> Shared {
+        let ctx = Arc::new(pollster::block_on(Context::new()).unwrap());
+        Shared { aux: Arc::new(Aux::load(&ctx)), ctx, energy: Arc::new(energy::Energy::start()),
+                 metrics: Arc::new(Metrics::default()), responses: Arc::new(dialects::ResponseStore::new()) }
+    }
+}
+
+pub(crate) struct Engine {
+    ctx: Arc<Context>,
+    model: Model,
+    /// The embedder, reranker and speech model — the server's, shared with every other loaded model.
+    pub(crate) aux: Arc<Aux>,
     /// What `/api/tags` and `/api/show` report about the chat model.
     card: ollama::Card,
     /// The GGUF's own chat template, compiled — `None` only when it is absent or will not compile, and
@@ -287,19 +361,17 @@ pub(crate) struct Engine {
     /// This model's reasoning markers, read from its chat template: `<think>`/`</think>` or Gemma 4's
     /// `<|channel>thought`/`<channel|>`. `None` = not a thinking model.
     reasoning_markers: Option<(String, String)>,
-    /// The long-lived power sampler every generation's joules are attributed from.
-    pub(crate) energy: energy::Energy,
-    /// Responses kept for the Responses API's `previous_response_id`.
-    responses: dialects::ResponseStore,
-    /// Counters for `/metrics`.
-    pub(crate) metrics: Metrics,
+    /// The long-lived power sampler every generation's joules are attributed from (the server's one).
+    pub(crate) energy: Arc<energy::Energy>,
+    /// Responses kept for the Responses API's `previous_response_id` (shared across models).
+    responses: Arc<dialects::ResponseStore>,
+    /// Counters for `/metrics` (server-wide).
+    pub(crate) metrics: Arc<Metrics>,
     /// **Prompt caching across requests** (dense runtime): the K/V of recent sequences, keyed by their
     /// tokens. A multi-turn chat resends the whole conversation, and every turn used to prefill all of it;
     /// now the longest cached whole-chunk prefix is copied and only the rest is computed. `FERRIC_PREFIX_CACHE`
     /// = sequences kept (default 8; 0 = off).
     prefix_cache: Option<std::cell::RefCell<ferric_llama::prefix::PrefixCache>>,
-    /// A speech recogniser for `/v1/audio/transcriptions`, from `--asr` / FERRIC_ASR_MODEL.
-    pub(crate) asr: Option<(String, ferric_llama::parakeet::Parakeet)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -402,32 +474,12 @@ pub(crate) struct GenOut {
 struct PrefixSlot { fed: Vec<u32>, cache: qwen35::Cache, mc: qwen35::MtpCache }
 
 impl Engine {
-    fn load(path: &str, name: String) -> Engine {
-        let ctx = Arc::new(pollster::block_on(Context::new()).unwrap());
-        // Loaded before the main model so a bad reranker path fails immediately rather than after a
-        // multi-GB load, and so the panic names which of the two files was wrong.
-        let reranker = std::env::var("FERRIC_RERANK_MODEL").ok().map(|rp| {
-            let rg = GgufFile::open(&rp).unwrap_or_else(|e| panic!("open FERRIC_RERANK_MODEL {rp}: {e:?}"));
-            ferric_llama::bert::Reranker::load(&ctx, &rg)
-                .unwrap_or_else(|e| panic!("load FERRIC_RERANK_MODEL {rp}: {e}"))
-        });
-        let embedder = std::env::var("FERRIC_EMBED_MODEL").ok().map(|ep| {
-            let eg = GgufFile::open(&ep).unwrap_or_else(|e| panic!("open FERRIC_EMBED_MODEL {ep}: {e:?}"));
-            let e = ferric_llama::bert::Embedder::load(&ctx, &eg)
-                .unwrap_or_else(|e| panic!("load FERRIC_EMBED_MODEL {ep}: {e}"));
-            let name = std::path::Path::new(&ep).file_stem().and_then(|s| s.to_str()).unwrap_or("embed").to_string();
-            eprintln!("ferric-serve: embedding model {name} ({}, d {}, pooling {}, context {})",
-                      e.cfg().arch, e.cfg().d, e.cfg().pooling, e.cfg().n_ctx);
-            let card = ollama::Card::from_gguf(&name, &ep, &eg, true, e.cfg().d, e.cfg().n_ctx, "");
-            (name, e, card)
-        });
-        let asr = std::env::var("FERRIC_ASR_MODEL").ok().map(|ap| {
-            let ag = GgufFile::open(&ap).unwrap_or_else(|e| panic!("open FERRIC_ASR_MODEL {ap}: {e:?}"));
-            let m = ferric_llama::parakeet::Parakeet::load(&ctx, &ag).unwrap_or_else(|e| panic!("load FERRIC_ASR_MODEL {ap}: {e}"));
-            let name = std::path::Path::new(&ap).file_stem().and_then(|s| s.to_str()).unwrap_or("asr").to_string();
-            eprintln!("ferric-serve: speech model {name} ({} Hz) — /v1/audio/transcriptions", m.cfg.sample_rate);
-            (name, m)
-        });
+    /// Load one model with a fresh context and whatever encoder-side models the environment names.
+    fn load(path: &str, name: String) -> Engine { Engine::load_in(&Shared::new(), path, name) }
+
+    /// Load one chat model into the server's shared context, meter and encoder-side models.
+    pub(crate) fn load_in(shared: &Shared, path: &str, name: String) -> Engine {
+        let ctx = shared.ctx.clone();
         let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
             Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
@@ -615,12 +667,12 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), metrics: Default::default(),
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, aux: shared.aux.clone(), card, chat_template, reasoning_markers, energy: shared.energy.clone(), responses: shared.responses.clone(), metrics: shared.metrics.clone(),
                  prefix_cache: {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 asr, rstrip_after, n_ctx }
+                 rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -837,7 +889,7 @@ impl Engine {
     /// Every loaded model's card: the chat model, then the embedder.
     pub(crate) fn cards(&self) -> Vec<ollama::Card> {
         let mut v = vec![self.card.clone()];
-        if let Some((_, _, c)) = &self.embedder { v.push(c.clone()); }
+        if let Some((_, _, c)) = &self.aux.embedder { v.push(c.clone()); }
         v
     }
 
@@ -1225,11 +1277,30 @@ fn pick_gguf(repo: &str) -> String {
     match pick { Some(f) => { eprintln!("ferric-serve: picked {f} from {repo}"); f.clone() } None => { eprintln!("ferric-serve: no .gguf found in {repo} (specify owner/repo:file.gguf)"); std::process::exit(1); } }
 }
 
+/// Physical memory in bytes: `hw.memsize` on macOS, `MemTotal` on Linux. `None` elsewhere (no budget).
+fn physical_memory() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        let o = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        return String::from_utf8_lossy(&o.stdout).trim().parse().ok();
+    }
+    let m = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = m.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
 /// CLI entry point. Lives in the library so the binary is a two-line shim and everything the
 /// server does stays reachable from tests — see the crate docs.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--embed <encoder.gguf>] [--rerank <cross-encoder.gguf>] [--asr <parakeet.gguf>] [--api-key K] [--host H] [--port N] [--name S]"); std::process::exit(1); });
+    // The model argument is optional: without one the server answers for every model in its model
+    // directory and loads each on its first request, as `ollama serve` does.
+    let path: Option<String> = args.get(1).filter(|a| !a.starts_with("--")).cloned();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprintln!("usage: ferric-serve [model.gguf | owner/repo[:file.gguf]] [--embed <encoder.gguf>] [--rerank <cross-encoder.gguf>] \
+                   [--asr <parakeet.gguf>] [--api-key K] [--host H] [--port N] [--name S] [--max-models N] [--keep-alive 5m]\n\
+                   Any other GGUF in FERRIC_MODELS (default ~/.cache/ferric/hub) loads when a request names it.");
+        std::process::exit(0);
+    }
     let mut port = 8080u16;
     // 127.0.0.1 by default: a model server is not exposed to the network unless someone says so.
     let mut host = "127.0.0.1".to_string();
@@ -1237,12 +1308,15 @@ pub fn run() {
     let mut api_key: Option<String> = std::env::var("FERRIC_API_KEY").ok().filter(|k| !k.is_empty());
     // Default: the file's stem, the way Ollama and LM Studio name a model — "ferric" said nothing about
     // which model this is, and it collided with nothing only because there was never a second one.
-    let mut name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("ferric").to_string();
+    let mut name = path.as_deref().and_then(|p| std::path::Path::new(p).file_stem()).and_then(|s| s.to_str()).unwrap_or("ferric").to_string();
     let mut mcp_cmds: Vec<(String, String)> = Vec::new();
     // How many sequences may share one decode step. 8 is a starting point, not a measured optimum:
     // occupancy is what decides the payoff and only the deployment knows its arrival rate.
     let mut max_batch = std::env::var("FERRIC_MAX_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(8usize);
-    let mut i = 2;
+    // Ollama's defaults: three models resident, each kept five minutes after its last request.
+    let mut max_models = std::env::var("FERRIC_MAX_LOADED_MODELS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(3usize);
+    let mut keep_alive = std::env::var("FERRIC_KEEP_ALIVE").ok().unwrap_or_else(|| "5m".to_string());
+    let mut i = if path.is_some() { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
@@ -1253,6 +1327,8 @@ pub fn run() {
             "--rerank" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_RERANK_MODEL", p) }; } i += 2; }
             "--asr" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_ASR_MODEL", p) }; } i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
+            "--max-models" => { max_models = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_models); i += 2; }
+            "--keep-alive" => { keep_alive = args.get(i + 1).cloned().unwrap_or(keep_alive); i += 2; }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
             "--no-batch" => { unsafe { std::env::set_var("FERRIC_NOBATCH", "1") }; i += 1; }
@@ -1276,39 +1352,61 @@ pub fn run() {
         if mcps.has("add") { eprintln!("  add(2,3) = {:?}", mcps.call("add", &json!({"a": 2, "b": 3}))); }
         return;
     }
-    let resolved = resolve_model(path);
-    let _ = std::time::Instant::now(); // uptime starts when the model is loaded (set below)
-    eprintln!("ferric-serve: loading {resolved} …");
-    let eng = Engine::load(&resolved, name.clone());
-    let _ = eng.metrics.started.set(std::time::Instant::now());
-    if let Some(i) = args.iter().position(|a| a == "--tokenize") {
-        // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
-        let text = args.get(i + 1).cloned().unwrap_or_default();
-        let mut ids = Vec::new();
-        if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
-        ids.extend(eng.enc(&text, true));
-        eprintln!("TOKENS {}: {:?}", ids.len(), ids);
-        return;
-    }
-    if args.iter().any(|a| a == "--once") {
-        // Smoke test: one chat turn straight through the pipeline, no HTTP.
-        let msgs = vec![json!({"role": "user", "content": "Hi"})];
-        let out = eng.generate(&eng.chat_ids(&msgs).expect("chat ids"), 16, &GenOpts::default(), None, |d, _| eprint!("{d}"));
-        eprintln!("\nferric-serve: --once ok ({} prompt + {} gen tokens, {}): {:?}", out.prompt_tokens, out.gen_tokens, out.finish, out.text);
-        return;
+    let keep_alive = match batch::keep_alive_of(&json!({"keep_alive": keep_alive})) {
+        Ok(Some(k)) => k,
+        _ => { eprintln!("ferric-serve: --keep-alive {keep_alive:?}: expected a duration like 5m, 1h or 30s (or -1 for until evicted)"); std::process::exit(1); }
+    };
+    // Weights dominate what a model holds, so model files are budgeted against 75% of physical memory,
+    // leaving the rest for KV caches and everything else on the machine. FERRIC_MAX_MEMORY (GiB) overrides.
+    let max_bytes = std::env::var("FERRIC_MAX_MEMORY").ok().and_then(|s| s.parse::<f64>().ok()).map(|g| (g * 1073741824.0) as u64)
+        .or_else(|| physical_memory().map(|b| b / 4 * 3)).unwrap_or(u64::MAX);
+    let shared = Shared::new();
+    let _ = shared.metrics.started.set(std::time::Instant::now());
+    let mut hub = models::Hub::new(shared.clone());
+    let mut initial = Vec::new();
+    if let Some(path) = &path {
+        let resolved = resolve_model(path);
+        eprintln!("ferric-serve: loading {resolved} …");
+        let key = std::fs::canonicalize(&resolved).map(|p| p.to_string_lossy().into_owned()).unwrap_or(resolved.clone());
+        hub.name(&key, name.clone());
+        let bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        // A model named on the command line that will not load stops the server: a server that will not
+        // boot is a bug report; one that boots without the model it was given answers for something else.
+        let eng = batch::Source::load(&mut hub, &key).unwrap_or_else(|e| { eprintln!("ferric-serve: {e}"); std::process::exit(1) });
+        if let Some(i) = args.iter().position(|a| a == "--tokenize") {
+            // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
+            let text = args.get(i + 1).cloned().unwrap_or_default();
+            let mut ids = Vec::new();
+            if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
+            ids.extend(eng.enc(&text, true));
+            eprintln!("TOKENS {}: {:?}", ids.len(), ids);
+            return;
+        }
+        if args.iter().any(|a| a == "--once") {
+            // Smoke test: one chat turn straight through the pipeline, no HTTP.
+            let msgs = vec![json!({"role": "user", "content": "Hi"})];
+            let out = eng.generate(&eng.chat_ids(&msgs).expect("chat ids"), 16, &GenOpts::default(), None, |d, _| eprint!("{d}"));
+            eprintln!("\nferric-serve: --once ok ({} prompt + {} gen tokens, {}): {:?}", out.prompt_tokens, out.gen_tokens, out.finish, out.text);
+            return;
+        }
+        eprintln!("ferric-serve: {} ({} layers, vocab {}, context {}) on {:?}",
+            name, eng.model.n_layer(), eng.model.n_vocab(), eng.n_ctx, eng.ctx.backend);
+        eprintln!("ferric-serve: continuous batching {}",
+            if eng.batchable() { format!("ON, max_batch {max_batch}") } else { "OFF (serial) — this model has no solo-equivalent batched decode, or it was disabled".to_string() });
+        initial.push(batch::Loaded { key, m: eng, bytes });
     }
     let mcps = std::cell::RefCell::new(mcps);
     let any_mcp_tools = !mcps.borrow().openai_tools().is_empty();
-    let batching = eng.batchable();
-    eprintln!("ferric-serve: {} ({} layers, vocab {}, context {}) on {:?}{} — http://{host}:{port}/v1",
-        name, eng.model.n_layer(), eng.model.n_vocab(), eng.n_ctx, eng.ctx.backend,
+    eprintln!("ferric-serve: http://{host}:{port}/v1 — other models load on request from {} (up to {max_models} resident{}, {}){}",
+        std::env::var("FERRIC_MODELS").unwrap_or_else(|_| "~/.cache/ferric/hub".to_string()),
+        if max_bytes == u64::MAX { String::new() } else { format!(", {:.0} GiB of model files", max_bytes as f64 / 1073741824.0) },
+        match keep_alive { Some(d) => format!("kept {} s after last use", d.as_secs()), None => "kept until evicted".to_string() },
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
-    eprintln!("ferric-serve: continuous batching {}",
-        if batching { format!("ON, max_batch {max_batch}") } else { "OFF (serial) — this model has no solo-equivalent batched decode, or it was disabled".to_string() });
     let listener = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
     // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
     // loop, embeddings, unknown paths) goes to the untouched serial handler below.
-    batch::serve_loop(eng, listener, batch::ServeOpts { max_batch, any_mcp_tools, api_key },
+    let fallback = !initial.is_empty();
+    batch::serve_loop(hub, initial, listener, batch::ServeOpts { max_batch, any_mcp_tools, api_key, max_models, max_bytes, keep_alive, fallback },
         |eng, method, path, body, headers, s| {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(eng, &mcps, method, path, body, headers, s)));
             match r {
@@ -1323,13 +1421,8 @@ pub fn run() {
 fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8],
           headers: &[(String, String)], stream: &mut TcpStream) -> bool {
     match (method, path) {
-        ("GET", "/health") => write_json(stream, 200, &json!({"status": "ok"})),
-        ("GET", "/v1/models") => {
-            let mut data = vec![json!({"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"})];
-            if let Some((n, _, _)) = &eng.embedder { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
-            if let Some((n, _)) = &eng.asr { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
-            write_json(stream, 200, &json!({"object": "list", "data": data}))
-        }
+        // `/health`, `/v1/models`, `/metrics`, `/api/tags`, `/api/ps` describe the whole server, not one
+        // model, and are answered by the pool before a request reaches a model (batch.rs).
         ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
@@ -1337,7 +1430,6 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
         ("POST", "/v1/audio/transcriptions") => audio::transcriptions(eng, body, headers, stream),
         ("POST", "/tokenize") | ("POST", "/v1/tokenize") => tokenize(eng, body, stream),
         ("POST", "/detokenize") | ("POST", "/v1/detokenize") => detokenize(eng, body, stream),
-        ("GET", "/metrics") => metrics(eng, stream),
         ("POST", "/v1/messages") => dialects::messages(eng, mcps, body, stream),
         ("POST", "/v1/messages/count_tokens") => dialects::count_tokens(eng, body, stream),
         ("POST", "/v1/responses") => dialects::responses(eng, mcps, &eng.responses, body, stream),
@@ -1361,7 +1453,7 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
 /// llama-server on bge-reranker-v2-m3: 6.585 vs 6.570 relevant, -8.366 vs -8.361 irrelevant.
 fn rerank(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let bad = |stream: &mut TcpStream, m: &str| write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
-    let Some(rr) = eng.reranker.as_ref() else {
+    let Some(rr) = eng.aux.reranker.as_ref() else {
         return bad(stream, "no reranker loaded: set FERRIC_RERANK_MODEL to a cross-encoder GGUF \
                             (e.g. bge-reranker-v2-m3). A reranker is a SECOND model — an encoder with \
                             a classification head — not a mode of the chat model");
@@ -1398,7 +1490,7 @@ fn rerank(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
 pub(crate) fn embed_texts(eng: &Engine, model: Option<&str>, inputs: &[String], truncate: bool)
     -> Result<(Vec<Vec<f32>>, usize, String), String>
 {
-    match &eng.embedder {
+    match &eng.aux.embedder {
         Some((name, e, _)) if model != Some(eng.name.as_str()) => {
             let (mut out, mut total) = (Vec::with_capacity(inputs.len()), 0usize);
             for t in inputs {
@@ -1504,14 +1596,14 @@ fn detokenize(eng: &Engine, body: &[u8], stream: &mut TcpStream) {
 }
 
 /// Prometheus text format. `ferric_energy_joules_total` is the attributed joules of every request the meter
-/// could attribute — the counter no serving peer exports.
-fn metrics(eng: &Engine, stream: &mut TcpStream) {
+/// could attribute — the counter no serving peer exports. Server-wide: the counters are shared by every
+/// loaded model, and `ferric_model_info` / `ferric_context_length` carry one line per loaded model.
+pub(crate) fn metrics_body(m: &Metrics, meter: bool, models: &[(String, String, usize)]) -> String {
     use std::sync::atomic::Ordering::Relaxed;
-    let m = &eng.metrics;
     let (j, jn) = m.joules.lock().map(|g| *g).unwrap_or((0.0, 0));
     let up = m.started.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
     let esc = |x: &str| x.replace('\\', "\\\\").replace('"', "\\\"");
-    let body = format!(
+    let mut body = format!(
 "# HELP ferric_requests_total Generations completed.\n# TYPE ferric_requests_total counter\nferric_requests_total {}\n\
 # HELP ferric_prompt_tokens_total Prompt tokens processed.\n# TYPE ferric_prompt_tokens_total counter\nferric_prompt_tokens_total {}\n\
 # HELP ferric_generation_tokens_total Tokens generated.\n# TYPE ferric_generation_tokens_total counter\nferric_generation_tokens_total {}\n\
@@ -1519,14 +1611,15 @@ fn metrics(eng: &Engine, stream: &mut TcpStream) {
 # HELP ferric_energy_joules_total Joules attributed to requests (accelerator rails, idle-subtracted; derived).\n# TYPE ferric_energy_joules_total counter\nferric_energy_joules_total {:.3}\n\
 # HELP ferric_energy_attributed_requests_total Requests whose joules the meter could attribute.\n# TYPE ferric_energy_attributed_requests_total counter\nferric_energy_attributed_requests_total {}\n\
 # HELP ferric_energy_meter_available Whether a power meter is running.\n# TYPE ferric_energy_meter_available gauge\nferric_energy_meter_available {}\n\
-# HELP ferric_context_length The loaded model's context.\n# TYPE ferric_context_length gauge\nferric_context_length {}\n\
 # HELP ferric_uptime_seconds Seconds since the server started.\n# TYPE ferric_uptime_seconds gauge\nferric_uptime_seconds {:.1}\n\
-# HELP ferric_model_info The loaded chat model.\n# TYPE ferric_model_info gauge\nferric_model_info{{model=\"{}\",arch=\"{}\"}} 1\n",
+# HELP ferric_models_loaded Chat models resident now.\n# TYPE ferric_models_loaded gauge\nferric_models_loaded {}\n\
+# HELP ferric_model_info A loaded chat model.\n# TYPE ferric_model_info gauge\n",
         m.requests.load(Relaxed), m.prompt_tokens.load(Relaxed), m.gen_tokens.load(Relaxed), m.cancelled.load(Relaxed),
-        j, jn, eng.energy.available() as u8, eng.n_ctx, up, esc(&eng.name), esc(&eng.card.arch));
-    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-    let _ = stream.flush();
+        j, jn, meter as u8, up, models.len());
+    for (name, arch, _) in models { body.push_str(&format!("ferric_model_info{{model=\"{}\",arch=\"{}\"}} 1\n", esc(name), esc(arch))); }
+    body.push_str("# HELP ferric_context_length A loaded model's context.\n# TYPE ferric_context_length gauge\n");
+    for (name, _, n) in models { body.push_str(&format!("ferric_context_length{{model=\"{}\"}} {n}\n", esc(name))); }
+    body
 }
 
 fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {

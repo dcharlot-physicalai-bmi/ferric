@@ -112,6 +112,11 @@ pub(crate) trait ServeModel {
     fn record(&self, _prompt: usize, _gen: usize, _energy: &Value) {}
     /// Close it and attribute its joules.
     fn energy_end(&self, _t: Option<crate::energy::Ticket>, _tokens: usize) -> Value { Value::Null }
+    /// `(name, Ollama /api/tags entry)` for everything this model answers for: itself first, then any
+    /// encoder-side model the server shares with it (an embedder). A request naming any of them routes here.
+    fn cards(&self) -> Vec<(String, Value)> {
+        vec![(self.name().to_string(), json!({"name": self.name(), "model": self.name(), "size": 0}))]
+    }
 }
 
 /// One HTTP request, parsed off its socket by a reader thread and handed to the engine thread.
@@ -150,6 +155,18 @@ impl Inbox {
     pub fn drain(&self) -> Vec<Job> {
         let mut g = self.q.lock().unwrap();
         g.0.drain(..).collect()
+    }
+
+    /// Block until a job arrives or `deadline` passes (then an empty batch). `None` = closed and empty.
+    pub fn wait_until(&self, deadline: std::time::Instant) -> Option<Vec<Job>> {
+        let mut g = self.q.lock().unwrap();
+        while g.0.is_empty() && !g.1 {
+            let now = std::time::Instant::now();
+            if now >= deadline { return Some(Vec::new()); }
+            g = self.cv.wait_timeout(g, deadline - now).unwrap().0;
+        }
+        if g.0.is_empty() { return None; }
+        Some(g.0.drain(..).collect())
     }
 
     /// Block until at least one job arrives. `None` = the listener closed and nothing is left.
@@ -225,6 +242,18 @@ pub(crate) struct ServeOpts {
     /// `--api-key`: when set, every request but `/health` and CORS preflight must present it as
     /// `Authorization: Bearer <key>` or `x-api-key: <key>` (the OpenAI and Anthropic spellings).
     pub api_key: Option<String>,
+    /// Most chat models resident at once (`--max-models`, FERRIC_MAX_LOADED_MODELS; Ollama's default is 3).
+    pub max_models: usize,
+    /// Most bytes of model files resident at once (FERRIC_MAX_MEMORY, GiB): weights dominate what a model
+    /// holds, so the file size is the estimate. KV caches are NOT counted — see `Pool::room_for`.
+    pub max_bytes: u64,
+    /// How long a model loaded for a request stays after its last one (`--keep-alive`, FERRIC_KEEP_ALIVE;
+    /// Ollama's default 5 m). `None` = until evicted for room. A model named on the command line stays.
+    pub keep_alive: Option<std::time::Duration>,
+    /// A model name nothing on disk matches goes to the default model instead of a 404 — the
+    /// llama-server behaviour single-model deployments rely on (clients that send `gpt-4o` to a local
+    /// server). On when the server was started with a model; the response's `model` names who answered.
+    pub fallback: bool,
 }
 
 fn authorized(headers: &[(String, String)], key: &str) -> bool {
@@ -242,14 +271,16 @@ fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
     false
 }
 
-/// The server. Owns the model on this thread forever; the listener is drained by a spawned accept
+/// The server. Owns every loaded model on this thread; the listener is drained by a spawned accept
 /// thread. `serial` handles everything the batch loop declines (guided decoding, the tool loop,
-/// embeddings, unknown paths) and returns whether it recognised the request.
-pub(crate) fn serve_loop<M: ServeModel>(
-    m: M,
+/// embeddings, unknown paths) and returns whether it recognised the request. `initial` = the models
+/// named on the command line; `src` loads any other model a request names.
+pub(crate) fn serve_loop<S: Source>(
+    src: S,
+    initial: Vec<Loaded<S::M>>,
     listener: TcpListener,
     opts: ServeOpts,
-    mut serial: impl FnMut(&M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool,
+    mut serial: impl FnMut(&S::M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool,
 ) {
     let inbox = Arc::new(Inbox::new());
     {
@@ -271,29 +302,38 @@ pub(crate) fn serve_loop<M: ServeModel>(
         });
     }
 
-    // A model that cannot batch runs the SAME loop with one slot. There is no second code path to
-    // rot: the fallback differs only in `max_batch` and in `decode` taking the solo forward.
-    let max_batch = if m.can_batch() { opts.max_batch.max(1) } else { 1 };
-    let mut sched = Scheduler::new(max_batch);
-    let mut gens: Vec<Gen<M::State>> = Vec::new();
+    let mut pool = Pool { src, slots: Vec::new() };
+    for l in initial { pool.slots.push(Slot::new(l, None, true, opts.max_batch)); }
+    // Requests for a model with no room yet: every resident model is mid-generation. Retried each step.
+    let mut pending: VecDeque<Job> = VecDeque::new();
 
     loop {
-        // Block only when there is nothing in flight; otherwise take whatever has arrived and keep
-        // stepping. This is the continuous-batching admission point.
-        let jobs = if gens.is_empty() {
-            match inbox.wait() { Some(j) => j, None => return }
-        } else {
+        // Block only when nothing is in flight; otherwise take whatever has arrived and keep stepping.
+        // This is the continuous-batching admission point. An idle wait still wakes for the next
+        // keep-alive expiry, so an idle model is unloaded on time rather than at the next request.
+        let busy = pool.slots.iter().any(Slot::busy);
+        let jobs = if busy || !pending.is_empty() {
             inbox.drain()
+        } else {
+            match pool.next_expiry() {
+                Some(t) => match inbox.wait_until(t) { Some(j) => j, None => return },
+                None => match inbox.wait() { Some(j) => j, None => return },
+            }
         };
-        for j in jobs { route(&m, &mut sched, &mut gens, j, &opts, &mut serial); }
-        if gens.is_empty() { continue; }
-
-        step(&m, &mut sched, &mut gens);
+        let mut todo = std::mem::take(&mut pending);
+        todo.extend(jobs);
+        for j in todo { if let Some(j) = pool.route(j, &opts, &mut serial) { pending.push_back(j); } }
+        // One step per busy model per turn: two models generating at once interleave their steps on
+        // the one GPU thread rather than one starving the other.
+        for s in pool.slots.iter_mut() {
+            if s.busy() { step(&s.m, &mut s.sched, &mut s.gens); s.last = std::time::Instant::now(); }
+        }
+        pool.expire();
     }
 }
 
-/// Dispatch one parsed request: fast endpoints inline, generation into the scheduler, everything
-/// else to the serial handler.
+/// Dispatch one parsed request to ONE model: generation into its scheduler, everything else to the
+/// serial handler.
 fn route<M: ServeModel>(
     m: &M,
     sched: &mut Scheduler,
@@ -302,12 +342,6 @@ fn route<M: ServeModel>(
     opts: &ServeOpts,
     serial: &mut impl FnMut(&M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool,
 ) {
-    if j.method == "OPTIONS" { return write_preflight(&mut j.stream); }
-    if let Some(key) = &opts.api_key {
-        if j.path != "/health" && !authorized(&j.headers, key) {
-            return write_json(&mut j.stream, 401, &json!({"error": {"message": "missing or wrong API key: send Authorization: Bearer <key> or x-api-key", "type": "authentication_error"}}));
-        }
-    }
     let chat = j.path == "/v1/chat/completions";
     let is_gen = chat || j.path == "/v1/completions";
     if j.method == "POST" && is_gen {
@@ -357,6 +391,302 @@ fn route<M: ServeModel>(
     }
     if !serial(m, &j.method, &j.path, &j.body, &j.headers, &mut j.stream) {
         write_json(&mut j.stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}}));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Several models: the pool
+// ---------------------------------------------------------------------------------------------
+
+/// Where models come from when a request names one that is not loaded (`models::Hub` for real files).
+pub(crate) trait Source {
+    type M: ServeModel;
+    /// The name a request used → the key of a loadable model (its canonical path) and its size in
+    /// bytes, or why nothing matches (a 404 carrying that text).
+    fn resolve(&mut self, spec: &str) -> Result<(String, u64), String>;
+    /// Build it. Runs on the engine thread, so every other model's generations pause for the load.
+    fn load(&mut self, key: &str) -> Result<Self::M, String>;
+    /// Every model that could be served, loaded or not: `(name, Ollama /api/tags entry)`.
+    fn available(&mut self) -> Vec<(String, Value)>;
+    /// `/api/show` for a model that is not loaded, from its file alone.
+    fn show(&mut self, _key: &str) -> Option<Value> { None }
+    /// `/metrics` for the server, given the keys of the loaded models.
+    fn metrics(&mut self, _loaded: &[&str]) -> Option<String> { None }
+}
+
+/// A model already built, handed to the pool (the ones named on the command line).
+pub(crate) struct Loaded<M> { pub key: String, pub m: M, pub bytes: u64 }
+
+/// One resident model: its own scheduler and in-flight sequences, so its batch never mixes with
+/// another model's (a batch is one weight set read once).
+struct Slot<M: ServeModel> {
+    key: String,
+    m: M,
+    bytes: u64,
+    sched: Scheduler,
+    gens: Vec<Gen<M::State>>,
+    /// `None` = until evicted for room.
+    keep_alive: Option<std::time::Duration>,
+    /// When it last did anything: routed a request, or stepped. Keep-alive counts from here, so a
+    /// long generation is not unloaded mid-answer and the clock starts when it finishes.
+    last: std::time::Instant,
+    /// Named on the command line: the default for requests that name no model, and never unloaded to
+    /// make room for another (only an explicit `keep_alive: 0` unloads it). Found live: with three
+    /// models on demand, the fourth evicted the command-line model, and the fallback for an unknown
+    /// name then went to whichever model happened to be used last.
+    startup: bool,
+}
+
+impl<M: ServeModel> Slot<M> {
+    fn new(l: Loaded<M>, keep_alive: Option<std::time::Duration>, startup: bool, max_batch: usize) -> Slot<M> {
+        // A model that cannot batch runs the SAME loop with one slot. There is no second code path to
+        // rot: the fallback differs only in `max_batch` and in `decode` taking the solo forward.
+        let max_batch = if l.m.can_batch() { max_batch.max(1) } else { 1 };
+        Slot { key: l.key, m: l.m, bytes: l.bytes, sched: Scheduler::new(max_batch), gens: Vec::new(),
+               keep_alive, last: std::time::Instant::now(), startup }
+    }
+    fn busy(&self) -> bool { !self.gens.is_empty() }
+    fn expires(&self) -> Option<std::time::Instant> { self.keep_alive.map(|d| self.last + d) }
+    fn answers_to(&self, spec: &str) -> bool {
+        let base = |s: &str| s.strip_suffix(":latest").unwrap_or(s).to_ascii_lowercase();
+        self.key == spec || self.m.cards().iter().any(|(n, _)| base(n) == base(spec))
+    }
+}
+
+/// Ollama's `keep_alive` (and LM Studio's `ttl`, seconds): `Ok(None)` = not given; `Ok(Some(None))` =
+/// forever (a negative value); `Ok(Some(Some(d)))` = unload `d` after the last request (0 = at once).
+/// A number is seconds; a string is a Go duration (`"5m"`, `"1h30m"`, `"250ms"`, `"-1"`), or bare seconds.
+pub(crate) fn keep_alive_of(req: &Value) -> Result<Option<Option<std::time::Duration>>, String> {
+    let secs = |x: f64| if x < 0.0 { None } else { Some(std::time::Duration::from_secs_f64(x)) };
+    let v = if !req["keep_alive"].is_null() { &req["keep_alive"] } else { &req["ttl"] };
+    match v {
+        Value::Null => Ok(None),
+        Value::Number(n) => Ok(Some(secs(n.as_f64().unwrap_or(0.0)))),
+        Value::String(s) => {
+            let t = s.trim();
+            if let Ok(x) = t.parse::<f64>() { return Ok(Some(secs(x))); }
+            let (neg, mut rest) = match t.strip_prefix('-') { Some(r) => (true, r), None => (false, t.strip_prefix('+').unwrap_or(t)) };
+            let mut total = 0f64;
+            if rest.is_empty() { return Err(format!("keep_alive {s:?}: expected a duration like \"5m\" or seconds")); }
+            while !rest.is_empty() {
+                let n = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+                let x: f64 = rest[..n].parse().map_err(|_| format!("keep_alive {s:?}: expected a duration like \"5m\" or seconds"))?;
+                rest = &rest[n..];
+                let u = rest.find(|c: char| c.is_ascii_digit() || c == '.').unwrap_or(rest.len());
+                let scale = match &rest[..u] { "ns" => 1e-9, "us" | "µs" | "μs" => 1e-6, "ms" => 1e-3, "s" => 1.0, "m" => 60.0, "h" => 3600.0,
+                    unit => return Err(format!("keep_alive {s:?}: unknown unit {unit:?} (ns, us, ms, s, m, h)")) };
+                total += x * scale;
+                rest = &rest[u..];
+            }
+            Ok(Some(if neg { None } else { secs(total) }))
+        }
+        v => Err(format!("keep_alive must be a number of seconds or a duration string, got {v}")),
+    }
+}
+
+struct Pool<S: Source> { src: S, slots: Vec<Slot<S::M>> }
+
+/// Why a request could not be given a model: the status and the message.
+type Refusal = (u16, String);
+
+impl<S: Source> Pool<S> {
+    fn next_expiry(&self) -> Option<std::time::Instant> {
+        self.slots.iter().filter(|s| !s.busy()).filter_map(Slot::expires).min()
+    }
+
+    /// Unload every idle model whose keep-alive has run out.
+    fn expire(&mut self) {
+        let now = std::time::Instant::now();
+        self.slots.retain(|s| {
+            let stay = s.busy() || s.expires().is_none_or(|t| t > now);
+            if !stay { eprintln!("ferric-serve: unloaded {} (keep-alive elapsed)", s.m.name()); }
+            stay
+        });
+    }
+
+    /// The model for a request that names none: the command-line model, else the one used last.
+    fn default_slot(&self) -> Option<usize> {
+        self.slots.iter().position(|s| s.startup)
+            .or_else(|| self.slots.iter().enumerate().max_by_key(|(_, s)| s.last).map(|(i, _)| i))
+    }
+
+    /// Unload idle models, least recently used first, until `bytes` more fit in both budgets.
+    /// `Ok(false)` = not yet: what would have to go is mid-generation. Command-line models never go.
+    ///
+    /// ⚠ The memory budget counts model FILES. A KV cache grows with each sequence's context and is not
+    /// in it; `max_bytes` defaults to 75% of physical memory to leave that room, not to measure it.
+    fn room_for(&mut self, bytes: u64, opts: &ServeOpts) -> Result<bool, Refusal> {
+        if bytes > opts.max_bytes {
+            return Err((507, format!("this model's files are {:.1} GiB; the memory budget is {:.1} GiB (FERRIC_MAX_MEMORY)",
+                                     bytes as f64 / 1073741824.0, opts.max_bytes as f64 / 1073741824.0)));
+        }
+        loop {
+            let used: u64 = self.slots.iter().map(|s| s.bytes).sum();
+            if self.slots.len() < opts.max_models.max(1) && used + bytes <= opts.max_bytes { return Ok(true); }
+            let lru = self.slots.iter().enumerate().filter(|(_, s)| !s.busy() && !s.startup).min_by_key(|(_, s)| s.last).map(|(i, _)| i);
+            match lru {
+                Some(i) => { let s = self.slots.remove(i); eprintln!("ferric-serve: unloaded {} to make room", s.m.name()); }
+                // Waiting only helps if a model that CAN go is busy now; otherwise the request would be
+                // deferred forever, and the loop would spin retrying it.
+                None if self.slots.iter().any(|s| s.busy() && !s.startup) => return Ok(false),
+                None => return Err((503, format!("no room: the models named on the command line fill the budget \
+                                                   ({} resident, --max-models {}); raise it or unload one with keep_alive 0",
+                                                  self.slots.len(), opts.max_models))),
+            }
+        }
+    }
+
+    /// The slot for a named model, loading it if it is on disk. `Ok(None)` = wait for room.
+    fn slot_for(&mut self, spec: Option<&str>, opts: &ServeOpts) -> Result<Option<usize>, Refusal> {
+        let Some(spec) = spec else {
+            return self.default_slot().map(Some).ok_or((400, "no model is loaded: name one in `model`".to_string()));
+        };
+        if let Some(i) = self.slots.iter().position(|s| s.answers_to(spec)) { return Ok(Some(i)); }
+        let (key, bytes) = match self.src.resolve(spec) {
+            Ok(k) => k,
+            Err(why) => return match self.default_slot() {
+                Some(i) if opts.fallback => Ok(Some(i)),
+                _ => Err((404, why)),
+            },
+        };
+        if let Some(i) = self.slots.iter().position(|s| s.key == key) { return Ok(Some(i)); }
+        if !self.room_for(bytes, opts)? { return Ok(None); }
+        let m = self.src.load(&key).map_err(|e| (500, format!("loading {spec}: {e}")))?;
+        self.slots.push(Slot::new(Loaded { key, m, bytes }, opts.keep_alive, false, opts.max_batch));
+        Ok(Some(self.slots.len() - 1))
+    }
+
+    /// Every model this server can answer for — loaded ones first — deduplicated by name.
+    fn listing(&mut self) -> Vec<(String, Value, bool)> {
+        let mut out: Vec<(String, Value, bool)> = Vec::new();
+        for s in &self.slots { for (n, e) in s.m.cards() { if !out.iter().any(|o| o.0 == n) { out.push((n, e, true)); } } }
+        for (n, e) in self.src.available() { if !out.iter().any(|o| o.0 == n) { out.push((n, e, false)); } }
+        out
+    }
+
+    fn ps(&self) -> Value {
+        let mut seen: Vec<String> = Vec::new();
+        let mut models = Vec::new();
+        for s in &self.slots {
+            for (n, mut e) in s.m.cards() {
+                if seen.contains(&n) { continue; }
+                seen.push(n);
+                // Ollama's spelling of "until evicted": a date no client will reach.
+                e["expires_at"] = json!(match s.keep_alive {
+                    None => "2318-01-01T00:00:00Z".to_string(),
+                    Some(d) => crate::ollama::rfc3339(std::time::SystemTime::now() + (s.last + d).saturating_duration_since(std::time::Instant::now())),
+                });
+                e["size_vram"] = e["size"].clone();
+                models.push(e);
+            }
+        }
+        json!({"models": models})
+    }
+
+    /// Answer one request: the endpoints about the server itself here, everything else on its model.
+    /// Returns the job when it must wait for room.
+    fn route(&mut self, mut j: Job, opts: &ServeOpts,
+             serial: &mut impl FnMut(&S::M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool) -> Option<Job> {
+        if j.method == "OPTIONS" { write_preflight(&mut j.stream); return None; }
+        if let Some(key) = &opts.api_key {
+            if j.path != "/health" && !authorized(&j.headers, key) {
+                write_json(&mut j.stream, 401, &json!({"error": {"message": "missing or wrong API key: send Authorization: Bearer <key> or x-api-key", "type": "authentication_error"}}));
+                return None;
+            }
+        }
+        let ollama = j.path.starts_with("/api/");
+        let refuse = |s: &mut TcpStream, code: u16, m: &str| if ollama { write_json(s, code, &json!({"error": m})) }
+            else { write_json(s, code, &json!({"error": {"message": m, "type": "invalid_request_error", "code": if code == 404 { "model_not_found" } else { "invalid_request" }}})) };
+        match (j.method.as_str(), j.path.as_str()) {
+            ("GET", "/health") => { write_json(&mut j.stream, 200, &json!({"status": "ok"})); return None; }
+            ("GET", "/") | ("HEAD", "/") => {
+                use std::io::Write;
+                let b = b"ferric-serve is running (OpenAI /v1 and Ollama /api)";
+                let _ = j.stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", b.len()).as_bytes());
+                if j.method == "GET" { let _ = j.stream.write_all(b); }
+                let _ = j.stream.flush();
+                return None;
+            }
+            ("GET", "/api/version") => { write_json(&mut j.stream, 200, &json!({"version": crate::ollama::API_VERSION})); return None; }
+            ("GET", "/api/tags") => {
+                let models: Vec<Value> = self.listing().into_iter().map(|(_, e, _)| e).collect();
+                write_json(&mut j.stream, 200, &json!({"models": models}));
+                return None;
+            }
+            ("GET", "/api/ps") => { let v = self.ps(); write_json(&mut j.stream, 200, &v); return None; }
+            ("GET", "/v1/models") => {
+                // `loaded` is not OpenAI's; LM Studio's model list carries the same fact, and a picker can
+                // show which answer at once and which will load first.
+                let data: Vec<Value> = self.listing().into_iter().map(|(n, _, loaded)|
+                    json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric", "loaded": loaded})).collect();
+                write_json(&mut j.stream, 200, &json!({"object": "list", "data": data}));
+                return None;
+            }
+            ("GET", "/metrics") => {
+                let keys: Vec<&str> = self.slots.iter().map(|s| s.key.as_str()).collect();
+                if let Some(body) = self.src.metrics(&keys) {
+                    use std::io::Write;
+                    let _ = j.stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                    let _ = j.stream.write_all(body.as_bytes());
+                    let _ = j.stream.flush();
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        let req: Option<Value> = if j.method == "POST" { serde_json::from_slice(&j.body).ok() } else { None };
+        let spec: Option<String> = req.as_ref().and_then(|r| r["model"].as_str().or_else(|| if j.path == "/api/show" { r["name"].as_str() } else { None }))
+            .filter(|s| !s.is_empty()).map(String::from);
+        let keep = match req.as_ref().map(keep_alive_of) {
+            Some(Err(e)) => { refuse(&mut j.stream, 400, &e); return None; }
+            Some(Ok(k)) => k,
+            None => None,
+        };
+        // Ollama's load and unload requests: a generate with no prompt, a chat with no messages.
+        let load_only = req.as_ref().is_some_and(|r| match j.path.as_str() {
+            "/api/generate" => r["prompt"].as_str().is_none_or(str::is_empty) && r["images"].is_null(),
+            "/api/chat" => r["messages"].as_array().is_none_or(|m| m.is_empty()),
+            _ => false,
+        });
+        let answer_load = |s: &mut TcpStream, model: &str, reason: &str, chat: bool| {
+            let mut v = json!({"model": model, "created_at": crate::ollama::now(), "done": true, "done_reason": reason});
+            if chat { v["message"] = json!({"role": "assistant", "content": ""}); } else { v["response"] = json!(""); }
+            write_json(s, 200, &v);
+        };
+        if load_only && keep == Some(Some(std::time::Duration::ZERO)) {
+            let name = spec.clone().unwrap_or_default();
+            if let Some(i) = spec.as_deref().and_then(|sp| self.slots.iter().position(|s| s.answers_to(sp))) {
+                if self.slots[i].busy() { self.slots[i].keep_alive = Some(std::time::Duration::ZERO); }
+                else { let s = self.slots.remove(i); eprintln!("ferric-serve: unloaded {} (keep_alive 0)", s.m.name()); }
+            }
+            answer_load(&mut j.stream, &name, "unload", j.path == "/api/chat");
+            return None;
+        }
+        if j.path == "/api/show" {
+            if let Some(sp) = spec.as_deref().filter(|sp| !self.slots.iter().any(|s| s.answers_to(sp))) {
+                match self.src.resolve(sp).map(|(k, _)| self.src.show(&k)) {
+                    Ok(Some(v)) => write_json(&mut j.stream, 200, &v),
+                    Ok(None) => refuse(&mut j.stream, 404, &format!("model '{sp}' has no readable header")),
+                    Err(why) => refuse(&mut j.stream, 404, &why),
+                }
+                return None;
+            }
+        }
+        let i = match self.slot_for(spec.as_deref(), opts) {
+            Ok(Some(i)) => i,
+            Ok(None) => return Some(j),
+            Err((code, msg)) => { refuse(&mut j.stream, code, &msg); return None; }
+        };
+        let s = &mut self.slots[i];
+        if let Some(k) = keep { s.keep_alive = k; }
+        s.last = std::time::Instant::now();
+        if load_only {
+            let name = s.m.name().to_string();
+            answer_load(&mut j.stream, &name, "load", j.path == "/api/chat");
+            return None;
+        }
+        route(&s.m, &mut s.sched, &mut s.gens, j, opts, serial);
+        None
     }
 }
 
@@ -543,6 +873,7 @@ impl ServeModel for Engine {
     fn remember(&self, tokens: &[u32], state: &ModelCache) { Engine::remember(self, tokens, state) }
     fn record(&self, prompt: usize, generated: usize, energy: &Value) { self.metrics.record(prompt, generated, energy) }
     fn energy_end(&self, t: Option<crate::energy::Ticket>, tokens: usize) -> Value { self.energy.end(t, tokens) }
+    fn cards(&self) -> Vec<(String, Value)> { Engine::cards(self).iter().map(|c| (c.name.clone(), c.tag_entry())).collect() }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -575,6 +906,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
         /// If set, the sequence stops when it would emit this token.
         stop: u32,
+        /// Which model this is. The salt enters every hash, so two models answer the same prompt
+        /// differently and a request run on the wrong one is visible in its text.
+        name: String,
+        salt: u32,
     }
 
     /// A sequence's whole visible history. Keeping the full history (rather than a rolling hash)
@@ -582,8 +917,10 @@ mod tests {
     #[derive(Clone)]
     struct MockState { fed: Vec<u32> }
 
-    fn hash(v: &[u32]) -> u32 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    fn hash(v: &[u32]) -> u32 { hash_salted(v, 0) }
+
+    fn hash_salted(v: &[u32], salt: u32) -> u32 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt as u64;
         for &x in v { h ^= x as u64; h = h.wrapping_mul(0x1000_0000_01b3); }
         (h % 4096) as u32 + 1 // never 0, so `stop: 0` means "never stop"
     }
@@ -591,13 +928,14 @@ mod tests {
     impl Mock {
         fn new(batchable: bool) -> Mock {
             Mock { batchable, step_delay: Duration::ZERO,
-                   widest: Arc::new(AtomicUsize::new(0)), calls: Arc::new(AtomicUsize::new(0)), stop: 0 }
+                   widest: Arc::new(AtomicUsize::new(0)), calls: Arc::new(AtomicUsize::new(0)), stop: 0,
+                   name: "mock".to_string(), salt: 0 }
         }
     }
 
     impl ServeModel for Mock {
         type State = MockState;
-        fn name(&self) -> &str { "mock" }
+        fn name(&self) -> &str { &self.name }
         fn n_vocab(&self) -> usize { 8192 }
         fn can_batch(&self) -> bool { self.batchable }
         fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String> {
@@ -608,7 +946,7 @@ mod tests {
         fn encode_text(&self, text: &str) -> Vec<u32> { text.bytes().map(|b| b as u32).collect() }
         fn prefill(&self, prompt: &[u32]) -> (MockState, Vec<f32>) {
             let st = MockState { fed: prompt.to_vec() };
-            (st.clone(), onehot(hash(&st.fed), self.n_vocab()))
+            (st.clone(), onehot(hash_salted(&st.fed, self.salt), self.n_vocab()))
         }
         fn decode(&self, toks: &[u32], states: &mut [&mut MockState]) -> Vec<f32> {
             assert_eq!(toks.len(), states.len(), "one token per sequence");
@@ -618,7 +956,7 @@ mod tests {
             let mut out = Vec::with_capacity(toks.len() * self.n_vocab());
             for (i, &t) in toks.iter().enumerate() {
                 states[i].fed.push(t);
-                out.extend_from_slice(&onehot(hash(&states[i].fed), self.n_vocab()));
+                out.extend_from_slice(&onehot(hash_salted(&states[i].fed, self.salt), self.n_vocab()));
             }
             out
         }
@@ -642,17 +980,79 @@ mod tests {
     /// Start a server on an ephemeral port and return its address. The thread is deliberately not
     /// joined: `serve_loop` is a server and never returns, and the test process reaps it on exit.
     fn spawn(m: Mock, max_batch: usize) -> String {
+        spawn_pool(Models::new(&[]), vec![Loaded { key: "mock".into(), m, bytes: 0 }], opts(max_batch))
+    }
+
+    fn opts(max_batch: usize) -> ServeOpts {
+        ServeOpts { max_batch, any_mcp_tools: false, api_key: None, max_models: 3, max_bytes: u64::MAX, keep_alive: None, fallback: true }
+    }
+
+    fn spawn_pool(src: Models, initial: Vec<Loaded<Mock>>, o: ServeOpts) -> String {
         let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = l.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
-            serve_loop(m, l, ServeOpts { max_batch, any_mcp_tools: false, api_key: None }, |_m, _me, _p, _b, _h, _s| false);
+            serve_loop(src, initial, l, o, |_m, _me, _p, _b, _h, _s| false);
         });
         addr
+    }
+
+    /// A model directory of mocks: `(name, bytes)`. Every load is counted. `broken` fails to load.
+    struct Models { have: Vec<(String, u64)>, loads: Arc<AtomicUsize>, step_delay: Duration }
+
+    impl Models {
+        fn new(have: &[(&str, u64)]) -> Models {
+            Models { have: have.iter().map(|(n, b)| (n.to_string(), *b)).collect(), loads: Arc::new(AtomicUsize::new(0)), step_delay: Duration::ZERO }
+        }
+    }
+
+    fn mock_named(name: &str, delay: Duration) -> Mock {
+        let mut m = Mock::new(true);
+        m.name = name.to_string();
+        m.salt = hash(&name.bytes().map(|b| b as u32).collect::<Vec<_>>());
+        m.step_delay = delay;
+        m
+    }
+
+    impl Source for Models {
+        type M = Mock;
+        fn resolve(&mut self, spec: &str) -> Result<(String, u64), String> {
+            let want = spec.strip_suffix(":latest").unwrap_or(spec);
+            self.have.iter().find(|(n, _)| n == want).cloned().ok_or(format!("model '{spec}' not found"))
+        }
+        fn load(&mut self, key: &str) -> Result<Mock, String> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if key == "broken" { return Err("not a model".into()); }
+            Ok(mock_named(key, self.step_delay))
+        }
+        fn available(&mut self) -> Vec<(String, Value)> {
+            self.have.iter().map(|(n, b)| (n.clone(), json!({"name": format!("{n}:latest"), "model": format!("{n}:latest"), "size": b}))).collect()
+        }
+    }
+
+    /// What model `name` answers to `prompt` on its own: the reference a pooled answer must equal.
+    fn solo(name: &str, prompt: &str, n: usize) -> String {
+        let addr = spawn_pool(Models::new(&[]), vec![Loaded { key: name.into(), m: mock_named(name, Duration::ZERO), bytes: 0 }], opts(1));
+        text_of(&post(&addr, "/v1/completions", &json!({"prompt": prompt, "max_tokens": n}).to_string()))
+    }
+
+    fn get(addr: &str, path: &str) -> Value {
+        let (code, b) = request(addr, "GET", path, "");
+        assert_eq!(code, 200, "GET {path}: {b}");
+        serde_json::from_str(&b).unwrap()
+    }
+
+    fn loaded(addr: &str) -> Vec<String> {
+        let mut v: Vec<String> = get(addr, "/api/ps")["models"].as_array().unwrap().iter()
+            .map(|m| m["name"].as_str().unwrap().trim_end_matches(":latest").to_string()).collect();
+        v.sort();
+        v
     }
 
     /// A real HTTP POST over a real socket. Returns the response body.
     fn post(addr: &str, path: &str, body: &str) -> String {
         let mut s = TcpStream::connect(addr).expect("connect");
+        // A server that never answers must FAIL the test, not hang it (and CI with it).
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let req = format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len());
         s.write_all(req.as_bytes()).unwrap();
         s.flush().unwrap();
@@ -678,6 +1078,7 @@ mod tests {
     /// A raw request; returns (status code, body).
     fn request(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
         let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len());
         s.write_all(req.as_bytes()).unwrap();
         s.flush().unwrap();
@@ -933,6 +1334,166 @@ mod tests {
     /// `batching_support` guard does: a test that searches a file for a literal it also declares is
     /// a tautology. Deleting the call and returning `true` is a mutation that COMPILES, so this
     /// assertion is not subsumed by the compiler.
+    // ---- several models ----------------------------------------------------------------------
+
+    #[test]
+    fn keep_alive_reads_ollamas_spellings() {
+        use std::time::Duration as D;
+        let k = |v: Value| keep_alive_of(&json!({"keep_alive": v}));
+        assert_eq!(k(json!("5m")), Ok(Some(Some(D::from_secs(300)))));
+        assert_eq!(k(json!("1h30m")), Ok(Some(Some(D::from_secs(5400)))));
+        assert_eq!(k(json!("250ms")), Ok(Some(Some(D::from_millis(250)))));
+        assert_eq!(k(json!(0)), Ok(Some(Some(D::ZERO))));
+        assert_eq!(k(json!("0")), Ok(Some(Some(D::ZERO))));
+        assert_eq!(k(json!(-1)), Ok(Some(None)), "negative = until evicted");
+        assert_eq!(k(json!("-1m")), Ok(Some(None)));
+        assert_eq!(k(json!(90)), Ok(Some(Some(D::from_secs(90)))));
+        assert_eq!(keep_alive_of(&json!({"ttl": 60})), Ok(Some(Some(D::from_secs(60)))), "LM Studio's ttl");
+        assert_eq!(keep_alive_of(&json!({})), Ok(None));
+        assert!(k(json!("5x")).unwrap_err().contains("unknown unit"));
+        assert!(k(json!("soon")).is_err());
+        assert!(k(json!([1])).is_err());
+    }
+
+    #[test]
+    fn requests_run_on_the_model_they_name_even_interleaved() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("beta", 1)]), vec![], ServeOpts { fallback: false, ..opts(4) });
+        let (a, b) = (solo("alpha", "same prompt", 24), solo("beta", "same prompt", 24));
+        assert_ne!(a, b, "the two mocks must answer differently or this test cannot see a misroute");
+        let hs: Vec<_> = (0..8).map(|i| {
+            let addr = addr.clone();
+            let name = if i % 2 == 0 { "alpha" } else { "beta" };
+            std::thread::spawn(move || (name, post(&addr, "/v1/completions", &json!({"model": name, "prompt": "same prompt", "max_tokens": 24}).to_string())))
+        }).collect();
+        for h in hs {
+            let (name, r) = h.join().unwrap();
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["model"], json!(name), "{r}");
+            assert_eq!(text_of(&r), if name == "alpha" { a.clone() } else { b.clone() }, "{name} answered with another model's text");
+        }
+        assert_eq!(loaded(&addr), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn an_unknown_model_is_a_404_unless_the_server_was_started_with_one() {
+        let bare = spawn_pool(Models::new(&[("alpha", 1)]), vec![], ServeOpts { fallback: false, ..opts(4) });
+        let (code, body) = request(&bare, "POST", "/v1/completions", &json!({"model": "gpt-4o", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(code, 404, "{body}");
+        assert!(body.contains("model_not_found") && body.contains("gpt-4o"), "{body}");
+        let (code, body) = request(&bare, "POST", "/api/generate", &json!({"model": "gpt-4o", "prompt": "x"}).to_string());
+        assert_eq!(code, 404);
+        assert!(serde_json::from_str::<Value>(&body).unwrap()["error"].is_string(), "the Ollama dialect's error is a string: {body}");
+        let (code, _) = request(&bare, "POST", "/v1/completions", &json!({"prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(code, 400, "no model named and none loaded");
+        // With a model loaded there IS something to fall back to; a server started without one still refuses.
+        post(&bare, "/v1/completions", &json!({"model": "alpha", "prompt": "x", "max_tokens": 1}).to_string());
+        let (code, body) = request(&bare, "POST", "/v1/completions", &json!({"model": "gpt-4o", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(code, 404, "an unknown name was answered by the loaded model: {body}");
+        // Started with a model: an unmatched name is answered by it, and the response says who answered.
+        let started = spawn_pool(Models::new(&[]), vec![Loaded { key: "mock".into(), m: Mock::new(true), bytes: 0 }], opts(4));
+        let r = post(&started, "/v1/completions", &json!({"model": "gpt-4o", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(serde_json::from_str::<Value>(&r).unwrap()["model"], json!("mock"));
+    }
+
+    #[test]
+    fn ollama_loads_on_an_empty_request_and_unloads_on_keep_alive_zero() {
+        let src = Models::new(&[("alpha", 1)]);
+        let loads = src.loads.clone();
+        let addr = spawn_pool(src, vec![], ServeOpts { fallback: false, ..opts(4) });
+        assert!(loaded(&addr).is_empty());
+        let v: Value = serde_json::from_str(&post(&addr, "/api/generate", &json!({"model": "alpha"}).to_string())).unwrap();
+        assert_eq!((v["done_reason"].as_str(), v["done"].as_bool()), (Some("load"), Some(true)));
+        assert_eq!(loaded(&addr), vec!["alpha"]);
+        let v: Value = serde_json::from_str(&post(&addr, "/api/chat", &json!({"model": "alpha:latest", "messages": []}).to_string())).unwrap();
+        assert_eq!(v["done_reason"], json!("load"));
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "an already-loaded model is not loaded again");
+        let v: Value = serde_json::from_str(&post(&addr, "/api/generate", &json!({"model": "alpha", "keep_alive": 0}).to_string())).unwrap();
+        assert_eq!(v["done_reason"], json!("unload"));
+        assert!(loaded(&addr).is_empty(), "keep_alive 0 unloads");
+    }
+
+    #[test]
+    fn an_idle_model_is_unloaded_when_its_keep_alive_runs_out() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("beta", 1)]), vec![], ServeOpts { fallback: false, ..opts(4) });
+        let t0 = Instant::now();
+        post(&addr, "/v1/completions", &json!({"model": "alpha", "prompt": "x", "max_tokens": 2, "keep_alive": "400ms"}).to_string());
+        post(&addr, "/v1/completions", &json!({"model": "beta", "prompt": "x", "max_tokens": 2, "keep_alive": -1}).to_string());
+        assert_eq!(loaded(&addr), vec!["alpha", "beta"]);
+        let ps = get(&addr, "/api/ps");
+        assert!(ps["models"].as_array().unwrap().iter().any(|m| m["expires_at"].as_str().is_some_and(|e| e.starts_with("2318"))), "{ps}");
+        // Nothing arrives while the keep-alive runs out, so only the idle wait's own deadline can unload it:
+        // a request would wake the loop and hide a wait that never woke (polling here did exactly that).
+        // `/api/ps` is answered BEFORE the loop's expiry pass, so this one look cannot trigger it either.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(loaded(&addr), vec!["beta"], "alpha outlived its keep-alive with the server idle");
+        assert!(t0.elapsed() >= Duration::from_millis(400));
+    }
+
+    #[test]
+    fn a_command_line_model_is_never_evicted_for_room() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("beta", 1)]), vec![Loaded { key: "mock".into(), m: Mock::new(true), bytes: 1 }],
+                              ServeOpts { max_models: 2, ..opts(4) });
+        for m in ["alpha", "mock", "beta"] {
+            post(&addr, "/v1/completions", &json!({"model": m, "prompt": "x", "max_tokens": 1}).to_string());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(loaded(&addr), vec!["beta", "mock"], "the command-line model must stay; alpha was the one to go");
+        let r = post(&addr, "/v1/completions", &json!({"model": "gpt-4o", "prompt": "x", "max_tokens": 1}).to_string());
+        assert_eq!(serde_json::from_str::<Value>(&r).unwrap()["model"], json!("mock"), "the fallback is the command-line model");
+        // Only command-line models stand in the way and nothing is generating: refuse, don't defer forever.
+        let full = spawn_pool(Models::new(&[("alpha", 1)]), vec![Loaded { key: "mock".into(), m: Mock::new(true), bytes: 1 }],
+                              ServeOpts { max_models: 1, ..opts(4) });
+        let (code, body) = request(&full, "POST", "/v1/completions", &json!({"model": "alpha", "prompt": "x", "max_tokens": 1}).to_string());
+        assert_eq!(code, 503, "{body}");
+    }
+
+    #[test]
+    fn the_least_recently_used_idle_model_makes_room() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("beta", 1), ("gamma", 1)]), vec![], ServeOpts { fallback: false, max_models: 2, ..opts(4) });
+        for m in ["alpha", "beta", "alpha"] {
+            post(&addr, "/v1/completions", &json!({"model": m, "prompt": "x", "max_tokens": 2}).to_string());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        post(&addr, "/v1/completions", &json!({"model": "gamma", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(loaded(&addr), vec!["alpha", "gamma"], "beta was the least recently used");
+    }
+
+    #[test]
+    fn a_generating_model_is_never_evicted_the_new_request_waits_for_it() {
+        let mut src = Models::new(&[("alpha", 1), ("beta", 1)]);
+        src.step_delay = Duration::from_millis(3);
+        let addr = spawn_pool(src, vec![], ServeOpts { fallback: false, max_models: 1, ..opts(4) });
+        let want = solo("alpha", "long one", 120);
+        let a = { let addr = addr.clone(); std::thread::spawn(move || post(&addr, "/v1/completions", &json!({"model": "alpha", "prompt": "long one", "max_tokens": 120}).to_string())) };
+        std::thread::sleep(Duration::from_millis(60));
+        let rb = post(&addr, "/v1/completions", &json!({"model": "beta", "prompt": "x", "max_tokens": 3}).to_string());
+        assert_eq!(text_of(&a.join().unwrap()), want, "alpha's answer was cut short or corrupted by the load of beta");
+        assert_eq!(text_of(&rb).matches(',').count(), 3);
+        assert_eq!(loaded(&addr), vec!["beta"]);
+    }
+
+    #[test]
+    fn a_model_over_the_memory_budget_or_failing_to_load_is_refused_and_the_server_lives() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("huge", 1000), ("broken", 1)]), vec![], ServeOpts { fallback: false, max_bytes: 100, ..opts(4) });
+        let (code, body) = request(&addr, "POST", "/v1/completions", &json!({"model": "huge", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(code, 507, "{body}");
+        let (code, body) = request(&addr, "POST", "/v1/completions", &json!({"model": "broken", "prompt": "x", "max_tokens": 2}).to_string());
+        assert_eq!(code, 500, "{body}");
+        assert!(body.contains("not a model"), "{body}");
+        assert_eq!(text_of(&post(&addr, "/v1/completions", &json!({"model": "alpha", "prompt": "x", "max_tokens": 2}).to_string())).matches(',').count(), 2);
+    }
+
+    #[test]
+    fn model_lists_show_everything_on_disk_and_say_what_is_loaded() {
+        let addr = spawn_pool(Models::new(&[("alpha", 1), ("beta", 1)]), vec![], ServeOpts { fallback: false, ..opts(4) });
+        post(&addr, "/v1/completions", &json!({"model": "beta", "prompt": "x", "max_tokens": 1}).to_string());
+        let m = get(&addr, "/v1/models");
+        let ids: Vec<(String, bool)> = m["data"].as_array().unwrap().iter().map(|d| (d["id"].as_str().unwrap().to_string(), d["loaded"].as_bool().unwrap())).collect();
+        assert_eq!(ids, vec![("beta".to_string(), true), ("alpha".to_string(), false)]);
+        let tags = get(&addr, "/api/tags");
+        assert_eq!(tags["models"].as_array().unwrap().len(), 2, "{tags}");
+    }
+
     #[test]
     fn engine_batchable_actually_consults_the_runtime_gate() {
         let src: &str = include_str!("lib.rs");
