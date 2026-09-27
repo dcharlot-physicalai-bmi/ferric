@@ -1306,15 +1306,15 @@ mod tests {
         attn(32, 8, 64, 4500, 36);
     }
 
-    /// **The tensor-core GEMM, every format**, against an f64 host GEMM on the SAME inputs the kernel
-    /// multiplies: each dequantised weight rounded f32 -> f16 on the host, the activation exact (the
-    /// kernel splits it into hi + lo f16 parts, see cuda_prefill.cu), so what remains is accumulation
-    /// order and the gate can be tight. The fully unrounded f64 product is printed beside it — that gap
-    /// is the f16-weight numerics trade, measured.
+    /// **The tensor-core GEMM, every format**, against the f64 product of the host-dequantised weights
+    /// and the activations. Neither operand is rounded in the kernel (integer codes, split activations —
+    /// see cuda_prefill.cu), so only f32 accumulation order remains and the tolerance is 2e-6 of the
+    /// row's Σ|a·w|. For contrast the test also prints the distance to f16-ROUNDED weights, the form
+    /// this kernel replaced.
     /// M = 70 and N = 100 are not multiples of the 64x64 tile, so the edge guards are exercised.
     #[test]
-    fn prefill_gemm_every_format_matches_f64_host_on_f16_weights() {
-        let Some(ctx) = ctx_or_skip("prefill_gemm_every_format_matches_f64_host_on_f16_weights") else { return };
+    fn prefill_gemm_every_format_matches_f64_host() {
+        let Some(ctx) = ctx_or_skip("prefill_gemm_every_format_matches_f64_host") else { return };
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
         let h16 = |v: f32| half::f16::from_f32(v).to_f32() as f64;
         for (ci, &(f, k)) in [(QFmt::Q4K, 512usize), (QFmt::Q5K, 512), (QFmt::Q6K, 512), (QFmt::Q8_0, 896), (QFmt::Q5_0, 896), (QFmt::Q8_0, 96), (QFmt::Q5_0, 96)].iter().enumerate() {
@@ -1329,7 +1329,7 @@ mod tests {
             for i in 0..m { for o in 0..n {
                 let (mut s, mut x, mut g) = (0f64, 0f64, 0f64);
                 for j in 0..k { let (av, wv) = (a[i * k + j], wrows[o][j]);
-                    s += av as f64 * h16(wv); x += av as f64 * wv as f64; g += (av as f64 * h16(wv)).abs(); }
+                    s += av as f64 * wv as f64; x += av as f64 * h16(wv); g += (av as f64 * wv as f64).abs(); }
                 want[i * n + o] = s; exact[i * n + o] = x; mag = mag.max(g);
             } }
             let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
@@ -1338,10 +1338,10 @@ mod tests {
             let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
             unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
             let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
-            let tol = 1e-5 * mag;
-            eprintln!("{f:?} gemm {m}x{n}x{k}: max|Δ| vs f64 on f16 weights {dr:.3e} (tol {tol:.3e})   vs unrounded f64 {dx:.3e}   Σ|a·w| {mag:.3e}");
+            let tol = 2e-6 * mag;
+            eprintln!("{f:?} gemm {m}x{n}x{k}: max|Δ| vs f64 {dr:.3e} (tol {tol:.3e})   [vs f64 on f16-rounded weights {dx:.3e}]   Σ|a·w| {mag:.3e}");
             assert!(flag[0].to_bits() == 0, "{f:?}: overflow flag raised on in-range inputs");
-            assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?}: tensor-core GEMM diverges from the f64 host GEMM on f16 weights");
+            assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?}: tensor-core GEMM diverges from the f64 host GEMM");
         }
         // The f16-range guard: one activation past 65504 must raise the flag (the host then runs WGSL).
         let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);

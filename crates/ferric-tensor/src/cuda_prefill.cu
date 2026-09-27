@@ -6,17 +6,19 @@
 // SwiGLU between them. Row-wise norm / rope reuse the decode kernels (they take a row index from
 // blockIdx.y), so both paths share one implementation of everything that is not a matmul.
 //
-// ⚠ NUMERICS. Tensor cores multiply f16 x f16 and accumulate in f32. Each weight tile is dequantised
-// from the SAME repacked words the GEMVs read straight into f16 in shared memory (<= 2^-12 relative
-// per weight). Each ACTIVATION is split into two f16 parts, hi = f16(a) and lo = f16(a - hi), and both
-// go through the tensor cores (two mma per fragment): a·w = hi·w + lo·w to ~2^-22, so the activation
-// is effectively f32. ⭐ Measured before choosing it: with a single f16 activation, Qwen3-0.6B Q5_K_M
-// over a 1000-row prompt sat 0.219 max |Δ logit| from the f32 WGSL path (argmax 1023/1024); with the
-// split, 0.028 (1024/1024) — activation rounding was 8x the error budget. It costs ~25% of prefill
-// throughput on the RTX 4050 (4218 -> 3245 tok/s on that model, 2964 -> 2162 on Llama-3.2-1B), and
-// is still a numerics change from the f32 decode path, gated as such by scripts/cuda_conformance.sh.
-// An activation above f16's 65504 would become inf: every A-tile load checks, and a hit raises `ovf`
-// so the host throws the result away and runs the f32 WGSL prefill instead — a fallback, never an inf.
+// ⚠ NUMERICS. Tensor cores multiply f16 x f16 and accumulate in f32, and NEITHER operand is rounded:
+//  • weights enter as their INTEGER codes (exact in f16), with each block's scale — and Q4_K/Q5_K's
+//    min, via the activation row-sum — applied per 32-wide K tile in f32 (codes16 / gemm_t);
+//  • each activation is split into hi = f16(a) and lo = f16(a - hi), both through the tensor cores,
+//    so a·w = hi·w + lo·w to ~2^-22 relative.
+//  What is left is f32 accumulation order — the same kind of difference the decode GEMVs have.
+//  ⭐ Measured on the way here (Qwen3-0.6B Q5_K_M, 1000-row prompt, max |Δ logit| from the f32 WGSL
+//  path): f16 activations and f16-rounded weights 0.219 (argmax 1023/1024); split activations 0.028;
+//  the numbers for this final form are in scripts/cuda_conformance.sh. The rounded-weight form also
+//  failed a control: with Qwen2.5's biases dropped, Q8_0's `d·q` rounded to f16 put the native prefill
+//  1.63 logits from WGSL-under-the-same-control. An activation above f16's 65504 would become inf:
+//  every A-tile load checks, and a hit raises `ovf` so the host throws the result away and runs the
+//  f32 WGSL prefill instead — a fallback, never a silent inf.
 //
 // `mma.sync.aligned.m16n8k8` (not k16) keeps this loadable as compute_75 PTX like the decode module:
 // m16n8k16 needs sm_80, and the tier's contract is "the driver alone loads it on Turing and newer".
@@ -66,17 +68,23 @@ __device__ __forceinline__ void scmin(const unsigned* __restrict__ aux, unsigned
     ds = d * (float)sc; mm = dmin * (float)mn;
 }
 
-// ── Dequantise 16 consecutive weights of output row `n`: values [32·kc + 16·h, +16) of the row, into
-//    8 packed half2 words. Every format's 32-value chunk splits into two such halves, which is what
-//    lets one tile loader serve all five. F: 0 Q4_K, 1 Q5_K, 2 Q6_K, 3 Q8_0, 4 Q5_0 (QFmt order). ──
+// ── The INTEGER codes of 16 consecutive weights of output row `n` — values [32·kc + 16·h, +16) of
+//    the row — as 8 packed half2 words, plus the affine map that turns them into weights:
+//        w = scale · q − mn.
+//    Every code is a small integer (Q8_0 −128..127 is the widest), so it is EXACT in f16: the tensor
+//    cores multiply the true codes, and the scale and min are applied per 32-wide K tile in f32
+//    (see gemm_t). This is llama.cpp's MMQ factorisation with the activations kept (split) f16 instead
+//    of int8. F: 0 Q4_K, 1 Q5_K, 2 Q6_K, 3 Q8_0, 4 Q5_0 (QFmt order). ──
 template <int F>
-__device__ __forceinline__ void dequant16(const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
-                                          unsigned n, unsigned K, unsigned kc, unsigned h, unsigned (&o)[8]) {
+__device__ __forceinline__ void codes16(const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                        unsigned n, unsigned K, unsigned kc, unsigned h, unsigned (&o)[8],
+                                        float& scale, float& mn) {
     float v[16];
+    mn = 0.f;
     if (F == 0 || F == 1) {
         const unsigned nblk = K / 256u, b = kc >> 3u, s = kc & 7u, bi = n * nblk + b, ab = bi * 4u;
         const unsigned dd = aux[ab];
-        float ds, mm; scmin(aux, ab, s, f16_to_f32(dd & 0xffffu), f16_to_f32(dd >> 16u), ds, mm);
+        scmin(aux, ab, s, f16_to_f32(dd & 0xffffu), f16_to_f32(dd >> 16u), scale, mn);
         const unsigned c = s >> 1u, sh = 4u * (s & 1u);
         const unsigned cb = bi * (F == 0 ? 32u : 40u);
         const uint4 q = *reinterpret_cast<const uint4*>(codes + cb + 8u * c + 4u * h);   // qs bytes [32c+16h, +16)
@@ -87,9 +95,9 @@ __device__ __forceinline__ void dequant16(const unsigned* __restrict__ codes, co
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
             for (unsigned k = 0u; k < 4u; ++k) {
-                float nib = (float)((qw[w] >> (8u * k + sh)) & 0xfu);
-                if (F == 1) nib += (float)((hw[w] >> (8u * k + s)) & 1u) * 16.f;
-                v[4u * w + k] = ds * nib - mm;
+                unsigned qq = (qw[w] >> (8u * k + sh)) & 0xfu;
+                if (F == 1) qq |= ((hw[w] >> (8u * k + s)) & 1u) << 4u;
+                v[4u * w + k] = (float)qq;
             }
     } else if (F == 2) {
         // ql[128] low nibbles / high nibbles, qh[64] 2-bit pairs, 16 int8 scales, f16 d (Q6_K_BODY).
@@ -103,32 +111,29 @@ __device__ __forceinline__ void dequant16(const unsigned* __restrict__ codes, co
         const uint4 qh = *reinterpret_cast<const uint4*>(codes + cb + 32u + (32u * hf + 16u * h) / 4u);
         const float d = f16_to_f32(aux[ab] & 0xffffu);
         const unsigned si = 8u * hf + 2u * qq + h;
-        const float sc = (float)((int)(((aux[ab + 1u + (si >> 2u)] >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
-        const float dsc = d * sc;
+        scale = d * (float)((int)(((aux[ab + 1u + (si >> 2u)] >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
         const unsigned lw[4] = {ql.x, ql.y, ql.z, ql.w}, hw[4] = {qh.x, qh.y, qh.z, qh.w};
         const unsigned nsh = 4u * (qq >> 1u), hsh = 2u * qq;
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
-            for (unsigned k = 0u; k < 4u; ++k) {
-                const int q = (int)(((lw[w] >> (8u * k + nsh)) & 0xfu) | (((hw[w] >> (8u * k + hsh)) & 3u) << 4u)) - 32;
-                v[4u * w + k] = dsc * (float)q;
-            }
+            for (unsigned k = 0u; k < 4u; ++k)
+                v[4u * w + k] = (float)((int)(((lw[w] >> (8u * k + nsh)) & 0xfu) | (((hw[w] >> (8u * k + hsh)) & 3u) << 4u)) - 32);
     } else if (F == 3) {
         const unsigned bi = n * (K / 32u) + kc;
         const unsigned sw = aux[bi >> 1u];
-        const float d = f16_to_f32((bi & 1u) ? (sw >> 16u) : (sw & 0xffffu));
+        scale = f16_to_f32((bi & 1u) ? (sw >> 16u) : (sw & 0xffffu));
         const uint4 q = *reinterpret_cast<const uint4*>(codes + bi * 8u + 4u * h);
         const unsigned qw[4] = {q.x, q.y, q.z, q.w};
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
-            for (unsigned k = 0u; k < 4u; ++k) v[4u * w + k] = d * (float)((int)(qw[w] << (24u - 8u * k)) >> 24);
+            for (unsigned k = 0u; k < 4u; ++k) v[4u * w + k] = (float)((int)(qw[w] << (24u - 8u * k)) >> 24);
     } else {
         // Q5_0: 16 code bytes; h = 0 -> low nibbles with qh bits 0..15, h = 1 -> high nibbles, bits 16..31.
         const unsigned bi = n * (K / 32u) + kc;
         const unsigned qh = aux[bi * 2u];
-        const float d = f16_to_f32(aux[bi * 2u + 1u] & 0xffffu);
+        scale = f16_to_f32(aux[bi * 2u + 1u] & 0xffffu);
         const uint4 q = *reinterpret_cast<const uint4*>(codes + bi * 4u);
         const unsigned qw[4] = {q.x, q.y, q.z, q.w};
         #pragma unroll
@@ -136,19 +141,22 @@ __device__ __forceinline__ void dequant16(const unsigned* __restrict__ codes, co
             #pragma unroll
             for (unsigned k = 0u; k < 4u; ++k) {
                 const unsigned e = 4u * w + k;
-                const int q5 = (int)(((qw[w] >> (8u * k + 4u * h)) & 0xfu) | (((qh >> (e + 16u * h)) & 1u) << 4u)) - 16;
-                v[e] = (float)q5 * d;
+                v[e] = (float)((int)(((qw[w] >> (8u * k + 4u * h)) & 0xfu) | (((qh >> (e + 16u * h)) & 1u) << 4u)) - 16);
             }
     }
     #pragma unroll
-    for (unsigned i = 0u; i < 8u; ++i) o[i] = pack2(v[2u * i], v[2u * i + 1u]);
+    for (unsigned i = 0u; i < 8u; ++i) o[i] = pack2(v[2u * i], v[2u * i + 1u]);   // exact: small integers
 }
 
-// ── C[M, N] (+)= A[M, K] · W[N, K]ᵀ with W quantised. A f32 row-major (lda), C f32 row-major (ldc).
-//    Tile 64x64x32, 128 threads = 2x2 warps of 32x32, each warp 2 (m16) x 4 (n8) mma tiles, k8 steps;
-//    A is held twice (hi and lo halves of the split, see NUMERICS) and every fragment gets two mma.
-//    Shared rows are padded to 40 halves (80 B = 20 words): the fragment reads of rows g = 0..7 then
-//    start on banks 0,20,8,28,16,4,24,12 — conflict-free, where an unpadded 64 B stride is 4-way. ──
+// ── C[M, N] = A[M, K] · W[N, K]ᵀ with W quantised. A f32 row-major (lda), C f32 row-major (ldc).
+//    Tile 64x64x32, 128 threads = 2x2 warps of 32x32, each warp 2 (m16) x 4 (n8) mma tiles, k8 steps.
+//    Per 32-wide K tile, per output column n, the weights are ONE affine map of integer codes per
+//    16-value half: w = s_h[n]·q − mn[n] (s_0 = s_1 except Q6_K, whose 16-value sub-blocks carry their
+//    own scales). So the tensor cores accumulate the exact code products into p_h, and the tile folds
+//    them in f32:  acc += s_0·p_0 + s_1·p_1 − mn·Σ_k a  (the last term only for Q4_K / Q5_K's mins,
+//    with the activation row-sum over the tile). A is held twice, hi and lo of the split, and every
+//    fragment gets two mma. Shared rows are padded to 40 halves (80 B = 20 words): the fragment reads
+//    of rows g = 0..7 then start on banks 0,20,8,28,16,4,24,12 — conflict-free, where 64 B is 4-way. ──
 #define BM 64u
 #define BN 64u
 #define BK 32u
@@ -162,22 +170,28 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
                                        const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
                                        float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, unsigned K,
                                        int* __restrict__ ovf) {
+    constexpr bool TWO = F == 2;            // two scales per 32-wide tile (Q6_K's 16-value sub-blocks)
+    constexpr bool MIN = F == 0 || F == 1;  // an affine min (Q4_K / Q5_K)
     __shared__ __align__(16) unsigned short As[BM * LDS];      // activation, f16 hi part
     __shared__ __align__(16) unsigned short Al[BM * LDS];      // activation, f16 lo part (a - hi)
-    __shared__ __align__(16) unsigned short Ws[BN * LDS];
+    __shared__ __align__(16) unsigned short Ws[BN * LDS];      // integer codes, exact in f16
+    __shared__ float Sc[2][BN], Mn[BN], Rs[BM];                // per-tile scales / mins / A row-sums
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
     const unsigned wm = warp >> 1u, wn = warp & 1u;
     const unsigned m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     const unsigned g = lane >> 2u, t4 = lane & 3u;
-    float acc[2][4][4];
+    float acc[2][4][4], p0[2][4][4], p1[2][4][4];
     #pragma unroll
     for (unsigned i = 0u; i < 2u; ++i)
         #pragma unroll
-        for (unsigned j = 0u; j < 4u; ++j) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; acc[i][j][2] = 0.f; acc[i][j][3] = 0.f; }
+        for (unsigned j = 0u; j < 4u; ++j)
+            #pragma unroll
+            for (unsigned c = 0u; c < 4u; ++c) acc[i][j][c] = 0.f;
     bool bad = false;
     const unsigned lr = tid >> 1u, lh = tid & 1u;    // the loaders: row lr of each tile, half lh of its 32 values
     for (unsigned k0 = 0u; k0 < K; k0 += BK) {
         unsigned a[8], al[8], w[8];
+        float rsum = 0.f;
         if (m0 + lr < M) {
             const float* src = A + (size_t)(m0 + lr) * lda + k0 + 16u * lh;
             #pragma unroll
@@ -186,23 +200,34 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
                 bad |= fabsf(v.x) > 65504.f || fabsf(v.y) > 65504.f || fabsf(v.z) > 65504.f || fabsf(v.w) > 65504.f;
                 a[2u * j] = pack2(v.x, v.y); a[2u * j + 1u] = pack2(v.z, v.w);
                 al[2u * j] = resid2(v.x, v.y, a[2u * j]); al[2u * j + 1u] = resid2(v.z, v.w, a[2u * j + 1u]);
+                if (MIN) rsum += (v.x + v.y) + (v.z + v.w);
             }
         } else {
             #pragma unroll
             for (unsigned j = 0u; j < 8u; ++j) { a[j] = 0u; al[j] = 0u; }
         }
-        if (n0 + lr < N) dequant16<F>(codes, aux, n0 + lr, K, k0 / 32u, lh, w);
+        float sc = 0.f, mn = 0.f;
+        if (n0 + lr < N) codes16<F>(codes, aux, n0 + lr, K, k0 / 32u, lh, w, sc, mn);
         else {
             #pragma unroll
             for (unsigned j = 0u; j < 8u; ++j) w[j] = 0u;
         }
+        if (MIN) rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);   // the row's other 16 values (lane lr*2+1)
         uint4* as = reinterpret_cast<uint4*>(As + lr * LDS + 16u * lh);
+        uint4* als = reinterpret_cast<uint4*>(Al + lr * LDS + 16u * lh);
         uint4* ws = reinterpret_cast<uint4*>(Ws + lr * LDS + 16u * lh);
         as[0] = make_uint4(a[0], a[1], a[2], a[3]); as[1] = make_uint4(a[4], a[5], a[6], a[7]);
-        uint4* als = reinterpret_cast<uint4*>(Al + lr * LDS + 16u * lh);
         als[0] = make_uint4(al[0], al[1], al[2], al[3]); als[1] = make_uint4(al[4], al[5], al[6], al[7]);
         ws[0] = make_uint4(w[0], w[1], w[2], w[3]); ws[1] = make_uint4(w[4], w[5], w[6], w[7]);
+        Sc[lh][lr] = sc;
+        if (lh == 0u) { Mn[lr] = mn; Rs[lr] = rsum; }
         __syncthreads();
+        #pragma unroll
+        for (unsigned i = 0u; i < 2u; ++i)
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j)
+                #pragma unroll
+                for (unsigned c = 0u; c < 4u; ++c) { p0[i][j][c] = 0.f; p1[i][j][c] = 0.f; }
         #pragma unroll
         for (unsigned ks = 0u; ks < BK; ks += 8u) {
             unsigned af[2][2], lf[2][2], bf[4];
@@ -221,11 +246,26 @@ __device__ __forceinline__ void gemm_t(const float* __restrict__ A, unsigned lda
             for (unsigned mi = 0u; mi < 2u; ++mi)
                 #pragma unroll
                 for (unsigned ni = 0u; ni < 4u; ++ni) {
+                    // the 16-value half this k-step is in: its own partial when the format has two scales
+                    float (&p)[4] = (TWO && ks >= 16u) ? p1[mi][ni] : p0[mi][ni];
                     // lo first: the small term accumulates before the large one lands on it.
-                    mma16816(acc[mi][ni], lf[mi][0], lf[mi][1], bf[ni]);
-                    mma16816(acc[mi][ni], af[mi][0], af[mi][1], bf[ni]);
+                    mma16816(p, lf[mi][0], lf[mi][1], bf[ni]);
+                    mma16816(p, af[mi][0], af[mi][1], bf[ni]);
                 }
         }
+        // Fold the tile: acc += s0·p0 (+ s1·p1) (− mn·Σa), per column n and row m of the fragment.
+        #pragma unroll
+        for (unsigned mi = 0u; mi < 2u; ++mi)
+            #pragma unroll
+            for (unsigned ni = 0u; ni < 4u; ++ni)
+                #pragma unroll
+                for (unsigned c = 0u; c < 4u; ++c) {
+                    const unsigned col = wn * 32u + ni * 8u + 2u * t4 + (c & 1u), row = wm * 32u + mi * 16u + g + 8u * (c >> 1u);
+                    float v = Sc[0][col] * p0[mi][ni][c];
+                    if (TWO) v += Sc[1][col] * p1[mi][ni][c];
+                    if (MIN) v -= Mn[col] * Rs[row];
+                    acc[mi][ni][c] += v;
+                }
         __syncthreads();
     }
     if (bad) atomicOr(ovf, 1);
