@@ -1,0 +1,648 @@
+{
+"scope": "Ferric side of E*, F*, B*, M*, T* features. Repo /Users/dcharlot/vibe-coding/ferric at HEAD 230edb9 (clean tree, 2026-09-27). All paths below are relative to that root. Code was read along the path, not grepped only. 'check' names the test / gate / example that exercises the claim; 'CI' means .github/workflows/ci.yml runs it (Linux lavapipe job and/or macos-latest real-Metal job). Conformance scripts (scripts/*_conformance.sh) are local gates run against real checkpoints and are NOT in CI.",
+"features": [
+{
+"id": "E01",
+"status": "verified",
+"evidence": "crates/ferric-serve/src/batch.rs:204 serve_loop (accept/dispatch, --max-batch N default 8, --no-batch; lib.rs:949-957); per-runtime gate Model::supports_batching crates/ferric-serve/src/lib.rs:126; scheduler crates/ferric-kv/src/sched.rs:91; batched forward on every generative runtime (Dense, Hybrid, Lfm2, Gemma4, DeepSeek2, Hyv4) dispatched at lib.rs:143-180",
+"check": "batch.rs tests :602 batched_responses_are_identical_to_serial_ones, :640 concurrent_requests_interleave_instead_of_queueing, :690 a_late_request_joins_a_batch_already_in_flight, :722 engine_batchable_actually_consults_the_runtime_gate (mock model); solo-equivalence examples with asserts: crates/ferric-llama/examples/batched_decode.rs, batched_decode_qwen35.rs, batched_decode_deepseek2.rs, gemma4_batched_decode.rs, lfm2_batched_decode.rs, continuous_batching.rs; hyv4 batched decode in examples/hyv4_synthetic.rs (CI, both jobs)",
+"notes": "Measured 3.07x at max_batch 5 on Qwen2.5-0.5B (docs/sota-feature-matrix.md §I). Prefill is still serial per request (batch.rs:85). nemotron_h has no batched path (supports_batching=false, serial fallback); qwen35 models with an MTP block take the serial speculative path unless FERRIC_NOSPEC=1 (lib.rs:599-602). Guided-decoding and tool-calling requests always run serial."
+},
+{
+"id": "E02",
+"status": "partial",
+"evidence": "crates/ferric-kv/src/lib.rs:76 BlockPool, :124 BlockTable, :143 PagedKv (refcounted block tables, fork on whole blocks, no copy-on-write by design)",
+"check": "6 unit tests in crates/ferric-kv/src/lib.rs (:254-:335), CI via cargo test --workspace and wasm32 build",
+"notes": "Bookkeeping only. No paged-attention kernel exists and no runtime uses PagedKv: every runtime attends over a contiguous per-sequence KvBuf (crates/ferric-llama/src/prefix.rs:18 and :310 say so; examples/batch_throughput.rs:19 calls it 'complete, tested, and unwired'). The only non-ferric-kv references are comments."
+},
+{
+"id": "E03",
+"status": "partial",
+"evidence": "Radix prefix tree with node splitting, refcounted pins and token-budget LRU eviction: crates/ferric-llama/src/prefix.rs:355 PrefixTree, :66 PrefixCache (f32 or quantized KV); crates/ferric-kv/src/radix.rs:47 RadixIndex. Server side: crates/ferric-serve/src/lib.rs:292-302 one-slot PrefixSlot, reused at :740-764 only inside generate_spec (qwen35 MTP path)",
+"check": "30 unit tests in prefix.rs; 8 in ferric-kv/src/radix.rs; examples/prefix_tree.rs asserts identical argmax and logits within 1e-3 vs full prefill on a branching agent workload (:169, :184) and that reuse happened (:185); examples/prefix_cache.rs:90",
+"notes": "The tree is a library proved on the Dense runtime in examples; ferric-serve does NOT use it. Cross-request reuse in the server is a single slot for the hybrid speculative path. Reuse saves compute, not memory (each sequence holds its own copy; sharing storage needs paged attention). Grouped-K quantized caches refuse prefix clone (treated as a miss)."
+},
+{
+"id": "E04",
+"status": "partial",
+"evidence": "Tail-of-history attention crates/ferric-tensor/src/nn.rs:364 chunked_attention; used for every non-flash prefill in crates/ferric-llama/src/qwen3.rs:1206-1208 and crates/ferric-llama/src/lfm2.rs:437; swiglu/gather_rows folded to 2-D grids so single-pass prefill passes 4096 tokens (docs/RUNTIME-PARITY-2026.md)",
+"check": "crates/ferric-tensor/examples/chunked_attn.rs (asserts vs full causal attention across MHA/GQA/MQA/softcap; CI on BOTH lavapipe and real Metal); crates/ferric-llama/examples/chunked_prefill.rs:106-129 asserts identical argmax, logits within 1e-3 and cache position at every chunk size",
+"notes": "The runtime can prefill in chunks and it is verified. What peers call chunked prefill (splitting long prompts and interleaving the chunks with decode steps in the scheduler) is NOT done: ferric-serve prefills each admitted request whole and serially (crates/ferric-serve/src/batch.rs:85 names it as the next lever)."
+},
+{
+"id": "E05",
+"status": "verified",
+"evidence": "crates/ferric-tensor/src/kvquant.rs:118 QKvCache (q8_0 / q4_0 / q4_1 blocks), :238 GroupedKvCache (per-channel x 32-token K axis), :342 KvStore; env switch parsed at crates/ferric-llama/src/qwen3.rs:639 (FERRIC_KVQ) and :623 (FERRIC_KVQ_K_AXIS=grouped); wired in qwen3, qwen35, lfm2, gemma4, deepseek2 caches",
+"check": "24 unit tests in kvquant.rs incl. :1689 gpu_dequantize_matches_the_cpu_reference_bit_for_bit, :1620 gpu_quantize_matches_the_exact_codes, :1585 grouped_fused_dequant_matches_the_two_pass_oracle_bit_for_bit, :1908 one_row_at_a_time_equals_one_shot; env test qwen3.rs:1965; examples/kv_quant_wire.rs, examples/lfm2_kvq.rs:114 (asserts the cache actually shrank)",
+"notes": "Default off and bit-identical to the pre-wiring build. Recorded: q8_0 3.76x context/GB at +1.8% ppl; grouped-K q4_0 ppl 32.23 vs f32 31.21 on qwen2.5-0.5b (docs/sota-feature-matrix.md §M; one model, one passage). No fp8 KV. The whole cache is dequantized per step rather than read packed inside the attention kernel. The qwen35 MTP draft cache stays f32 on purpose."
+},
+{
+"id": "E06",
+"status": "verified",
+"evidence": "crates/ferric-tensor/src/lib.rs:839 flash_attention_prefill, :858 fused_decode_attention (one workgroup per head), split-KV decode kernels FUSED_ATTN_SPLIT_WGSL lib.rs:3304 + combine; ferric-core flash attention kernel; fused QKV, add+rmsnorm, q|k RoPE",
+"check": "crates/ferric-tensor/examples/flash.rs:71 and fattn.rs:25 (both asserted, both in CI); examples/split_kv.rs:64 (24 shape x length combos, worst 7.8e-8)",
+"notes": "flash_attention_prefill is used only when t==s, s<=65535, head_dim<=128 and no softcap (qwen3.rs:1203); otherwise chunked_attention. Split-KV is gated at >=512 keys per split and was never timed end to end (docs/RUNTIME-PARITY-2026.md, 'Not yet timed')."
+},
+{
+"id": "E07",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No separate-draft-model path. The only speculation is MTP self-drafting (E09). docs/INGEST-2026-08.md:62 records it: 'only works for models that ship an MTP/nextn block. Qwen3, Llama-3 and Gemma-3 get nothing.'"
+},
+{
+"id": "E08",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No EAGLE / EAGLE-3 heads or tree verification anywhere in the tree (grep over crates for eagle returns nothing)."
+},
+{
+"id": "E09",
+"status": "implemented",
+"evidence": "Draft block crates/ferric-llama/src/qwen35.rs:1428 mtp_forward, :244 MtpCache, nextn layers read at :90-95; verify+rollback loop crates/ferric-serve/src/lib.rs:730 generate_spec (default for hybrid models with an MTP block, :637), FERRIC_SPEC_DRAFT=2 two-token drafting (:786-789); energy break-even gate crates/ferric-serve/src/specgate.rs:41 SpecGate",
+"check": "No automated test. crates/ferric-llama/examples/run_bonsai.rs --spec / --spec2 are manual (they print ids for comparison with --gen; nothing asserts equality). specgate.rs has 0 tests.",
+"notes": "Lossless by construction (a draft is committed only if it equals the main model's pick). Recorded ~80% d1 acceptance, ~19% faster with FERRIC_SPEC_DRAFT=2 (docs/INGEST-2026-08.md:62). Only the qwen35 family; nemotron_h skips MTP at load and gemma4's mtp- file is unread (docs/sota-feature-matrix.md §C)."
+},
+{
+"id": "E10",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "Recommended but not built (docs/INGEST-2026-08.md:62 'Cheaper first cut: suffix/n-gram prompt-lookup drafting')."
+},
+{
+"id": "E11",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No tensor parallelism in any runtime. The nearest primitive is crates/ferric-tensor/src/sched.rs:209 Fabric::data_parallel_bmm, which splits the batch dimension of one bmm across GPU/CPU/remote devices (examples/fabric.rs in CI); no model uses it. docs/sota-feature-matrix.md §B: 'no tensor or expert parallelism'."
+},
+{
+"id": "E12",
+"status": "partial",
+"evidence": "crates/ferric-tensor/src/sched.rs:242 Fabric::pipeline_mlp (layers round-robin across GPU/CPU/remote devices); crates/ferric-dist/src/lib.rs (framed wire protocol, :161 Transport trait), src/route.rs plan_route (gapless layer chain), src/session.rs prefix-hash guard",
+"check": "crates/ferric-tensor/examples/fabric.rs:52 asserts pipelined MLP == single device (CI, both jobs); ferric-dist: 25 unit tests + tests/pipeline_recovery.rs (6, in-process transport)",
+"notes": "Neither piece is connected to an LLM runtime: no crate depends on ferric-dist, and pipeline_mlp runs a toy MLP. ferric-dist ships no TCP Transport implementation (only the trait). Multi-GPU in one host is possible in principle (ferric-core Context::enumerate / for_adapter, lib.rs:190-230) but no runtime splits a model across adapters."
+},
+{
+"id": "E13",
+"status": "partial",
+"evidence": "crates/ferric-tensor/src/sched.rs:26 Device::Remote (TCP worker), :29 Device::BrowserWorker (WebSocket to a tab's WebGPU), :429 spawn_worker; crates/ferric-dist (protocol, routing, replay/re-route recovery)",
+"check": "examples/fabric.rs (CI) runs a TCP worker on localhost for bmm and MLP and asserts equality; crates/ferric-web/examples/browser_worker.rs (manual); ferric-dist tests/pipeline_recovery.rs",
+"notes": "Remote devices execute single ops (bmm, linear_relu) shipped as host buffers, not model shards. No LLM inference has run across hosts. Same gap as E12."
+},
+{
+"id": "E14",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No expert parallelism. ferric-tier's MirroredBacking (crates/ferric-tier/src/mirror.rs) splits READS of identical weight copies across devices by bandwidth; it is storage, not compute, and only examples/fabric_profile.rs uses it."
+},
+{
+"id": "E15",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "Planning math only: crates/ferric-tier/src/fabric.rs FabricProfile::split_for_latency / split_within_budget / split_n decide how many missing experts cross the bus vs compute on host (12 tests), and crates/ferric-tensor/src/cpu_simd.rs has an autovectorized Q8_0 matvec. No runtime computes experts on the CPU; examples/fabric_decode_shapes.rs is a measurement study. All MoE compute is on the GPU."
+},
+{
+"id": "E16",
+"status": "verified",
+"evidence": "Expert streaming: crates/ferric-llama/src/qwen35.rs:374 StreamedExperts (C GPU slots, fetch-on-miss by file range read through ferric_tier::ExpertCache), enabled by FERRIC_MOE_SLOTS at qwen35.rs:731 (Q4_K gate/up, Q4_K or Q6_K down). Whole-layer streaming: crates/ferric-llama/src/hyv4.rs:672 Hyv4::load_streaming, used by ferric-serve under FERRIC_STREAM_GIB (crates/ferric-serve/src/lib.rs:421-427); dense layer streaming crates/ferric-llama/src/stream.rs:322; browser range-fetch backing crates/ferric-web/src/stream.rs",
+"check": "crates/ferric-tier/tests/placement_invariance.rs (CI); examples/moe_streaming.rs:142 asserts byte-identical MoE output at every expert-cache capacity (Instella DeepSeekMoE block); examples/moe_slots.rs:107 (manual diff across FERRIC_MOE_SLOTS values); examples/stream_generate.rs:97 asserts identical token ids at every budget; ferric-tier/examples/stream_gguf.rs:140",
+"notes": "Recorded: the 213.66 GiB hyv4 checkpoint runs on a 256 GiB M3 Ultra only via load_streaming, at ~250 s/token because every token rebuilds all 78 blocks (arch.rs:391-395). Expert streaming costs a GPU->CPU sync per (token, MoE layer); cross-layer routing prediction measured at chance, so prefetch cannot hide it (docs/expert-streaming-decision.md). Not available in wasm (qwen35.rs:639)."
+},
+{
+"id": "E17",
+"status": "partial",
+"evidence": "crates/ferric-llama/src/stream.rs:322 open / :332 open_with: a byte budget pins a prefix of layers resident and streams the rest from disk each token (ferric_tier::LayerCache pinned-prefix + ring, PrefetchCache one layer ahead)",
+"check": "examples/stream_generate.rs:97 (token ids identical at every budget), examples/stream_overlap.rs:118",
+"notes": "This is a memory-budget analogue of n-gpu-layers, not the same thing: offloaded layers are re-uploaded and still computed on the GPU; nothing computes a layer on the CPU. Recorded 5.3-11.3x slower than resident on Qwen2.5-0.5B, dominated by GPU tensor rebuilds (stream.rs header table)."
+},
+{
+"id": "E18",
+"status": "verified",
+"evidence": "Lazy GGUF: crates/ferric-gguf/src/lib.rs:621 GgufFile (header parsed from a growing prefix read, tensors pulled on demand, split/sharded files followed at :687); positional-read backing crates/ferric-tier/src/file.rs:21 FileBacking; lazy safetensors crates/ferric-load/src/lib.rs:141",
+"check": "crates/ferric-load/src/lib.rs:479 the_lazy_reader_and_the_eager_one_agree; ferric-gguf/examples/shards.rs:27 (bytes identical to the merged file); every conformance gate loads through GgufFile",
+"notes": "No mmap, deliberately: crates/ferric-tier/src/file.rs:8-15 (honest RSS accounting, enforceable budgets). Peak host memory is the largest tensor, not the file."
+},
+{
+"id": "E19",
+"status": "partial",
+"evidence": "YaRN: crates/ferric-llama/src/qwen35.rs:612 yarn_freq_scale, read at qwen3.rs:320, qwen35.rs:132, deepseek2.rs:168 (with the in-kernel mscale correction, deepseek2.rs:133); Llama-3 rope_freqs tensor qwen3.rs:674/900-920; multimodal RoPE crates/ferric-tensor/src/lib.rs:488 rope_mrope; scaled kernels lib.rs:634 rope_scaled, :645 rope_scaled_interleaved; partial rotary",
+"check": "Llama-3 scaling is inside the verified llama row: scripts/lm_conformance.sh vs crates/ferric-llama/tests/fixtures/lm/llama-3.2-1b.json; mRoPE unit tests ferric-tensor/src/lib.rs:4494-4659; deepseek2.rs:715/727 YaRN attention-scale tests",
+"notes": "Only 'yarn' is read from rope.scaling.type; a GGUF declaring 'linear' gets no scaling at all, silently (qwen3.rs:320). NTK-aware and LongRoPE are absent. The YaRN path has no reference comparison: the qwen35 row says 'the YaRN long-rope SUB-PATH is unverified' (arch.rs:417) and the YaRN models (deepseek2, laguna) are only Status::Loads."
+},
+{
+"id": "E20",
+"status": "verified",
+"evidence": "crates/ferric-llama/src/qwen3.rs:1195-1200 (decode_attention_win / causal_attention_win per-layer window); gemma3 1-in-6 global with separate SWA rope base; gemma2 alternating SWA; gemma4 SWA; modern-bert symmetric band; Parakeet limited-context attention",
+"check": "scripts/lm_conformance.sh vs tests/fixtures/lm/gemma-3-1b-long.json (666 tokens; window disabled is 236,359x worse, arch.rs:324-334); scripts/modern_bert_conformance.sh (window disabled 297x worse); gemma4_batched_decode.rs past the 512 window",
+"notes": "gemma2 and gemma4 rows are Loads, not reference-verified."
+},
+{
+"id": "E21",
+"status": "partial",
+"evidence": "Learned per-head softmax sink: crates/ferric-llama/src/mla.rs:281 (sinks: Option<Tensor>), loaded from attn_sinks.weight at crates/ferric-llama/src/hyv4.rs:475",
+"check": "mla.rs:709 cached_decode_equals_a_full_re_run (with and without a sink), :753 block_decode_in_uneven_chunks_equals_the_whole; hyv4 real-weights comparison vs Tencent's reference (scripts/hyv4_vs_reference.sh, VERIFICATION.md §3d)",
+"notes": "Only the MLA path (hyv4) carries sinks; the dense/hybrid runtimes do not, and gpt-oss (the common sink model) is not a registered architecture. StreamingLLM-style sink-token retention during context shift is absent."
+},
+{
+"id": "E22",
+"status": "verified",
+"evidence": "Runtime WGSL fusion codegen crates/ferric-tensor/src/fuse.rs; fused QKV, add+rmsnorm, swiglu, q|k RoPE, K+V append, gather removed (410 -> 290 dispatches/token, docs/RUNTIME-PARITY-2026.md); ferric_tensor::batch collapses queue submissions to ~1 per layer; CUDA tier-2 keeps the whole decode step resident (cuda.rs)",
+"check": "crates/ferric-llama/examples/dispatch_budget.rs:125 asserts the per-layer dispatch count; ferric-tensor/examples/fusion.rs:74 and bench_fuse_mm (CI); ffn_fuse.rs:122",
+"notes": "No graph capture (CUDA graphs measured at ~0.2 ms of a 9.3 ms step on the RTX 4050 and not pursued, docs/sota-2026-09-10.md:295-305). Cutting 29% of dispatches changed native decode by 0.00 ms."
+},
+{
+"id": "E23",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "Listed as still open in docs/RUNTIME-PARITY-2026.md ('matters at multi-GPU scale, which is not Ferric's near-term shape')."
+},
+{
+"id": "E24",
+"status": "verified",
+"evidence": "Mamba-2 conv+SSM state crates/ferric-llama/src/nemotron_h.rs:549 Cache, :373 forward_cached; gated-delta-net recurrent state crates/ferric-llama/src/qwen35.rs:211 Cache (+ :238 O(1) snapshot for speculative rollback); LFM2 short-conv state crates/ferric-llama/src/lfm2.rs:86",
+"check": "crates/ferric-llama/examples/nemotron_trace.rs:111 asserts incremental == stateless (reference-verified) token for token; examples/gdn_state.rs + gdn_state_aliasing.rs (ferric-tensor, gdn_state in CI); batched_decode_qwen35.rs and lfm2_batched_decode.rs solo-equivalence; lfm2 cached decode vs re-prefill by hand (examples/run_lfm2_cached.rs)",
+"notes": "nemotron_h state is 85.4 MB and does not grow with the conversation (arch.rs:168-170). State survives across requests only through ferric-serve's one-slot prefix (qwen35 MTP path, E03); no state cache keyed across many conversations."
+},
+{
+"id": "E25",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No LoRA adapter loading of any kind (no adapter GGUF / PEFT reader); docs/sota-feature-matrix.md §C 'LoRA / adapter serving ❌'. The only 'lora' in the runtimes is DeepSeek/hyv4 q_lora_rank/kv_lora_rank MLA internals."
+},
+{
+"id": "E26",
+"status": "verified",
+"evidence": "crates/ferric-llama/src/pooling.rs:41 pool(): MEAN (1), CLS (2), LAST (3) read from <arch>.pooling_type; NONE (0) and RANK (4) refused; RANK served by the cross-encoder head crates/ferric-llama/src/bert.rs Reranker; modern-bert head pools per the checkpoint (classifier_pooling=mean); sentence-transformers 1_Pooling/config.json read by crates/ferric-load/src/hf.rs",
+"check": "4 unit tests in pooling.rs (:78-:100+); scripts/bert_conformance.sh (bge-small, bge-reranker-v2-m3), scripts/modern_bert_conformance.sh",
+"notes": "Pooling was previously hardcoded LAST in ferric-serve; now one shared rule (pooling.rs header)."
+},
+{
+"id": "E27",
+"status": "verified",
+"evidence": "Strict-float patches in the forked wgpu/naga: docs/determinism/0001-wgpu-hal-metal-safe-math.patch, 0002-naga-spv-nocontraction.patch, 0003-naga-msl-fp-contract-off.patch; deterministic transcendental preamble ferric-core kernels::DET_MATH_WGSL (crates/ferric-core/src/lib.rs pipeline()); batched decode token-identical to solo on all batching runtimes",
+"check": "scripts/fabric-ci.sh (kernel-probe FNV digests: local Metal vs headless Chrome WebGPU vs remote Vulkan over ssh; local, not CI); examples/hyv4_synthetic.rs golden hash keyed per adapter (CI on lavapipe and real Metal); batched_decode examples",
+"notes": "Bit-identity is per ADAPTER, not per backend (three different hashes on M5 Max, Apple Paravirtual, llvmpipe; VERIFICATION.md §5b). Metal vs browser WebGPU on the same Apple GPU is bit-identical; Metal vs NVIDIA Vulkan agreed to ~1e-5 per logit (docs/SOTA.md:22-33). Batch invariance is checked at token level, not bitwise logits. Split-KV decode and the CUDA/Metal4/coop native tiers are declared NOT bit-identical and are opt-in."
+},
+{
+"id": "E28",
+"status": "partial",
+"evidence": "crates/ferric-tier/src/kvstore.rs: persistent KV checkpoint identity keyed on the rendered byte prefix, ResumePlan, eviction reasons",
+"check": "10 unit tests in kvstore.rs; examples/bpe_boundary.rs checks the BPE-merge premise",
+"notes": "Not wired: no runtime serializes its cache to kvstore and nothing outside ferric-tier uses it. No CPU offload of live KV."
+},
+{
+"id": "E29",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "Logits are read back (~608 KB/token, measured 0.45 ms, docs/RUNTIME-PARITY-2026.md) and sampled on the host: crates/ferric-serve/src/lib.rs:891 sample_top_p. The only GPU top-k kernel is MoE routing (crates/ferric-tensor/src/dtype.rs:3468 MOE_TOPK_WGSL)."
+},
+{
+"id": "F01",
+"status": "verified",
+"evidence": "Dequant crates/ferric-gguf/src/lib.rs:596-605 (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K); packed GPU kernels for all of them, crates/ferric-tensor/src/dtype.rs:1158-1169 QMatrix::block_bytes",
+"check": "CI examples with exact asserts: ferric-tensor/examples/q4_0, q4_k, q5_k, q6_k, q8_0 and coop_q4_k/q5_k/q6_k/q8_0; examples/q2k_q3k_kernel.rs one-hot probe (worst delta 0.0 across 8 tensor/format pairs); Q4_K_M/Q5_K_M/Q8_0 checkpoints in lm/parakeet/bert conformance gates",
+"notes": "Weights stay packed on the device. Q8_1/Q8_K intermediate types not applicable."
+},
+{
+"id": "F02",
+"status": "partial",
+"evidence": "IQ2_XXS, IQ3_XXS, IQ4_NL, IQ4_XS: dequant crates/ferric-gguf/src/lib.rs:606-609, packed kernels crates/ferric-tensor/src/dtype.rs:1170-1181",
+"check": "dtype.rs:6744 packed_iq_matmuls_match_dequant_then_matmul; Kani proofs ksigns_is_an_injective_even_parity_code / iq2_subscale_is_in_the_sign_word / iq3_control_words_live_after_the_index_bytes (scripts/proofs.sh, CI proofs job); hyv4 real 213.66 GiB checkpoint (IQ2_XXS/IQ3_XXS experts) vs Tencent's reference (VERIFICATION.md §3d); examples/iq4_real_weights.rs",
+"notes": "IQ1_S, IQ1_M, IQ2_XS, IQ2_S, IQ3_S are not decoded at all (type_size returns 'unsupported ggml type')."
+},
+{
+"id": "F03",
+"status": "partial",
+"evidence": "crates/ferric-load/src/hf.rs HfCheckpoint implements GgufSource over config.json + (sharded) safetensors; model_type maps at hf.rs:101-106: lfm2, qwen3_vl, qwen2_5_vl, qwen2, nomic_bert; F32/F16/BF16 only (hf.rs:71); BF16/F16 kept 16-bit on device (crates/ferric-tensor/src/dtype.rs:1178 HalfWeights); Cosmos3 Edge and MiMo-ASR load their own safetensors",
+"check": "LFM2-350M vs HF transformers logits (docs/sota-feature-matrix.md §D, correlation 1.000000); scripts/vl_conformance.sh (MiMo-Embodied-7B from the authors' safetensors, image file to logits); scripts/mimo_asr_conformance.sh; crates/ferric-load/src/lib.rs:370 sharded-checkpoint test",
+"notes": "Verified where it exists, but only 5 model_types map; any other HF directory (llama, qwen3, gemma, mistral...) is refused with 'no HF mapping for model_type'. Those architectures run only from GGUF."
+},
+{
+"id": "F04",
+"status": "partial",
+"evidence": "safetensors F8_E4M3/F8_E4M3FN/F8_E5M2 decode crates/ferric-load/src/lib.rs:101-102 with companion-scale application get_scaled :280 (get() refuses bare FP8, :263); GGUF F8_E4M3_B128 (DeepSeek-V4 fork type 42) crates/ferric-gguf/src/lib.rs:616",
+"check": "crates/ferric-load/src/fp8.rs:57/:71/:87 exhaustive over all 256 bytes; lib.rs:406/:419/:444 scale tests; ferric-gguf/examples/f8_ref_diff.rs: 0 of 2,097,152 elements differ from torch.float8_e4m3fn on real V4 weights (docs/sota-feature-matrix.md §N addendum)",
+"notes": "Format decode only. HfCheckpoint refuses scale-carrying dtypes (crates/ferric-load/src/hf.rs:67-79), no FP8 kernel exists (FP8 would dequantize to f32), and the DeepSeek-V4 forward graph is not implemented, so no FP8 checkpoint runs end to end."
+},
+{
+"id": "F05",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No qweight/qzeros/g_idx reader. ferric-load decodes I8/U8/I32 tensors (lib.rs:88-95) so the raw codes are readable, but nothing maps them. The 'GPTQ' in the tree is Ferric's own ternary quantizer (T08)."
+},
+{
+"id": "F06",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No AWQ reader."
+},
+{
+"id": "F07",
+"status": "verified",
+"evidence": "Dequant crates/ferric-gguf/src/lib.rs:612 deq_mxfp4 (type 39, 17 B / 32 values); packed kernel crates/ferric-tensor/src/dtype.rs:1172 + MXFP4_HELPERS",
+"check": "ferric-gguf lib.rs:1668 mxfp4_grid_is_bit_identical_to_ggml, :1698 mxfp4_real_gguf_blocks_are_bit_identical_to_ggml (11,124,608 real elements), :1895; dtype.rs:5926 mxfp4_kernel_matches_ggml_over_the_full_e8m0_x_e2m1_grid, :6051, :6105 resident bytes are the format's own",
+"notes": "Recorded token-identical to the f32 dense fallback over 16 steps on a 72-tensor MXFP4 checkpoint (docs/sota-feature-matrix.md §D). The format works; gpt-oss, the main MXFP4 model, is not a registered architecture."
+},
+{
+"id": "F08",
+"status": "partial",
+"evidence": "NVFP4 (ggml type 40) packed GPU kernel crates/ferric-tensor/src/dtype.rs:4538-4626 Nvfp4Weights, listed in QMatrix::block_bytes dtype.rs:1173",
+"check": "dtype.rs:5853 nvfp4_kernel_matches_ggml_over_the_full_ue4m3_x_e2m1_grid",
+"notes": "WIRING GAP: crates/ferric-gguf/src/lib.rs type_size (:542) and deq_raw (:589) have no case for type 40, so GgufFile::raw (:769) fails with 'unsupported ggml type 40' before the kernel can be reached. No NVFP4 GGUF can load today; no safetensors (ModelOpt) NVFP4 path either."
+},
+{
+"id": "F09",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No EXL2/EXL3 reader."
+},
+{
+"id": "F10",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No bitsandbytes NF4/int8 reader."
+},
+{
+"id": "F11",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No HQQ reader."
+},
+{
+"id": "F12",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No MLX quantized-checkpoint reader."
+},
+{
+"id": "F13",
+"status": "verified",
+"evidence": "Types crates/ferric-gguf/src/lib.rs:39-43: TQ2_0 (35), Q1_0 (41), Q2_0 (42, PrismML; collision with mainline Q2_0/F8 resolved by stride), STQ1_0 (43, Tencent hyv4); packed kernels for Q2_0 and STQ1_0 crates/ferric-tensor/src/dtype.rs:1174/:1179; quantizers crates/ferric-gguf/src/lib.rs:1429-1460 and quantize.rs:464",
+"check": "Kani: codebook_is_the_thirty_two_patterns, only_three_of_four_groups_are_encodable, decoder_places_every_group_where_the_encoder_says, vec4_traversal_... (scripts/proofs.sh, CI); dtype.rs:6381 every_group_position_reaches_the_kernel, :6317 packed_matmul_matches_dequant_then_matmul; CI q2_0 example under 4 kernel variants; ferric-gguf/examples/stq1_0_interop.rs; hyv4 real weights vs reference",
+"notes": "TQ2_0 and Q1_0 have no packed kernel (not in block_bytes), so they load through the f32 dense fallback at ~16x the resident bytes. TQ1_0 (type 34) is unsupported. There is no 'bitnet' architecture row, so BitNet b1.58 GGUFs are refused; ternary support is exercised via PrismML Bonsai (qwen3 arch) and hyv4."
+},
+{
+"id": "F14",
+"status": "partial",
+"evidence": "crates/ferric-onnx/src/lib.rs: prost-decoded ModelProto, 20 ops (Add, Concat, Div, Gather, Gelu, Gemm, Identity, LayerNormalization, MatMul, Mul, Relu, Reshape, Sigmoid, SimplifiedLayerNormalization, Softmax, Sqrt, Squeeze, Sub, Transpose, Unsqueeze)",
+"check": "CI: ferric-onnx examples run_mlp, run_attn, run_block, run_struct, run_swiglu vs onnxruntime references; run_projectors (SmolVLA components) is manual",
+"notes": "Small graphs only; no control flow, no quantized ONNX ops, no LLM-scale ONNX model."
+},
+{
+"id": "F15",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No compressed-tensors reader. ferric-load's scale naming handles <name>_scale (the compressed-tensors convention) for FP8 decode only (fp8.rs:11), which HfCheckpoint then refuses."
+},
+{
+"id": "F16",
+"status": "partial",
+"evidence": "GGUF writer crates/ferric-gguf/src/write.rs:228 GgufWriter; tensor quantizers crates/ferric-gguf/src/lib.rs:1429-1545 (Q1_0, Q2_0, TQ2_0, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1) and crates/ferric-gguf/src/quantize.rs (Q2_K :56, Q3_K :151, STQ1_0 :464, least-squares refinement)",
+"check": "21 tests in quantize.rs, 10 in write.rs; ferric-gguf/examples/roundtrip.rs (CI); examples/quant_real_weights.rs (Llama-3.2-1B)",
+"notes": "No model-level quantize command: nothing takes a checkpoint and writes a quantized GGUF. GgufWriter is used only to emit synthetic test checkpoints (hyv4_synthetic, hyv4_real_block/moe). No Q4_K/Q5_K/Q6_K/IQ encoders."
+},
+{
+"id": "F17",
+"status": "partial",
+"evidence": "crates/ferric-gguf/src/imatrix.rs:37 Imatrix (accumulate sum x^2 per input channel, llama.cpp legacy .dat read/write :96/:115), :177 quantize_ternary_weighted; STQ1_0 quantizer takes an imatrix (quantize.rs:464); role-based plan crates/ferric-gguf/src/quantplan.rs (imatrix must not be applied to gate); activation capture hook crates/ferric-llama/src/qwen3.rs:675/799",
+"check": "7 unit tests in imatrix.rs (:253-:344), 9 in quantplan.rs; examples/imatrix_ternary.rs (measured -0.262 / -0.467 nats on up/down, +4.156 on gate)",
+"notes": "Applied to ternary formats only; the K-quant encoders (Q2_K/Q3_K) take no importance vector."
+},
+{
+"id": "B01",
+"status": "partial",
+"path": "Hand-written native tier: CUDA driver API over dlopen (no cudarc/cuBLAS/CUTLASS), shipped PTX (crates/ferric-tensor/src/cuda_decode.ptx, 11 kernels; cuda_q5k_gemv.ptx), opt-in FERRIC_CUDA, Linux/Windows only. Also reachable through wgpu -> Vulkan (portable default; coop16 f16 tensor-core GEMM opt-in).",
+"hardware": "RTX 4050 Laptop (sm_89): tier-2 resident decode 5.2 ms/tok vs llama.cpp CUDA 4.46 ms/tok (1.17x), ids identical to the WGSL path over 16 tokens (docs/sota-2026-09-10.md:260-275). wgpu/Vulkan on the same card in July: Bonsai-1.7B logits matched Metal to fp32 rounding (docs/SOTA.md:22-33); in Sept the box's NVIDIA Vulkan ICD was broken and 'Ferric on NVIDIA via wgpu is NOT YET MEASURED' (docs/sota-2026-09-10.md:232).",
+"evidence": "crates/ferric-tensor/src/cuda.rs (Driver :44, DecodeGraph); wired into crates/ferric-llama/src/qwen3.rs:1651 forward_cached -> native_step :1684",
+"check": "cuda.rs tests :680 q5k_gemv_matches_flat_wgsl_on_a_real_driver, :766 q6k_gemv_matches_flat_wgsl, :788, :808 q5k_swiglu_matches_wgsl_composed, :829 norm_rope_attention_match_wgsl (SKIP without a driver, so never run in CI); crates/ferric-tensor/tests/ptx_artifact.rs (every .cu kernel exported by the tracked .ptx; runs everywhere)",
+"notes": "Narrow eligibility (qwen3.rs:1686-1690): Dense runtime only, decode only (prefill on WGSL), Q5_K/Q6_K weights, NEOX rope, no biases/softcaps/windows/YaRN/rope_freqs, f32 KV, <=2048 tokens. Every other model and all MoE/hybrid runtimes run on NVIDIA only via Vulkan."
+},
+{
+"id": "B02",
+"status": "absent",
+"path": "No HIP/ROCm code. AMD would be reached only through wgpu -> Vulkan.",
+"hardware": "No AMD GPU run recorded anywhere in docs/ or the tree.",
+"evidence": "",
+"check": "",
+"notes": "docs/sota-feature-matrix.md §B: 'ROCm native ❌ | AMD via Vulkan; AITER/CK unused'."
+},
+{
+"id": "B03",
+"status": "verified",
+"path": "Default: wgpu -> Metal (forked wgpu-hal with MTLMathModeSafe + naga MSL FP_CONTRACT OFF, docs/determinism/). Hand-written opt-ins: Metal 4 MetalPerformancePrimitives tensor_ops::matmul2d through the MTL4 command model (crates/ferric-tensor/src/metal4.rs, FERRIC_METAL4, fp16 in / fp32 acc); simdgroup_matrix coop_mat via the naga fork (FERRIC_COOP, Context::coop_gemm_ok / coop_shared_ok crates/ferric-core/src/lib.rs:79-104).",
+"hardware": "Apple M5 Max (dev box), M3 Ultra 256 GB (hyv4 real 213.66 GiB weights), GitHub macos-latest (CI 'build + validate (real Metal)').",
+"evidence": "crates/ferric-core/src/lib.rs:108 Context::new (HighPerformance adapter); metal4.rs; every conformance fixture in crates/ferric-llama/tests/fixtures was produced against Metal runs",
+"check": "CI macos-metal job: cargo test --workspace plus transformer_block, decoder_layer, tiny_llm, generate, devices, fabric, dtypes, general, chunked_attn, hyv4_synthetic, ebm_cert_verify on real Metal; 12 tests in metal4.rs; all scripts/*_conformance.sh",
+"notes": "The primary fabric. Metal 4 and coop paths are not bit-identical to the portable path and are off by default."
+},
+{
+"id": "B04",
+"status": "verified",
+"path": "wgpu -> Vulkan (forked naga SPIR-V backend decorates float ops NoContraction, docs/determinism/0002). Opt-in matmul_coop16 (KHR_cooperative_matrix, 16x16 f16 in / f32 acc) via Context::coop16_ok (crates/ferric-core/src/lib.rs:88).",
+"hardware": "CI ubuntu-latest on Mesa lavapipe (software Vulkan); NVIDIA RTX 4050 (July 2026, docs/SOTA.md:22-33, :101-126); Intel Iris Xe via Mesa ANV (2026-09-14, docs/sota-2026-09-10.md:227-245).",
+"evidence": "Same Context::new path; .github/workflows/ci.yml job build-and-validate",
+"check": "CI Linux job: cargo test --workspace (575 s) and ~58 validating examples on lavapipe incl. q2_0/q4_k/q5_k/q6_k/q8_0, flash, chunked_attn, hyv4_synthetic, fabric; scripts/fabric-ci.sh remote-Vulkan leg (manual)",
+"notes": "The f32 8x8 coop kernel returns all zeros on NVIDIA Vulkan and is gated off there (lib.rs:69-80)."
+},
+{
+"id": "B05",
+"status": "partial",
+"path": "No hand-written AVX2/AVX-512/AMX kernels. The full runtime runs on x86 CPUs only as a wgpu adapter over Mesa lavapipe/llvmpipe (software Vulkan, LLVM JIT). Separate plain-Rust autovectorized Q8_0 matvec with a thread pool: crates/ferric-tensor/src/cpu_simd.rs.",
+"hardware": "CI ubuntu-latest x86_64 via lavapipe: all tests and examples pass; llvmpipe sustains ~2 GFLOP/s and 3.9 GB/s scalar reads vs 292 GB/s on Metal (VERIFICATION.md §7).",
+"evidence": "cpu_simd.rs (safe Rust shaped for LLVM autovectorization, header lines 1-20); sched.rs Device::Cpu plain-Rust bmm",
+"check": "10 unit tests in cpu_simd.rs (:163 matvec_matches_the_dequantised_reference ...); CI Linux job on lavapipe",
+"notes": "cpu_simd is not wired into any runtime (only examples/fabric_decode_shapes.rs uses it). Correct-but-slow CPU execution, not a CPU inference backend."
+},
+{
+"id": "B06",
+"status": "partial",
+"path": "Same as B05: cpu_simd.rs autovectorizes to NEON on aarch64; no SVE/SME; no hand-written intrinsics.",
+"hardware": "cpu_simd measured on Apple silicon in examples/fabric_decode_shapes.rs (a split-matmul study). macOS has no software Vulkan adapter, so there is no CPU path for whole models on Apple; ARM Linux lavapipe is not tested anywhere.",
+"evidence": "crates/ferric-tensor/src/cpu_simd.rs",
+"check": "cpu_simd.rs unit tests (run on the Mac dev box and CI)",
+"notes": "No runtime runs a model on ARM CPU cores."
+},
+{
+"id": "B07",
+"status": "verified",
+"path": "Same Rust compiled to wasm32; wgpu -> browser WebGPU (Dawn/Tint in Chrome compiles the WGSL). crates/ferric-web.",
+"hardware": "Headless and headed Chrome on Apple M5 Max: Parakeet ASR in a tab with transcript identical to native (README), LFM2.5-1.2B, Bonsai-1.7B ternary with q4_0 grouped-K KV (docs/sota-feature-matrix.md §O), matmul bit-identical to native Metal (7.153e-7 both, docs/ARCHITECTURE.md).",
+"evidence": "crates/ferric-web/src/lib.rs (FerricModel), src/stream.rs (Range-fetch streaming backing), web/*.html pages",
+"check": "puppeteer drivers crates/ferric-web/*.mjs (speech_test, runtimes_page_test, bonsai_page_test, xfabric_test, probe_test) and scripts/fabric-ci.sh browser leg (manual); CI only BUILDS wasm32 for 9 crates, it does not execute in a browser",
+"notes": "Recorded blocker: a 3.27 GB gemma4 E2B file failed to load through the whole-file fetch path (§O). Expert streaming is compiled out of wasm."
+},
+{
+"id": "B08",
+"status": "absent",
+"path": "None. Context::new errors when no WebGPU adapter exists.",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "The only CPU code in the wasm build is a reference matmul and a tiny demo LM used to validate the GPU result (crates/ferric-web/src/lib.rs:72-211). No WASM SIMD inference path."
+},
+{
+"id": "B09",
+"status": "partial",
+"path": "wgpu -> Vulkan (Mesa ANV) only. No SYCL, oneAPI, Level Zero or OpenVINO code. coop16 is documented as applicable to Intel XMX (crates/ferric-core/src/lib.rs:83-86) but not verified on Intel.",
+"hardware": "Intel Iris Xe (RPL-P) on the jetson-hub box, 2026-09-14: 101.6 ms/tok default, 91.5 ms/tok with FERRIC_SUBBLK=1 (docs/sota-2026-09-10.md:227-245).",
+"evidence": "docs/sota-2026-09-10.md:227-245",
+"check": "scripts/ab_env.sh + scripts/quiet.sh measured A/B; generation identical across arms",
+"notes": "Those runs were first mislabeled RTX 4050 because wgpu silently picked the iGPU; the adapter is now printed first (vacuous-test mechanism #71)."
+},
+{
+"id": "B10",
+"status": "partial",
+"path": "Hand-written CoreML execution provider (objc2-core-ml), crates/ferric-tensor/src/npu_coreml.rs: arbitrary bmm tiled onto an embedded rank-4 matmul .mlmodelc; ANE dispatch evidenced by Apple's MLComputePlan receipt.",
+"hardware": "M5 Max, macOS 26.5: plan shows ios16.matmul -> ANE; ~500 us dispatch, ~700 GFLOP/s through host-boundary tiling (docs/NPU.md).",
+"evidence": "npu_coreml.rs; added to the fabric as sched Device::Npu only when the receipt shows the ANE",
+"check": "npu_coreml test asserts only err < 2e-2 vs an fp16 oracle (npu_coreml.rs:279); ane_confirmed is printed (:264), never asserted, and the test returns early if CoreML fails to load (docs/backend-expansion.md §0.1)",
+"notes": "One op (bmm) reachable only through the sched Planner; no LLM runtime calls it, so no token of real inference touches the ANE."
+},
+{
+"id": "B11",
+"status": "absent",
+"path": "None (no QNN/Hexagon code).",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "docs/sota-feature-matrix.md §B lists Hexagon/QNN as absent."
+},
+{
+"id": "B12",
+"status": "absent",
+"path": "None. sched.rs:31-34 names DirectML-QNN / OpenVINO / WebNN as possible NpuBackend implementations; none exists besides CoreML.",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "crates/ferric-web/examples/npu.rs launches Chrome with WebNN and reports whichever device WebNN bound; docs/NPU.md records WebNN absent in the local Chrome. No Ascend, Rebellions, Furiosa or other NPU code."
+},
+{
+"id": "B13",
+"status": "partial",
+"path": "Hand-written host tier: tt-kmd ioctl UAPI called directly (no luwen), crates/ferric-tensor/src/tenstorrent.rs; RISC-V ELF32 kernel loader.",
+"hardware": "Never run on a card: 'Nothing here has run against a Tenstorrent card. No Wormhole or Blackhole device has been available' (tenstorrent.rs:14-16).",
+"evidence": "tenstorrent.rs (ioctl numbers and struct layouts checked against the real header under 4 target triples)",
+"check": "crates/ferric-tensor/tests/tt_elf.rs (:28 parses a real rv32 image exactly as llvm-readobj, :137 parses a kernel built by Tenstorrent's compiler for a Wormhole core); layout tests in tenstorrent.rs",
+"notes": "No compute kernels, no device path exercised; host plumbing only."
+},
+{
+"id": "B14",
+"status": "absent",
+"path": "None.",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "No XLA/PJRT/TPU code."
+},
+{
+"id": "B15",
+"status": "absent",
+"path": "None.",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "No Android build target, JNI or Kotlin binding in the tree. (wgpu could reach Vulkan on Android; nothing does.) The C ABI in crates/ferric-ffi is the only foreign binding (O08)."
+},
+{
+"id": "B16",
+"status": "absent",
+"path": "None.",
+"hardware": "",
+"evidence": "",
+"check": "",
+"notes": "No iOS target, Swift package or app. wgpu's Metal backend would apply; nothing builds or tests it."
+},
+{
+"id": "M01",
+"status": "verified",
+"arch_rows": "crates/ferric-llama/src/arch.rs — Verified: qwen2 (:254), qwen3 (:266), llama (:309), gemma3 (:324). Loads (not reference-diffed): phi3 (:318), gemma (:320), gemma2 (:322), muse-glimmer (:349), gemma4 (:357, dense E2B/E4B only), cosmos3_edge (:463, AR text tower from safetensors), qwen3vl (:280, text-only).",
+"evidence": "Dense runtime crates/ferric-llama/src/qwen3.rs; exact-match registry resolve() arch.rs:512 refuses unknown archs",
+"check": "scripts/lm_conformance.sh vs crates/ferric-llama/tests/fixtures/lm/{qwen2.5-0.5b,qwen3-0.6b,llama-3.2-1b,gemma-3-1b,gemma-3-1b-long}.json (vs transformers 5.7.0 float32; max |logit diff| 7e-5 to 2.6e-4, argmax equal at every position)",
+"notes": "Mistral, Phi-4, GLM, Granite, OLMo, etc. are not registered and are refused (arch.rs:569 test lists glm4, minimax, hunyuan, mimo, kimi, step3, ernie4)."
+},
+{
+"id": "M02",
+"status": "verified",
+"arch_rows": "Verified: hyv4 (:369, Tencent Hy4 770B/49B, real weights vs Tencent's hyv4.cpp), qwen35moe (:433; the shared hybrid path is verified, its MoE FFN was not compared against the authors). Loads: qwen3moe (:428, Qwen3-30B-A3B / Coder), deepseek2 (:363, MLA legacy path; absorbed and Q-LoRA variants refused), lfm2moe (:452), laguna (:437, no reference exists). Parts (refused): qwen3vlmoe (:306). gemma4 MoE variants (26B-A4B, 31B) refused at load.",
+"evidence": "crates/ferric-llama/src/qwen35.rs (MoE FFN, GPU moe_topk dtype.rs:3468), deepseek2.rs, hyv4.rs, lfm2.rs",
+"check": "scripts/hyv4_vs_reference.sh (sum_abs and greedy pick, synthetic) + VERIFICATION.md §3d (78 blocks on the real 213.66 GiB checkpoint, same greedy token 220); scripts/lm_conformance.sh qwen3.5 fixtures; lfm2moe expert compute vs FERRIC_MOE_REF at 1.8e-8",
+"notes": "The hyv4 reference comparison is one prompt and one token at a thin margin (arch.rs:388-391). The most-downloaded MoE (Qwen3-Coder-30B-A3B) is Loads only."
+},
+{
+"id": "M03",
+"status": "verified",
+"arch_rows": "Verified: qwen2vl (:289, MiMo-Embodied-7B / Qwen2.5-VL, image file to logits vs the authors' transformers code). Loads: qwen3vl (:280, GGUF row text-only, note says 'No vision tower yet'), muse-glimmer (:349, glimmer_vision tower wired, never diffed end to end). Parts: qwen3vlmoe (:306).",
+"evidence": "crates/ferric-llama/src/qwen25vl_vision.rs, qwen3vl_vision.rs (Qwen3-VL tower from HF safetensors via hf.rs qwen3_vl map), qwen3vl_image.rs (preprocessing), qwen3vl_rope.rs, glimmer_vision.rs",
+"check": "scripts/vl_conformance.sh vs tests/fixtures/qwen25vl (logits within 4x the authors' own f32-vs-f64 distance at 83 positions, 64-token greedy decode identical); Qwen3-VL: examples/qwen3vl_vision_ref.rs, qwen3vl_e2e.rs, qwen3vl_preproc_ref.rs vs tests/fixtures/qwen3vl_{vision,e2e,preproc,lm}",
+"notes": "One still image per prompt; video refused. The qwen3vl registry note is stale relative to the code: a verified Qwen3-VL tower exists on the HF-safetensors path, but a Qwen3-VL GGUF served through the registry is text-only. No audio-in LLMs beyond MiMo-ASR."
+},
+{
+"id": "M04",
+"status": "verified",
+"arch_rows": "Verified: asr (:181, NeMo parakeet-ctc-1.1b), parakeet (:196, parakeet-unified-en-0.6b RNN-T and nemotron-3.5-asr-streaming-0.6b). MiMo-V2.5-ASR (7B audio-LM) served through the qwen2 row (:254) plus crates/ferric-llama/src/mimo_asr.rs.",
+"evidence": "crates/ferric-llama/src/parakeet.rs (Conformer + CTC / RNN-T, native and in-browser), mimo_asr.rs",
+"check": "scripts/parakeet_conformance.sh vs tests/fixtures/parakeet (stage by stage vs NeMo 3.0.0, 26-31 negative controls each); scripts/mimo_asr_conformance.sh vs tests/fixtures/mimo_asr; examples/librispeech_wer.rs (2.07% WER ctc-1.1b Q8_0, 1.77% unified-0.6b f16 on full LibriSpeech test-clean)",
+"notes": "Offline only; the cache-aware streaming encoder is not implemented (arch.rs:220-221). Whisper is not supported."
+},
+{
+"id": "M05",
+"status": "absent",
+"arch_rows": "none",
+"evidence": "",
+"check": "",
+"notes": "No TTS / vocoder model anywhere in the tree."
+},
+{
+"id": "M06",
+"status": "verified",
+"arch_rows": "Verified: bert (:224, bge-small-en-v1.5 vs transformers within 1.4e-6). Qwen3-Embedding via the qwen3 row (LAST pooling). nomic-bert: encoder supported in crates/ferric-llama/src/bert.rs:55-70 and mapped from HF (crates/ferric-load/src/hf.rs:445), but NOT a registry row, so arch::resolve refuses it and ferric-serve cannot serve it.",
+"evidence": "crates/ferric-llama/src/bert.rs, pooling.rs:41",
+"check": "scripts/bert_conformance.sh vs tests/fixtures/bert/bge_hf.json; retrieval benches crates/ferric-web/examples/retrieval_scale.rs, lookup_vs_weights.rs",
+"notes": "nomic-embed-text is Ollama's default embedder; the missing registry row is a one-line gap between working code and serving."
+},
+{
+"id": "M07",
+"status": "verified",
+"arch_rows": "Verified: bert (:224, XLM-R cross-encoder bge-reranker-v2-m3, scores exact to 4 dp vs transformers), modern-bert (:235, Alibaba gte-reranker-modernbert-base, head scores exact to 4 dp).",
+"evidence": "crates/ferric-llama/src/bert.rs Reranker (owns its SentencePiece/WordPiece tokenizer), modern_bert.rs",
+"check": "scripts/bert_conformance.sh, scripts/modern_bert_conformance.sh vs tests/fixtures/modern_bert/gte_reranker_hf.json",
+"notes": "4-bit reranker files differ from the authors by 0.04-0.31 (arch.rs:232-233), so the math is only verified on F16/F32 weights."
+},
+{
+"id": "M08",
+"status": "partial",
+"arch_rows": "bert (:224) and modern-bert (:235) carry classifier heads; only k=1 (reranker) heads are verified.",
+"evidence": "Bert::score_all returns the full cls.output vector (crates/ferric-llama/examples/cls_head.rs header)",
+"check": "examples/cls_head.rs proves score() == score_all()[0] on a k=1 checkpoint only",
+"notes": "The k-way path (NLI, moderation, guardrail classifiers) is 'IMPLEMENTED AND UNVERIFIED' in the example's own words: no k>1 checkpoint has been run."
+},
+{
+"id": "M09",
+"status": "absent",
+"arch_rows": "none",
+"evidence": "",
+"check": "",
+"notes": "No LLaDA/Dream/Mercury-style diffusion LM. The diffusion code present is for world models (Cosmos UniPC sampler crates/ferric-llama/src/unipc.rs, VAE examples) and an EBM toy (ferric-tensor/examples/ebm_edlm.rs), not text diffusion."
+},
+{
+"id": "M10",
+"status": "verified",
+"arch_rows": "Verified: nemotron_h (:149, Mamba-2 hybrid vs NVIDIA's own modeling file), qwen35 (:398, gated delta net 3-in-4, vs transformers; also MiMo-V2.6-Distill-Qwen-9B), qwen35moe (:433), lfm2 (:444, short-conv). Loads: lfm2moe (:452), laguna (:437).",
+"evidence": "crates/ferric-llama/src/nemotron_h.rs, qwen35.rs, lfm2.rs",
+"check": "scripts/lm_conformance.sh vs tests/fixtures/lm/{nemotron3-nano-4b,qwen3.5-0.8b,mimo-v2.6-distill-qwen-9b,lfm2-350m}.json; examples/nemotron_trace.rs:111 (cached == stateless)",
+"notes": "qwen35's 7.5e-4 residual is ~10x the dense rows' (chunked vs recurrent delta rule, unmeasured hypothesis). nemotron_h has no batched decode. Qwen3.6-27B (qwen35 arch) runs in ferric-serve per README."
+},
+{
+"id": "M11",
+"status": "absent",
+"arch_rows": "none",
+"evidence": "",
+"check": "",
+"notes": "No T5 / encoder-decoder runtime ('t5' appears only as a SentencePiece tokenizer model name in bert.rs)."
+},
+{
+"id": "T01",
+"status": "partial",
+"evidence": "Reverse-mode autograd crates/ferric-tensor/src/autograd.rs (Var), Adam crates/ferric-tensor/src/optim.rs; LoRA examples on Qwen3-0.6B: crates/ferric-llama/examples/finetune_qwen3_attn.rs (q/k/v LoRA on the last block), finetune_qwen3_block.rs (FFN gate/up LoRA), finetune_qwen3_multilayer.rs (q/k/v LoRA on the last K blocks), finetune_qwen3.rs (residual adapter)",
+"check": "Each example asserts its autograd reconstruction equals the model's own forward (e.g. finetune_qwen3_attn.rs:143) and that accuracy did not drop (:182); VJPs gradchecked by ferric-tensor/examples/gradcheck_ffn.rs; train_transformer and train in CI",
+"notes": "Example-level, one model family: the trained blocks are re-transcribed by hand into autograd ops; there is no general trainer, dataset loader, checkpointing or adapter file output."
+},
+{
+"id": "T02",
+"status": "partial",
+"evidence": "crates/ferric-llama/examples/finetune_qwen3_block.rs:56-61: every frozen weight stays in its GGUF quant format (forward via matmul_q, backward via an int8 row-wise transpose Var::matmul_qf, crates/ferric-tensor/src/autograd.rs:122-128); only norms and LoRA adapters are fp",
+"check": "finetune_qwen3_block.rs:142 (reconstruction == model forward), :206 (accuracy not worse)",
+"notes": "One block of one model, same limits as T01."
+},
+{
+"id": "T03",
+"status": "partial",
+"evidence": "Full-parameter training exists only as QAT: crates/ferric-llama/examples/ternary_qat_model.rs (all 7 linears in all 24 blocks of Qwen2.5-0.5B as trainable f32 shadows, STE, teacher distillation), instella_qat.rs (16B Instella-MoE scaffold for the 256 GB M3 Ultra), ternary_lsq_model.rs; toy transformers trained from scratch (ferric-tensor/examples/train_transformer.rs, in CI)",
+"check": "train_transformer and train (CI, asserts convergence); QAT examples are manual",
+"notes": "No general full fine-tuning recipe for a pretrained model in its own precision. Whether the 16B QAT completed is not recorded in the tree."
+},
+{
+"id": "T04",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No DPO/ORPO/KTO or any preference loss."
+},
+{
+"id": "T05",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No GRPO/PPO for language models. (Robot-policy experiments such as ferric-tensor/examples/efa2_pusht_es.rs use evolution strategies, not LLM RL.)"
+},
+{
+"id": "T06",
+"status": "partial",
+"evidence": "Teacher-logit distillation inside the QAT examples: crates/ferric-llama/examples/ternary_qat_model.rs (f32 teacher distills the ternary student), instella_qat.rs",
+"check": "manual examples only",
+"notes": "Distillation is a loss inside quantization-aware training, not a standalone teacher-to-smaller-student pipeline."
+},
+{
+"id": "T07",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No model merging (linear/SLERP/TIES/DARE)."
+},
+{
+"id": "T08",
+"status": "partial",
+"evidence": "GPTQ-style Hessian error compensation for TERNARY targets: crates/ferric-tensor/examples/ternary_gptq.rs (synthetic, held-out output error), crates/ferric-llama/examples/ternary_gptq_model.rs (real per-layer input Hessians from the qwen3 capture hook, qwen3.rs:675/799, perplexity vs original); imatrix-weighted STQ1_0 quantizer (F17)",
+"check": "manual examples; imatrix unit tests",
+"notes": "No GPTQ/AWQ to 4-bit integer formats and no GPTQ/AWQ output file."
+},
+{
+"id": "T09",
+"status": "absent",
+"evidence": "",
+"check": "",
+"notes": "No training example writes its result back to a file the runtime loads. The only write is ternary_pack_model.rs:80, a custom size-measurement blob. GgufWriter (crates/ferric-gguf/src/write.rs:228) exists, so the missing piece is plumbing."
+},
+{
+"id": "T10",
+"status": "partial",
+"evidence": "Training runs on Apple silicon through wgpu -> Metal (the dev box is an M5 Max); crates/ferric-tensor/examples/metal4_train.rs routes every training GEMM through the Metal 4 tensor units under FERRIC_METAL4; instella_qat.rs targets the 256 GB M3 Ultra",
+"check": "metal4_train.rs (loss must fall on both paths); the T01 examples on Metal",
+"notes": "Bounded by T01: example-level fine-tuning, not a general trainer."
+}
+],
+"added": [
+{
+"id": "X01",
+"feature": "Sharded / split GGUF (model-00001-of-0000N.gguf) opened from any part",
+"status": "verified",
+"evidence": "crates/ferric-gguf/src/lib.rs:679-700 GgufFile::open follows split.count; checks tensor count against split.tensors.count and each shard's data span against its length",
+"check": "ferric-gguf/examples/shards.rs:17-27 (310 tensors byte-identical to the merged original, opened from part 1, 2 and 3)",
+"notes": "Peer side needs confirming by the peer agents; llama.cpp, vLLM and Ollama all follow split files per docs/sota-feature-matrix.md §V. Streaming readers refuse sharded input."
+},
+{
+"id": "X02",
+"feature": "Matrix-unit GEMM (tensor cores / simdgroup matrix / XMX)",
+"status": "partial",
+"evidence": "Metal simdgroup_matrix coop_mat 8x8 f32 (crates/ferric-tensor/src/lib.rs:3669 matmul_coop) and quant dequant-tile coop prefill (dtype.rs:1395 ff., Metal only); Vulkan KHR_cooperative_matrix 16x16 f16 (lib.rs:3693 matmul_coop16); Metal 4 tensor_ops (metal4.rs)",
+"check": "CI: coop_spike, coop_gemm, coop_matmul_route, coop_q2_0/q4_k/q5_k/q6_k/q8_0 examples; examples/coop_shape (constant-operand check)",
+"notes": "All opt-in (FERRIC_COOP / FERRIC_METAL4), off by default because not bit-identical. On NVIDIA Vulkan the quant coop path measured exactly 1.0x (dequant-bound, ferric-core/src/lib.rs:90-103)."
+}
+],
+"notes": "Counts over the 83 assigned features (E29 + F17 + B16 + M11 + T10): verified 23, implemented 1, partial 29, absent 30 (counted from this file by script). By group: E verified 10 / implemented 1 / partial 9 / absent 9; F verified 3 / partial 7 / absent 7; B verified 3 / partial 6 / absent 7; M verified 7 / partial 1 / absent 3; T partial 6 / absent 4. Registry (crates/ferric-llama/src/arch.rs:147-465): 26 rows = 14 Verified (nemotron_h, asr, parakeet, bert, modern-bert, qwen2, qwen3, qwen2vl, llama, gemma3, hyv4, qwen35, qwen35moe, lfm2), 11 Loads (qwen3vl, phi3, gemma, gemma2, muse-glimmer, gemma4, deepseek2, qwen3moe, laguna, lfm2moe, cosmos3_edge), 1 Parts (qwen3vlmoe). Backend reality: everything runs through wgpu (Metal on Apple, Vulkan elsewhere, WebGPU in the browser); the hand-written native tiers are CUDA (dense decode only, RTX 4050 verified), Metal 4 tensor GEMM, CoreML/ANE bmm, and a Tenstorrent host layer never run on a card. CPU exists only as software Vulkan (lavapipe) plus an unwired Q8_0 matvec. Wiring gaps found this pass: (1) NVFP4 kernel is tested but ferric-gguf type_size/deq_raw lack type 40, so no NVFP4 GGUF can load; (2) nomic-bert encoder code and HF map exist but no registry row, so resolve() refuses it; (3) a GGUF declaring rope.scaling.type=linear is silently run with no scaling (only 'yarn' is read); (4) the qwen3vl registry note says 'no vision tower' while a verified Qwen3-VL tower exists on the HF path. Conformance scripts are local gates, not CI; CI covers kernels, synthetic models (hyv4_synthetic) and unit tests on lavapipe and real Metal."
+}

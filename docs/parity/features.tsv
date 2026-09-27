@@ -1,0 +1,131 @@
+id	group	feature
+S01	serve	OpenAI /v1/chat/completions
+S02	serve	OpenAI /v1/completions (legacy text completion)
+S03	serve	OpenAI /v1/embeddings
+S04	serve	OpenAI /v1/responses (Responses API)
+S05	serve	Anthropic /v1/messages API
+S06	serve	Ollama-native API (/api/chat, /api/generate, /api/tags, /api/show, /api/pull, /api/embed, /api/ps)
+S07	serve	SSE token streaming
+S08	serve	Tool / function calling (model output parsed into tool_calls, per-model formats)
+S09	serve	Structured output: JSON mode and JSON-Schema response_format
+S10	serve	Grammar-constrained decoding (GBNF / regex / EBNF / lark)
+S11	serve	Reasoning separated from answer (reasoning_content / think-tag parsing, reasoning effort)
+S12	serve	logprobs / top_logprobs
+S13	serve	n>1 / parallel sampling of one prompt
+S14	serve	Stop sequences
+S15	serve	Sampler set: temperature, top_k, top_p, min_p, typical_p, repetition/presence/frequency penalty, seed
+S16	serve	Extended samplers: DRY, XTC, mirostat, logit_bias
+S17	serve	Chat template from the model's own Jinja template
+S18	serve	Images in chat requests (image_url / base64) for VLMs
+S19	serve	Audio transcription endpoint (/v1/audio/transcriptions)
+S20	serve	Text-to-speech endpoint (/v1/audio/speech)
+S21	serve	Rerank / score endpoint
+S22	serve	Tokenize / detokenize endpoints
+S23	serve	/v1/models listing
+S24	serve	Several models served at once, load/unload on demand, keep-alive / idle eviction
+S25	serve	Pull / download models by name (HF hub or registry) with progress
+S26	serve	API key auth
+S27	serve	Prometheus /metrics
+S28	serve	Health / readiness endpoint
+S29	serve	Request cancellation when the client disconnects
+S30	serve	Prompt cache reuse across requests (slot / prefix reuse for multi-turn chat)
+S31	serve	MCP (Model Context Protocol) client or server
+S32	serve	Bundled web chat UI
+S33	serve	Interactive CLI (run / chat / pull / list)
+S34	serve	Desktop or menu-bar app
+S35	serve	Context overflow handling (truncation / context shift) with a clear error otherwise
+S36	serve	Batch API (offline file of requests)
+S37	serve	Per-request LoRA adapter selection
+E01	engine	Continuous batching of concurrent requests
+E02	engine	Paged KV cache
+E03	engine	Automatic prefix caching (radix / hash) across requests
+E04	engine	Chunked prefill
+E05	engine	KV cache quantization (q8 / q4 / fp8)
+E06	engine	Fused / flash attention kernels
+E07	engine	Speculative decoding with a draft model
+E08	engine	EAGLE / EAGLE-3 speculative decoding
+E09	engine	MTP-head speculative decoding
+E10	engine	N-gram / prompt-lookup speculative decoding
+E11	engine	Tensor parallel across GPUs
+E12	engine	Pipeline parallel across GPUs
+E13	engine	Multi-host / RPC distributed inference
+E14	engine	Expert parallel for MoE
+E15	engine	MoE experts offloaded to CPU with attention on GPU (hybrid CPU/GPU)
+E16	engine	Expert streaming from SSD/RAM for models larger than memory
+E17	engine	Partial layer offload (n-gpu-layers)
+E18	engine	mmap / lazy weight loading
+E19	engine	Rope scaling for long context (YaRN, linear, NTK, LongRoPE)
+E20	engine	Sliding-window attention
+E21	engine	Attention sinks
+E22	engine	Kernel fusion / CUDA-graph-style launch reduction
+E23	engine	Disaggregated prefill / decode
+E24	engine	Hybrid SSM / linear-attention state caching (Mamba2, GatedDeltaNet)
+E25	engine	Multi-LoRA batched serving
+E26	engine	Embedding pooling modes (mean, CLS, last, rank)
+E27	engine	Deterministic / batch-invariant inference
+E28	engine	KV cache offload to CPU / disk
+E29	engine	Sampling on GPU
+F01	format	GGUF k-quants (Q2_K..Q6_K, Q8_0, Q4_0..)
+F02	format	GGUF i-quants (IQ1..IQ4)
+F03	format	safetensors BF16/F16/F32 directly from the HF checkpoint
+F04	format	FP8 (e4m3) checkpoints
+F05	format	GPTQ checkpoints
+F06	format	AWQ checkpoints
+F07	format	MXFP4
+F08	format	NVFP4
+F09	format	EXL2 / EXL3
+F10	format	bitsandbytes NF4 / int8
+F11	format	HQQ
+F12	format	MLX quantized checkpoints
+F13	format	Ternary / 1-bit (BitNet b1.58, TQ1/TQ2, Q1_0)
+F14	format	ONNX models
+F15	format	compressed-tensors (llm-compressor output)
+F16	format	Writes its own quantized files
+F17	format	Importance-matrix (activation-aware) quantization
+B01	backend	NVIDIA CUDA
+B02	backend	AMD ROCm / HIP
+B03	backend	Apple Metal
+B04	backend	Vulkan
+B05	backend	CPU x86 (AVX2 / AVX-512 / AMX)
+B06	backend	CPU ARM (NEON / SVE / SME)
+B07	backend	WebGPU in the browser
+B08	backend	WASM CPU in the browser
+B09	backend	Intel GPU (SYCL / oneAPI / OpenVINO)
+B10	backend	Apple Neural Engine
+B11	backend	Qualcomm Hexagon NPU
+B12	backend	Other NPUs (Ascend, Rebellions, Furiosa...)
+B13	backend	Tenstorrent
+B14	backend	Google TPU
+B15	backend	Android app / SDK
+B16	backend	iOS app / SDK
+M01	model	Dense decoder LLMs
+M02	model	MoE LLMs
+M03	model	Vision-language models
+M04	model	Speech recognition
+M05	model	Text-to-speech
+M06	model	Embedding models
+M07	model	Rerankers
+M08	model	Encoder classifiers
+M09	model	Diffusion LLMs
+M10	model	Hybrid SSM / linear-attention LLMs
+M11	model	Encoder-decoder (T5 family)
+T01	tuning	LoRA fine-tuning
+T02	tuning	QLoRA (quantized base + LoRA)
+T03	tuning	Full fine-tuning
+T04	tuning	Preference tuning (DPO / ORPO / KTO)
+T05	tuning	RL fine-tuning (GRPO / PPO)
+T06	tuning	Distillation
+T07	tuning	Model merging
+T08	tuning	Calibration-based quantization (GPTQ / AWQ)
+T09	tuning	Export trained model / adapter to a runnable format
+T10	tuning	Fine-tuning on Apple silicon
+O01	ops	Energy / power per request or per token reported by the runtime
+O02	ops	Benchmark tool (prefill / decode throughput)
+O03	ops	Perplexity / eval tool
+O04	ops	Model conversion tool (HF -> own format)
+O05	ops	Hardware auto-detect and fit-to-memory configuration
+O06	ops	Install via package manager (brew / pip / cargo / winget)
+O07	ops	Docker images
+O08	ops	Language bindings (Python / JS / Swift / Kotlin / C)
+O09	ops	OpenTelemetry / tracing
+O10	ops	Distributed across home devices (exo-style)

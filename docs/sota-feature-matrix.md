@@ -1,3 +1,5 @@
+> ⛔ **Superseded by [`docs/parity/MATRIX.md`](parity/MATRIX.md)** (27 Sept 2026): an evidence-based audit of 130 features against 18 engine and 14 serving peers, with Ferric's status re-read from the code. This file's line references are stale and it lists tool calling as complete where one format is supported.
+
 # SOTA feature matrix — what Ferric needs to be the go-to runtime on all hardware
 
 **Focus.** Feature completeness across every fabric, not throughput on any one machine. A runtime is

@@ -1,0 +1,733 @@
+{
+"features": [
+{
+"id": "T01",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift"
+],
+"partial": [
+"Petals"
+],
+"lack": [
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit",
+"llama.cpp"
+],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/README.md",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (L107, L358-369 table)",
+"TRL": "https://github.com/huggingface/trl/blob/main/README.md (PEFT integration: LoRA/QLoRA)",
+"PEFT": "https://github.com/huggingface/peft/blob/main/README.md",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (SFT table: LoRA/QLoRA 1 device/>1 device/>1 node)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (L26 lightweight training)",
+"Petals": "https://github.com/bigscience-workshop/petals/blob/main/src/petals/client/ptune.py (distributed prompt / deep-prompt tuning, not LoRA)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/examples/training/finetune.cpp (llama_opt_param_filter_all = all weights trained)",
+"GPTQModel": "https://github.com/ModelCloud/GPTQModel/blob/main/README.md ('Lora Training' column = PEFT on GPTQ/AWQ bases; EoRA is training-free)",
+"mergekit": "https://github.com/arcee-ai/mergekit/blob/main/README.md (LoRA EXTRACTION from a fine-tune, not training)"
+},
+"notes": "Every trainer here is PyTorch/Transformers+PEFT based except mlx-lm/mlx-lm-lora (MLX) and llama.cpp. Upstream llama.cpp has NO LoRA training: examples/training/finetune.cpp trains all weights (llama_opt_param_filter_all); the llama_opt_params.param_filter API exists in include/llama.h (~L1704-1721) so LoRA is buildable, and the tetherto/qvac-fabric-llm.cpp fork ships llama-finetune-lora (see notes). bitsandbytes/torchao are primitives (quantized base types, 8-bit optimizers), not LoRA trainers."
+},
+{
+"id": "T02",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift",
+"bitsandbytes"
+],
+"partial": [
+"torchao"
+],
+"lack": [
+"llm-compressor",
+"GPTQModel",
+"mergekit",
+"llama.cpp"
+],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/get-started/fine-tuning-for-beginners/unsloth-requirements (QLoRA 4-bit VRAM table)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (Training Methods: QLoRA; not on Mac: https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/mac.qmd)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (L107: 2/3/4/5/6/8-bit QLoRA via AQLM/AWQ/GPTQ/LLM.int8/HQQ/EETQ)",
+"TRL": "https://github.com/huggingface/trl/blob/main/README.md",
+"PEFT": "https://github.com/huggingface/peft/blob/main/docs/source/developer_guides/quantization.md (QLoRA-style training, GPTQ/AQLM/EETQ/HQQ/torchao/INC bases)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (Llama 3.1 8B QLoRA 7.4 GiB on 1x4090)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md (L77: if --model is quantized, training uses QLoRA)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (QLoRA 4/6/8-bit)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (L27: BNB/AWQ/GPTQ/AQLM/HQQ/EETQ bases, 9GB for 7B)",
+"bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes/blob/main/README.md (QLoRA 4-bit column; Linear4bit/NF4 primitive)",
+"torchao": "https://github.com/pytorch/ao/blob/main/torchao/quantization/quantize_/workflows/nf4/nf4_tensor.py (NF4 tensor used by torchtune QLoRA; primitive only)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/examples/training/README.md (FP32 models only upstream)"
+},
+"notes": "QLoRA in the PyTorch tools means a bitsandbytes NF4 (or GPTQ/AWQ/HQQ) frozen base + PEFT LoRA. mlx-lm's QLoRA is LoRA over an MLX affine-quantized base (mlx_lm.convert -q), not NF4. Upstream llama.cpp cannot train on a quantized base; the QVAC Fabric fork claims Q8 and Q4 LoRA training paths on GGUF."
+},
+{
+"id": "T03",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"torchtune",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift"
+],
+"partial": [
+"llama.cpp"
+],
+"lack": [
+"PEFT",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit"
+],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/README.md ('LoRA, QLoRA, full fine tuning, pretraining')",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (Full-tuning column)",
+"TRL": "https://github.com/huggingface/trl/tree/main/trl/trainer (SFTTrainer trains full model when no peft_config)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (Full: 1 device/>1 device/>1 node)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md (L66-67: --fine-tune-type full)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (Full-precision)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (Full-Parameter column)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/examples/training/README.md ('technically functional (for FP32 models and limited hardware setups) but the code is very much WIP'; Llama 3.2 1B in 24 GB)",
+"torchao": "https://github.com/pytorch/ao/blob/main/README.md (float8/MXFP8 pre-training utilities only, not a fine-tuning tool)"
+},
+"notes": "llama.cpp is the only non-PyTorch, non-MLX full fine-tuner in the set, and it is a proof of concept: FP32 weights, flash attention disabled (no backward), KV cache forced to F32 (no F16 OUT_PROD)."
+},
+{
+"id": "T04",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"torchtune",
+"mlx-lm-lora",
+"ms-swift"
+],
+"partial": [],
+"lack": [
+"PEFT",
+"mlx-lm",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit",
+"llama.cpp"
+],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/preference-dpo-orpo-and-kto (DPO, ORPO, KTO, SimPO, reward modelling)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (DPO, IPO, KTO, ORPO; SimPO in agent-docs)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (DPO/KTO/ORPO/SimPO rows)",
+"TRL": "https://github.com/huggingface/trl/tree/main/trl/trainer (dpo_trainer.py, kto_trainer.py; ORPO/CPO under trl/experimental)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (DPO full + LoRA/QLoRA)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (DPO, CPO, ORPO, Online DPO, XPO, FTPO)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (DPO, KTO, RM, CPO, SimPO, ORPO)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md (fine-tune types lora/dora/full only)"
+},
+"notes": "On Apple silicon, preference tuning exists only through mlx-lm-lora (a 418-star third-party package), not mlx-lm itself."
+},
+{
+"id": "T05",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"torchtune",
+"mlx-lm-lora",
+"ms-swift"
+],
+"partial": [],
+"lack": [
+"PEFT",
+"mlx-lm",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit",
+"llama.cpp"
+],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/README.md (RL, GRPO; GSPO notebooks) and https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/preference-dpo-orpo-and-kto (PPO works)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (GRPO, GDPO, async GRPO)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (PPO row; GRPO lives in the separate EasyR1 repo, README L174)",
+"TRL": "https://github.com/huggingface/trl/tree/main/trl/trainer (grpo_trainer.py, rloo_trainer.py; no PPO trainer in the current tree)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (PPO full single-device; GRPO full distributed)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (GRPO, GSPO, Dr. GRPO, DAPO, RLHF Reinforce, PPO)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (GRPO, DAPO, GSPO, SAPO, CISPO, RLOO, Reinforce++; PPO for multimodal)"
+},
+"notes": "TRL (the library most of the others wrap) no longer ships a PPO trainer: trl/trainer has grpo_trainer.py and rloo_trainer.py only."
+},
+{
+"id": "T06",
+"have": [
+"Axolotl",
+"TRL",
+"torchtune",
+"ms-swift"
+],
+"partial": [],
+"lack": [
+"Unsloth",
+"LLaMA-Factory",
+"PEFT",
+"mlx-lm",
+"mlx-lm-lora",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit",
+"llama.cpp"
+],
+"unverified": [],
+"evidence": {
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/tree/main/src/axolotl/integrations/kd (offline + online vLLM/SGLang teacher; support-matrix L204)",
+"TRL": "https://github.com/huggingface/trl/blob/main/trl/trainer/distillation_trainer.py (+ experimental gkd/, minillm/, gold/, async_distillation/)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (knowledge_distillation_single_device / _distributed recipes, LoRA/QLoRA)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (GKD, L32/L58)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LEARNED_QUANTS.md (DWQ = distillation used for quantization only, not model distillation)",
+"Unsloth": "https://unsloth.ai/docs/get-started/fine-tuning-llms-guide (no distillation method documented)"
+},
+"notes": "Model-to-model distillation is a PyTorch-only capability in this set. mlx-lm's DWQ uses the unquantized model as teacher, but to tune quantization scales, not to train a smaller student."
+},
+{
+"id": "T07",
+"have": [
+"mergekit",
+"PEFT",
+"TRL"
+],
+"partial": [
+"llama.cpp"
+],
+"lack": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"torchtune",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao"
+],
+"unverified": [],
+"evidence": {
+"mergekit": "https://github.com/arcee-ai/mergekit/blob/main/README.md (linear, SLERP, TIES, DARE, task arithmetic, evolutionary merge, MoE merge, tokenizer surgery; runs on CPU or 8 GB VRAM)",
+"PEFT": "https://github.com/huggingface/peft/blob/main/docs/source/developer_guides/model_merging.md (add_weighted_adapter: TIES, DARE, linear, SVD for LoRA adapters)",
+"TRL": "https://github.com/huggingface/trl/blob/main/trl/experimental/merge_model_callback.py (experimental MergeModelCallback, calls mergekit: linear/ties/dare_ties/slerp)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/tools/export-lora/README.md (--lora-scaled applies several scaled adapters to one base: a linear adapter merge only)"
+},
+"notes": "Counted as T07 only when distinct models/adapters are combined. Merging one LoRA back into its base (Unsloth save_pretrained_merged, Axolotl merge-lora, LLaMA-Factory export, ms-swift --merge_lora, mlx_lm.fuse) is export (T09), not model merging."
+},
+{
+"id": "T08",
+"have": [
+"llm-compressor",
+"GPTQModel",
+"mlx-lm",
+"torchao",
+"ms-swift",
+"LLaMA-Factory",
+"llama.cpp"
+],
+"partial": [
+"Unsloth"
+],
+"lack": [
+"Axolotl",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm-lora",
+"bitsandbytes",
+"mergekit"
+],
+"unverified": [],
+"evidence": {
+"llm-compressor": "https://github.com/vllm-project/llm-compressor/blob/main/README.md (GPTQ, AWQ, SmoothQuant, AutoRound, SpinQuant/QuIP, iMatrix observer)",
+"GPTQModel": "https://github.com/ModelCloud/GPTQModel/blob/main/README.md (GPTQ, AWQ, ParoQuant, QQQ, GPTAQ, EoRA, GAR, FOEM)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LEARNED_QUANTS.md (DWQ, AWQ, dynamic, GPTQ; 'All methods use calibration data')",
+"torchao": "https://github.com/pytorch/ao/tree/main/torchao/prototype (awq/, gptq/, smoothquant/) (prototype AWQ, GPTQ, SmoothQuant)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Instruction/Export-and-push.md (AWQ/GPTQ need a calibration dataset; delegates to autoawq / gptqmodel)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/examples/merge_lora/qwen3_gptq.yaml (export_quantization_dataset; AutoGPTQ)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md (importance matrix from calibration text; not GPTQ/AWQ)",
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/unsloth/save.py (IMATRIX_QUANTS L164-176; --imatrix passthrough L416-421) + https://github.com/unslothai/unsloth-zoo/blob/main/unsloth_zoo/llama_cpp.py (resolve_imatrix_file ~L6337) (applies a user-supplied or Unsloth-published imatrix through llama-quantize; no GPTQ/AWQ)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/quantize.qmd ('We do not currently support quantization techniques such as GGUF/GPTQ,EXL2'; torchao PTQ is data-free)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/recipes/quantization.md (torchao Int8DynActInt4Weight, data-free; QAT)",
+"bitsandbytes": "https://huggingface.co/docs/transformers/quantization/bitsandbytes (NF4/FP4/LLM.int8 are data-free)"
+},
+"notes": "Only four independent calibrated-quantizer implementations sit underneath this list: llm-compressor, GPTQModel, mlx-lm, torchao (+ llama.cpp imatrix). ms-swift and LLaMA-Factory delegate to AutoAWQ/GPTQModel/AutoGPTQ."
+},
+{
+"id": "T09",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift",
+"mergekit",
+"llama.cpp"
+],
+"partial": [],
+"lack": [],
+"unverified": [],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/new/studio/export (merged 16-bit, LoRA only, GGUF) and https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf (save_pretrained_gguf q4_k_m/q8_0/f16; NVFP4/FP8 per README)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/export.qmd (L83: imatrix not yet supported) (axolotl export -> GGUF via llama.cpp convert + llama-quantize; merge-lora first)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/examples/README.md (llamafactory-cli export: merge LoRA, GPTQ, Ollama Modelfile)",
+"TRL": "https://github.com/huggingface/trl/blob/main/README.md (HF Transformers / PEFT checkpoints)",
+"PEFT": "https://github.com/huggingface/peft/blob/main/README.md (adapter save_pretrained; merge_and_unload)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (HF-format checkpoints; ExecuTorch for on-device inference of fine-tuned models)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md (mlx_lm.fuse; --export-gguf limited to Mistral/Mixtral/Llama in fp16)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (--fuse)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Instruction/Export-and-push.md (merge_lora, AWQ/GPTQ/FP8/BNB export, --to_ollama)",
+"mergekit": "https://github.com/arcee-ai/mergekit/blob/main/README.md (merged safetensors; LoRA extraction)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/convert_lora_to_gguf.py (PEFT adapter -> GGUF), https://github.com/ggml-org/llama.cpp/blob/master/tools/export-lora/README.md (merge), llama-finetune writes GGUF"
+},
+"notes": "The de facto interchange is HF safetensors + PEFT adapter; GGUF export is almost always a shell-out to llama.cpp's convert_hf_to_gguf.py and llama-quantize (Unsloth, Axolotl, mlx-lm's own writer is the exception). A runtime that loads PEFT adapters and HF safetensors directly consumes the output of every trainer here.",
+"not_applicable": [
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao"
+]
+},
+{
+"id": "T10",
+"have": [
+"Unsloth",
+"mlx-lm",
+"mlx-lm-lora",
+"ms-swift",
+"torchtune",
+"LLaMA-Factory",
+"PEFT",
+"bitsandbytes"
+],
+"partial": [
+"Axolotl",
+"llama.cpp"
+],
+"lack": [
+"llm-compressor",
+"GPTQModel",
+"torchao",
+"mergekit"
+],
+"unverified": [
+"TRL"
+],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/get-started/install/mac (Desktop/Studio train MLX or GGUF models on Mac); https://github.com/unslothai/unsloth/blob/main/unsloth/device_type.py (get_device_type L87-122: mlx/cuda/hip/xpu/npu) (DEVICE_TYPE 'mlx'); NOTE https://unsloth.ai/docs/get-started/fine-tuning-for-beginners/unsloth-requirements still says for Unsloth Core 'Apple/Silicon/MLX is in the works'",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/README.md ('fine-tuning large language models on Apple silicon with MLX')",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (L25 Hardware Support: ... CPU, MPS)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md ('NVIDIA GPU, Intel XPU, AMD ROCm, Apple MPS, and Ascend NPU')",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/src/llamafactory/extras/misc.py (get_current_device L144-170: xpu/npu/mps/cuda) (source only; no doc claim)",
+"PEFT": "https://github.com/huggingface/peft/blob/main/README.md (L162: works with Accelerate on 'Apple Silicon')",
+"bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes/blob/main/README.md (macOS 14+ Metal mps: QLoRA 4-bit supported on dev branch; 8-bit optimizers planned)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/mac.qmd ('partially usable': full + LoRA yes; no QLoRA, no fp16/bf16, no flash-attn, no DeepSpeed)",
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-metal/ggml-metal-device.m (supports_op: OPT_STEP_ADAMW/SGD yes; no OUT_PROD / CROSS_ENTROPY_LOSS case) (Metal has OPT_STEP but not OUT_PROD/CROSS_ENTROPY_LOSS, so training falls back to CPU; README: 'For CPU training, compile ... without any additional backends')",
+"TRL": "https://github.com/huggingface/trl/blob/main/README.md (no Apple/MPS claim found in docs; trl/trainer/utils.py special-cases cuda/xpu only)"
+},
+"notes": "Apple-silicon training splits into two stacks: MLX (mlx-lm, mlx-lm-lora, Unsloth Studio/Desktop) and PyTorch MPS (torchtune, ms-swift, LLaMA-Factory, PEFT, partially Axolotl). bitsandbytes on MPS is dev-branch status per its README table."
+},
+{
+"id": "F16",
+"have": [
+"llama.cpp",
+"llm-compressor",
+"GPTQModel",
+"torchao",
+"mlx-lm",
+"bitsandbytes",
+"ms-swift",
+"LLaMA-Factory",
+"Unsloth",
+"Axolotl",
+"torchtune",
+"distributed-llama"
+],
+"partial": [],
+"lack": [
+"TRL",
+"PEFT",
+"mergekit",
+"mlx-lm-lora",
+"exo",
+"Petals"
+],
+"unverified": [
+"prima.cpp"
+],
+"evidence": {
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md (llama-quantize GGUF k-/i-quants)",
+"llm-compressor": "https://github.com/vllm-project/llm-compressor/blob/main/README.md ('Models saved in the compressed-tensors format')",
+"GPTQModel": "https://github.com/ModelCloud/GPTQModel/blob/main/README.md (writes GPTQ/AWQ/GGUF(Q1_0,Q2_0,TQ1_0,TQ2_0,MXFP4)/EXL3/FP8/QQQ; native MLX quantization on Apple silicon)",
+"torchao": "https://github.com/pytorch/ao/blob/main/README.md (quantize_ + HF TorchAoConfig; pre-quantized models published at huggingface.co/pytorch)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/README.md (mlx_lm.convert -q; upload to HF)",
+"bitsandbytes": "https://huggingface.co/docs/transformers/quantization/bitsandbytes (save_pretrained / push_to_hub of 4-bit and 8-bit models via Transformers)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Instruction/Export-and-push.md (AWQ, GPTQ, FP8, BNB export)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/examples/merge_lora/qwen3_gptq.yaml",
+"Unsloth": "https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf (GGUF via llama.cpp) + README (NVFP4, FP8 export)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/quantize.qmd (torchao PTQ -> {output_dir}/quantized) and https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/export.qmd (L83: imatrix not yet supported) (GGUF quant types via llama-quantize)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/recipes/quantization.md (tune run quantize)",
+"distributed-llama": "https://github.com/b4rtaz/distributed-llama/blob/main/docs/HOW_TO_CONVERT_HF_MODEL.md (convert-hf.py ... q40 -> .m file)",
+"prima.cpp": "https://github.com/OpenCPIL/prima.cpp/blob/main/README.md (supports Q4K/Q6K/Q80/IQ1 GGUF; whether its fork ships llama-quantize was not checked)"
+},
+"notes": "Writers that own a quantizer: llama.cpp, llm-compressor, GPTQModel, torchao, mlx-lm, bitsandbytes, distributed-llama. Unsloth and Axolotl shell out to llama-quantize for GGUF; ms-swift/LLaMA-Factory delegate to AutoAWQ/GPTQModel/AutoGPTQ.",
+"not_applicable": [
+"llama.cpp RPC"
+]
+},
+{
+"id": "F17",
+"have": [
+"llama.cpp",
+"llm-compressor",
+"GPTQModel",
+"mlx-lm",
+"torchao",
+"ms-swift",
+"LLaMA-Factory"
+],
+"partial": [
+"Unsloth"
+],
+"lack": [
+"Axolotl",
+"bitsandbytes",
+"torchtune",
+"TRL",
+"PEFT",
+"mergekit",
+"mlx-lm-lora",
+"distributed-llama",
+"exo",
+"Petals"
+],
+"unverified": [
+"prima.cpp"
+],
+"evidence": {
+"llama.cpp": "https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md (llama-imatrix) + https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md ('can be minimized by using a suitable imatrix file')",
+"llm-compressor": "https://github.com/vllm-project/llm-compressor/tree/main/examples/imatrix (iMatrix observer; plus GPTQ/AWQ/SmoothQuant/AutoRound)",
+"GPTQModel": "https://github.com/ModelCloud/GPTQModel/blob/main/README.md (GPTQ/AWQ calibration)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LEARNED_QUANTS.md (AWQ, GPTQ, DWQ, dynamic; calibration data)",
+"torchao": "https://github.com/pytorch/ao/tree/main/torchao/prototype (awq/, gptq/, smoothquant/)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Instruction/Export-and-push.md",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/examples/merge_lora/qwen3_gptq.yaml",
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/unsloth/save.py (IMATRIX_QUANTS L164-176; --imatrix passthrough L416-421) (imatrix_file= path or True -> downloads Unsloth's published imatrix; applied by llama-quantize, not computed by Unsloth)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/docs/export.qmd (L83: imatrix not yet supported) (L83 'Not yet supported: importance-matrix (imatrix) calibration')",
+"bitsandbytes": "https://huggingface.co/docs/transformers/quantization/bitsandbytes (data-free NF4/FP4/int8)",
+"distributed-llama": "https://github.com/b4rtaz/distributed-llama/blob/main/README.md (only q40 / f32; round-to-nearest)"
+},
+"notes": "llm-compressor has adopted llama.cpp's imatrix idea as an observer for FP4 (README: iMatrix/MSE observers 'outperform GPTQ for NVFP4'). imatrix-style activation-aware quantization is therefore present in both the GGUF and the vLLM worlds.",
+"not_applicable": [
+"llama.cpp RPC"
+]
+},
+{
+"id": "E13",
+"have": [
+"exo",
+"distributed-llama",
+"prima.cpp",
+"Petals",
+"llama.cpp RPC",
+"mlx-lm"
+],
+"partial": [],
+"lack": [],
+"unverified": [],
+"evidence": {
+"exo": "https://github.com/exo-explore/exo/blob/main/README.md (MLX distributed; tensor + pipeline sharding; RDMA over Thunderbolt 5)",
+"distributed-llama": "https://github.com/b4rtaz/distributed-llama/blob/main/README.md (root + 2^n-1 workers over TCP, tensor parallel; nodes <= KV heads; only q40/f32)",
+"prima.cpp": "https://github.com/OpenCPIL/prima.cpp/blob/main/README.md (piped-ring parallelism over zmq, llama.cpp fork)",
+"Petals": "https://github.com/bigscience-workshop/petals/blob/main/README.md (BitTorrent-style public or private swarm; last push 2024-09-07)",
+"llama.cpp RPC": "https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md (ggml-rpc-server per host, --rpc host:port list; TCP or RDMA (RoCEv2, Thunderbolt 5); 'proof-of-concept ... fragile and insecure')",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/README.md (L14 'Distributed inference and fine-tuning with mx.distributed')"
+},
+"notes": "Backend reach differs: exo = MLX only (README L588: 'On macOS, exo uses the GPU. On Linux, exo currently runs on CPU'); distributed-llama = CPU (ARM/AVX2) + experimental Vulkan; prima.cpp = CPU + CUDA + Metal; llama.cpp RPC = any ggml backend per host (diagram mixes CUDA, Metal, CPU hosts); Petals = PyTorch CUDA/ROCm/MPS. llama.cpp RPC is the only one here that mixes vendors across hosts through one backend abstraction.",
+"not_applicable": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm-lora",
+"ms-swift",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit"
+]
+},
+{
+"id": "O10",
+"have": [
+"exo",
+"distributed-llama",
+"prima.cpp"
+],
+"partial": [
+"llama.cpp RPC",
+"Petals"
+],
+"lack": [],
+"unverified": [
+"mlx-lm"
+],
+"evidence": {
+"exo": "https://github.com/exo-explore/exo/blob/main/README.md ('Automatic Device Discovery', topology-aware auto parallel)",
+"distributed-llama": "https://github.com/b4rtaz/distributed-llama/blob/main/README.md ('Connect home devices into a powerful cluster'; Raspberry Pi guide)",
+"prima.cpp": "https://github.com/OpenCPIL/prima.cpp/blob/main/README.md (laptops, desktops, phones via Termux; heterogeneity-aware scheduler, automatic device selection)",
+"llama.cpp RPC": "https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md (heterogeneous hosts but manual --rpc list, no discovery, 'Never run the RPC server on an open network')",
+"Petals": "https://github.com/bigscience-workshop/petals/blob/main/README.md (private swarm possible; project inactive since 2024-09)",
+"mlx-lm": "https://github.com/ml-explore/mlx-lm/blob/main/README.md (mx.distributed; home-device ergonomics not documented)"
+},
+"notes": "Only exo has zero-config discovery; prima.cpp has the richest heterogeneity model (per-device compute, disk speed, memory, OS). None of them report energy per device.",
+"not_applicable": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"PEFT",
+"torchtune",
+"mlx-lm-lora",
+"ms-swift",
+"llm-compressor",
+"GPTQModel",
+"bitsandbytes",
+"torchao",
+"mergekit"
+]
+}
+],
+"added": [
+{
+"id": "X01",
+"group": "tuning",
+"feature": "Quantization-aware training (QAT)",
+"have": [
+"Unsloth",
+"Axolotl",
+"torchtune",
+"torchao",
+"mlx-lm-lora"
+],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/blog/quantization-aware-training-qat",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (QAT int8/int4/FP8/NVFP4/MXFP4)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (qat_distributed, qat_lora_finetune_distributed)",
+"torchao": "https://github.com/pytorch/ao/blob/main/README.md (QATConfig prepare/convert)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md (QAT for SFT/DPO/ORPO, 4-16 bit)"
+},
+"notes": "All PyTorch QAT paths route through torchao's QATConfig."
+},
+{
+"id": "X02",
+"group": "tuning",
+"feature": "Reward-model training",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"ms-swift",
+"mlx-lm-lora"
+],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/preference-dpo-orpo-and-kto ('KTO Reward Modelling all work')",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (RM / PRM)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (Reward Modeling row)",
+"TRL": "https://github.com/huggingface/trl/tree/main/trl/trainer (reward_trainer.py)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (RM)",
+"mlx-lm-lora": "https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md ('Training Your Custom Preference Model')"
+},
+"notes": ""
+},
+{
+"id": "X03",
+"group": "tuning",
+"feature": "Multi-GPU / multi-node training (DDP, FSDP, DeepSpeed, Megatron)",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"TRL",
+"torchtune",
+"ms-swift"
+],
+"evidence": {
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/README.md ('Multi GPU setups')",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (FSDP2, DeepSpeed, torchrun/Ray multi-node, ND parallelism, EP)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/tree/main/docs/en/advanced/distributed",
+"TRL": "https://github.com/huggingface/trl/blob/main/README.md (Accelerate DDP/DeepSpeed/FSDP)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (>1 node columns)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (DDP, ZeRO2/3, FSDP2, Megatron TP/PP/CP/EP)"
+},
+"notes": "Distributed TRAINING is NVIDIA/AMD/NPU cluster territory; no peer trains across heterogeneous home devices (Petals only prompt-tunes over a swarm)."
+},
+{
+"id": "X04",
+"group": "tuning",
+"feature": "Vision / multimodal / audio model fine-tuning",
+"have": [
+"Unsloth",
+"Axolotl",
+"LLaMA-Factory",
+"ms-swift",
+"torchtune"
+],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/get-started/fine-tuning-llms-guide (TTS, embedding, vision, multimodal)",
+"Axolotl": "https://github.com/axolotl-ai-cloud/axolotl/blob/main/README.md (VLMs + Voxtral audio)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/README.md (multimodal SFT; Qwen2-Audio)",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (400+ multimodal models)",
+"torchtune": "https://github.com/meta-pytorch/torchtune/blob/main/README.md (Llama3.2-Vision 11B/90B)"
+},
+"notes": "mlx-lm itself is text-only (VLM training lives in mlx-vlm, not checked)."
+},
+{
+"id": "X05",
+"group": "tuning",
+"feature": "No-code web UI for training",
+"have": [
+"Unsloth",
+"LLaMA-Factory",
+"ms-swift"
+],
+"evidence": {
+"Unsloth": "https://github.com/unslothai/unsloth/blob/main/README.md (Unsloth Studio web UI + Desktop app)",
+"LLaMA-Factory": "https://github.com/hiyouga/LlamaFactory/blob/main/docs/en/llamaboard-web-ui.md",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (L36 'UI Training')"
+},
+"notes": ""
+},
+{
+"id": "X06",
+"group": "tuning",
+"feature": "Embedding / reranker model fine-tuning",
+"have": [
+"Unsloth",
+"ms-swift"
+],
+"evidence": {
+"Unsloth": "https://unsloth.ai/docs/new/embedding-finetuning",
+"ms-swift": "https://github.com/modelscope/ms-swift/blob/main/README.md (Embedding/Reranker/sequence classification tasks)"
+},
+"notes": ""
+}
+],
+"answers": {
+"unsloth_hardware_and_models": {
+"training_hardware": "NVIDIA (CUDA capability >= 7.0), AMD (Radeon RDNA 3/3.5/4 RX 6000-9000 on Windows+Linux, MI300X; ROCm), Intel (Data Center GPU Max, Arc, Core Ultra AI PC via PyTorch XPU), Apple (Unsloth Desktop/Studio train through an MLX backend). Source device detection also returns 'npu' (Ascend) but no doc claims Ascend training. CPU: chat + data recipes only, no training. The advertised 'Vulkan backend' is llama.cpp for inference only (UNSLOTH_LLAMA_CPP_BACKEND=vulkan).",
+"inconsistency": "The requirements page says Studio training works on 'NVIDIA, AMD, MLX, Intel' but the same page says for Unsloth Core 'Apple/Silicon/MLX is in the works'. Mac training = Studio/Desktop MLX path; the pip library is still CUDA/ROCm/XPU.",
+"models": "'all types models': dense and MoE LLMs (Qwen3.x, gpt-oss, DeepSeek, GLM, Llama, Gemma, Mistral...), vision/multimodal, TTS, embedding/BERT/reranker (via SentenceTransformers), diffusion; built on Transformers v5 + TRL.",
+"qlora_8b_memory": "6 GB VRAM for QLoRA (4-bit); 22 GB for LoRA (16-bit); stated as 'absolute minimum'.",
+"sources": [
+"https://unsloth.ai/docs/get-started/fine-tuning-for-beginners/unsloth-requirements",
+"https://github.com/unslothai/unsloth/blob/main/README.md",
+"https://unsloth.ai/docs/get-started/install/amd",
+"https://unsloth.ai/docs/get-started/install/intel",
+"https://unsloth.ai/docs/get-started/install/mac",
+"https://github.com/unslothai/unsloth/blob/main/unsloth/device_type.py (get_device_type L87-122: mlx/cuda/hip/xpu/npu)",
+"https://unsloth.ai/docs/get-started/fine-tuning-llms-guide"
+]
+},
+"mlx_lm_hardware_and_models": {
+"training_hardware": "Apple silicon only per mlx-lm docs ('fine-tuning large language models on Apple silicon with MLX'). MLX itself also ships mlx[cuda] (Linux NVIDIA) and mlx[cpu] packages, but mlx-lm does not document LoRA training on them. No AMD, no Intel, no Vulkan/WebGPU.",
+"models": "LORA.md lists Mistral, Llama, Phi2, Mixtral, Qwen2, Gemma, OLMo, MiniCPM, InternLM2, but the list is stale: tuner/utils.py converts any nn.Linear/QuantizedLinear/SwitchLinear(MoE)/Embedding, so LoRA works on any of the ~134 architectures in mlx_lm/models. mlx-lm-lora: 'Training works with all models supported by MLX-LM'.",
+"qlora_8b_memory": "No 8B QLoRA figure in mlx-lm docs. Closest: Mistral-7B LoRA (batch 1, 4 layers) 'on a machine with 32 GB ... M1 Max ... about 250 tokens-per-second'. mlx-lm-lora recommends for 7B '--batch-size 2 --num-layers 8 --load-in-8bits', 13B+ '--load-in-4bits --grad-checkpoint' (no GB numbers).",
+"sources": [
+"https://github.com/ml-explore/mlx-lm/blob/main/README.md",
+"https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md",
+"https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tuner/utils.py (linear_to_lora_layers L40-121)",
+"https://github.com/Goekdeniz-Guelmez/mlx-lm-lora/blob/main/README.md",
+"https://github.com/ml-explore/mlx/blob/main/README.md"
+]
+},
+"qlora_8b_memory_other_peers": {
+"torchtune": "Llama 3.1 8B QLoRA peak 7.4 GiB on 1x RTX 4090 (bs 2, packed seq 2048, compile) - https://github.com/meta-pytorch/torchtune/blob/main/README.md",
+"LLaMA-Factory": "QLoRA 4-bit 7B ~6 GB, 14B 12 GB, rule x/2 GB (estimated) - https://github.com/hiyouga/LlamaFactory/blob/main/README.md L503-514",
+"ms-swift": "quantized training 'only 9GB training resources for 7B models' - https://github.com/modelscope/ms-swift/blob/main/README.md L27"
+},
+"non_nvidia_amd_apple_gpu_training": {
+"intel_gpu_xpu": "YES, documented: Unsloth (guide incl. 4-bit QLoRA of Qwen3-32B on Intel GPU), torchtune ('Intel XPU'), bitsandbytes (Intel XPU: LLM.int8, QLoRA 4-bit, 8-bit optimizers all supported). Source-only: LLaMA-Factory (xpu device selection), TRL (xpu branches). Intel Gaudi HPU: bitsandbytes (QLoRA partial).",
+"ascend_npu": "LLaMA-Factory (docs + NPU docker images), ms-swift, torchtune; Unsloth source only; Axolotl marks Ascend feature parity out-of-scope.",
+"vulkan": "No peer documents LLM fine-tuning on Vulkan. Upstream llama.cpp's Vulkan backend DOES implement every op llama-finetune needs (OUT_PROD, SILU_BACK, RMS_NORM_BACK, SOFT_MAX_BACK, ROPE_BACK, CROSS_ENTROPY_LOSS(_BACK), OPT_STEP_ADAMW/SGD in ggml-vulkan.cpp supports_op ~L15558-15735), so full FP32 fine-tuning can run there at source level, but examples/training/README.md names only CPU and CUDA and calls the code WIP.",
+"webgpu": "NO. llama.cpp's WebGPU backend supports none of the training ops (no OPT_STEP, OUT_PROD, CROSS_ENTROPY or *_BACK case in ggml-webgpu.cpp supports_op). No listed peer trains in a browser. GitHub search for WebGPU fine-tuning found only toy repos (largest: jsgrad-org/jsgrad, 63 stars, general ML, not LLM LoRA).",
+"outside_the_peer_list": [
+"tetherto/qvac-fabric-llm.cpp (Tether QVAC Fabric; llama.cpp fork; 129 stars; pushed 2026-09-26): 'native LoRA fine-tuning across CPU, Vulkan, and Metal backends', 'Multi-backend GPU training (NVIDIA, AMD, Intel, Apple, Mali, Adreno)', 'FP32, FP16, Q8, and Q4 training paths', llama-finetune-lora with checkpoint/resume; HF blog 2025-12-01 reports Qwen3-1.7B Q8 per-epoch times RTX 4090 5.5 min, 7900 XTX 13 min, Arc A770 20 min, M3 Pro 40 min, Adreno 830 1h40, Mali-G715 7h40. Sources: https://github.com/tetherto/qvac-fabric-llm.cpp/blob/master/README.md , https://huggingface.co/blog/qvac/fabric-llm-finetune . Not in the census as its own row (census has 'QVAC Workbench', github:tetherto/qvac).",
+"tracel-ai/burn (Rust, 15,994 stars): LoRA reparameterizer (crates/burn-core/src/module/lora.rs) + autodiff on CubeCL backends incl. Vulkan and WebGPU; its LoRA example fine-tunes a text classifier (examples/text-classification ag-news-finetune --features wgpu), not HF LLM checkpoints. Source: https://github.com/tracel-ai/burn/blob/main/README.md"
+],
+"verdict": "Vendor-neutral (Vulkan) LLM LoRA training is NOT an empty lane: QVAC Fabric, a small llama.cpp fork, claims it on NVIDIA/AMD/Intel/Apple/Adreno/Mali with Q4/Q8 bases and publishes per-device epoch times. None of the 20 listed peers offers it. WebGPU / in-browser LLM fine-tuning appears unoccupied (no peer, no fork, no project over 100 stars found). Neither QVAC nor anyone else in this set claims cross-vendor bit-identical training or reports joules per training step."
+}
+},
+"peers_checked": {
+"Unsloth (incl. Studio/Desktop)": "github:unslothai/unsloth 76,855 stars, push 2026-09-27",
+"Axolotl": "github:axolotl-ai-cloud/axolotl 12,506, push 2026-09-27",
+"LLaMA-Factory": "github:hiyouga/LlamaFactory 75,070, push 2026-09-14",
+"TRL": "github:huggingface/trl 19,398, push 2026-09-27",
+"PEFT": "github:huggingface/peft 21,728, push 2026-09-25",
+"torchtune": "github:meta-pytorch/torchtune 5,812, push 2026-09-09; README: 'no longer actively maintained ... wound down in 2025'",
+"mlx-lm": "github:ml-explore/mlx-lm 7,155, push 2026-09-24",
+"mlx-lm-lora (MLX-LoRA tool)": "github:Goekdeniz-Guelmez/mlx-lm-lora 418, push 2026-09-25; ml-explore/mlx-examples lora/ is superseded by mlx-lm (its README points there)",
+"ms-swift": "github:modelscope/ms-swift 15,734, push 2026-09-26",
+"llm-compressor": "github:vllm-project/llm-compressor 3,824, push 2026-09-27",
+"GPTQModel": "github:ModelCloud/GPTQModel 1,262, push 2026-09-27",
+"bitsandbytes": "github:bitsandbytes-foundation/bitsandbytes 8,503, push 2026-09-07",
+"torchao": "github:pytorch/ao 2,987, push 2026-09-25",
+"mergekit": "github:arcee-ai/mergekit 7,376, push 2026-09-12",
+"llama.cpp (llama-quantize, llama-imatrix, llama-finetune, export-lora)": "github:ggml-org/llama.cpp master, push 2026-09-27",
+"exo": "github:exo-explore/exo 47,654, push 2026-08-25",
+"distributed-llama": "github:b4rtaz/distributed-llama 3,062, push 2026-07-05",
+"prima.cpp": "github:OpenCPIL/prima.cpp 102 (official; canonical at gitee.com/zonghang-li/prima.cpp; Lizonghang/prima.cpp now 404), push 2026-09-06",
+"Petals": "github:bigscience-workshop/petals 10,589, last push 2024-09-07 (inactive)",
+"llama.cpp RPC": "tools/rpc in ggml-org/llama.cpp master"
+},
+"notes": "Schema: have / partial / lack / unverified (+ not_applicable where a peer is not the kind of tool the feature is about). T* features score the 15 tuning/quantization peers plus Petals on T01 only; exo, distributed-llama, prima.cpp and llama.cpp RPC do no training. Every have/partial carries a URL or repo path read this session (gh api repo contents/readme, unsloth.ai .md docs, HF docs via WebFetch). llama.cpp is scored on upstream master only; the QVAC Fabric fork is reported separately under answers. 'Model merging' (T07) excludes merging one LoRA into its own base, which is counted under export (T09). Raw fetched sources are in scratchpad/parity/tuning_src/."
+}

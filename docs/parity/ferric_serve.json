@@ -1,0 +1,647 @@
+{
+"repo": "/Users/dcharlot/vibe-coding/ferric",
+"head": "230edb9",
+"features": [
+{
+"id": "S01",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1027 route -> chat()",
+"crates/ferric-serve/src/lib.rs:1123-1196 chat()",
+"crates/ferric-serve/src/batch.rs:261-297 batched path (plain chat requests go to the scheduler)",
+"crates/ferric-serve/src/lib.rs:525 content read with v['content'].as_str().unwrap_or(\"\")",
+"crates/ferric-serve/src/lib.rs:1127-1133 only max_tokens, temperature, stream, tools read",
+"crates/ferric-serve/src/lib.rs:1134 constant id 'chatcmpl-ferric'",
+"crates/ferric-serve/src/lib.rs:887 created = 1700000000 static",
+"crates/ferric-serve/src/batch.rs:369-374 finish_reason hard-coded 'stop' (acknowledged)"
+],
+"check": "No test posts to /v1/chat/completions (batch tests use /v1/completions only). live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: string content -> 'Paris'.",
+"notes": "Works for string `content`. PART MISSING: OpenAI content-part arrays ([{type:'text',text:...}]) are silently turned into an empty string - probe gave prompt_tokens 8 instead of 20 and answered 'Hello! How can I assist you today?' instead of 'Paris'. `model` field ignored ('no-such-model' -> 200). finish_reason is always 'stop', even when max_tokens cut the output (probe max_tokens=3 -> 'stop'). id and created are constants. Everything else in the request body is ignored without an error: n, logprobs, stop, top_p, seed, tool_choice, and the rest."
+},
+{
+"id": "S02",
+"status": "verified",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1028 route -> completions()",
+"crates/ferric-serve/src/lib.rs:1198-1212 completions()",
+"crates/ferric-serve/src/batch.rs:262-297 batched path",
+"crates/ferric-serve/src/batch.rs:281 streaming = chat && stream (so completions never stream)",
+"crates/ferric-serve/src/batch.rs:394-398 response envelope"
+],
+"check": "ferric-serve batch::tests::{batched_responses_are_identical_to_serial_ones, concurrent_requests_interleave_instead_of_queueing, a_late_request_joins_a_batch_already_in_flight} (real serve_loop + real sockets + real HTTP, MOCK model, POST /v1/completions only); run by CI step 'Test workspace' (.github/workflows/ci.yml); 8/8 ferric-serve tests passed this session (cargo test -p ferric-serve --release)",
+"notes": "The transport/envelope is verified with a mock model; the real-model prefill/decode is not in CI. live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: ' Paris. It is the largest'. Gaps: `stream:true` is ignored and a plain JSON body comes back (probe). `prompt` must be a string (array prompts become ''). No echo, suffix, logprobs, stop or n. finish_reason is always 'stop'. A /v1/completions request carrying response_format goes to the serial completions(), which ignores response_format (batch.rs:196, lib.rs:1198-1212)."
+},
+{
+"id": "S03",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1029 route",
+"crates/ferric-serve/src/lib.rs:1081-1110 embeddings()",
+"crates/ferric-serve/src/lib.rs:568-590 embed(): pooling from GGUF <arch>.pooling_type via ferric_llama::pooling (default LAST)",
+"crates/ferric-serve/src/lib.rs:377 declared_pooling",
+"crates/ferric-serve/src/lib.rs:184-219 forward_hidden (NemotronH/Hyv4 panic by design)",
+"crates/ferric-serve/src/lib.rs:60-74 dispatchable refuses Bert/ModernBert as the main model"
+],
+"check": "No HTTP test. ferric_llama::pooling has 4 unit tests. live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: 2 inputs -> 2 x 896-d vectors.",
+"notes": "Only decoder-architecture GGUFs can embed (for example Qwen3-Embedding). The registry's Verified embedding families, bert (bge-small) and modern-bert, cannot be the server's model: bge-small-en-v1.5-f16.gguf panicked at startup this session (lib.rs:350, a tokenizer check fired before the intended 'point FERRIC_RERANK_MODEL at it' refusal). On nemotron_h and hyv4 the request panics inside the handler. catch_unwind (lib.rs:1010-1014) marks it 'handled', so the client gets a closed connection with no HTTP response instead of an error. `dimensions` and `encoding_format` are ignored."
+},
+{
+"id": "S04",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1020-1035 handle() route table has no /v1/responses"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: POST /v1/responses -> 404.",
+"notes": ""
+},
+{
+"id": "S05",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1020-1035 no /v1/messages"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: POST /v1/messages -> 404.",
+"notes": ""
+},
+{
+"id": "S06",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1020-1035 no /api/* routes"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: GET /api/tags and POST /api/chat -> 404.",
+"notes": ""
+},
+{
+"id": "S07",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1177-1187 serial chat SSE",
+"crates/ferric-serve/src/batch.rs:282-288, 170-183, 377-385 batched chat SSE",
+"crates/ferric-serve/src/lib.rs:1243-1251 write_sse_headers/send_sse",
+"crates/ferric-serve/src/batch.rs:281 completions never stream",
+"crates/ferric-serve/src/lib.rs:1136-1167 tool path returns plain JSON regardless of stream"
+],
+"check": "No test reads an SSE stream (the batch tests parse Content-Length JSON). live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: chat stream gives role chunk, content deltas, finish chunk, [DONE].",
+"notes": "Chat streaming works, both serial and batched, with UTF-8-safe deltas. PART MISSING: /v1/completions ignores stream:true. Chat with tools plus stream:true returns a non-SSE JSON body (probe), which breaks clients such as the AI SDK that stream tool calls. No stream_options.include_usage, so there is no usage chunk. Write errors are ignored (`let _ =`)."
+},
+{
+"id": "S08",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1112-1121 inject_tools: tools rendered as a Hermes system prompt",
+"crates/ferric-agent/src/tools.rs:8-15 hermes_prompt",
+"crates/ferric-agent/src/tools.rs:45-62 parse_tool_calls",
+"crates/ferric-serve/src/lib.rs:1136-1167 up to 4-round server-side loop executing MCP-owned calls; others returned as tool_calls",
+"crates/ferric-serve/src/batch.rs:195-199 tool requests bypass batching"
+],
+"check": "ferric-agent tools.rs unit tests: clean_tags, leaked_tag_fallback, no_false_positive (38/38 ferric-agent tests pass; CI 'Test workspace'). No HTTP test. live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: get_weather -> tool_calls [{name:get_weather, arguments:{\"city\":\"Paris\"}}], finish_reason 'tool_calls'.",
+"notes": "ONE format: Hermes/Qwen <tool_call>{json}</tool_call>, plus a bare {name, arguments} JSON fallback. There are no per-model parsers (Llama-3 JSON/python_tag, Mistral [TOOL_CALLS], Gemma, DeepSeek, GLM, Kimi, gpt-oss harmony). The tool prompt is Ferric's own text, not the model's template tool section. tool_choice and parallel_tool_calls are ignored. Streaming is not supported with tools. In history, an assistant tool_calls message becomes empty content and role 'tool' is emitted raw as <|im_start|>tool (a tool-result turn still answered sensibly in the probe). Tool-call arguments are not grammar-constrained."
+},
+{
+"id": "S09",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:8-21 doc",
+"crates/ferric-serve/src/lib.rs:1170-1175 response_format json_object / json_schema -> Guide",
+"crates/ferric-serve/src/lib.rs:703-718 select_token masks logits to legal bytes",
+"crates/ferric-agent/src/guide.rs:20 Json acceptor, 152 compile(), 298 Schema",
+"crates/ferric-serve/src/batch.rs:196 guided requests take the serial path"
+],
+"check": "ferric-agent guide.rs: 35 unit tests on the acceptor/compiler (schema_object, schema_int_range_exhaustive, schema_str_utf8_wellformed, ...), in CI. Nothing drives response_format through the HTTP server. live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: json_schema {name maxLength 12, age 0..120} -> {\"name\":\"\",\"age\":0} (conformant).",
+"notes": "Supported: objects with properties in declaration order, required/optional, nesting <= 8, <= 32 props, string min/maxLength, integer min/max, number, boolean, enum, typed arrays with min/maxItems. Unsupported shapes silently fall back to 'any JSON object' (lib.rs:17-18), and `strict` is ignored. Chat only: /v1/completions ignores response_format. Guided requests are serial and block the batch while they run (batch.rs:41-47)."
+},
+{
+"id": "S10",
+"status": "absent",
+"evidence": [
+"crates/ferric-agent/src/guide.rs only has JSON / JSON-Schema acceptors; no GBNF, regex, EBNF or lark parser anywhere in crates/"
+],
+"check": null,
+"notes": "Tool arguments are not constrained either."
+},
+{
+"id": "S11",
+"status": "absent",
+"evidence": [
+"no reasoning/think handling in crates/ferric-serve/src/lib.rs or crates/ferric-serve/src/batch.rs"
+],
+"check": null,
+"notes": "Thinking models (qwen35 / Qwen3.6, nemotron_h) put <think>...</think> text straight into `content`. The hard-coded ChatML template (lib.rs:547-551) omits the empty-think / enable_thinking prefix that the Qwen3.5 Jinja template adds (the template contains '<think>'; checked this session with a GGUF metadata reader). No reasoning_effort. The only think-awareness is the tool parser's fallback (tools.rs:41-44)."
+},
+{
+"id": "S12",
+"status": "absent",
+"evidence": [
+"no logprobs field read or written in crates/ferric-serve/src/*.rs"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: logprobs:true, top_logprobs:2 ignored silently.",
+"notes": ""
+},
+{
+"id": "S13",
+"status": "absent",
+"evidence": [
+"`n` never read"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: n=2 returned 1 choice.",
+"notes": ""
+},
+{
+"id": "S14",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:378-385 stops only on EOS / <|im_end|> / <|endoftext|> / <end_of_turn> / <|end|> token ids",
+"`stop` never read"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: stop:['5'] ignored, output ran '1, 2, ... 10'.",
+"notes": ""
+},
+{
+"id": "S15",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1128 and crates/ferric-serve/src/batch.rs:292 only temperature read",
+"crates/ferric-serve/src/lib.rs:716-717 top_p fixed at 0.95 in sample_top_p",
+"crates/ferric-serve/src/lib.rs:677, crates/ferric-serve/src/batch.rs:294 fixed RNG seed 0x2545F4914F6CDD1D",
+"crates/ferric-serve/src/lib.rs:891-906 sample_top_p"
+],
+"check": null,
+"notes": "Temperature is the only knob. temperature 0 (the default) is greedy. Above 0 it is nucleus sampling at a HARD-CODED top_p 0.95 with a FIXED seed, so output is reproducible but seed cannot be chosen. Request top_p, top_k, min_p, typical_p, repetition/presence/frequency penalties and seed are all ignored silently."
+},
+{
+"id": "S16",
+"status": "absent",
+"evidence": [
+"none of DRY / XTC / mirostat / logit_bias read or implemented in crates/ferric-serve"
+],
+"check": null,
+"notes": ""
+},
+{
+"id": "S17",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:471-474 GGUF tokenizer.chat_template read into Engine.template",
+"crates/ferric-serve/src/lib.rs:291 field `template` - rustc this session: 'fields im_start, im_end, and template are never read'",
+"crates/ferric-serve/src/lib.rs:518-520 has_chat_family (vocab probe for 4 marker tokens)",
+"crates/ferric-serve/src/lib.rs:524-553 render_chat: hard-coded Llama-3, Gemma(2/3), Phi-3, ChatML",
+"crates/ferric-serve/src/lib.rs:614-630 chat_ids: base-model fallback 'role: content\\n'"
+],
+"check": null,
+"notes": "NOT the model's Jinja template. The template is loaded and never used (compiler warning). Four hard-coded families are picked from vocabulary tokens; anything else falls to plain 'role: content' concatenation with no assistant cue. Checked this session by reading GGUF metadata. gemma-4-E2B-it (a loadable gemma4 row) has '<|turn>' markers and none of the four probes, so it gets the concatenation. DeepSeek-Coder-V2-Lite (deepseek2) has '<｜User｜>', so it gets the concatenation. The TinyLlama/Zephyr '<|user|>' style gets it too. LFM2 (BPE, add_bos=true, BOS '<|startoftext|>') loses the BOS its template emits, because chat_ids prepends BOS only for SentencePiece (lib.rs:626). There are no system-prompt defaults, generation flags or tool sections from the template."
+},
+{
+"id": "S18",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:525 non-string content becomes ''",
+"vision towers exist only as library/examples: crates/ferric-llama/src/qwen25vl_vision.rs, glimmer_vision.rs, qwen3vl_vision.rs; crates/ferric-llama/examples/vl_ask.rs"
+],
+"check": null,
+"notes": "VLM rows qwen3vl, qwen2vl and muse-glimmer load through ferric-serve TEXT-ONLY. An image_url part is dropped together with the text parts around it (see S01)."
+},
+{
+"id": "S19",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:70-72 Parakeet refused ('Use the parakeet examples')",
+"no /v1/audio route"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: POST /v1/audio/transcriptions -> 404.",
+"notes": "ASR is real, but only outside the server: crates/ferric-llama/examples/parakeet_transcribe.rs, librispeech_wer.rs, mimo_asr_wer.rs, and the browser (ferric-web)."
+},
+{
+"id": "S20",
+"status": "absent",
+"evidence": [
+"no TTS model or endpoint anywhere in crates/"
+],
+"check": null,
+"notes": ""
+},
+{
+"id": "S21",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1030 POST /v1/rerank and POST /rerank",
+"crates/ferric-serve/src/lib.rs:1048-1079 rerank(): Cohere shape, top_n, return_documents, raw logits",
+"crates/ferric-serve/src/lib.rs:243-249, 309-313 reranker = second model from FERRIC_RERANK_MODEL",
+"crates/ferric-llama/src/bert.rs:474-560 Reranker (Bert::load only)"
+],
+"check": "scripts/bert_conformance.sh gates the Reranker SCORES against the authors' fixtures (library level, not HTTP). live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731 with FERRIC_RERANK_MODEL=bge-reranker-v2-m3-Q4_K_M: relevant doc 8.51, irrelevant -0.43, top_n and return_documents honoured.",
+"notes": "Only BERT/XLM-R cross-encoders. The Verified modern-bert reranker (gte-reranker-modernbert-base) cannot be used: FERRIC_RERANK_MODEL goes through Bert::load, and this session it panicked at startup with 'no blk.0.attn_output_norm.weight'. The reranker file is not checked against the arch registry. N documents cost N forwards."
+},
+{
+"id": "S22",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:981-989 `--tokenize <text>` is a CLI debug flag that prints ids and exits"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: POST /tokenize -> 404.",
+"notes": "No /tokenize or /detokenize endpoint."
+},
+{
+"id": "S23",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1023-1026 GET /v1/models"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: {object:list, data:[{id:'qwen05', created:1700000000, owned_by:'ferric'}]}.",
+"notes": "Lists exactly one entry (the --name value, default 'ferric'). created is a constant. GET /v1/models/{id} -> 404."
+},
+{
+"id": "S24",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:240-243 Engine holds one `model: Model` plus an optional reranker",
+"crates/ferric-serve/src/lib.rs:941-1016 one model path per process",
+"docs/sota-feature-matrix.md:24 'Multi-model in one process: absent'"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: model:'no-such-model' served by the loaded model with 200.",
+"notes": "One generative model per process; there is no load/unload and no keep-alive or idle eviction. The only second model is the FERRIC_RERANK_MODEL cross-encoder, used only by /v1/rerank."
+},
+{
+"id": "S25",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:908-937 resolve_model / pick_gguf: owner/repo[:file.gguf] -> curl download with --progress-bar, resume (-C -), cache ~/.cache/ferric/hub",
+"crates/ferric-serve/src/lib.rs:978 called at startup"
+],
+"check": null,
+"notes": "Download happens at startup only; there is no pull endpoint or command. Without an explicit file it picks the first file containing 'Q4_K_M', otherwise the first .gguf. It downloads ONE file, so a sharded repo (-00001-of-0000N) fetches one part and the load then fails (crates/ferric-gguf/src/lib.rs:665-686 expects the sibling parts). No HF token, so gated or private repos fail. Branch is always 'main'. Depends on the curl binary."
+},
+{
+"id": "S26",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1214-1232 read_request ignores every header except Content-Length",
+"crates/ferric-serve/src/lib.rs:1005 binds 127.0.0.1 only"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: 'Authorization: Bearer wrong' -> 200.",
+"notes": ""
+},
+{
+"id": "S27",
+"status": "absent",
+"evidence": [
+"no /metrics route; no counters exported"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: GET /metrics -> 404.",
+"notes": ""
+},
+{
+"id": "S28",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1022 GET /health -> {\"status\":\"ok\"}",
+"crates/ferric-serve/src/lib.rs:980 then crates/ferric-serve/src/lib.rs:1005 listener binds only after the model loads, so a 200 means ready",
+"python/ferric/__init__.py uses /health as its readiness wait"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: /health -> {\"status\":\"ok\"}.",
+"notes": "Paths match exactly including the query string: '/health?x=1' -> 404 (probe). No separate liveness vs readiness."
+},
+{
+"id": "S29",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1248-1251 send_sse ignores write errors",
+"crates/ferric-llama/src/sched.rs:177 Scheduler::cancel exists and Done::Cancelled is defined, but ferric-serve never calls cancel",
+"crates/ferric-serve/src/batch.rs:360-364 retirement ignores the Done reason"
+],
+"check": null,
+"notes": "A disconnected client's generation runs to max_tokens or EOS, holding a batch slot."
+},
+{
+"id": "S30",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:292-302 one-slot PrefixSlot",
+"crates/ferric-serve/src/lib.rs:740-749, 763-765, 882 reuse inside generate_spec only",
+"crates/ferric-serve/src/lib.rs:643-673 generate_spec is reached only via Engine::generate on a qwen35-family model with an MTP block",
+"crates/ferric-serve/src/batch.rs:261-297 plain chat/completions requests go to the scheduler, which never calls Engine::generate",
+"crates/ferric-llama/src/prefix.rs radix PrefixCache (30 tests) is not used by ferric-serve"
+],
+"check": null,
+"notes": "One slot, hybrid (qwen35) models with an MTP draft block only. After batch.rs was wired, only response_format or tool requests still reach generate_spec. Plain chat takes the scheduler's prefill/decode (batch.rs:422-444), even with --no-batch, because a non-batchable model still runs the scheduler loop with max_batch 1 (batch.rs:230-232). So multi-turn prefix reuse, and MTP speculation with its SpecGate, no longer apply to ordinary chat. There is no cross-request prefix reuse for any other runtime. The engine's radix PrefixCache is unwired."
+},
+{
+"id": "S31",
+"status": "implemented",
+"evidence": [
+"crates/ferric-serve/src/mcp.rs:1-152 MCP client: stdio subprocess and Streamable-HTTP (via curl, Mcp-Session-Id), initialize -> tools/list -> tools/call",
+"crates/ferric-serve/src/lib.rs:958-959 --mcp / --mcp-http flags",
+"crates/ferric-serve/src/lib.rs:963-977 connect + --mcp-test self-check",
+"crates/ferric-serve/src/lib.rs:1130-1157 MCP tools advertised and executed server-side in the tool loop"
+],
+"check": "No test in CI; --mcp-test is a manual self-check (calls add(2,3) if present).",
+"notes": "Client only; ferric-serve does not expose itself as an MCP server. Protocol version is pinned to 2025-06-18. Only the 'tools' capability is used (no resources or prompts). Every chat request becomes serial while any MCP server is connected (batch.rs:197)."
+},
+{
+"id": "S32",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1020-1035 no static-file or UI route"
+],
+"check": "live smoke this session: target/release/ferric-serve built at HEAD 230edb9, qwen2.5-0.5b-instruct-q8_0.gguf on Metal, port 18731: GET / -> 404.",
+"notes": "ferric-web/site/*.html (tools.html, bonsai.html, agent.html, rag.html) are in-browser demos that run a model in the tab via WASM/WebGPU. They are not a chat UI for the server."
+},
+{
+"id": "S33",
+"status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:941-962 the only binary is ferric-serve <model> [--port --name --max-batch --no-batch --mcp --mcp-http]",
+"crates/ferric-serve/src/lib.rs:990-996 --once = one-turn smoke test",
+"cargo metadata: bins are ferric-serve and ferric-signal only"
+],
+"check": null,
+"notes": "No run, chat, pull or list commands and no REPL. The ~145 ferric-llama examples (run_qwen3, run_gemma4, ...) are one-shot developer programs."
+},
+{
+"id": "S34",
+"status": "absent",
+"evidence": [],
+"check": null,
+"notes": ""
+},
+{
+"id": "S35",
+"status": "absent",
+"evidence": [
+"no context_length / n_ctx read anywhere in crates/ferric-serve",
+"crates/ferric-serve/src/lib.rs:1127 and crates/ferric-serve/src/batch.rs:280 max_tokens is uncapped",
+"crates/ferric-serve/src/lib.rs:1008-1015 catch_unwind wraps only the serial handler; batch::step (batch.rs:236-248) runs unguarded on the main thread"
+],
+"check": null,
+"notes": "There is no context limit, no truncation or context shift, and no 400 on overflow. Prompts past the trained context are silently run with growing KV. A panic inside a batched prefill/decode (for example nemotron_h's 'token id outside the embedding table' at lib.rs:101-102) would take down the whole process. A panic in the serial handler closes the connection without a response."
+},
+{
+"id": "S36",
+"status": "absent",
+"evidence": [
+"no /v1/files or /v1/batches route"
+],
+"check": null,
+"notes": "batch.rs is continuous batching, not the OpenAI Batch API."
+},
+{
+"id": "S37",
+"status": "absent",
+"evidence": [
+"no LoRA-adapter loading for inference anywhere in crates/ (the 'lora' hits are MLA kv_lora_rank)"
+],
+"check": null,
+"notes": ""
+},
+{
+"id": "O01",
+"status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1166, 1193, 1210 and crates/ferric-serve/src/batch.rs:391, 397: usage carries token counts only",
+"crates/ferric-serve/src/specgate.rs:27-31, 49-58: E_draft/E_main = 1/n_layer is a STRUCTURAL estimate used only to decide whether to speculate",
+"crates/ferric-joule/src/lib.rs:160 Meter trait, 179 measure(), 488-500 RAPL, 502-538 nvidia-smi, 544-573 MacBattery, 613-700 and 863 Macmon (sudoless)",
+"scripts/speech_joules.sh, scripts/speech_joules_browser.sh, scripts/asr_joules.sh (macmon, idle-baseline-subtracted J per transcription or word)",
+"ferric-tensor/examples/quant_kernel_joules.rs, ferric-llama/examples/fabric_profile.rs, ferric-web/examples/lookup_vs_weights.rs use the meters"
+],
+"check": "ferric-joule has 92 unit tests (in CI) for its accounting. No test or gate checks per-request joules, because the runtime reports none.",
+"notes": "The server reports NO joules per request or per token. Energy is measured beside the runtime by harness scripts and research examples, not inside the response or the logs. The meter library already exists (ferric_joule::measure + Macmon/RAPL/NvidiaSmi). Wiring it around Engine::generate (serial) is direct. For the batched path, per-request attribution needs a split rule, because one decode step serves N requests."
+},
+{
+"id": "O02",
+"status": "partial",
+"evidence": [
+"crates/ferric-llama/examples/decode_pass_ab.rs:22-49 any GGUF -> ms/token and tok/s (Dense runtime only, Qwen3::load without the registry, decode only)",
+"crates/ferric-llama/examples/batch_throughput.rs (Qwen2.5-0.5B, aggregate tok/s vs live sequences, load-average guard)",
+"crates/ferric-llama/examples/parakeet_bench.rs (ASR)",
+"crates/ferric-tensor/examples/bench.rs (matmul GFLOP/s; CI runs it)"
+],
+"check": null,
+"notes": "No general llama-bench equivalent (pp/tg sweep over any runtime and GGUF). The benches are research examples, each tied to one runtime or question."
+},
+{
+"id": "O03",
+"status": "partial",
+"evidence": [
+"crates/ferric-llama/examples/librispeech_wer.rs, asr_corpus.rs, mimo_asr_wer.rs + scripts/asr_wer_normalized.py (corpus WER)",
+"crates/ferric-llama/examples/ternary_ppl.rs, kv_quant_wire.rs, iq4_real_weights.rs (task-specific perplexity/NLL)",
+"scripts/lm_conformance.sh (logit match vs the authors' reference fixtures)"
+],
+"check": "scripts/lm_conformance.sh, parakeet_conformance.sh, vl_conformance.sh are gates, but they check reference agreement, not an eval score.",
+"notes": "ASR WER is a real user-facing eval (README Quickstart). There is no generic `perplexity <model.gguf> <text>` tool and no lm-eval-harness style task runner for LLMs."
+},
+{
+"id": "O04",
+"status": "partial",
+"evidence": [
+"crates/ferric-gguf/src/write.rs:220-470 GgufWriter (10 tests)",
+"crates/ferric-gguf/src/quantize.rs (Q2_K/Q3_K/STQ1_0... 21 tests), imatrix.rs (7), quantplan.rs (9)",
+"crates/ferric-load/src/hf.rs reads HF safetensors directly for some runtimes"
+],
+"check": "Library unit tests only; GgufWriter's only callers are the hyv4 examples (synthetic/slice checkpoints).",
+"notes": "No end-user converter (HF safetensors -> GGUF, or GGUF -> requantised GGUF). ferric-serve accepts GGUF only (lib.rs:314), so safetensors-only models (MiMo, Cosmos, the qwen2vl authors' weights) cannot be served."
+},
+{
+"id": "O05",
+"status": "partial",
+"evidence": [
+"crates/ferric-core/src/lib.rs:114-118 Context::new auto-selects a wgpu adapter (HighPerformance)",
+"crates/ferric-core/examples/fabric_probe.rs",
+"crates/ferric-tier/src/plan.rs:100 plan_layers(budget) pin-vs-stream arithmetic",
+"crates/ferric-serve/src/lib.rs:424-430 hyv4 streamed with FERRIC_STREAM_GIB (default 12 GiB, user-supplied)"
+],
+"check": "ferric-tier plan tests plus tests/placement_invariance.rs (placement never changes results).",
+"notes": "The backend is auto-detected. Memory is not: nothing reads device or host RAM to pick a budget, quant or context. Every model except hyv4 is loaded resident with no fit check. The hyv4 comment itself notes that an oversized resident load is killed by the OS with no error."
+},
+{
+"id": "O06",
+"status": "partial",
+"evidence": [
+"crates.io: ferric-serve 0.3.0, created 2026-08-15T11:28Z, 19 downloads (crates.io API this session); ~/.cargo/registry/src/*/ferric-serve-0.3.0/src/main.rs:35 `enum Model { Dense(Qwen3), Hybrid(Qwen35) }`, main.rs:661-668 routes: health, models, chat, completions, embeddings",
+"python/pyproject.toml name 'ferric' 0.1.0 (not published)"
+],
+"check": null,
+"notes": "`cargo install ferric-serve` works but installs a 6-week-old build: 2 of today's 7 runtimes, no continuous batching, no /v1/rerank. On PyPI the name 'ferric' belongs to an unrelated project (0.1.0rc5, 'a Rust-native quantum chemistry engine'), so the Python package cannot publish under its declared name. There is no Homebrew formula and no winget package."
+},
+{
+"id": "O07",
+"status": "absent",
+"evidence": [
+"no Dockerfile/Containerfile in the tree outside .reference/llama.cpp (llama.cpp's own)"
+],
+"check": null,
+"notes": ""
+},
+{
+"id": "O08",
+"status": "partial",
+"evidence": [
+"crates/ferric-ffi/src/lib.rs:99-132 C ABI: ferric_load, ferric_generate, ferric_generate_json, ferric_free_string, ferric_free; libferric.h; bindings/{smoke.c, smoke.zig, smoke.mojo, go/main.go, swift/}",
+"crates/ferric-ffi/src/lib.rs:37-62 loads EVERY GGUF with Qwen3::load (no arch::resolve)",
+"crates/ferric-ffi/src/lib.rs:48 Bpe::new without pre-tokenizer; lib.rs:72 EOS hard-coded 151645/151643",
+"python/ferric/__init__.py drives the ferric-serve binary over HTTP via subprocess",
+"crates/ferric-web (wasm-bindgen FerricModel, src/lib.rs:487-806) + ferric-provider.js (Vercel AI SDK LanguageModelV2) + ferric-tools.js"
+],
+"check": "No CI test for ferric-ffi or the Python package. The ffi README says C/Zig/Swift/Go were checked by hand on Qwen2.5-0.5B.",
+"notes": "C covers one runtime. The C ABI skips the arch registry, so a gemma4 or deepseek2 GGUF would load as a dense Qwen3: the fluent-wrong-text failure arch.rs exists to stop. It also uses Qwen-only stop ids and the GPT-2 pre-tokenizer (the defect lib.rs:326-333 fixed in the server), and decodes greedy only. Python is a subprocess wrapper (pyo3 is 'the follow-up'). JS exists for the browser runtime. No Kotlin/Java binding."
+},
+{
+"id": "O09",
+"status": "absent",
+"evidence": [
+"no tracing/opentelemetry dependency in any Cargo.toml; logging is eprintln!, plus env-gated FERRIC_SPEC_TRACE / FERRIC_DUMP_IDS"
+],
+"check": null,
+"notes": ""
+},
+{
+"id": "O10",
+"status": "partial",
+"evidence": [
+"crates/ferric-dist/src/lib.rs:1-33, 161 Transport trait: wire protocol + route planning + prefix-hash session guards",
+"crates/ferric-dist/tests/pipeline_recovery.rs (6 in-process tests)"
+],
+"check": "ferric-dist tests/pipeline_recovery.rs, in CI.",
+"notes": "A correctness layer only. No Transport implementation exists anywhere (no sockets), and no runtime or server depends on ferric-dist. ferric-serve binds 127.0.0.1 only, so it cannot even be reached from another device."
+}
+],
+"routes": [
+{
+"method": "GET",
+"path": "/health",
+"handler": "lib.rs:1022 handle() inline -> {\"status\":\"ok\"}",
+"via": "batch::route -> serial handle (batch.rs:299)"
+},
+{
+"method": "GET",
+"path": "/v1/models",
+"handler": "lib.rs:1023-1026 handle() inline, one entry",
+"via": "batch::route -> serial handle"
+},
+{
+"method": "POST",
+"path": "/v1/chat/completions",
+"handler": "batch.rs:261-297 scheduler (continuous batching) by default; lib.rs:1027 -> chat() lib.rs:1123 when response_format is set or tools/MCP are present (batch.rs:195-199)",
+"via": "batch::route"
+},
+{
+"method": "POST",
+"path": "/v1/completions",
+"handler": "batch.rs:262-297 scheduler; lib.rs:1028 -> completions() lib.rs:1198 only when response_format is set (which it then ignores)",
+"via": "batch::route"
+},
+{
+"method": "POST",
+"path": "/v1/embeddings",
+"handler": "lib.rs:1029 -> embeddings() lib.rs:1081",
+"via": "batch::route -> serial handle"
+},
+{
+"method": "POST",
+"path": "/v1/rerank",
+"handler": "lib.rs:1030 -> rerank() lib.rs:1048 (400 unless FERRIC_RERANK_MODEL is set)",
+"via": "batch::route -> serial handle"
+},
+{
+"method": "POST",
+"path": "/rerank",
+"handler": "lib.rs:1030 alias of /v1/rerank",
+"via": "batch::route -> serial handle"
+},
+{
+"method": "*",
+"path": "anything else (incl. OPTIONS preflight, query strings, /v1/models/{id})",
+"handler": "batch.rs:269-271, 299-301 -> 404 JSON {error:{message:'not found'}}",
+"via": "batch::route"
+}
+],
+"specific_answers": {
+"model_families_serve_can_load": {
+"dispatch": "lib.rs:60-74 Model::dispatchable + lib.rs:386-435, through ferric_llama::arch::resolve (exact-match registry, arch.rs:147-465).",
+"loadable_runtimes": [
+"Dense",
+"Hybrid",
+"Lfm2",
+"Gemma4",
+"DeepSeek2",
+"NemotronH",
+"Hyv4 (streamed, FERRIC_STREAM_GIB default 12)"
+],
+"loadable_arch_strings": [
+"qwen2",
+"qwen3",
+"llama",
+"phi3",
+"gemma",
+"gemma2",
+"gemma3",
+"qwen3vl (text-only)",
+"qwen2vl (text-only)",
+"muse-glimmer (text-only)",
+"gemma4 (E2B/E4B dense only; MoE refused)",
+"deepseek2 (lite, legacy MLA only; absorbed/Q-LoRA refused)",
+"hyv4",
+"qwen35",
+"qwen3moe",
+"qwen35moe",
+"laguna",
+"lfm2",
+"lfm2moe",
+"nemotron_h"
+],
+"registry_rows_serve_refuses": {
+"asr / parakeet (Verified)": "speech; refused (lib.rs:70-72); no /v1/audio endpoint",
+"bert (Verified, 'EMBEDS AND SCORES')": "refused as the main model, so bge/e5/gte-style BERT embedders CANNOT serve /v1/embeddings; usable only as a FERRIC_RERANK_MODEL cross-encoder. bge-small-en-v1.5-f16 panicked at the tokenizer check (lib.rs:350) before the intended refusal message this session",
+"modern-bert (Verified, 'EMBEDS AND SCORES')": "refused as the main model AND unusable as the reranker (Bert::load: 'no blk.0.attn_output_norm.weight', reproduced this session). Reachable through no endpoint",
+"cosmos3_edge (Loads)": "safetensors only; serve opens GGUF only",
+"qwen3vlmoe (Parts)": "not runnable in the registry either"
+},
+"guarded_by": "lib.rs tests every_verified_registry_row_can_actually_be_loaded and a_runnable_row_is_either_loadable_here_or_non_generative (pass this session). They pin the refusal set to {Bert, ModernBert, Cosmos, Parakeet} but cannot see that bert/modern-bert then have no serving endpoint for their verified embedding use.",
+"other_gaps": "qwen2vl is Verified on the authors' safetensors (ferric_load::hf), a path serve cannot open. VLM rows load text-only. gemma4 and deepseek2 load but get the wrong chat template (S17). The published crates.io ferric-serve 0.3.0 dispatches only Dense and Hybrid."
+},
+"two_models_at_once": "No. One generative model per process (lib.rs:240-243). The request `model` field is ignored. The only second model is the optional FERRIC_RERANK_MODEL cross-encoder for /v1/rerank.",
+"chat_template": "Hard-coded, not the model's Jinja. The GGUF template is read into Engine.template and never used (rustc dead-code warning this session). There are four families (ChatML, Llama-3, Gemma, Phi-3), detected from vocabulary tokens, with a 'role: content' fallback.",
+"tool_call_parsing": "Yes, in one format only: Hermes/Qwen <tool_call>{json}</tool_call> with a bare-JSON fallback (ferric-agent/src/tools.rs:45-62). A server-side MCP loop runs up to 4 rounds. No streaming with tools.",
+"joules_per_request": "No. The response carries token usage only. SpecGate uses a structural 1/n_layer energy ratio, not a measurement. ferric-joule's meters (Macmon, RAPL, nvidia-smi, battery) and the macmon harness scripts are not wired into the server."
+},
+"added": [
+{
+"id": "X01",
+"feature": "Configurable bind address / LAN exposure (--host)",
+"ferric_status": "absent",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1005 TcpListener::bind((\"127.0.0.1\", port)) hard-coded; no --host flag (crates/ferric-serve/src/lib.rs:950-962)"
+],
+"notes": "Proposed by the ferric_serve pass; peer side not checked here. Candidate peers: llama-server --host, Ollama OLLAMA_HOST, vLLM --host, LM Studio 'serve on local network'."
+},
+{
+"id": "X02",
+"feature": "CORS incl. OPTIONS preflight for browser clients",
+"ferric_status": "partial",
+"evidence": [
+"crates/ferric-serve/src/lib.rs:1236, 1244 send Access-Control-Allow-Origin: *",
+"OPTIONS /v1/chat/completions -> 404 (live probe)"
+],
+"notes": "A browser POST with Content-Type: application/json triggers a preflight, which fails. Peer side not checked here."
+},
+{
+"id": "X03",
+"feature": "Configurable context size (-c / num_ctx / --max-model-len)",
+"ferric_status": "absent",
+"evidence": [
+"no context flag or n_ctx read in crates/ferric-serve"
+],
+"notes": "Related to S35. Peer side not checked here."
+},
+{
+"id": "X04",
+"feature": "Accurate finish_reason ('length' vs 'stop') and streamed usage (stream_options.include_usage)",
+"ferric_status": "absent",
+"evidence": [
+"crates/ferric-serve/src/batch.rs:369-374 finish_reason hard-coded 'stop' (acknowledged in code)",
+"no stream_options read"
+],
+"notes": "The scheduler already records Done::Length / Done::Eos (ferric-llama/src/sched.rs), and batch.rs discards it. Peer side not checked here."
+}
+],
+"notes": "Ferric repo /Users/dcharlot/vibe-coding/ferric at HEAD 230edb9 (paths above are relative to it). Read in full: ferric-serve lib.rs, batch.rs, mcp.rs, specgate.rs, examples/self_check.rs; ferric-agent tools.rs (plus guide.rs API); ferric-ffi; ferric-llama arch.rs. Tests run this session: ferric-serve 8/8 and ferric-agent 38/38 pass. Live smoke: ferric-serve built at HEAD, qwen2.5-0.5b-instruct-q8_0 + bge-reranker-v2-m3-Q4_K_M reranker, Metal, 127.0.0.1:18731, stopped afterwards; outputs are in probe1.txt, probe2.txt and probe3.txt in this folder. Load average was about 36 (a shared machine), so no timings were taken. Stale in-tree claims: lib.rs:116-121 says 'ferric-serve still has no batched dispatch path ... Nothing reads this yet' (batch.rs now reads it); lib.rs:1260-1262 says the crate has no lib target; docs/sota-feature-matrix.md:22 cites serve_loop at lib.rs:785 and supports_batching at lib.rs:421 (now 1008 and 126); matrix row 17 lists tool calling as complete when it supports one format. Engine-side finding for the E group: after batch.rs was wired, plain requests on MTP hybrids (qwen35 with nextn) never reach generate_spec, even with --no-batch. MTP speculation, the SpecGate and the one-slot prefix cache now run only for response_format and tool requests."
+}
