@@ -114,7 +114,7 @@ async fn run() {
             let mut c = Cache::new(&m.cfg);
             c.set_adapters(vec![(Arc::clone(&da), 1.0)]).unwrap();
             let _ = m.forward_cached(&ids, &mut c).to_vec().await;
-            pc.insert(&ctx, &ids, &c);
+            pc.insert(&ctx, &ids, &mut c);
             for (label, sel) in [("adapter", vec![(da, 1.0)]), ("none", vec![]), ("adapter_b", vec![(db, 1.0)])] {
                 let mut c = Cache::new(&m.cfg);
                 c.set_adapters(sel).unwrap();

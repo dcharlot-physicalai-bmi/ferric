@@ -69,6 +69,7 @@ UPDATES = {
     "S37": ("partial", "8a42c8b: engine API only — Qwen3::upload_lora(PEFT dir or llama.cpp GGUF) + Cache::set_adapters per request, merged or unmerged, 0.4-1.5x PEFT's floor on 4 adapters incl. a published one; ferric-serve does not expose it yet"),
     "T09": ("verified", "8a42c8b: examples/finetune_lora_peft trains LoRA pairs and writes a PEFT adapter (+ GGUF); PEFT loading only the files reproduces Ferric's in-memory logits at 0.93x its float32 floor (scripts/lora_roundtrip.sh)"),
     "T01": ("partial", "8a42c8b: genuine LoRA A/B on q_proj/v_proj with PEFT's scaling, exported as a PEFT adapter; still example-level (qwen2/qwen3 blocks reconstructed by hand)"),
+    "B01": ("partial", "9190710 (merged): dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 (whole Q4_K_M/Q5_K_M/Q8_0 files), q/k/v bias, NORM + rope_freqs rope, KV grown on demand (was <= 2048); scripts/cuda_conformance.sh on Qwen2.5-0.5B Q4_K_M + Q8_0, Llama-3.2-1B Q4_K_M, Qwen3-0.6B Q5_K_M: logits within 1.4e-3 of WGSL to 2300 positions, greedy ids equal. Still opt-in (FERRIC_CUDA); MoE/hybrid runtimes, YaRN, softcaps, SWA, IQ/F16 weights stay on Vulkan"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})

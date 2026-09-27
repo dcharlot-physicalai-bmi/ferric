@@ -75,7 +75,7 @@ async fn run() {
         // already installed — feeding those tokens again would double-count them.
         let logits = m.forward_cached(&t[done..], &mut c).to_vec().await;
         cached_logits.push(logits);
-        pc.insert(&ctx, t, &c);
+        pc.insert(&ctx, t, &mut c);
     }
     let cached_ms = t1.elapsed().as_secs_f64() * 1000.0;
 

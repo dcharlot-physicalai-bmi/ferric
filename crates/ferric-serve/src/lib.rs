@@ -930,7 +930,10 @@ impl Engine {
     }
 
     /// Keep `tokens` (exactly the ones this cache has consumed) for later requests to reuse.
-    pub(crate) fn remember(&self, tokens: &[u32], cache: &ModelCache) {
+    ///
+    /// `&mut` because with the NVIDIA tier on (FERRIC_CUDA) the newest K/V rows can live only on the
+    /// device; `PrefixCache::insert` brings them into the WGSL store before it copies.
+    pub(crate) fn remember(&self, tokens: &[u32], cache: &mut ModelCache) {
         if let (ModelCache::Dense(c), Some(pc)) = (cache, &self.prefix_cache) {
             let n = c.pos.min(tokens.len());
             pc.borrow_mut().insert(&self.ctx, &tokens[..n], c);
@@ -1040,7 +1043,7 @@ impl Engine {
             if peer_gone() { finish = "stop"; break; }
         }
         let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
-        if mm.is_none() { self.remember(&fed, &cache); }
+        if mm.is_none() { self.remember(&fed, &mut cache); }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
@@ -1113,7 +1116,7 @@ impl Engine {
                       r#gen.len(), r#gen.len() as f64 / steps as f64, t0.elapsed().as_secs_f64(), t_fwd);
         }
         let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
-        self.remember(&fed, &cache);
+        self.remember(&fed, &mut cache);
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }

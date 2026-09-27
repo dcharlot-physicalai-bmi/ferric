@@ -103,7 +103,12 @@ impl PrefixCache {
     /// The cache clones the KV rather than borrowing it, because the caller's cache keeps growing and
     /// `KvBuf::append` writes in place — sharing the buffer would let the caller's next token overwrite
     /// what a later request is about to reuse.
-    pub fn insert(&mut self, ctx: &Arc<Context>, tokens: &[u32], cache: &Cache) {
+    ///
+    /// `&mut Cache` because with the NVIDIA tier on (FERRIC_CUDA) the newest rows can live only on the
+    /// device; they are brought into the WGSL store here, before the copy. Leaving that to each caller
+    /// is how a snapshot ends up SHORTER than the prefix it is indexed under (`clone_prefix` clamps).
+    pub fn insert(&mut self, ctx: &Arc<Context>, tokens: &[u32], cache: &mut Cache) {
+        cache.sync_native();
         let keep = (tokens.len() / CHUNK) * CHUNK;
         if keep == 0 { return; }
         if self.entries.len() >= self.capacity {
@@ -1441,12 +1446,12 @@ mod cache_tests {
         let c = cfg(3);
         let tokens: Vec<u32> = (0..CHUNK as u32 * 2).collect();
 
-        let src = quantized_cache(&ctx, &c, tokens.len(), KvqFmt::Q8_0, 1.0);
+        let mut src = quantized_cache(&ctx, &c, tokens.len(), KvqFmt::Q8_0, 1.0);
         let want: Vec<Vec<f32>> = src.layers_q().iter()
             .map(|(k, _)| pollster::block_on(k.dequantize(&ctx).to_vec())).collect();
 
         let mut pc = PrefixCache::new(4);
-        pc.insert(&ctx, &tokens, &src);
+        pc.insert(&ctx, &tokens, &mut src);
 
         let mut dst = Cache::with_kvq(&c, Some(KvqFmt::Q8_0));
         let hit = pc.seed(&ctx, &tokens, &mut dst).expect("the prefix it just stored must be found");
@@ -1475,7 +1480,7 @@ mod cache_tests {
         let tokens: Vec<u32> = (0..CHUNK as u32 * 2).collect();
 
         let mut pc = PrefixCache::new(4);
-        pc.insert(&ctx, &tokens, &quantized_cache(&ctx, &c, tokens.len(), KvqFmt::Q8_0, 1.0));
+        pc.insert(&ctx, &tokens, &mut quantized_cache(&ctx, &c, tokens.len(), KvqFmt::Q8_0, 1.0));
 
         // quantized entry -> f32 cache
         let mut f32_cache = Cache::with_kvq(&c, None);
