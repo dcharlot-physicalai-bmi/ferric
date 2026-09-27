@@ -1,0 +1,31 @@
+[package]
+name = "ferric-cli"
+description = "The `ferric` command line — run, chat, pull, list, show, ps, stop, rm and bench local models. An HTTP client of ferric-serve (Ollama's /api dialect) and a process manager for it; reports joules per answer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["llm", "cli", "ollama", "inference", "ai"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "ferric"
+path = "src/main.rs"
+
+[dependencies]
+# Header reads only (`list`, `show`): GgufFile::open parses a bounded prefix, never the weights.
+ferric-gguf = { path = "../ferric-gguf", version = "0.3" }
+# For `ferric_llama::arch` alone — the registry that says whether this runtime runs an architecture
+# and how far it was checked. `show` must report the SAME verdict the server acts on, so it reads the
+# same table rather than a copy of it.
+ferric-llama = { path = "../ferric-llama", version = "0.3" }
+serde_json = "1"
+# SIGINT during a streamed answer cancels that answer, not the conversation (Ollama's behaviour).
+# Already vendored and in the graph through ferric-tensor.
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+ferric-gguf = { path = "../ferric-gguf", version = "0.3" }

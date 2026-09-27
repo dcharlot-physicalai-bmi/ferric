@@ -55,6 +55,18 @@ builds fully offline from vendored source.
 - [`ferric-load`](crates/ferric-load) — safetensors reader (fp16/bf16 dequant) — how real checkpoints enter.
 - [`ferric-llama`](crates/ferric-llama) — maps a Llama/SmolLM safetensors checkpoint onto the kernels and runs it.
 - [`ferric-web`](crates/ferric-web) — the same core compiled to WASM, running on browser WebGPU.
+- [`ferric-cli`](crates/ferric-cli) — the `ferric` command line: run, chat, pull, list, show, ps, stop, rm, bench.
+
+## Command line
+```bash
+cargo build --release -p ferric-serve -p ferric-cli && export PATH="$PWD/target/release:$PATH"
+ferric pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q8_0       # a GGUF from Hugging Face into ~/.cache/ferric/hub
+ferric run qwen2.5-0.5b-instruct-q8_0 "What is the capital of France?" --verbose   # + joules, J/token
+ferric run qwen2.5-0.5b-instruct-q8_0                  # chat (starts ferric-serve in the background)
+ferric list · ferric show <model> · ferric ps · ferric stop <model> · ferric bench <model>
+```
+An Ollama-style client of `ferric-serve` on `127.0.0.1:11435`; `FERRIC_HOST=127.0.0.1:11434` drives a
+real Ollama. Details: [`crates/ferric-cli`](crates/ferric-cli/README.md).
 
 ## Quickstart
 ```bash
