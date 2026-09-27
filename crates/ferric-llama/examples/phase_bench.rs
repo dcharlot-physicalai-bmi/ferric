@@ -44,16 +44,16 @@ async fn run() {
         tp.push(t0.elapsed().as_secs_f64());
         mark("prefill", "end");
         let mut tok = am(&v);
-        let mut gen = vec![tok];
+        let mut generated = vec![tok];
         mark("decode", "begin");
         let t1 = Instant::now();
         for _ in 0..d {
             let v = m.forward_cached(&[tok], &mut c).to_vec().await;
-            tok = am(&v); gen.push(tok);
+            tok = am(&v); generated.push(tok);
         }
         td.push(t1.elapsed().as_secs_f64());
         mark("decode", "end");
-        ids = gen;
+        ids = generated;
     }
     println!("{path}: {} layers", m.cfg.n_layer);
     println!("  prefill {n} tok  per rep (s): {:?}", tp.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>());
