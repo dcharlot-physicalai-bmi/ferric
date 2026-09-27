@@ -1666,6 +1666,21 @@ impl Qwen3 {
         out
     }
 
+    /// [`Qwen3::forward_cached`] with the LM head applied to the LAST row only — what generation needs.
+    ///
+    /// A prefill of N tokens used to project all N rows through the vocabulary head and read the whole
+    /// [N, vocab] matrix back to keep one row: on Qwen2.5-0.5B at N=1780 that is 242 GFLOP and a 1.08 GB
+    /// readback, 16% of the prefill's GPU time on its own. Returns `[1, vocab]`.
+    pub fn forward_cached_last(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+        use ferric_tensor::{batch, prof};
+        if tokens.len() == 1 { return self.forward_cached(tokens, cache); }
+        let x = self.run_layers(tokens, cache);
+        let last = x.narrow(0, tokens.len() - 1, 1).contiguous();
+        let out = batch(&self.ctx, || self.head(&last));
+        prof(&self.ctx, "lm_head");
+        out
+    }
+
     /// Fetch embedding rows on demand instead of holding the whole table.
     ///
     /// `base` is the table's absolute byte offset. Frees the resident copy, so peak drops by the table's

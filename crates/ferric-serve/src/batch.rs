@@ -502,7 +502,7 @@ impl ServeModel for Engine {
 
     fn prefill(&self, prompt: &[u32]) -> (ModelCache, Vec<f32>) {
         let (mut c, skip) = self.seeded_cache(prompt);
-        let v = pollster::block_on(self.model.forward_cached(&prompt[skip..], &mut c).to_vec());
+        let v = pollster::block_on(self.model.forward_cached_last(&prompt[skip..], &mut c).to_vec());
         let nv = self.model.n_vocab();
         let row = v[v.len() - nv..].to_vec();
         (c, row)

@@ -105,6 +105,17 @@ impl Model {
                 .unwrap_or_else(|e| panic!("hyv4 cache: {e}"))),
         }
     }
+    /// Logits for the LAST position only — all a generation step needs. The dense runtime heads just that
+    /// row (a 1780-token prefill no longer projects 1780 rows through the vocabulary and reads back 1 GB);
+    /// other runtimes compute the full rows and keep the last, as before.
+    fn forward_cached_last(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
+        if let (Model::Dense(m), ModelCache::Dense(c)) = (self, &mut *cache) { return m.forward_cached_last(tokens, c); }
+        let n = self.n_vocab();
+        let full = self.forward_cached(tokens, cache);
+        let rows = full.numel() / n;
+        full.reshape(&[rows, n]).narrow(0, rows - 1, 1).contiguous()
+    }
+
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
         match (self, cache) {
             (Model::Dense(m), ModelCache::Dense(c)) => m.forward_cached(tokens, c),
@@ -930,7 +941,7 @@ impl Engine {
         let mut finish = "length";
         for step in 0..max_tokens {
             let input: Vec<u32> = if step == 0 { prompt[skip..].to_vec() } else { vec![*r#gen.last().unwrap()] };
-            let logits = self.model.forward_cached(&input, &mut cache);
+            let logits = self.model.forward_cached_last(&input, &mut cache);
             let v = pollster::block_on(logits.to_vec());
             let row = &v[v.len() - n_vocab..];
             let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };
