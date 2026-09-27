@@ -1155,6 +1155,13 @@ mod tests {
         x.iter().zip(w).map(|(&v, &ww)| ((v as f64) * inv * (ww as f64)) as f32).collect()
     }
     fn rnd(n: usize, seed: u64) -> Vec<f32> { (0..n).map(|i| ((i as u64 * 2654435761 + seed) % 1000) as f32 / 500.0 - 1.0).collect() }
+    /// xorshift uniform in [-1, 1). ⛔ NOT `rnd` for attention: `rnd` has period 1000, so with a 512-wide
+    /// K row every 125th row is IDENTICAL, no later 2048-key chunk can raise the running max, and a
+    /// kernel that never rescales across chunks passed the long-context test (mutation run, 2026-09-27).
+    fn rndx(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 }).collect()
+    }
 
     /// Launch `qk_norm_rope` for one row and return (q, k, k-cache row, v-cache row).
     #[allow(clippy::too_many_arguments)]
@@ -1268,7 +1275,10 @@ mod tests {
         // attention vs fused_decode_attention, and vs an f64 softmax at lengths across the chunk edge
         let attn = |nh: usize, nkv: usize, dh: usize, s: usize, seed: u64| {
             let (qo, kvo) = (nh * dh, nkv * dh);
-            let (qv, kv, vv) = (rnd(qo, seed), rnd(s * kvo, seed + 1), rnd(s * kvo, seed + 2));
+            // Keys drift upward with position, so each later chunk holds a higher max than the one before
+            // and the online softmax MUST rescale what it accumulated (see `rndx`).
+            let (qv, vv) = (rndx(qo, seed), rndx(s * kvo, seed + 2));
+            let kv: Vec<f32> = rndx(s * kvo, seed + 1).iter().enumerate().map(|(i, &v)| v * (1.0 + 2.0 * (i / kvo) as f32 / s as f32)).collect();
             let want = pollster::block_on(crate::Tensor::from_vec(&ctx, &qv, &[1, qo]).fused_decode_attention(
                 &crate::Tensor::from_vec(&ctx, &kv, &[s, kvo]), &crate::Tensor::from_vec(&ctx, &vv, &[s, kvo]), nh, nkv, dh).to_vec());
             let (mut qd, mut kd, mut vd, mut ad) = (up(&qv), up(&kv), up(&vv), drv.alloc(qo * 4).unwrap());
@@ -1352,7 +1362,8 @@ mod tests {
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
         for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3)] {
             let (qw, kw) = (nh * dh, nkv * dh); let s = pos + t;
-            let (q, kc, vc) = (rnd(t * qw, 1 + t as u64), rnd(s * kw, 2 + s as u64), rnd(s * kw, 3 + s as u64));
+            let (q, vc) = (rndx(t * qw, 1 + t as u64), rndx(s * kw, 3 + s as u64));
+            let kc: Vec<f32> = rndx(s * kw, 2 + s as u64).iter().enumerate().map(|(i, &v)| v * (1.0 + 2.0 * (i / kw) as f32 / s as f32)).collect();
             let mut want = vec![0f64; t * qw];
             for i in 0..t { for h in 0..nh {
                 let kvh = h / (nh / nkv);
