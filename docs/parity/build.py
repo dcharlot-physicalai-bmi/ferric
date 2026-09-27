@@ -59,7 +59,10 @@ UPDATES = {
     "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
     "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
     "S24": ("verified", "e0bf215: any GGUF in the model directory loads when a request names it (stem, owner/repo:tag, path); per-model batches, one shared meter; Ollama keep_alive/ttl, LRU eviction under --max-models and a memory budget, command-line model pinned; 10 socket tests, 8 mutation-checked; live: 4 models by 3 name forms, concurrent two-model answers equal solo"),
-    "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without)"),
+    "S29": ("verified", "15e605c: a disconnected client frees its batch slot (socket test; mutation-checked: 14.8 s without); 5667ff5: serial streams too — hang up at 1 s → 2-60 tokens instead of 800 on four routes, counted"),
+    "S18": ("partial", "5667ff5: images on every dialect for Qwen2.5-VL/Qwen3-VL checkpoints; MiMo-Embodied over HTTP = the authors' 83 prompt ids and 64/64 greedy tokens (PNG). ⛔ JPEG decode not PIL-identical (max 3 levels) and it flips the answer at char 52"),
+    "S33": ("verified", "63dd4aa: `ferric` run/chat/pull/list/show/ps/stop/rm/bench/serve; 30 tests vs an Ollama-API mock, 8/8 mutations; live with the multi-model server"),
+    "S25": ("verified", "63dd4aa: `ferric pull owner/repo[:QUANT]` — split GGUFs, resume (Range asserted), progress; real HF pull sha256 = the repo's LFS hash"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})
