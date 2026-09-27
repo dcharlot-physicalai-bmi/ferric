@@ -15,7 +15,7 @@
 #      rows, so without this the gate would pass on a tier that never ran — the fate of the first CUDA
 #      check, whose "reference" had been routed to CUDA too.
 #   2. NATIVE vs WGSL, same weights: max |Δ logit| within TOL_NW (decode: two f32 reduction orders) or
-#      TOL_PF (full: the tensor cores round activations to f16). Both bands are measured, below.
+#      TOL_PF (full: prefill on the tensor cores). Both bands are measured, below.
 #   3. vs THE AUTHORS (transformers, float32, the fixture): a quantised file cannot match them — its
 #      distance is the quantisation noise — so the claim is RELATIVE: the native tier sits no further
 #      from the authors than the portable path does (plus the native-vs-WGSL band), with the same argmax
@@ -107,13 +107,15 @@ def vs_authors(rows):
 #   it was accepted) 4.0e-5, Qwen2.5-0.5B Q4_K_M 1.2e-4, Qwen2.5-0.5B Q8_0 5.0e-5, Llama-3.2-1B Q4_K_M
 #   2.0e-5 — but the band GROWS WITH CONTEXT (two f32 attention sums over more keys): at 2300 positions
 #   Qwen2.5 reached 3.2e-4 and Llama 1.35e-3, which a 1e-3 tolerance refused. TOL_NW = 5e-3 is ~4x that.
-#   FULL (tensor-core prefill, split hi+lo f16 activations, f16 weights), fixture / 1000-row prompt:
-#   Qwen2.5 Q4_K_M 1.2e-2 / 1.8e-2, Qwen2.5 Q8_0 2.0e-2 / 4.7e-2, Qwen3 Q5_K_M 1.0e-2 / 2.8e-2, Llama
-#   Q4_K_M 5.4e-3 / 7.3e-3. TOL_PF = 0.1 is ~2x the widest. (With a SINGLE f16 activation Qwen3's
-#   1000-row prompt sat at 0.219 — the reason the activation is split.)
+#   FULL (tensor-core prefill: integer weight codes + split hi/lo f16 activations, nothing rounded but
+#   f32 accumulation), fixture / 1000-row prompt: Qwen2.5 Q4_K_M 1.9e-4 / 1.3e-4, Qwen2.5 Q8_0 1.1e-4 /
+#   1.4e-4, Qwen3 Q5_K_M 2.0e-4 / 5.1e-4, Llama Q4_K_M 2.0e-5 / 1.3e-4 — the decode band's order, so
+#   TOL_PF = TOL_NW. (The two forms it replaced: f16 activations + f16-rounded weights, 0.219 on Qwen3's
+#   1000 rows; split activations + rounded weights, 0.028 there and 4.7e-2 on Qwen2.5 Q8_0.)
 #   For scale: every one of these files sits 2.4-11.7 logits from the authors (quantisation), and the
 #   native tier's distance from them matched WGSL's to within 0.01 in every run.
-TOL_NW, TOL_PF = 5e-3, 0.1
+TOL_NW = 5e-3
+TOL_PF = TOL_NW
 ok = True
 print(f"model:     {os.path.basename(M)} (arch {ARCH})   fixture: {ref['model']} — transformers {ref['transformers']}, float32")
 wr, _, wdev, _ = run(False)
@@ -143,10 +145,10 @@ if "rope_freqs.weight" in NAMES: controls.append(("rope_freqs dropped", {"FERRIC
 if "blk.0.attn_q.bias" in NAMES: controls.append(("q/k/v bias dropped", {"FERRIC_NO_QKV_BIAS": "1"}))
 if not controls: print("  ⛔ no negative control applies — this gate has shown nothing"); ok = False
 # DECODE-mode controls run on the fixture. FULL-mode controls run on a LONG PROMPT — 1024 positions, the
-# first 1000 one native prefill (two 512-row chunks) — because the prefill band is ~100x wider and some
-# mechanisms only act at distance: dropping Llama-3's rope_freqs moved a 136-token prompt by 0.46
-# (5x TOL_PF, which this gate refused), and 1024 positions by 2.40. The long run is also where the
-# chunked prefill is checked against WGSL at all.
+# first 1000 one native prefill (two 512-row chunks) — because some mechanisms only act at distance:
+# dropping Llama-3's rope_freqs moved a 136-token prompt by 0.46 and 1024 positions by 2.40. (With the
+# 0.1 band the rounded-f16 prefill needed, the short prompt could not show it: 5x, refused.) The long
+# run is also where the chunked prefill is checked against WGSL at all.
 short = dict(total=len(ref["ids"]), chunk_at=10**9)
 longpf = dict(total=1024, prefill=1000, chunk_at=10**9)
 lw_pf, _, _, _ = run(False, **longpf)
@@ -163,12 +165,7 @@ for name, env in controls:
         same, _, _ = diff(xc, xw)
         moved, _, _ = diff(xc, {t: base[t] for t in xc})
         ran = xs[0][0] == xs[0][1] > 0 and xs[1][0] == (xs[1][1] if mode == "FULL" else 0)
-        # ⚠ FULL mode judges "native follows the switch" RELATIVE to how far the switch moves things. A
-        # control breaks the model (dropping Qwen2.5's biases moves logits by 24), activations leave their
-        # trained range, and the tensor cores' f16 WEIGHTS then diverge from f32 far beyond the normal band
-        # (measured 1.9-2.25 with single-f16 activations). The claim kept is the one that matters: the
-        # native run lands ≥ 20x closer to WGSL-under-the-control than the control moved it.
-        follow = tol if mode == "DECODE" else max(tol, moved / 20)
+        follow = tol
         print(f"  control '{name}' [{mode}]: native vs WGSL-under-control {same:.2e} (≤ {follow:.2e});  moved from normal "
               f"{moved:.2e} = {moved / tol:.0f}x tol;  ran natively: {ran}")
         if same > follow or moved < 20 * tol or not ran: print("  ⛔ the gate cannot see this mechanism on the native path"); ok = False
