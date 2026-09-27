@@ -40,6 +40,10 @@ pub const CHUNK: usize = 16;
 struct Entry {
     tokens: Vec<u32>,
     kv: EntryKv,
+    /// [`Cache::adapter_key`] of the cache that produced the KV. ⛔ Same tokens, different LoRA adapter
+    /// (or none) is a DIFFERENT prefix: the adapted k/v projections wrote other rows, and seeding across
+    /// selections would serve one request with another's fine-tune — fluent, and wrong.
+    adapters: String,
 }
 
 /// A cached prefix's KV, in whichever representation the cache that produced it uses.
@@ -138,7 +142,7 @@ impl PrefixCache {
         // block addressing, so the "block id" is just the chunk's ordinal.
         let chunks: Vec<u32> = (0..(keep / CHUNK) as u32).collect();
         self.index.insert(&tokens[..keep], &chunks, id);
-        self.entries.insert(id, Entry { tokens: tokens[..keep].to_vec(), kv });
+        self.entries.insert(id, Entry { tokens: tokens[..keep].to_vec(), kv, adapters: cache.adapter_key() });
     }
 
     /// Seed `cache` with the longest cached prefix of `tokens`.
@@ -160,6 +164,13 @@ impl PrefixCache {
         // prefix here is undetectable downstream — the model simply attends to someone else's history.
         debug_assert_eq!(&e.tokens[..m.tokens], &tokens[..m.tokens], "radix returned a non-matching prefix");
         if e.tokens.len() < m.tokens || e.tokens[..m.tokens] != tokens[..m.tokens] {
+            self.misses += 1;
+            return None;
+        }
+        // KV computed under another adapter selection is not this sequence's prefix. A MISS, not a
+        // search for another entry: missing is always safe, and the index returns one entry per match.
+        // The caller selects adapters BEFORE seeding (`Cache::set_adapters` refuses once `pos > 0`).
+        if e.adapters != cache.adapter_key() {
             self.misses += 1;
             return None;
         }

@@ -65,6 +65,10 @@ UPDATES = {
     "S18": ("partial", "5667ff5: images on every dialect for Qwen2.5-VL/Qwen3-VL checkpoints; MiMo-Embodied over HTTP = the authors' 83 prompt ids and 64/64 greedy tokens (PNG). ⛔ JPEG decode not PIL-identical (max 3 levels) and it flips the answer at char 52"),
     "S33": ("verified", "63dd4aa: `ferric` run/chat/pull/list/show/ps/stop/rm/bench/serve; 30 tests vs an Ollama-API mock, 8/8 mutations; live with the multi-model server"),
     "S25": ("verified", "63dd4aa: `ferric pull owner/repo[:QUANT]` — split GGUFs, resume (Range asserted), progress; real HF pull sha256 = the repo's LFS hash"),
+    "E25": ("verified", "8a42c8b: forward_batch applies EACH ROW's LoRA selection; rows a/b/none match PEFT's adapter_names mixed batch at 0.77x its float32 floor (scripts/lora_conformance.sh; crossed-rows control 26k x). Dense runtime only; not yet exposed by ferric-serve"),
+    "S37": ("partial", "8a42c8b: engine API only — Qwen3::upload_lora(PEFT dir or llama.cpp GGUF) + Cache::set_adapters per request, merged or unmerged, 0.4-1.5x PEFT's floor on 4 adapters incl. a published one; ferric-serve does not expose it yet"),
+    "T09": ("verified", "8a42c8b: examples/finetune_lora_peft trains LoRA pairs and writes a PEFT adapter (+ GGUF); PEFT loading only the files reproduces Ferric's in-memory logits at 0.93x its float32 floor (scripts/lora_roundtrip.sh)"),
+    "T01": ("partial", "8a42c8b: genuine LoRA A/B on q_proj/v_proj with PEFT's scaling, exported as a PEFT adapter; still example-level (qwen2/qwen3 blocks reconstructed by hand)"),
 }
 for k, (st, why) in UPDATES.items():
     fer.setdefault(k, {"id": k})

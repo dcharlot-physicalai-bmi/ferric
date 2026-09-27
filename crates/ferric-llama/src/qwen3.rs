@@ -15,6 +15,7 @@ use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufSource, Meta};
 use ferric_tensor::kvquant::{KvStore, KvqFmt};
 use ferric_tensor::{nn, KvBuf, QMatrix, Tensor};
+use crate::lora::{Active, DeviceLora, Slot};
 use std::sync::Arc;
 
 
@@ -451,6 +452,9 @@ pub struct Cache {
     /// would spend the memory the quantization exists to save.
     q: Vec<(KvStore, KvStore)>,
     fmt: Option<KvqFmt>,
+    /// The LoRA adapters this sequence runs with, and each one's multiplier. Empty = the base model.
+    /// Per SEQUENCE rather than per model, so a batched decode can give every row its own adapter.
+    lora: Vec<(Arc<DeviceLora>, f32)>,
 }
 impl Cache {
     /// Forget every position from `n` on — a speculative step's rejected drafts. f32 caches only (a
@@ -493,13 +497,14 @@ impl Cache {
                     .map(|_| (if grouped_k { KvStore::grouped(f) } else { KvStore::block(f) }, KvStore::block(f)))
                     .collect(),
                 fmt: Some(f),
+                lora: Vec::new(),
             },
         }
     }
 
     pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
         match fmt {
-            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None },
+            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None, lora: Vec::new() },
             Some(f) => Cache {
                 pos: 0,
                 kv: Vec::new(),
@@ -514,12 +519,40 @@ impl Cache {
                 // that makes a regression impossible to attribute.
                 q: (0..cfg.n_layer).map(|_| (k_store(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
+                lora: Vec::new(),
             },
         }
     }
 
     /// The KV-cache quantization format in force, or `None` for f32.
     pub fn kvq_fmt(&self) -> Option<KvqFmt> { self.fmt }
+
+    /// **Choose this sequence's LoRA adapters** — the per-request selection. Each entry is an adapter
+    /// uploaded with [`Qwen3::upload_lora`] and a multiplier (1.0 = as trained; PEFT's own `scaling` is
+    /// already inside the adapter). Several entries SUM, as PEFT does with several active adapters.
+    /// An empty selection is the base model.
+    ///
+    /// ⛔ Only before the first token. The K/V rows already in this cache were computed through the
+    /// adapted k/v projections of whatever was selected then; switching mid-sequence would attend over
+    /// history the new adapter never produced — fluent, and wrong. Refused, not ignored.
+    pub fn set_adapters(&mut self, sel: Vec<(Arc<DeviceLora>, f32)>) -> Result<(), String> {
+        if self.pos > 0 {
+            return Err(format!("set_adapters on a cache already {} tokens in: its K/V were computed under \
+                                the previous selection", self.pos));
+        }
+        self.lora = sel;
+        Ok(())
+    }
+
+    /// The adapters this sequence runs with.
+    pub fn adapters(&self) -> &[(Arc<DeviceLora>, f32)] { &self.lora }
+
+    /// A key naming the selection — `""` for the base model. ⛔ A prefix/prompt cache MUST include it:
+    /// K/V computed under one adapter are not the K/V of the same tokens under another (or none), and
+    /// seeding across selections serves a request with another request's fine-tune.
+    pub fn adapter_key(&self) -> String {
+        self.lora.iter().map(|(d, s)| format!("{}@{s}", d.id)).collect::<Vec<_>>().join("+")
+    }
 
     /// **Device bytes the K/V caches actually occupy right now**, summed over layers.
     ///
@@ -692,6 +725,12 @@ pub struct Qwen3 {
     /// NVIDIA tier 2: the resident decode graph, built lazily on the first eligible decode step.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     native: std::cell::RefCell<Option<ferric_tensor::cuda::DecodeGraph>>,
+    /// `general.architecture` — decides the q/k row order a LoRA adapter must be bound to.
+    arch: String,
+    /// Phi-3 stores q|k|v as one `attn_qkv` weight and gate|up as one `ffn_up`; a LoRA pair can only
+    /// target the weights as stored.
+    fused_qkv: bool,
+    fused_gate_up: bool,
 }
 /// Build one transformer layer from a weight source.
 ///
@@ -810,6 +849,24 @@ impl Step {
 }
 
 impl Qwen3 {
+    /// **Upload a LoRA adapter for UNMERGED application** — the adapter stays separate from the base
+    /// weights (which may be quantized), and any number of adapters can be resident at once. Select it
+    /// per sequence with [`Cache::set_adapters`]; a batched decode honours each row's selection.
+    ///
+    /// Binds the adapter to this model's q/k row order (a PEFT adapter on a `llama` GGUF has its q/k
+    /// `lora_B` rows permuted as the converter permuted the base) and refuses any pair whose layer,
+    /// projection or shape this model does not have. For the adapter MERGED into the weights instead,
+    /// load through `ferric_load::lora::LoraMerged`.
+    pub fn upload_lora(&self, adapter: &ferric_load::lora::LoraAdapter) -> Result<Arc<DeviceLora>, String> {
+        let c = &self.cfg;
+        let bound = adapter.bind(&self.arch, c.n_head, c.n_head_kv, ferric_load::lora::RowOrder::Gguf)?;
+        let geo = crate::lora::Geometry {
+            n_layer: c.n_layer, n_embd: c.n_embd, q_out: c.n_head * c.head_dim, kv_out: c.n_head_kv * c.head_dim,
+            n_ff: c.n_ff, fused_qkv: self.fused_qkv, fused_gate_up: self.fused_gate_up,
+        };
+        Ok(Arc::new(DeviceLora::build(&self.ctx, &bound, &geo)?))
+    }
+
     /// Start/stop capturing linear-input activations for GPTQ calibration.
     pub fn set_capture(&self, on: bool) { *self.cap.borrow_mut() = if on { Some(Vec::new()) } else { None }; }
     /// Take the captured (name, activation) pairs, leaving capture off.
@@ -937,6 +994,9 @@ impl Qwen3 {
                 let inv: Vec<f32> = f[..n].iter().map(|&x| if x != 0.0 { 1.0 / x } else { 1.0 }).collect();
                 Ok::<_, String>(Tensor::from_vec(ctx, &inv, &[n]))
             }).transpose()? },
+            arch: match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => "qwen3".into() },
+            fused_qkv: g.tensor("blk.0.attn_qkv.weight").is_some(),
+            fused_gate_up: g.tensor("blk.0.ffn_gate.weight").is_none(),
             cfg, ctx: ctx.clone(), layers, stream: None,
         })
     }
@@ -1085,11 +1145,11 @@ impl Qwen3 {
     }
 
     fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize,
-            mrope: Option<&[u32]>) -> Tensor {
+            mrope: Option<&[u32]>, lr: &Active) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         self.grab(format!("l{il}.qkv"), h); // GPTQ calibration: capture wqkv input
-        // One fused matmul emits [q | k | v]; (+ bias for Qwen2); split, optional QK-norm, RoPE.
-        let qkv = l.wqkv.matmul(h);
+        // One fused matmul emits [q | k | v]; (+ LoRA delta, + bias for Qwen2); split, optional QK-norm, RoPE.
+        let qkv = lr.add_to(l.wqkv.matmul(h), h, il, Slot::Qkv);
         let qkv = match &l.qkv_bias { Some(bias) => qkv.add(bias), None => qkv };
         // QK-norm (Qwen3) normalizes each head; without it (Qwen2/Llama) q/k pass through unchanged.
         let qn = |x: Tensor, n: usize, norm: &Option<Tensor>| match norm {
@@ -1237,19 +1297,33 @@ impl Qwen3 {
             _ => o,
         };
         self.grab(format!("l{il}.wo"), &o); // GPTQ calibration: capture wo input
-        o.matmul_q(&l.wo)
+        lr.add_to(o.matmul_q(&l.wo), &o, il, Slot::O)
     }
 
-    fn ffn(&self, h: &Tensor, l: &Layer, il: usize) -> Tensor {
+    fn ffn(&self, h: &Tensor, l: &Layer, il: usize, lr: &Active) -> Tensor {
         self.grab(format!("l{il}.ffn_gu"), h); // GPTQ calibration: capture ffn_gate_up input
         // Gemma uses GEGLU (gelu gate) not SwiGLU (silu), so it can't use the silu-fused fast paths:
         // project gate|up, gelu the gate half, multiply by the up half, then the down projection.
         if self.cfg.is_gemma {
-            let gu = l.ffn_gate_up.matmul(h);
+            let gu = lr.add_to(l.ffn_gate_up.matmul(h), h, il, Slot::GateUp);
             let n = l.ffn_gate_out;
             let gate = gu.narrow(1, 0, n).contiguous().gelu_tanh();
             let up = gu.narrow(1, n, n).contiguous();
-            return gate.mul(&up).matmul_q(&l.ffn_down);
+            let act = gate.mul(&up);
+            return lr.add_to(act.matmul_q(&l.ffn_down), &act, il, Slot::Down);
+        }
+        // ⚠ LoRA on gate|up adds to the PRE-activation, which the fused SwiGLU kernel and the FFN
+        // megakernel never materialise — so an adapted layer takes the plain matmul + SwiGLU, and an
+        // adapted down projection needs SwiGLU's output as its LoRA input. Taking a fused path here
+        // would drop the delta with no error.
+        if lr.touches(il, Slot::GateUp) || lr.touches(il, Slot::Down) {
+            let sw = if lr.touches(il, Slot::GateUp) {
+                lr.add_to(l.ffn_gate_up.matmul(h), h, il, Slot::GateUp).swiglu(l.ffn_gate_out)
+            } else {
+                l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out)
+            };
+            self.grab(format!("l{il}.ffn_down"), &sw);
+            return lr.add_to(sw.matmul_q(&l.ffn_down), &sw, il, Slot::Down);
         }
         // Whole-FFN megakernel (gate_up Q4_K + SwiGLU + down Q6_K in one dispatch), OPT-IN via
         // FERRIC_MEGA — correct but ~2× slower at decode (occupancy-bound); off by default.
@@ -1276,7 +1350,7 @@ impl Qwen3 {
     /// between layers — a browser fetching the next layer's weights — cannot use a loop that runs to
     /// completion. See [`Qwen3::step_layer`].
     fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize,
-                   mrope: Option<&[u32]>) -> Tensor {
+                   mrope: Option<&[u32]>, lr: &Active) -> Tensor {
         use ferric_tensor::{batch, prof};
         dump("inpL", il, x);
         dump_with("attn_norm", il, || x.rmsnorm(&l.attn_norm, self.cfg.eps));
@@ -1285,9 +1359,9 @@ impl Qwen3 {
         let xin = x;
         if profiling {
             // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
-            let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope));
+            let y = batch(&self.ctx, || self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope, lr));
             prof(&self.ctx, "attn");
-            out = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il).add(&xy) });
+            out = batch(&self.ctx, || { let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps); self.ffn(&xy_n, l, il, lr).add(&xy) });
             prof(&self.ctx, "ffn");
         } else if self.cfg.post_norms {
             // Gemma and Muse Glimmer normalize the attn AND ffn *outputs* (post-norms) before each add:
@@ -1299,16 +1373,16 @@ impl Qwen3 {
             // different model from the same weights.
             let mode = std::env::var("FERRIC_POSTNORM").unwrap_or_default();
             out = batch(&self.ctx, || {
-                let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il, mrope);
+                let a = self.attn(&xin.rmsnorm(&l.attn_norm, eps), l, lc, pos, il, mrope, lr);
                 match mode.as_str() {
                     "off" => {
                         let x1 = xin.add(&a);
-                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il, lr);
                         x1.add(&f)
                     }
                     "sum" => {
                         let x1 = xin.add(&a).rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps);
-                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il, lr);
                         x1.add(&f).rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps)
                     }
                     _ => {
@@ -1316,7 +1390,7 @@ impl Qwen3 {
                         // the model's rms eps. Same tensor op, different constant.
                         let pe = if std::env::var("FERRIC_POSTEPS").is_ok() { eps } else { self.cfg.post_norm_eps };
                         let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), pe));
-                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                        let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il, lr);
                         x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), pe))
                     }
                 }
@@ -1336,10 +1410,10 @@ impl Qwen3 {
             let (no_attn, no_ffn) = (skip.contains("attn"), skip.contains("ffn"));
             out = batch(&self.ctx, || {
                 let y = if no_attn { xin.clone() }
-                        else { self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope) };
+                        else { self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, mrope, lr) };
                 // fused: xy = xin + y (next residual), xy_n = rmsnorm(xy) — one kernel, not two.
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                if no_ffn { xy } else { self.ffn(&xy_n, l, il).add(&xy) }
+                if no_ffn { xy } else { self.ffn(&xy_n, l, il, lr).add(&xy) }
             });
         }
 
@@ -1355,11 +1429,11 @@ impl Qwen3 {
     /// What cannot be batched is attention itself: sequence `i` attends *its own* KV history, at *its own*
     /// position, and those histories have different lengths. So the per-sequence work stays a loop, and
     /// only the projections are shared. (Paged attention is what would collapse that loop too.)
-    fn attn_batch(&self, h: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize) -> Tensor {
+    fn attn_batch(&self, h: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize, lr: &Active) -> Tensor {
         let (n, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
         debug_assert_eq!(n, caches.len(), "one row per sequence");
 
-        let qkv = l.wqkv.matmul(h);                                  // <-- batched: the win
+        let qkv = lr.add_to(l.wqkv.matmul(h), h, il, Slot::Qkv);    // <-- batched: the win
         let qkv = match &l.qkv_bias { Some(bias) => qkv.add(bias), None => qkv };
         let qn = |x: Tensor, hn: usize, norm: &Option<Tensor>| match norm {
             Some(w) => x.reshape(&[n, hn, hd]).rmsnorm(w, self.cfg.eps).reshape(&[n, hn * hd]),
@@ -1404,26 +1478,26 @@ impl Qwen3 {
                       else { nn::decode_attention(&qi, &kc, &vc, nh, nkv, sc) });
         }
         let o = outs.iter().skip(1).fold(outs[0].clone(), |acc, t| acc.cat(t, 0));
-        o.matmul_q(&l.wo)                                            // <-- batched again
+        lr.add_to(o.matmul_q(&l.wo), &o, il, Slot::O)               // <-- batched again
     }
 
     /// One layer for N sequences. Identical structure to `apply_layer`; only attention differs.
-    fn apply_layer_batch(&self, x: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize) -> Tensor {
+    fn apply_layer_batch(&self, x: &Tensor, l: &Layer, caches: &mut [&mut Cache], il: usize, lr: &Active) -> Tensor {
         use ferric_tensor::batch;
         let xin = x;
         if self.cfg.is_gemma {
             let eps = self.cfg.eps;
             batch(&self.ctx, || {
-                let a = self.attn_batch(&xin.rmsnorm(&l.attn_norm, eps), l, caches, il);
+                let a = self.attn_batch(&xin.rmsnorm(&l.attn_norm, eps), l, caches, il, lr);
                 let x1 = xin.add(&a.rmsnorm(l.post_attn_norm.as_ref().unwrap(), eps));
-                let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il);
+                let f = self.ffn(&x1.rmsnorm(&l.ffn_norm, eps), l, il, lr);
                 x1.add(&f.rmsnorm(l.post_ffn_norm.as_ref().unwrap(), eps))
             })
         } else {
             batch(&self.ctx, || {
-                let y = self.attn_batch(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, caches, il);
+                let y = self.attn_batch(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, caches, il, lr);
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                self.ffn(&xy_n, l, il).add(&xy)
+                self.ffn(&xy_n, l, il, lr).add(&xy)
             })
         }
     }
@@ -1470,9 +1544,15 @@ impl Qwen3 {
         assert_eq!(tokens.len(), caches.len(), "one token per sequence");
         assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
         let mut x = self.embed(tokens);
+        // Each row's adapters come from ITS cache — the per-request selection. Resolved once here,
+        // before the layers borrow the caches mutably.
+        let lr = {
+            let sels: Vec<&[(Arc<DeviceLora>, f32)]> = caches.iter().map(|c| c.lora.as_slice()).collect();
+            Active::per_row(&self.ctx, &sels)
+        };
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            x = self.apply_layer_batch(&x, &l, caches, il);
+            x = self.apply_layer_batch(&x, &l, caches, il, &lr);
         }
         for c in caches.iter_mut() { c.pos += 1; }
         batch(&self.ctx, || self.head(&x))
@@ -1504,7 +1584,8 @@ impl Qwen3 {
     pub fn step_layer(&self, step: &mut Step, cache: &mut Cache) -> bool {
         let Some(il) = step.next_layer() else { return true };
         let l = self.layer_ref(il);
-        step.x = self.apply_layer(&step.x, &l, cache.layer_kv(il), step.pos, il, None);
+        let lr = Active::uniform(&cache.lora);
+        step.x = self.apply_layer(&step.x, &l, cache.layer_kv(il), step.pos, il, None, &lr);
         step.il += 1;
         step.il >= step.n_layer
     }
@@ -1522,10 +1603,11 @@ impl Qwen3 {
         let mut x = self.embed(tokens);
         prof(&self.ctx, "embed");
         let pos = cache.pos;
+        let lr = Active::uniform(&cache.lora);
         for il in 0..self.cfg.n_layer {
             // A streamed layer is dropped at the end of the iteration — that drop IS the eviction.
             let l = self.layer_ref(il);
-            x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il, None);
+            x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
         cache.pos += tokens.len();
         x
@@ -1549,9 +1631,10 @@ impl Qwen3 {
         // fluent text about the wrong subject — which is why `embed_tokens` returns RAW rows and the
         // normalisation happens once, here, after the splice.
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
+        let lr = Active::uniform(&cache.lora);
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
         cache.pos += t;
         batch(&self.ctx, || self.head(&h))
@@ -1568,9 +1651,10 @@ impl Qwen3 {
         let t = x.shape[0];
         let pos = cache.pos;
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
+        let lr = Active::uniform(&cache.lora);
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None);
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
         cache.pos += t;
         let last = h.narrow(0, t - 1, 1).contiguous();
@@ -1633,9 +1717,10 @@ impl Qwen3 {
                 "{} deepstack features for {} layers", deepstack.len(), self.cfg.n_layer);
         let pos = cache.pos;
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
+        let lr = Active::uniform(&cache.lora);
         for il in 0..self.cfg.n_layer {
             let l = self.layer_ref(il);
-            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, Some(mrope));
+            h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, Some(mrope), &lr);
             if let Some(d) = deepstack.get(il) {
                 h = Self::splice_rows(&h, img_start, d, true);
                 taps.push(h.clone());
@@ -1718,7 +1803,8 @@ impl Qwen3 {
         use ferric_tensor::cuda::{DecodeGraph, GraphSpec, LayerSpec};
         const NATIVE_CAP: usize = 2048;
         let c = &self.cfg;
-        if self.stream.is_some() || cache.fmt.is_some() || self.rope_freqs.is_some() { return None; }
+        // The resident graph has no LoRA: an adapted sequence stays on the portable path.
+        if self.stream.is_some() || cache.fmt.is_some() || self.rope_freqs.is_some() || !cache.lora.is_empty() { return None; }
         if c.is_gemma || c.qkv_bias || c.rope_interleaved || c.yarn_factor > 1.0 || c.logit_scale != 1.0
             || c.final_softcap > 0.0 || c.attn_softcap > 0.0 || c.sliding_window > 0 || cache.pos + 1 > NATIVE_CAP { return None; }
         let mut slot = self.native.borrow_mut();
@@ -1791,9 +1877,9 @@ impl Qwen3 {
             let lc = cache.layer_kv(il);
             let xin = &x;
             x = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None, &Active::none());
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                self.ffn(&xy_n, l, il).add(&xy)
+                self.ffn(&xy_n, l, il, &Active::none()).add(&xy)
             });
         }
         x
@@ -1819,14 +1905,14 @@ impl Qwen3 {
             let xin = &x;
             if il == last {
                 return batch(&self.ctx, || {
-                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
+                    let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None, &Active::none());
                     xin.add(&y) // post-attention residual, BEFORE the FFN
                 });
             }
             x = batch(&self.ctx, || {
-                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None);
+                let y = self.attn(&xin.rmsnorm(&l.attn_norm, self.cfg.eps), l, lc, pos, il, None, &Active::none());
                 let (xy, xy_n) = xin.add_rmsnorm(&y, &l.ffn_norm, self.cfg.eps);
-                self.ffn(&xy_n, l, il).add(&xy)
+                self.ffn(&xy_n, l, il, &Active::none()).add(&xy)
             });
         }
         unreachable!()
