@@ -270,6 +270,9 @@ pub(crate) struct Engine {
     /// The GGUF's own chat template, compiled — `None` only when it is absent or will not compile, and
     /// then the family heuristic below is the fallback (with a warning at load).
     chat_template: Option<template::ChatTemplate>,
+    /// This model's reasoning markers, read from its chat template: `<think>`/`</think>` or Gemma 4's
+    /// `<|channel>thought`/`<channel|>`. `None` = not a thinking model.
+    reasoning_markers: Option<(String, String)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -537,6 +540,9 @@ impl Engine {
         // rstrip=True except `<|endoftext|>`, so "<|user|>\nHi" tokenises as "<|user|>Hi". Without this a
         // two-turn prompt was 36 tokens where the authors' tokenizer gives 26 (checked against HF
         // apply_chat_template). llama.cpp restores the same flag by model name.
+        let reasoning_markers = if template.contains("<think>") { Some(("<think>".to_string(), "</think>".to_string())) }
+            else if template.contains("<|channel>thought") { Some(("<|channel>thought".to_string(), "<channel|>".to_string())) }
+            else { None };
         let rstrip_after: std::collections::HashSet<u32> = if arch == "phi3" {
             specials.iter().filter(|(t, _)| t.starts_with("<|") && t.ends_with("|>") && t != "<|endoftext|>").map(|(_, i)| *i).collect()
         } else { Default::default() };
@@ -548,7 +554,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -849,7 +855,8 @@ impl Engine {
             if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
             r#gen.push(next);
             // Re-detok the whole generation and release only what is safe (multi-byte UTF-8, stop strings).
-            if let Some(d) = em.update(&self.detok(&r#gen)) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
+            let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
+            if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
             if em.hit_stop { finish = "stop"; break; }
         }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
@@ -921,7 +928,8 @@ impl Engine {
                 if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[$tok as usize].as_ref()) { for &c in b { g.step(c); } }
                 if opts.logprobs { lps.push(self.lp_entry($row, $tok, opts)); }
                 r#gen.push($tok);
-                if let Some(d) = em.update(&self.detok(&r#gen)) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
+                let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
+                if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
                 if em.hit_stop { finish = "stop"; }
                 em.hit_stop
             }};
@@ -1387,6 +1395,8 @@ fn logprobs_field(chat: bool, lps: &[Value]) -> Value {
 /// One chat turn, whatever API it arrived through.
 pub(crate) struct ChatResult {
     pub text: String,
+    /// The model's reasoning, apart from the answer (`reasoning_content`); empty for non-thinking models.
+    pub reasoning: String,
     /// OpenAI-shaped `tool_calls` (`function.arguments` a JSON string); empty unless the model called one.
     pub tool_calls: Vec<Value>,
     pub prompt_tokens: usize,
@@ -1400,12 +1410,19 @@ pub(crate) struct ChatResult {
 /// streamed text and its logprob entries; it is not called on the tool path, whose answer is only known
 /// once the model has finished (a tool call is parsed from the whole output).
 pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req: &Value,
-                       mut on_delta: impl FnMut(&str, &[Value])) -> Result<ChatResult, String> {
+                       mut on_delta: impl FnMut(&str, &[Value], bool)) -> Result<ChatResult, String> {
     let empty = vec![];
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
     // `developer` is OpenAI's newer name for the system role (Cursor sends it).
     for m in messages.iter_mut() { if m["role"] == "developer" { m["role"] = json!("system"); } }
-    let opts = GenOpts::from_req(req, true)?;
+    let mut opts = GenOpts::from_req(req, true)?;
+    opts.with_specials = eng.reasoning_markers.is_some();
+    // A thinking model's reasoning is split from its answer; the block may already be open in the prompt.
+    let splitter = |prompt: &[u32]| eng.reasoning_markers.as_ref().map(|(o, c)| {
+        let tail = eng.detok_all(&prompt[prompt.len().saturating_sub(24)..]);
+        let started = tail.rfind(o.as_str()).is_some_and(|a| tail.rfind(c.as_str()).is_none_or(|b| a > b));
+        genopts::ReasoningSplit::new(o, c, started)
+    });
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
     tools.extend(mcps.borrow().openai_tools());
@@ -1423,20 +1440,26 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
             let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
-            // Each model writes tool calls in its own template's format; parse the decode that keeps
-            // special tokens, with the tools' schemas for argument types.
-            let (before_call, calls) = ferric_agent::tools::parse_tool_calls_any(&eng.detok_all(&out.ids), &tools);
+            // Reasoning first (a thinking model reasons before it calls), then the answer part is parsed:
+            // each model writes tool calls in its own template's format, in the decode that keeps special
+            // tokens, with the tools' schemas for argument types.
+            let raw = eng.detok_all(&out.ids);
+            let (reasoning, answer) = match splitter(&prompt) {
+                Some(mut sp) => { sp.push(&raw); sp.finish(); (sp.reasoning, sp.content) }
+                None => (String::new(), raw),
+            };
+            let (before_call, calls) = ferric_agent::tools::parse_tool_calls_any(&answer, &tools);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
             if mcp_calls.is_empty() {
                 let finish = if calls.is_empty() { out.finish } else { "tool_calls" };
                 // With a call, `content` is the visible text before it (often empty); without, the answer.
-                let text = if calls.is_empty() { out.text } else {
+                let text = if calls.is_empty() { if reasoning.is_empty() { out.text } else { answer.trim().to_string() } } else {
                     let special: Vec<&str> = eng.specials.iter().map(|(t, _)| t.as_str()).collect();
                     let mut t = before_call;
                     for sp in special { t = t.replace(sp, ""); }
                     t.trim().to_string()
                 };
-                return Ok(ChatResult { text, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new() });
+                return Ok(ChatResult { text, reasoning, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new() });
             }
             messages.push(json!({"role": "assistant", "content": out.text}));
             for c in &mcp_calls {
@@ -1458,8 +1481,25 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         else { None };
     let prompt = eng.chat_ids_with(&messages, None, &kwargs)?;
     let max = eng.budget(prompt.len(), opts.max_tokens)?;
-    let out = eng.generate(&prompt, max, &opts, guide, |d, l| on_delta(d, l));
-    Ok(ChatResult { text: out.text, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
+    let mut sp = splitter(&prompt);
+    let out = eng.generate(&prompt, max, &opts, guide, |d, l| match sp.as_mut() {
+        Some(sp) => {
+            let (r, c) = sp.push(d);
+            if !r.is_empty() { on_delta(&r, &[], true); }
+            if !c.is_empty() { on_delta(&c, l, false); }
+        }
+        None => on_delta(d, l, false),
+    });
+    let (text, reasoning) = match sp.as_mut() {
+        Some(sp) => {
+            let (r, c) = sp.finish();
+            if !r.is_empty() { on_delta(&r, &[], true); }
+            if !c.is_empty() { on_delta(&c, &[], false); }
+            (sp.content.trim_end().to_string(), sp.reasoning.trim_end().to_string())
+        }
+        None => (out.text, String::new()),
+    };
+    Ok(ChatResult { text, reasoning, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
                     finish: out.finish, logprobs: out.logprobs })
 }
 
@@ -1477,7 +1517,7 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         // A tool call is parsed from the whole output, so the answer exists only at the end — but a client
         // that asked for a stream must still get SSE (a JSON body breaks it). The tool calls go out as one
         // delta, with the index/id/type/function shape streaming clients accumulate.
-        let r = run_chat(eng, mcps, &req, |_, _| {});
+        let r = run_chat(eng, mcps, &req, |_, _, _| {});
         write_sse_headers(stream);
         let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(),
             "model": eng.name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
@@ -1504,9 +1544,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
-        let r = run_chat(eng, mcps, &req, |delta, lps| {
-            let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
-            if opts.logprobs { ch["logprobs"] = json!({"content": lps}); }
+        let r = run_chat(eng, mcps, &req, |delta, lps, reasoning| {
+            let mut ch = json!({"index": 0, "delta": {(if reasoning { "reasoning_content" } else { "content" }): delta}, "finish_reason": Value::Null});
+            if opts.logprobs && !reasoning { ch["logprobs"] = json!({"content": lps}); }
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [ch]}));
         });
         let (finish, u) = match &r { Ok(r) => (r.finish, Some(usage(r))), Err(_) => ("stop", None) };
@@ -1519,11 +1559,12 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
         let _ = stream.write_all(b"data: [DONE]\n\n");
         return;
     }
-    match run_chat(eng, mcps, &req, |_, _| {}) {
+    match run_chat(eng, mcps, &req, |_, _, _| {}) {
         Err(e) => bad_request(stream, &e),
         Ok(r) => {
-            let message = if r.tool_calls.is_empty() { json!({"role": "assistant", "content": r.text}) }
+            let mut message = if r.tool_calls.is_empty() { json!({"role": "assistant", "content": r.text}) }
                           else { json!({"role": "assistant", "content": Value::Null, "tool_calls": r.tool_calls}) };
+            if !r.reasoning.is_empty() { message["reasoning_content"] = json!(r.reasoning); }
             let mut choice = json!({"index": 0, "message": message, "finish_reason": r.finish});
             if opts.logprobs { choice["logprobs"] = logprobs_field(true, &r.logprobs); }
             write_json(stream, 200, &json!({"id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,

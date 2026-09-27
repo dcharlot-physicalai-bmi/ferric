@@ -296,9 +296,10 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], strea
     let mut first: Option<Instant> = None;
     if streaming {
         write_ndjson_headers(stream);
-        let res = run_chat(eng, mcps, &r, |d, _| {
+        let res = run_chat(eng, mcps, &r, |d, _, reasoning| {
             first.get_or_insert_with(Instant::now);
-            send_line(stream, &json!({"model": model, "created_at": now(), "message": {"role": "assistant", "content": d}, "done": false}));
+            let msg = if reasoning { json!({"role": "assistant", "content": "", "thinking": d}) } else { json!({"role": "assistant", "content": d}) };
+            send_line(stream, &json!({"model": model, "created_at": now(), "message": msg, "done": false}));
         });
         match res {
             Err(e) => send_line(stream, &json!({"error": e})),
@@ -313,10 +314,11 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], strea
         }
         return;
     }
-    match run_chat(eng, mcps, &r, |_, _| { first.get_or_insert_with(Instant::now); }) {
+    match run_chat(eng, mcps, &r, |_, _, _| { first.get_or_insert_with(Instant::now); }) {
         Err(e) => err(stream, 400, &e),
         Ok(res) => {
             let mut msg = json!({"role": "assistant", "content": res.text});
+            if !res.reasoning.is_empty() { msg["thinking"] = json!(res.reasoning); }
             if !res.tool_calls.is_empty() { msg["tool_calls"] = json!(ollama_tool_calls(&res.tool_calls)); }
             let mut out = json!({"model": model, "created_at": now(), "message": msg,
                                  "done_reason": if res.finish == "length" { "length" } else { "stop" }, "done": true});
@@ -351,14 +353,14 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
             let ids = eng.encode_prompt(prompt);
             let max = eng.budget(ids.len(), opts.max_tokens)?;
             let out = eng.generate(&ids, max, &opts, None, |d, _| on_delta(d));
-            Ok(ChatResult { text: out.text, tool_calls: vec![], prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
+            Ok(ChatResult { text: out.text, reasoning: String::new(), tool_calls: vec![], prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
                             finish: out.finish, logprobs: vec![] })
         } else {
             let mut messages = Vec::new();
             if let Some(sys) = req["system"].as_str() { messages.push(json!({"role": "system", "content": sys})); }
             messages.push(json!({"role": "user", "content": prompt}));
             let r = prepare(eng, &req, &messages)?;
-            run_chat(eng, mcps, &r, |d, _| on_delta(d))
+            run_chat(eng, mcps, &r, |d, _, reasoning| if !reasoning { on_delta(d) })
         }
     };
     if streaming {

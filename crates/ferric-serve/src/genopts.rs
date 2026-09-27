@@ -52,6 +52,9 @@ pub(crate) struct GenOpts {
     pub stop: Vec<String>,
     pub logprobs: bool,
     pub top_logprobs: usize,
+    /// Internal, never from a request: decode WITH special tokens, because this model's reasoning
+    /// markers are specials the visible decode would drop (Gemma 4).
+    pub with_specials: bool,
 }
 
 pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
@@ -59,7 +62,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0 }
+                  logprobs: false, top_logprobs: 0, with_specials: false }
     }
 }
 
@@ -304,6 +307,70 @@ impl Emitter {
     pub fn flush(&mut self) -> Option<String> { let n = self.text.len(); self.release(n) }
 }
 
+/// **Reasoning apart from the answer.** A thinking model writes its reasoning between markers its chat
+/// template defines — `<think>…</think>` (Qwen3/3.5, DeepSeek-R1, MiMo, Nemotron) or
+/// `<|channel>thought…<channel|>` (Gemma 4) — and 12 of 14 serving peers return it as `reasoning_content`
+/// rather than inside the answer. Fed the decode WITH special tokens (Gemma's markers are specials), in
+/// pieces as they stream; `push` returns (reasoning, content) text safe to release, holding back any tail
+/// that could still become a marker.
+pub(crate) struct ReasoningSplit {
+    open: String,
+    close: String,
+    inside: bool,
+    buf: String,
+    pub reasoning: String,
+    pub content: String,
+}
+
+impl ReasoningSplit {
+    /// `started` = the prompt already opened the block (a template that ends its generation prompt with
+    /// `<think>\n`): everything up to the close marker is reasoning.
+    pub fn new(open: &str, close: &str, started: bool) -> ReasoningSplit {
+        ReasoningSplit { open: open.into(), close: close.into(), inside: started, buf: String::new(),
+                         reasoning: String::new(), content: String::new() }
+    }
+
+    pub fn push(&mut self, piece: &str) -> (String, String) {
+        self.buf.push_str(piece);
+        let (mut r, mut c) = (String::new(), String::new());
+        loop {
+            let marker = if self.inside { self.close.clone() } else { self.open.clone() };
+            if let Some(p) = self.buf.find(&marker) {
+                let head: String = self.buf[..p].to_string();
+                if self.inside { r.push_str(&head) } else { c.push_str(&head) }
+                self.buf = self.buf[p + marker.len()..].to_string();
+                self.inside = !self.inside;
+                continue;
+            }
+            // Keep the longest tail that is a proper prefix of the marker; release the rest.
+            let mut hold = 0;
+            for k in (1..marker.len().min(self.buf.len() + 1)).rev() {
+                if marker.is_char_boundary(k) && self.buf.ends_with(&marker[..k]) { hold = k; break; }
+            }
+            let mut cut = self.buf.len() - hold;
+            while !self.buf.is_char_boundary(cut) { cut -= 1; }
+            let out: String = self.buf[..cut].to_string();
+            self.buf = self.buf[cut..].to_string();
+            if self.inside { r.push_str(&out) } else { c.push_str(&out) }
+            break;
+        }
+        // The first content after the block usually opens with the template's newlines; they are framing.
+        if !self.content.is_empty() || !c.trim_start().is_empty() || self.inside {
+            if self.content.is_empty() { c = c.trim_start().to_string(); }
+        } else { c.clear(); }
+        if self.reasoning.is_empty() { r = r.trim_start().to_string(); }
+        self.reasoning.push_str(&r);
+        self.content.push_str(&c);
+        (r, c)
+    }
+
+    /// End of generation: whatever was held back belongs where the stream stood.
+    pub fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.buf);
+        if self.inside { self.reasoning.push_str(&rest); (rest, String::new()) } else { self.content.push_str(&rest); (String::new(), rest) }
+    }
+}
+
 /// OpenAI message `content`: a string, null, or an array of parts. Text parts are joined with a newline
 /// (vLLM's rule). Image and audio parts are refused by name — this path feeds text-only prompts, and
 /// dropping an image silently answers a question the user did not ask.
@@ -372,6 +439,30 @@ mod tests {
         let mut e = Emitter::new(&["zz".to_string(), "b".to_string()]);
         let out = run(&mut e, &["aaabzz"]);
         assert_eq!(out, "aaa");
+    }
+
+    fn split_all(sp: &mut ReasoningSplit, pieces: &[&str]) -> (String, String) {
+        let (mut r, mut c) = (String::new(), String::new());
+        for p in pieces { let (a, b) = sp.push(p); r.push_str(&a); c.push_str(&b); }
+        let (a, b) = sp.finish(); r.push_str(&a); c.push_str(&b);
+        (r, c)
+    }
+
+    #[test]
+    fn reasoning_is_split_from_the_answer_across_any_token_boundary() {
+        let mut sp = ReasoningSplit::new("<think>", "</think>", false);
+        let (r, c) = split_all(&mut sp, &["<th", "ink>\nLet me ", "add: 2+2=4.\n</thi", "nk>\n\nThe answer is 4."]);
+        assert_eq!((r.as_str(), c.as_str()), ("Let me add: 2+2=4.\n", "The answer is 4."));
+        // a prompt that opened the block: everything up to the close is reasoning
+        let mut sp = ReasoningSplit::new("<think>", "</think>", true);
+        assert_eq!(split_all(&mut sp, &["hmm</think>Four."]), ("hmm".to_string(), "Four.".to_string()));
+        // Gemma 4's channel markers
+        let mut sp = ReasoningSplit::new("<|channel>thought", "<channel|>", false);
+        assert_eq!(split_all(&mut sp, &["<|channel>thought\nParis is the capital.<channel|>Paris"]),
+                   ("Paris is the capital.".to_string(), "Paris".to_string()));
+        // no block at all: all content
+        let mut sp = ReasoningSplit::new("<think>", "</think>", false);
+        assert_eq!(split_all(&mut sp, &["Just ", "an answer."]), (String::new(), "Just an answer.".to_string()));
     }
 
     #[test]
