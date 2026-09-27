@@ -122,6 +122,10 @@ def streamed_logits(auto_cls, text_config, snapshot, ids):
     body.rotary_emb = type(body.rotary_emb)(config=text_config)          # non-persistent buffers: computed
     body.norm = type(body.norm)(text_config.hidden_size, eps=text_config.rms_norm_eps)
     body.norm.load_state_dict({"weight": ckpt.get(ckpt.resolve(prefix[: -len("layers.")] + "norm.weight")).float()}, strict=True)
+    # ⛔ Gathering rows is the authors' embedding only for a plain lookup: Gemma 3's scaled embedding
+    # multiplies by sqrt(hidden) in its forward, and a gathered row skips it (lm_floor_ref.py found it).
+    if type(body.embed_tokens) is not torch.nn.Embedding:
+        raise SystemExit(f"{type(body.embed_tokens).__name__} is not a plain lookup — refusing to gather its rows")
     emb_key = ckpt.resolve(prefix[: -len("layers.")] + "embed_tokens.weight")
     emb = ckpt.get(emb_key)[torch.tensor(ids)].to(torch.float32)[None]
     report["embedding"] = emb_key

@@ -273,6 +273,9 @@ pub const REGISTRY: &[Arch] = &[
                   ids, argmax 139/139, full-row sum of squares within 1.3e-5. The wrong rope pairing is \
                   52,151x worse. The earlier check compared greedy tokens only, which a small logit \
                   error almost never moves. Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/. \
+                  At positions 30,000+ within 4x of the authors' float64 floor (worst 1.59x) with rope \
+                  angles built on the host their way — device-derived angles sat at 18x. Gate: \
+                  scripts/lm_floor_conformance.sh vs tests/fixtures/lm_floor/. \
                   ⭐ Also the language model of MiMo-V2.5-ASR (crate::mimo_asr), read from the authors' \
                   float32 safetensors rounded to bf16 as their loader rounds them: logits at all 62 \
                   prompt positions within 4x the authors' own float32-vs-float64 distance (worst 0.58x), \
@@ -283,7 +286,9 @@ pub const REGISTRY: &[Arch] = &[
                   (transformers 5.7.0, float32, eager) on Qwen/Qwen3-0.6B, F32 converted from their \
                   files: max |logit diff| 7.0e-5 over 139 positions x 128 sampled ids, argmax 139/139, \
                   full-row sum of squares within 4.3e-6. The wrong rope pairing is 222,647x worse. \
-                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/. At positions 30,000+ (the fused \
+                  QK-norm+rope kernel reading host-built angles) worst 2.31x the authors' float64 floor; \
+                  device-derived angles 109x. Gate: scripts/lm_floor_conformance.sh" },
     // Qwen3-VL-8B-Instruct is the #2 most-downloaded model on Hugging Face (18.4M/30d, 2026-09).
     // ⚠ TEXT-ONLY, and that is not a hedge — it is what llama.cpp does. `n_embd_inp` is
     // `n_embd * (1 + n_deepstack_layers)`, but the token path ZERO-PADS to that width
@@ -329,9 +334,24 @@ pub const REGISTRY: &[Arch] = &[
                   full-row sum of squares within 1.6e-5. The wrong (NeoX) pairing is 114,914x worse. \
                   It was first checked against llama-cli, greedy tokens only. ⚠ The weights are \
                   unsloth/Llama-3.2-1B-Instruct, an ungated re-upload, not Meta's gated repo. \
-                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
-    Arch { name: "phi3", runtime: Runtime::Dense, status: Status::Loads,
-           note: "shares the dense path and the SPM vocab; not diffed against the reference" },
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/. At positions 30,000+ worst 2.21x \
+                  the authors' float64 floor; device-derived angles 46x, and even the system powf held it \
+                  there (an ulp off torch at dim 3). Gate: scripts/lm_floor_conformance.sh" },
+    Arch { name: "phi3", runtime: Runtime::Dense, status: Status::Verified,
+           note: "fused attn_qkv and gate|up, NEOX, SPM vocab; LongRoPE (rope_factors_short/long + \
+                  rope.scaling.attn_factor). ⛔ LongRoPE was NOT APPLIED at any length until 2026-09-27: the \
+                  converter declares no rope.scaling.type, so nothing refused the file — on 155 tokens max \
+                  |logit diff| 6.26, argmax 118/155. ⭐ Verified against the MODEL AUTHORS' implementation \
+                  (transformers 5.7.0 Phi3ForCausalLM, float32 AND float64, sdpa) on \
+                  microsoft/Phi-3.5-mini-instruct, F32 converted from their files, within 4x of their own \
+                  float32-vs-float64 distance at every recorded position, argmax everywhere: 155 tokens \
+                  (short table) worst 1.48x; 4,650 tokens (long table) worst 2.31x; and a conversation \
+                  prefilled to 4096 then decoded across the switch, the cache recomputed with the long table \
+                  as their generate intends, 1.84x. Controls: long table below 4096 7,359x, short table past \
+                  it 41,745x, no attention factor 5,098x, stale cache across the crossing 122,418x. ⚠ The \
+                  ids come from the authors' tokenizer; Ferric's SPM tokenisation of Phi is not part of this \
+                  check. Decodes serially: a sequence crossing 4096 must recompute its cache, which a \
+                  batched step cannot. Gate: scripts/phi3_longrope_conformance.sh vs tests/fixtures/lm_floor/" },
     Arch { name: "gemma", runtime: Runtime::Dense, status: Status::Loads,
            note: "embd_scale = sqrt(n_embd); SPM vocab" },
     Arch { name: "gemma2", runtime: Runtime::Dense, status: Status::Loads,

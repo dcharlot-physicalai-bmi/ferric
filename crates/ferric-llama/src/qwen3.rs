@@ -141,6 +141,107 @@ pub(crate) fn mrope_is_interleaved_arch(arch: &str) -> bool {
     arch == "qwen3vl" || arch == "qwen3vlmoe" || arch.starts_with("qwen35")
 }
 
+/// **Phi-3 / Phi-3.5 LongRoPE** — two per-dimension frequency tables and a cos/sin scale, read from
+/// `rope_factors_short.weight`, `rope_factors_long.weight` and `{arch}.rope.scaling.attn_factor`.
+///
+/// ⛔⛔ THIS WAS NOT APPLIED AT ALL, AT ANY LENGTH. The Phi GGUF converter declares no
+/// `rope.scaling.type`, so [`crate::arch::rope_scaling`] saw "none" and let the file through, and the
+/// loader keyed scaling off `rope_freqs.weight` alone. Phi-3.5-mini (F32 from the authors' weights) on a
+/// 155-token prompt: max |logit diff| 6.26 against the authors (transformers 5.7.0), median 2.05,
+/// argmax agreeing at 118 of 155 positions — 89,397x their own float32-vs-float64 distance. Short
+/// prompts are NOT safe: `short_factor` runs 1.0 -> 2.07, and the attention factor scales every q.k.
+///
+/// The authors' rule (transformers `_compute_longrope_parameters` + `dynamic_rope_update`, and the
+/// same lines in `modeling_phi3.py` in their repo):
+///   inv_freq[i] = 1 / (ext[i] * base^(2i/d)),  ext = long_factor if seq_len > original_max_position
+///   _embeddings else short_factor, where seq_len = max(position_ids) + 1 OF THIS FORWARD — the absolute
+///   position, so a decode step at position 4096 (seq_len 4097) is long even though it feeds one token;
+///   cos and sin are both multiplied by attn_factor = sqrt(1 + ln(max/orig) / ln(orig)) — 1.1902 for
+///   131072 / 4096 — ALWAYS, whichever table is in force (it is fixed at construction).
+///
+/// ⚠ The cache at the crossing. The table is chosen per forward, so a conversation that grows past
+/// 4096 holds K/V rotated by the SHORT table and would attend to it with LONG-table queries. The
+/// authors' answer (their `prepare_inputs_for_generation`: "enforce re-compute cache") is to drop the
+/// cache once and recompute the whole sequence with the long table — and every row changes, not just
+/// the keys, because each layer's input depends on the attention below it. Ferric does that: see
+/// [`Qwen3::longrope_refill`]. Measured on a tiny random Phi3 (orig 16) in transformers 5.7.0, the
+/// three behaviours after the crossing: a full re-prefill (this); a stale cache (`model.forward` with
+/// the cache kept) 0.34 away from it; and 5.7.0's own `generate()`, which drops the cache but then
+/// feeds ONLY THE LAST TOKEN — it matches "that token alone, no context" to 1e-8 at every step after
+/// the crossing. That is a transformers regression against the authors' stated intent, not a
+/// behaviour to reproduce.
+pub(crate) struct LongRope {
+    /// Per-dimension multipliers on the inverse frequency, `1/short_factor` and `1/long_factor` —
+    /// multiplier form, which is what `rope_scaled` takes (the factors are DIVISORS, as `rope_freqs`).
+    short: Tensor,
+    long: Tensor,
+    /// The factors themselves, host side, for `rope_inv_freq`'s `1 / (ext * base^(2i/d))`.
+    short_ext: Vec<f32>,
+    long_ext: Vec<f32>,
+    /// `original_max_position_embeddings` (4096 on Phi-3.5-mini).
+    orig_ctx: usize,
+    attn_factor: f32,
+}
+
+/// The authors' table switch: `seq_len > original_max_position_embeddings`, with seq_len the last
+/// position of THIS forward plus one. Pinned against their rotary module, which at `position_ids`
+/// 0..4095 (seq_len 4096) uses the short table and at 0..4096 (4097) the long one.
+pub(crate) fn longrope_uses_long(first_pos: usize, t: usize, orig_ctx: usize) -> bool {
+    first_pos + t > orig_ctx
+}
+
+/// A per-dimension rope scaling, on the host, in the form its authors apply it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RopeScale {
+    None,
+    /// `inv / d[c]` — Llama-3's `rope_freqs.weight` (ggml `freq_factors`, divisors) and linear scaling.
+    Div(Vec<f32>),
+    /// `1 / (ext[c] * base^(2c/d))` — LongRoPE's `short_factor` / `long_factor`, product first.
+    Ext(Vec<f32>),
+    /// `inv * m[c]` — the dense loader's YaRN, built in multiplier form (`qwen35::yarn_freq_scale`).
+    Mul(Vec<f32>),
+}
+
+/// **The authors' float32 inverse frequencies** — transformers' `1.0 / (base ** (arange(0, d, 2).float() / d))`
+/// with the scaling applied as their code applies it.
+///
+/// ⛔ Three formulas that look the same are not, and the position multiplies the difference:
+///   - the device's `exp(-2c/d * ln base)` (every WGSL rope kernel): Qwen2.5-0.5B at position 30,000
+///     sat 18x the authors' float32-vs-float64 distance, Llama-3.2-1B 46x;
+///   - the system `powf(base, e)`: for base 500000 it misses the authors' value by an ulp at dims 3 and
+///     16 — dim 3 alone is 9e-4 rad at 30k, and it kept Llama at 46x;
+///   - `base^e` correctly rounded, with `e` rounded to float32 FIRST (`arange(...).float() / d`) — what
+///     torch produces here for bases 1e6 and 500000 at every dim, and within 1 ulp at one dim of 48 for
+///     base 10000 / d 96 (torch's `pow` is not itself correctly rounded; 9e-6 rad at position 5000).
+///     With it, at position 30,000: Qwen2.5-0.5B worst 1.59x the floor, Llama-3.2-1B 2.21x, Qwen3-0.6B
+///     2.31x (device angles: 18x, 46x, 109x). Gate: scripts/lm_floor_conformance.sh.
+/// The exponent must be the float32 quotient: for d = 96 (Phi-3) `2c/96` is inexact, and an f64
+/// exponent is a different number.
+pub(crate) fn rope_inv_freq(base: f32, head_dim: usize, scale: &RopeScale) -> Vec<f32> {
+    (0..head_dim / 2).map(|c| {
+        let e = (2 * c) as f32 / head_dim as f32;
+        let p = (base as f64).powf(e as f64) as f32;
+        match scale {
+            RopeScale::None => 1.0 / p,
+            RopeScale::Div(d) => (1.0 / p) / d[c],
+            RopeScale::Ext(x) => 1.0 / (x[c] * p),
+            RopeScale::Mul(m) => (1.0 / p) * m[c],
+        }
+    }).collect()
+}
+
+/// `FERRIC_ROPE_DEVICE=1` derives the rope angles on the device, as every kernel did before host tables:
+/// the precision gates' can-fail demonstration, not a mode.
+pub(crate) fn rope_on_device() -> bool { std::env::var("FERRIC_ROPE_DEVICE").is_ok() }
+
+/// Which rows a rope table covers: a run `start..start+t` (one sequence), or explicit per-row positions
+/// (batched decode, one row per sequence).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RopeRows {
+    Run(usize, usize),
+    At(Vec<u32>),
+}
+
 pub struct Cfg {
     pub n_embd: usize,
     pub n_layer: usize,
@@ -466,6 +567,12 @@ pub struct Cache {
     /// next, in any order, and neither ever reads a stale row.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     native: Option<NativeKv>,
+    /// Token ids of the cached rows, while every row has one (`ids.len() == pos`). A LongRoPE model
+    /// needs them to recompute the cache when the table changes — see `Qwen3::longrope_refill`.
+    ids: Vec<u32>,
+    /// Which LongRoPE table the cached rows were rotated with (`Some(true)` = long); `None` on a model
+    /// without LongRoPE, or for rows installed from outside (`set_layers`).
+    rope_long: Option<bool>,
 }
 /// The device half of a [`Cache`] (see its `native` field) and the context its rows are pulled with.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
@@ -476,6 +583,10 @@ impl Cache {
     pub fn truncate(&mut self, n: usize) -> bool {
         if self.fmt.is_some() || !self.q.is_empty() || n > self.pos { return false; }
         for (k, v) in &mut self.kv { let m = n.min(k.len()); k.truncate(m); v.truncate(m.min(v.len())); }
+        // The recorded ids are always rows [0, ids.len()), so cutting them at `n` keeps them true: a
+        // LongRoPE recompute must never replay a rejected draft.
+        let keep = n.min(self.ids.len());
+        self.ids.truncate(keep);
         self.pos = n;
         true
     }
@@ -511,18 +622,14 @@ impl Cache {
                     .map(|_| (if grouped_k { KvStore::grouped(f) } else { KvStore::block(f) }, KvStore::block(f)))
                     .collect(),
                 fmt: Some(f),
-                lora: Vec::new(),
-                #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-                native: None,
+                ..Cache::default()
             },
         }
     }
 
     pub fn with_kvq(cfg: &Cfg, fmt: Option<KvqFmt>) -> Cache {
         match fmt {
-            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None, lora: Vec::new(),
-                            #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-                            native: None },
+            None => Cache { pos: 0, kv: (0..cfg.n_layer).map(|_| (KvBuf::default(), KvBuf::default())).collect(), q: Vec::new(), fmt: None, ..Cache::default() },
             Some(f) => Cache {
                 pos: 0,
                 kv: Vec::new(),
@@ -537,9 +644,7 @@ impl Cache {
                 // that makes a regression impossible to attribute.
                 q: (0..cfg.n_layer).map(|_| (k_store(f), KvStore::block(f))).collect(),
                 fmt: Some(f),
-                lora: Vec::new(),
-                #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-                native: None,
+                ..Cache::default()
             },
         }
     }
@@ -607,6 +712,60 @@ impl Cache {
     /// seeding across selections serves a request with another request's fine-tune.
     pub fn adapter_key(&self) -> String {
         self.lora.iter().map(|(d, s)| format!("{}@{s}", d.id)).collect::<Vec<_>>().join("+")
+    }
+
+    /// Which LongRoPE table the cached rows were rotated with (`Some(true)` = long). `None` on a model
+    /// without LongRoPE, and for rows installed with `set_layers` until `set_history` says.
+    pub fn rope_long(&self) -> Option<bool> { self.rope_long }
+
+    /// Declare the ids of the rows just installed with `set_layers`/`set_layers_q`, and the LongRoPE
+    /// table they were rotated with — what a prefix cache knows about the rows it seeds.
+    pub fn set_history(&mut self, ids: &[u32], rope_long: Option<bool>) {
+        assert_eq!(ids.len(), self.pos, "set_history: {} ids for {} cached rows", ids.len(), self.pos);
+        self.ids = ids.to_vec();
+        self.rope_long = rope_long;
+    }
+
+    /// Record `t` rows just appended: their ids when known, the LongRoPE table they were rotated with
+    /// (`None` without LongRoPE), and the position.
+    ///
+    /// History stays complete only while EVERY row has an id: one row without (an embeddings forward,
+    /// a manually positioned cache) leaves `ids` short of `pos` for good — both then grow by the same
+    /// count — and that is what makes a later refill refuse instead of recomputing from a partial
+    /// sequence. (So the `len == pos` test below is not what keeps it honest; it only stops an
+    /// incomplete history from growing for nothing.)
+    fn note_rows(&mut self, ids: Option<&[u32]>, t: usize, rope_long: Option<bool>) {
+        if let Some(ids) = ids {
+            debug_assert_eq!(ids.len(), t);
+            if self.ids.len() == self.pos { self.ids.extend_from_slice(ids); }
+        }
+        self.rope_long = rope_long;
+        self.pos += t;
+    }
+
+    /// The LongRoPE crossing, cache side: `None` when rows rotated with the table `want_long` may
+    /// simply be appended; otherwise the cache is CLEARED and the whole sequence (history + `tokens`)
+    /// is returned for one prefill. Panics when the history is unknown — see `Qwen3::longrope_refill`.
+    fn take_for_refill(&mut self, want_long: bool, tokens: &[u32]) -> Option<Vec<u32>> {
+        if self.pos == 0 || self.rope_long == Some(want_long) { return None; }
+        assert!(self.ids.len() == self.pos,
+                "LongRoPE: this forward needs the {} table but the {} cached rows were rotated with the other \
+                 one, and their token ids are unknown ({} recorded) — cannot recompute them",
+                if want_long { "long" } else { "short" }, self.pos, self.ids.len());
+        let mut all = std::mem::take(&mut self.ids);
+        all.extend_from_slice(tokens);
+        self.clear();
+        Some(all)
+    }
+
+    /// Empty every layer's K/V (same format and layout), the ids and the position.
+    fn clear(&mut self) {
+        for kv in &mut self.kv { *kv = (KvBuf::default(), KvBuf::default()); }
+        let empty = |s: &KvStore| if s.is_grouped() { KvStore::grouped(s.fmt()) } else { KvStore::block(s.fmt()) };
+        for (k, v) in &mut self.q { *k = empty(k); *v = empty(v); }
+        self.pos = 0;
+        self.ids.clear();
+        self.rope_long = None;
     }
 
     /// **Device bytes the K/V caches actually occupy right now**, summed over layers.
@@ -699,6 +858,8 @@ impl Cache {
                  the older rows would reconstruct wrong with no error",
                 kv.first().map(|(k, _)| k.fmt()), f);
         self.q = kv;
+        self.ids.clear();
+        self.rope_long = None;
     }
 
     /// Install pre-computed KV, e.g. a prefix copied from an earlier request.
@@ -713,6 +874,8 @@ impl Cache {
         // native step pushes the new ones over.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
         if let Some(n) = &mut self.native { n.kv.len = 0; }
+        self.ids.clear();
+        self.rope_long = None;
     }
 }
 
@@ -786,6 +949,13 @@ pub struct Qwen3 {
     lm_head: QMatrix,
     embd_type: u32,
     rope_freqs: Option<Tensor>, // Llama-3 rope-scaling factors [head_dim/2]; None for Qwen
+    /// Phi-3 LongRoPE: two tables switched per forward, plus a cos/sin scale. See [`LongRope`].
+    longrope: Option<LongRope>,
+    /// The per-dimension rope scaling, host side, in its authors' form — what `rope_table` builds from.
+    rope_scale: RopeScale,
+    /// Host-built cos/sin tables for the forward in flight, keyed by rows, base and LongRoPE table:
+    /// built once and read by every layer (Gemma 3 alternates two bases, so there can be two).
+    rope_tabs: std::cell::RefCell<Vec<((RopeRows, u32, Option<bool>), Tensor, Tensor)>>,
     /// GPTQ calibration hook: when Some, each linear's input activation is captured (name → tensor) during
     /// the forward, for building per-layer input Hessians. None (default) = zero overhead.
     pub cap: std::cell::RefCell<Option<Vec<(String, Tensor)>>>,
@@ -910,6 +1080,8 @@ pub struct Step {
     il: usize,
     n_layer: usize,
     n_tokens: usize,
+    /// The step's token ids, recorded into the cache's history at `step_finish`.
+    ids: Vec<u32>,
 }
 
 impl Step {
@@ -1030,6 +1202,29 @@ impl Qwen3 {
             }
         }
         let head = if g.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+        // ⚠ RECIPROCAL. `rope_freqs.weight` holds ggml's `freq_factors`, which ggml applies as
+        // `theta / ff` (ops.cpp: `rope_yarn(theta/ff, …)`) — DIVISORS. Llama-3.2-1B ships values running
+        // 1.0 → 32.0 (1.0 on the high-frequency dims); passed through as multipliers they once shortened
+        // the low-frequency wavelengths by 32x instead of stretching them — the exact inverse of the
+        // context extension they encode. Nothing errors and short prompts look fine.
+        //
+        // YaRN and Llama-3 rope scaling are different mechanisms that both end up as a per-dim factor on
+        // the inverse frequency. Llama-3 ships an explicit tensor of divisors; YaRN is computed from
+        // metadata, already in multiplier form (`yarn_freq_scale` builds `(1/factor)·(1−ramp) + ramp`).
+        // Only one is ever present. Recorded here in the form each is applied (`rope_inv_freq`).
+        let half = cfg.head_dim / 2;
+        let rope_scale = if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { RopeScale::None }
+            else if let Some(t) = g.tensor("rope_freqs.weight") {
+                let n = t.dims[0] as usize;
+                if n != half { return Err(format!("rope_freqs.weight has {n} factors for head_dim {}", cfg.head_dim)); }
+                let f = g.dequant("rope_freqs.weight")?;
+                RopeScale::Div(f[..n].iter().map(|&x| if x != 0.0 { x } else { 1.0 }).collect())
+            } else if cfg.linear_factor > 1.0 {
+                RopeScale::Div(vec![cfg.linear_factor; half])
+            } else if cfg.yarn_factor > 1.0 {
+                RopeScale::Mul(crate::qwen35::yarn_freq_scale(cfg.head_dim, cfg.rope_base, cfg.yarn_factor,
+                                                             cfg.yarn_orig_ctx, 32.0, 1.0))
+            } else { RopeScale::None };
         Ok(Qwen3 {
             cap: std::cell::RefCell::new(None),
             #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
@@ -1041,37 +1236,146 @@ impl Qwen3 {
             out_norm: nrm("output_norm.weight", cfg.n_embd)?,
             lm_head: qm(ctx, g, head)?,
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
-            // ⚠ RECIPROCAL. `rope_freqs.weight` holds ggml's `freq_factors`, which ggml applies as
-            // `theta / ff` (ops.cpp: `rope_yarn(theta/ff, …)`). Ferric's `rope_scaled` kernel instead
-            // MULTIPLIES each inverse frequency by its scale, so the factors must be inverted on the
-            // way in. Llama-3.2-1B ships values running 1.0 → 32.0 (1.0 on the high-frequency dims),
-            // so passing them through unchanged shortened the low-frequency wavelengths by 32x
-            // instead of stretching them — the exact inverse of the context extension they encode.
-            // Nothing errors and short prompts look fine; only long context degrades.
-            //
-            // The qwen35 path is unaffected: `yarn_freq_scale` there builds
-            // `(1/factor)·(1−ramp) + ramp`, already in multiplier form.
-            // YaRN and Llama-3 rope scaling are different mechanisms that both end up as a per-dim
-            // multiplier on the inverse frequency. Llama-3 ships an explicit tensor of DIVISORS;
-            // YaRN is computed from metadata. Only one is ever present.
-            rope_freqs: if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { None }
-                else if g.tensor("rope_freqs.weight").is_none() && cfg.linear_factor > 1.0 {
-                    Some(Tensor::from_vec(ctx, &vec![1.0 / cfg.linear_factor; cfg.head_dim / 2], &[cfg.head_dim / 2]))
-                } else if g.tensor("rope_freqs.weight").is_none() && cfg.yarn_factor > 1.0 {
-                    let v = crate::qwen35::yarn_freq_scale(cfg.head_dim, cfg.rope_base, cfg.yarn_factor,
-                                                           cfg.yarn_orig_ctx, 32.0, 1.0);
-                    Some(Tensor::from_vec(ctx, &v, &[cfg.head_dim / 2]))
-                } else { g.tensor("rope_freqs.weight").map(|t| {
-                let n = t.dims[0] as usize;
-                let f = g.dequant("rope_freqs.weight")?;
-                let inv: Vec<f32> = f[..n].iter().map(|&x| if x != 0.0 { 1.0 / x } else { 1.0 }).collect();
-                Ok::<_, String>(Tensor::from_vec(ctx, &inv, &[n]))
-            }).transpose()? },
+            // The device path's multiplier table (`FERRIC_ROPE_DEVICE`, and the `rope_freqs.is_some()` guards
+            // on the fused and native paths), derived from the host record above: DIVISORS inverted.
+            rope_freqs: match &rope_scale {
+                RopeScale::None | RopeScale::Ext(_) => None,
+                RopeScale::Div(d) => Some(Tensor::from_vec(ctx, &d.iter().map(|&x| 1.0 / x).collect::<Vec<f32>>(), &[d.len()])),
+                RopeScale::Mul(m) => Some(Tensor::from_vec(ctx, m, &[m.len()])),
+            },
+            rope_scale,
+            rope_tabs: std::cell::RefCell::new(Vec::new()),
+            longrope: Self::load_longrope(ctx, g, &cfg)?,
             arch: match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => "qwen3".into() },
             fused_qkv: g.tensor("blk.0.attn_qkv.weight").is_some(),
             fused_gate_up: g.tensor("blk.0.ffn_gate.weight").is_none(),
             cfg, ctx: ctx.clone(), layers, stream: None,
         })
+    }
+
+    /// The LongRoPE tables, when the file carries them — keyed on the TENSORS, because the converter
+    /// declares no `rope.scaling.type` for them (which is how they went unapplied).
+    fn load_longrope(ctx: &Arc<Context>, g: &impl GgufSource, cfg: &Cfg) -> Result<Option<LongRope>, String> {
+        let (s, l) = ("rope_factors_short.weight", "rope_factors_long.weight");
+        match (g.tensor(s).is_some(), g.tensor(l).is_some()) {
+            (false, false) => return Ok(None),
+            (true, true) => {}
+            _ => return Err(format!("the file carries only one of {s} and {l} — LongRoPE needs both")),
+        }
+        if g.tensor("rope_freqs.weight").is_some() {
+            return Err("the file carries rope_freqs.weight AND LongRoPE factors — two scalings, refused".into());
+        }
+        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => String::new() };
+        let md_u = |k: &str| match g.metadata().get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => Some(*v as usize), _ => None };
+        let orig_ctx = md_u("rope.scaling.original_context_length")
+            .ok_or("LongRoPE factors without rope.scaling.original_context_length — the switch point is unknown")?;
+        // The converter writes the authors' value; a file without it gets the authors' formula (the
+        // same one transformers applies when `attention_factor` is absent).
+        let attn_factor = match g.metadata().get(&format!("{arch}.rope.scaling.attn_factor")) {
+            Some(Meta::F(v)) => *v as f32,
+            _ => {
+                let ctx_len = md_u("context_length").unwrap_or(orig_ctx);
+                let scale = ctx_len as f64 / orig_ctx as f64;
+                if scale <= 1.0 { 1.0 } else { (1.0 + scale.ln() / (orig_ctx as f64).ln()).sqrt() as f32 }
+            }
+        };
+        let half = cfg.head_dim / 2;
+        let factors = |name: &str| -> Result<Vec<f32>, String> {
+            let f = g.dequant(name)?;
+            if f.len() != half {
+                return Err(format!("{name} has {} factors for head_dim {} ({half} expected)", f.len(), cfg.head_dim));
+            }
+            Ok(f)
+        };
+        let (short_ext, long_ext) = (factors(s)?, factors(l)?);
+        // DIVISORS in the file (the authors' `1 / (ext * base^(2i/d))`); multipliers for `rope_scaled`.
+        let mult = |f: &[f32]| Tensor::from_vec(ctx, &f.iter().map(|&x| 1.0 / x).collect::<Vec<f32>>(), &[half]);
+        Ok(Some(LongRope { short: mult(&short_ext), long: mult(&long_ext), short_ext, long_ext, orig_ctx, attn_factor }))
+    }
+
+    /// **The rope cos/sin tables `[rows, head_dim/2]`, built on the host the authors' way**: inverse
+    /// frequencies from [`rope_inv_freq`], angle = `f32(position) * inv` (their float32 product), cos and
+    /// sin of that angle, and — LongRoPE — both times the attention factor in float32, where their
+    /// `emb.cos() * attention_scaling` rounds it. Cached for the forward in flight: every layer reads
+    /// the same table, so it is built and uploaded once per forward, not once per layer.
+    fn rope_table(&self, rows: &RopeRows, base: f32) -> (Tensor, Tensor) {
+        let (first, t) = match rows { RopeRows::Run(s, t) => (*s, *t), RopeRows::At(p) => (0, p.len()) };
+        let long = match rows {
+            RopeRows::Run(..) => self.longrope_long(first, t),
+            // Batching is refused on a LongRoPE model (`batching_supported`), so rows never mix tables.
+            RopeRows::At(_) => { assert!(self.longrope.is_none(), "LongRoPE rows cannot be batched"); None }
+        };
+        let key = (rows.clone(), base.to_bits(), long);
+        let mut cache = self.rope_tabs.borrow_mut();
+        if let Some((_, c, sn)) = cache.iter().find(|(k, _, _)| *k == key) { return (c.clone(), sn.clone()); }
+        // A new forward (other rows) retires the previous one's tables.
+        cache.retain(|((r, _, _), _, _)| *r == key.0);
+        let inv = match (&self.longrope, long) {
+            (Some(lr), Some(l)) => rope_inv_freq(base, self.cfg.head_dim, &RopeScale::Ext(if l { lr.long_ext.clone() } else { lr.short_ext.clone() })),
+            _ => rope_inv_freq(base, self.cfg.head_dim, &self.rope_scale),
+        };
+        let af = match &self.longrope {
+            Some(lr) if std::env::var("FERRIC_LONGROPE_NO_ATTN_FACTOR").is_err() => lr.attn_factor,
+            _ => 1.0,
+        };
+        let half = inv.len();
+        let (mut cv, mut sv) = (Vec::with_capacity(t * half), Vec::with_capacity(t * half));
+        for r in 0..t {
+            let p = match rows { RopeRows::Run(s, _) => (s + r) as f32, RopeRows::At(ps) => ps[r] as f32 };
+            for &f in &inv {
+                let a = (p * f) as f64;
+                cv.push(a.cos() as f32 * af);
+                sv.push(a.sin() as f32 * af);
+            }
+        }
+        let (c, sn) = (Tensor::from_vec(&self.ctx, &cv, &[t, half]), Tensor::from_vec(&self.ctx, &sv, &[t, half]));
+        cache.push((key, c.clone(), sn.clone()));
+        (c, sn)
+    }
+
+    /// Which LongRoPE table a forward of `t` rows starting at position `first_pos` uses: `None` on a
+    /// model without LongRoPE. `FERRIC_LONGROPE=short|long` forces one — the negative controls of
+    /// `scripts/phi3_longrope_conformance.sh`.
+    fn longrope_long(&self, first_pos: usize, t: usize) -> Option<bool> {
+        let lr = self.longrope.as_ref()?;
+        Some(match std::env::var("FERRIC_LONGROPE").as_deref() {
+            Ok("short") => false,
+            Ok("long") => true,
+            _ => longrope_uses_long(first_pos, t, lr.orig_ctx),
+        })
+    }
+
+    /// Account for `t` rows just appended to `cache`. Every path that appends K/V ends here.
+    fn advance(&self, cache: &mut Cache, ids: Option<&[u32]>, t: usize) {
+        let long = self.longrope_long(cache.pos, t);
+        cache.note_rows(ids, t, long);
+    }
+
+    /// **The crossing.** When this forward needs a different LongRoPE table from the one the cached
+    /// rows were rotated with — a conversation growing past `original_max_position_embeddings`, or a
+    /// prefix seeded from a request on the other side of it — clear the cache and return the WHOLE
+    /// sequence to prefill again, as the authors' `generate` intends ("enforce re-compute cache").
+    /// `None` when the cache can simply be extended. See [`LongRope`] for what the alternatives do.
+    ///
+    /// ⛔ Refuses (panics) when the cached rows' ids are unknown: extending would attend with one
+    /// table to keys rotated by the other — fluent, finite, and not the model.
+    ///
+    /// `FERRIC_LONGROPE_NO_REFILL=1` keeps the stale cache instead — what the authors' bare
+    /// `model.forward` does with a cache across the crossing. A negative control, not a mode.
+    fn longrope_refill(&self, tokens: &[u32], cache: &mut Cache) -> Option<Vec<u32>> {
+        let want = self.longrope_long(cache.pos, tokens.len())?;
+        if std::env::var("FERRIC_LONGROPE_NO_REFILL").is_ok() { return None; }
+        cache.take_for_refill(want, tokens)
+    }
+
+    /// The paths with no token ids (embeddings in, the stepping forward) cannot refill: refuse a
+    /// forward that would mix tables rather than run it. See [`Self::longrope_refill`].
+    fn longrope_guard(&self, cache: &Cache, t: usize) {
+        if let Some(want) = self.longrope_long(cache.pos, t) {
+            assert!(cache.pos == 0 || cache.rope_long == Some(want),
+                    "LongRoPE: {} cached rows use the other table from the one this forward needs, and this \
+                     path has no token ids to recompute them — use forward_cached", cache.pos);
+        }
     }
 
     /// `embed` without the weightless embedding norm — the row gather only.
@@ -1129,7 +1433,7 @@ impl Qwen3 {
     /// a controlled A/B in the same binary.
     fn qk_rope_fusable(&self, l: &Layer) -> bool {
         qk_fusable(&self.cfg, l.q_norm.is_some() && l.k_norm.is_some(), l.rope,
-                   self.rope_freqs.is_some(), std::env::var("FERRIC_NEOX").is_ok(),
+                   self.rope_freqs.is_some() || self.longrope.is_some(), std::env::var("FERRIC_NEOX").is_ok(),
                    std::env::var("FERRIC_NO_QK_FUSE").is_ok())
     }
 
@@ -1145,6 +1449,14 @@ impl Qwen3 {
         if self.cfg.yarn_factor > 1.0 {
             let m = 1.0 + 0.1 * self.cfg.yarn_factor.ln();
             return r.mul(&r.scalar(m));
+        }
+        // LongRoPE multiplies cos AND sin by its attention factor (1.1902 on Phi-3.5-mini), on q and on
+        // k — so every q.k is 1.4167x — at every length, whichever table is in force. The host table
+        // carries it (`rope_table`, rounded where the authors round it); the device path applies it here.
+        if let Some(lr) = &self.longrope {
+            if rope_on_device() && lr.attn_factor != 1.0 && std::env::var("FERRIC_LONGROPE_NO_ATTN_FACTOR").is_err() {
+                return r.mul(&r.scalar(lr.attn_factor));
+            }
         }
         r
     }
@@ -1194,7 +1506,21 @@ impl Qwen3 {
             let mode = if interleaved { ferric_tensor::MropeMode::Interleaved } else { ferric_tensor::MropeMode::Chunked };
             return x.rope_mrope(n_heads, self.cfg.head_dim, base, &pos, sections, mode);
         }
-        match &self.rope_freqs {
+        let t = x.numel() / (n_heads * self.cfg.head_dim);
+        let interleaved = self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err();
+        // ⭐ The angles are built on the HOST, the authors' way — see `rope_inv_freq` and
+        // `Tensor::rope_with_table` for the measured reason.
+        if !rope_on_device() {
+            let (c, sn) = self.rope_table(&RopeRows::Run(offset, t), base);
+            return x.rope_with_table(&c, &sn, n_heads, self.cfg.head_dim, interleaved);
+        }
+        // `FERRIC_ROPE_DEVICE=1`: the angles derived on the device, as before — kept as the gate's
+        // can-fail demonstration. LongRoPE picks its table from THIS forward's last position.
+        let fs = match (&self.longrope, self.longrope_long(offset, t)) {
+            (Some(lr), Some(long)) => Some(if long { &lr.long } else { &lr.short }),
+            _ => self.rope_freqs.as_ref(),
+        };
+        match fs {
             // The scaled path must honour the pairing too. It did not: `rope_interleaved` was
             // consulted only in the `None` arm, so any model with rope_freqs (every Llama-3.1+)
             // silently got NEOX regardless — and an A/B on the flag appeared to "rule out" pairing
@@ -1289,10 +1615,18 @@ impl Qwen3 {
             // composed path by `qk_norm_rope_eq_composed` at five shapes including GQA, t > 1 and a
             // non-zero position. Guarded to NEOX + full rotation + no rope-scaling + no YaRN, because
             // a model built for one pairing and run with the other emits fluent garbage.
-            let (qr, kr) = Tensor::qk_norm_rope(
-                &qkv, 0, l.q_out,
-                l.q_norm.as_ref().unwrap(), l.k_norm.as_ref().unwrap(),
-                t, nh, nkv, hd, l.rope_base, offset, self.cfg.eps);
+            let (qr, kr) = if rope_on_device() {
+                Tensor::qk_norm_rope(
+                    &qkv, 0, l.q_out,
+                    l.q_norm.as_ref().unwrap(), l.k_norm.as_ref().unwrap(),
+                    t, nh, nkv, hd, l.rope_base, offset, self.cfg.eps)
+            } else {
+                let (c, sn) = self.rope_table(&RopeRows::Run(offset, t), l.rope_base);
+                Tensor::qk_norm_rope_table(
+                    &qkv, 0, l.q_out,
+                    l.q_norm.as_ref().unwrap(), l.k_norm.as_ref().unwrap(),
+                    t, nh, nkv, hd, &c, &sn, self.cfg.eps)
+            };
             dump("Qcur_rope", il, &qr);
             dump("Kcur_rope", il, &kr);
             (qr, kr)
@@ -1520,7 +1854,13 @@ impl Qwen3 {
         // so Llama-3.2 diverged from `forward_cached` at token 2 with no error.
         let il_pair = self.cfg.rope_interleaved && std::env::var("FERRIC_NEOX").is_err();
         let fs = self.rope_freqs.as_ref();
-        let rope_rows = |x: Tensor, heads: usize| x.rope_at_ex(heads, hd, l.rope_base, &positions, fs, il_pair);
+        // The same host table as the solo path, built for each row's own position — so a batched row
+        // and the solo decode of that sequence read identical angles.
+        let tab = (!rope_on_device()).then(|| self.rope_table(&RopeRows::At(positions.clone()), l.rope_base));
+        let rope_rows = |x: Tensor, heads: usize| match &tab {
+            Some((c, sn)) => x.rope_with_table(c, sn, heads, hd, il_pair),
+            None => x.rope_at_ex(heads, hd, l.rope_base, &positions, fs, il_pair),
+        };
         let fuse = l.q_norm.is_none() && l.k_norm.is_none();
         let (q, k) = if fuse {
             let qk = rope_rows(qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv);
@@ -1585,7 +1925,11 @@ impl Qwen3 {
     ///
     /// Kept as an explicit predicate rather than deleted, because this exact question was once
     /// answered "obviously yes" and was wrong — a scheduler should ask rather than assume.
-    pub fn batching_supported(&self) -> bool { true }
+    ///
+    /// ⚠ NOT with LongRoPE: the table is a per-sequence choice by position, and a sequence crossing
+    /// `original_max_position_embeddings` must recompute its whole cache (`longrope_refill`), which a
+    /// one-token batched step cannot do. Such a model decodes serially — correct, and slower.
+    pub fn batching_supported(&self) -> bool { self.longrope.is_none() }
 
     /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
     ///
@@ -1610,10 +1954,9 @@ impl Qwen3 {
         // needs `rope_at_scaled` / `rope_at_interleaved`, which is the same gap found in
         // `rope_scaled` one layer along. See `Self::batching_supported`.
         assert!(self.batching_supported(),
-                "forward_batch is not solo-equivalent on this model: rope_freqs={} interleaved={}. \
-                 rope_at has no scaled/interleaved variant, so the batched path would silently \
-                 diverge from forward_cached. Use forward_cached per sequence until rope_at covers it.",
-                self.rope_freqs.is_some(), self.cfg.rope_interleaved);
+                "forward_batch is not solo-equivalent on this model: longrope={} (a per-sequence table \
+                 that can force a whole-cache refill). Use forward_cached per sequence.",
+                self.longrope.is_some());
         assert_eq!(tokens.len(), caches.len(), "one token per sequence");
         assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
         let mut x = self.embed(tokens);
@@ -1627,7 +1970,7 @@ impl Qwen3 {
             let l = self.layer_ref(il);
             x = self.apply_layer_batch(&x, &l, caches, il, &lr);
         }
-        for c in caches.iter_mut() { c.pos += 1; }
+        for (c, &tk) in caches.iter_mut().zip(tokens) { self.advance(c, Some(&[tk]), 1); }
         batch(&self.ctx, || self.head(&x))
     }
 
@@ -1641,12 +1984,14 @@ impl Qwen3 {
 
     /// Begin a forward pass that can be advanced one layer at a time.
     pub fn step_begin(&self, tokens: &[u32], cache: &Cache) -> Step {
+        self.longrope_guard(cache, tokens.len());
         Step {
             x: self.embed(tokens),
             pos: cache.pos,
             il: 0,
             n_layer: self.cfg.n_layer,
             n_tokens: tokens.len(),
+            ids: tokens.to_vec(),
         }
     }
 
@@ -1667,7 +2012,7 @@ impl Qwen3 {
     pub fn step_finish(&self, step: Step, cache: &mut Cache) -> Tensor {
         use ferric_tensor::batch;
         debug_assert!(step.next_layer().is_none(), "step_finish called before every layer ran");
-        cache.pos += step.n_tokens;
+        self.advance(cache, Some(&step.ids), step.n_tokens);
         batch(&self.ctx, || self.head(&step.x))
     }
 
@@ -1682,7 +2027,7 @@ impl Qwen3 {
             let l = self.layer_ref(il);
             x = self.apply_layer(&x, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
-        cache.pos += tokens.len();
+        self.advance(cache, Some(tokens), tokens.len());
         x
     }
 
@@ -1696,6 +2041,7 @@ impl Qwen3 {
         use ferric_tensor::batch;
         assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
         let t = x.shape[0];
+        self.longrope_guard(cache, t);
         let pos = cache.pos;
         // The weightless embedding RMS norm applies to the WHOLE input row block, image rows
         // included: llama.cpp normalises the OUTPUT of build_inp_embd, and build_inp_embd is exactly
@@ -1709,7 +2055,7 @@ impl Qwen3 {
             let l = self.layer_ref(il);
             h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
-        cache.pos += t;
+        self.advance(cache, None, t);
         batch(&self.ctx, || self.head(&h))
     }
 
@@ -1722,6 +2068,7 @@ impl Qwen3 {
         use ferric_tensor::batch;
         assert_eq!(x.shape[1], self.cfg.n_embd, "embeddings must be [T, n_embd]");
         let t = x.shape[0];
+        self.longrope_guard(cache, t);
         let pos = cache.pos;
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
         let lr = Active::uniform(&cache.lora);
@@ -1729,7 +2076,7 @@ impl Qwen3 {
             let l = self.layer_ref(il);
             h = self.apply_layer(&h, &l, cache.layer_kv(il), pos, il, None, &lr);
         }
-        cache.pos += t;
+        self.advance(cache, None, t);
         let last = h.narrow(0, t - 1, 1).contiguous();
         batch(&self.ctx, || self.head(&last))
     }
@@ -1788,6 +2135,7 @@ impl Qwen3 {
                    "mrope needs 4 components x {t} tokens, got {}", mrope.len());
         assert!(deepstack.len() <= self.cfg.n_layer,
                 "{} deepstack features for {} layers", deepstack.len(), self.cfg.n_layer);
+        self.longrope_guard(cache, t);
         let pos = cache.pos;
         let mut h = if self.cfg.embd_rmsnorm { x.rmsnorm_weightless(self.cfg.eps) } else { x.clone() };
         let lr = Active::uniform(&cache.lora);
@@ -1799,7 +2147,7 @@ impl Qwen3 {
                 taps.push(h.clone());
             }
         }
-        cache.pos += t;
+        self.advance(cache, None, t);
         batch(&self.ctx, || h.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 
@@ -1830,6 +2178,11 @@ impl Qwen3 {
             let native = if tokens.len() == 1 { self.native_step(tokens[0], cache) } else { self.native_prefill(tokens, cache, true) };
             if let Some(lg) = native { return lg; }
         }
+        if let Some(all) = self.longrope_refill(tokens, cache) {
+            let x = self.run_layers(&all, cache);
+            let rows = x.narrow(0, all.len() - tokens.len(), tokens.len()).contiguous();
+            return batch(&self.ctx, || self.head(&rows));
+        }
         let x = self.run_layers(tokens, cache);
         let out = batch(&self.ctx, || self.head(&x));
         prof(&self.ctx, "lm_head");
@@ -1844,6 +2197,8 @@ impl Qwen3 {
     pub fn forward_cached_last(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
         if tokens.len() == 1 { return self.forward_cached(tokens, cache); }
+        let refill;
+        let tokens = match self.longrope_refill(tokens, cache) { Some(all) => { refill = all; &refill[..] } None => tokens };
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
         if let Some(lg) = self.native_prefill(tokens, cache, false) { return lg; }
         let x = self.run_layers(tokens, cache);
@@ -1899,7 +2254,9 @@ impl Qwen3 {
                      f: impl FnOnce(&mut ferric_tensor::cuda::DecodeGraph, &mut ferric_tensor::cuda::DevKv) -> Option<R>) -> Option<R> {
         use ferric_tensor::cuda::DecodeGraph;
         // The resident graph has no LoRA: an adapted sequence stays on the portable path (decode AND prefill).
-        if cache.fmt.is_some() || !cache.lora.is_empty() { return None; }
+        // Nor LongRoPE: its table switch at original_max_position_embeddings recomputes the cache on the
+        // portable path (`longrope_refill`), and the graph's angles are the base table's.
+        if cache.fmt.is_some() || !cache.lora.is_empty() || self.longrope.is_some() { return None; }
         let mut slot = self.native.borrow_mut();
         if let NativeSlot::Untried = *slot {
             *slot = match self.native_graph_spec() {
@@ -2319,5 +2676,119 @@ mod proj_grouping_tests {
                 assert!(types[r.clone()].iter().all(|t| *t == types[r.start]), "mixed run {r:?} in {types:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rope_table_tests {
+    use super::{longrope_uses_long, qwen3_test_cfg, rope_inv_freq, Cache, RopeScale};
+
+    fn bits(v: &[f32]) -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() }
+
+    // The authors' float32 inverse frequencies, read back from their rotary module after their forward
+    // (refgen/lm_floor_ref.py, transformers 5.7.0 / torch 2.11.0).
+    /// Qwen/Qwen2.5-0.5B-Instruct: base 1e6, head_dim 64.
+    const QWEN25: [u32; 32] = [
+        0x3f800000, 0x3f263de0, 0x3ed7e89b, 0x3e8c3504, 0x3e361887, 0x3dec7fd6, 0x3d99940d, 0x3d47763f,
+        0x3d0186e3, 0x3ca8398b, 0x3c5a7bf2, 0x3c0de12d, 0x3bb8449c, 0x3b6f520e, 0x3b1b690d, 0x3ac9d75c,
+        0x3a83126f, 0x3a2a3b44, 0x39dd1725, 0x398f9272, 0x393a7753, 0x38f22ce2, 0x389d43a4, 0x384c3fbe,
+        0x3804a2b2, 0x37ac431d, 0x375fba4f, 0x371148e3, 0x36bcb0c1, 0x36751070, 0x361f23e4, 0x35ceaf79];
+    /// Their default formula at base 500000, head_dim 64 (Llama-3.2-1B before its Llama-3 scaling).
+    /// ⚠ The system `powf` misses this at dims 3 and 16 (macOS libm, 2026-09) — dim 3 alone is 9e-4 rad
+    /// at position 30,000, and it held Llama-3.2-1B at 46x its float32 floor there.
+    const BASE_500K: [u32; 32] = [
+        0x3f800000, 0x3f29e1c6, 0x3ee177bc, 0x3e959ee3, 0x3e4693b0, 0x3e03c6a0, 0x3daee4ad, 0x3d681e67,
+        0x3d1a08c8, 0x3ccc6f49, 0x3c87a9c3, 0x3c340d6d, 0x3beef74f, 0x3b9e9402, 0x3b527720, 0x3b0baa41,
+        0x3ab95d21, 0x3a7603ea, 0x3a23418d, 0x39d8ac81, 0x398fc8f8, 0x393ed4f4, 0x38fd45c3, 0x38a8126b,
+        0x385f10c4, 0x381406cb, 0x37c47610, 0x37825f34, 0x372d07a7, 0x36e5a54d, 0x369864a7, 0x364a41b0];
+    /// microsoft/Phi-3.5-mini-instruct rope_scaling.short_factor / long_factor (float32).
+    const PHI_SHORT: [f32; 48] = [
+        1.0, 1.02, 1.03, 1.03, 1.05, 1.05, 1.05, 1.05, 1.05, 1.0699999, 1.0999999, 1.1099999, 1.1599998,
+        1.1599998, 1.1699998, 1.2899998, 1.3399998, 1.6799998, 1.7899998, 1.8199998, 1.8499998, 1.8799998,
+        1.9099997, 1.9399997, 1.9899997, 2.0199997, 2.0199997, 2.0199997, 2.0199997, 2.0199997, 2.0199997,
+        2.0299997, 2.0299997, 2.0299997, 2.0299997, 2.0299997, 2.0299997, 2.0299997, 2.0299997, 2.0299997,
+        2.0799997, 2.0899997, 2.1899996, 2.2199996, 2.5899994, 2.7299995, 2.7499995, 2.8399994];
+    const PHI_LONG: [f32; 48] = [
+        1.08, 1.11, 1.14, 1.34, 1.5899999, 1.6, 1.62, 2.6200001, 3.23, 3.23, 4.79, 7.4, 7.7000003, 9.09, 12.2,
+        17.67, 24.460001, 28.570002, 30.420002, 30.840002, 32.590004, 32.930004, 42.320004, 44.960003,
+        50.340004, 50.450005, 57.550003, 57.930004, 58.210003, 60.140003, 62.610004, 62.620003, 62.710003,
+        63.140003, 63.140003, 63.770004, 63.930004, 63.960003, 63.97, 64.03, 64.07, 64.08, 64.12, 64.41,
+        64.48, 64.51, 64.53, 64.84];
+    /// Their LongRoPE tables as used: `1 / (ext * 10000^(2i/96))`, short (155 tokens) and long (4,650).
+    const PHI_SHORT_INV: [u32; 48] = [
+        0x3f800000, 0x3f4f2907, 0x3f2954b3, 0x3f0bc432, 0x3ee2552e, 0x3ebad0e4, 0x3e9a32dd, 0x3e7e8d6f,
+        0x3e521bd3, 0x3e2a2eda, 0x3e08a387, 0x3ddf8846, 0x3db08d3f, 0x3d91b9ff, 0x3d6e82b2, 0x3d328de6,
+        0x3d0de155, 0x3cbad0e6, 0x3c90b90a, 0x3c6af8b5, 0x3c3ecd2c, 0x3c1af9a5, 0x3bfbd0e4, 0x3bcca2c5,
+        0x3ba4a9d1, 0x3b85e533, 0x3b5d0912, 0x3b36718f, 0x3b1696f9, 0x3af8983d, 0x3acd30f0, 0x3aa88806,
+        0x3a8b1b3f, 0x3a65a35a, 0x3a3d8b56, 0x3a1c7359, 0x3a01228f, 0x39d52d5b, 0x39aff50e, 0x39913c63,
+        0x3969fe48, 0x39403700, 0x39176914, 0x38f6926f, 0x38ae726e, 0x38889af1, 0x385fde79, 0x3832ed36];
+    const PHI_LONG_INV: [u32; 48] = [
+        0x3f6d097b, 0x3f3e5d0c, 0x3f18fded, 0x3ed6dd5f, 0x3e95770b, 0x3e753229, 0x3e47e31e, 0x3dcc07d5,
+        0x3d889a68, 0x3d618173, 0x3cfb0703, 0x3c861e8f, 0x3c54c77b, 0x3c14c5c4, 0x3bb6fd06, 0x3b5090e1,
+        0x3af8b9b2, 0x3aafc3e7, 0x3a884124, 0x3a5ddde1, 0x3a2d4bd1, 0x3a0d8ffe, 0x39b5d731, 0x398d475f,
+        0x39504c7b, 0x392b8e4a, 0x38f8442e, 0x38cb936e, 0x38a73963, 0x38859912, 0x3853d811, 0x382ed43c,
+        0x381018f3, 0x37ec41e2, 0x37c30202, 0x379f5ebb, 0x3783372c, 0x37588296, 0x3732ae2b, 0x37135868,
+        0x36f3164c, 0x36c89d1d, 0x36a57bf0, 0x3687f9f1, 0x36603a23, 0x3638fdf1, 0x3618a556, 0x35fac8c1];
+
+    /// Ulp distance per dimension, and the dimensions that differ at all.
+    fn ulps(got: &[f32], want: &[u32]) -> Vec<(usize, i64)> {
+        bits(got).iter().zip(want).enumerate()
+            .filter(|(_, (a, b))| a != b).map(|(i, (a, b))| (i, *a as i64 - *b as i64)).collect()
+    }
+
+    /// The whole reason host tables exist: an ulp in `inv_freq` is a milliradian at position 30,000.
+    #[test]
+    fn inverse_frequencies_are_the_authors_bit_for_bit() {
+        assert_eq!(bits(&rope_inv_freq(1e6, 64, &RopeScale::None)), QWEN25, "Qwen2.5: base 1e6, d 64");
+        assert_eq!(bits(&rope_inv_freq(500_000.0, 64, &RopeScale::None)), BASE_500K, "base 500000, d 64");
+        // d = 96 makes the exponent 2i/96 inexact: it must be rounded to float32 before the power, as
+        // `arange(...).float() / dim` rounds it. torch's own `pow` is within an ulp of the correctly
+        // rounded power, not always on it: at base 10000 / d 96 it differs at dim 20 alone.
+        let s = ulps(&rope_inv_freq(10_000.0, 96, &RopeScale::Ext(PHI_SHORT.to_vec())), &PHI_SHORT_INV);
+        let l = ulps(&rope_inv_freq(10_000.0, 96, &RopeScale::Ext(PHI_LONG.to_vec())), &PHI_LONG_INV);
+        for (name, d) in [("short", &s), ("long", &l)] {
+            assert!(d.len() <= 1 && d.iter().all(|&(i, u)| i == 20 && u.abs() == 1),
+                    "Phi-3.5 {name} table: dims off the authors' {d:?} — only dim 20, by one ulp, is expected");
+        }
+    }
+
+    /// Pinned against their rotary module: `position_ids` 0..4095 (seq_len 4096) take the short
+    /// table and 0..4096 (4097) the long one — and a decode step is judged by its absolute position.
+    #[test]
+    fn longrope_switches_where_the_authors_do() {
+        assert!(!longrope_uses_long(0, 4096, 4096));
+        assert!(longrope_uses_long(0, 4097, 4096));
+        assert!(!longrope_uses_long(4095, 1, 4096), "one token at position 4095 is seq_len 4096: short");
+        assert!(longrope_uses_long(4096, 1, 4096), "one token at position 4096 is seq_len 4097: long");
+    }
+
+    /// The crossing, cache side: rows rotated by one table are never extended with the other. With the
+    /// ids known, the cache empties and hands back the whole sequence to prefill again; without them
+    /// it refuses rather than attend across tables.
+    #[test]
+    fn a_table_change_refills_from_history_or_refuses() {
+        let cfg = qwen3_test_cfg();
+        let mut c = Cache::with_kvq(&cfg, None);
+        c.note_rows(Some(&[1, 2, 3]), 3, Some(false));
+        assert_eq!(c.take_for_refill(false, &[4]), None, "same table: extend");
+        c.note_rows(Some(&[4]), 1, Some(false));
+        assert_eq!(c.take_for_refill(true, &[5]), Some(vec![1, 2, 3, 4, 5]), "table changed: refill everything");
+        assert_eq!((c.pos, c.rope_long()), (0, None), "the refill starts from an empty cache");
+        assert_eq!(c.take_for_refill(true, &[1]), None, "an empty cache has nothing to refill");
+
+        // Rows appended without ids (an embeddings forward) leave the history short for good.
+        let mut d = Cache::with_kvq(&cfg, None);
+        d.note_rows(None, 2, Some(false));
+        d.note_rows(Some(&[9]), 1, Some(false));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.take_for_refill(true, &[1])));
+        assert!(refused.is_err(), "a refill with unknown ids must refuse, not recompute a partial sequence");
+
+        // Rows installed from outside carry no history until the installer declares it.
+        let mut e = Cache::with_kvq(&cfg, None);
+        e.set_layers((0..cfg.n_layer).map(|_| Default::default()).collect());
+        e.pos = 2;
+        assert_eq!(e.rope_long(), None);
+        e.set_history(&[7, 8], Some(false));
+        assert_eq!(e.take_for_refill(true, &[9]), Some(vec![7, 8, 9]));
     }
 }

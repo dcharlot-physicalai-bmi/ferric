@@ -621,6 +621,61 @@ impl Tensor {
          Tensor::from_parts(&src.ctx, ko, vec![t, nkv * dh]))
     }
 
+    /// [`Tensor::qk_norm_rope`] with the angles read from HOST-BUILT tables instead of derived on the
+    /// device — see [`Tensor::rope_with_table`] for why. `cos`/`sin` are `[t, dh/2]`, row `i` for q's and
+    /// k's row `i`. Pinned to the composed rmsnorm + `rope_with_table` by `qk_norm_rope_table_eq_composed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_table(src: &Tensor, q_col: usize, k_col: usize,
+                              qw: &Tensor, kw: &Tensor, t: usize,
+                              nh: usize, nkv: usize, dh: usize, cos: &Tensor, sin: &Tensor, eps: f32)
+                              -> (Tensor, Tensor) {
+        assert_eq!(src.rank(), 2, "qk_norm_rope_table: src is the 2D [t, qkv_width] projection output");
+        assert!(cos.numel() == t * dh / 2 && sin.numel() == t * dh / 2,
+                "qk_norm_rope_table: cos/sin must be [t, dh/2] = [{t}, {}], got {} and {}", dh / 2, cos.numel(), sin.numel());
+        let rs = src.strides[0];
+        let (q_off, k_off) = (src.offset + q_col, src.offset + k_col);
+        let (qo, ko) = (empty(&src.ctx, t * nh * dh), empty(&src.ctx, t * nkv * dh));
+        run(&src.ctx, &qk_norm_rope_table_src(), "qk_norm_rope",
+            &[src.buf.as_ref(), qw.contiguous().buf.as_ref(), kw.contiguous().buf.as_ref(), &qo, &ko,
+              &u32buf(&src.ctx, &[t as u32, nh as u32, nkv as u32, dh as u32,
+                                  0, 0, eps.to_bits(), q_off as u32, k_off as u32, rs as u32]),
+              cos.contiguous().buf.as_ref(), sin.contiguous().buf.as_ref()],
+            groups(t * (nh + nkv)));
+        (Tensor::from_parts(&src.ctx, qo, vec![t, nh * dh]),
+         Tensor::from_parts(&src.ctx, ko, vec![t, nkv * dh]))
+    }
+
+    /// **RoPE with the angles built on the HOST** — the rotation of [`Tensor::rope`] /
+    /// [`Tensor::rope_interleaved`] (same kernel source, same pairing substitution, same in-place read
+    /// of a row-major strided window), with `cos`/`sin` read from `[t, head_dim/2]` tables instead of
+    /// computed on the device.
+    ///
+    /// ⛔ WHY. The device derives the inverse frequency as `exp(-2c/d * ln base)`; the authors'
+    /// `1 / base^(2c/d)` in float32 lands an ulp away in some dimensions, and the position multiplies
+    /// that. At position 30,000 Qwen2.5-0.5B sat 18x and Llama-3.2-1B 46x the authors' own
+    /// float32-vs-float64 distance (their float64 run SHARES their float32 angles, so its floor cannot
+    /// absorb a different angle formula); at position 0, 1.3x and 3.6x. Even the system `powf` is not
+    /// the authors' value (base 500000: dims 3 and 16 differ by an ulp — dim 3 alone is 9e-4 rad at
+    /// 30k). The caller builds the table the authors' way; see `qwen3::rope_inv_freq`.
+    ///
+    /// A table also takes the device's transcendental accuracy out of the answer: WGSL bounds `cos`
+    /// only on [-pi, pi], and a rope angle at position 30,000 is ~3e4 rad.
+    pub fn rope_with_table(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize, interleaved: bool) -> Tensor {
+        let owned;
+        let c = if self.rank() == 2 && self.strides[1] == 1 { self } else { owned = self.contiguous(); &owned };
+        let t = c.numel() / (n_heads * head_dim);
+        assert!(cos.numel() == t * head_dim / 2 && sin.numel() == t * head_dim / 2,
+                "rope_with_table: cos/sin must be [t, head_dim/2] = [{t}, {}], got {} and {}",
+                head_dim / 2, cos.numel(), sin.numel());
+        let out = empty(&self.ctx, c.numel());
+        let srs = if t > 1 { c.strides[0] } else { n_heads * head_dim };
+        let info = [t as u32, n_heads as u32, head_dim as u32, 0, 0, c.offset as u32, srs as u32, head_dim as u32];
+        run(&self.ctx, &rope_table_src(interleaved), "rope",
+            &[c.buf.as_ref(), &out, &u32buf(&self.ctx, &info), cos.contiguous().buf.as_ref(), sin.contiguous().buf.as_ref()],
+            groups(t * n_heads));
+        Tensor::from_parts(&self.ctx, out, c.shape.clone())
+    }
+
     pub fn apply_rope_costable(&self, cos: &Tensor, sin: &Tensor, n_heads: usize, head_dim: usize) -> Tensor {
         let c = self.contiguous();
         let t = c.numel() / (n_heads * head_dim);
@@ -2647,6 +2702,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Substitute each `(from, to)` in `src`, refusing unless every `from` occurs EXACTLY once. A derived
+/// kernel whose substitution silently matched nothing would be the original kernel under a new name —
+/// device angles where a table was asked for, with no error.
+fn derive_kernel(src: &str, subs: &[(&str, &str)]) -> String {
+    let mut s = src.to_string();
+    for (from, to) in subs {
+        assert_eq!(s.matches(from).count(), 1, "kernel derivation: {from:?} must occur exactly once");
+        s = s.replacen(from, to, 1);
+    }
+    s
+}
+
+/// ROPE_WGSL reading cos/sin from host-built `[t, n_rot/2]` tables (bindings 3 and 4) in place of the
+/// device's `exp`/`cos`/`sin`. Everything else — strided in-place input, pairing, the partial-rope
+/// tail — is the same source. See [`Tensor::rope_with_table`].
+fn rope_table_src(interleaved: bool) -> String {
+    let s = derive_kernel(ROPE_WGSL, &[
+        ("@group(0) @binding(2) var<storage,read>        info: array<u32>;\n",
+         "@group(0) @binding(2) var<storage,read>        info: array<u32>;\n\
+          @group(0) @binding(3) var<storage,read>        ctab: array<f32>;   // [t, n_rot/2] host-built cos\n\
+          @group(0) @binding(4) var<storage,read>        stab: array<f32>;   // [t, n_rot/2] host-built sin\n"),
+        ("    let lb = log(base);\n", ""),
+        ("        let inv = exp(-2.0 * f32(c) / f32(n_rot) * lb);\n", ""),
+        ("let ang = f32(info[8u + i]) * inv; let cs = cos(ang); let sn = sin(ang);",
+         "let cs = ctab[i * half + c]; let sn = stab[i * half + c];"),
+    ]);
+    if interleaved {
+        s.replace("__PAIRLO__", "2u * c").replace("__PAIRHI__", "2u * c + 1u")
+    } else {
+        s.replace("__PAIRLO__", "c").replace("__PAIRHI__", "c + half")
+    }
+}
+
+/// QK_NORM_ROPE_WGSL reading host-built cos/sin tables (bindings 6 and 7). See
+/// [`Tensor::qk_norm_rope_table`].
+fn qk_norm_rope_table_src() -> String {
+    derive_kernel(QK_NORM_ROPE_WGSL, &[
+        ("@group(0) @binding(5) var<storage,read>        info: array<u32>;\n",
+         "@group(0) @binding(5) var<storage,read>        info: array<u32>;\n\
+          @group(0) @binding(6) var<storage,read>        ctab: array<f32>;   // [t, dh/2] host-built cos\n\
+          @group(0) @binding(7) var<storage,read>        stab: array<f32>;   // [t, dh/2] host-built sin\n"),
+        ("    let lb = log(base);\n", ""),
+        ("        let fr = exp(-2.0 * f32(c) / f32(dh) * lb);\n", ""),
+        ("let ang = f32(pos + i) * fr; let cs = cos(ang); let sn = sin(ang);",
+         "let cs = ctab[i * half + c]; let sn = stab[i * half + c];"),
+    ])
+}
+
 // Apply RoPE from a per-token cos/sin table (per-index), INTERLEAVED-pair convention (V-JEPA 2):
 // out[2j]=x[2j]·cos[2j]−x[2j+1]·sin[2j]; out[2j+1]=x[2j+1]·cos[2j+1]+x[2j]·sin[2j+1].
 const ROPE_INTERLEAVED_WGSL: &str = r#"
@@ -4389,6 +4492,86 @@ mod qk_norm_rope_tests {
             let dk = kf.iter().zip(&kc).fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
             assert!(dq < 2e-4 * scale, "q differs by {dq:.3e} (scale {scale:.3e}) at t={t} nh={nh} pos={pos}");
             assert!(dk < 2e-4 * scale, "k differs by {dk:.3e} (scale {scale:.3e}) at t={t} nkv={nkv} pos={pos}");
+        }
+    }
+
+    /// Host cos/sin tables `[t, dh/2]` for positions `pos..pos+t`, angles from the device's own formula
+    /// evaluated on the host — so a table kernel must reproduce `rope()` to rounding.
+    fn device_formula_table(t: usize, dh: usize, base: f32, pos: usize) -> (Vec<f32>, Vec<f32>) {
+        let half = dh / 2;
+        let (mut c, mut s) = (vec![0f32; t * half], vec![0f32; t * half]);
+        for i in 0..t { for j in 0..half {
+            let a = (pos + i) as f32 * (-2.0 * j as f32 / dh as f32 * base.ln()).exp();
+            c[i * half + j] = a.cos(); s[i * half + j] = a.sin();
+        } }
+        (c, s)
+    }
+
+    /// `rope_with_table` is `rope`/`rope_interleaved` with the angles supplied: same pairing, same row
+    /// and column indexing of the table, same in-place read of a strided window. A table indexed
+    /// `[c][i]` instead of `[i][c]`, or a pairing substitution that missed, rotates by the wrong angles
+    /// with finite output — so this pins it against the device-angle kernel at t > 1, pos != 0, both
+    /// pairings, and a narrow view of a fused projection.
+    #[test]
+    fn rope_with_table_is_rope_given_its_angles() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED rope_with_table: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        for (t, nh, dh, base, pos) in [(1usize, 4usize, 64usize, 10_000.0f32, 0usize), (5, 6, 64, 1_000_000.0, 37),
+                                       (3, 2, 128, 500_000.0, 129), (4, 3, 96, 10_000.0, 7)] {
+            // A [t, 2*nh*dh] projection whose first half is the rotated span: a strided window.
+            let w = 2 * nh * dh;
+            let xv: Vec<f32> = (0..t * w).map(|i| ((i as f32) * 0.013).sin() * 1.3 + 0.1).collect();
+            let full = Tensor::from_vec(&ctx, &xv, &[t, w]);
+            let x = full.narrow(1, 0, nh * dh);
+            let (cv, sv) = device_formula_table(t, dh, base, pos);
+            let (ct, st) = (Tensor::from_vec(&ctx, &cv, &[t, dh / 2]), Tensor::from_vec(&ctx, &sv, &[t, dh / 2]));
+            let x0 = pollster::block_on(x.contiguous().to_vec());
+            for il in [false, true] {
+                let want = if il { x.rope_interleaved(nh, dh, base, pos) } else { x.rope(nh, dh, base, pos) };
+                let got = x.rope_with_table(&ct, &st, nh, dh, il);
+                let (wv, g) = (pollster::block_on(want.to_vec()), pollster::block_on(got.to_vec()));
+                let moved = wv.iter().zip(&x0).fold(0f32, |a, (&y, &x)| a.max((y - x).abs()));
+                assert!(pos == 0 || moved > 0.1, "the rotation moved nothing (max {moved:.3e}) — this proves nothing");
+                let d = wv.iter().zip(&g).fold(0f32, |a, (&p, &q)| a.max((p - q).abs()));
+                assert!(d < 1e-4, "t={t} dh={dh} pos={pos} interleaved={il}: table rope differs from rope by {d:.3e}");
+            }
+        }
+    }
+
+    /// The fused QK-norm + table-rope kernel against its composition: rmsnorm, then `rope_with_table`.
+    #[test]
+    fn qk_norm_rope_table_eq_composed() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
+            eprintln!("SKIPPED qk_norm_rope_table: no GPU");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let eps = 1e-6f32;
+        for (t, nh, nkv, dh, base, pos) in [(1usize, 16usize, 8usize, 128usize, 1_000_000.0f32, 30_000usize),
+                                            (3, 16, 8, 128, 1_000_000.0, 5), (5, 32, 8, 64, 500_000.0, 129)] {
+            let (q_out, kv_out) = (nh * dh, nkv * dh);
+            let rs = q_out + kv_out;
+            let cat: Vec<f32> = (0..t * rs).map(|i| ((i as f32) * 0.021).sin() * 1.5).collect();
+            let src = Tensor::from_vec(&ctx, &cat, &[t, rs]);
+            let qwv: Vec<f32> = (0..dh).map(|i| 0.5 + 0.01 * i as f32).collect();
+            let kwv: Vec<f32> = (0..dh).map(|i| 1.3 - 0.007 * i as f32).collect();
+            let (qw, kw) = (Tensor::from_vec(&ctx, &qwv, &[dh]), Tensor::from_vec(&ctx, &kwv, &[dh]));
+            let (cv, sv) = device_formula_table(t, dh, base, pos);
+            let (ct, st) = (Tensor::from_vec(&ctx, &cv, &[t, dh / 2]), Tensor::from_vec(&ctx, &sv, &[t, dh / 2]));
+            let (qf, kf) = Tensor::qk_norm_rope_table(&src, 0, q_out, &qw, &kw, t, nh, nkv, dh, &ct, &st, eps);
+            let q = src.narrow(1, 0, q_out).contiguous().reshape(&[t, nh, dh]).rmsnorm(&qw, eps).reshape(&[t, q_out]);
+            let k = src.narrow(1, q_out, kv_out).contiguous().reshape(&[t, nkv, dh]).rmsnorm(&kw, eps).reshape(&[t, kv_out]);
+            let (qc, kc) = (q.rope_with_table(&ct, &st, nh, dh, false), k.rope_with_table(&ct, &st, nkv, dh, false));
+            for (f, c, what) in [(qf, qc, "q"), (kf, kc, "k")] {
+                let (f, c) = (pollster::block_on(f.to_vec()), pollster::block_on(c.to_vec()));
+                let scale = c.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                assert!(scale > 0.1, "{what}: reference is ~zero; this proves nothing");
+                let d = f.iter().zip(&c).fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
+                assert!(d < 2e-4 * scale, "{what} differs by {d:.3e} at t={t} pos={pos}");
+            }
         }
     }
 }
