@@ -258,6 +258,11 @@ pub(crate) struct Engine {
     /// takes the same shape with its own `--reranking` flag. Absent by default, so `/v1/rerank`
     /// answers 400 with what to set rather than pretending the endpoint does not exist.
     reranker: Option<ferric_llama::bert::Reranker>,
+    /// A sentence embedder (bge, nomic-embed-text, MiniLM…) loaded from `--embed` / `FERRIC_EMBED_MODEL`,
+    /// with the name `/v1/models` and `/api/tags` list it under. A chat model's hidden state pooled at its
+    /// last token is not what a RAG pipeline means by an embedding; when this is loaded, `/v1/embeddings`
+    /// uses it unless the request names the chat model.
+    embedder: Option<(String, ferric_llama::bert::Embedder)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -335,6 +340,15 @@ impl Engine {
             let rg = GgufFile::open(&rp).unwrap_or_else(|e| panic!("open FERRIC_RERANK_MODEL {rp}: {e:?}"));
             ferric_llama::bert::Reranker::load(&ctx, &rg)
                 .unwrap_or_else(|e| panic!("load FERRIC_RERANK_MODEL {rp}: {e}"))
+        });
+        let embedder = std::env::var("FERRIC_EMBED_MODEL").ok().map(|ep| {
+            let eg = GgufFile::open(&ep).unwrap_or_else(|e| panic!("open FERRIC_EMBED_MODEL {ep}: {e:?}"));
+            let e = ferric_llama::bert::Embedder::load(&ctx, &eg)
+                .unwrap_or_else(|e| panic!("load FERRIC_EMBED_MODEL {ep}: {e}"));
+            let name = std::path::Path::new(&ep).file_stem().and_then(|s| s.to_str()).unwrap_or("embed").to_string();
+            eprintln!("ferric-serve: embedding model {name} ({}, d {}, pooling {}, context {})",
+                      e.cfg().arch, e.cfg().d, e.cfg().pooling, e.cfg().n_ctx);
+            (name, e)
         });
         let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
@@ -503,7 +517,7 @@ impl Engine {
         // Absent is not "unlimited": 4096 is a conservative bound for a file that does not say, and the
         // error it produces names the number so a caller can see why.
         let n_ctx = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -995,7 +1009,7 @@ fn pick_gguf(repo: &str) -> String {
 /// server does stays reachable from tests — see the crate docs.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--host H] [--port N] [--name S]"); std::process::exit(1); });
+    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--embed <encoder.gguf>] [--rerank <cross-encoder.gguf>] [--host H] [--port N] [--name S]"); std::process::exit(1); });
     let mut port = 8080u16;
     // 127.0.0.1 by default: a model server is not exposed to the network unless someone says so.
     let mut host = "127.0.0.1".to_string();
@@ -1009,6 +1023,9 @@ pub fn run() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--host" => { host = args.get(i + 1).cloned().unwrap_or(host); i += 2; }
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            "--embed" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_EMBED_MODEL", p) }; } i += 2; }
+            "--rerank" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_RERANK_MODEL", p) }; } i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -1078,10 +1095,11 @@ pub fn run() {
 fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8], stream: &mut TcpStream) -> bool {
     match (method, path) {
         ("GET", "/health") => write_json(stream, 200, &json!({"status": "ok"})),
-        ("GET", "/v1/models") => write_json(stream, 200, &json!({
-            "object": "list",
-            "data": [{"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"}]
-        })),
+        ("GET", "/v1/models") => {
+            let mut data = vec![json!({"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"})];
+            if let Some((n, _)) = &eng.embedder { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
+            write_json(stream, 200, &json!({"object": "list", "data": data}))
+        }
         ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
@@ -1136,33 +1154,80 @@ fn rerank(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     write_json(stream, 200, &json!({"object": "list", "model": eng.name, "results": results}));
 }
 
+/// Embed a batch of texts with whichever model the request means: the dedicated embedder when one is
+/// loaded (unless the request names the chat model), else the chat model's own pooled hidden state.
+/// Returns (vectors, prompt tokens, model name).
+pub(crate) fn embed_texts(eng: &Engine, model: Option<&str>, inputs: &[String], truncate: bool)
+    -> Result<(Vec<Vec<f32>>, usize, String), String>
+{
+    match &eng.embedder {
+        Some((name, e)) if model != Some(eng.name.as_str()) => {
+            let (mut out, mut total) = (Vec::with_capacity(inputs.len()), 0usize);
+            for t in inputs {
+                let (v, n) = pollster::block_on(e.embed(t, truncate))?;
+                out.push(v); total += n;
+            }
+            Ok((out, total, name.clone()))
+        }
+        _ => {
+            let (mut out, mut total) = (Vec::with_capacity(inputs.len()), 0usize);
+            for t in inputs { total += eng.enc(t, true).len(); out.push(eng.embed(t)?); }
+            Ok((out, total, eng.name.clone()))
+        }
+    }
+}
+
+/// Little-endian float32 bytes, base64 — what OpenAI's `encoding_format: "base64"` returns (the official
+/// Python client asks for it by default and decodes it itself).
+fn b64_f32(v: &[f32]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// OpenAI-compatible `/v1/embeddings`: `input` is a string or array of strings → L2-normalized vectors.
 fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
-    let bad = |stream: &mut TcpStream, m: &str| write_json(stream, 400, &json!({"error": {"message": m, "type": "invalid_request_error"}}));
-    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad(stream, &format!("bad json: {e}")) };
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
     let inputs: Vec<String> = match &req["input"] {
         Value::String(s) => vec![s.clone()],
         // Error (don't silently drop) on a non-string element — dropping would misalign every `index`.
         Value::Array(a) => {
             let mut v = Vec::with_capacity(a.len());
-            for x in a { match x.as_str() { Some(s) => v.push(s.to_string()), None => return bad(stream, "`input` array must contain only strings") } }
+            for x in a { match x.as_str() { Some(s) => v.push(s.to_string()), None => return bad_request(stream, "`input` array must contain only strings") } }
             v
         }
-        _ => return bad(stream, "`input` must be a string or array of strings"),
+        _ => return bad_request(stream, "`input` must be a string or array of strings"),
     };
-    let mut total = 0usize;
-    let mut data: Vec<Value> = Vec::with_capacity(inputs.len());
-    for (i, text) in inputs.iter().enumerate() {
-        total += eng.enc(text, true).len();
-        // A checkpoint whose pooling this build cannot honour is a 400, not a 200 carrying a vector
-        // of the right length and no meaning. The client can act on an error; it cannot act on a
-        // cosine score that looks ordinary.
-        match eng.embed(text) {
-            Ok(e) => data.push(json!({"object": "embedding", "index": i, "embedding": e})),
-            Err(m) => return bad(stream, &m),
+    let b64 = match req["encoding_format"].as_str() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(f) => return bad_request(stream, &format!("`encoding_format` {f:?}: use \"float\" or \"base64\"")),
+    };
+    // A checkpoint whose pooling this build cannot honour is a 400, not a 200 carrying a vector of the
+    // right length and no meaning. The client can act on an error; it cannot act on a cosine score
+    // that looks ordinary.
+    let (vecs, total, name) = match embed_texts(eng, req["model"].as_str(), &inputs, false) {
+        Ok(r) => r, Err(m) => return bad_request(stream, &m),
+    };
+    if let Some(d) = req["dimensions"].as_u64() {
+        // Matryoshka truncation is model-specific (nomic layer-norms before cutting); truncating and
+        // renormalising the OpenAI way would return a vector the model was not trained to produce.
+        if vecs.first().is_some_and(|v| v.len() != d as usize) {
+            return bad_request(stream, &format!("`dimensions` {d}: this model returns {} and does not truncate", vecs[0].len()));
         }
     }
+    let data: Vec<Value> = vecs.iter().enumerate().map(|(i, e)| json!({"object": "embedding", "index": i,
+        "embedding": if b64 { json!(b64_f32(e)) } else { json!(e) }})).collect();
     write_json(stream, 200, &json!({
-        "object": "list", "data": data, "model": eng.name,
+        "object": "list", "data": data, "model": name,
         "usage": {"prompt_tokens": total, "total_tokens": total}
     }));
 }
@@ -1374,6 +1439,16 @@ mod tests {
     /// `byte_decoder` inverts GPT-2's byte↔printable-unicode map, and every token this server emits
     /// passes through it. A wrong entry does not error — it silently corrupts one byte value in all
     /// output, which is exactly the failure class that survives "curl it and look".
+    /// `encoding_format: "base64"` is what the official OpenAI Python client asks for by default; a
+    /// wrong encoder returns vectors that decode to different floats with no error.
+    #[test]
+    fn base64_embeddings_are_little_endian_f32() {
+        // 1.0f32 = 00 00 80 3F; -2.0f32 = 00 00 00 C0  →  "AACAPwAAAMA="
+        assert_eq!(super::b64_f32(&[1.0, -2.0]), "AACAPwAAAMA=");
+        // one float: 4 bytes → 8 characters with "==" padding
+        assert_eq!(super::b64_f32(&[0.0]), "AAAAAA==");
+    }
+
     #[test]
     fn the_byte_decoder_is_a_bijection_over_all_256_bytes() {
         let m = super::byte_decoder();

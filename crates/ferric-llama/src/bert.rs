@@ -502,14 +502,10 @@ enum RerankTok {
     Spm(ferric_tokenizer::Spm),
 }
 
-impl Reranker {
-    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Reranker, String> {
-        let model = Bert::load(ctx, g)?;
-        if !model.is_reranker() {
-            return Err("this checkpoint has no cls.* head: it embeds but cannot score pairs. \
-                        Reranking needs a cross-encoder such as bge-reranker".into());
-        }
-        let md = g.metadata();
+/// The encoder's own tokenizer from its GGUF metadata: WordPiece for `tokenizer.ggml.model = "bert"`,
+/// SentencePiece otherwise (XLM-R's `"t5"`). Returns (tokenizer, bos/cls id, eos/sep id).
+fn encoder_tokenizer(g: &impl GgufSource) -> Result<(RerankTok, u32, u32), String> {
+    let md = g.metadata();
         let toks: Vec<String> = match md.get("tokenizer.ggml.tokens") {
             Some(Meta::Arr(v)) => v.iter()
                 .map(|x| if let Meta::Str(s) = x { s.clone() } else { String::new() }).collect(),
@@ -533,11 +529,19 @@ impl Reranker {
                     &ferric_gguf::token_types(g.metadata().get("tokenizer.ggml.token_type"))))
             }
         };
-        Ok(Reranker {
-            bos: u("tokenizer.ggml.bos_token_id", u("tokenizer.ggml.cls_token_id", 0)),
-            eos: u("tokenizer.ggml.eos_token_id", u("tokenizer.ggml.seperator_token_id", 2)),
-            model, tok,
-        })
+        Ok((tok, u("tokenizer.ggml.bos_token_id", u("tokenizer.ggml.cls_token_id", 0)),
+            u("tokenizer.ggml.eos_token_id", u("tokenizer.ggml.seperator_token_id", 2))))
+}
+
+impl Reranker {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Reranker, String> {
+        let model = Bert::load(ctx, g)?;
+        if !model.is_reranker() {
+            return Err("this checkpoint has no cls.* head: it embeds but cannot score pairs. \
+                        Reranking needs a cross-encoder such as bge-reranker".into());
+        }
+        let (tok, bos, eos) = encoder_tokenizer(g)?;
+        Ok(Reranker { bos, eos, model, tok })
     }
 
     /// The pair layout llama.cpp's `format_rerank` builds: **BOS query EOS doc EOS**.
@@ -580,5 +584,56 @@ impl Reranker {
         for (i, d) in docs.iter().enumerate() { out.push((i, self.score(query, d).await?)); }
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(out)
+    }
+}
+
+
+/// **A sentence embedder, tokenizer and pooling included** — what `/v1/embeddings` and Ollama's
+/// `/api/embed` serve for bge, nomic-embed-text, MiniLM, e5 and gte.
+///
+/// Pooling is the checkpoint's declared `<arch>.pooling_type` (MEAN for nomic and most
+/// sentence-transformers exports, CLS for bge), then L2 normalisation — the vector the authors'
+/// sentence-transformers pipeline returns. Task prefixes (`search_query: `, `search_document: ` for
+/// nomic) are the caller's text: they are part of what the model was trained on, not a server setting.
+pub struct Embedder {
+    model: Bert,
+    tok: RerankTok,
+    bos: u32,
+    eos: u32,
+}
+
+impl Embedder {
+    pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Embedder, String> {
+        let model = Bert::load(ctx, g)?;
+        let (tok, bos, eos) = encoder_tokenizer(g)?;
+        Ok(Embedder { model, tok, bos, eos })
+    }
+
+    pub fn cfg(&self) -> &Cfg { &self.model.cfg }
+
+    /// `[CLS] text [SEP]` (or `<s> text </s>`) in this checkpoint's own tokenizer.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        match &self.tok {
+            RerankTok::Wordpiece(w) => w.encode(text),
+            RerankTok::Spm(s) => { let mut v = vec![self.bos]; v.extend(s.encode_piece(text, true)); v.push(self.eos); v }
+        }
+    }
+
+    /// One text → an L2-normalised vector. Longer than the encoder's context: truncated to it (keeping
+    /// the final `[SEP]`) when `truncate`, otherwise an error naming both lengths.
+    pub async fn embed(&self, text: &str, truncate: bool) -> Result<(Vec<f32>, usize), String> {
+        let mut ids = self.encode(text);
+        let n_ctx = self.model.cfg.n_ctx;
+        if ids.len() > n_ctx {
+            if !truncate { return Err(format!("input is {} tokens; this embedding model's context is {n_ctx}", ids.len())); }
+            let last = *ids.last().unwrap_or(&self.eos);
+            ids.truncate(n_ctx - 1);
+            ids.push(last);
+        }
+        let d = self.model.cfg.d;
+        let v = self.model.forward(&ids)?.to_vec().await;
+        let pooled = crate::pooling::pool(&v, ids.len(), d, self.model.cfg.pooling)?;
+        let n = pooled.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        Ok((pooled.iter().map(|x| x / n).collect(), ids.len()))
     }
 }
