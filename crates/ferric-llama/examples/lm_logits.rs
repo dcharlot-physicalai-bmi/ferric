@@ -49,6 +49,11 @@ async fn run() {
         Qwen3::load(&ctx, &g).expect("load").forward(&ids).to_vec().await
     };
     let v = lg.len() / ids.len();
+    // LM_LOGITS_DUMP=<path>: every row, raw little-endian f32 [T, V] — for full-vocabulary metrics
+    // (KL, top-k) that the fixture's 128-id sample cannot give.
+    if let Ok(p) = std::env::var("LM_LOGITS_DUMP") {
+        std::fs::write(&p, lg.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).expect("dump");
+    }
     for t in 0..ids.len() {
         let r = &lg[t * v..(t + 1) * v];
         let (mut best, mut bv) = (0usize, f32::NEG_INFINITY);

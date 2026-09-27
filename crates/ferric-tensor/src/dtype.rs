@@ -8,6 +8,18 @@ use ferric_core::Context;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+/// The Metal-4 tensor-unit prefill route (opt-in `FERRIC_QGEMM`, see `native_qgemm`): a multi-row
+/// `x·Wᵀ` on the matrix units straight from the packed blocks. Returns from the enclosing matmul
+/// when it fires; otherwise falls through to the portable kernel untouched.
+macro_rules! native_qgemm_route {
+    ($x:expr, $codes:expr, $aux:expr, $w:expr, $fmt:ident) => {
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if let Some(t) = crate::native_qgemm::qmm(&$x, &$codes, &$aux, $w.rows, $w.cols, crate::native_qgemm::QFmt::$fmt) {
+            return t;
+        }
+    };
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DType {
     F16,
@@ -1247,6 +1259,14 @@ impl Tensor {
                 QShard::Q4_K(sh) => return Some(self.matmul_q4_k_swiglu(sh)),
                 QShard::Q5_K(sh) => return Some(self.matmul_q5_k_swiglu(sh)),
                 QShard::Q6_K(sh) => return Some(self.matmul_q6_k_swiglu(sh)),
+                // No portable fused Q8_0 kernel exists (the caller's matmul + swiglu is the portable
+                // path), so this arm answers only when the tensor-unit route takes the op.
+                #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+                QShard::Q8_0(sh) => {
+                    if let Some(y) = crate::native_qgemm::qmm_swiglu(self, &sh.codes, &sh.scales, sh.rows, sh.cols, crate::native_qgemm::QFmt::Q8_0) {
+                        return Some(y);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1695,6 +1715,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        native_qgemm_route!(x, w.codes, w.aux, w, Q6K);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (lanes, opw) = splitk_lanes_wide(inn / 256);
@@ -2039,6 +2060,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        native_qgemm_route!(x, w.codes, w.scales, w, Q8_0);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
@@ -2221,6 +2243,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        native_qgemm_route!(x, w.codes, w.aux, w, Q4K);
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (lanes, opw) = splitk_lanes_wide(inn / 256);
@@ -2355,6 +2378,11 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
         let n_ff = w.rows / 2;
+        // Prefill on the tensor units (opt-in FERRIC_QGEMM): the same fusion, as a GEMM epilogue.
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if let Some(y) = crate::native_qgemm::qmm_swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q4K) {
+            return y;
+        }
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
         // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
@@ -2621,6 +2649,10 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
         let n_ff = w.rows / 2;
+        #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+        if let Some(y) = crate::native_qgemm::qmm_swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q6K) {
+            return y;
+        }
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
         // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
@@ -6888,5 +6920,29 @@ mod shader_valid {
         check("stq1_0 vec4+table", MATMUL_STQ1_0_V4T_WGSL);
         check("iq2_xxs", &matmul_iq2_xxs_wgsl());
         check("iq3_xxs", &matmul_iq3_xxs_wgsl());
+    }
+}
+
+/// The tensor-unit kernels with the opt-in and row-count gates bypassed — the hermetic seam
+/// `native_qgemm`'s tests use (an env var is process-wide and would reroute every other test).
+#[cfg(all(test, target_os = "macos", not(target_arch = "wasm32")))]
+impl Tensor {
+    pub(crate) fn native_qmm_q8_0(&self, w: &Q8_0Weights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.scales, w.rows, w.cols, crate::native_qgemm::QFmt::Q8_0, false)
+    }
+    pub(crate) fn native_qmm_q4_k(&self, w: &Q4_KWeights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q4K, false)
+    }
+    pub(crate) fn native_qmm_swiglu_q8_0(&self, w: &Q8_0Weights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.scales, w.rows, w.cols, crate::native_qgemm::QFmt::Q8_0, true)
+    }
+    pub(crate) fn native_qmm_swiglu_q4_k(&self, w: &Q4_KWeights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q4K, true)
+    }
+    pub(crate) fn native_qmm_swiglu_q6_k(&self, w: &Q6_KWeights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q6K, true)
+    }
+    pub(crate) fn native_qmm_q6_k(&self, w: &Q6_KWeights) -> Option<Tensor> {
+        crate::native_qgemm::qmm_unchecked(self, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q6K, false)
     }
 }
