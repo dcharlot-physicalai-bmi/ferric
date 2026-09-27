@@ -42,7 +42,18 @@
 //! None of the tested models comes near it, and the conformance gate refuses non-finite logits, but a
 //! model with larger activations must be gated before this route is trusted on it.
 //!
-//! What it buys: `examples/qgemm_bench.rs` (kernel) and `examples/prefill_bench.rs` (model).
+//! What it buys (M5 Max, a machine shared with other GPU jobs — ranges; tools: `examples/qgemm_bench.rs`,
+//! `examples/prefill_bench.rs`, `scripts/prefill_joules.sh`): Qwen2.5-0.5B Q8_0 prefills 512 tokens
+//! at ~7,900-10,000 tok/s against ~450-550 portable, and Qwen2.5-1.5B Q4_K_M at ~3,900 against ~145.
+//! GPU-rail energy per prompt token, where the idle-gap guard let a whole run through: 0.5B Q8_0 at
+//! 2,048 tokens 3.6 mJ vs 35.1 portable; 1.5B Q4_K_M at 128 tokens 8.0 mJ vs 139.5.
+//!
+//! Why not the other two designs. A one-time f16 copy of the weights costs 1.9x the memory of a Q8_0
+//! file and ~3.6x of Q4_K, and buys nothing: in-tile dequantization already runs the GEMM at 21-28
+//! TFLOP/s in isolation, the same band as `metal4.rs`'s dense f16 GEMM (23-31). The WGSL
+//! cooperative-matrix kernels (`FERRIC_COOP`, 8x8 f32 `coop_mat` -> `simdgroup_matrix`, the ALUs, not
+//! the matrix units) measured 1.5 / 0.8 TFLOP/s at the same Q8_0 / Q4_K shapes where this route does
+//! 5.0 / 11.7, and prefill 1,340-1,540 tok/s (0.5B Q8_0) and 223 (1.5B Q4_K_M) at 512 tokens.
 //!
 //! # Where it applies
 //!
