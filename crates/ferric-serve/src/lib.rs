@@ -1365,8 +1365,35 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
     let id = "chatcmpl-ferric";
     let has_tools = req["tools"].as_array().is_some_and(|t| !t.is_empty()) || !mcps.borrow().openai_tools().is_empty();
-    let streaming = req["stream"].as_bool().unwrap_or(false) && !has_tools;
+    let streaming = req["stream"].as_bool().unwrap_or(false);
     let usage = |r: &ChatResult| json!({"prompt_tokens": r.prompt_tokens, "completion_tokens": r.gen_tokens, "total_tokens": r.prompt_tokens + r.gen_tokens});
+    if streaming && has_tools {
+        // A tool call is parsed from the whole output, so the answer exists only at the end — but a client
+        // that asked for a stream must still get SSE (a JSON body breaks it). The tool calls go out as one
+        // delta, with the index/id/type/function shape streaming clients accumulate.
+        let r = run_chat(eng, mcps, &req, |_, _| {});
+        write_sse_headers(stream);
+        let chunk = |delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(),
+            "model": eng.name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+        send_sse(stream, &chunk(json!({"role": "assistant"}), Value::Null));
+        match &r {
+            Err(e) => send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})),
+            Ok(r) if !r.tool_calls.is_empty() => {
+                let calls: Vec<Value> = r.tool_calls.iter().enumerate().map(|(i, c)| json!({"index": i,
+                    "id": c["id"].as_str().map(String::from).unwrap_or_else(|| format!("call_{i}")), "type": "function",
+                    "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}})).collect();
+                send_sse(stream, &chunk(json!({"tool_calls": calls}), Value::Null));
+            }
+            Ok(r) => send_sse(stream, &chunk(json!({"content": r.text}), Value::Null)),
+        }
+        let finish = r.as_ref().map(|r| r.finish).unwrap_or("stop");
+        send_sse(stream, &chunk(json!({}), json!(finish)));
+        if let (Ok(r), true) = (&r, req["stream_options"]["include_usage"].as_bool() == Some(true)) {
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [], "usage": usage(r)}));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        return;
+    }
     if streaming {
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
@@ -1409,11 +1436,28 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.enc(prompt_text, true));
     let max = match eng.budget(ids.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+    let cid = format!("cmpl-ferric-{}", ids.len());
+    if req["stream"].as_bool() == Some(true) {
+        write_sse_headers(stream);
+        let out = eng.generate(&ids, max, &opts, None, |delta, lps| {
+            let mut ch = json!({"index": 0, "text": delta, "finish_reason": Value::Null});
+            if opts.logprobs { ch["logprobs"] = logprobs_field(false, lps); }
+            send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name, "choices": [ch]}));
+        });
+        send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name,
+            "choices": [{"index": 0, "text": "", "finish_reason": out.finish}]}));
+        if req["stream_options"]["include_usage"].as_bool() == Some(true) {
+            send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name, "choices": [],
+                "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}}));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        return;
+    }
     let out = eng.generate(&ids, max, &opts, None, |_, _| {});
     let mut choice = json!({"index": 0, "text": out.text, "finish_reason": out.finish});
     if opts.logprobs { choice["logprobs"] = logprobs_field(false, &out.logprobs); }
     write_json(stream, 200, &json!({
-        "id": format!("cmpl-ferric-{}", ids.len()), "object": "text_completion", "created": now_unix(), "model": eng.name,
+        "id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name,
         "choices": [choice],
         "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}
     }));
