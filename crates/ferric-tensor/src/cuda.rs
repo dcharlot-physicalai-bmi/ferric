@@ -1296,6 +1296,82 @@ mod tests {
         attn(32, 8, 64, 4500, 36);
     }
 
+    /// **The tensor-core GEMM, every format**, against an f64 host GEMM on the SAME f16-rounded inputs:
+    /// A rounded f32 -> f16 and each dequantised weight rounded f32 -> f16 on the host, exactly as the
+    /// kernel feeds `mma.sync`, so what remains is accumulation order and the gate can be tight. The
+    /// unrounded f64 product is printed beside it — that gap is the f16 numerics trade, measured.
+    /// M = 70 and N = 100 are not multiples of the 64x64 tile, so the edge guards are exercised.
+    #[test]
+    fn prefill_gemm_every_format_matches_f16_rounded_f64_host() {
+        let Some(ctx) = ctx_or_skip("prefill_gemm_every_format_matches_f16_rounded_f64_host") else { return };
+        let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
+        let h16 = |v: f32| half::f16::from_f32(v).to_f32() as f64;
+        for (ci, &(f, k)) in [(QFmt::Q4K, 512usize), (QFmt::Q5K, 512), (QFmt::Q6K, 512), (QFmt::Q8_0, 896), (QFmt::Q5_0, 896), (QFmt::Q8_0, 96), (QFmt::Q5_0, 96)].iter().enumerate() {
+            let (m, n) = (70usize, 100usize);
+            let bytes = q_fixture(f, n, k, 0xF00D + ci as u64);
+            let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).expect("qmatrix");
+            let w = qm.native_weight().expect("mirror");
+            let a: Vec<f32> = rnd(m * k, 77 + ci as u64).iter().map(|v| v * 2.0).collect();
+            let rb = bytes.len() / n;
+            let wrows: Vec<Vec<f32>> = (0..n).map(|o| ferric_gguf::deq_raw(&bytes[o * rb..(o + 1) * rb], k, f.ggml_type()).unwrap()).collect();
+            let (mut want, mut exact, mut mag) = (vec![0f64; m * n], vec![0f64; m * n], 0f64);
+            for i in 0..m { for o in 0..n {
+                let (mut s, mut x, mut g) = (0f64, 0f64, 0f64);
+                for j in 0..k { let (av, wv) = (a[i * k + j], wrows[o][j]);
+                    s += h16(av) * h16(wv); x += av as f64 * wv as f64; g += (h16(av) * h16(wv)).abs(); }
+                want[i * n + o] = s; exact[i * n + o] = x; mag = mag.max(g);
+            } }
+            let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+            assert!(unsafe { launch_gemm(drv, &pk, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
+            let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
+            let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
+            unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+            let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
+            let tol = 1e-5 * mag;
+            eprintln!("{f:?} gemm {m}x{n}x{k}: max|Δ| vs f16-rounded f64 {dr:.3e} (tol {tol:.3e})   vs unrounded f64 {dx:.3e}   Σ|a·w| {mag:.3e}");
+            assert!(flag[0].to_bits() == 0, "{f:?}: overflow flag raised on in-range inputs");
+            assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?}: tensor-core GEMM diverges from the f16-rounded f64 host GEMM");
+        }
+        // The f16-range guard: one activation past 65504 must raise the flag (the host then runs WGSL).
+        let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);
+        let bytes = q_fixture(f, n, k, 5);
+        let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).unwrap();
+        let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
+        let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+        assert!(unsafe { launch_gemm(drv, &pk, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
+        let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
+        assert!(flag[0].to_bits() != 0, "an activation of 7e4 did NOT raise the f16 overflow flag");
+    }
+
+    /// Causal prefill attention with a cache offset (`pos` earlier rows), GQA, row counts that leave
+    /// part-empty 16-row query tiles and 32-row key tiles, against an f64 softmax.
+    #[test]
+    fn prefill_attention_matches_f64_causal_softmax() {
+        if driver().is_none() { eprintln!("SKIPPED prefill_attention_matches_f64_causal_softmax: no CUDA driver / FERRIC_CUDA unset."); return; }
+        let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
+        for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3)] {
+            let (qw, kw) = (nh * dh, nkv * dh); let s = pos + t;
+            let (q, kc, vc) = (rnd(t * qw, 1 + t as u64), rnd(s * kw, 2 + s as u64), rnd(s * kw, 3 + s as u64));
+            let mut want = vec![0f64; t * qw];
+            for i in 0..t { for h in 0..nh {
+                let kvh = h / (nh / nkv);
+                let sc: Vec<f64> = (0..=pos + i).map(|j| (0..dh).map(|e| q[i * qw + h * dh + e] as f64 * kc[j * kw + kvh * dh + e] as f64).sum::<f64>() / (dh as f64).sqrt()).collect();
+                let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+                let z: f64 = sc.iter().map(|v| (v - mx).exp()).sum();
+                for (j, v) in sc.iter().enumerate() { let p = (v - mx).exp() / z;
+                    for e in 0..dh { want[i * qw + h * dh + e] += p * vc[j * kw + kvh * dh + e] as f64; } }
+            } }
+            let (mut qd, mut kd, mut vd, mut od) = (drv.upload_f32(&q).unwrap(), drv.upload_f32(&kc).unwrap(), drv.upload_f32(&vc).unwrap(), drv.alloc(t * qw * 4).unwrap());
+            let (mut a, mut b, mut c, mut tt, mut pp, mut scl) = (nh as u32, nkv as u32, dh as u32, t as u32, pos as u32, 1.0f32 / (dh as f32).sqrt());
+            assert!(unsafe { drv.launch2(pk.attn_prefill, (t as u32).div_ceil(16), nh as u32, 128, &mut p!(qd, kd, vd, od, a, b, c, tt, pp, scl)) } && drv.sync());
+            let mut got = vec![0f32; t * qw]; assert!(drv.dtoh(&mut got, od));
+            unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
+            let d = max_abs_diff(&got, &want);
+            eprintln!("attn_prefill nh={nh} nkv={nkv} dh={dh} T={t} pos={pos}: max|Δ| vs f64 {d:.3e}");
+            assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "attn_prefill diverges from the f64 causal softmax by {d:.3e}");
+        }
+    }
+
     /// The device K/V grows by doubling and CARRIES its rows: write, grow twice, read back bit-exact.
     #[test]
     fn devkv_growth_carries_rows() {

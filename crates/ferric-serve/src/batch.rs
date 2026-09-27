@@ -107,7 +107,7 @@ pub(crate) trait ServeModel {
     /// Count a generation abandoned by its client.
     fn cancelled(&self) {}
     /// Offer a finished sequence's cache for prompt caching (`tokens` = prompt + generated).
-    fn remember(&self, _tokens: &[u32], _state: &Self::State) {}
+    fn remember(&self, _tokens: &[u32], _state: &mut Self::State) {}
     /// Count a finished generation.
     fn record(&self, _prompt: usize, _gen: usize, _energy: &Value) {}
     /// Close it and attribute its joules.
@@ -436,7 +436,7 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
 /// when the scheduler retired it at its token budget and `"stop"` for a stop token or stop string — the
 /// same rule as the serial path, so a batched response stays indistinguishable from a serial one.
 fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
-    if let Some(st) = g.state.as_ref() {
+    if let Some(st) = g.state.as_mut() {
         let fed: Vec<u32> = g.prompt.iter().chain(g.r#gen.iter()).copied().collect();
         m.remember(&fed, st);
     }
@@ -540,7 +540,7 @@ impl ServeModel for Engine {
     }
     fn energy_begin(&self) -> Option<crate::energy::Ticket> { self.energy.begin() }
     fn cancelled(&self) { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-    fn remember(&self, tokens: &[u32], state: &ModelCache) { Engine::remember(self, tokens, state) }
+    fn remember(&self, tokens: &[u32], state: &mut ModelCache) { Engine::remember(self, tokens, state) }
     fn record(&self, prompt: usize, generated: usize, energy: &Value) { self.metrics.record(prompt, generated, energy) }
     fn energy_end(&self, t: Option<crate::energy::Ticket>, tokens: usize) -> Value { self.energy.end(t, tokens) }
 }

@@ -138,13 +138,26 @@ if ARCH not in ("nemotron_h",):
 if "rope_freqs.weight" in NAMES: controls.append(("rope_freqs dropped", {"FERRIC_NO_ROPE_FREQS": "1"}))
 if "blk.0.attn_q.bias" in NAMES: controls.append(("q/k/v bias dropped", {"FERRIC_NO_QKV_BIAS": "1"}))
 if not controls: print("  ⛔ no negative control applies — this gate has shown nothing"); ok = False
+# DECODE-mode controls run on the fixture. FULL-mode controls run on a LONG PROMPT — 1024 positions, the
+# first 1000 one native prefill (two 512-row chunks) — because the prefill band is ~100x wider and some
+# mechanisms only act at distance: dropping Llama-3's rope_freqs moved a 136-token prompt by 0.46
+# (5x TOL_PF, which this gate refused), and 1024 positions by 2.40. The long run is also where the
+# chunked prefill is checked against WGSL at all.
 short = dict(total=len(ref["ids"]), chunk_at=10**9)
+longpf = dict(total=1024, prefill=1000, chunk_at=10**9)
+lw_pf, _, _, _ = run(False, **longpf)
+lc_pf, lps, _, _ = run(True, None, **longpf)
+dl, tl, sl = diff(lc_pf, lw_pf)
+print(f"  [FULL] 1000-row prefill (2 chunks) + 24 decode steps: native vs WGSL max |Δ| {dl:.3e} at {tl}   ssq rel {sl:.2e}   "
+      f"prompt rows {lps[1][0]}/{lps[1][1]} native   (tol {TOL_PF:g})")
+ok &= dl <= TOL_PF and lps[1][0] == lps[1][1] == 1000
 for name, env in controls:
     for mode, extra, tol in (("DECODE", {"FERRIC_CUDA_NO_PREFILL": "1"}, TOL_NW), ("FULL", {}, TOL_PF)):
-        xw, _, _, _ = run(False, env, **short)
-        xc, xs, _, _ = run(True, {**env, **extra}, **short)
+        cfg, base = (short, wr) if mode == "DECODE" else (longpf, lw_pf)
+        xw, _, _, _ = run(False, env, **cfg)
+        xc, xs, _, _ = run(True, {**env, **extra}, **cfg)
         same, _, _ = diff(xc, xw)
-        moved, _, _ = diff(xc, {t: wr[t] for t in xc})
+        moved, _, _ = diff(xc, {t: base[t] for t in xc})
         ran = xs[0][0] == xs[0][1] > 0 and xs[1][0] == (xs[1][1] if mode == "FULL" else 0)
         print(f"  control '{name}' [{mode}]: native vs WGSL-under-control {same:.2e} (tol {tol:g});  moved from normal "
               f"{moved:.2e} = {moved / tol:.0f}x tol;  ran natively: {ran}")

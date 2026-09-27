@@ -863,8 +863,14 @@ impl Engine {
     }
 
     /// Keep `tokens` (exactly the ones this cache has consumed) for later requests to reuse.
-    pub(crate) fn remember(&self, tokens: &[u32], cache: &ModelCache) {
+    ///
+    /// `&mut` because with the NVIDIA tier on (FERRIC_CUDA) the newest K/V rows can live only on the
+    /// device; they are brought into the WGSL store first. A snapshot without that would store a
+    /// SHORTER prefix than it is indexed under (`KvBuf::clone_prefix` clamps), and every later hit
+    /// would attend to a hole — `Cache::layers` now refuses rather than allow it.
+    pub(crate) fn remember(&self, tokens: &[u32], cache: &mut ModelCache) {
         if let (ModelCache::Dense(c), Some(pc)) = (cache, &self.prefix_cache) {
+            c.sync_native();
             let n = c.pos.min(tokens.len());
             pc.borrow_mut().insert(&self.ctx, &tokens[..n], c);
         }
@@ -955,7 +961,7 @@ impl Engine {
             if em.hit_stop { finish = "stop"; break; }
         }
         let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
-        self.remember(&fed, &cache);
+        self.remember(&fed, &mut cache);
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
