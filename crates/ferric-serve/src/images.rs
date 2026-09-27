@@ -205,7 +205,7 @@ mod tests {
         flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut json).unwrap();
         let r: serde_json::Value = serde_json::from_slice(&json).unwrap();
         let imgs = r["images"].as_object().unwrap();
-        assert_eq!(imgs.len(), 85, "the fixture set changed size: regenerate reference.json.gz with make_images.py");
+        assert_eq!(imgs.len(), 86, "the fixture set changed size: regenerate reference.json.gz with make_images.py");
         let mut failed = Vec::new();
         for (name, want) in imgs {
             let got = decode(&std::fs::read(format!("{dir}/{name}")).unwrap()).unwrap_or_else(|e| panic!("{name}: {e}"));

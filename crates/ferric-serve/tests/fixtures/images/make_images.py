@@ -69,6 +69,11 @@ save("exif3.jpg", base, quality=90, exif=exif3.tobytes())
 for q in (1, 50, 75, 95, 100):
     save(f"q{q}.jpg", base, quality=q)
 save("q100_444.jpg", base, quality=100, subsampling=0)
+# The exact JPEG on which the q92-vs-PIL answers of MiMo-Embodied-7B diverged at character 52 (5667ff5):
+# the authors' fixture image (crates/ferric-llama/tests/fixtures/qwen25vl/probe.ppm) saved at quality 92.
+# Pixel-equal decoding of THIS file is what makes that answer the authors' again.
+_here = os.path.dirname(os.path.abspath(__file__))
+save("probe_q92.jpg", Image.open(os.path.join(_here, "../../../../ferric-llama/tests/fixtures/qwen25vl/probe.ppm")).convert("RGB"), quality=92)
 save("q30_progressive.jpg", base, quality=30, progressive=True)
 save("q100_progressive.jpg", base, quality=100, progressive=True)
 save("optimized.jpg", base, quality=80, optimize=True)
