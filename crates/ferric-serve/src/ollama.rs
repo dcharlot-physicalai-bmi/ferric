@@ -180,6 +180,8 @@ fn to_openai(req: &Value) -> Result<Value, String> {
         v => return Err(format!("`format` must be \"json\" or a JSON Schema object, got {v}")),
     }
     if let Some(t) = req["tools"].as_array() { r["tools"] = json!(t); }
+    // Ollama's `think` is the template's `enable_thinking` (Qwen3 and its descendants read it).
+    if let Some(b) = req["think"].as_bool() { r["chat_template_kwargs"] = json!({"enable_thinking": b}); }
     Ok(r)
 }
 

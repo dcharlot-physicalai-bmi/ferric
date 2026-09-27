@@ -29,3 +29,8 @@ ferric-agent = { path = "../ferric-agent", version = "0.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 pollster = "0.4"
+# The model's own chat template (Jinja), rendered as Hugging Face's apply_chat_template renders it. Vendored
+# like every other dependency. `pycompat` adds the Python str/dict methods HF templates call (.strip(),
+# .startswith(), .items()); `loop_controls` is jinja2.ext.loopcontrols, which HF enables.
+minijinja = { version = "2.24", default-features = false, features = ["builtins", "loop_controls", "macros", "serde", "preserve_order", "adjacent_loop_items", "std_collections", "deserialization", "json"] }
+minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }

@@ -304,6 +304,8 @@ fn route<M: ServeModel>(
                 None => return bad(&mut j.stream, "`prompt` must be a string (arrays of prompts and token arrays are not accepted here)"),
             }
         };
+        // Same debug hook as the serial path: the ids the model will actually see, replayable elsewhere.
+        if std::env::var("FERRIC_DUMP_IDS").is_ok() { eprintln!("prompt ids ({}): {:?}", prompt.len(), prompt); }
         let max_tokens = match m.budget(prompt.len(), gopts.max_tokens) { Ok(n) => n, Err(e) => return bad(&mut j.stream, &e) };
         let streaming = chat && req["stream"].as_bool().unwrap_or(false);
         if streaming {

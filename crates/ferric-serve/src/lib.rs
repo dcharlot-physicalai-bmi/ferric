@@ -40,6 +40,7 @@ mod mcp;
 mod batch;
 mod genopts;
 mod ollama;
+pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};
 use ferric_core::Context;
@@ -266,6 +267,9 @@ pub(crate) struct Engine {
     embedder: Option<(String, ferric_llama::bert::Embedder, ollama::Card)>,
     /// What `/api/tags` and `/api/show` report about the chat model.
     card: ollama::Card,
+    /// The GGUF's own chat template, compiled — `None` only when it is absent or will not compile, and
+    /// then the family heuristic below is the fallback (with a warning at load).
+    chat_template: Option<template::ChatTemplate>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -306,6 +310,9 @@ pub(crate) struct Engine {
     /// (special-token string, id), longest first — for special-token-aware tokenization of a
     /// rendered chat template (so `<|im_start|>` etc. encode to their id, not BPE'd text).
     specials: Vec<(String, u32)>,
+    /// Special tokens after which the authors' tokenizer strips whitespace (`AddedToken(rstrip=True)`). A
+    /// GGUF does not record the flag; it is restored from the authors' `tokenizer.json` per family.
+    rstrip_after: std::collections::HashSet<u32>,
     /// The GGUF `chat_template` string (used only to detect the model's template family).
     template: String,
     /// One-slot prompt-prefix cache (hybrid speculative path): the last request's fed tokens plus
@@ -521,8 +528,22 @@ impl Engine {
         // Absent is not "unlimited": 4096 is a conservative bound for a file that does not say, and the
         // error it produces names the number so a caller can see why.
         let n_ctx = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
+        // Phi-3 / 3.5: microsoft/Phi-3.5-mini-instruct's tokenizer.json marks every `<|…|>` added token
+        // rstrip=True except `<|endoftext|>`, so "<|user|>\nHi" tokenises as "<|user|>Hi". Without this a
+        // two-turn prompt was 36 tokens where the authors' tokenizer gives 26 (checked against HF
+        // apply_chat_template). llama.cpp restores the same flag by model name.
+        let rstrip_after: std::collections::HashSet<u32> = if arch == "phi3" {
+            specials.iter().filter(|(t, _)| t.starts_with("<|") && t.ends_with("|>") && t != "<|endoftext|>").map(|(_, i)| *i).collect()
+        } else { Default::default() };
         let card = ollama::Card::from_gguf(&name, path, &g, false, model.n_embd(), n_ctx, &template);
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, n_ctx }
+        let tok_str = |id: Option<u32>| id.and_then(|i| tokens.get(i as usize).cloned()).unwrap_or_default();
+        let chat_template = if template.is_empty() { None } else {
+            match template::ChatTemplate::compile(&template, &tok_str(bos_id), &tok_str(eos_id)) {
+                Ok(t) => Some(t),
+                Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
+            }
+        };
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -546,12 +567,18 @@ impl Engine {
                 }
             }
             match best {
+                // Every text fragment here starts the string or follows a special token, and a
+                // SentencePiece model that adds a space prefix adds it to EACH such fragment: the authors'
+                // legacy normalizer is `Prepend("▁")` per segment (microsoft/Phi-3.5-mini-instruct's
+                // tokenizer.json), and llama.cpp's SPM tokenizer does the same (`is_prev_special`). Only
+                // the first got it before, so "<|system|>You" encoded as `You` where the authors write `▁You`.
                 Some((pos, s, id)) => {
-                    if pos > 0 { let p = ids.is_empty(); ids.extend(self.enc(&rest[..pos], p)); }
+                    if pos > 0 { ids.extend(self.enc(&rest[..pos], true)); }
                     ids.push(id);
                     rest = &rest[pos + s.len()..];
+                    if self.rstrip_after.contains(&id) { rest = rest.trim_start(); }
                 }
-                None => { let p = ids.is_empty(); ids.extend(self.enc(rest, p)); break 'outer; }
+                None => { ids.extend(self.enc(rest, true)); break 'outer; }
             }
         }
         ids
@@ -660,11 +687,34 @@ impl Engine {
     }
 
     fn chat_ids(&self, messages: &[Value]) -> Result<Vec<u32>, String> {
+        self.chat_ids_with(messages, None, &Default::default())
+    }
+
+    /// Whether `tools` go to the model's own template (it reads them) rather than into a Hermes system
+    /// prompt of Ferric's making.
+    pub(crate) fn template_handles_tools(&self) -> bool { self.chat_template.as_ref().is_some_and(|t| t.handles_tools) }
+
+    /// The prompt for a conversation: the model's OWN chat template when the file carries one (rendered
+    /// as Hugging Face renders it — see `template`), with `tools` and `chat_template_kwargs`
+    /// (`enable_thinking`, …) passed through; the vocabulary-family heuristic only when it does not.
+    pub(crate) fn chat_ids_with(&self, messages: &[Value], tools: Option<&[Value]>,
+                                kwargs: &serde_json::Map<String, Value>) -> Result<Vec<u32>, String> {
         // ⛔ An OpenAI content-part array used to read as "" here (`as_str()` on an array), so the model
         // answered a prompt with the user's words missing. Parts are read, and a part this path cannot
         // feed (an image) is refused by name.
         for (i, m) in messages.iter().enumerate() {
             genopts::content_text(&m["content"]).map_err(|e| format!("messages[{i}]: {e}"))?;
+        }
+        if let Some(t) = &self.chat_template {
+            // Templates read `content` as a string, and tool-call `arguments` as an object (OpenAI clients
+            // send a JSON string; vLLM parses it the same way before templating).
+            let msgs: Vec<Value> = messages.iter().map(|m| prepare_for_template(m)).collect();
+            let text = t.render(&msgs, tools, true, kwargs)?;
+            let mut ids = self.encode_special(&text);
+            if self.spm.is_some() && self.add_bos {
+                if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
+            }
+            return Ok(ids);
         }
         if !self.has_chat_family() {
             // No recognized chat family in the vocab → a base model — plain concatenation.
@@ -992,6 +1042,32 @@ impl Engine {
     }
 }
 
+/// A message as a chat template expects it: `content` as text, and tool-call `arguments` as an object
+/// (OpenAI clients send a JSON string; vLLM parses it the same way before templating). Adds NO key the
+/// message did not have.
+///
+/// ⛔ The first version wrote `m["tool_calls"].as_array_mut()`, and serde_json's `IndexMut` INSERTS a
+/// missing key as `null`: every message gained `"tool_calls": null`, Llama-3.2's template read
+/// `'tool_calls' in message` as true, and every conversation failed with "cannot calculate length of
+/// value of type none". The template-vs-HF harness could not see it (it bypasses this step); comparing
+/// the served token ids with HF's `apply_chat_template` did.
+fn prepare_for_template(m: &Value) -> Value {
+    let mut m = m.clone();
+    if m.get("content").is_some() {
+        m["content"] = json!(genopts::content_text(&m["content"]).unwrap_or_default());
+    }
+    if let Some(calls) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+        for c in calls {
+            if let Some(f) = c.get_mut("function") {
+                if let Some(a) = f.get("arguments").and_then(|a| a.as_str()).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                    f["arguments"] = a;
+                }
+            }
+        }
+    }
+    m
+}
+
 fn now_unix() -> u64 { 1_700_000_000 } // static stamp (no wall clock needed for the API contract)
 
 /// Resolve a model spec to a local GGUF path. Accepts a local file, or a HuggingFace ref
@@ -1315,13 +1391,16 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
     tools.extend(mcps.borrow().openai_tools());
 
+    let kwargs = req["chat_template_kwargs"].as_object().cloned().unwrap_or_default();
+    let via_template = eng.template_handles_tools();
+    let tools_arg = (via_template && !tools.is_empty()).then_some(tools.as_slice());
     if !tools.is_empty() {
-        inject_tools(&mut messages, &tools);
+        if !via_template { inject_tools(&mut messages, &tools); }
         // Server-side agent loop: generate → parse tool_calls → execute the MCP-owned ones and feed
         // results back → repeat. Non-MCP tool calls are returned to the client (standard OpenAI flow).
         let (mut ptok, mut gtok) = (0usize, 0usize);
         for _round in 0..4 {
-            let prompt = eng.chat_ids(&messages)?;
+            let prompt = eng.chat_ids_with(&messages, tools_arg, &kwargs)?;
             let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
@@ -1350,7 +1429,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
         else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
         else { None };
-    let prompt = eng.chat_ids(&messages)?;
+    let prompt = eng.chat_ids_with(&messages, None, &kwargs)?;
     let max = eng.budget(prompt.len(), opts.max_tokens)?;
     let out = eng.generate(&prompt, max, &opts, guide, |d, l| on_delta(d, l));
     Ok(ChatResult { text: out.text, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
@@ -1534,6 +1613,17 @@ mod tests {
     /// output, which is exactly the failure class that survives "curl it and look".
     /// `encoding_format: "base64"` is what the official OpenAI Python client asks for by default; a
     /// wrong encoder returns vectors that decode to different floats with no error.
+    #[test]
+    fn preparing_a_message_for_the_template_adds_no_key() {
+        let m = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let p = super::prepare_for_template(&m);
+        assert_eq!(p, serde_json::json!({"role": "user", "content": "hi"}));
+        assert!(p.get("tool_calls").is_none(), "a missing key must stay missing, or `'tool_calls' in message` is true");
+        let tc = serde_json::json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{\"a\": 1}"}}]});
+        assert_eq!(super::prepare_for_template(&tc)["tool_calls"][0]["function"]["arguments"]["a"], 1);
+    }
+
     #[test]
     fn base64_embeddings_are_little_endian_f32() {
         // 1.0f32 = 00 00 80 3F; -2.0f32 = 00 00 00 C0  →  "AACAPwAAAMA="

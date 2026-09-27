@@ -1,0 +1,16 @@
+[
+  {"name": "user", "messages": [{"role": "user", "content": "What is the capital of France?"}], "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "system+user", "messages": [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Name a colour."}], "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "multi-turn", "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello! How can I help?"}, {"role": "user", "content": "Tell me a joke."}], "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "tools", "messages": [{"role": "system", "content": "You can call tools."}, {"role": "user", "content": "Weather in Paris?"}],
+   "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}}, "required": ["city"]}}}],
+   "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "tool-round-trip", "messages": [{"role": "user", "content": "Weather in Paris?"},
+     {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]},
+     {"role": "tool", "tool_call_id": "call_0", "name": "get_weather", "content": "{\"temp_c\": 21, \"sky\": \"clear\"}"}],
+   "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+   "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "no-thinking", "messages": [{"role": "user", "content": "2+2?"}], "kwargs": {"enable_thinking": false, "date_string": "26 Jul 2024"}},
+  {"name": "no-generation-prompt", "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello."}], "add_generation_prompt": false, "kwargs": {"date_string": "26 Jul 2024"}},
+  {"name": "unicode", "messages": [{"role": "user", "content": "Café «quoted» \"double\"\nnew line — ü 你好"}], "kwargs": {"date_string": "26 Jul 2024"}}
+]
