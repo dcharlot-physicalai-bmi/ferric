@@ -83,8 +83,13 @@ pub(crate) fn attribute(samples: &[ferric_joule::MacmonSample], windows: &[(f64,
     let inside: Vec<&ferric_joule::MacmonSample> = samples.iter().filter(|s| s.t >= t0 && s.t <= t1).collect();
     let before = samples.iter().rev().find(|s| s.t < t0);
     let after = samples.iter().find(|s| s.t > t1);
-    if inside.len() + (before.is_some() as usize) + (after.is_some() as usize) < 2 {
-        return json!({"joules": null, "why": format!("{secs:.3} s is shorter than the meter can resolve (100 ms samples)")});
+    // Fewer than three samples inside the window is below what 100 ms sampling resolves: a live 0.1 s
+    // request came out at −0.004 J, noise around the idle baseline. It is reported as unresolved, with
+    // the gross window, rather than as a number that means nothing.
+    if inside.len() < 3 || before.is_none() {
+        let gross = inside.first().map(|s| (s.gpu + s.ram) * secs);
+        return json!({"joules": null, "window_joules": gross.map(|g| (g * 1000.0).round() / 1000.0), "seconds": (secs * 1000.0).round() / 1000.0,
+                      "why": format!("{secs:.3} s spans {} meter samples — too short to resolve at 100 ms", inside.len())});
     }
     let span: Vec<&ferric_joule::MacmonSample> = before.into_iter().chain(inside.iter().copied()).chain(after).collect();
     if let Some(bad) = span.iter().find(|s| s.cpu.max(s.gpu).max(s.ram).max(s.sys) > CEILING_W) {
@@ -172,14 +177,21 @@ mod tests {
     }
 
     #[test]
+    fn a_window_under_three_samples_is_unresolved_not_a_number() {
+        let tr: Vec<_> = (0..120).map(|i| s(i as f64 * 0.1, 1.0)).collect();
+        let v = attribute(&tr, &[(10.02, 10.17)], 10.02, 10.17, 3);
+        assert!(v["joules"].is_null() && v["why"].as_str().unwrap().contains("too short"), "{v}");
+    }
+
+    #[test]
     fn a_glitch_sample_voids_the_figure_and_no_baseline_leaves_it_null() {
         let mut tr: Vec<_> = (0..100).map(|i| s(i as f64 * 0.1, 1.0)).collect();
         tr.push(s(10.05, 18_779.0));
         tr.extend((1..=10).map(|i| s(10.05 + i as f64 * 0.1, 11.0)));
         let v = attribute(&tr, &[(10.0, 11.0)], 10.0, 11.0, 5);
         assert!(v["joules"].is_null() && v["why"].as_str().unwrap().contains("glitch"), "{v}");
-        let fresh: Vec<_> = (0..12).map(|i| s(i as f64 * 0.1, 11.0)).collect();
-        let v = attribute(&fresh, &[(0.0, 1.1)], 0.0, 1.1, 5);
+        let fresh: Vec<_> = (0..14).map(|i| s(i as f64 * 0.1, 11.0)).collect();
+        let v = attribute(&fresh, &[(0.05, 1.15)], 0.05, 1.15, 5);
         assert!(v["joules"].is_null() && v["window_joules"].as_f64().unwrap() > 0.0, "{v}");
     }
 }

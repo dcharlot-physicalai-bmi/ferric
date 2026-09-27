@@ -104,6 +104,10 @@ pub(crate) trait ServeModel {
     fn serial_generation(&self) -> bool { false }
     /// Open a request's energy window (see `energy`); the default meters nothing.
     fn energy_begin(&self) -> Option<crate::energy::Ticket> { None }
+    /// Count a generation abandoned by its client.
+    fn cancelled(&self) {}
+    /// Count a finished generation.
+    fn record(&self, _prompt: usize, _gen: usize, _energy: &Value) {}
     /// Close it and attribute its joules.
     fn energy_end(&self, _t: Option<crate::energy::Ticket>, _tokens: usize) -> Value { Value::Null }
 }
@@ -177,6 +181,8 @@ struct Gen<S> {
     include_usage: bool,
     /// Energy window, opened when the sequence is admitted (prefill) and closed when it retires.
     ticket: Option<crate::energy::Ticket>,
+    /// The client went away: stop generating for it and free the slot on the next step.
+    gone: bool,
     state: Option<S>,
     /// The token to feed on the next decode step.
     next: u32,
@@ -200,9 +206,9 @@ impl<S> Gen<S> {
         if self.streaming {
             let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
             if self.opts.logprobs { ch["logprobs"] = json!({"content": &self.logprobs[self.lp_sent..]}); }
-            send_sse(&mut self.stream, &json!({
+            if !send_sse(&mut self.stream, &json!({
                 "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
-                "model": m.name(), "choices": [ch]}));
+                "model": m.name(), "choices": [ch]})) { self.gone = true; }
         }
         self.lp_sent = self.logprobs.len();
     }
@@ -343,7 +349,7 @@ fn route<M: ServeModel>(
             em: Emitter::new(&gopts.stop),
             include_usage: req["stream_options"]["include_usage"].as_bool() == Some(true),
             opts: gopts,
-            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, state: None, next: 0,
+            prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, gone: false, state: None, next: 0,
         });
         return;
     }
@@ -402,7 +408,14 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
             let g = &mut gens[i];
             let lrow = &logits[row * nv..(row + 1) * nv];
             match m.pick(lrow, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
-                Some(t) if !m.is_stop(t) => { g.next = t; let hit = g.commit(m, t, lrow); rec.push((g.id, t, hit)); }
+                Some(t) if !m.is_stop(t) => {
+                    g.next = t;
+                    let hit = g.commit(m, t, lrow);
+                    // A client that disconnected (a failed stream write, or a closed socket seen every 16
+                    // tokens for a non-streaming one) stops holding a batch slot.
+                    if !g.gone && !g.streaming && g.r#gen.len() % 16 == 0 && crate::peer_closed(&g.stream) { g.gone = true; }
+                    rec.push((g.id, t, hit || g.gone));
+                }
                 _ => rec.push((g.id, 0, true)),
             }
         }
@@ -421,11 +434,17 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
 /// when the scheduler retired it at its token budget and `"stop"` for a stop token or stop string — the
 /// same rule as the serial path, so a batched response stays indistinguishable from a serial one.
 fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
+    if g.gone {
+        m.cancelled();
+        let _ = m.energy_end(g.ticket.take(), g.r#gen.len());
+        return;
+    }
     let reason = if g.em.hit_stop || !matches!(why, Done::Length) { "stop" } else { "length" };
     if let Some(d) = g.em.flush() { g.send_delta(m, &d); }
     let (ptok, gtok) = (g.prompt.len(), g.r#gen.len());
     let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
     let energy = m.energy_end(g.ticket.take(), gtok);
+    m.record(ptok, gtok, &energy);
     if g.streaming {
         send_sse(&mut g.stream, &json!({
             "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
@@ -514,6 +533,8 @@ impl ServeModel for Engine {
         matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err()
     }
     fn energy_begin(&self) -> Option<crate::energy::Ticket> { self.energy.begin() }
+    fn cancelled(&self) { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    fn record(&self, prompt: usize, generated: usize, energy: &Value) { self.metrics.record(prompt, generated, energy) }
     fn energy_end(&self, t: Option<crate::energy::Ticket>, tokens: usize) -> Value { self.energy.end(t, tokens) }
 }
 
@@ -731,6 +752,28 @@ mod tests {
         assert!(b.contains("image_url"), "the refusal must name the part: {b}");
         let (c, b) = request(&addr, "POST", "/v1/completions", &json!({"prompt": "x", "n": 3}).to_string());
         assert_eq!(c, 400, "n=3 must be refused, not answered with one choice: {b}");
+    }
+
+    /// A client that disconnects mid-stream frees its batch slot. With ONE slot and a 5000-token request
+    /// abandoned after its first chunk, the next request would otherwise wait out ~10 s of decode steps
+    /// generated for nobody.
+    #[test]
+    fn a_disconnected_client_frees_its_slot() {
+        let mut m = Mock::new(true);
+        m.step_delay = Duration::from_millis(2);
+        let addr = spawn(m, 1);
+        {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            let body = json!({"messages": [{"role": "user", "content": "long"}], "max_tokens": 5000, "stream": true}).to_string();
+            s.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            let mut first = [0u8; 256];
+            let _ = s.read(&mut first);
+        } // dropped: the client is gone
+        let t0 = Instant::now();
+        let r = post(&addr, "/v1/completions", &json!({"prompt": "next", "max_tokens": 4}).to_string());
+        assert_eq!(text_of(&r).matches(',').count(), 4);
+        assert!(t0.elapsed() < Duration::from_secs(3),
+                "the next request waited {:?}: the abandoned one kept its slot", t0.elapsed());
     }
 
     /// A browser front-end sends OPTIONS before every JSON POST. It used to 404.

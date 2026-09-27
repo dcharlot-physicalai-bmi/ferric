@@ -280,6 +280,8 @@ pub(crate) struct Engine {
     pub(crate) energy: energy::Energy,
     /// Responses kept for the Responses API's `previous_response_id`.
     responses: dialects::ResponseStore,
+    /// Counters for `/metrics`.
+    pub(crate) metrics: Metrics,
     /// A speech recogniser for `/v1/audio/transcriptions`, from `--asr` / FERRIC_ASR_MODEL.
     pub(crate) asr: Option<(String, ferric_llama::parakeet::Parakeet)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
@@ -336,6 +338,28 @@ pub(crate) struct Engine {
     /// `<arch>.context_length`: the prompt plus everything generated must fit. A request with no
     /// `max_tokens` generates until a stop token or this limit, as OpenAI, llama-server and Ollama do.
     n_ctx: usize,
+}
+
+/// What `/metrics` exposes, in Prometheus text format.
+#[derive(Default)]
+pub(crate) struct Metrics {
+    pub requests: std::sync::atomic::AtomicU64,
+    pub prompt_tokens: std::sync::atomic::AtomicU64,
+    pub gen_tokens: std::sync::atomic::AtomicU64,
+    pub cancelled: std::sync::atomic::AtomicU64,
+    /// Attributed joules summed (only requests the meter could attribute), and how many were attributed.
+    pub joules: std::sync::Mutex<(f64, u64)>,
+    pub started: std::sync::OnceLock<std::time::Instant>,
+}
+
+impl Metrics {
+    pub fn record(&self, prompt: usize, generated: usize, energy: &Value) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.requests.fetch_add(1, Relaxed);
+        self.prompt_tokens.fetch_add(prompt as u64, Relaxed);
+        self.gen_tokens.fetch_add(generated as u64, Relaxed);
+        if let (Some(j), Ok(mut g)) = (energy["joules"].as_f64(), self.joules.lock()) { g.0 += j; g.1 += 1; }
+    }
 }
 
 /// One finished generation.
@@ -575,7 +599,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), asr, rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), metrics: Default::default(), asr, rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -823,6 +847,7 @@ impl Engine {
         let ticket = self.energy.begin();
         let mut out = self.generate_inner(prompt, max_tokens, opts, guide, on_delta);
         out.energy = self.energy.end(ticket, out.gen_tokens);
+        self.metrics.record(out.prompt_tokens, out.gen_tokens, &out.energy);
         out
     }
 
@@ -1208,8 +1233,10 @@ pub fn run() {
         return;
     }
     let resolved = resolve_model(path);
+    let _ = std::time::Instant::now(); // uptime starts when the model is loaded (set below)
     eprintln!("ferric-serve: loading {resolved} …");
     let eng = Engine::load(&resolved, name.clone());
+    let _ = eng.metrics.started.set(std::time::Instant::now());
     if let Some(i) = args.iter().position(|a| a == "--tokenize") {
         // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
         let text = args.get(i + 1).cloned().unwrap_or_default();
@@ -1264,6 +1291,9 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
         ("POST", "/v1/rerank") | ("POST", "/rerank") => rerank(eng, stream, body),
         ("POST", "/v1/audio/transcriptions") => audio::transcriptions(eng, body, headers, stream),
+        ("POST", "/tokenize") | ("POST", "/v1/tokenize") => tokenize(eng, body, stream),
+        ("POST", "/detokenize") | ("POST", "/v1/detokenize") => detokenize(eng, body, stream),
+        ("GET", "/metrics") => metrics(eng, stream),
         ("POST", "/v1/messages") => dialects::messages(eng, mcps, body, stream),
         ("POST", "/v1/messages/count_tokens") => dialects::count_tokens(eng, body, stream),
         ("POST", "/v1/responses") => dialects::responses(eng, mcps, &eng.responses, body, stream),
@@ -1394,6 +1424,65 @@ fn embeddings(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         "object": "list", "data": data, "model": name,
         "usage": {"prompt_tokens": total, "total_tokens": total}
     }));
+}
+
+/// `/tokenize` in both shapes clients use: llama-server's `{"content", "add_special", "with_pieces"}` and
+/// vLLM's `{"prompt" | "messages", "add_special_tokens"}` — a chat is tokenised through the model's own
+/// template, exactly as a chat request would be.
+fn tokenize(eng: &Engine, body: &[u8], stream: &mut TcpStream) {
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
+    let ids = if let Some(msgs) = req["messages"].as_array() {
+        match eng.chat_ids(msgs) { Ok(i) => i, Err(e) => return bad_request(stream, &e) }
+    } else {
+        let Some(text) = req["content"].as_str().or_else(|| req["prompt"].as_str()) else {
+            return bad_request(stream, "give `content` (llama-server), `prompt` or `messages` (vLLM)")
+        };
+        let special = req["add_special"].as_bool().or_else(|| req["add_special_tokens"].as_bool()).unwrap_or(false);
+        let mut ids = if special { Vec::new() } else { eng.encode_special(text) };
+        if special { ids = eng.encode_prompt(text); }
+        ids
+    };
+    let mut v = json!({"tokens": ids, "count": ids.len(), "max_model_len": eng.n_ctx});
+    if req["with_pieces"].as_bool() == Some(true) {
+        v["tokens"] = json!(ids.iter().map(|&i| json!({"id": i, "piece": eng.detok_all(&[i])})).collect::<Vec<_>>());
+    }
+    write_json(stream, 200, &v);
+}
+
+fn detokenize(eng: &Engine, body: &[u8], stream: &mut TcpStream) {
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
+    let Some(ids) = req["tokens"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|i| i as u32)).collect::<Vec<u32>>()) else {
+        return bad_request(stream, "`tokens` must be an array of ids")
+    };
+    if let Some(&bad) = ids.iter().find(|&&i| i as usize >= eng.tokens.len()) { return bad_request(stream, &format!("token id {bad} is outside the vocabulary")); }
+    let text = eng.detok_all(&ids);
+    write_json(stream, 200, &json!({"content": text, "prompt": text}));
+}
+
+/// Prometheus text format. `ferric_energy_joules_total` is the attributed joules of every request the meter
+/// could attribute — the counter no serving peer exports.
+fn metrics(eng: &Engine, stream: &mut TcpStream) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &eng.metrics;
+    let (j, jn) = m.joules.lock().map(|g| *g).unwrap_or((0.0, 0));
+    let up = m.started.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let esc = |x: &str| x.replace('\\', "\\\\").replace('"', "\\\"");
+    let body = format!(
+"# HELP ferric_requests_total Generations completed.\n# TYPE ferric_requests_total counter\nferric_requests_total {}\n\
+# HELP ferric_prompt_tokens_total Prompt tokens processed.\n# TYPE ferric_prompt_tokens_total counter\nferric_prompt_tokens_total {}\n\
+# HELP ferric_generation_tokens_total Tokens generated.\n# TYPE ferric_generation_tokens_total counter\nferric_generation_tokens_total {}\n\
+# HELP ferric_requests_cancelled_total Generations stopped because the client disconnected.\n# TYPE ferric_requests_cancelled_total counter\nferric_requests_cancelled_total {}\n\
+# HELP ferric_energy_joules_total Joules attributed to requests (accelerator rails, idle-subtracted; derived).\n# TYPE ferric_energy_joules_total counter\nferric_energy_joules_total {:.3}\n\
+# HELP ferric_energy_attributed_requests_total Requests whose joules the meter could attribute.\n# TYPE ferric_energy_attributed_requests_total counter\nferric_energy_attributed_requests_total {}\n\
+# HELP ferric_energy_meter_available Whether a power meter is running.\n# TYPE ferric_energy_meter_available gauge\nferric_energy_meter_available {}\n\
+# HELP ferric_context_length The loaded model's context.\n# TYPE ferric_context_length gauge\nferric_context_length {}\n\
+# HELP ferric_uptime_seconds Seconds since the server started.\n# TYPE ferric_uptime_seconds gauge\nferric_uptime_seconds {:.1}\n\
+# HELP ferric_model_info The loaded chat model.\n# TYPE ferric_model_info gauge\nferric_model_info{{model=\"{}\",arch=\"{}\"}} 1\n",
+        m.requests.load(Relaxed), m.prompt_tokens.load(Relaxed), m.gen_tokens.load(Relaxed), m.cancelled.load(Relaxed),
+        j, jn, eng.energy.available() as u8, eng.n_ctx, up, esc(&eng.name), esc(&eng.card.arch));
+    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.flush();
 }
 
 fn inject_tools(messages: &mut Vec<Value>, tools: &[Value]) {
@@ -1580,14 +1669,14 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
             "model": eng.name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
         send_sse(stream, &chunk(json!({"role": "assistant"}), Value::Null));
         match &r {
-            Err(e) => send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})),
+            Err(e) => { send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})); }
             Ok(r) if !r.tool_calls.is_empty() => {
                 let calls: Vec<Value> = r.tool_calls.iter().enumerate().map(|(i, c)| json!({"index": i,
                     "id": c["id"].as_str().map(String::from).unwrap_or_else(|| format!("call_{i}")), "type": "function",
                     "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}})).collect();
                 send_sse(stream, &chunk(json!({"tool_calls": calls}), Value::Null));
             }
-            Ok(r) => send_sse(stream, &chunk(json!({"content": r.text}), Value::Null)),
+            Ok(r) => { send_sse(stream, &chunk(json!({"content": r.text}), Value::Null)); }
         }
         let finish = r.as_ref().map(|r| r.finish).unwrap_or("stop");
         let mut last = chunk(json!({}), json!(finish));
@@ -1719,9 +1808,18 @@ fn write_sse_headers(stream: &mut TcpStream) {
     let _ = stream.flush();
 }
 
-fn send_sse(stream: &mut TcpStream, v: &Value) {
-    let _ = stream.write_all(format!("data: {}\n\n", v).as_bytes());
-    let _ = stream.flush();
+/// Returns false when the client has gone (the write failed) — the caller can stop generating for it.
+fn send_sse(stream: &mut TcpStream, v: &Value) -> bool {
+    stream.write_all(format!("data: {}\n\n", v).as_bytes()).is_ok() && stream.flush().is_ok()
+}
+
+/// Whether the peer has closed the connection, without consuming anything it sent.
+pub(crate) fn peer_closed(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() { return false; }
+    let mut b = [0u8; 1];
+    let closed = matches!(stream.peek(&mut b), Ok(0));
+    let _ = stream.set_nonblocking(false);
+    closed
 }
 
 /// Compile-time check that the engine crosses a thread boundary.
