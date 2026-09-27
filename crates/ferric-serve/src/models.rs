@@ -7,7 +7,7 @@
 //!
 //! A name resolves, in order, as
 //! 1. a path to a `.gguf` file;
-//! 2. a model in the model directory (`FERRIC_MODELS`, default `~/.cache/ferric/hub`, where
+//! 2. a model in the model directory (`FERRIC_MODELS`, else `$FERRIC_HOME/hub`, default `~/.cache/ferric/hub`, where
 //!    `ferric-serve owner/repo` and `ferric pull` download to), by file stem — `qwen2.5-0.5b-instruct-q8_0`
 //!    — with Ollama's `:latest` accepted and ignored; a stem two directories share is named `dir/stem`;
 //! 3. a downloaded Hugging Face repository, `owner/repo[:tag]` (also `hf.co/owner/repo:tag`, Ollama's
@@ -17,6 +17,11 @@
 //! Nothing is downloaded on a request: a name that is not on disk is a 404 that says how to fetch it,
 //! the choice Ollama makes. A multi-gigabyte download started by a chat request would hold its client for
 //! minutes with no progress to show.
+//!
+//! 4. a vision checkpoint DIRECTORY of a served type (`vision::VL_TYPES`): by path, or as `owner/repo` from
+//!    the Hugging Face cache (`HF_HUB_CACHE`, `HF_HOME/hub`, default `~/.cache/huggingface/hub`), its
+//!    `refs/main` snapshot. Those are the only checkpoints served from safetensors, because they are the
+//!    ones whose image path is verified; a text model is served from its GGUF.
 //!
 //! Only files a chat model can be built from are listed or loaded: a GGUF whose architecture the
 //! registry refuses, a LoRA adapter, a vision projector or an encoder (served with `--embed` /
@@ -28,9 +33,38 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// One file in the model directory.
+/// One model on disk: a GGUF file, or a vision checkpoint directory (`dir`).
 #[derive(Clone)]
-struct Entry { name: String, path: PathBuf, bytes: u64 }
+struct Entry { name: String, path: PathBuf, bytes: u64, dir: bool }
+
+/// Where downloaded GGUFs live: `FERRIC_MODELS`, else `$FERRIC_HOME/hub` (the `ferric` CLI's store), else
+/// `~/.cache/ferric/hub`. One rule for the server, its downloader and the CLI.
+pub(crate) fn hub_dir() -> PathBuf {
+    let env = |k: &str| std::env::var(k).ok().filter(|d| !d.is_empty());
+    env("FERRIC_MODELS").map(PathBuf::from)
+        .or_else(|| env("FERRIC_HOME").map(|h| PathBuf::from(h).join("hub")))
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/ferric/hub"))
+}
+
+/// The Hugging Face hub cache, as huggingface_hub resolves it.
+fn hf_cache() -> PathBuf {
+    if let Ok(d) = std::env::var("HF_HUB_CACHE") { return PathBuf::from(d); }
+    if let Ok(h) = std::env::var("HF_HOME") { return PathBuf::from(h).join("hub"); }
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
+}
+
+/// A model's name from its path: `owner/repo` for a Hugging Face cache snapshot, the file stem for a GGUF,
+/// the directory's name otherwise.
+pub(crate) fn default_name(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if let Some(i) = s.find("/models--") {
+        if let Some(repo) = s[i + 9..].split('/').next() { return repo.replacen("--", "/", 1); }
+    }
+    p.file_stem().and_then(|x| x.to_str()).unwrap_or("model").to_string()
+}
+
+/// A checkpoint directory's size: its weight files.
+pub(crate) fn model_bytes(p: &Path) -> u64 { if p.is_dir() { crate::vision::weights_summary(p).0 } else { total_bytes(p) } }
 
 pub(crate) struct Hub {
     shared: Shared,
@@ -70,10 +104,7 @@ fn base_name(s: &str) -> &str { s.strip_suffix(":latest").unwrap_or(s) }
 
 impl Hub {
     pub(crate) fn new(shared: Shared) -> Hub {
-        let dir = std::env::var("FERRIC_MODELS").ok().filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/ferric/hub")
-        });
-        Hub { shared, dirs: vec![dir], names: HashMap::new(), headers: HashMap::new(), info: HashMap::new() }
+        Hub { shared, dirs: vec![hub_dir()], names: HashMap::new(), headers: HashMap::new(), info: HashMap::new() }
     }
 
     /// A name for the model at `key` other than its file stem (`--name`).
@@ -107,12 +138,40 @@ impl Hub {
                 let dir = p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()).unwrap_or("");
                 format!("{dir}/{stem}")
             } else { stem };
-            Entry { bytes: total_bytes(&p), name, path: p }
-        }).collect()
+            Entry { bytes: total_bytes(&p), name, path: p, dir: false }
+        }).chain(self.hf_vision()).collect()
+    }
+
+    /// Vision checkpoints of a served type in the Hugging Face cache, at their `refs/main` snapshot.
+    fn hf_vision(&self) -> Vec<Entry> {
+        let root = hf_cache();
+        let Ok(rd) = std::fs::read_dir(&root) else { return Vec::new() };
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some(repo) = n.strip_prefix("models--") else { continue };
+            let rev = std::fs::read_to_string(e.path().join("refs/main")).ok().map(|r| r.trim().to_string());
+            let snaps = e.path().join("snapshots");
+            let dir = match rev.map(|r| snaps.join(r)).filter(|d| d.is_dir()) {
+                Some(d) => d,
+                None => match std::fs::read_dir(&snaps).ok().and_then(|r| r.flatten().map(|x| x.path()).find(|p| p.is_dir())) { Some(d) => d, None => continue },
+            };
+            if crate::vision::vl_model_type(&dir).is_none() { continue; }
+            // A snapshot whose weights have not all downloaded would load as a partial model.
+            let idx = dir.join("model.safetensors.index.json");
+            if idx.exists() {
+                let v: serde_json::Value = std::fs::read(&idx).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                let files: std::collections::HashSet<&str> = v["weight_map"].as_object().map(|m| m.values().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                if files.is_empty() || !files.iter().all(|f| dir.join(f).exists()) { continue; }
+            }
+            out.push(Entry { name: repo.replacen("--", "/", 1), bytes: model_bytes(&dir), path: dir, dir: true });
+        }
+        out
     }
 
     /// The card a file's header gives, or `None` when no chat model can be built from it. Cached.
     fn card(&mut self, e: &Entry) -> Option<ollama::Card> {
+        if e.dir { return crate::vision::card(&e.name, &e.path); }
         let md = std::fs::metadata(&e.path).ok()?;
         let (len, mt) = (md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         if let Some((l, m, c)) = self.headers.get(&e.path) {
@@ -142,6 +201,13 @@ impl batch::Source for Hub {
     fn resolve(&mut self, spec: &str) -> Result<(String, u64), String> {
         if spec.ends_with(".gguf") && Path::new(spec).is_file() {
             return Ok((Hub::key_of(Path::new(spec)), total_bytes(Path::new(spec))));
+        }
+        if Path::new(spec).is_dir() {
+            return match crate::vision::vl_model_type(Path::new(spec)) {
+                Some(_) => Ok((Hub::key_of(Path::new(spec)), model_bytes(Path::new(spec)))),
+                None => Err(format!("{spec}: a directory is served only as a vision checkpoint of type {}; serve a text model from its GGUF",
+                                    crate::vision::VL_TYPES.join(", "))),
+            };
         }
         let want = base_name(spec.strip_prefix("hf.co/").or_else(|| spec.strip_prefix("huggingface.co/")).unwrap_or(spec));
         let entries = self.scan();
@@ -178,16 +244,19 @@ impl batch::Source for Hub {
     fn load(&mut self, key: &str) -> Result<Engine, String> {
         let name = self.names.get(key).cloned().unwrap_or_else(|| {
             self.scan().into_iter().find(|e| Hub::key_of(&e.path) == key).map(|e| e.name)
-                .unwrap_or_else(|| Path::new(key).file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string())
+                .unwrap_or_else(|| default_name(Path::new(key)))
         });
         let t = std::time::Instant::now();
         let shared = self.shared.clone();
         // `Engine::load_in` refuses a bad file by panicking (fail-closed at startup is its contract); a
         // model loaded for a request must refuse THAT request, not take the server down.
-        let eng = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Engine::load_in(&shared, key, name.clone())))
+        let eng = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if Path::new(key).is_dir() {
+                Engine::load_hf_in(&shared, key, name.clone())
+            } else { Ok(Engine::load_in(&shared, key, name.clone())) }))
             .map_err(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "the loader panicked".to_string()))?;
-        eprintln!("ferric-serve: loaded {name} in {:.1} s ({} layers, context {})", t.elapsed().as_secs_f64(), eng.model.n_layer(), eng.n_ctx);
+                .unwrap_or_else(|| "the loader panicked".to_string()))??;
+        eprintln!("ferric-serve: loaded {name} in {:.1} s ({} layers, context {}{})", t.elapsed().as_secs_f64(), eng.model.n_layer(), eng.n_ctx,
+                  if eng.vision.is_some() { ", reads images" } else { "" });
         self.info.insert(key.to_string(), (name, eng.card.arch.clone(), eng.n_ctx));
         Ok(eng)
     }

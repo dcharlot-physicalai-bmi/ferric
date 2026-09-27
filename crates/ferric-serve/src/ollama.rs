@@ -19,7 +19,7 @@
 //! `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `stop`, `repeat_penalty`, `repeat_last_n`,
 //! `presence_penalty`, `frequency_penalty`) map onto `GenOpts`; `format: "json"` or a JSON Schema onto
 //! guided decoding; `tools` onto the tool path, with Ollama's `arguments` as an object and an `id` per call
-//! (Zed needs it). Images are refused by name. Model management (`pull`, `create`, `delete`, `copy`,
+//! (Zed needs it). `images` go to the vision path (`vision`) on a vision model and are refused by name on any other. Model management (`pull`, `create`, `delete`, `copy`,
 //! `push`) is a 501 that says what to do instead.
 //!
 //! ⚠ These requests run on the serial path; they do not share a decode batch with `/v1` traffic yet.
@@ -154,9 +154,9 @@ fn write_ndjson_headers(stream: &mut TcpStream) {
 }
 
 /// One NDJSON object per write, flushed — a client reading line by line must never wait on a buffer.
+/// A failed write marks the client gone, which stops the generation feeding it (see `crate::mark_peer_gone`).
 fn send_line(stream: &mut TcpStream, v: &Value) {
-    let _ = stream.write_all(format!("{v}\n").as_bytes());
-    let _ = stream.flush();
+    if stream.write_all(format!("{v}\n").as_bytes()).is_err() || stream.flush().is_err() { crate::mark_peer_gone(); }
 }
 
 /// Ollama `options` + top-level fields → an OpenAI-shaped request `GenOpts` / `run_chat` understand.
@@ -258,11 +258,7 @@ fn prepare(eng: &Engine, req: &Value, messages: &[Value]) -> Result<Value, Strin
     if req["model"].as_str().is_some_and(|m| eng.cards().iter().any(|c| c.embedding && c.matches(m))) {
         return Err(format!("\"{}\" is an embedding model; it does not generate text", req["model"].as_str().unwrap_or("")));
     }
-    for (i, m) in messages.iter().enumerate() {
-        if m["images"].as_array().is_some_and(|a| !a.is_empty()) {
-            return Err(format!("messages[{i}] carries images; this server feeds text-only prompts"));
-        }
-    }
+    // `images` are read by the vision path (`vision`), or refused there by name on a text model.
     let mut r = to_openai(req)?;
     r["messages"] = json!(messages);
     crate::genopts::GenOpts::from_req(&r, true)?;

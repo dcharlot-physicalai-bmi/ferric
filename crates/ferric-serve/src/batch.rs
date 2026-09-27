@@ -117,6 +117,8 @@ pub(crate) trait ServeModel {
     fn cards(&self) -> Vec<(String, Value)> {
         vec![(self.name().to_string(), json!({"name": self.name(), "model": self.name(), "size": 0}))]
     }
+    /// The context the model serves (for `/api/ps`'s `context_length`); 0 = unknown.
+    fn context(&self) -> usize { 0 }
 }
 
 /// One HTTP request, parsed off its socket by a reader thread and handed to the engine thread.
@@ -268,6 +270,11 @@ fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
     // one JSON blob it did not ask for.
     if !chat && req["stream"].as_bool() == Some(true) { return true; }
     if chat && (opts.any_mcp_tools || req["tools"].as_array().is_some_and(|t| !t.is_empty())) { return true; }
+    // An image is spliced into its own prefill with its own positions (`vision`); it never shares a batch.
+    if chat && req["messages"].as_array().is_some_and(|ms| ms.iter().any(|m|
+        m["images"].as_array().is_some_and(|a| !a.is_empty())
+        || m["content"].as_array().is_some_and(|ps| ps.iter().any(|p| matches!(p["type"].as_str(), Some("image_url" | "input_image" | "image"))))))
+    { return true; }
     false
 }
 
@@ -568,7 +575,7 @@ impl<S: Source> Pool<S> {
         let mut seen: Vec<String> = Vec::new();
         let mut models = Vec::new();
         for s in &self.slots {
-            for (n, mut e) in s.m.cards() {
+            for (k, (n, mut e)) in s.m.cards().into_iter().enumerate() {
                 if seen.contains(&n) { continue; }
                 seen.push(n);
                 // Ollama's spelling of "until evicted": a date no client will reach.
@@ -577,6 +584,8 @@ impl<S: Source> Pool<S> {
                     Some(d) => crate::ollama::rfc3339(std::time::SystemTime::now() + (s.last + d).saturating_duration_since(std::time::Instant::now())),
                 });
                 e["size_vram"] = e["size"].clone();
+                // The model's own card (the first); a shared embedder's context is not this model's.
+                if k == 0 && s.m.context() > 0 { e["context_length"] = json!(s.m.context()); }
                 models.push(e);
             }
         }
@@ -874,6 +883,7 @@ impl ServeModel for Engine {
     fn record(&self, prompt: usize, generated: usize, energy: &Value) { self.metrics.record(prompt, generated, energy) }
     fn energy_end(&self, t: Option<crate::energy::Ticket>, tokens: usize) -> Value { self.energy.end(t, tokens) }
     fn cards(&self) -> Vec<(String, Value)> { Engine::cards(self).iter().map(|c| (c.name.clone(), c.tag_entry())).collect() }
+    fn context(&self) -> usize { self.n_ctx }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1154,10 +1164,16 @@ mod tests {
         let empty = post(&addr, "/v1/chat/completions",
                          &json!({"messages": [{"role": "user", "content": ""}], "max_tokens": 4}).to_string());
         assert_ne!(text_of(&parts), text_of(&empty), "the parts must reach the model, not read as empty");
-        let (c, b) = request(&addr, "POST", "/v1/chat/completions", &json!({"messages": [{"role": "user", "content":
-            [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:x"}}]}]}).to_string());
-        assert_eq!(c, 400, "an image part must be refused: {b}");
-        assert!(b.contains("image_url"), "the refusal must name the part: {b}");
+        // ⛔ An image never enters a batch: the batched prefill has no image to splice, so a vision model
+        // would answer fluently about nothing. Every spelling goes to the serial path (vision, or its refusal).
+        let o = ServeOpts { max_batch: 4, any_mcp_tools: false, api_key: None, max_models: 3, max_bytes: u64::MAX, keep_alive: None, fallback: true };
+        for m in [json!({"role": "user", "content": [{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:x"}}]}),
+                  json!({"role": "user", "content": [{"type": "input_image", "image_url": "data:x"}]}),
+                  json!({"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "x"}}]}),
+                  json!({"role": "user", "content": "what is this", "images": ["AAAA"]})] {
+            assert!(must_run_serial(&json!({"messages": [m.clone()]}), true, &o), "batched: {m}");
+        }
+        assert!(!must_run_serial(&json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}), true, &o));
         let (c, b) = request(&addr, "POST", "/v1/completions", &json!({"prompt": "x", "n": 3}).to_string());
         assert_eq!(c, 400, "n=3 must be refused, not answered with one choice: {b}");
     }

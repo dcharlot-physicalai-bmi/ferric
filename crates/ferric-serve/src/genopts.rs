@@ -55,6 +55,9 @@ pub(crate) struct GenOpts {
     /// Internal, never from a request: decode WITH special tokens, because this model's reasoning
     /// markers are specials the visible decode would drop (Gemma 4).
     pub with_specials: bool,
+    /// Internal: the request's image, decoded and planned (`vision`). It rides with the request rather
+    /// than on the engine, because two images of one size produce the same prompt ids.
+    pub image: Option<std::sync::Arc<crate::vision::MmInput>>,
 }
 
 pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
@@ -62,7 +65,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0, with_specials: false }
+                  logprobs: false, top_logprobs: 0, with_specials: false, image: None }
     }
 }
 

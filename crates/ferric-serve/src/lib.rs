@@ -57,6 +57,8 @@ mod dialects;
 mod audio;
 mod ollama;
 mod models;
+mod images;
+mod vision;
 pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};
@@ -426,6 +428,8 @@ pub(crate) struct Engine {
     /// `<arch>.context_length`: the prompt plus everything generated must fit. A request with no
     /// `max_tokens` generates until a stop token or this limit, as OpenAI, llama-server and Ollama do.
     n_ctx: usize,
+    /// The image path, for a vision model served from its authors' checkpoint directory (`vision`).
+    vision: Option<vision::Vision>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -672,7 +676,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx }
+                 rstrip_after, n_ctx, vision: None }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -842,6 +846,8 @@ impl Engine {
     /// (`enable_thinking`, …) passed through; the vocabulary-family heuristic only when it does not.
     pub(crate) fn chat_ids_with(&self, messages: &[Value], tools: Option<&[Value]>,
                                 kwargs: &serde_json::Map<String, Value>) -> Result<Vec<u32>, String> {
+        // A conversation carrying an image: placed by the vision path, or refused naming why.
+        if let Some((ids, _)) = self.vision_prompt(messages, tools, kwargs)? { return Ok(ids); }
         // ⛔ An OpenAI content-part array used to read as "" here (`as_str()` on an array), so the model
         // answered a prompt with the user's words missing. Parts are read, and a part this path cannot
         // feed (an image) is refused by name.
@@ -874,6 +880,15 @@ impl Engine {
             if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
         }
         Ok(ids)
+    }
+
+    /// The prompt, and the image it carries if any — what a generating caller needs (a validating one
+    /// needs only `chat_ids_with`).
+    pub(crate) fn chat_prompt(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &serde_json::Map<String, Value>)
+        -> Result<(Vec<u32>, Option<Arc<vision::MmInput>>), String>
+    {
+        if let Some((ids, mm)) = self.vision_prompt(messages, tools, kwargs)? { return Ok((ids, Some(mm))); }
+        Ok((self.chat_ids_with(messages, tools, kwargs)?, None))
     }
 
     /// How many tokens this request may generate: its own limit, capped by what is left of the context.
@@ -939,7 +954,9 @@ impl Engine {
     /// newly-decoded fragment. Returns (full_text, prompt_tokens, gen_tokens).
     fn generate(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, guide: Option<ferric_agent::guide::Guide>, on_delta: impl FnMut(&str, &[Value])) -> GenOut {
         let ticket = self.energy.begin();
+        PEER_GONE.with(|g| g.set(false));
         let mut out = self.generate_inner(prompt, max_tokens, opts, guide, on_delta);
+        if peer_gone() { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         out.energy = self.energy.end(ticket, out.gen_tokens);
         self.metrics.record(out.prompt_tokens, out.gen_tokens, &out.energy);
         out
@@ -984,7 +1001,10 @@ impl Engine {
                 }
             }
         }
-        let (mut cache, skip) = self.seeded_cache(prompt);
+        // ⛔ An image prompt never touches the prefix cache: two images of one size are the SAME ids.
+        let mm = opts.image.clone();
+        let (mut cache, skip) = if mm.is_some() { (self.model.new_cache(), 0) } else { self.seeded_cache(prompt) };
+        let mut delta = 0i64;
         let n_vocab = self.model.n_vocab();
         let mut rng: u64 = opts.rng; // fixed default seed → reproducible sampling; `seed` overrides it
         let mut r#gen: Vec<u32> = Vec::new();
@@ -993,8 +1013,16 @@ impl Engine {
         let mut finish = "length";
         for step in 0..max_tokens {
             let input: Vec<u32> = if step == 0 { prompt[skip..].to_vec() } else { vec![*r#gen.last().unwrap()] };
-            let logits = self.model.forward_cached_last(&input, &mut cache);
-            let v = pollster::block_on(logits.to_vec());
+            let v = match (&mm, &mut cache) {
+                (Some(mm), ModelCache::Dense(c)) if step == 0 => {
+                    let (row, d) = self.vision_prefill(prompt, mm, c).unwrap_or_else(|e| panic!("vision prefill: {e}"));
+                    delta = d;
+                    row
+                }
+                // Generated token k-1 sits at position len + delta + (k-1) — see `vision_decode`.
+                (Some(_), ModelCache::Dense(c)) => self.vision_decode(input[0], prompt.len() as i64 + delta + step as i64 - 1, c),
+                _ => pollster::block_on(self.model.forward_cached_last(&input, &mut cache).to_vec()),
+            };
             let row = &v[v.len() - n_vocab..];
             let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };
             if self.eos.contains(&next) { finish = "stop"; break; }
@@ -1005,9 +1033,10 @@ impl Engine {
             let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
             if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
             if em.hit_stop { finish = "stop"; break; }
+            if peer_gone() { finish = "stop"; break; }
         }
         let fed: Vec<u32> = prompt.iter().chain(r#gen.iter()).copied().collect();
-        self.remember(&fed, &cache);
+        if mm.is_none() { self.remember(&fed, &cache); }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
         GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen, energy: Value::Null, stop_seq: em.hit_str.clone() }
     }
@@ -1079,8 +1108,8 @@ impl Engine {
                 r#gen.push($tok);
                 let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
                 if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
-                if em.hit_stop { finish = "stop"; }
-                em.hit_stop
+                if em.hit_stop || peer_gone() { finish = "stop"; }
+                em.hit_stop || peer_gone()
             }};
         }
         macro_rules! save_slot {
@@ -1229,7 +1258,12 @@ impl Engine {
 /// the served token ids with HF's `apply_chat_template` did.
 fn prepare_for_template(m: &Value) -> Value {
     let mut m = m.clone();
-    if m.get("content").is_some() {
+    // ⛔ A message carrying an image keeps its PARTS: the vision template places `<|image_pad|>` where
+    // it finds `{"type": "image"}`. Flattening it (the first vision path did) read the part list as text,
+    // failed on the image part, and `unwrap_or_default` left "" — the image AND the question gone, and
+    // the template placed 0 image tokens. Found by the live check against the authors' prompt ids.
+    let has_image = m["content"].as_array().is_some_and(|a| a.iter().any(|p| p["type"] == "image"));
+    if m.get("content").is_some() && !has_image {
         m["content"] = json!(genopts::content_text(&m["content"]).unwrap_or_default());
     }
     if let Some(calls) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
@@ -1255,8 +1289,7 @@ fn resolve_model(spec: &str) -> String {
     let (repo, file) = match spec.split_once(':') { Some((r, f)) => (r.to_string(), Some(f.to_string())), None => (spec.to_string(), None) };
     if !repo.contains('/') { eprintln!("ferric-serve: '{spec}' is neither a local file nor an HF repo (owner/repo)"); std::process::exit(1); }
     let file = file.unwrap_or_else(|| pick_gguf(&repo));
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dir = format!("{home}/.cache/ferric/hub/{}", repo.replace('/', "_"));
+    let dir = format!("{}/{}", models::hub_dir().display(), repo.replace('/', "_"));
     std::fs::create_dir_all(&dir).ok();
     let dest = format!("{dir}/{}", file.rsplit('/').next().unwrap_or(&file));
     if std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) { eprintln!("ferric-serve: cached {dest}"); return dest; }
@@ -1308,7 +1341,7 @@ pub fn run() {
     let mut api_key: Option<String> = std::env::var("FERRIC_API_KEY").ok().filter(|k| !k.is_empty());
     // Default: the file's stem, the way Ollama and LM Studio name a model — "ferric" said nothing about
     // which model this is, and it collided with nothing only because there was never a second one.
-    let mut name = path.as_deref().and_then(|p| std::path::Path::new(p).file_stem()).and_then(|s| s.to_str()).unwrap_or("ferric").to_string();
+    let mut name = path.as_deref().map(|p| models::default_name(std::path::Path::new(p))).unwrap_or_else(|| "ferric".to_string());
     let mut mcp_cmds: Vec<(String, String)> = Vec::new();
     // How many sequences may share one decode step. 8 is a starting point, not a measured optimum:
     // occupancy is what decides the payoff and only the deployment knows its arrival rate.
@@ -1369,7 +1402,7 @@ pub fn run() {
         eprintln!("ferric-serve: loading {resolved} …");
         let key = std::fs::canonicalize(&resolved).map(|p| p.to_string_lossy().into_owned()).unwrap_or(resolved.clone());
         hub.name(&key, name.clone());
-        let bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        let bytes = models::model_bytes(std::path::Path::new(&resolved));
         // A model named on the command line that will not load stops the server: a server that will not
         // boot is a bug report; one that boots without the model it was given answers for something else.
         let eng = batch::Source::load(&mut hub, &key).unwrap_or_else(|e| { eprintln!("ferric-serve: {e}"); std::process::exit(1) });
@@ -1398,7 +1431,7 @@ pub fn run() {
     let mcps = std::cell::RefCell::new(mcps);
     let any_mcp_tools = !mcps.borrow().openai_tools().is_empty();
     eprintln!("ferric-serve: http://{host}:{port}/v1 — other models load on request from {} (up to {max_models} resident{}, {}){}",
-        std::env::var("FERRIC_MODELS").unwrap_or_else(|_| "~/.cache/ferric/hub".to_string()),
+        models::hub_dir().display(),
         if max_bytes == u64::MAX { String::new() } else { format!(", {:.0} GiB of model files", max_bytes as f64 / 1073741824.0) },
         match keep_alive { Some(d) => format!("kept {} s after last use", d.as_secs()), None => "kept until evicted".to_string() },
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
@@ -1718,7 +1751,8 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         let (mut ptok, mut gtok) = (0usize, 0usize);
         let mut energies: Vec<Value> = Vec::new();
         for _round in 0..4 {
-            let prompt = eng.chat_ids_with(&messages, tools_arg, &kwargs)?;
+            let (prompt, image) = eng.chat_prompt(&messages, tools_arg, &kwargs)?;
+            opts.image = image;
             let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
@@ -1762,7 +1796,8 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
         else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
         else { None };
-    let prompt = eng.chat_ids_with(&messages, None, &kwargs)?;
+    let (prompt, image) = eng.chat_prompt(&messages, None, &kwargs)?;
+    opts.image = image;
     let max = eng.budget(prompt.len(), opts.max_tokens)?;
     let mut sp = splitter(&prompt);
     let out = eng.generate(&prompt, max, &opts, guide, |d, l| match sp.as_mut() {
@@ -1947,8 +1982,24 @@ fn write_sse_headers(stream: &mut TcpStream) {
 
 /// Returns false when the client has gone (the write failed) — the caller can stop generating for it.
 fn send_sse(stream: &mut TcpStream, v: &Value) -> bool {
-    stream.write_all(format!("data: {}\n\n", v).as_bytes()).is_ok() && stream.flush().is_ok()
+    let ok = stream.write_all(format!("data: {}\n\n", v).as_bytes()).is_ok() && stream.flush().is_ok();
+    if !ok { mark_peer_gone(); }
+    ok
 }
+
+thread_local! {
+    /// A stream write on this (the engine) thread failed: the client of the generation running here has
+    /// gone. Every serial streaming route writes through `send_sse` / `ollama::send_line` /
+    /// `dialects::send_event`, and `generate` stops at the next token when this is set, so none of them
+    /// has to thread a cancel flag of its own. Cleared when a generation starts.
+    ///
+    /// ⛔ Found by the CLI's live test: Ctrl-C closed an `/api/chat` stream at 4 s, and the server went on
+    /// to generate all 800 requested tokens with `ferric_requests_cancelled_total` still 0 — the NDJSON
+    /// writer ignored its write errors. The batched path had this (`Gen::gone`, 3f6089f); no serial one did.
+    static PEER_GONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn mark_peer_gone() { PEER_GONE.with(|g| g.set(true)); }
+fn peer_gone() -> bool { PEER_GONE.with(|g| g.get()) }
 
 /// Whether the peer has closed the connection, without consuming anything it sent.
 pub(crate) fn peer_closed(stream: &TcpStream) -> bool {
@@ -1992,6 +2043,9 @@ mod tests {
         let tc = serde_json::json!({"role": "assistant", "content": null,
             "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{\"a\": 1}"}}]});
         assert_eq!(super::prepare_for_template(&tc)["tool_calls"][0]["function"]["arguments"]["a"], 1);
+        // An image message keeps its parts — the template places the image where it finds one.
+        let img = serde_json::json!({"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "what is it?"}]});
+        assert_eq!(super::prepare_for_template(&img), img);
     }
 
     #[test]

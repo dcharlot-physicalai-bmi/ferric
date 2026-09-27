@@ -42,9 +42,16 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
             Value::String(s) => msgs.push(json!({"role": role, "content": s})),
             Value::Array(blocks) => {
                 let (mut text, mut calls) = (Vec::new(), Vec::new());
+                // An image block keeps its place among the text: the content becomes parts, which the
+                // vision path reads (or refuses by name on a model without one).
+                let mut parts: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b["type"].as_str() {
-                        Some("text") => text.push(b["text"].as_str().unwrap_or("").to_string()),
+                        Some("text") => {
+                            text.push(b["text"].as_str().unwrap_or("").to_string());
+                            parts.push(json!({"type": "text", "text": b["text"]}));
+                        }
+                        Some("image") => parts.push(b.clone()),
                         Some("tool_use") => calls.push(json!({"id": b["id"], "type": "function",
                             "function": {"name": b["name"], "arguments": b["input"].to_string()}})),
                         Some("tool_result") => {
@@ -56,13 +63,14 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
                             msgs.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": c}));
                         }
                         Some("thinking") | Some("redacted_thinking") => {} // prior reasoning is not re-fed
-                        Some(t @ ("image" | "document")) => return Err(format!("messages[{i}] has a `{t}` block; this server feeds text-only prompts")),
+                        Some("document") => return Err(format!("messages[{i}] has a `document` block; documents are not read here")),
                         Some(t) => return Err(format!("messages[{i}] has an unknown block type `{t}`")),
                         None => return Err(format!("messages[{i}] has a block without `type`")),
                     }
                 }
-                if !text.is_empty() || !calls.is_empty() {
-                    let mut o = json!({"role": role, "content": text.join("\n")});
+                let has_image = parts.iter().any(|p| p["type"] == "image");
+                if !text.is_empty() || !calls.is_empty() || has_image {
+                    let mut o = json!({"role": role, "content": if has_image { Value::Array(parts) } else { json!(text.join("\n")) }});
                     if !calls.is_empty() { o["tool_calls"] = json!(calls); }
                     msgs.push(o);
                 }
@@ -105,9 +113,9 @@ fn anthropic_blocks(r: &ChatResult) -> Vec<Value> {
     v
 }
 
+/// A failed write marks the client gone, which stops the generation feeding it (see `crate::mark_peer_gone`).
 fn send_event(stream: &mut TcpStream, ev: &str, data: &Value) {
-    let _ = stream.write_all(format!("event: {ev}\ndata: {data}\n\n").as_bytes());
-    let _ = stream.flush();
+    if stream.write_all(format!("event: {ev}\ndata: {data}\n\n").as_bytes()).is_err() || stream.flush().is_err() { crate::mark_peer_gone(); }
 }
 
 pub(crate) fn messages(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], stream: &mut TcpStream) {
@@ -198,6 +206,20 @@ impl ResponseStore {
     }
 }
 
+/// A Responses item's content for a chat message: its text, or — when it carries an `input_image` — its
+/// parts, which the vision path reads.
+fn item_content(content: &Value) -> Result<Value, String> {
+    if let Value::Array(parts) = content {
+        if parts.iter().any(|p| p["type"] == "input_image") {
+            return parts.iter().map(|p| match p["type"].as_str() {
+                Some("input_image") => Ok(p.clone()),
+                _ => item_text(&Value::Array(vec![p.clone()])).map(|t| json!({"type": "text", "text": t})),
+            }).collect::<Result<Vec<_>, _>>().map(Value::Array);
+        }
+    }
+    item_text(content).map(Value::String)
+}
+
 fn item_text(content: &Value) -> Result<String, String> {
     match content {
         Value::String(s) => Ok(s.clone()),
@@ -206,7 +228,7 @@ fn item_text(content: &Value) -> Result<String, String> {
             for p in parts {
                 match p["type"].as_str() {
                     Some("input_text" | "output_text" | "text") => v.push(p["text"].as_str().unwrap_or("").to_string()),
-                    Some(t @ ("input_image" | "input_file" | "input_audio")) => return Err(format!("a `{t}` part: this server feeds text-only prompts")),
+                    Some(t @ ("input_file" | "input_audio")) => return Err(format!("a `{t}` part: files and audio are not read here")),
                     Some("refusal") => v.push(p["refusal"].as_str().unwrap_or("").to_string()),
                     t => return Err(format!("unknown content part {t:?}")),
                 }
@@ -230,7 +252,7 @@ fn responses_to_messages(req: &Value, mut msgs: Vec<Value>) -> Result<Vec<Value>
             match it["type"].as_str() {
                 None | Some("message") => {
                     let role = match it["role"].as_str() { Some("developer") => "system", Some(r) => r, None => "user" };
-                    msgs.push(json!({"role": role, "content": item_text(&it["content"])?}));
+                    msgs.push(json!({"role": role, "content": item_content(&it["content"])?}));
                 }
                 Some("function_call") => msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [{"id": it["call_id"],
                     "type": "function", "function": {"name": it["name"], "arguments": it["arguments"]}}]})),
@@ -385,7 +407,11 @@ mod tests {
         assert_eq!(r["stop"], json!(["\n\n"]));
         assert_eq!(r["tools"][0]["function"]["parameters"], json!({"type": "object"}));
         assert!(anthropic_to_openai(&json!({"messages": []})).unwrap_err().contains("max_tokens"));
-        assert!(anthropic_to_openai(&json!({"max_tokens": 1, "messages": [{"role": "user", "content": [{"type": "image"}]}]})).is_err());
+        // An image block keeps its place among the text, as parts the vision path reads; a document is refused.
+        let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let r = anthropic_to_openai(&json!({"max_tokens": 1, "messages": [{"role": "user", "content": [img.clone(), {"type": "text", "text": "what is it?"}]}]})).unwrap();
+        assert_eq!(r["messages"][0]["content"], json!([img, {"type": "text", "text": "what is it?"}]));
+        assert!(anthropic_to_openai(&json!({"max_tokens": 1, "messages": [{"role": "user", "content": [{"type": "document"}]}]})).is_err());
     }
 
     #[test]
@@ -397,6 +423,9 @@ mod tests {
         assert_eq!(m[0], json!({"role": "system", "content": "Be terse."}));
         assert_eq!(m[3], json!({"role": "user", "content": "And now?"}));
         assert_eq!(m[4], json!({"role": "tool", "tool_call_id": "c1", "content": "42"}));
-        assert!(responses_to_messages(&json!({"input": [{"role": "user", "content": [{"type": "input_image"}]}]}), vec![]).is_err());
+        let img = json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA"});
+        let m = responses_to_messages(&json!({"input": [{"role": "user", "content": [{"type": "input_text", "text": "and this?"}, img.clone()]}]}), vec![]).unwrap();
+        assert_eq!(m[0]["content"], json!([{"type": "text", "text": "and this?"}, img]), "an input_image stays, as a part");
+        assert!(responses_to_messages(&json!({"input": [{"role": "user", "content": [{"type": "input_file"}]}]}), vec![]).is_err());
     }
 }

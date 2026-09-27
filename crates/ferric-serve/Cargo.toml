@@ -23,6 +23,7 @@ ferric-core = { path = "../ferric-core", version = "0.3" }
 ferric-tensor = { path = "../ferric-tensor", version = "0.3" }
 ferric-gguf = { path = "../ferric-gguf", version = "0.3" }
 ferric-llama = { path = "../ferric-llama", version = "0.3" }
+ferric-load = { path = "../ferric-load", version = "0.3" }
 ferric-joule = { path = "../ferric-joule", version = "0.3" }
 ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.3" }
 ferric-agent = { path = "../ferric-agent", version = "0.3" }
@@ -34,3 +35,12 @@ pollster = "0.4"
 # .startswith(), .items()); `loop_controls` is jinja2.ext.loopcontrols, which HF enables.
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "loop_controls", "macros", "serde", "preserve_order", "adjacent_loop_items", "std_collections", "deserialization", "json"] }
 minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
+# Images a client sends (PNG, JPEG): decoded here, the one crate that receives them, so ferric-tensor stays
+# codec-free (see its image.rs). Pure Rust, vendored; checked against the pixels transformers' load_image gives.
+png = "0.18"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+
+[dev-dependencies]
+# Reads the gzipped reference pixels in tests/fixtures/images (already vendored as a dependency of png).
+flate2 = "1"
