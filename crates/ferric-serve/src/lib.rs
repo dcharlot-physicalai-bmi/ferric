@@ -335,6 +335,9 @@ pub(crate) struct GenOut {
     pub finish: &'static str,
     /// Chat-format `logprobs.content` entries, one per generated token, when the request asked.
     pub logprobs: Vec<Value>,
+    /// The generated token ids — decoded WITH special tokens for tool-call parsing (Gemma 4's argument
+    /// delimiters are specials, which the visible text drops).
+    pub ids: Vec<u32>,
 }
 
 /// See `Engine::prefix`. `fed` is exactly the token sequence the main cache has consumed —
@@ -432,7 +435,9 @@ impl Engine {
         if let Some(e) = im_end { if !eos.contains(&e) { eos.push(e); } }
         if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
         // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
-        for t in ["<end_of_turn>", "<|end|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
+        // Llama 3.1+ ends a tool-call message with <|eom_id|> ("end of message", more to come from the tool),
+        // which llama.cpp also treats as end-of-generation; without it a tool call ran to max_tokens.
+        for t in ["<end_of_turn>", "<|end|>", "<|eom_id|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
         // Dispatch through the architecture REGISTRY, which refuses anything this runtime has not been
         // taught. The previous form was `if starts_with("qwen35") … else { Dense }`, and that `else`
         // was a catch-all: a gemma4 / deepseek2 / glm4 / minimax / hunyuan checkpoint loaded as a dense
@@ -625,6 +630,20 @@ impl Engine {
             s.push_str("<|im_start|>assistant\n");
             s
         }
+    }
+
+    /// `detok`, but a special token is written as its literal text — the form a tool-call parser needs.
+    pub(crate) fn detok_all(&self, ids: &[u32]) -> String {
+        let special: std::collections::HashMap<u32, &str> = self.specials.iter().map(|(t, i)| (*i, t.as_str())).collect();
+        let (mut out, mut run) = (String::new(), Vec::new());
+        for &i in ids {
+            if let Some(t) = special.get(&i) {
+                if !run.is_empty() { out.push_str(&self.detok(&run)); run.clear(); }
+                out.push_str(t);
+            } else { run.push(i); }
+        }
+        if !run.is_empty() { out.push_str(&self.detok(&run)); }
+        out
     }
 
     fn detok(&self, ids: &[u32]) -> String {
@@ -834,7 +853,7 @@ impl Engine {
             if em.hit_stop { finish = "stop"; break; }
         }
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps }
+        GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen }
     }
 
     /// Pick the next token from a row of TRUE model logits: guided decoding masks illegal tokens to
@@ -921,13 +940,13 @@ impl Engine {
         let first = self.select_token(row0, &guide, sm, prompt, &r#gen, &mut rng);
         let Some(pend0) = first.filter(|t| !self.eos.contains(t)) else {
             save_slot!();
-            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps }, drafted, accepted)
+            return (GenOut { text: String::new(), prompt_tokens: prompt.len(), gen_tokens: 0, finish: "stop", logprobs: lps, ids: Vec::new() }, drafted, accepted)
         };
         if commit!(pend0, row0) || max_tokens <= 1 {
             save_slot!();
             if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
             let fin = if em.hit_stop { "stop" } else { "length" };
-            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps }, drafted, accepted)
+            return (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish: fin, logprobs: lps, ids: r#gen }, drafted, accepted)
         }
         let mut unfed: Vec<u32> = vec![pend0]; // committed tokens the main cache hasn't seen yet
         // Draft pairs resume at the first position the draft cache lacks — but no earlier than the
@@ -1038,7 +1057,7 @@ impl Engine {
         }
         save_slot!();
         if let Some(d) = em.flush() { on_delta(&d, &lps[lp_sent..]); }
-        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps }, drafted, accepted)
+        (GenOut { text: em.text, prompt_tokens: prompt.len(), gen_tokens: r#gen.len(), finish, logprobs: lps, ids: r#gen }, drafted, accepted)
     }
 }
 
@@ -1404,11 +1423,19 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
             let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
-            let calls = ferric_agent::tools::parse_tool_calls(&out.text);
+            // Each model writes tool calls in its own template's format; parse the decode that keeps
+            // special tokens, with the tools' schemas for argument types.
+            let (before_call, calls) = ferric_agent::tools::parse_tool_calls_any(&eng.detok_all(&out.ids), &tools);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
             if mcp_calls.is_empty() {
                 let finish = if calls.is_empty() { out.finish } else { "tool_calls" };
-                let text = if calls.is_empty() { out.text } else { String::new() };
+                // With a call, `content` is the visible text before it (often empty); without, the answer.
+                let text = if calls.is_empty() { out.text } else {
+                    let special: Vec<&str> = eng.specials.iter().map(|(t, _)| t.as_str()).collect();
+                    let mut t = before_call;
+                    for sp in special { t = t.replace(sp, ""); }
+                    t.trim().to_string()
+                };
                 return Ok(ChatResult { text, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new() });
             }
             messages.push(json!({"role": "assistant", "content": out.text}));
