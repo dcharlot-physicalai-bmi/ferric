@@ -39,6 +39,7 @@
 mod mcp;
 mod batch;
 mod genopts;
+mod ollama;
 mod specgate;
 use genopts::{GenOpts, Emitter};
 use ferric_core::Context;
@@ -262,7 +263,9 @@ pub(crate) struct Engine {
     /// with the name `/v1/models` and `/api/tags` list it under. A chat model's hidden state pooled at its
     /// last token is not what a RAG pipeline means by an embedding; when this is loaded, `/v1/embeddings`
     /// uses it unless the request names the chat model.
-    embedder: Option<(String, ferric_llama::bert::Embedder)>,
+    embedder: Option<(String, ferric_llama::bert::Embedder, ollama::Card)>,
+    /// What `/api/tags` and `/api/show` report about the chat model.
+    card: ollama::Card,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -348,7 +351,8 @@ impl Engine {
             let name = std::path::Path::new(&ep).file_stem().and_then(|s| s.to_str()).unwrap_or("embed").to_string();
             eprintln!("ferric-serve: embedding model {name} ({}, d {}, pooling {}, context {})",
                       e.cfg().arch, e.cfg().d, e.cfg().pooling, e.cfg().n_ctx);
-            (name, e)
+            let card = ollama::Card::from_gguf(&name, &ep, &eg, true, e.cfg().d, e.cfg().n_ctx, "");
+            (name, e, card)
         });
         let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
@@ -517,7 +521,8 @@ impl Engine {
         // Absent is not "unlimited": 4096 is a conservative bound for a file that does not say, and the
         // error it produces names the number so a caller can see why.
         let n_ctx = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, n_ctx }
+        let card = ollama::Card::from_gguf(&name, path, &g, false, model.n_embd(), n_ctx, &template);
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -686,6 +691,21 @@ impl Engine {
                                 shorten the conversation", self.n_ctx));
         }
         Ok(want.unwrap_or(usize::MAX).min(self.n_ctx - prompt_len))
+    }
+
+    /// Every loaded model's card: the chat model, then the embedder.
+    pub(crate) fn cards(&self) -> Vec<ollama::Card> {
+        let mut v = vec![self.card.clone()];
+        if let Some((_, _, c)) = &self.embedder { v.push(c.clone()); }
+        v
+    }
+
+    /// A raw prompt's ids: BOS when the model adds one, then the text — no chat template.
+    pub(crate) fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
+        ids.extend(self.enc(text, true));
+        ids
     }
 
     /// A token's text and bytes, for `logprobs`.
@@ -1013,7 +1033,9 @@ pub fn run() {
     let mut port = 8080u16;
     // 127.0.0.1 by default: a model server is not exposed to the network unless someone says so.
     let mut host = "127.0.0.1".to_string();
-    let mut name = "ferric".to_string();
+    // Default: the file's stem, the way Ollama and LM Studio name a model — "ferric" said nothing about
+    // which model this is, and it collided with nothing only because there was never a second one.
+    let mut name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("ferric").to_string();
     let mut mcp_cmds: Vec<(String, String)> = Vec::new();
     // How many sequences may share one decode step. 8 is a starting point, not a measured optimum:
     // occupancy is what decides the payoff and only the deployment knows its arrival rate.
@@ -1097,15 +1119,15 @@ fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, pa
         ("GET", "/health") => write_json(stream, 200, &json!({"status": "ok"})),
         ("GET", "/v1/models") => {
             let mut data = vec![json!({"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"})];
-            if let Some((n, _)) = &eng.embedder { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
+            if let Some((n, _, _)) = &eng.embedder { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
             write_json(stream, 200, &json!({"object": "list", "data": data}))
         }
         ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
         ("POST", "/v1/rerank") | ("POST", "/rerank") => rerank(eng, stream, body),
-        // Unrecognised: let the caller answer, so there is exactly one 404 writer.
-        _ => return false,
+        // The Ollama dialect, or unrecognised — then the caller answers, so there is one 404 writer.
+        _ => return ollama::handle(eng, mcps, method, path, body, stream),
     }
     true
 }
@@ -1161,7 +1183,7 @@ pub(crate) fn embed_texts(eng: &Engine, model: Option<&str>, inputs: &[String], 
     -> Result<(Vec<Vec<f32>>, usize, String), String>
 {
     match &eng.embedder {
-        Some((name, e)) if model != Some(eng.name.as_str()) => {
+        Some((name, e, _)) if model != Some(eng.name.as_str()) => {
             let (mut out, mut total) = (Vec::with_capacity(inputs.len()), 0usize);
             for t in inputs {
                 let (v, n) = pollster::block_on(e.embed(t, truncate))?;
@@ -1267,32 +1289,49 @@ fn logprobs_field(chat: bool, lps: &[Value]) -> Value {
     })
 }
 
-fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
-    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
+/// One chat turn, whatever API it arrived through.
+pub(crate) struct ChatResult {
+    pub text: String,
+    /// OpenAI-shaped `tool_calls` (`function.arguments` a JSON string); empty unless the model called one.
+    pub tool_calls: Vec<Value>,
+    pub prompt_tokens: usize,
+    pub gen_tokens: usize,
+    pub finish: &'static str,
+    pub logprobs: Vec<Value>,
+}
+
+/// **The chat core both API dialects share** (OpenAI `/v1/chat/completions`, Ollama `/api/chat`), so they
+/// cannot disagree about what a conversation means. `req` is OpenAI-shaped. `on_delta` receives the
+/// streamed text and its logprob entries; it is not called on the tool path, whose answer is only known
+/// once the model has finished (a tool call is parsed from the whole output).
+pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req: &Value,
+                       mut on_delta: impl FnMut(&str, &[Value])) -> Result<ChatResult, String> {
     let empty = vec![];
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
-    let opts = match GenOpts::from_req(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
-    let streaming = req["stream"].as_bool().unwrap_or(false);
+    // `developer` is OpenAI's newer name for the system role (Cursor sends it).
+    for m in messages.iter_mut() { if m["role"] == "developer" { m["role"] = json!("system"); } }
+    let opts = GenOpts::from_req(req, true)?;
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
     tools.extend(mcps.borrow().openai_tools());
-    let has_tools = !tools.is_empty();
-    let id = "chatcmpl-ferric".to_string();
 
-    if has_tools {
+    if !tools.is_empty() {
         inject_tools(&mut messages, &tools);
         // Server-side agent loop: generate → parse tool_calls → execute the MCP-owned ones and feed
         // results back → repeat. Non-MCP tool calls are returned to the client (standard OpenAI flow).
         let (mut ptok, mut gtok) = (0usize, 0usize);
-        let (mut out_text, mut out_calls, mut out_finish) = (String::new(), Vec::new(), "stop");
         for _round in 0..4 {
-            let prompt = match eng.chat_ids(&messages) { Ok(p) => p, Err(e) => return bad_request(stream, &e) };
-            let max = match eng.budget(prompt.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+            let prompt = eng.chat_ids(&messages)?;
+            let max = eng.budget(prompt.len(), opts.max_tokens)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
             let calls = ferric_agent::tools::parse_tool_calls(&out.text);
             let mcp_calls: Vec<&Value> = calls.iter().filter(|c| mcps.borrow().has(c["function"]["name"].as_str().unwrap_or(""))).collect();
-            if mcp_calls.is_empty() { out_text = out.text; out_calls = calls; out_finish = out.finish; break; }
+            if mcp_calls.is_empty() {
+                let finish = if calls.is_empty() { out.finish } else { "tool_calls" };
+                let text = if calls.is_empty() { out.text } else { String::new() };
+                return Ok(ChatResult { text, tool_calls: calls, prompt_tokens: ptok, gen_tokens: gtok, finish, logprobs: Vec::new() });
+            }
             messages.push(json!({"role": "assistant", "content": out.text}));
             for c in &mcp_calls {
                 let name = c["function"]["name"].as_str().unwrap_or("");
@@ -1302,51 +1341,61 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
                 messages.push(json!({"role": "user", "content": format!("<tool_response>\n{{\"name\": \"{name}\", \"content\": {}}}\n</tool_response>", serde_json::to_string(&result).unwrap_or_default())}));
             }
         }
-        let (message, finish) = if !out_calls.is_empty() {
-            (json!({"role": "assistant", "content": Value::Null, "tool_calls": out_calls}), "tool_calls")
-        } else {
-            (json!({"role": "assistant", "content": out_text}), out_finish)
-        };
-        return write_json(stream, 200, &json!({
-            "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok}
-        }));
+        return Err("the tool loop did not settle in 4 rounds".into());
     }
 
-    // No tools → optional guided decoding + streaming.
+    // No tools → optional guided decoding.
     let rf = req["response_format"]["type"].as_str().unwrap_or("");
     let sch_prog = if rf == "json_schema" { ferric_agent::guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
     let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
         else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
         else { None };
-    let prompt = match eng.chat_ids(&messages) { Ok(p) => p, Err(e) => return bad_request(stream, &e) };
-    let max = match eng.budget(prompt.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+    let prompt = eng.chat_ids(&messages)?;
+    let max = eng.budget(prompt.len(), opts.max_tokens)?;
+    let out = eng.generate(&prompt, max, &opts, guide, |d, l| on_delta(d, l));
+    Ok(ChatResult { text: out.text, tool_calls: Vec::new(), prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
+                    finish: out.finish, logprobs: out.logprobs })
+}
+
+fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
+    let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
+    // Validate before any header goes out, so a bad request is a 400 and not a broken stream.
+    let opts = match GenOpts::from_req(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
+    let empty = vec![];
+    if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
+    let id = "chatcmpl-ferric";
+    let has_tools = req["tools"].as_array().is_some_and(|t| !t.is_empty()) || !mcps.borrow().openai_tools().is_empty();
+    let streaming = req["stream"].as_bool().unwrap_or(false) && !has_tools;
+    let usage = |r: &ChatResult| json!({"prompt_tokens": r.prompt_tokens, "completion_tokens": r.gen_tokens, "total_tokens": r.prompt_tokens + r.gen_tokens});
     if streaming {
         write_sse_headers(stream);
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
-        let out = eng.generate(&prompt, max, &opts, guide, |delta, lps| {
+        let r = run_chat(eng, mcps, &req, |delta, lps| {
             let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
             if opts.logprobs { ch["logprobs"] = json!({"content": lps}); }
             send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [ch]}));
         });
+        let (finish, u) = match &r { Ok(r) => (r.finish, Some(usage(r))), Err(_) => ("stop", None) };
+        if let Err(e) = &r { send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})); }
         send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": out.finish}]}));
-        if req["stream_options"]["include_usage"].as_bool() == Some(true) {
-            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [],
-                "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}}));
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}));
+        if let (Some(u), true) = (u, req["stream_options"]["include_usage"].as_bool() == Some(true)) {
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [], "usage": u}));
         }
         let _ = stream.write_all(b"data: [DONE]\n\n");
-    } else {
-        let out = eng.generate(&prompt, max, &opts, guide, |_, _| {});
-        let mut choice = json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": out.finish});
-        if opts.logprobs { choice["logprobs"] = logprobs_field(true, &out.logprobs); }
-        write_json(stream, 200, &json!({
-            "id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
-            "choices": [choice],
-            "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens}
-        }));
+        return;
+    }
+    match run_chat(eng, mcps, &req, |_, _| {}) {
+        Err(e) => bad_request(stream, &e),
+        Ok(r) => {
+            let message = if r.tool_calls.is_empty() { json!({"role": "assistant", "content": r.text}) }
+                          else { json!({"role": "assistant", "content": Value::Null, "tool_calls": r.tool_calls}) };
+            let mut choice = json!({"index": 0, "message": message, "finish_reason": r.finish});
+            if opts.logprobs { choice["logprobs"] = logprobs_field(true, &r.logprobs); }
+            write_json(stream, 200, &json!({"id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
+                "choices": [choice], "usage": usage(&r)}));
+        }
     }
 }
 
