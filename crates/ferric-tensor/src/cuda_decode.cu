@@ -36,21 +36,26 @@ __device__ __forceinline__ float block_sum256(float v, float* red) {
     return red[0];
 }
 
-// ── rmsnorm: out = x * rsqrt(mean(x^2) + eps) * w.  One block of 256 threads, any d. ──
+// ── rmsnorm: out = x * rsqrt(mean(x^2) + eps) * w.  One block of 256 threads per ROW (blockIdx.x),
+//    any d. Decode launches one block (row 0: the same arithmetic as before rows existed); prefill
+//    launches one per prompt row. ──
 extern "C" __global__ void rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
                                    float* __restrict__ out, unsigned d, float eps) {
     __shared__ float red[8];
+    x += (size_t)blockIdx.x * d; out += (size_t)blockIdx.x * d;
     float ms = 0.f;
     for (unsigned j = threadIdx.x; j < d; j += blockDim.x) { const float v = x[j]; ms += v * v; }
     ms = block_sum256(ms, red);
     const float inv = 1.f / sqrtf(ms / (float)d + eps);
     for (unsigned j = threadIdx.x; j < d; j += blockDim.x) out[j] = x[j] * inv * w[j];
 }
-// ── add_rmsnorm: sum = x + y (the next residual); norm = rmsnorm(sum) * w. One block. ──
+// ── add_rmsnorm: sum = x + y (the next residual); norm = rmsnorm(sum) * w. One block per row. ──
 extern "C" __global__ void add_rmsnorm(const float* __restrict__ x, const float* __restrict__ y,
                                        const float* __restrict__ w, float* __restrict__ sum,
                                        float* __restrict__ norm, unsigned d, float eps) {
     __shared__ float red[8];
+    const size_t ro = (size_t)blockIdx.x * d;
+    x += ro; y += ro; sum += ro; norm += ro;
     float ms = 0.f;
     for (unsigned j = threadIdx.x; j < d; j += blockDim.x) { const float v = x[j] + y[j]; sum[j] = v; ms += v * v; }
     ms = block_sum256(ms, red);
@@ -400,18 +405,23 @@ extern "C" __global__ void q5_0_swiglu_gemv(GEMV_ARGS) { swiglu_t<4>(x, codes, a
 //                 `exp(-2c/dh * ln base) * scale[c]`. Null = plain rope.
 //      norm_pairs 1 = ggml NORM pairing, partners (2c, 2c+1) — `llama`'s GGUF rows are permuted for it;
 //                 0 = NEOX split-half, partners (c, c + dh/2). The frequency index is c in both.
-//                 ⛔ The wrong pairing is the classic silent RoPE failure: finite logits, fluent text. ──
+//                 ⛔ The wrong pairing is the classic silent RoPE failure: finite logits, fluent text.
+//    ROWS: blockIdx.y is the row (prefill); row i sits at position pos + i, reads qkv row i (width
+//    row_w) and writes q/k row i and cache row i. Decode launches gridDim.y = 1 (row 0, same math). ──
 extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
                                         const float* __restrict__ kw, float* __restrict__ qo,
                                         float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
                                         float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
                                         unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
                                         unsigned v_off, const float* __restrict__ bias,
-                                        const float* __restrict__ ff, unsigned norm_pairs) {
+                                        const float* __restrict__ ff, unsigned norm_pairs, unsigned row_w) {
     __shared__ float red[4]; __shared__ float s_inv;
-    const unsigned id = blockIdx.x, t = threadIdx.x;
+    const unsigned id = blockIdx.x, t = threadIdx.x, row = blockIdx.y;
     const bool is_k = id >= nh;
     const unsigned head = is_k ? id - nh : id;
+    qkv += (size_t)row * row_w; qo += (size_t)row * nh * dh; ko += (size_t)row * nkv * dh; pos += row;
+    if (kc_row != 0) kc_row += (size_t)row * nkv * dh;
+    if (vc_row != 0) vc_row += (size_t)row * nkv * dh;
     const unsigned so = (is_k ? k_off : q_off) + head * dh;
     const float* src = qkv + so;
     const float* bsrc = bias != 0 ? bias + so : 0;

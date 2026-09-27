@@ -71,7 +71,19 @@ pub struct Driver {
     gemv_q5k: OnceLock<Option<CUfunction>>,
     /// Tier-2 kernels from `cuda_decode.ptx`, loaded once BY NAME (see [`DecodeK`]).
     decode: OnceLock<Option<DecodeK>>,
+    /// Tier-3 (prefill) kernels from `cuda_prefill.ptx` (see [`PrefillK`]).
+    prefill: OnceLock<Option<PrefillK>>,
 }
+
+/// The prefill kernel table, resolved by name from `cuda_prefill.ptx`.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefillK {
+    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format.
+    gemm: [CUfunction; 5],
+    swiglu_rows: CUfunction, attn_prefill: CUfunction,
+}
+unsafe impl Send for PrefillK {}
+unsafe impl Sync for PrefillK {}
 
 /// The tier-2 kernel table, resolved by name from `cuda_decode.ptx`.
 ///
@@ -130,6 +142,7 @@ impl Driver {
             name: String::new(),
             gemv_q5k: OnceLock::new(),
             decode: OnceLock::new(),
+            prefill: OnceLock::new(),
             _lib: lib,
         };
         unsafe {
@@ -243,6 +256,22 @@ impl Driver {
         }).as_ref()
     }
 
+    fn prefill_kernels(&self) -> Option<&PrefillK> {
+        self.prefill.get_or_init(|| {
+            const N: [&[u8]; 7] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
+                                   b"swiglu_rows\0", b"attn_prefill\0"];
+            let v = self.load_ptx("cuda_prefill.ptx", &N)?;
+            Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6] })
+        }).as_ref()
+    }
+    /// 2-D grid launch, same contract as [`Driver::launch`].
+    unsafe fn launch2(&self, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
+        self.bind();
+        let r = (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(),
+                                        params.as_mut_ptr(), std::ptr::null_mut());
+        if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
+        true
+    }
     /// 1-D launch with pointer-to-argument slots; errors print here, completion is checked by `sync`.
     unsafe fn launch(&self, f: CUfunction, grid: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
@@ -292,6 +321,9 @@ pub fn driver() -> Option<&'static Arc<Driver>> {
 /// only other trace of "nothing native ran" is one stderr line.)
 static NATIVE_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn native_steps() -> u64 { NATIVE_STEPS.load(std::sync::atomic::Ordering::Relaxed) }
+/// Prompt rows the native PREFILL has completed in this process (see [`native_steps`]).
+static PREFILL_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn native_prefill_rows() -> u64 { PREFILL_ROWS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// A packed weight mirrored into CUDA memory at load time — from the SAME host words the WGSL buffers
 /// are built from (`dtype.rs` `from_bytes`), so there is no readback and no second repack; only the
@@ -414,6 +446,18 @@ unsafe fn launch_swiglu(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUd
     }
     let mut xp = x;
     d.launch(k.swiglu[w.fmt as usize], (n_ff as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, nff, din))
+}
+
+/// `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores (f16 in, f32 accumulate; see cuda_prefill.cu).
+/// `ldc` lets several weights write side by side into one wider C (the q|k|v parts). An A value past
+/// f16 range raises `*ovf`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
+                      m: usize, ovf: CUdeviceptr) -> bool {
+    let (mut ap, mut la, mut cp, mut xp, mut cc, mut lc) = (a, lda as u32, w.codes, w.aux, c, ldc as u32);
+    let (mut mm, mut nn, mut kk, mut of) = (m as u32, w.rows as u32, w.cols as u32, ovf);
+    d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128,
+              &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of))
 }
 
 /// **The K/V cache on the device — one per SEQUENCE, owned by the caller's cache, not by the graph.**
@@ -584,7 +628,21 @@ pub struct DecodeGraph {
     q8x: bool, xq: CUdeviceptr, xs: CUdeviceptr,
     /// Every device allocation this graph made, freed on drop (it used to leak them).
     owned: Vec<CUdeviceptr>,
+    /// Prefill scratch, allocated on the first prefill and grown on demand (see [`PrefillBufs`]).
+    pf: Option<PrefillBufs>,
 }
+
+/// Rows per prefill chunk. A prompt longer than this is run in chunks, each attending to the cache the
+/// previous ones wrote — causal attention makes that exact — so scratch stays bounded (≈85 MB at 512
+/// rows on Llama-3.2-1B) instead of growing with the prompt. `FERRIC_CUDA_PREFILL_CHUNK` overrides.
+fn prefill_chunk() -> usize {
+    std::env::var("FERRIC_CUDA_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(512)
+}
+/// Prefill scratch for up to `rows` rows (and `logit_rows` rows of logits). Indices into `b`:
+const PX: usize = 0; const PXN: usize = 1; const PQKV: usize = 2; const PQ: usize = 3; const PK: usize = 4;
+const PATT: usize = 5; const PY: usize = 6; const PXY: usize = 7; const PGU: usize = 8; const PH: usize = 9;
+const PDN: usize = 10; const POVF: usize = 11; const PLOG: usize = 12;
+struct PrefillBufs { rows: usize, logit_rows: usize, b: [CUdeviceptr; 13] }
 /// ⛔ **`ferric-serve` asserts `Engine: Send` at compile time, and `Qwen3` owns a
 /// `RefCell<Option<DecodeGraph>>`.** Without this impl the raw handles inside (`CUdeviceptr`,
 /// `CUfunction`, the two `CUevent`s in `Prof`) make `Qwen3` — and therefore the whole server —
@@ -649,7 +707,7 @@ impl DecodeGraph {
             // ffn_down (input n_ff) would have overrun under FERRIC_CUDA_Q8X — Qwen3-0.6B's down is
             // Q6_K, which is the only reason it never fired.
             xq: al(widest)?, xs: al(widest / 32 * 4 + 4)?,
-            owned, drv,
+            owned, drv, pf: None,
         })
     }
     /// A [`DevKv`] shaped for this graph.
@@ -693,10 +751,10 @@ impl DecodeGraph {
                 let rowb = (self.kv_out * 4) as u64;
                 // K and V rows go straight into the cache from the kernel: no D2D copies (class 3 is 0).
                 let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + pos as u64 * rowb, kv.v[li] + pos as u64 * rowb, (self.q_out + self.kv_out) as u32);
-                let (mut bias, mut ff, mut np) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32);
+                let (mut bias, mut ff, mut np, mut roww) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, (self.q_out + 2 * self.kv_out) as u32);
                 let heads = (self.nh + self.nkv) as u32;
                 timed!(2, drv.launch(k.qk_norm_rope, heads, 128,
-                                     &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np)));
+                                     &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww)));
                 let (mut q, mut kc, mut vc, mut ao, mut s, mut scale) = (self.q, kv.k[li], kv.v[li], self.attn, (pos + 1) as u32, 1.0f32 / (self.dh as f32).sqrt());
                 timed!(4, drv.launch(k.attn_decode, self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)));
                 timed!(5, launch_gemv(&drv, &k, self.attn, l.wo, self.y, q8));
@@ -723,8 +781,123 @@ impl DecodeGraph {
         Some(out)
     }
 }
+impl DecodeGraph {
+    fn free_prefill(&mut self) {
+        if let Some(pf) = self.pf.take() { self.drv.bind(); for p in pf.b { unsafe { (self.drv.cu_mem_free)(p); } } }
+    }
+    /// Make sure the prefill scratch holds `rows` rows and `logit_rows` rows of logits.
+    fn prefill_bufs(&mut self, rows: usize, logit_rows: usize) -> bool {
+        if self.pf.as_ref().is_some_and(|b| b.rows >= rows && b.logit_rows >= logit_rows) { return true; }
+        let (rows, logit_rows) = match &self.pf { Some(b) => (rows.max(b.rows), logit_rows.max(b.logit_rows)), None => (rows, logit_rows) };
+        self.free_prefill();
+        let (d, w, ff) = (self.d, self.q_out + 2 * self.kv_out, self.n_ff);
+        let sizes = [rows * d, rows * d, rows * w, rows * self.q_out, rows * self.kv_out, rows * self.q_out,
+                     rows * d, rows * d, rows * 2 * ff, rows * ff, rows * d, 1, logit_rows * self.n_vocab];
+        let mut b = [0 as CUdeviceptr; 13];
+        for (i, n) in sizes.into_iter().enumerate() {
+            match self.drv.alloc(n * 4) {
+                Some(p) => b[i] = p,
+                None => { self.drv.bind(); for &p in &b[..i] { unsafe { (self.drv.cu_mem_free)(p); } } return false; }
+            }
+        }
+        self.pf = Some(PrefillBufs { rows, logit_rows, b });
+        true
+    }
+
+    /// **Prefill: T prompt rows through every layer on the device**, K/V rows written straight into
+    /// `kv` at `[kv.len, kv.len + T)`. `x_rows` is `[T, d]` (already scaled/normed embeddings).
+    /// Returns the logits of every row (`all_logits`, `[T, n_vocab]`) or of the last row only.
+    ///
+    /// The matmuls run on the tensor cores (`cuda_prefill.cu`: f16 in, f32 accumulate); norms, rope,
+    /// bias and the residual adds are the decode kernels with a row grid, so the two paths share them.
+    /// `None` on any failure — including an activation past f16 range, detected in the GEMM — with
+    /// `kv.len` unchanged: rows written past it are dead, and the caller's WGSL prefill runs instead.
+    pub fn prefill(&mut self, kv: &mut DevKv, x_rows: &[f32], all_logits: bool) -> Option<Vec<f32>> {
+        let d = self.d;
+        if x_rows.is_empty() || x_rows.len() % d != 0 || kv.n_layer() != self.layers.len() || kv.width() != self.kv_out { return None; }
+        let t = x_rows.len() / d;
+        let k = *self.drv.decode_kernels()?;
+        let pk = *self.drv.prefill_kernels()?;
+        let pos0 = kv.len;
+        if !kv.reserve(pos0 + t) { return None; }
+        let chunk = prefill_chunk().min(t);
+        if !self.prefill_bufs(chunk, if all_logits { chunk } else { 1 }) { return None; }
+        let b = self.pf.as_ref().unwrap().b;
+        let drv = self.drv.clone();
+        drv.bind();
+        if !drv.htod(b[POVF], &[0.0]) { return None; }
+        let (q_out, kv_out, n_ff, nv) = (self.q_out, self.kv_out, self.n_ff, self.n_vocab);
+        let width = q_out + 2 * kv_out;
+        let mut out = Vec::with_capacity(if all_logits { t * nv } else { nv });
+        let nl = self.layers.len();
+        unsafe {
+            let (mut d32, mut eps) = (d as u32, self.eps);
+            for c0 in (0..t).step_by(chunk) {
+                let rows = chunk.min(t - c0);
+                let (pos, r32) = (pos0 + c0, rows as u32);
+                if !drv.htod(b[PX], &x_rows[c0 * d..(c0 + rows) * d]) { return None; }
+                for (li, l) in self.layers.iter().enumerate() {
+                    if li == 0 {
+                        let (mut x, mut w, mut o) = (b[PX], l.attn_norm, b[PXN]);
+                        if !drv.launch(k.rmsnorm, r32, 256, &mut p!(x, w, o, d32, eps)) { return None; }
+                    }
+                    let mut off = 0usize;
+                    for &w in &l.qkv {
+                        if !launch_gemm(&drv, &pk, b[PXN], d, w, b[PQKV] + (off * 4) as u64, width, rows, b[POVF]) { return None; }
+                        off += w.rows;
+                    }
+                    let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (b[PQKV], l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), b[PQ], b[PK]);
+                    let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
+                    let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, q_out as u32, self.has_qk_norm as u32);
+                    let rowb = (kv_out * 4) as u64;
+                    let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + pos as u64 * rowb, kv.v[li] + pos as u64 * rowb, (q_out + kv_out) as u32);
+                    let (mut bias, mut ff, mut np, mut roww) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, width as u32);
+                    if !drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
+                                    &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww)) { return None; }
+                    let (mut q, mut kc, mut vc, mut ao, mut tt, mut sc) = (b[PQ], kv.k[li], kv.v[li], b[PATT], r32, 1.0f32 / (self.dh as f32).sqrt());
+                    if !drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128,
+                                    &mut p!(q, kc, vc, ao, nh, nkv, dh, tt, posu, sc)) { return None; }
+                    if !launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]) { return None; }
+                    let (mut x2, mut y2, mut fw, mut xy, mut xn) = (b[PX], b[PY], l.ffn_norm, b[PXY], b[PXN]);
+                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)) { return None; }
+                    if !launch_gemm(&drv, &pk, b[PXN], d, l.gate_up, b[PGU], 2 * n_ff, rows, b[POVF]) { return None; }
+                    let (mut gu, mut h, mut nff) = (b[PGU], b[PH], n_ff as u32);
+                    if !drv.launch(pk.swiglu_rows, ((rows * n_ff) as u32).div_ceil(256), 256, &mut p!(gu, h, nff, tt)) { return None; }
+                    if !launch_gemm(&drv, &pk, b[PH], n_ff, l.down, b[PDN], d, rows, b[POVF]) { return None; }
+                    let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
+                    let (mut a, mut bb, mut nw, mut xo, mut xno) = (b[PXY], b[PDN], next_w, b[PX], b[PXN]);
+                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(a, bb, nw, xo, xno, d32, eps)) { return None; }
+                }
+                if all_logits {
+                    if !launch_gemm(&drv, &pk, b[PXN], d, self.lm_head, b[PLOG], nv, rows, b[POVF]) { return None; }
+                    let mut part = vec![0f32; rows * nv];
+                    if !drv.dtoh(&mut part, b[PLOG]) { return None; }
+                    out.extend_from_slice(&part);
+                } else if c0 + rows == t {
+                    let last = b[PXN] + ((rows - 1) * d * 4) as u64;
+                    if !launch_gemv(&drv, &k, last, self.lm_head, b[PLOG], None) { return None; }
+                    let mut row = vec![0f32; nv];
+                    if !drv.dtoh(&mut row, b[PLOG]) { return None; }
+                    out.extend_from_slice(&row);
+                }
+            }
+        }
+        if !drv.sync() { return None; }
+        let mut flag = [0f32]; if !drv.dtoh(&mut flag, b[POVF]) { return None; }
+        if flag[0].to_bits() != 0 {
+            eprintln!("cuda: a prefill activation exceeded f16 range (65504); discarding the native prefill — WGSL runs it");
+            return None;
+        }
+        kv.len = pos0 + t;
+        PREFILL_ROWS.fetch_add(t as u64, std::sync::atomic::Ordering::Relaxed);
+        Some(out)
+    }
+}
 impl Drop for DecodeGraph {
-    fn drop(&mut self) { self.drv.bind(); for &p in &self.owned { unsafe { (self.drv.cu_mem_free)(p); } } }
+    fn drop(&mut self) {
+        self.free_prefill();
+        self.drv.bind(); for &p in &self.owned { unsafe { (self.drv.cu_mem_free)(p); } }
+    }
 }
 
 /// **Per-kernel microbench for the native GEMVs** — `iters` back-to-back launches rotating over `ws`,
@@ -996,9 +1169,9 @@ mod tests {
         let (mut sd, mut qwd, mut kwd, mut bd, mut ffd) = (drv.upload_f32(qkv).unwrap(), up(qw), up(kw), up(bias), up(ff));
         let (mut qo, mut ko, mut kc, mut vc) = (drv.alloc(q_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap());
         let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2) = (nh as u32, nkv as u32, dh as u32, base, pos as u32, eps);
-        let (mut qoff, mut koff, mut hn, mut voff, mut np) = (0u32, q_out as u32, qw.is_some() as u32, (q_out + kv_out) as u32, norm_pairs as u32);
+        let (mut qoff, mut koff, mut hn, mut voff, mut np, mut rw) = (0u32, q_out as u32, qw.is_some() as u32, (q_out + kv_out) as u32, norm_pairs as u32, (q_out + 2 * kv_out) as u32);
         assert!(unsafe { drv.launch(k.qk_norm_rope, (nh + nkv) as u32, 128,
-            &mut p!(sd, qwd, kwd, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, kc, vc, voff, bd, ffd, np)) } && drv.sync());
+            &mut p!(sd, qwd, kwd, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, kc, vc, voff, bd, ffd, np, rw)) } && drv.sync());
         let (mut qg, mut kg, mut kcg, mut vcg) = (vec![0f32; q_out], vec![0f32; kv_out], vec![0f32; kv_out], vec![0f32; kv_out]);
         assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko) && drv.dtoh(&mut kcg, kc) && drv.dtoh(&mut vcg, vc));
         (qg, kg, kcg, vcg)

@@ -18,9 +18,13 @@
 /// `.cu` without rebuilding the `.ptx` fails HERE rather than at someone else's runtime.
 #[test]
 fn tracked_ptx_exports_every_kernel_the_cu_defines() {
-    let cu = include_str!("../src/cuda_decode.cu");
-    let ptx = include_str!("../src/cuda_decode.ptx");
+    // Both native modules: decode (tier 2) and prefill (tier 3). `load_ptx` treats each the same way —
+    // every name resolved, the whole module refused on the first miss.
+    check("cuda_decode", include_str!("../src/cuda_decode.cu"), include_str!("../src/cuda_decode.ptx"), 17);
+    check("cuda_prefill", include_str!("../src/cuda_prefill.cu"), include_str!("../src/cuda_prefill.ptx"), 7);
+}
 
+fn check(stem: &str, cu: &str, ptx: &str, floor: usize) {
     let names: Vec<&str> = cu
         .lines()
         .filter_map(|l| {
@@ -34,9 +38,9 @@ fn tracked_ptx_exports_every_kernel_the_cu_defines() {
     // ⚠ A parser that silently matches nothing would make every assertion below vacuous
     // (vacuous-test mechanism: "a loop that asserts nothing"). Floor it on the real count.
     assert!(
-        names.len() >= 8,
-        "parsed only {} kernels out of cuda_decode.cu — the `__global__ void` parser drifted, and \
-         this test would have passed while checking nothing",
+        names.len() >= floor,
+        "parsed only {} kernels out of {stem}.cu (expected >= {floor}) — the `__global__ void` parser \
+         drifted, and this test would have passed while checking nothing",
         names.len()
     );
 
@@ -48,12 +52,11 @@ fn tracked_ptx_exports_every_kernel_the_cu_defines() {
 
     assert!(
         missing.is_empty(),
-        "cuda_decode.ptx is STALE: {:?} defined in cuda_decode.cu but not exported by the tracked \
-         PTX ({} of {} present). decode_kernels() resolves all of them and gives up on the first \
-         miss, so this disables the ENTIRE native decode tier while still generating correct ids. \
-         Rebuild it on a CUDA box:\n  \
-         nvcc -O3 -arch=compute_75 -ptx crates/ferric-tensor/src/cuda_decode.cu -o crates/ferric-tensor/src/cuda_decode.ptx\n  \
-         ptxas -arch=sm_89 -o /dev/null crates/ferric-tensor/src/cuda_decode.ptx",
+        "{stem}.ptx is STALE: {:?} defined in {stem}.cu but not exported by the tracked PTX ({} of {} \
+         present). The loader resolves all of them and gives up on the first miss, so this disables \
+         that ENTIRE native module while still generating correct ids. Rebuild it on a CUDA box:\n  \
+         nvcc -O3 -arch=compute_75 -ptx crates/ferric-tensor/src/{stem}.cu -o crates/ferric-tensor/src/{stem}.ptx\n  \
+         ptxas -arch=sm_89 -o /dev/null crates/ferric-tensor/src/{stem}.ptx",
         missing,
         names.len() - missing.len(),
         names.len()

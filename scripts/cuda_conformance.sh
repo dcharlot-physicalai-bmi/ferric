@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# **The NVIDIA native tier, one decode step at a time, against Ferric's portable path AND the authors.**
+#
+#   scripts/cuda_conformance.sh <model.gguf> <fixture.json> [long_total]
+#
+# Runs `examples/lm_decode_logits` twice on the SAME quantised file — once with FERRIC_CUDA unset (the
+# WGSL path, which `scripts/lm_conformance.sh` verifies against the authors on F32 weights) and once with
+# it set — and compares every position's logits (128 sampled ids + the full row's sum of squares):
+#
+#   1. ENGAGEMENT: every single-token call must have been a native step (`NATIVE_STEPS n OF n`). A WGSL
+#      fallback prints the same kind of rows, so without this the gate would pass on a tier that never
+#      ran — the fate of the first CUDA check, whose "reference" had been routed to CUDA too.
+#   2. NATIVE vs WGSL, same weights: max |Δ logit| within TOL_NW. Two f32 implementations with different
+#      reduction orders; the band is measured (see TOL_NW below), not assumed.
+#   3. vs THE AUTHORS (transformers, float32, the fixture): a quantised file cannot match them — its
+#      distance is the quantisation noise — so the claim is RELATIVE: the native tier sits no further
+#      from the authors than the portable path does (plus the native-vs-WGSL band), with the same argmax
+#      agreement up to near-ties.
+#   4. NEGATIVE CONTROLS on the native path: each flips one mechanism the native kernels implement to a
+#      known-wrong form (rope pairing; Llama-3 rope_freqs; Qwen2 q/k/v bias — whichever the FILE has),
+#      and the native run must move ≥ 20x TOL_NW away from the normal WGSL run WHILE STILL RUNNING
+#      NATIVELY. Otherwise this gate has not shown it can see that mechanism.
+#   5. LONG (optional `long_total`, e.g. 2300): native vs WGSL only, past the old 2048-token cap.
+#
+# The multi-token chunk mid-sequence (lm_decode_logits' `chunk_at`) runs on WGSL, so the K/V cache is
+# handed device → WGSL and back inside every run; a stale row anywhere shows up in (2).
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+M="${1:-}"; FX="${2:-}"; LONG="${3:-0}"
+[ -f "$M" ] && [ -f "$FX" ] || { echo "usage: $0 <model.gguf> <fixture.json> [long_total]"; exit 2; }
+BIN="$ROOT/target/release/examples/lm_decode_logits"
+[ -x "$BIN" ] || cargo build -q -p ferric-llama --release --example lm_decode_logits || exit 2
+
+python3 - "$BIN" "$M" "$FX" "$LONG" <<'PY'
+import json, os, struct, subprocess, sys
+BIN, M, FX, LONG = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+ref = json.load(open(FX))
+
+def gguf(path):
+    """architecture + the tensor names (so the controls are chosen from what the FILE has)."""
+    def u32(f): return struct.unpack('<I', f.read(4))[0]
+    def u64(f): return struct.unpack('<Q', f.read(8))[0]
+    def rstr(f): return f.read(u64(f)).decode('utf-8', 'replace')
+    def skip(f, t):
+        sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+        if t in sizes: f.read(sizes[t]); return
+        if t == 8: rstr(f); return
+        if t == 9:
+            et = u32(f); n = u64(f)
+            for _ in range(n): skip(f, et)
+    arch, names = '?', []
+    with open(path, 'rb') as f:
+        f.read(4); u32(f); nt = u64(f); nkv = u64(f)
+        for _ in range(nkv):
+            k = rstr(f); t = u32(f)
+            if k == 'general.architecture' and t == 8: arch = rstr(f)
+            else: skip(f, t)
+        for _ in range(nt):
+            names.append(rstr(f)); nd = u32(f); f.read(8 * nd + 4 + 8)
+    return arch, set(names)
+ARCH, NAMES = gguf(M)
+
+# ⚠ Clear every knob that changes the math, so an inherited shell variable cannot make both arms wrong alike.
+KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_Q8X", "FERRIC_NEOX", "FERRIC_ROPE_NORM", "FERRIC_NO_ROPE_FREQS", "FERRIC_NO_QKV_BIAS",
+         "FERRIC_KVQ", "FERRIC_NOFUSE", "FERRIC_NO_QK_FUSE", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA")
+def run(cuda, extra=None, total=0, prefill=8, chunk_at=64, chunk=5):
+    env = {k: v for k, v in os.environ.items() if k not in KNOBS}
+    if cuda: env["FERRIC_CUDA"] = "1"
+    env.update(extra or {})
+    r = subprocess.run([BIN, M, FX, str(prefill), str(chunk_at), str(chunk), str(total)], capture_output=True, text=True, env=env)
+    if r.returncode: print(r.stderr[-2000:]); sys.exit(1)
+    rows, steps = {}, None
+    for l in r.stdout.splitlines():
+        p = l.split(" ")
+        if p[0] == "ROW": rows[int(p[1])] = (int(p[2]), float(p[4]), [float(x) for x in p[5:]])
+        elif p[0] == "NATIVE_STEPS": steps = (int(p[1]), int(p[3]))
+    dev = [l for l in r.stderr.splitlines() if l.startswith(("adapter", "native"))]
+    return rows, steps, dev, r.stderr
+
+def diff(a, b):
+    """max |Δ| over the sampled logits, worst position, worst relative Δ of the full-row sum of squares."""
+    worst, wt, ssq = 0.0, -1, 0.0
+    for t in a:
+        d = max(abs(x - y) for x, y in zip(a[t][2], b[t][2]))
+        if d > worst: worst, wt = d, t
+        ssq = max(ssq, abs(a[t][1] - b[t][1]) / max(abs(b[t][1]), 1e-30))
+    return worst, wt, ssq
+
+POS = ref.get("positions") or list(range(len(ref["ids"])))
+AUTH = {t: rr for t, rr in zip(POS, ref["rows"])}
+def vs_authors(rows):
+    worst, agree, n = 0.0, 0, 0
+    for t, rr in AUTH.items():
+        if t not in rows: continue
+        worst = max(worst, max(abs(x - y) for x, y in zip(rows[t][2], rr["sample"])))
+        agree += rows[t][0] == rr["top"][0][0]; n += 1
+    return worst, agree, n
+
+# ⭐ TOL_NW, the native-vs-WGSL band. UNMEASURED-PLACEHOLDER: set from the accepted configuration's run.
+TOL_NW = None
+wr, ws, wdev, _ = run(False)
+cr, cs, cdev, cerr = run(True)
+print(f"model:     {os.path.basename(M)} (arch {ARCH})   fixture: {ref['model']} — transformers {ref['transformers']}, float32")
+for l in cdev: print(f"  {l}")
+if not any(l.startswith("native") for l in cdev):
+    print("⛔ no CUDA device line: FERRIC_CUDA had no driver to open. NOTHING native was checked."); sys.exit(1)
+ok = True
+n_steps, n_single = cs
+print(f"  engagement: {n_steps} native steps of {n_single} single-token calls")
+if n_steps == 0 or n_steps != n_single:
+    print("  ⛔ the native tier did not serve every decode step"); print("\n".join(l for l in cerr.splitlines() if "cuda" in l)[-800:]); ok = False
+d, dt, ssq = diff(cr, wr)
+print(f"  native vs WGSL (same weights)   max |Δ logit| {d:.3e} at position {dt}   ssq rel {ssq:.2e}   (tol {TOL_NW:g})")
+ok &= d <= TOL_NW
+arg = sum(cr[t][0] == wr[t][0] for t in cr)
+print(f"  argmax agreement native vs WGSL {arg}/{len(cr)}")
+wa, wagree, na = vs_authors(wr); ca, cagree, _ = vs_authors(cr)
+print(f"  vs the authors: WGSL max |Δ| {wa:.3f}, argmax {wagree}/{na}   native max |Δ| {ca:.3f}, argmax {cagree}/{na}   (quantisation noise)")
+if ca > 1.25 * wa + TOL_NW: print("  ⛔ the native tier sits further from the authors than the portable path"); ok = False
+if abs(cagree - wagree) > max(1, na // 50): print("  ⛔ argmax agreement with the authors differs beyond near-ties"); ok = False
+
+controls = []
+if ARCH not in ("nemotron_h",):
+    controls.append(("wrong rope pairing", {"FERRIC_NEOX": "1"} if ARCH in ("llama", "muse-glimmer") else {"FERRIC_ROPE_NORM": "1"}))
+if "rope_freqs.weight" in NAMES: controls.append(("rope_freqs dropped", {"FERRIC_NO_ROPE_FREQS": "1"}))
+if "blk.0.attn_q.bias" in NAMES: controls.append(("q/k/v bias dropped", {"FERRIC_NO_QKV_BIAS": "1"}))
+for name, env in controls:
+    xr, xs, _, _ = run(True, env, total=min(48, len(ref["ids"])), chunk_at=10**9)
+    short = {t: wr[t] for t in xr}
+    xd, _, _ = diff(xr, short)
+    moved = xd / TOL_NW
+    ran = xs[0] == xs[1] and xs[0] > 0
+    print(f"  control '{name}' ({' '.join(env)}): native moved {xd:.3e} = {moved:.0f}x tol   ran natively: {ran}")
+    if moved < 20 or not ran: print("  ⛔ the gate cannot see this mechanism on the native path"); ok = False
+if not controls: print("  ⛔ no negative control applies — this gate has shown nothing"); ok = False
+
+if LONG:
+    lw, _, _, _ = run(False, total=LONG, chunk_at=LONG // 2)
+    lc, ls, _, _ = run(True, total=LONG, chunk_at=LONG // 2)
+    d2, t2, s2 = diff(lc, lw)
+    print(f"  LONG {LONG} positions: native vs WGSL max |Δ| {d2:.3e} at {t2}   ssq rel {s2:.2e}   native {ls[0]}/{ls[1]}")
+    ok &= d2 <= TOL_NW and ls[0] == ls[1] and ls[0] > 0
+print("PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)
+PY

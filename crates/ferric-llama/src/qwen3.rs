@@ -1725,8 +1725,9 @@ impl Qwen3 {
         use ferric_tensor::{batch, prof};
         // NVIDIA tier 2 (opt-in, FERRIC_CUDA): one resident decode step per token after a WGSL prefill.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if tokens.len() == 1 {
-            if let Some(lg) = self.native_step(tokens[0], cache) { return lg; }
+        {
+            let native = if tokens.len() == 1 { self.native_step(tokens[0], cache) } else { self.native_prefill(tokens, cache, true) };
+            if let Some(lg) = native { return lg; }
         }
         let x = self.run_layers(tokens, cache);
         let out = batch(&self.ctx, || self.head(&x));
@@ -1742,6 +1743,8 @@ impl Qwen3 {
     pub fn forward_cached_last(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
         if tokens.len() == 1 { return self.forward_cached(tokens, cache); }
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(lg) = self.native_prefill(tokens, cache, false) { return lg; }
         let x = self.run_layers(tokens, cache);
         let last = x.narrow(0, tokens.len() - 1, 1).contiguous();
         let out = batch(&self.ctx, || self.head(&last));
@@ -1767,8 +1770,33 @@ impl Qwen3 {
     /// multimodal rope) stays on the portable path rather than being approximated.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     fn native_step(&self, token: u32, cache: &mut Cache) -> Option<Tensor> {
-        use ferric_tensor::cuda::DecodeGraph;
         ferric_tensor::cuda::driver()?;
+        let row = self.embed_rows(&[token], true);
+        let logits = self.native_run(cache, |g, kv| g.step(kv, &row))?;
+        cache.pos += 1;
+        Some(Tensor::from_vec(&self.ctx, &logits, &[1, self.cfg.n_vocab]))
+    }
+
+    /// **A multi-token forward on the NVIDIA tier** — the prompt's matmuls on the tensor cores
+    /// (`DecodeGraph::prefill`). `all` = logits for every row (`forward_cached`), else the last row only
+    /// (`forward_cached_last`). `FERRIC_CUDA_NO_PREFILL` keeps prefill on WGSL (native decode only) —
+    /// the A/B switch, since this path rounds activations to f16 on their way into the tensor cores.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    fn native_prefill(&self, tokens: &[u32], cache: &mut Cache, all: bool) -> Option<Tensor> {
+        ferric_tensor::cuda::driver()?;
+        if std::env::var("FERRIC_CUDA_NO_PREFILL").is_ok() { return None; }
+        let rows = self.embed_rows(tokens, true);
+        let logits = self.native_run(cache, |g, kv| g.prefill(kv, &rows, all))?;
+        cache.pos += tokens.len();
+        Some(Tensor::from_vec(&self.ctx, &logits, &[if all { tokens.len() } else { 1 }, self.cfg.n_vocab]))
+    }
+
+    /// Build (or refuse, once) the graph, attach this cache's device K/V, bring it up to `cache.pos`,
+    /// then run `f`. The caller advances `cache.pos` on `Some`.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    fn native_run<R>(&self, cache: &mut Cache,
+                     f: impl FnOnce(&mut ferric_tensor::cuda::DecodeGraph, &mut ferric_tensor::cuda::DevKv) -> Option<R>) -> Option<R> {
+        use ferric_tensor::cuda::DecodeGraph;
         if cache.fmt.is_some() { return None; }
         let mut slot = self.native.borrow_mut();
         if let NativeSlot::Untried = *slot {
@@ -1805,10 +1833,7 @@ impl Qwen3 {
             }
             n.kv.len = pos;
         }
-        let row = self.embed_rows(&[token], true);
-        let logits = g.step(&mut n.kv, &row)?;
-        cache.pos += 1;
-        Some(Tensor::from_vec(&self.ctx, &logits, &[1, self.cfg.n_vocab]))
+        f(g, &mut n.kv)
     }
 
     /// The host-side description of this model for [`ferric_tensor::cuda::DecodeGraph::build`], or the
