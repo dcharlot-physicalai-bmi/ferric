@@ -182,6 +182,8 @@ fn to_openai(req: &Value) -> Result<Value, String> {
     if let Some(t) = req["tools"].as_array() { r["tools"] = json!(t); }
     // Ollama's `think` is the template's `enable_thinking` (Qwen3 and its descendants read it).
     if let Some(b) = req["think"].as_bool() { r["chat_template_kwargs"] = json!({"enable_thinking": b}); }
+    // The model name selects a LoRA adapter when it names one; `lora` is llama-server's per-request list.
+    for k in ["model", "lora"] { if !req[k].is_null() { r[k] = req[k].clone(); } }
     Ok(r)
 }
 
@@ -261,7 +263,7 @@ fn prepare(eng: &Engine, req: &Value, messages: &[Value]) -> Result<Value, Strin
     // `images` are read by the vision path (`vision`), or refused there by name on a text model.
     let mut r = to_openai(req)?;
     r["messages"] = json!(messages);
-    crate::genopts::GenOpts::from_req(&r, true)?;
+    eng.gen_opts(&r, true)?;
     eng.chat_ids(messages)?;
     Ok(r)
 }
@@ -337,7 +339,7 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
     let run = |on_delta: &mut dyn FnMut(&str)| -> Result<ChatResult, String> {
         if raw {
             let r = to_openai(&req)?;
-            let opts = crate::genopts::GenOpts::from_req(&r, false)?;
+            let opts = eng.gen_opts(&r, false)?;
             let ids = eng.encode_prompt(prompt);
             let max = eng.budget(ids.len(), opts.max_tokens)?;
             let out = eng.generate(&ids, max, &opts, None, |d, _| on_delta(d));
@@ -353,7 +355,7 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
     };
     if streaming {
         // Validate first (a raw prompt has nothing to validate beyond its options).
-        if let Err(e) = to_openai(&req).and_then(|r| crate::genopts::GenOpts::from_req(&r, false).map(|_| ())) { return err(stream, 400, &e); }
+        if let Err(e) = to_openai(&req).and_then(|r| eng.gen_opts(&r, false).map(|_| ())) { return err(stream, 400, &e); }
         write_ndjson_headers(stream);
         let res = run(&mut |d: &str| {
             first.get_or_insert_with(Instant::now);

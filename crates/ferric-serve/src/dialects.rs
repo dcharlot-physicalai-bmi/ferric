@@ -81,6 +81,8 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
     let mut r = json!({"messages": msgs});
     let max = req["max_tokens"].as_u64().ok_or("`max_tokens` is required (Anthropic's API has no default)")?;
     r["max_tokens"] = json!(max);
+    // Carried so the model name can select a LoRA adapter (`Engine::gen_opts`).
+    for k in ["model", "lora"] { if !req[k].is_null() { r[k] = req[k].clone(); } }
     for (a, o) in [("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("stop_sequences", "stop")] {
         if !req[a].is_null() { r[o] = req[a].clone(); }
     }
@@ -122,7 +124,7 @@ pub(crate) fn messages(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, bod
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad(stream, true, &format!("bad json: {e}")) };
     let r = match anthropic_to_openai(&req) { Ok(r) => r, Err(e) => return bad(stream, true, &e) };
     let empty = vec![];
-    if let Err(e) = crate::genopts::GenOpts::from_req(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
+    if let Err(e) = eng.gen_opts(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
         return bad(stream, true, &e);
     }
     let id = rand_id("msg_");
@@ -294,6 +296,7 @@ pub(crate) fn responses(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, st
     let msgs = match responses_to_messages(&req, prior) { Ok(m) => m, Err(e) => return bad(stream, false, &e) };
     let mut r = json!({"messages": msgs});
     if let Some(n) = req["max_output_tokens"].as_u64() { r["max_tokens"] = json!(n); }
+    for k in ["model", "lora"] { if !req[k].is_null() { r[k] = req[k].clone(); } }
     for k in ["temperature", "top_p"] { if !req[k].is_null() { r[k] = req[k].clone(); } }
     if let Some(tools) = req["tools"].as_array() {
         let fns: Vec<Value> = tools.iter().filter(|t| t["type"] == "function").map(|t| json!({"type": "function",
@@ -310,7 +313,7 @@ pub(crate) fn responses(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, st
         r["chat_template_kwargs"] = json!({"enable_thinking": e != "minimal" && e != "none"});
     }
     let empty = vec![];
-    if let Err(e) = crate::genopts::GenOpts::from_req(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
+    if let Err(e) = eng.gen_opts(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
         return bad(stream, false, &e);
     }
     let id = rand_id("resp_");

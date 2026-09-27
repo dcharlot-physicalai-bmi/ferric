@@ -80,7 +80,11 @@ pub(crate) trait ServeModel {
 
     /// Start a sequence: a fresh state (or one seeded from the prompt cache) and how many of the
     /// prompt's tokens it already holds — never all of them, since the last must be fed to give logits.
-    fn begin(&self, prompt: &[u32]) -> (Self::State, usize);
+    fn begin(&self, prompt: &[u32], opts: &GenOpts) -> (Self::State, usize);
+
+    /// A request's generation options. The default reads only the request; a model with LoRA adapters
+    /// also resolves which of them it selects (`Engine::gen_opts`), so every batched row keeps its own.
+    fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> { GenOpts::from_req(req, chat) }
 
     /// Feed the next run of prompt tokens. `last` = they end the prompt: return the **last** row of
     /// logits, the row the first sampled token comes from.
@@ -370,7 +374,7 @@ fn route<M: ServeModel>(
             }
             return;
         }
-        let gopts = match GenOpts::from_req(&req, chat) { Ok(o) => o, Err(e) => return bad(&mut j.stream, &e) };
+        let gopts = match m.gen_opts(&req, chat) { Ok(o) => o, Err(e) => return bad(&mut j.stream, &e) };
         let prompt = if chat {
             let empty = vec![];
             match m.encode_chat(req["messages"].as_array().unwrap_or(&empty)) { Ok(p) => p, Err(e) => return bad(&mut j.stream, &e) }
@@ -733,7 +737,7 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
         if budget == 0 { break; }
         if g.state.is_none() {
             g.ticket = m.energy_begin();
-            let (st, skip) = m.begin(&g.prompt);
+            let (st, skip) = m.begin(&g.prompt, &g.opts);
             g.state = Some(st);
             g.fed = skip;
         }
@@ -873,7 +877,8 @@ impl ServeModel for Engine {
         ids
     }
 
-    fn begin(&self, prompt: &[u32]) -> (ModelCache, usize) { self.seeded_cache(prompt) }
+    fn begin(&self, prompt: &[u32], opts: &GenOpts) -> (ModelCache, usize) { self.seeded_cache(prompt, &opts.lora) }
+    fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> { Engine::gen_opts(self, req, chat) }
 
     /// A chunk continues the cache exactly as a prompt-cache hit does (the suffix after a seeded prefix),
     /// so chunked and whole prefill feed the same tokens through the same cached forward.
@@ -996,7 +1001,7 @@ mod tests {
             Ok(out)
         }
         fn encode_text(&self, text: &str) -> Vec<u32> { text.bytes().map(|b| b as u32).collect() }
-        fn begin(&self, _prompt: &[u32]) -> (MockState, usize) { (MockState { fed: Vec::new() }, 0) }
+        fn begin(&self, _prompt: &[u32], _o: &GenOpts) -> (MockState, usize) { (MockState { fed: Vec::new() }, 0) }
         fn feed(&self, st: &mut MockState, toks: &[u32], last: bool) -> Option<Vec<f32>> {
             self.prefills.fetch_add(1, Ordering::SeqCst);
             if !self.prefill_per_token.is_zero() { std::thread::sleep(self.prefill_per_token * toks.len() as u32); }

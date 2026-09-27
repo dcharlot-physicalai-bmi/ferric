@@ -58,6 +58,17 @@ pub(crate) struct GenOpts {
     /// Internal: the request's image, decoded and planned (`vision`). It rides with the request rather
     /// than on the engine, because two images of one size produce the same prompt ids.
     pub image: Option<std::sync::Arc<crate::vision::MmInput>>,
+    /// Internal: the LoRA adapters this request runs with (`Engine::gen_opts`); empty = the base model.
+    pub lora: Lora,
+}
+
+/// A request's adapter selection: each adapter uploaded once, and its multiplier.
+#[derive(Clone, Default)]
+pub(crate) struct Lora(pub Vec<(std::sync::Arc<ferric_llama::lora::DeviceLora>, f32)>);
+impl std::fmt::Debug for Lora {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|(d, s)| format!("{}@{s}", d.id))).finish()
+    }
 }
 
 pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
@@ -65,7 +76,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0, with_specials: false, image: None }
+                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default() }
     }
 }
 

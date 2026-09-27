@@ -1,0 +1,24 @@
+{
+ "prompts": [
+  "The three laws of motion state that",
+  "def fibonacci(n):\n    ",
+  "Paris is the capital of"
+ ],
+ "peft": {
+  "base": [
+   " an object will accelerate if it is subjected to a net force, and the magnitude of the acceleration is directly proportional to the",
+   " if n <= 1:\n         return n\n     else:\n         return fibonacci(n-1) + fibonacci(n-",
+   " France and the largest city in the country. It is located on the Mediterranean coast, in the south of the country."
+  ],
+  "syn_a": [
+   " an object will move in a straight line with constant velocity unless acted upon by an external force. The first law states that",
+   " if n <= 1:\n         return n\n     else:\n         return fibonacci(n-1) + fibonacci(n-",
+   " France and the largest city in the country. It is located on the Mediterranean coast, facing the Atlantic Ocean. It is"
+  ],
+  "syn_b": [
+   " an object will accelerate if it is subjected to a net force, and the magnitude of the acceleration will be directly proportional to",
+   " if n <= 1:\n         return n\n     else:\n         return fibonacci(n-1) + fibonacci(n-",
+   " France and the largest city in the country. It is located on the Mediterranean coast, in the south of the country."
+  ]
+ }
+}

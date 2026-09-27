@@ -430,6 +430,8 @@ pub(crate) struct Engine {
     n_ctx: usize,
     /// The image path, for a vision model served from its authors' checkpoint directory (`vision`).
     vision: Option<vision::Vision>,
+    /// LoRA adapters named on the command line (`--lora name=path`), uploaded once: (name, adapter, card).
+    adapters: Vec<(String, Arc<ferric_llama::lora::DeviceLora>, ollama::Card)>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -676,7 +678,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx, vision: None }
+                 rstrip_after, n_ctx, vision: None, adapters: Vec::new() }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -901,9 +903,10 @@ impl Engine {
         Ok(want.unwrap_or(usize::MAX).min(self.n_ctx - prompt_len))
     }
 
-    /// Every loaded model's card: the chat model, then the embedder.
+    /// Every loaded model's card: the chat model, its LoRA adapters, then the embedder.
     pub(crate) fn cards(&self) -> Vec<ollama::Card> {
         let mut v = vec![self.card.clone()];
+        v.extend(self.adapters.iter().map(|(_, _, c)| c.clone()));
         if let Some((_, _, c)) = &self.aux.embedder { v.push(c.clone()); }
         v
     }
@@ -919,14 +922,62 @@ impl Engine {
     /// A fresh cache for `prompt`, seeded from the prefix cache when this is the dense runtime and a
     /// previous sequence shares a whole-chunk prefix. Returns the cache and how many prompt tokens it
     /// already holds. Never the WHOLE prompt: the last token must be fed to produce the next logits.
-    pub(crate) fn seeded_cache(&self, prompt: &[u32]) -> (ModelCache, usize) {
-        if let (Model::Dense(m), Some(pc)) = (&self.model, &self.prefix_cache) {
-            if prompt.len() > 1 {
-                let (c, n) = pc.borrow_mut().cache_for(&self.ctx, &m.cfg, &prompt[..prompt.len() - 1]);
-                if n > 0 { return (ModelCache::Dense(c), n); }
-            }
+    pub(crate) fn seeded_cache(&self, prompt: &[u32], lora: &genopts::Lora) -> (ModelCache, usize) {
+        if let Model::Dense(m) = &self.model {
+            // The adapters go on BEFORE seeding: the prompt cache keys its entries on the selection, and a
+            // cache refuses a new selection once it holds tokens.
+            let mut c = qwen3::Cache::new(&m.cfg);
+            if !lora.0.is_empty() { c.set_adapters(lora.0.clone()).expect("a fresh cache takes any selection"); }
+            let n = match (&self.prefix_cache, prompt.len() > 1) {
+                (Some(pc), true) => pc.borrow_mut().seed(&self.ctx, &prompt[..prompt.len() - 1], &mut c).map(|h| h.tokens).unwrap_or(0),
+                _ => 0,
+            };
+            return (ModelCache::Dense(c), n);
         }
         (self.model.new_cache(), 0)
+    }
+
+    /// A request's generation options, including which LoRA adapters it runs with:
+    /// - `model` naming a loaded adapter (vLLM's convention: an adapter is served as a model of its own);
+    /// - `lora: [{"id": i | "name": n, "scale": s}]` (llama-server's; `id` is the adapter's place among
+    ///   the `--lora` flags). Several SUM, as PEFT does; scale 0 drops one; an unknown one is refused.
+    pub(crate) fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> {
+        let mut o = GenOpts::from_req(req, chat)?;
+        let find = |n: &str| self.adapters.iter().position(|(a, _, _)| a == n.strip_suffix(":latest").unwrap_or(n));
+        let names = || self.adapters.iter().map(|(a, _, _)| a.as_str()).collect::<Vec<_>>().join(", ");
+        if let Some(i) = req["model"].as_str().and_then(find) { o.lora.0.push((self.adapters[i].1.clone(), 1.0)); }
+        match &req["lora"] {
+            Value::Null => {}
+            Value::Array(sel) => for (k, x) in sel.iter().enumerate() {
+                let i = match (&x["id"], &x["name"]) {
+                    (Value::Number(n), _) => n.as_u64().map(|n| n as usize).filter(|&n| n < self.adapters.len())
+                        .ok_or_else(|| format!("lora[{k}].id {n}: {} adapter(s) are loaded ({})", self.adapters.len(), names()))?,
+                    (_, Value::String(n)) => find(n).ok_or_else(|| format!("lora[{k}].name {n:?} is not loaded; loaded: {}", names()))?,
+                    _ => return Err(format!("lora[{k}] needs an `id` or a `name`")),
+                };
+                let scale = match &x["scale"] { Value::Null => 1.0, v => v.as_f64().ok_or_else(|| format!("lora[{k}].scale must be a number"))? as f32 };
+                if scale != 0.0 { o.lora.0.push((self.adapters[i].1.clone(), scale)); }
+            },
+            v => return Err(format!("`lora` must be an array of {{id|name, scale}}, got {v}")),
+        }
+        Ok(o)
+    }
+
+    /// Upload the `--lora name=path` adapters onto this (dense) model.
+    pub(crate) fn load_adapters(&mut self, specs: &[(String, String)]) -> Result<(), String> {
+        for (name, path) in specs {
+            let Model::Dense(m) = &self.model else { return Err(format!("--lora {name}: LoRA is served on the dense runtime only")); };
+            let a = ferric_load::lora::LoraAdapter::open(path).map_err(|e| format!("--lora {name}={path}: {e}"))?;
+            let dev = m.upload_lora(&a).map_err(|e| format!("--lora {name}={path}: {e}"))?;
+            let mut card = self.card.clone();
+            card.name = name.clone();
+            card.path = path.clone();
+            card.size = walk_size(std::path::Path::new(path));
+            eprintln!("ferric-serve: LoRA adapter {name} ({}, base {}) — request it as `model: \"{name}\"` or `lora: [{{\"name\": \"{name}\"}}]`",
+                      path, a.base_model.as_deref().unwrap_or("undeclared"));
+            self.adapters.push((name.clone(), dev, card));
+        }
+        Ok(())
     }
 
     /// Keep `tokens` (exactly the ones this cache has consumed) for later requests to reuse.
@@ -1010,7 +1061,7 @@ impl Engine {
         }
         // ⛔ An image prompt never touches the prefix cache: two images of one size are the SAME ids.
         let mm = opts.image.clone();
-        let (mut cache, skip) = if mm.is_some() { (self.model.new_cache(), 0) } else { self.seeded_cache(prompt) };
+        let (mut cache, skip) = if mm.is_some() { (self.model.new_cache(), 0) } else { self.seeded_cache(prompt, &opts.lora) };
         let mut delta = 0i64;
         let n_vocab = self.model.n_vocab();
         let mut rng: u64 = opts.rng; // fixed default seed → reproducible sampling; `seed` overrides it
@@ -1061,7 +1112,7 @@ impl Engine {
     /// path (~34 ms per forward measured) where a batched decode step takes ~10 ms, so the forwards it saves
     /// cost more each. It pays once a few-row forward reads the weights once, as a decode step does.
     fn generate_lookup(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, k: usize, mut on_delta: impl FnMut(&str, &[Value])) -> GenOut {
-        let (mut cache, skip) = self.seeded_cache(prompt);
+        let (mut cache, skip) = self.seeded_cache(prompt, &opts.lora);
         let n_vocab = self.model.n_vocab();
         let mut rng: u64 = opts.rng;
         let mut r#gen: Vec<u32> = Vec::new();
@@ -1414,6 +1465,12 @@ fn lookup_draft(ctx: &[u32], k: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// A file's size, or a directory's (a PEFT adapter is a directory).
+fn walk_size(p: &std::path::Path) -> u64 {
+    if p.is_dir() { std::fs::read_dir(p).map(|r| r.flatten().map(|e| walk_size(&e.path())).sum()).unwrap_or(0) }
+    else { std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) }
+}
+
 /// Physical memory in bytes: `hw.memsize` on macOS, `MemTotal` on Linux. `None` elsewhere (no budget).
 fn physical_memory() -> Option<u64> {
     if cfg!(target_os = "macos") {
@@ -1453,6 +1510,7 @@ pub fn run() {
     // Ollama's defaults: three models resident, each kept five minutes after its last request.
     let mut max_models = std::env::var("FERRIC_MAX_LOADED_MODELS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(3usize);
     let mut keep_alive = std::env::var("FERRIC_KEEP_ALIVE").ok().unwrap_or_else(|| "5m".to_string());
+    let mut loras: Vec<(String, String)> = Vec::new();
     let mut i = if path.is_some() { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
@@ -1466,6 +1524,16 @@ pub fn run() {
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-models" => { max_models = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_models); i += 2; }
             "--keep-alive" => { keep_alive = args.get(i + 1).cloned().unwrap_or(keep_alive); i += 2; }
+            // `--lora name=path` (repeatable): a PEFT adapter directory or a llama.cpp GGUF adapter for the
+            // model on the command line; `--lora path` names it by its file or directory name.
+            "--lora" => {
+                if let Some(v) = args.get(i + 1) {
+                    let (n, p) = v.split_once('=').map(|(n, p)| (n.to_string(), p.to_string()))
+                        .unwrap_or_else(|| (models::default_name(std::path::Path::new(v)), v.clone()));
+                    loras.push((n, p));
+                }
+                i += 2;
+            }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
             "--no-batch" => { unsafe { std::env::set_var("FERRIC_NOBATCH", "1") }; i += 1; }
@@ -1501,6 +1569,7 @@ pub fn run() {
     let _ = shared.metrics.started.set(std::time::Instant::now());
     let mut hub = models::Hub::new(shared.clone());
     let mut initial = Vec::new();
+    if path.is_none() && !loras.is_empty() { eprintln!("ferric-serve: --lora adapts the model on the command line; name one"); std::process::exit(1); }
     if let Some(path) = &path {
         let resolved = resolve_model(path);
         eprintln!("ferric-serve: loading {resolved} …");
@@ -1509,7 +1578,8 @@ pub fn run() {
         let bytes = models::model_bytes(std::path::Path::new(&resolved));
         // A model named on the command line that will not load stops the server: a server that will not
         // boot is a bug report; one that boots without the model it was given answers for something else.
-        let eng = batch::Source::load(&mut hub, &key).unwrap_or_else(|e| { eprintln!("ferric-serve: {e}"); std::process::exit(1) });
+        let mut eng = batch::Source::load(&mut hub, &key).unwrap_or_else(|e| { eprintln!("ferric-serve: {e}"); std::process::exit(1) });
+        if let Err(e) = eng.load_adapters(&loras) { eprintln!("ferric-serve: {e}"); std::process::exit(1); }
         if let Some(i) = args.iter().position(|a| a == "--tokenize") {
             // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
             let text = args.get(i + 1).cloned().unwrap_or_default();
@@ -1833,7 +1903,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
     // `developer` is OpenAI's newer name for the system role (Cursor sends it).
     for m in messages.iter_mut() { if m["role"] == "developer" { m["role"] = json!("system"); } }
-    let mut opts = GenOpts::from_req(req, true)?;
+    let mut opts = eng.gen_opts(req, true)?;
     opts.with_specials = eng.reasoning_markers.is_some();
     // A thinking model's reasoning is split from its answer; the block may already be open in the prompt.
     let splitter = |prompt: &[u32]| eng.reasoning_markers.as_ref().map(|(o, c)| {
@@ -1928,7 +1998,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
 fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, body: &[u8]) {
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
     // Validate before any header goes out, so a bad request is a 400 and not a broken stream.
-    let opts = match GenOpts::from_req(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
+    let opts = match eng.gen_opts(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let empty = vec![];
     if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
     let id = "chatcmpl-ferric";
@@ -2004,7 +2074,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let Some(prompt_text) = req["prompt"].as_str() else {
         return bad_request(stream, "`prompt` must be a string (arrays of prompts and token arrays are not accepted here)")
     };
-    let opts = match GenOpts::from_req(&req, false) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
+    let opts = match eng.gen_opts(&req, false) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.enc(prompt_text, true));
