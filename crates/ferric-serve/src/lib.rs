@@ -41,6 +41,7 @@ mod batch;
 mod genopts;
 mod energy;
 mod dialects;
+mod audio;
 mod ollama;
 pub mod template;
 mod specgate;
@@ -279,6 +280,8 @@ pub(crate) struct Engine {
     pub(crate) energy: energy::Energy,
     /// Responses kept for the Responses API's `previous_response_id`.
     responses: dialects::ResponseStore,
+    /// A speech recogniser for `/v1/audio/transcriptions`, from `--asr` / FERRIC_ASR_MODEL.
+    pub(crate) asr: Option<(String, ferric_llama::parakeet::Parakeet)>,
     /// Whether speculative decoding pays for itself on this request, learned from observed draft
     /// acceptance. Behind a mutex because the serving path shares one `Engine` across connections and
     /// this is the only mutable state on it — a `Mutex` rather than an atomic because the estimator is
@@ -377,6 +380,13 @@ impl Engine {
                       e.cfg().arch, e.cfg().d, e.cfg().pooling, e.cfg().n_ctx);
             let card = ollama::Card::from_gguf(&name, &ep, &eg, true, e.cfg().d, e.cfg().n_ctx, "");
             (name, e, card)
+        });
+        let asr = std::env::var("FERRIC_ASR_MODEL").ok().map(|ap| {
+            let ag = GgufFile::open(&ap).unwrap_or_else(|e| panic!("open FERRIC_ASR_MODEL {ap}: {e:?}"));
+            let m = ferric_llama::parakeet::Parakeet::load(&ctx, &ag).unwrap_or_else(|e| panic!("load FERRIC_ASR_MODEL {ap}: {e}"));
+            let name = std::path::Path::new(&ap).file_stem().and_then(|s| s.to_str()).unwrap_or("asr").to_string();
+            eprintln!("ferric-serve: speech model {name} ({} Hz) — /v1/audio/transcriptions", m.cfg.sample_rate);
+            (name, m)
         });
         let g = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let tokens: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
@@ -565,7 +575,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), rstrip_after, n_ctx }
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, reranker, embedder, card, chat_template, reasoning_markers, energy: energy::Energy::start(), responses: dialects::ResponseStore::new(), asr, rstrip_after, n_ctx }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -1150,10 +1160,12 @@ fn pick_gguf(repo: &str) -> String {
 /// server does stays reachable from tests — see the crate docs.
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--embed <encoder.gguf>] [--rerank <cross-encoder.gguf>] [--host H] [--port N] [--name S]"); std::process::exit(1); });
+    let path = args.get(1).unwrap_or_else(|| { eprintln!("usage: ferric-serve <model.gguf> [--embed <encoder.gguf>] [--rerank <cross-encoder.gguf>] [--asr <parakeet.gguf>] [--api-key K] [--host H] [--port N] [--name S]"); std::process::exit(1); });
     let mut port = 8080u16;
     // 127.0.0.1 by default: a model server is not exposed to the network unless someone says so.
     let mut host = "127.0.0.1".to_string();
+    // FERRIC_API_KEY or --api-key; unset = no auth (the default for a server bound to localhost).
+    let mut api_key: Option<String> = std::env::var("FERRIC_API_KEY").ok().filter(|k| !k.is_empty());
     // Default: the file's stem, the way Ollama and LM Studio name a model — "ferric" said nothing about
     // which model this is, and it collided with nothing only because there was never a second one.
     let mut name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("ferric").to_string();
@@ -1166,9 +1178,11 @@ pub fn run() {
         match args[i].as_str() {
             "--port" => { port = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(port); i += 2; }
             "--host" => { host = args.get(i + 1).cloned().unwrap_or(host); i += 2; }
+            "--api-key" => { api_key = args.get(i + 1).cloned(); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
             "--embed" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_EMBED_MODEL", p) }; } i += 2; }
             "--rerank" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_RERANK_MODEL", p) }; } i += 2; }
+            "--asr" => { if let Some(p) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_ASR_MODEL", p) }; } i += 2; }
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-batch" => { max_batch = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_batch); i += 2; }
             // FIXME: Audit that the environment access only happens in single-threaded code.
@@ -1223,9 +1237,9 @@ pub fn run() {
     let listener = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
     // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
     // loop, embeddings, unknown paths) goes to the untouched serial handler below.
-    batch::serve_loop(eng, listener, batch::ServeOpts { max_batch, any_mcp_tools },
-        |eng, method, path, body, s| {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(eng, &mcps, method, path, body, s)));
+    batch::serve_loop(eng, listener, batch::ServeOpts { max_batch, any_mcp_tools, api_key },
+        |eng, method, path, body, headers, s| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(eng, &mcps, method, path, body, headers, s)));
             match r {
                 Ok(handled) => handled,
                 Err(_) => { eprintln!("ferric-serve: handler panicked (recovered)"); true }
@@ -1235,18 +1249,21 @@ pub fn run() {
 
 /// The serial handler: every endpoint the batch loop does not own. Returns whether it recognised the
 /// request (`false` → the caller writes a 404).
-fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8], stream: &mut TcpStream) -> bool {
+fn handle(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, method: &str, path: &str, body: &[u8],
+          headers: &[(String, String)], stream: &mut TcpStream) -> bool {
     match (method, path) {
         ("GET", "/health") => write_json(stream, 200, &json!({"status": "ok"})),
         ("GET", "/v1/models") => {
             let mut data = vec![json!({"id": eng.name, "object": "model", "created": now_unix(), "owned_by": "ferric"})];
             if let Some((n, _, _)) = &eng.embedder { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
+            if let Some((n, _)) = &eng.asr { data.push(json!({"id": n, "object": "model", "created": now_unix(), "owned_by": "ferric"})); }
             write_json(stream, 200, &json!({"object": "list", "data": data}))
         }
         ("POST", "/v1/chat/completions") => chat(eng, mcps, stream, body),
         ("POST", "/v1/completions") => completions(eng, stream, body),
         ("POST", "/v1/embeddings") => embeddings(eng, stream, body),
         ("POST", "/v1/rerank") | ("POST", "/rerank") => rerank(eng, stream, body),
+        ("POST", "/v1/audio/transcriptions") => audio::transcriptions(eng, body, headers, stream),
         ("POST", "/v1/messages") => dialects::messages(eng, mcps, body, stream),
         ("POST", "/v1/messages/count_tokens") => dialects::count_tokens(eng, body, stream),
         ("POST", "/v1/responses") => dialects::responses(eng, mcps, &eng.responses, body, stream),
@@ -1655,7 +1672,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     }));
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>, Vec<(String, String)>)> {
     let peer = stream.try_clone().ok()?;
     let mut reader = BufReader::new(peer);
     let mut line = String::new();
@@ -1665,15 +1682,20 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
     // The query string is not part of the route: `/health?x=1` used to 404.
     let path = parts.next()?.split('?').next().unwrap_or("").to_string();
     let mut content_length = 0usize;
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 { break; }
         if h.trim().is_empty() { break; }
-        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") { content_length = v.trim().parse().unwrap_or(0); }
+        if let Some((k, v)) = h.split_once(':') {
+            let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_string());
+            if k == "content-length" { content_length = v.parse().unwrap_or(0); }
+            headers.push((k, v));
+        }
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 { reader.read_exact(&mut body).ok()?; }
-    Some((method, path, body))
+    Some((method, path, body, headers))
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, v: &Value) {

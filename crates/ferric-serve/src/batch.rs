@@ -113,6 +113,8 @@ pub(crate) struct Job {
     pub method: String,
     pub path: String,
     pub body: Vec<u8>,
+    /// Request headers, names lower-cased (Content-Type for multipart, Authorization / x-api-key).
+    pub headers: Vec<(String, String)>,
     pub stream: TcpStream,
 }
 
@@ -212,6 +214,13 @@ pub(crate) struct ServeOpts {
     /// Any MCP server is connected, so every chat request advertises tools and must take the
     /// multi-round serial agent path.
     pub any_mcp_tools: bool,
+    /// `--api-key`: when set, every request but `/health` and CORS preflight must present it as
+    /// `Authorization: Bearer <key>` or `x-api-key: <key>` (the OpenAI and Anthropic spellings).
+    pub api_key: Option<String>,
+}
+
+fn authorized(headers: &[(String, String)], key: &str) -> bool {
+    headers.iter().any(|(k, v)| (k == "authorization" && v.strip_prefix("Bearer ").map(str::trim) == Some(key)) || (k == "x-api-key" && v.trim() == key))
 }
 
 /// Requests the batch loop declines, and hands to the untouched serial path. See the module docs.
@@ -232,7 +241,7 @@ pub(crate) fn serve_loop<M: ServeModel>(
     m: M,
     listener: TcpListener,
     opts: ServeOpts,
-    mut serial: impl FnMut(&M, &str, &str, &[u8], &mut TcpStream) -> bool,
+    mut serial: impl FnMut(&M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool,
 ) {
     let inbox = Arc::new(Inbox::new());
     {
@@ -245,8 +254,8 @@ pub(crate) fn serve_loop<M: ServeModel>(
                 // the engine must never block on a socket that has not finished sending its body.
                 std::thread::spawn(move || {
                     let mut s = s;
-                    if let Some((method, path, body)) = read_request(&mut s) {
-                        ib2.push(Job { method, path, body, stream: s });
+                    if let Some((method, path, body, headers)) = read_request(&mut s) {
+                        ib2.push(Job { method, path, body, headers, stream: s });
                     }
                 });
             }
@@ -283,9 +292,14 @@ fn route<M: ServeModel>(
     gens: &mut Vec<Gen<M::State>>,
     mut j: Job,
     opts: &ServeOpts,
-    serial: &mut impl FnMut(&M, &str, &str, &[u8], &mut TcpStream) -> bool,
+    serial: &mut impl FnMut(&M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool,
 ) {
     if j.method == "OPTIONS" { return write_preflight(&mut j.stream); }
+    if let Some(key) = &opts.api_key {
+        if j.path != "/health" && !authorized(&j.headers, key) {
+            return write_json(&mut j.stream, 401, &json!({"error": {"message": "missing or wrong API key: send Authorization: Bearer <key> or x-api-key", "type": "authentication_error"}}));
+        }
+    }
     let chat = j.path == "/v1/chat/completions";
     let is_gen = chat || j.path == "/v1/completions";
     if j.method == "POST" && is_gen {
@@ -295,7 +309,7 @@ fn route<M: ServeModel>(
             Err(e) => return bad(&mut j.stream, &format!("bad json: {e}")),
         };
         if must_run_serial(&req, chat, opts) || m.serial_generation() {
-            if !serial(m, &j.method, &j.path, &j.body, &mut j.stream) {
+            if !serial(m, &j.method, &j.path, &j.body, &j.headers, &mut j.stream) {
                 write_json(&mut j.stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}}));
             }
             return;
@@ -333,7 +347,7 @@ fn route<M: ServeModel>(
         });
         return;
     }
-    if !serial(m, &j.method, &j.path, &j.body, &mut j.stream) {
+    if !serial(m, &j.method, &j.path, &j.body, &j.headers, &mut j.stream) {
         write_json(&mut j.stream, 404, &json!({"error": {"message": "not found", "type": "invalid_request_error"}}));
     }
 }
@@ -603,7 +617,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = l.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
-            serve_loop(m, l, ServeOpts { max_batch, any_mcp_tools: false }, |_m, _me, _p, _b, _s| false);
+            serve_loop(m, l, ServeOpts { max_batch, any_mcp_tools: false, api_key: None }, |_m, _me, _p, _b, _h, _s| false);
         });
         addr
     }
