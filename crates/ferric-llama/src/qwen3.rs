@@ -69,7 +69,7 @@ pub(crate) fn qwen3_test_cfg() -> Cfg {
         gemma2: false, attn_softcap: 0.0, final_softcap: 0.0,
         swa: vec![false; 4], logit_scale: 1.0, post_norms: false, nope_global: false,
         rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
-        yarn_factor: 1.0, yarn_orig_ctx: 0,
+        yarn_factor: 1.0, linear_factor: 1.0, yarn_orig_ctx: 0,
         mrope_sections: None, mrope_interleaved: false,
     }
 }
@@ -200,6 +200,8 @@ pub struct Cfg {
     /// so the op is within 0.3% of a uniform x16 — but it lands on the RESIDUAL, which the scale-
     /// invariant RMSNorms downstream cannot recover.
     pub embd_rmsnorm: bool,
+    /// `rope.scaling.type == "linear"` factor (positions divided by it); 1.0 means none.
+    pub linear_factor: f32,
     /// YaRN context-extension factor from `rope.scaling.type == "yarn"`; 1.0 means none.
     ///
     /// This is a SEPARATE mechanism from the Llama-3 `rope_freqs.weight` tensor, and this loader used
@@ -317,8 +319,11 @@ impl Cfg {
             rope_interleaved: rope_is_interleaved(&arch) || std::env::var("FERRIC_ROPE_NORM").is_ok(),
             post_norm_eps: if arch == "muse-glimmer" { 1e-8 } else { f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5) },
             embd_rmsnorm: arch == "muse-glimmer",
-            yarn_factor: if matches!(g.metadata().get(&format!("{arch}.rope.scaling.type")), Some(Meta::Str(t)) if t == "yarn")
-                { f("rope.scaling.factor").unwrap_or(1.0) } else { 1.0 },
+            yarn_factor: match crate::arch::rope_scaling(g.metadata(), &arch, &["yarn", "linear"])? {
+                (t, f) if t == "yarn" => f, _ => 1.0 },
+            // Linear scaling divides every position by the factor — every inverse frequency x 1/factor.
+            linear_factor: match crate::arch::rope_scaling(g.metadata(), &arch, &["yarn", "linear"])? {
+                (t, f) if t == "linear" => f, _ => 1.0 },
             yarn_orig_ctx: u("rope.scaling.original_context_length").unwrap_or(0),
             // ⚠ Absent means ordinary RoPE, not "assume zeros" — an empty sections array would make
             // every sector fall to the 4th component and rotate nothing at all.
@@ -911,7 +916,9 @@ impl Qwen3 {
             // multiplier on the inverse frequency. Llama-3 ships an explicit tensor of DIVISORS;
             // YaRN is computed from metadata. Only one is ever present.
             rope_freqs: if std::env::var("FERRIC_NO_ROPE_FREQS").is_ok() { None }
-                else if g.tensor("rope_freqs.weight").is_none() && cfg.yarn_factor > 1.0 {
+                else if g.tensor("rope_freqs.weight").is_none() && cfg.linear_factor > 1.0 {
+                    Some(Tensor::from_vec(ctx, &vec![1.0 / cfg.linear_factor; cfg.head_dim / 2], &[cfg.head_dim / 2]))
+                } else if g.tensor("rope_freqs.weight").is_none() && cfg.yarn_factor > 1.0 {
                     let v = crate::qwen35::yarn_freq_scale(cfg.head_dim, cfg.rope_base, cfg.yarn_factor,
                                                            cfg.yarn_orig_ctx, 32.0, 1.0);
                     Some(Tensor::from_vec(ctx, &v, &[cfg.head_dim / 2]))
@@ -1928,7 +1935,7 @@ mod kvq_cache_tests {
             gemma2: false, attn_softcap: 0.0, final_softcap: 0.0,
             swa: vec![false; n_layer], logit_scale: 1.0, post_norms: false, nope_global: false,
             rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
-            yarn_factor: 1.0, yarn_orig_ctx: 0,
+            yarn_factor: 1.0, linear_factor: 1.0, yarn_orig_ctx: 0,
             mrope_sections: None, mrope_interleaved: false,
         }
     }

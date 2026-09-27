@@ -86,6 +86,7 @@ impl Cfg {
             match g.metadata().get(&key(k)) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing metadata {}", key(k))) }
         };
         let fo = |k: &str, d: f32| -> f32 { match g.metadata().get(&key(k)) { Some(Meta::F(v)) => *v as f32, _ => d } };
+        crate::arch::rope_scaling(g.metadata(), &p, &["yarn"])?;
         let n_vocab = match g.metadata().get("tokenizer.ggml.tokens") { Some(Meta::Arr(a)) => a.len(), _ => return Err("missing tokenizer.ggml.tokens".into()) };
         // Multi-token-prediction (MTP/"nextn") draft blocks are stored as the LAST `nextn_predict_layers`
         // blocks and are NOT part of the main decode graph (llama.cpp: l_out-(N-1) → output head). Running

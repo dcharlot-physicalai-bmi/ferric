@@ -721,3 +721,49 @@ mod tests {
         assert!(c.contains("reference-verified"));
     }
 }
+
+
+/// **Which rope scaling the file declares — refused when this runtime does not apply it.**
+///
+/// ⛔ Every loader read `rope.scaling.type` as "is it yarn?" and nothing else. A checkpoint declaring
+/// `linear` (or `longrope`) therefore ran with NO scaling and no error: short prompts look right, and
+/// past the trained context every position rotates by the wrong angle. llama.cpp recognises `none`,
+/// `linear`, `yarn` and `longrope`. Returns the declared type (`"none"` when absent) and its factor; a type
+/// outside `handled`, with a factor that is not 1, is an error naming both.
+pub fn rope_scaling(md: &std::collections::HashMap<String, ferric_gguf::Meta>, arch: &str, handled: &[&str])
+    -> Result<(String, f32), String>
+{
+    use ferric_gguf::Meta;
+    let ty = match md.get(&format!("{arch}.rope.scaling.type")) { Some(Meta::Str(s)) => s.clone(), _ => "none".into() };
+    let factor = match md.get(&format!("{arch}.rope.scaling.factor")) { Some(Meta::F(v)) => *v as f32, _ => 1.0 };
+    if ty == "none" || handled.contains(&ty.as_str()) || factor == 1.0 { return Ok((ty, factor)); }
+    Err(format!("{arch}.rope.scaling.type = '{ty}' (factor {factor}): this runtime applies {} — running it \
+                 unscaled would put every position past the trained context at the wrong angle",
+                if handled.is_empty() { "no rope scaling".to_string() } else { handled.join(" and ") }))
+}
+
+#[cfg(test)]
+mod rope_scaling_tests {
+    use super::rope_scaling;
+    use ferric_gguf::Meta;
+    use std::collections::HashMap;
+
+    fn md(ty: Option<&str>, factor: Option<f64>) -> HashMap<String, Meta> {
+        let mut m = HashMap::new();
+        if let Some(t) = ty { m.insert("x.rope.scaling.type".to_string(), Meta::Str(t.into())); }
+        if let Some(f) = factor { m.insert("x.rope.scaling.factor".to_string(), Meta::F(f)); }
+        m
+    }
+
+    /// The defect this exists for: `linear` was read as "not yarn" and ran UNSCALED with no error.
+    #[test]
+    fn a_declared_scaling_the_runtime_does_not_apply_is_refused() {
+        assert!(rope_scaling(&md(Some("linear"), Some(4.0)), "x", &["yarn"]).unwrap_err().contains("linear"));
+        assert!(rope_scaling(&md(Some("longrope"), Some(8.0)), "x", &[]).is_err());
+        assert_eq!(rope_scaling(&md(Some("linear"), Some(4.0)), "x", &["yarn", "linear"]).unwrap(), ("linear".into(), 4.0));
+        assert_eq!(rope_scaling(&md(None, None), "x", &[]).unwrap().0, "none");
+        assert_eq!(rope_scaling(&md(Some("none"), Some(2.0)), "x", &[]).unwrap().0, "none");
+        // A factor of 1 scales nothing, whatever the type says.
+        assert!(rope_scaling(&md(Some("linear"), Some(1.0)), "x", &[]).is_ok());
+    }
+}

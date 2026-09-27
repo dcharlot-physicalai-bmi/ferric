@@ -90,6 +90,7 @@ impl Cfg {
             _ => return Err("no general.architecture".into()),
         };
         if arch != "hyv4" { return Err(format!("not a hyv4 checkpoint: architecture is '{arch}'")) }
+        crate::arch::rope_scaling(md, &arch, &[])?;
         // ⛔ ACCEPT BOTH SIGNAGES. GGUF's numeric KV tags distinguish signed from unsigned, and a
         // writer picks whichever it likes for a count that is never negative. Tencent's file stores
         // `indexer.is_full` as **I32**; reading only `Meta::U` silently produced an all-false

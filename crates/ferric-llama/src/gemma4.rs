@@ -85,6 +85,7 @@ impl Cfg {
         let u = |k: &str| match md.get(&format!("gemma4.{k}")) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing gemma4.{k}")) };
         let f = |k: &str| match md.get(&format!("gemma4.{k}")) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing gemma4.{k}")) };
 
+        crate::arch::rope_scaling(md, "gemma4", &[])?;
         let n_layer = u("block_count")?;
         let d = u("embedding_length")?;
 

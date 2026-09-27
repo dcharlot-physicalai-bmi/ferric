@@ -143,6 +143,7 @@ fn per_block(md: &std::collections::HashMap<String, Meta>, key: &str, n: usize) 
 impl Cfg {
     pub fn from_gguf(g: &impl GgufSource) -> Result<Cfg, String> {
         let md = g.metadata();
+        crate::arch::rope_scaling(md, "nemotron_h", &[])?;
         let u = |k: &str| match md.get(&format!("nemotron_h.{k}")) {
             Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing nemotron_h.{k}")),
         };

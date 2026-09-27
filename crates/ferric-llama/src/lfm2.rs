@@ -222,6 +222,7 @@ impl Lfm2 {
         // rather than hardcoded. Everything else about the two is identical up to the FFN.
         let arch = match md.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => "lfm2".to_string() };
         let ap = arch.clone();
+        crate::arch::rope_scaling(md, &arch, &[])?;
         let u = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::U(v)) => Ok(*v as usize), _ => Err(format!("missing {ap}.{k}")) };
         let uo = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => 0 };
         let f = |k: &str| match md.get(&format!("{ap}.{k}")) { Some(Meta::F(v)) => Ok(*v as f32), _ => Err(format!("missing {ap}.{k}")) };

@@ -1404,7 +1404,7 @@ mod cache_tests {
             gemma2: false, attn_softcap: 0.0, final_softcap: 0.0,
             swa: vec![false; n_layer], logit_scale: 1.0, post_norms: false, nope_global: false,
             rope_interleaved: false, post_norm_eps: 1e-6, embd_rmsnorm: false,
-            yarn_factor: 1.0, yarn_orig_ctx: 0,
+            yarn_factor: 1.0, linear_factor: 1.0, yarn_orig_ctx: 0,
             mrope_sections: None, mrope_interleaved: false,
         }
     }

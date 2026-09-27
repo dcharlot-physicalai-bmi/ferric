@@ -165,6 +165,7 @@ impl Cfg {
         let qk_rope = u("rope.dimension_count")?;
         if qk_rope >= key_len { return Err(format!("rope dim {qk_rope} must be below key length {key_len}")); }
 
+        crate::arch::rope_scaling(md, "deepseek2", &["yarn"])?;
         let yarn = s("rope.scaling.type").as_deref() == Some("yarn");
         let n_vocab = match md.get("deepseek2.vocab_size") {
             Some(Meta::U(v)) => *v as usize,
