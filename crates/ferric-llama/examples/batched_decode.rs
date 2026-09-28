@@ -50,7 +50,11 @@ async fn run() {
 
     println!("Batched decode — N sequences in one forward pass\n");
 
-    for &n in &[2usize, 4, 8] {
+    // `FERRIC_MR=0` restores the pre-small-M kernels, under which rows above two took the `flat` LM head
+    // and batched logits were NOT bit-identical to solo (tokens were); with the small-M kernels they are.
+    // `BATCHED_FORCE_BITEXACT` keeps the bit check on under FERRIC_MR=0 — the can-fail demonstration.
+    let bitexact = std::env::var("FERRIC_MR").map(|v| v != "0").unwrap_or(true) || std::env::var_os("BATCHED_FORCE_BITEXACT").is_some();
+    for &n in &[2usize, 3, 4, 8, 9, 16] {
         // Deliberately UNEQUAL prompt lengths, so every sequence sits at a different position. If the
         // batched path shared a position or crossed a cache, equal lengths could hide it.
         let prompts: Vec<Vec<u32>> = (0..n)
@@ -59,17 +63,21 @@ async fn run() {
 
         // ---- reference: each sequence decoded entirely on its own ----
         let mut ref_out: Vec<Vec<u32>> = Vec::new();
+        let mut ref_rows: Vec<Vec<Vec<f32>>> = Vec::new();
         for p in &prompts {
             let mut c = Cache::new(&m.cfg);
             let l = m.forward_cached(p, &mut c).to_vec().await;
             let mut tok = am(&l[l.len() - vn..]);
             let mut r#gen = vec![tok];
+            let mut rows = Vec::new();
             for _ in 1..STEPS {
                 let l = m.forward_cached(&[tok], &mut c).to_vec().await;
                 tok = am(&l[l.len() - vn..]);
                 r#gen.push(tok);
+                rows.push(l[l.len() - vn..].to_vec());
             }
             ref_out.push(r#gen);
+            ref_rows.push(rows);
         }
 
         // ---- batched: same sequences, one forward per step ----
@@ -82,10 +90,19 @@ async fn run() {
             caches.push(c);
         }
         let mut bat_out: Vec<Vec<u32>> = next.iter().map(|&t| vec![t]).collect();
-        for _ in 1..STEPS {
+        let mut bit_rows = 0usize;
+        for step in 1..STEPS {
             let mut refs: Vec<&mut Cache> = caches.iter_mut().collect();
             let logits = m.forward_batch(&next, &mut refs).to_vec().await;
             for i in 0..n {
+                // Bit-identity, not only the argmax: a row must not depend on which rows share its step.
+                // Checked while the histories still agree (a diverged token would change the inputs).
+                if bitexact && bat_out[i] == ref_out[i][..bat_out[i].len()] {
+                    let (b, r) = (&logits[i * vn..(i + 1) * vn], &ref_rows[i][step - 1]);
+                    let bad = b.iter().zip(r).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                    assert_eq!(bad, 0, "n={n} seq {i} step {step}: {bad} of {vn} logits differ in their bits from solo decode");
+                    bit_rows += 1;
+                }
                 next[i] = am(&logits[i * vn..(i + 1) * vn]);
                 bat_out[i].push(next[i]);
             }
@@ -98,7 +115,7 @@ async fn run() {
                  crossed cache or a shared RoPE position produces fluent, wrong text with no error."
             );
         }
-        println!("  n={n}: all {n} sequences IDENTICAL to solo decode over {STEPS} steps \
+        println!("  n={n}: all {n} sequences IDENTICAL to solo decode over {STEPS} steps, {bit_rows} rows bit-identical \
                   (prompt lengths {:?})", prompts.iter().map(|p| p.len()).collect::<Vec<_>>());
     }
 

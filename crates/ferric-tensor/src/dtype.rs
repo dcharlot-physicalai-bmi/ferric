@@ -8,6 +8,10 @@ use ferric_core::Context;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+// Small-M GEMV (2..=32 rows read each weight block once, bit-identical per row to one-row decode).
+mod mrgemv;
+pub use mrgemv::{set_small_m, set_small_m_tile};
+
 /// The Metal-4 tensor-unit prefill route (opt-in `FERRIC_QGEMM`, see `native_qgemm`): a multi-row
 /// `x·Wᵀ` on the matrix units straight from the packed blocks. Returns from the enclosing matmul
 /// when it fires; otherwise falls through to the portable kernel untouched.
@@ -1407,8 +1411,10 @@ impl Tensor {
                 }
             }
         }
+        let x = self.contiguous();
+        if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q5K) { return y; }
         let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
-        self.matmul_q5_k_cfg(w, split, splitk_lanes_sub(w.cols / 256))
+        x.matmul_q5_k_cfg(w, split, splitk_lanes_sub(w.cols / 256))
     }
 
     /// `matmul_q5_k` with the kernel choice and lane layout supplied rather than derived.
@@ -1734,8 +1740,10 @@ impl Q6_KWeights {
 impl Tensor {
     /// y = x·Wᵀ where W is a packed **Q6_K** [out, in] weight, dequantized per-super-block in-kernel.
     pub fn matmul_q6_k(&self, w: &Q6_KWeights) -> Tensor {
+        let x = self.contiguous();
+        if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q6K) { return y; }
         let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
-        self.matmul_q6_k_cfg(w, split)
+        x.matmul_q6_k_cfg(w, split)
     }
     /// `matmul_q6_k` with the kernel choice supplied — the hermetic seam the native-tier test uses to
     /// reach the FLAT kernel without env vars (see `matmul_q5_k_cfg` and vacuous-test-mechanisms #68).
@@ -2101,6 +2109,7 @@ impl Tensor {
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         native_qgemm_route!(x, w.codes, w.scales, w, Q8_0);
+        if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.scales, w.rows, w.cols, mrgemv::Fmt::Q8_0) { return y; }
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
@@ -2296,6 +2305,11 @@ impl Tensor {
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         native_qgemm_route!(x, w.codes, w.aux, w, Q4K);
+        // Not when the one-row path is an opt-in variant (transposed layout, subgroup GEMV): the small-M
+        // kernel reproduces the default split-K kernel, so it steps aside where that is not what runs.
+        if std::env::var_os("FERRIC_SGGEMV").is_none() && !(w.codes_t.is_some() && std::env::var_os("FERRIC_Q4K_TRANS_M").is_some()) {
+            if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q4K) { return y; }
+        }
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (lanes, opw) = splitk_lanes_wide(inn / 256);
@@ -2434,6 +2448,9 @@ impl Tensor {
         #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
         if let Some(y) = crate::native_qgemm::qmm_swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q4K) {
             return y;
+        }
+        if w.codes_t.is_none() {
+            if let Some(y) = mrgemv::swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q4K) { return y; }
         }
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
@@ -2674,6 +2691,7 @@ impl Tensor {
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         assert_eq!(w.rows % 2, 0, "gate_up weight must have an even row count (gate|up)");
         let n_ff = w.rows / 2;
+        if let Some(y) = mrgemv::swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q5K) { return y; }
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
         // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
@@ -2705,6 +2723,7 @@ impl Tensor {
         if let Some(y) = crate::native_qgemm::qmm_swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, crate::native_qgemm::QFmt::Q6K) {
             return y;
         }
+        if let Some(y) = mrgemv::swiglu(&x, &w.codes, &w.aux, w.rows, w.cols, mrgemv::Fmt::Q6K) { return y; }
         let out = empty(&self.ctx, rows * n_ff);
         let n = rows * n_ff;
         // __OPW__ outputs share a workgroup now (see the kernel), so the grid covers ceil(n/opw).
@@ -2790,6 +2809,7 @@ impl Tensor {
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
         native_qgemm_route!(x, w.codes, w.scales, w, Q5_0);
+        if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.scales, w.rows, w.cols, mrgemv::Fmt::Q5_0) { return y; }
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let (grid, rs, wgsl, label) = if q2_0_split_k(rows, w.rows, inn) {
