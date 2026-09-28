@@ -91,7 +91,11 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
             "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}})).collect::<Vec<_>>());
     }
     match req["thinking"]["type"].as_str() {
-        Some("enabled") => { r["chat_template_kwargs"] = json!({"enable_thinking": true}); }
+        Some("enabled") => {
+            r["chat_template_kwargs"] = json!({"enable_thinking": true});
+            // Anthropic's `thinking.budget_tokens` is the reasoning budget.
+            if let Some(n) = req["thinking"]["budget_tokens"].as_i64() { r["thinking_budget_tokens"] = json!(n); }
+        }
         Some("disabled") => { r["chat_template_kwargs"] = json!({"enable_thinking": false}); }
         _ => {}
     }

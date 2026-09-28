@@ -58,6 +58,8 @@ pub(crate) struct Sampling {
     pub mirostat_eta: f32,
     /// Mirostat's running threshold for THIS sequence (NaN until the first step sets it to 2·tau).
     pub mirostat_mu: std::cell::Cell<f32>,
+    /// A thinking model's reasoning budget (`thinking_budget_tokens`, `--reasoning-budget`), when set.
+    pub reasoning_budget: Option<std::sync::Arc<BudgetCfg>>,
 }
 
 impl Default for Sampling {
@@ -67,7 +69,8 @@ impl Default for Sampling {
                    logit_bias: Vec::new(), dry_multiplier: 0.0, dry_base: 1.75, dry_allowed_length: 2,
                    dry_breakers: Vec::new(), dry_breaker_strings: vec!["\n".into(), ":".into(), "\"".into(), "*".into()],
                    dry_range: 0, xtc_threshold: 0.1, xtc_probability: 0.0, xtc_specials: Vec::new(), typical_p: 1.0,
-                   top_n_sigma: 0.0, mirostat: 0, mirostat_tau: 5.0, mirostat_eta: 0.1, mirostat_mu: std::cell::Cell::new(f32::NAN) }
+                   top_n_sigma: 0.0, mirostat: 0, mirostat_tau: 5.0, mirostat_eta: 0.1, mirostat_mu: std::cell::Cell::new(f32::NAN),
+                   reasoning_budget: None }
     }
 }
 
@@ -101,6 +104,122 @@ pub(crate) struct GenOpts {
 
 /// Most choices one request may ask for.
 pub(crate) const MAX_N: usize = 16;
+
+/// **The reasoning budget** — llama.cpp's `common/reasoning-budget.cpp` state machine, line for line
+/// (checked against its own `tests/test-reasoning-budget.cpp`): IDLE → (start sequence) COUNTING →
+/// (budget spent, at a UTF-8 boundary) FORCING the message + end sequence one token at a time → DONE,
+/// re-armed by a new start sequence; a natural end sequence while counting ends it early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BudgetState { Idle, Counting, Forcing, WaitingUtf8, Done }
+
+#[derive(Clone, Debug, Default)]
+struct TokenMatcher { tokens: Vec<u32>, pos: usize }
+impl TokenMatcher {
+    fn advance(&mut self, t: u32) -> bool {
+        if self.tokens.is_empty() { return false; }
+        if t == self.tokens[self.pos] {
+            self.pos += 1;
+            if self.pos >= self.tokens.len() { self.pos = 0; return true; }
+        } else {
+            self.pos = 0;
+            if t == self.tokens[0] { self.pos = 1; }
+        }
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReasoningBudget {
+    start: TokenMatcher,
+    end: TokenMatcher,
+    forced: Vec<u32>,
+    budget: i32,
+    remaining: i32,
+    pub state: BudgetState,
+    force_pos: usize,
+}
+
+impl ReasoningBudget {
+    pub fn new(start: &[u32], end: &[u32], forced: &[u32], budget: i32, initial: BudgetState) -> ReasoningBudget {
+        let initial = if initial == BudgetState::Counting && budget <= 0 { BudgetState::Forcing } else { initial };
+        ReasoningBudget { start: TokenMatcher { tokens: start.to_vec(), pos: 0 }, end: TokenMatcher { tokens: end.to_vec(), pos: 0 },
+                          forced: forced.to_vec(), budget, remaining: budget, state: initial, force_pos: 0 }
+    }
+    /// `complete`: the token's text ends on a whole UTF-8 character (`utf8_is_complete`).
+    pub fn accept(&mut self, t: u32, complete: bool) {
+        use BudgetState::*;
+        match self.state {
+            Idle => if self.start.advance(t) {
+                self.state = Counting;
+                self.remaining = self.budget;
+                if self.remaining <= 0 { self.state = Forcing; self.force_pos = 0; }
+            },
+            Counting | WaitingUtf8 => {
+                if self.end.advance(t) { self.state = Done; return; }
+                if self.state == WaitingUtf8 {
+                    if complete { self.state = Forcing; self.force_pos = 0; self.end.pos = 0; }
+                } else {
+                    self.remaining -= 1;
+                    if self.remaining <= 0 {
+                        if complete { self.state = Forcing; self.force_pos = 0; } else { self.state = WaitingUtf8; }
+                        self.end.pos = 0;
+                    }
+                }
+            }
+            Forcing => {
+                self.force_pos += 1;
+                if self.force_pos >= self.forced.len() { self.state = Done; }
+            }
+            Done => if self.start.advance(t) {
+                self.state = Counting;
+                self.remaining = self.budget;
+                self.end.pos = 0;
+                if self.remaining <= 0 { self.state = Forcing; self.force_pos = 0; }
+            },
+        }
+    }
+    /// The token the sampler must produce now, if forcing.
+    pub fn forced_token(&self) -> Option<u32> {
+        (self.state == BudgetState::Forcing).then(|| self.forced.get(self.force_pos).copied()).flatten()
+    }
+    /// llama.cpp's `common_reasoning_budget_force`: from COUNTING only, start forcing now.
+    pub fn force(&mut self) -> bool {
+        if self.state != BudgetState::Counting { return false; }
+        self.state = BudgetState::Forcing;
+        self.force_pos = 0;
+        self.end.pos = 0;
+        true
+    }
+}
+
+/// llama.cpp's `common_utf8_is_complete` (common/unicode.cpp), as written: the last lead byte within the final
+/// four decides — the string is complete when at least its sequence length of bytes follow from it.
+pub(crate) fn utf8_is_complete(s: &[u8]) -> bool {
+    if s.is_empty() { return true; }
+    for i in 1..=4.min(s.len()) {
+        let c = s[s.len() - i];
+        if c & 0xC0 != 0x80 {
+            let expected = if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 };
+            return i >= expected;
+        }
+    }
+    false
+}
+
+/// A request's budget: the start / end / forced token sequences and the token count. The state is replayed
+/// from the prompt's tail (llama.cpp feeds the template's generation prompt, so a template that opens
+/// `<think>` starts it counting) and every generated token, each step — a pure function of what is in the
+/// sequence, so the serial, batched and speculative paths agree without carrying state.
+#[derive(Debug)]
+pub(crate) struct BudgetCfg { pub start: Vec<u32>, pub end: Vec<u32>, pub forced: Vec<u32>, pub budget: i32 }
+
+impl BudgetCfg {
+    pub fn forced(&self, prompt_tail: &[u32], generated: &[u32], complete: impl Fn(u32) -> bool) -> Option<u32> {
+        let mut b = ReasoningBudget::new(&self.start, &self.end, &self.forced, self.budget, BudgetState::Idle);
+        for &t in prompt_tail.iter().chain(generated) { b.accept(t, complete(t)); }
+        b.forced_token()
+    }
+}
 
 /// A model's own recommended sampling, from its GGUF's `general.sampling.*` keys (llama.cpp's
 /// `common_init_sampler_from_model` reads the same keys, as server defaults), mapped to request fields.
@@ -866,6 +985,63 @@ mod tests {
         assert_eq!(content_text(&Value::Null).unwrap(), "");
         let img = json!([{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:..."}}]);
         assert!(content_text(&img).unwrap_err().contains("image_url"));
+    }
+
+    /// llama.cpp's own tests/test-reasoning-budget.cpp, case for case: where forcing starts and ends in each
+    /// sequence (the harness applies before accepting token i, exactly as the C++ harness does), the clone
+    /// cases, the manual force transition, and the UTF-8 boundary checks.
+    #[test]
+    fn the_reasoning_budget_passes_llama_cpps_own_tests() {
+        use BudgetState::*;
+        fn run(seq: &[u32], start: &[u32], end: &[u32], forced: &[u32], budget: i32, init: BudgetState) -> (Option<usize>, Option<usize>) {
+            let mut b = ReasoningBudget::new(start, end, forced, budget, init);
+            let (mut fs, mut fe) = (None, None);
+            for (i, &t) in seq.iter().enumerate() {
+                let forcing = b.forced_token().is_some();
+                b.accept(t, true);
+                if forcing { if fs.is_none() { fs = Some(i); } fe = Some(i); } else if fs.is_some() { break; }
+            }
+            (fs, fe)
+        }
+        let (s, e, f1, f2) = ([100u32], [101u32], [102u32], [102u32, 101]);
+        assert_eq!(run(&[100, 50, 51, 101, 52], &s, &e, &f1, 5, Idle), (None, None), "natural end before budget exhausted");
+        assert_eq!(run(&[100, 50, 51, 52, 53], &s, &e, &f2, 2, Idle), (Some(3), Some(4)), "budget exhausted forcing");
+        assert_eq!(run(&[100, 50, 51, 52], &s, &e, &f2, 0, Counting), (Some(0), Some(1)), "activate immediately budget=0");
+        assert_eq!(run(&[50, 51, 52, 53], &[], &[], &f1, 2, Idle), (None, None), "no start/end configured");
+        assert_eq!(run(&[50, 51, 52, 53], &s, &e, &f2, 2, Counting), (Some(2), Some(3)), "activate immediately with budget");
+        assert_eq!(run(&[100, 50, 101, 100, 60, 61, 62, 63], &s, &e, &f2, 2, Idle), (Some(6), Some(7)), "multi-block re-arms budget after DONE");
+        // clone mid counting / mid forcing
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 2, Idle);
+        b.accept(100, true); b.accept(50, true);
+        let mut c = b.clone(); c.accept(51, true);
+        assert_eq!(c.forced_token(), Some(102));
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 0, Forcing);
+        assert_eq!(b.forced_token(), Some(102));
+        b.accept(102, true);
+        assert_eq!(b.clone().forced_token(), Some(101));
+        // manual force
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 5, Idle);
+        b.accept(100, true); b.accept(50, true);
+        assert!(b.state == Counting && b.force() && b.state == Forcing);
+        assert_eq!(b.forced_token(), Some(102)); b.accept(102, true);
+        assert_eq!(b.forced_token(), Some(101)); b.accept(101, true);
+        assert_eq!(b.state, Done);
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 5, Idle);
+        assert!(!b.force() && b.state == Idle);
+        b.accept(100, true); b.accept(101, true);
+        assert!(b.state == Done && !b.force() && b.state == Done);
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 0, Forcing);
+        b.accept(102, true);
+        assert!(!b.force() && b.state == Forcing && b.forced_token() == Some(101));
+        // UTF-8 boundaries
+        for ok in [&b"hello"[..], b"", b"\xC2\xA0", b"\xE2\x80\x9C", b"\xF0\x9F\x98\x80", b"abc\xC3\xA9", b"hello\xC3\xA9"] { assert!(utf8_is_complete(ok), "{ok:?}"); }
+        for bad in [&b"\xC2"[..], b"\xE2\x80", b"\xE2", b"\xF0\x9F\x98", b"\xF0\x9F", b"\xF0", b"\x80", b"hello\xC3"] { assert!(!utf8_is_complete(bad), "{bad:?}"); }
+        // A budget spent mid-character waits for the character to finish before forcing.
+        let mut b = ReasoningBudget::new(&s, &e, &f2, 1, Idle);
+        b.accept(100, true); b.accept(7, false);
+        assert_eq!((b.state, b.forced_token()), (WaitingUtf8, None));
+        b.accept(8, true);
+        assert_eq!(b.forced_token(), Some(102));
     }
 
     /// `general.sampling.*` (Bonsai 2's keys and types: top_k u32, top_p/temp f32) become request defaults;

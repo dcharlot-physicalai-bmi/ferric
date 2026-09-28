@@ -995,6 +995,23 @@ impl Engine {
             &merged
         };
         let mut o = GenOpts::from_req(req, chat)?;
+        // The reasoning budget (llama.cpp's semantics): the request's `thinking_budget_tokens`, else the
+        // server's `--reasoning-budget`; -1 = unlimited. Only a model with reasoning markers has one.
+        let budget = match &req["thinking_budget_tokens"] {
+            Value::Null => std::env::var("FERRIC_REASONING_BUDGET").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(-1),
+            v => v.as_i64().filter(|&n| n >= -1).ok_or_else(|| format!("`thinking_budget_tokens` must be -1 (unlimited) or a count, got {v}"))?,
+        };
+        if budget >= 0 {
+            let Some((open, close)) = &self.reasoning_markers else {
+                return Err("`thinking_budget_tokens`: this model has no reasoning markers, so there is no thinking to budget".into());
+            };
+            let marker = |s: &str| self.specials.iter().find(|(t, _)| t == s).map(|(_, i)| vec![*i]).unwrap_or_else(|| self.enc(s, false));
+            let message = req["reasoning_budget_message"].as_str().map(String::from)
+                .or_else(|| std::env::var("FERRIC_REASONING_BUDGET_MESSAGE").ok()).unwrap_or_default();
+            let mut forced = if message.is_empty() { Vec::new() } else { self.enc(&message, false) };
+            forced.extend(marker(close));
+            o.sampling.reasoning_budget = Some(Arc::new(genopts::BudgetCfg { start: marker(open), end: marker(close), forced, budget: budget as i32 }));
+        }
         // The tokenizer-dependent sampler inputs, resolved as their reference implementation resolves them:
         // DRY's breakers are the LAST id of "a" + breaker (so a breaker is tokenized as text-final); XTC's
         // specials are the last id of "\n" and EOS; a text logit_bias applies to every token of its text.
@@ -1252,6 +1269,12 @@ impl Engine {
     /// legal continuation (stop cleanly). Most tokens reject on their first byte, so the scan is cheap.
     fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, s: &genopts::Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
         let n_vocab = row.len();
+        // A spent reasoning budget forces its message and end marker, one token per step (every other logit
+        // is -inf in llama.cpp's sampler, so sampling can only pick it).
+        if let Some(b) = &s.reasoning_budget {
+            let complete = |t: u32| self.token_bytes.get(t as usize).and_then(|b| b.as_deref()).is_none_or(genopts::utf8_is_complete);
+            if let Some(t) = b.forced(&prompt[prompt.len().saturating_sub(24)..], generated, complete) { return Some(t); }
+        }
         if let Some(g) = guide.as_ref() {
             let ok = self.allowed(g);
             let mut masked = vec![f32::NEG_INFINITY; n_vocab];
@@ -1593,6 +1616,11 @@ pub fn run() {
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-models" => { max_models = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_models); i += 2; }
             "--keep-alive" => { keep_alive = args.get(i + 1).cloned().unwrap_or(keep_alive); i += 2; }
+            // `--reasoning-budget N` (-1 unlimited, 0 = end thinking at once) and the message forced before the
+            // end marker when it runs out — llama-server's flags; a request's `thinking_budget_tokens` overrides.
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            "--reasoning-budget" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET", v) }; } i += 2; }
+            "--reasoning-budget-message" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET_MESSAGE", v) }; } i += 2; }
             // `--otlp http://collector:4318`: OpenTelemetry traces (else the OTEL_EXPORTER_OTLP_* variables).
             "--otlp" => { otlp = args.get(i + 1).cloned(); i += 2; }
             // `--lora name=path` (repeatable): a PEFT adapter directory or a llama.cpp GGUF adapter for the
