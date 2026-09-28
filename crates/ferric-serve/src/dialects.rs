@@ -309,9 +309,8 @@ pub(crate) fn responses(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, st
     } else if req["text"]["format"]["type"] == "json_object" {
         r["response_format"] = json!({"type": "json_object"});
     }
-    if let Some(e) = req["reasoning"]["effort"].as_str() {
-        r["chat_template_kwargs"] = json!({"enable_thinking": e != "minimal" && e != "none"});
-    }
+    // `reasoning.effort` is Chat Completions' `reasoning_effort` (see `template_kwargs`).
+    if let Some(e) = req["reasoning"]["effort"].as_str() { r["reasoning_effort"] = json!(e); }
     let empty = vec![];
     if let Err(e) = eng.gen_opts(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
         return bad(stream, false, &e);

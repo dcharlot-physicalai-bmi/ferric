@@ -904,6 +904,25 @@ impl Engine {
 
     /// The prompt, and the image it carries if any — what a generating caller needs (a validating one
     /// needs only `chat_ids_with`).
+    /// The prompt a tool-free chat request renders to — the same rules as `run_chat` (`developer` is the
+    /// system role; `template_kwargs`), for the batched path.
+    pub(crate) fn chat_request_ids(&self, req: &Value) -> Result<Vec<u32>, String> {
+        let empty = vec![];
+        let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
+        for m in messages.iter_mut() { if m["role"] == "developer" { m["role"] = json!("system"); } }
+        self.chat_prompt(&messages, None, &template_kwargs(req)).map(|(p, _)| p)
+    }
+
+    /// A thinking model's reasoning/answer splitter for a reply to `prompt` (the block may already be open
+    /// in the prompt's tail), or None for a model without reasoning markers.
+    pub(crate) fn reasoning_split(&self, prompt: &[u32]) -> Option<genopts::ReasoningSplit> {
+        self.reasoning_markers.as_ref().map(|(o, c)| {
+            let tail = self.detok_all(&prompt[prompt.len().saturating_sub(24)..]);
+            let started = tail.rfind(o.as_str()).is_some_and(|a| tail.rfind(c.as_str()).is_none_or(|b| a > b));
+            genopts::ReasoningSplit::new(o, c, started)
+        })
+    }
+
     pub(crate) fn chat_prompt(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &serde_json::Map<String, Value>)
         -> Result<(Vec<u32>, Option<Arc<vision::MmInput>>), String>
     {
@@ -1936,6 +1955,19 @@ fn sum_energy(parts: &[Value]) -> Value {
     v
 }
 
+/// What the chat template is rendered with besides the messages: `chat_template_kwargs`, plus OpenAI's
+/// `reasoning_effort` (passed to templates that read it — Bonsai 2, gpt-oss — and, when the request did
+/// not set `enable_thinking`, "none"/"minimal" turn thinking off in templates that read that instead).
+/// One reader for the serial and batched paths, so the same request renders the same prompt on both.
+pub(crate) fn template_kwargs(req: &Value) -> serde_json::Map<String, Value> {
+    let mut k = req["chat_template_kwargs"].as_object().cloned().unwrap_or_default();
+    if let Some(e) = req["reasoning_effort"].as_str() {
+        k.entry("reasoning_effort").or_insert_with(|| json!(e));
+        k.entry("enable_thinking").or_insert_with(|| json!(e != "none" && e != "minimal"));
+    }
+    k
+}
+
 /// **The chat core both API dialects share** (OpenAI `/v1/chat/completions`, Ollama `/api/chat`), so they
 /// cannot disagree about what a conversation means. `req` is OpenAI-shaped. `on_delta` receives the
 /// streamed text and its logprob entries; it is not called on the tool path, whose answer is only known
@@ -1949,16 +1981,12 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let mut opts = eng.gen_opts(req, true)?;
     opts.with_specials = eng.reasoning_markers.is_some();
     // A thinking model's reasoning is split from its answer; the block may already be open in the prompt.
-    let splitter = |prompt: &[u32]| eng.reasoning_markers.as_ref().map(|(o, c)| {
-        let tail = eng.detok_all(&prompt[prompt.len().saturating_sub(24)..]);
-        let started = tail.rfind(o.as_str()).is_some_and(|a| tail.rfind(c.as_str()).is_none_or(|b| a > b));
-        genopts::ReasoningSplit::new(o, c, started)
-    });
+    let splitter = |prompt: &[u32]| eng.reasoning_split(prompt);
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
     tools.extend(mcps.borrow().openai_tools());
 
-    let kwargs = req["chat_template_kwargs"].as_object().cloned().unwrap_or_default();
+    let kwargs = template_kwargs(req);
     let via_template = eng.template_handles_tools();
     let tools_arg = (via_template && !tools.is_empty()).then_some(tools.as_slice());
     if !tools.is_empty() {

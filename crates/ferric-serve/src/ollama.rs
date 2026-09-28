@@ -181,7 +181,10 @@ fn to_openai(req: &Value) -> Result<Value, String> {
     }
     if let Some(t) = req["tools"].as_array() { r["tools"] = json!(t); }
     // Ollama's `think` is the template's `enable_thinking` (Qwen3 and its descendants read it).
+    // `think` may also be a level ("high" / "medium" / "low", Ollama's gpt-oss spelling): the template's
+    // `reasoning_effort`.
     if let Some(b) = req["think"].as_bool() { r["chat_template_kwargs"] = json!({"enable_thinking": b}); }
+    if let Some(level) = req["think"].as_str() { r["reasoning_effort"] = json!(level); }
     // The model name selects a LoRA adapter when it names one; `lora` is llama-server's per-request list.
     for k in ["model", "lora"] { if !req[k].is_null() { r[k] = req[k].clone(); } }
     Ok(r)
