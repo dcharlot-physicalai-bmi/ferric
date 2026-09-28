@@ -18,6 +18,7 @@
 pub mod fp8;
 pub mod hf;
 pub mod lora;
+pub mod quant;
 
 use half::{bf16, f16};
 use std::collections::{BTreeMap, HashMap};

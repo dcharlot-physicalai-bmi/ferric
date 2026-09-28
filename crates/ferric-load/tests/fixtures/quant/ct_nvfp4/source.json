@@ -1,0 +1,7 @@
+{
+ "source": "mgoin/Qwen3-0.6B-NVFP4",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "compressed-tensors 0.19.0 nvfp4-pack-quantized decompress (scale float32)",
+ "revision": "545def2dd2492f4abd75435ccde6dd93d1d93e34"
+}

@@ -1,0 +1,30 @@
+{
+ "quantization_config": {
+  "config_groups": {
+   "group_0": {
+    "input_activations": {
+     "dynamic": false,
+     "num_bits": 4,
+     "type": "float",
+     "group_size": 16
+    },
+    "weights": {
+     "dynamic": false,
+     "num_bits": 4,
+     "type": "float",
+     "group_size": 16
+    }
+   }
+  },
+  "ignore": [
+   "lm_head"
+  ],
+  "quant_algo": "NVFP4",
+  "kv_cache_scheme": "FP8",
+  "producer": {
+   "name": "modelopt",
+   "version": "0.33.0"
+  },
+  "quant_library": "modelopt"
+ }
+}

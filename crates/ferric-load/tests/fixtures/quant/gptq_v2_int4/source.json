@@ -1,0 +1,7 @@
+{
+ "source": "TheS3b/Qwen3-0.6B-GPTQ-4bit-calib500-rel0.4",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "gptqmodel 7.5.0 convert_gptq_file (float32)",
+ "revision": "4597e0b4c3cfd8132519335f04481716c2990683"
+}
