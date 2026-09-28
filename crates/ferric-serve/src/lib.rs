@@ -60,6 +60,8 @@ mod models;
 mod images;
 mod vision;
 mod constrain;
+mod trace;
+mod batchapi;
 pub mod template;
 mod specgate;
 mod gpu_sample;
@@ -1042,10 +1044,16 @@ impl Engine {
     fn generate(&self, prompt: &[u32], max_tokens: usize, opts: &GenOpts, guide: Option<ferric_agent::guide::Guide>, on_delta: impl FnMut(&str, &[Value])) -> GenOut {
         let ticket = self.energy.begin();
         PEER_GONE.with(|g| g.set(false));
-        let mut out = self.generate_inner(prompt, max_tokens, opts, guide, on_delta);
-        if peer_gone() { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        let mut on_delta = on_delta;
+        let mut first = true;
+        let mut out = self.generate_inner(prompt, max_tokens, opts, guide, |d: &str, l: &[Value]| {
+            if first && !d.is_empty() { first = false; trace::with(|s| s.first_token()); }
+            on_delta(d, l)
+        });
+        if peer_gone() { self.metrics.cancelled.fetch_add(1, std::sync::atomic::Ordering::Relaxed); trace::with(|s| s.cancelled()); }
         out.energy = self.energy.end(ticket, out.gen_tokens);
         self.metrics.record(out.prompt_tokens, out.gen_tokens, &out.energy);
+        trace::with(|s| s.generation(&self.name, out.prompt_tokens, out.gen_tokens, out.finish, &out.energy));
         out
     }
 
@@ -1561,6 +1569,7 @@ pub fn run() {
     let mut max_models = std::env::var("FERRIC_MAX_LOADED_MODELS").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(3usize);
     let mut keep_alive = std::env::var("FERRIC_KEEP_ALIVE").ok().unwrap_or_else(|| "5m".to_string());
     let mut loras: Vec<(String, String)> = Vec::new();
+    let mut otlp: Option<String> = None;
     let mut i = if path.is_some() { 2 } else { 1 };
     while i < args.len() {
         match args[i].as_str() {
@@ -1574,6 +1583,8 @@ pub fn run() {
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-models" => { max_models = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_models); i += 2; }
             "--keep-alive" => { keep_alive = args.get(i + 1).cloned().unwrap_or(keep_alive); i += 2; }
+            // `--otlp http://collector:4318`: OpenTelemetry traces (else the OTEL_EXPORTER_OTLP_* variables).
+            "--otlp" => { otlp = args.get(i + 1).cloned(); i += 2; }
             // `--lora name=path` (repeatable): a PEFT adapter directory or a llama.cpp GGUF adapter for the
             // model on the command line; `--lora path` names it by its file or directory name.
             "--lora" => {
@@ -1606,6 +1617,10 @@ pub fn run() {
         eprintln!("ferric-serve: --mcp-test, {} tool(s) advertised", mcps.openai_tools().len());
         if mcps.has("add") { eprintln!("  add(2,3) = {:?}", mcps.call("add", &json!({"a": 2, "b": 3}))); }
         return;
+    }
+    match trace::config(&|k| std::env::var(k).ok(), otlp.as_deref()) {
+        Ok(cfg) => if let Some(what) = trace::init(cfg) { eprintln!("ferric-serve: {what}"); },
+        Err(e) => { eprintln!("ferric-serve: {e}"); std::process::exit(1); }
     }
     let keep_alive = match batch::keep_alive_of(&json!({"keep_alive": keep_alive})) {
         Ok(Some(k)) => k,
@@ -1660,6 +1675,8 @@ pub fn run() {
         match keep_alive { Some(d) => format!("kept {} s after last use", d.as_secs()), None => "kept until evicted".to_string() },
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
     let listener = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
+    // The Batch API sends each line to this server's own endpoint, so a batch runs on the live code path.
+    batchapi::init(&host, port, api_key.clone(), max_batch);
     // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
     // loop, embeddings, unknown paths) goes to the untouched serial handler below.
     let fallback = !initial.is_empty();
@@ -2256,6 +2273,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>, Vec<
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, v: &Value) {
+    trace::with(|s| s.status(status));
     let body = serde_json::to_vec(v).unwrap_or_default();
     let head = format!("HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
         if status == 200 { "OK" } else { "ERR" }, body.len());
@@ -2272,6 +2290,7 @@ pub(crate) fn write_preflight(stream: &mut TcpStream) {
 }
 
 fn write_sse_headers(stream: &mut TcpStream) {
+    trace::with(|s| s.status(200));
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
     let _ = stream.flush();
 }

@@ -25,7 +25,8 @@ use ferric_gguf::{GgufSource, Meta};
 #[allow(unused_imports)] use ferric_gguf::GgufFile;
 use ferric_tensor::dtype::{Q2_0Weights, Q4_KWeights, Q6_KWeights, Q8_0Weights};
 use ferric_tensor::QMatrix;
-use crate::qwen3::Proj; // Fused-or-Split projection: real Q4_K_M models mix quants within a fused qkv/gate
+// PrismML Bonsai 2: folded weights carry their activation transform; see prism_rot.rs.
+use crate::prism_rot::{rproj, rq, RProj, Rotations, RQ};
 use ferric_tensor::kvquant::{KvqFmt, QKvCache};
 use ferric_tensor::{nn, Tensor};
 use std::sync::Arc;
@@ -155,10 +156,10 @@ impl Cfg {
 }
 
 pub struct AttnW {
-    pub wqkv: Proj, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
+    pub wqkv: RProj, // wq | wk | wv stacked: one matmul, then split by q_out/k_out
     pub q_out: usize,      // n_head·head_dim·2 (query and gate, interleaved per head)
     pub kv_out: usize,     // n_head_kv·head_dim (each of k and v)
-    pub wo: QMatrix,
+    pub wo: RQ,
     pub q_norm: Tensor,
     pub k_norm: Tensor,
 }
@@ -166,7 +167,11 @@ pub struct AttnW {
 pub struct GdnW {
     // in_proj = qkv | z | alpha | beta stacked: the four projections all read the same h, so one
     // fused matmul replaces four (48 GDN layers × 4 → 1).
-    pub in_proj: Proj,
+    pub in_proj: RProj,
+    /// alpha | beta, when they must read a DIFFERENT activation from in_proj: under a PrismML Hadamard
+    /// contract qkv|z are folded (they read `H(s ⊙ h)`) and alpha/beta are not (the fork cannot fold
+    /// them — `is_foldable_weight`), so the fused four split in two. `None` = all four in `in_proj`.
+    pub ab: Option<RProj>,
     pub qkv_out: usize, // 2·key_dim + d_inner
     pub z_out: usize,   // d_inner
     pub ba_out: usize,  // n_v_heads (each of alpha, beta)
@@ -174,7 +179,14 @@ pub struct GdnW {
     pub dt_bias: Tensor, // [n_v_heads]
     pub a: Tensor,       // [n_v_heads] — already -exp(A_log)
     pub norm: Tensor,    // [head_v_dim]
-    pub out: QMatrix,
+    pub out: RQ,
+}
+
+impl GdnW {
+    /// `[qkv | z | alpha | beta]` for `h` — one fused matmul, or two when a Hadamard contract splits it.
+    fn project(&self, h: &Tensor) -> Tensor {
+        match &self.ab { None => self.in_proj.matmul(h), Some(ab) => self.in_proj.matmul(h).cat(&ab.matmul(h), 1) }
+    }
 }
 
 /// Laguna (Poolside) attention: separate q/k/v (+ per-head softplus output gate `g_proj`), QK-norm,
@@ -498,7 +510,7 @@ pub struct MoeFfn {
 }
 
 pub enum Ffn {
-    Dense { gate_up: Proj, gate_out: usize, down: QMatrix }, // gate|up fused, then down
+    Dense { gate_up: RProj, gate_out: usize, down: RQ }, // gate|up fused, then down
     Moe(MoeFfn),
 }
 
@@ -530,8 +542,10 @@ pub struct Qwen35 {
     emb_row_bytes: usize, // packed bytes per embedding row
     pub layers: Vec<Layer>,
     pub out_norm: Tensor,
-    pub lm_head: QMatrix,
+    pub lm_head: RQ,
     pub mtp: Option<Mtp>,
+    /// PrismML's Hadamard contract (Bonsai 2), or `None` for an ordinary file.
+    pub rot: Option<Arc<Rotations>>,
 }
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
@@ -571,6 +585,12 @@ pub(crate) fn f32t(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, shape: &
 pub(crate) fn qm(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<ferric_tensor::QMatrix, String> {
     let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
     let (ty, rows, cols) = (t.ggml_type, t.dims[1] as usize, t.dims[0] as usize);
+    // PTQ1_0 and mainline group-64 Q2_0 ride the group-128 Q2_0 kernels through a LOSSLESS transcode
+    // (`ferric_gguf::prism::as_q2_0_g128`) — never the f32 fallback below, which for a 27B model is
+    // ~108 GB. Decode is bit-identical to the file's own format; the device footprint is Q2_0's.
+    if let Some(b) = ferric_gguf::prism::as_q2_0_g128(ty, &g.raw(name)?, cols)? {
+        return ferric_tensor::QMatrix::from_bytes(ctx, &b, 42, rows, cols);
+    }
     // Native packed kernel if we have one; otherwise dequantize to f32 and run the dense fallback
     // (e.g. IQ4_XS/IQ4_NL — the quant is decoded, just not matmul'd in packed form).
     if ferric_tensor::QMatrix::block_bytes(ty).is_some() {
@@ -593,6 +613,14 @@ pub(crate) fn qm_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) ->
         out += t.dims[1] as usize;
     }
     let (ty, inn) = (ty.unwrap(), inn.unwrap());
+    // Transcoded ternary formats (see `qm`): transcode each part, then stack the group-128 bytes.
+    if matches!(ty, ferric_gguf::prism::PTQ1_0 | ferric_gguf::prism::Q2_0_G64) {
+        let mut raw = Vec::new();
+        for &name in names {
+            raw.extend(ferric_gguf::prism::as_q2_0_g128(ty, &g.raw(name)?, inn)?.expect("transcodable type"));
+        }
+        return ferric_tensor::QMatrix::from_bytes(ctx, &raw, 42, out, inn);
+    }
     // Concatenate along the output dim: for the packed path stack raw block bytes; for the dense
     // fallback stack the dequantized row-major [out_i, inn] blocks — both yield the fused [out, inn].
     if ferric_tensor::QMatrix::block_bytes(ty).is_some() {
@@ -693,14 +721,14 @@ fn try_streamed(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, c
     }))
 }
 
-fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg) -> Result<Ffn, String> {
+fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: Option<&Rotations>) -> Result<Ffn, String> {
     let b = |s: &str| format!("blk.{il}.{s}");
     // Dense FFN: non-MoE models, and a MoE model's leading dense blocks (laguna: layer 0).
     if !cfg.is_moe() || il < cfg.n_dense_lead {
         return Ok(Ffn::Dense {
-            gate_up: Proj::load(ctx, g, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
+            gate_up: rproj(ctx, g, rot, &[&b("ffn_gate.weight"), &b("ffn_up.weight")])?,
             gate_out: g.tensor(&b("ffn_gate.weight")).ok_or("no ffn_gate")?.dims[1] as usize,
-            down: qm(ctx, g, &b("ffn_down.weight"))?,
+            down: rq(ctx, g, rot, &b("ffn_down.weight"), None)?,
         });
     }
     let (ne, eff, d) = (cfg.n_expert, cfg.expert_ff, cfg.n_embd);
@@ -885,9 +913,26 @@ impl Qwen35 {
         if let Ok(n) = std::env::var("FERRIC_MAX_LAYERS") { if let Ok(n) = n.parse::<usize>() { cfg.n_layer = cfg.n_layer.min(n); } }
         let conv_dim = cfg.key_dim() * 2 + cfg.d_inner;
 
+        // PrismML Bonsai 2: validate the Hadamard contract and refuse what this runtime does not
+        // transform BEFORE unlocking the reader (`ferric_gguf::prism::PrismLock`).
+        let rot = Rotations::from_gguf(ctx, g)?;
+        if let Some(r) = &rot {
+            if cfg.is_moe() || cfg.arch == "laguna" || cfg.arch != "qwen35" {
+                return Err(format!("{}: PrismML Hadamard-folded weights are implemented for the dense qwen35 \
+                                    runtime only (not MoE experts, not laguna); refusing", cfg.arch));
+            }
+            if !g.unlock_prism_hadamard() {
+                return Err("this GGUF source cannot unlock PrismML Hadamard-folded tensors".into());
+            }
+            eprintln!("prism.hadamard v{}: {} folded weight(s) + {} latent table(s), block {}, {} sign width(s){}",
+                      r.contract.version, r.contract.folded.len(), r.contract.inverse.len(), r.contract.block_size,
+                      r.contract.signs.len(), if r.contract.gdn_v_grouped { ", GDN out in grouped V order" } else { "" });
+        }
+        let rref = rot.as_ref();
+
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
-            layers.push(Self::load_layer(ctx, g, il, &cfg, conv_dim)?);
+            layers.push(Self::load_layer(ctx, g, il, &cfg, conv_dim, rref)?);
             // MoE layers allocate ~500 buffers (~300 MB) each; flush per layer so pending buffer
             // initializations commit — past ~10 GB un-flushed, Metal silently zeroes later buffers.
             if cfg.is_moe() { ctx.flush(); }
@@ -905,7 +950,7 @@ impl Qwen35 {
                     enorm: f32t(ctx, g, &b("nextn.enorm.weight"), &[cfg.n_embd])?,
                     hnorm: f32t(ctx, g, &b("nextn.hnorm.weight"), &[cfg.n_embd])?,
                     head_norm: f32t(ctx, g, &b("nextn.shared_head_norm.weight"), &[cfg.n_embd])?,
-                    layer: Self::load_layer(ctx, g, il, &cfg, conv_dim)?,
+                    layer: Self::load_layer(ctx, g, il, &cfg, conv_dim, rref)?,
                 };
                 if cfg.is_moe() { ctx.flush(); }
                 Some(m)
@@ -918,17 +963,21 @@ impl Qwen35 {
         let emb_type = emb.ggml_type;
         let tok_embd = g.raw("token_embd.weight")?;
         let emb_row_bytes = tok_embd.len() / cfg.n_vocab;
+        let lm_head = rq(ctx, g, rref, head, None)?;
+        // The fork's graph check, at load: every folded weight went through a transform-applying site.
+        if let Some(r) = &rot { r.verify_all_claimed()?; }
         Ok(Qwen35 {
             tok_embd, emb_type, emb_row_bytes,
             out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
-            lm_head: qm(ctx, g, head)?,
-            cfg, ctx: ctx.clone(), layers, mtp,
+            lm_head,
+            cfg, ctx: ctx.clone(), layers, mtp, rot: rot.map(Arc::new),
         })
     }
 
     /// One transformer block's weights (mixer feature-detected from tensor presence) — shared by the
     /// main-layer loop and the MTP draft block, which is a standard block plus glue tensors.
-    fn load_layer(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, conv_dim: usize) -> Result<Layer, String> {
+    fn load_layer(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, conv_dim: usize,
+                  rot: Option<&Rotations>) -> Result<Layer, String> {
         {
             let b = |s: &str| format!("blk.{il}.{s}");
             // Feature-detect the mixer from tensor presence, not the interval formula: qwen35moe makes
@@ -957,8 +1006,28 @@ impl Qwen35 {
                     base, n_rot, yarn,
                 })
             } else if g.tensor(&b("ssm_out.weight")).is_some() {
+                let (qkvz, ab) = (&[b("attn_qkv.weight"), b("attn_gate.weight")], &[b("ssm_alpha.weight"), b("ssm_beta.weight")]);
+                let all4: Vec<&str> = qkvz.iter().chain(ab.iter()).map(|s| s.as_str()).collect();
+                // One fused matmul unless a Hadamard contract makes qkv|z and alpha|beta read different
+                // activations (see `GdnW::ab`).
+                let split = rot.is_some_and(|r| all4.iter().any(|n| r.contract.is_folded(n)));
+                let (in_proj, ab) = if split {
+                    (rproj(ctx, g, rot, &all4[..2])?, Some(rproj(ctx, g, rot, &all4[2..])?))
+                } else {
+                    (rproj(ctx, g, rot, &all4)?, None)
+                };
+                // ssm_out under `gdn_v_grouped`: the fold was computed in the training (GROUPED) V-head
+                // order while this runtime's activation is TILED (the converter permuted everything
+                // else), so the transform gathers tiled→grouped first — the fork's perm_hd/nk/rep.
+                let out_perm = rot.filter(|r| r.contract.gdn_v_grouped && r.contract.is_folded(&b("ssm_out.weight")))
+                    .map(|_| (cfg.head_v_dim(), cfg.n_k_heads, cfg.n_v_heads / cfg.n_k_heads.max(1)));
+                if let Some((hd, nk, rep)) = out_perm {
+                    if nk == 0 || cfg.n_v_heads % nk != 0 || hd * nk * rep != cfg.d_inner {
+                        return Err(format!("prism.hadamard: bad GDN head geometry for blk.{il}.ssm_out"));
+                    }
+                }
                 Mixer::Gdn(GdnW {
-                    in_proj: Proj::load(ctx, g, &[&b("attn_qkv.weight"), &b("attn_gate.weight"), &b("ssm_alpha.weight"), &b("ssm_beta.weight")])?,
+                    in_proj, ab,
                     qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
                     z_out: g.tensor(&b("attn_gate.weight")).ok_or("no attn_gate")?.dims[1] as usize,
                     ba_out: g.tensor(&b("ssm_alpha.weight")).ok_or("no ssm_alpha")?.dims[1] as usize,
@@ -966,14 +1035,14 @@ impl Qwen35 {
                     dt_bias: f32t(ctx, g, &b("ssm_dt.bias"), &[cfg.n_v_heads])?,
                     a: f32t(ctx, g, &b("ssm_a"), &[cfg.n_v_heads])?,
                     norm: f32t(ctx, g, &b("ssm_norm.weight"), &[cfg.head_v_dim()])?,
-                    out: qm(ctx, g, &b("ssm_out.weight"))?,
+                    out: rq(ctx, g, rot, &b("ssm_out.weight"), out_perm)?,
                 })
             } else {
                 Mixer::Attn(AttnW {
-                    wqkv: Proj::load(ctx, g, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
+                    wqkv: rproj(ctx, g, rot, &[&b("attn_q.weight"), &b("attn_k.weight"), &b("attn_v.weight")])?,
                     q_out: g.tensor(&b("attn_q.weight")).ok_or("no attn_q")?.dims[1] as usize,
                     kv_out: g.tensor(&b("attn_k.weight")).ok_or("no attn_k")?.dims[1] as usize,
-                    wo: qm(ctx, g, &b("attn_output.weight"))?,
+                    wo: rq(ctx, g, rot, &b("attn_output.weight"), None)?,
                     q_norm: f32t(ctx, g, &b("attn_q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: f32t(ctx, g, &b("attn_k_norm.weight"), &[cfg.head_dim])?,
                 })
@@ -984,7 +1053,7 @@ impl Qwen35 {
             Ok(Layer {
                 attn_norm: f32t(ctx, g, &b("attn_norm.weight"), &[cfg.n_embd])?,
                 post_norm: f32t(ctx, g, &pn, &[cfg.n_embd])?,
-                ffn: load_ffn(ctx, g, il, cfg)?,
+                ffn: load_ffn(ctx, g, il, cfg, rot)?,
                 mixer,
             })
         }
@@ -1004,6 +1073,8 @@ impl Qwen35 {
             let off = t as usize * rb;
             v.extend(ferric_gguf::deq_raw(&self.tok_embd[off..off + rb], d, self.emb_type).expect("embed row"));
         }
+        // A Hadamard-latent table stores rotated rows: restore the primal basis, h = s ⊙ (H z).
+        if let Some(r) = &self.rot { r.inverse_rows("token_embd.weight", &mut v, d).expect("embedding inverse"); }
         if std::env::var("FERRIC_EMB_DEBUG").is_ok() {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             eprintln!("embed dbg: cpu-side v norm={norm:.4} first3={:?}", &v[..3.min(v.len())]);
@@ -1098,7 +1169,7 @@ impl Qwen35 {
             None => Some(LayerCache::Attn { k: kc, v: vc }),
         };
         // Ungated (qwen3moe): straight to wo. A ones-multiply would cost a dispatch to do nothing.
-        match &gate { Some(g) => o.mul(&g.sigmoid()), None => o }.matmul_q(&w.wo)
+        w.wo.mm(&match &gate { Some(g) => o.mul(&g.sigmoid()), None => o })
     }
 
     fn gdn(&self, h: &Tensor, w: &GdnW, cache: &mut Option<LayerCache>) -> Tensor {
@@ -1111,7 +1182,7 @@ impl Qwen35 {
         // fused q|k|v block, looking back conv_kernel-1 steps: the carried tail (zeros at the start
         // of a sequence — exactly the standalone conv's causal zero-padding) is prepended virtually
         // inside the kernel, which also emits the next tail and the (conv'd, silu'd) V block.
-        let proj = w.in_proj.matmul(h);
+        let proj = w.project(h);
         let (qo, zo) = (w.qkv_out, w.z_out);
         let pad = c.conv_kernel - 1;
         let (prev_conv, prev_state) = match cache.take() {
@@ -1144,7 +1215,7 @@ impl Qwen35 {
         *cache = Some(LayerCache::Gdn { state, conv: conv_tail });
 
         // gated RMSNorm over head_v_dim gated by silu(z) — fused, z read in place from the in_proj
-        nn::gdn_post(&o, &proj, &w.norm, qo, c.eps).matmul_q(&w.out)
+        w.out.mm(&nn::gdn_post(&o, &proj, &w.norm, qo, c.eps))
     }
 
     /// Laguna attention: GQA with QK-norm, per-layer rope (plain or YaRN-scaled, partial rotary), a
@@ -1224,7 +1295,7 @@ impl Qwen35 {
     fn ffn(&self, h: &Tensor, l: &Layer) -> Tensor {
         match &l.ffn {
             // gate_up matmul → fused SwiGLU (silu(gate)·up in one kernel) → down projection.
-            Ffn::Dense { gate_up, gate_out, down } => gate_up.gate_up_swiglu(h, *gate_out).matmul_q(down),
+            Ffn::Dense { gate_up, gate_out, down } => down.mm(&gate_up.gate_up_swiglu(h, *gate_out)),
             Ffn::Moe(m) => self.moe_ffn(h, m),
         }
     }
@@ -1312,7 +1383,7 @@ impl Qwen35 {
             }
         }
         cache.pos += tokens.len();
-        let out = batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head));
+        let out = batch(&self.ctx, || self.lm_head.mm(&x.rmsnorm(&self.out_norm, self.cfg.eps)));
         prof(&self.ctx, "lm_head");
         if std::env::var("FERRIC_LAYER_SUMS").is_ok() {
             let rn: f32 = pollster::block_on(x.rmsnorm(&self.out_norm, self.cfg.eps).to_vec()).iter().sum();
@@ -1401,7 +1472,7 @@ impl Qwen35 {
         let t = tokens.len();
         let keep = t.min(keep);
         let xl = if t > keep { x.narrow(0, t - keep, keep).contiguous() } else { x.clone() };
-        let logits = batch(&self.ctx, || xl.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head));
+        let logits = batch(&self.ctx, || self.lm_head.mm(&xl.rmsnorm(&self.out_norm, self.cfg.eps)));
         prof(&self.ctx, "lm_head");
         (logits, x)
     }
@@ -1459,7 +1530,7 @@ impl Qwen35 {
             // Only the last position drafts — don't head (or read back) the whole pair stream.
             let t = x.shape[0];
             let xl = if t > 1 { x.narrow(0, t - 1, 1).contiguous() } else { x };
-            (xl.rmsnorm(&m.head_norm, eps).matmul_q(&self.lm_head), xl)
+            (self.lm_head.mm(&xl.rmsnorm(&m.head_norm, eps)), xl)
         });
         mc.pos += tokens.len();
         (logits, hid)
@@ -1598,7 +1669,7 @@ impl Qwen35 {
             };
         }
         let o = Self::stack_rows(outs);
-        match &gate { Some(g) => o.mul(&g.sigmoid()), None => o }.matmul_q(&w.wo)   // <-- batched again
+        w.wo.mm(&match &gate { Some(g) => o.mul(&g.sigmoid()), None => o })   // <-- batched again
     }
 
     /// Laguna attention (sliding-window or YaRN full) for N sequences, one token each.
@@ -1685,7 +1756,7 @@ impl Qwen35 {
         let (dk, dv, kd) = (c.head_k_dim, c.head_v_dim(), c.key_dim());
         debug_assert_eq!(n, caches.len(), "one row per sequence");
 
-        let proj = w.in_proj.matmul(h);                               // <-- batched: the win
+        let proj = w.project(h);                                      // <-- batched: the win
         let (qo, zo) = (w.qkv_out, w.z_out);
         let pad = c.conv_kernel - 1;
 
@@ -1732,7 +1803,7 @@ impl Qwen35 {
 
         let o = Self::stack_rows(outs).reshape(&[n, nv, dv]);
         // gdn_post reads each row's z gate at `(r/nv)·pw + z_off`, so the batched proj lines up row-wise.
-        nn::gdn_post(&o, &proj, &w.norm, qo, c.eps).matmul_q(&w.out)   // <-- batched again
+        w.out.mm(&nn::gdn_post(&o, &proj, &w.norm, qo, c.eps))   // <-- batched again
     }
 
     /// One block for N sequences. Same structure as the non-profiling arm of `forward_cached`; only
@@ -1783,7 +1854,7 @@ impl Qwen35 {
         // AFTER the layers: `attn_batch`/`lag_attn_batch` read `c.pos` as this token's own absolute
         // position. Bumping first would rope every row one step into the future.
         for c in caches.iter_mut() { c.pos += 1; }
-        batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps).matmul_q(&self.lm_head))
+        batch(&self.ctx, || self.lm_head.mm(&x.rmsnorm(&self.out_norm, self.cfg.eps)))
     }
 }
 

@@ -30,6 +30,8 @@ pub struct GgufBacked {
     pub tensors: Vec<TensorInfo>,
     data_start: u64,
     backing: Arc<dyn Backing + Send + Sync>,
+    /// Same Hadamard read guard as the file and in-memory readers (`crate::prism::PrismLock`).
+    prism_lock: crate::prism::PrismLock,
 }
 
 impl GgufBacked {
@@ -47,6 +49,7 @@ impl GgufBacked {
             tensors: g.tensors,
             data_start: g.data_start as u64,
             backing,
+            prism_lock: g.prism_lock,
         })
     }
 
@@ -67,6 +70,7 @@ impl GgufSource for GgufBacked {
         self.tensors.iter().find(|t| t.name == name)
     }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
+        self.prism_lock.check(name)?;
         let (off, sz) = self.extent(name).ok_or_else(|| format!("no tensor '{name}'"))?;
         let mut buf = vec![0u8; sz];
         self.backing.read_at(off, &mut buf).map_err(|e| e.to_string())?;
@@ -78,6 +82,7 @@ impl GgufSource for GgufBacked {
         let ty = t.ggml_type;
         deq_raw(&self.raw(name)?, n, ty)
     }
+    fn unlock_prism_hadamard(&self) -> bool { self.prism_lock.unlock() }
 }
 
 /// Smallest prefix of a checkpoint that parses as a GGUF header.

@@ -24,6 +24,7 @@ pub mod cpu_simd; // CPU vector-unit kernels + worker pool: the fabric's second 
 pub mod iq_grids;
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)
+pub mod fwht; // blockwise Walsh–Hadamard transform (PrismML Bonsai 2 rotated-basis activations)
 pub mod kvquant; // block-quantized KV cache: q8_0/q4_0/q4_1 blocks that grow one row at a time
 pub mod nn; // transformer blocks expressed on the general runtime
 pub mod optim; // optimizers (Adam)

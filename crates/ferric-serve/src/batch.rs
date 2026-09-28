@@ -140,6 +140,8 @@ pub(crate) struct Job {
     /// Request headers, names lower-cased (Content-Type for multipart, Authorization / x-api-key).
     pub headers: Vec<(String, String)>,
     pub stream: TcpStream,
+    /// The request's trace span (when OTLP export is on): begun when it was read, exported when dropped.
+    pub span: Option<crate::trace::Span>,
 }
 
 /// Reader-threads → engine-thread handoff. `closed` is set when the listener stops yielding.
@@ -222,6 +224,8 @@ struct Gen<S> {
     ready: bool,
     /// The token to feed on the next decode step.
     next: u32,
+    /// The request's trace span, exported when the sequence retires.
+    span: Option<crate::trace::Span>,
 }
 
 impl<S> Gen<S> {
@@ -273,6 +277,16 @@ pub(crate) struct ServeOpts {
     pub fallback: bool,
 }
 
+/// The bundled chat page (src/ui.html): one self-contained file — no fonts, scripts or styles from anywhere
+/// else, so it works on a machine with no network.
+fn write_ui(stream: &mut TcpStream, body: bool) {
+    use std::io::Write;
+    const UI: &str = include_str!("ui.html");
+    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", UI.len()).as_bytes());
+    if body { let _ = stream.write_all(UI.as_bytes()); }
+    let _ = stream.flush();
+}
+
 fn authorized(headers: &[(String, String)], key: &str) -> bool {
     headers.iter().any(|(k, v)| (k == "authorization" && v.strip_prefix("Bearer ").map(str::trim) == Some(key)) || (k == "x-api-key" && v.trim() == key))
 }
@@ -320,7 +334,8 @@ pub(crate) fn serve_loop<S: Source>(
                 std::thread::spawn(move || {
                     let mut s = s;
                     if let Some((method, path, body, headers)) = read_request(&mut s) {
-                        ib2.push(Job { method, path, body, headers, stream: s });
+                        let span = crate::trace::Span::begin(&method, &path, &headers, &body);
+                        ib2.push(Job { method, path, body, headers, stream: s, span });
                     }
                 });
             }
@@ -412,6 +427,7 @@ fn route<M: ServeModel>(
             include_usage: req["stream_options"]["include_usage"].as_bool() == Some(true),
             opts: gopts,
             prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, gone: false, state: None, fed: 0, ready: false, next: 0,
+            span: crate::trace::leave(),
         });
         return;
     }
@@ -616,17 +632,35 @@ impl<S: Source> Pool<S> {
     fn route(&mut self, mut j: Job, opts: &ServeOpts,
              serial: &mut impl FnMut(&S::M, &str, &str, &[u8], &[(String, String)], &mut TcpStream) -> bool) -> Option<Job> {
         if j.method == "OPTIONS" { write_preflight(&mut j.stream); return None; }
+        // The request's span is current while it is routed: whatever answers it (a refusal here, the
+        // serial handler, a batch admission that takes it along) reports into it.
+        crate::trace::enter(j.span.take());
+        let _current = crate::trace::Current;
         if let Some(key) = &opts.api_key {
-            if j.path != "/health" && !authorized(&j.headers, key) {
+            // The chat page itself is static and public; the API calls it makes carry the key.
+            let public = j.path == "/health" || (j.method == "GET" && (j.path == "/" || j.path == "/ui"));
+            if !public && !authorized(&j.headers, key) {
                 write_json(&mut j.stream, 401, &json!({"error": {"message": "missing or wrong API key: send Authorization: Bearer <key> or x-api-key", "type": "authentication_error"}}));
                 return None;
             }
+        }
+        // The Batch API's files and batches belong to the server, not to a model.
+        if crate::batchapi::handles(&j.path) {
+            crate::batchapi::handle(&j.method, &j.path, &j.headers, &j.body, &mut j.stream);
+            return None;
         }
         let ollama = j.path.starts_with("/api/");
         let refuse = |s: &mut TcpStream, code: u16, m: &str| if ollama { write_json(s, code, &json!({"error": m})) }
             else { write_json(s, code, &json!({"error": {"message": m, "type": "invalid_request_error", "code": if code == 404 { "model_not_found" } else { "invalid_request" }}})) };
         match (j.method.as_str(), j.path.as_str()) {
             ("GET", "/health") => { write_json(&mut j.stream, 200, &json!({"status": "ok"})); return None; }
+            // The bundled chat page: at /ui, and at / for a browser (an Accept that names text/html). Other
+            // clients asking / keep the one-line text Ollama-style clients probe for.
+            ("GET", "/ui") | ("HEAD", "/ui") => { write_ui(&mut j.stream, j.method == "GET"); return None; }
+            ("GET", "/") | ("HEAD", "/") if j.headers.iter().any(|(k, v)| k == "accept" && v.contains("text/html")) => {
+                write_ui(&mut j.stream, j.method == "GET");
+                return None;
+            }
             ("GET", "/") | ("HEAD", "/") => {
                 use std::io::Write;
                 let b = b"ferric-serve is running (OpenAI /v1 and Ollama /api)";
@@ -702,7 +736,7 @@ impl<S: Source> Pool<S> {
         }
         let i = match self.slot_for(spec.as_deref(), opts) {
             Ok(Some(i)) => i,
-            Ok(None) => return Some(j),
+            Ok(None) => { j.span = crate::trace::leave(); return Some(j) }
             Err((code, msg)) => { refuse(&mut j.stream, code, &msg); return None; }
         };
         let s = &mut self.slots[i];
@@ -758,7 +792,12 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
         let Some(row) = row else { continue };
         g.ready = true;
         match m.pick(&row, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng) {
-            Some(t) if !m.is_stop(t) => { g.next = t; let hit = g.commit(m, t, &row); first.push((g.id, t, hit)); }
+            Some(t) if !m.is_stop(t) => {
+                g.next = t;
+                if let Some(s) = g.span.as_mut() { s.first_token(); }
+                let hit = g.commit(m, t, &row);
+                first.push((g.id, t, hit));
+            }
             // Stop token (or a dead guide) on the very first sampled token: the serial path emits
             // nothing at all in that case, so neither does this one.
             _ => first.push((g.id, 0, true)),
@@ -850,7 +889,8 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
     }
     if g.gone {
         m.cancelled();
-        let _ = m.energy_end(g.ticket.take(), g.r#gen.len());
+        let energy = m.energy_end(g.ticket.take(), g.r#gen.len());
+        if let Some(s) = g.span.as_mut() { s.cancelled(); s.generation(m.name(), g.prompt.len(), g.r#gen.len(), "cancelled", &energy); }
         return;
     }
     let reason = if g.em.hit_stop || !matches!(why, Done::Length) { "stop" } else { "length" };
@@ -859,6 +899,7 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
     let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
     let energy = m.energy_end(g.ticket.take(), gtok);
     m.record(ptok, gtok, &energy);
+    if let Some(s) = g.span.as_mut() { s.generation(m.name(), ptok, gtok, reason, &energy); s.status(200); }
     if g.streaming {
         send_sse(&mut g.stream, &json!({
             "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
