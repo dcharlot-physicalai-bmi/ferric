@@ -51,6 +51,7 @@ UPDATES = {
     "S17": ("verified", "b0b4448: the GGUF's own Jinja template via minijinja = HF apply_chat_template — 23/23 templates byte-identical; token ids equal on Qwen2.5, Gemma-3, Phi-3.5, Llama-3.2 (scripts/chat_template_conformance.py, chat_ids_conformance.sh)"),
     "S08": ("verified", "dda7557: each family's own tool-call syntax (Hermes, Qwen3.5 XML, Gemma-4, LFM2, Mistral, DeepSeek, Llama python_tag); live: 5 families return the same call"),
     "S11": ("verified", "1c3fe7c: reasoning_content / Ollama thinking from the template's markers; streamed"),
+    "O09": ("verified", "OTLP/HTTP traces, json + protobuf, one span per request with GenAI semconv attributes and the request's joules; traceparent continued; scripts/otlp_conformance.sh decodes every export with opentelemetry-proto and checks spans against responses"),
     "O01": ("verified", "944f580: joules per request on every route, ∫(P−P_idle)/n(t) on the accelerator rails; unit-tested attribution; live batching −40% J/token"),
     "S05": ("verified", "d3adbe1: Anthropic /v1/messages + count_tokens; the official anthropic SDK works unmodified (tools, round trip, stream, stop_sequence)"),
     "S04": ("verified", "d3adbe1: OpenAI Responses API incl. previous_response_id and streaming; the official openai SDK works unmodified"),
