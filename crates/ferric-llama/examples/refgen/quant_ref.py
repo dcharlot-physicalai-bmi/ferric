@@ -337,6 +337,11 @@ def logits(ck, out, base):
     cfg = AutoConfig.from_pretrained(base)
     for k in ("quantization_config", "compression_config"):
         if hasattr(cfg, k): delattr(cfg, k)
+    # ⚠ A file that CARRIES its own head is untied, whatever the base config says: bartowski's GGUFs
+    # write output.weight (Q6_K) beside an IQ3_S token_embd, and tie_weights() would silently replace
+    # that head with the embedding — a reference 5.9 logits away from the file it claims to describe.
+    if "lm_head.weight" in sd:
+        cfg.tie_word_embeddings = False
     rng = random.Random(1234)
     sample = sorted(rng.sample(range(cfg.vocab_size), 128))
     res = {}

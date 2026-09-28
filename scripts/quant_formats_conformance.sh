@@ -23,6 +23,20 @@
 #    signs / delta flipped) must land >= 20x the clean max error — or the gate has not shown it can see
 #    that mechanism.
 #
+# Where the model-level checkpoints come from:
+#   safetensors — the Hub ids recorded in each fixture's "model" (huggingface_hub snapshot_download);
+#                 base config/tokenizer from its "base".
+#   gguf_<TYPE> — ~/.cache/ferric/hub/quant-fixtures/qwen3-0.6b-<TYPE>.gguf, made from the AUTHORS'
+#                 weights at F32 (Qwen3-0.6B-F32-authors.gguf, convert_hf_to_gguf --outtype f32) by
+#                 llama-quantize (ggml 0.25.3):
+#       llama-imatrix -m <f32> -f <text> -c 512 --chunks 16 -o imat.gguf
+#       llama-quantize --pure --imatrix imat.gguf --token-embedding-type q8_0 --output-tensor-type q8_0 \
+#           <f32> qwen3-0.6b-<TYPE>.gguf <TYPE>                         (IQ1_S, IQ1_M, IQ2_XS, IQ3_S)
+#       ... with --tensor-type {attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down}=<type>
+#           and ftype Q8_0 for IQ2_S (its ftype maps to IQ2_XS tensors) and NVFP4 / MXFP4 (no ftype).
+#   The reference dequantizes whatever file is there with libggml-base, so a regenerated file needs a
+#   regenerated fixture (quant_ref.py logits <file> <fixture> --base Qwen/Qwen3-0.6B), not a new recipe.
+#
 #   scripts/quant_formats_conformance.sh [--unit-only] [name ...]
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -78,6 +92,8 @@ CONTROLS = {
     "gguf_IQ2_S":       ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
     "gguf_IQ3_S":       ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
     "gguf_NVFP4":       ("FERRIC_IQ_CONTROL",    "nvfp4_half",  "UE4M3 scale without ggml's * 0.5"),
+    "gguf_MXFP4":       ("FERRIC_IQ_CONTROL",    "mxfp4_bias",  "E8M0 scale one binade high (2^(e-127))"),
+    "gguf_pub_IQ3_XS":  ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
 }
 
 def locate(fx, name):

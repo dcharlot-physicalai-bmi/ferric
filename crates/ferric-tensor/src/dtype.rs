@@ -4802,6 +4802,10 @@ impl Tensor {
             .replace("__L__", &lanes.to_string())
             .replace("__OPW__", &opw.to_string())
             .replace("__LH__", &(lanes / 2).to_string());
+        // Negative control for scripts/quant_formats_conformance.sh: the E8M0 scale one binade high —
+        // 2^(e-127) where the doubled table needs 2^(e-128), the off-by-one this kernel's docs name.
+        let src = if std::env::var("FERRIC_IQ_CONTROL").as_deref() == Ok("mxfp4_bias") {
+            src.replace("let d = e8m0h(mxsc(bi));", "let d = e8m0h(mxsc(bi)) * vec2<f32>(2.0, 1.0);") } else { src };
         run(&self.ctx, &src, "matmul_mxfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
