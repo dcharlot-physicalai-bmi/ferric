@@ -1225,14 +1225,16 @@ pub fn bench_swiglu(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<
 /// **Prefill GEMM microbench** — `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores, `iters`
 /// back-to-back launches rotating over `ws` (weights past L2, as the GEMV bench), one sync. Returns
 /// (µs per GEMM, the last C). The number `examples/cuda_gemm_bench.rs` turns into useful TFLOPS.
-pub fn bench_gemm(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize) -> Option<(f64, Vec<f32>)> {
+pub fn bench_gemm(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize) -> Option<(f64, Vec<f32>)> { bench_gemm_v(ws, a, m, iters, 0) }
+/// [`bench_gemm`] with the kernel version named (1, 2, 3; 0 = what `FERRIC_CUDA_GEMM` / the default picks).
+pub fn bench_gemm_v(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize, ver: u8) -> Option<(f64, Vec<f32>)> {
     let drv = driver()?.clone(); drv.bind();
     let w0 = ws.first()?;
     let (n, k) = (w0.rows, w0.cols);
     if a.len() != m * k || ws.iter().any(|w| w.rows != n || w.cols != k) { return None; }
     let pk = *drv.prefill_kernels()?;
     let (ad, cd, ovf) = (drv.upload_f32(a)?, drv.alloc(m * n * 4)?, drv.upload_f32(&[0.0])?);
-    let run = |w: &NativeWeight<'_>| unsafe { launch_gemm(&drv, &pk, ad, k, w.dw(), cd, n, m, ovf) };
+    let run = |w: &NativeWeight<'_>| unsafe { if ver == 0 { launch_gemm(&drv, &pk, ad, k, w.dw(), cd, n, m, ovf) } else { launch_gemm_v(&drv, &pk, ver, ad, k, w.dw(), cd, n, m, ovf) } };
     if !run(w0) || !drv.sync() { return None; }      // warm (PTX JIT)
     let t0 = std::time::Instant::now();
     for i in 0..iters { if !run(&ws[i % ws.len()]) { return None; } }
