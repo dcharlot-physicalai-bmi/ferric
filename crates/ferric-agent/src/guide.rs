@@ -4,16 +4,16 @@
 //! complete top-level value has been consumed, so the model auto-terminates on valid JSON. This is the
 //! core of Ferric's differentiator: constrained decoding done in-runtime, deterministic across fabrics.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Phase { Value, ObjKey, ObjKeyReq, Colon, ObjComma, ArrValue, ArrValueReq, ArrComma, End }
 
 /// JSON number sub-state (proper grammar: `-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`). `completable`
 /// marks states where the number is a valid stopping point (so a non-numeric byte ends it cleanly).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NumSt { Neg, IntZero, Int, Dot, Frac, Exp, ExpSign, ExpDig }
 impl NumSt { fn completable(self) -> bool { matches!(self, NumSt::IntZero | NumSt::Int | NumSt::Frac | NumSt::ExpDig) } }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Lex { None, Str, StrEsc, StrU(u8), Num(NumSt), Kw(u8, u8) } // Kw(kind 0=true 1=false 2=null, matched)
 
 #[derive(Clone, Copy)]
@@ -24,6 +24,21 @@ pub struct Json {
     lex: Lex,
     str_key: bool,       // the string currently being lexed is an object key
     require_object: bool, // top-level value must be an object (OpenAI json_object mode)
+}
+
+/// Two states are equal when they accept the same continuations: the stack only up to `depth` counts (the
+/// slots above it are stale). So an equal state has an equal token mask, which is what a mask cache keys on.
+impl PartialEq for Json {
+    fn eq(&self, o: &Self) -> bool {
+        self.depth == o.depth && self.stack[..self.depth.min(32)] == o.stack[..o.depth.min(32)] && self.phase == o.phase
+            && self.lex == o.lex && self.str_key == o.str_key && self.require_object == o.require_object
+    }
+}
+impl Eq for Json {}
+impl std::hash::Hash for Json {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (self.depth, &self.stack[..self.depth.min(32)], self.phase, self.lex, self.str_key, self.require_object).hash(h);
+    }
 }
 
 impl Json {
@@ -706,6 +721,23 @@ impl<'a> Guide<'a> {
 #[cfg(test)]
 mod tests {
     use super::{compile, Json, Schema};
+
+    /// `Json` equality is "accepts the same continuations": stale stack slots above `depth` do not count, the
+    /// stack below does (a mask cache keys on it, so both directions matter).
+    #[test]
+    fn json_states_are_equal_exactly_when_they_continue_alike() {
+        let at = |s: &str| { let mut j = Json::object(); for &b in s.as_bytes() { assert!(j.step(b), "{s}"); } j };
+        let h = |j: &Json| { use std::hash::{Hash, Hasher}; let mut x = std::collections::hash_map::DefaultHasher::new(); j.hash(&mut x); x.finish() };
+        // Same meaning, different stale slot 1 (an array was there vs an object).
+        let (a, b) = (at("{\"a\":[1],"), at("{\"a\":{},"));
+        assert!(a == b && h(&a) == h(&b));
+        // Same depth, phase and lexer state; different containers below: they close differently.
+        let (c, d) = (at("{\"x\":[[[1"), at("{\"x\":{\"y\":[[1"));
+        assert!(c != d);
+        assert!(at("{\"x\":[[[1]]").step(b']') && !at("{\"x\":{\"y\":[[1]]").step(b']'));
+        let (e, f) = (at("{\"x\":\"ab"), at("{\"x\":\"a\\"));
+        assert!(e != f, "inside a string vs after a backslash");
+    }
     fn sch_accepts(schema: &str, out: &str) -> bool { sch_accepts_bytes(schema, out.as_bytes()) }
 
 

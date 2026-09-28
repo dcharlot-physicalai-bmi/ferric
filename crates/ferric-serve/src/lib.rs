@@ -435,6 +435,10 @@ pub(crate) struct Engine {
     adapters: Vec<(String, Arc<ferric_llama::lora::DeviceLora>, ollama::Card)>,
     /// The vocabulary as a byte trie, built on the first constrained request (`constrain`).
     trie: std::cell::OnceCell<constrain::Trie>,
+    /// Recently used grammars with the per-top masks learned for them (`constrain`).
+    grammars: std::cell::RefCell<Vec<(String, std::sync::Arc<constrain::Masks>)>>,
+    /// JSON-object guide masks by guide state (`constrain`).
+    json_masks: std::cell::RefCell<HashMap<ferric_agent::guide::Json, Vec<u64>>>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -681,7 +685,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default() }
+                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default() }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is

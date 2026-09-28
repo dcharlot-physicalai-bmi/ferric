@@ -328,7 +328,7 @@ impl Engine {
             prefix_cache: None, spec_gate, bpe, spm: None, add_space_prefix: false, tokens, u2b, im_start, im_end,
             bos_id: None, add_bos: false, eos_id: eos.first().copied(), add_eos: false, pooling: None, eos, name,
             token_bytes, specials, rstrip_after: Default::default(), template, prefix: std::cell::RefCell::new(None),
-            n_ctx, vision, adapters: Vec::new(), trie: Default::default(),
+            n_ctx, vision, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default(),
         })
     }
 }

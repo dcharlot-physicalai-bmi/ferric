@@ -360,8 +360,8 @@ impl Grammar {
 }
 
 /// A position in a rule: (rule id, element index). A stack's LAST entry is the next element to match.
-type Pos = (u32, u32);
-type Stack = Vec<Pos>;
+pub type Pos = (u32, u32);
+pub type Stack = Vec<Pos>;
 
 /// Where matching stands: every live parse stack, and a code point begun but not finished by the bytes so
 /// far (`n_remain` = continuation bytes still owed; -1 = invalid UTF-8 seen).
@@ -384,6 +384,27 @@ impl Matcher {
         Matcher { g, stacks, partial: (0, 0) }
     }
     fn at(&self, p: Pos) -> El { self.g.rules[p.0 as usize][p.1 as usize] }
+
+    /// A matcher over exactly these stacks (each already advanced to a terminal, or empty), no character
+    /// half-written. Stepping bytes treats every stack independently, so a state's mask is the union of its
+    /// stacks' masks — which is what lets a mask be cached per stack TOP (`ferric-serve` constrain.rs).
+    pub fn from_stacks(g: Arc<Grammar>, stacks: Vec<Stack>) -> Matcher { Matcher { g, stacks, partial: (0, 0) } }
+    /// The state of a parse whose stack is `st`, its top not yet expanded to terminals — what matches next
+    /// once everything that was above `st` has finished.
+    pub fn resume(g: Arc<Grammar>, st: Stack) -> Matcher {
+        let mut stacks = Vec::new();
+        advance(&g, st, &mut stacks);
+        Matcher { g, stacks, partial: (0, 0) }
+    }
+    pub fn grammar(&self) -> &Arc<Grammar> { &self.g }
+    pub fn stacks(&self) -> &[Stack] { &self.stacks }
+    /// A code point is begun and not finished.
+    pub fn mid_char(&self) -> bool { self.partial.1 != 0 }
+    /// Some stack is empty: a parse reached the end of everything these stacks hold. Run from a stack's top
+    /// alone, that is the point where the stack below would decide what comes next.
+    pub fn reached_bottom(&self) -> bool { self.stacks.iter().any(|s| s.is_empty()) }
+    /// Whether the element at `p` is a whole-token element (`<[id]>`, `!<[id]>`), which text never matches.
+    pub fn is_token_el(&self, p: Pos) -> bool { matches!(self.at(p).ty, Ty::Token | Ty::TokenNot) }
     /// Every parse is complete (an empty stack exists) and no character is half-written: EOS is legal.
     pub fn can_stop(&self) -> bool { self.partial.1 == 0 && self.stacks.iter().any(|s| s.is_empty()) }
     /// No stack left: the text so far is not a prefix of any sentence of the grammar.
