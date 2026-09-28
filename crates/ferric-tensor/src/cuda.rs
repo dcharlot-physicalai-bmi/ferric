@@ -1111,6 +1111,11 @@ impl DecodeGraph {
         let width = q_out + 2 * kv_out;
         let mut out = Vec::with_capacity(if all_logits { t * nv } else { nv });
         let nl = self.layers.len();
+        // FERRIC_CUDA_PROFILE: GPU time per kernel class of this prefill (an event pair + a sync around
+        // each launch, so the profiled prefill is slower; the split is what matters).
+        let mut pp = Prof::new(&drv);
+        let null: CUstream = std::ptr::null_mut();
+        macro_rules! pt { ($cls:expr, $body:expr) => {{ pp.start(&drv, null); let ok: bool = $body; pp.stop(&drv, null, $cls); if !ok { return None; } }} }
         unsafe {
             let (mut d32, mut eps) = (d as u32, self.eps);
             for c0 in (0..t).step_by(chunk) {
@@ -1118,17 +1123,16 @@ impl DecodeGraph {
                 // `row`: where this chunk's K/V go and how many cached rows it attends past; `pos`: the
                 // absolute position of its first row, for the rope angles only.
                 let (row, pos, r32) = (row0 + c0, pos0 + c0, rows as u32);
-                if !drv.htod(b[PX], &x_rows[c0 * d..(c0 + rows) * d]) { return None; }
-                if let Some(r) = rope { if !drv.htod(b[PROPE], &r[c0 * dh..(c0 + rows) * dh]) { return None; } }
+                pt!(13, drv.htod(b[PX], &x_rows[c0 * d..(c0 + rows) * d]) && rope.is_none_or(|r| drv.htod(b[PROPE], &r[c0 * dh..(c0 + rows) * dh])));
                 let tab = if rope.is_some() { b[PROPE] } else { 0 };
                 for (li, l) in self.layers.iter().enumerate() {
                     if li == 0 {
                         let (mut x, mut w, mut o) = (b[PX], l.attn_norm, b[PXN]);
-                        if !drv.launch(k.rmsnorm, r32, 256, &mut p!(x, w, o, d32, eps)) { return None; }
+                        pt!(0, drv.launch(k.rmsnorm, r32, 256, &mut p!(x, w, o, d32, eps)));
                     }
                     let mut off = 0usize;
                     for &w in &l.qkv {
-                        if !launch_gemm(&drv, &pk, b[PXN], d, w, b[PQKV] + (off * 4) as u64, width, rows, b[POVF]) { return None; }
+                        pt!(1, launch_gemm(&drv, &pk, b[PXN], d, w, b[PQKV] + (off * 4) as u64, width, rows, b[POVF]));
                         off += w.rows;
                     }
                     let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (b[PQKV], l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), b[PQ], b[PK]);
@@ -1137,21 +1141,21 @@ impl DecodeGraph {
                     let rowb = (kv_out * 4) as u64;
                     let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + row as u64 * rowb, kv.v[li] + row as u64 * rowb, (q_out + kv_out) as u32);
                     let (mut bias, mut ff, mut np, mut roww, mut tb) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, width as u32, tab);
-                    if !drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
-                                    &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh32, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww, tb)) { return None; }
+                    pt!(2, drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
+                                    &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh32, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww, tb)));
                     let (mut q, mut kc, mut vc, mut ao, mut tt, mut rowu, mut sc) = (b[PQ], kv.k[li], kv.v[li], b[PATT], r32, row as u32, 1.0f32 / (dh as f32).sqrt());
-                    if !drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128,
-                                    &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]) { return None; }
+                    pt!(4, drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128,
+                                    &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)));
+                    pt!(5, launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]));
                     let (mut x2, mut y2, mut fw, mut xy, mut xn) = (b[PX], b[PY], l.ffn_norm, b[PXY], b[PXN]);
-                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PXN], d, l.gate_up, b[PGU], 2 * n_ff, rows, b[POVF]) { return None; }
+                    pt!(6, drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
+                    pt!(7, launch_gemm(&drv, &pk, b[PXN], d, l.gate_up, b[PGU], 2 * n_ff, rows, b[POVF]));
                     let (mut gu, mut h, mut nff) = (b[PGU], b[PH], n_ff as u32);
-                    if !drv.launch(pk.swiglu_rows, ((rows * n_ff) as u32).div_ceil(256), 256, &mut p!(gu, h, nff, tt)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PH], n_ff, l.down, b[PDN], d, rows, b[POVF]) { return None; }
+                    pt!(10, drv.launch(pk.swiglu_rows, ((rows * n_ff) as u32).div_ceil(256), 256, &mut p!(gu, h, nff, tt)));
+                    pt!(8, launch_gemm(&drv, &pk, b[PH], n_ff, l.down, b[PDN], d, rows, b[POVF]));
                     let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
                     let (mut a, mut bb, mut nw, mut xo, mut xno) = (b[PXY], b[PDN], next_w, b[PX], b[PXN]);
-                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(a, bb, nw, xo, xno, d32, eps)) { return None; }
+                    pt!(9, drv.launch(k.add_rmsnorm, r32, 256, &mut p!(a, bb, nw, xo, xno, d32, eps)));
                 }
                 if all_logits {
                     if !launch_gemm(&drv, &pk, b[PXN], d, self.lm_head, b[PLOG], nv, rows, b[POVF]) { return None; }
@@ -1168,6 +1172,15 @@ impl DecodeGraph {
             }
         }
         if !drv.sync() { return None; }
+        if pp.on {
+            let tot: f64 = pp.acc.iter().sum();
+            let names = ["attn_norm", "qkv_gemm", "qk_norm_rope", "-", "attn_prefill", "wo_gemm", "add_rmsnorm", "gate_up_gemm",
+                         "down_gemm", "resid+norm", "swiglu", "-", "-", "h2d x+rope"];
+            let mut rows: Vec<(usize, f64)> = pp.acc.iter().copied().enumerate().filter(|r| r.1 > 0.0).collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("cuda prefill profile: {t} rows, GPU {tot:.2} ms ({:.0} tok/s of GPU time): {}", t as f64 / tot * 1e3,
+                      rows.iter().map(|(i, v)| format!("{} {:.2} ms ({:.0}%)", names[*i], v, v / tot * 100.0)).collect::<Vec<_>>().join(", "));
+        }
         let mut flag = [0f32]; if !drv.dtoh(&mut flag, b[POVF]) { return None; }
         if flag[0].to_bits() != 0 {
             eprintln!("cuda: a prefill activation was not finite (GEMM v1: or past f16's 65504); discarding the native prefill — WGSL runs it");
