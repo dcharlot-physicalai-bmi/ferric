@@ -2443,17 +2443,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let t = lid.x; let base = row * d;
     // ⭐ LATENCY, NOT BANDWIDTH. A thread walks d/64 elements (80 at d = 5120), and a loop that loads one
     // value and then consumes it waits a full memory latency per element: 88 us per row measured on the
-    // M3 Ultra (examples/gdn_decode_bench.rs), 161 rows a Bonsai 2 decode step. Eight loads are issued
-    // before the first is consumed; the ADDS keep the one-at-a-time order, so the result is the same bits.
+    // M3 Ultra (examples/gdn_decode_bench.rs), 161 rows a Bonsai 2 decode step. Sixteen loads are issued
+    // before the first is consumed (eight: 31.7 us; sixteen: see the commit); the ADDS keep the one-at-a-time order, so the result is the same bits.
     var ms = 0.0;
     var j = t;
     loop {
-        if (j + 448u >= d) { break; }
-        let v0 = x[base + j]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u];
-        let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u];
-        ms = ms + v0 * v0; ms = ms + v1 * v1; ms = ms + v2 * v2; ms = ms + v3 * v3;
-        ms = ms + v4 * v4; ms = ms + v5 * v5; ms = ms + v6 * v6; ms = ms + v7 * v7;
-        j = j + 512u;
+        if (j + 960u >= d) { break; }
+        let v0 = x[base + j + 0u]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u]; let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u]; let v8 = x[base + j + 512u]; let v9 = x[base + j + 576u]; let v10 = x[base + j + 640u]; let v11 = x[base + j + 704u]; let v12 = x[base + j + 768u]; let v13 = x[base + j + 832u]; let v14 = x[base + j + 896u]; let v15 = x[base + j + 960u];
+        ms = ms + v0 * v0; ms = ms + v1 * v1; ms = ms + v2 * v2; ms = ms + v3 * v3; ms = ms + v4 * v4; ms = ms + v5 * v5; ms = ms + v6 * v6; ms = ms + v7 * v7; ms = ms + v8 * v8; ms = ms + v9 * v9; ms = ms + v10 * v10; ms = ms + v11 * v11; ms = ms + v12 * v12; ms = ms + v13 * v13; ms = ms + v14 * v14; ms = ms + v15 * v15;
+        j = j + 1024u;
     }
     for (; j < d; j = j + 64u) { let v = x[base + j]; ms = ms + v * v; }
     part[t] = ms;
@@ -2465,15 +2463,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
     j = t;
     loop {
-        if (j + 448u >= d) { break; }
-        let v0 = x[base + j]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u];
-        let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u];
-        let w0 = weight[j]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u];
-        let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u];
-        out[base + j] = v0 * inv * w0; out[base + j + 64u] = v1 * inv * w1; out[base + j + 128u] = v2 * inv * w2;
-        out[base + j + 192u] = v3 * inv * w3; out[base + j + 256u] = v4 * inv * w4; out[base + j + 320u] = v5 * inv * w5;
-        out[base + j + 384u] = v6 * inv * w6; out[base + j + 448u] = v7 * inv * w7;
-        j = j + 512u;
+        if (j + 960u >= d) { break; }
+        let v0 = x[base + j + 0u]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u]; let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u]; let v8 = x[base + j + 512u]; let v9 = x[base + j + 576u]; let v10 = x[base + j + 640u]; let v11 = x[base + j + 704u]; let v12 = x[base + j + 768u]; let v13 = x[base + j + 832u]; let v14 = x[base + j + 896u]; let v15 = x[base + j + 960u];
+        let w0 = weight[j + 0u]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u]; let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u]; let w8 = weight[j + 512u]; let w9 = weight[j + 576u]; let w10 = weight[j + 640u]; let w11 = weight[j + 704u]; let w12 = weight[j + 768u]; let w13 = weight[j + 832u]; let w14 = weight[j + 896u]; let w15 = weight[j + 960u];
+        out[base + j + 0u] = v0 * inv * w0; out[base + j + 64u] = v1 * inv * w1; out[base + j + 128u] = v2 * inv * w2; out[base + j + 192u] = v3 * inv * w3; out[base + j + 256u] = v4 * inv * w4; out[base + j + 320u] = v5 * inv * w5; out[base + j + 384u] = v6 * inv * w6; out[base + j + 448u] = v7 * inv * w7; out[base + j + 512u] = v8 * inv * w8; out[base + j + 576u] = v9 * inv * w9; out[base + j + 640u] = v10 * inv * w10; out[base + j + 704u] = v11 * inv * w11; out[base + j + 768u] = v12 * inv * w12; out[base + j + 832u] = v13 * inv * w13; out[base + j + 896u] = v14 * inv * w14; out[base + j + 960u] = v15 * inv * w15;
+        j = j + 1024u;
     }
     for (; j < d; j = j + 64u) { out[base + j] = x[base + j] * inv * weight[j]; }
 }
@@ -2534,22 +2528,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let row = wg.x + wg.y * 32768u;
     if (row >= rows) { return; }        // uniform per workgroup: barriers below stay uniform
     let t = lid.x; let base = row * d;
-    // Eight loads in flight before the first is consumed — see RMSNORM_WGSL; same order of adds.
+    // Sixteen loads in flight before the first is consumed — see RMSNORM_WGSL; same order of adds.
     var ms = 0.0;
     var j = t;
     loop {
-        if (j + 448u >= d) { break; }
-        let a0 = a[base + j]; let a1 = a[base + j + 64u]; let a2 = a[base + j + 128u]; let a3 = a[base + j + 192u];
-        let a4 = a[base + j + 256u]; let a5 = a[base + j + 320u]; let a6 = a[base + j + 384u]; let a7 = a[base + j + 448u];
-        let b0 = b[base + j]; let b1 = b[base + j + 64u]; let b2 = b[base + j + 128u]; let b3 = b[base + j + 192u];
-        let b4 = b[base + j + 256u]; let b5 = b[base + j + 320u]; let b6 = b[base + j + 384u]; let b7 = b[base + j + 448u];
-        let s0 = a0 + b0; let s1 = a1 + b1; let s2 = a2 + b2; let s3 = a3 + b3;
-        let s4 = a4 + b4; let s5 = a5 + b5; let s6 = a6 + b6; let s7 = a7 + b7;
-        sumo[base + j] = s0; sumo[base + j + 64u] = s1; sumo[base + j + 128u] = s2; sumo[base + j + 192u] = s3;
-        sumo[base + j + 256u] = s4; sumo[base + j + 320u] = s5; sumo[base + j + 384u] = s6; sumo[base + j + 448u] = s7;
-        ms = ms + s0 * s0; ms = ms + s1 * s1; ms = ms + s2 * s2; ms = ms + s3 * s3;
-        ms = ms + s4 * s4; ms = ms + s5 * s5; ms = ms + s6 * s6; ms = ms + s7 * s7;
-        j = j + 512u;
+        if (j + 960u >= d) { break; }
+        let a0 = a[base + j + 0u]; let a1 = a[base + j + 64u]; let a2 = a[base + j + 128u]; let a3 = a[base + j + 192u]; let a4 = a[base + j + 256u]; let a5 = a[base + j + 320u]; let a6 = a[base + j + 384u]; let a7 = a[base + j + 448u]; let a8 = a[base + j + 512u]; let a9 = a[base + j + 576u]; let a10 = a[base + j + 640u]; let a11 = a[base + j + 704u]; let a12 = a[base + j + 768u]; let a13 = a[base + j + 832u]; let a14 = a[base + j + 896u]; let a15 = a[base + j + 960u];
+        let b0 = b[base + j + 0u]; let b1 = b[base + j + 64u]; let b2 = b[base + j + 128u]; let b3 = b[base + j + 192u]; let b4 = b[base + j + 256u]; let b5 = b[base + j + 320u]; let b6 = b[base + j + 384u]; let b7 = b[base + j + 448u]; let b8 = b[base + j + 512u]; let b9 = b[base + j + 576u]; let b10 = b[base + j + 640u]; let b11 = b[base + j + 704u]; let b12 = b[base + j + 768u]; let b13 = b[base + j + 832u]; let b14 = b[base + j + 896u]; let b15 = b[base + j + 960u];
+        let s0 = a0 + b0; let s1 = a1 + b1; let s2 = a2 + b2; let s3 = a3 + b3; let s4 = a4 + b4; let s5 = a5 + b5; let s6 = a6 + b6; let s7 = a7 + b7; let s8 = a8 + b8; let s9 = a9 + b9; let s10 = a10 + b10; let s11 = a11 + b11; let s12 = a12 + b12; let s13 = a13 + b13; let s14 = a14 + b14; let s15 = a15 + b15;
+        sumo[base + j + 0u] = s0; sumo[base + j + 64u] = s1; sumo[base + j + 128u] = s2; sumo[base + j + 192u] = s3; sumo[base + j + 256u] = s4; sumo[base + j + 320u] = s5; sumo[base + j + 384u] = s6; sumo[base + j + 448u] = s7; sumo[base + j + 512u] = s8; sumo[base + j + 576u] = s9; sumo[base + j + 640u] = s10; sumo[base + j + 704u] = s11; sumo[base + j + 768u] = s12; sumo[base + j + 832u] = s13; sumo[base + j + 896u] = s14; sumo[base + j + 960u] = s15;
+        ms = ms + s0 * s0; ms = ms + s1 * s1; ms = ms + s2 * s2; ms = ms + s3 * s3; ms = ms + s4 * s4; ms = ms + s5 * s5; ms = ms + s6 * s6; ms = ms + s7 * s7; ms = ms + s8 * s8; ms = ms + s9 * s9; ms = ms + s10 * s10; ms = ms + s11 * s11; ms = ms + s12 * s12; ms = ms + s13 * s13; ms = ms + s14 * s14; ms = ms + s15 * s15;
+        j = j + 1024u;
     }
     for (; j < d; j = j + 64u) {
         let sv = a[base + j] + b[base + j];
@@ -2565,15 +2554,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
     j = t;
     loop {
-        if (j + 448u >= d) { break; }
-        let v0 = sumo[base + j]; let v1 = sumo[base + j + 64u]; let v2 = sumo[base + j + 128u]; let v3 = sumo[base + j + 192u];
-        let v4 = sumo[base + j + 256u]; let v5 = sumo[base + j + 320u]; let v6 = sumo[base + j + 384u]; let v7 = sumo[base + j + 448u];
-        let w0 = weight[j]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u];
-        let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u];
-        normo[base + j] = v0 * inv * w0; normo[base + j + 64u] = v1 * inv * w1; normo[base + j + 128u] = v2 * inv * w2;
-        normo[base + j + 192u] = v3 * inv * w3; normo[base + j + 256u] = v4 * inv * w4; normo[base + j + 320u] = v5 * inv * w5;
-        normo[base + j + 384u] = v6 * inv * w6; normo[base + j + 448u] = v7 * inv * w7;
-        j = j + 512u;
+        if (j + 960u >= d) { break; }
+        let v0 = sumo[base + j + 0u]; let v1 = sumo[base + j + 64u]; let v2 = sumo[base + j + 128u]; let v3 = sumo[base + j + 192u]; let v4 = sumo[base + j + 256u]; let v5 = sumo[base + j + 320u]; let v6 = sumo[base + j + 384u]; let v7 = sumo[base + j + 448u]; let v8 = sumo[base + j + 512u]; let v9 = sumo[base + j + 576u]; let v10 = sumo[base + j + 640u]; let v11 = sumo[base + j + 704u]; let v12 = sumo[base + j + 768u]; let v13 = sumo[base + j + 832u]; let v14 = sumo[base + j + 896u]; let v15 = sumo[base + j + 960u];
+        let w0 = weight[j + 0u]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u]; let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u]; let w8 = weight[j + 512u]; let w9 = weight[j + 576u]; let w10 = weight[j + 640u]; let w11 = weight[j + 704u]; let w12 = weight[j + 768u]; let w13 = weight[j + 832u]; let w14 = weight[j + 896u]; let w15 = weight[j + 960u];
+        normo[base + j + 0u] = v0 * inv * w0; normo[base + j + 64u] = v1 * inv * w1; normo[base + j + 128u] = v2 * inv * w2; normo[base + j + 192u] = v3 * inv * w3; normo[base + j + 256u] = v4 * inv * w4; normo[base + j + 320u] = v5 * inv * w5; normo[base + j + 384u] = v6 * inv * w6; normo[base + j + 448u] = v7 * inv * w7; normo[base + j + 512u] = v8 * inv * w8; normo[base + j + 576u] = v9 * inv * w9; normo[base + j + 640u] = v10 * inv * w10; normo[base + j + 704u] = v11 * inv * w11; normo[base + j + 768u] = v12 * inv * w12; normo[base + j + 832u] = v13 * inv * w13; normo[base + j + 896u] = v14 * inv * w14; normo[base + j + 960u] = v15 * inv * w15;
+        j = j + 1024u;
     }
     for (; j < d; j = j + 64u) { normo[base + j] = sumo[base + j] * inv * weight[j]; }
 }
