@@ -6,8 +6,8 @@
 //! ⚠ "Useful" FLOPs: the kernel runs every product TWICE on the tensor cores (the activation's hi and lo
 //! f16 halves — it rounds nothing the f32 path does not), so the tensor-core work is 2x what is printed.
 //!
-//! All three kernel versions (v1 hi/lo f16 64x64; v2 hi/lo f16 64x128 double-buffered; v3 int8 digits)
-//! per shape, interleaved, minimum of `GEMM_ROUNDS` (default 5).
+//! Both kernel versions (v1: f16 hi/lo activations, 64x64 tile; v3: int8 digits on the integer tensor
+//! cores, 64x128, two stages) per shape, interleaved, minimum of `GEMM_ROUNDS` (default 5).
 //!
 //!   FERRIC_CUDA=1 cargo run -p ferric-tensor --release --example cuda_gemm_bench [-- M]
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
@@ -44,9 +44,9 @@ fn main() {
     let a: Vec<f32> = { let mut s = 0x1234_5678u64; (0..m * 8192).map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 }).collect() };
     // ⛔ This laptop GPU's clock wanders by 30-40% between runs (power/thermal): v1 measured 1186 us and
     // then 863 us on the same shape minutes apart. So the versions are INTERLEAVED per shape, several
-    // rounds, and each keeps its MINIMUM — the three see the same clock history.
+    // rounds, and each keeps its MINIMUM — both see the same clock history.
     let rounds: usize = std::env::var("GEMM_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    println!("{:<22} {:>7}   {:>9} {:>9} {:>9}   {:>6} {:>6} {:>6}   {:>6}", "shape", "MiB", "v1 us", "v2 us", "v3 us", "v1 TF", "v2 TF", "v3 TF", "v3/v1");
+    println!("{:<22} {:>7}   {:>9} {:>9}   {:>6} {:>6}   {:>6}", "shape", "MiB", "v1 us", "v3 us", "v1 TF", "v3 TF", "v3/v1");
     for (label, k, n, ty) in shapes {
         let (vals, bpb) = QMatrix::block_bytes(ty).unwrap();
         let bytes = n * (k / vals) * bpb;
@@ -54,17 +54,17 @@ fn main() {
         let qms: Vec<_> = (0..reps).map(|_| QMatrix::from_bytes(&ctx, &blk(bytes, ty, bpb), ty, n, k).expect("qmatrix")).collect();
         let ws: Vec<_> = qms.iter().map(|q| q.native_weight().expect("native mirror")).collect();
         let iters = (4e9 / (2.0 * (m * n * k) as f64)).clamp(5.0, 200.0) as usize;
-        let mut best = [f64::MAX; 3];
+        let mut best = [f64::MAX; 2];
         for _ in 0..rounds {
-            for v in 0..3 {
-                let Some((us, c)) = cuda::bench_gemm_v(&ws, &a[..m * k], m, iters, v as u8 + 1) else { println!("{label:<22} v{} FAILED", v + 1); return };
+            for (v, ver) in [1u8, 3].into_iter().enumerate() {
+                let Some((us, c)) = cuda::bench_gemm_v(&ws, &a[..m * k], m, iters, ver) else { println!("{label:<22} v{ver} FAILED"); return };
                 assert!(c.iter().all(|x| x.is_finite()));
                 best[v] = best[v].min(us);
             }
         }
         let tf = |us: f64| 2.0 * (m * n * k) as f64 / (us * 1e-6) / 1e12;
-        println!("{label:<22} {:>7.2}   {:>9.1} {:>9.1} {:>9.1}   {:>6.2} {:>6.2} {:>6.2}   {:>5.2}x", bytes as f64 / 1048576.0,
-                 best[0], best[1], best[2], tf(best[0]), tf(best[1]), tf(best[2]), best[0] / best[2]);
+        println!("{label:<22} {:>7.2}   {:>9.1} {:>9.1}   {:>6.2} {:>6.2}   {:>5.2}x", bytes as f64 / 1048576.0,
+                 best[0], best[1], tf(best[0]), tf(best[1]), best[0] / best[1]);
     }
 }
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32"))))]

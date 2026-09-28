@@ -15,15 +15,21 @@
 //!
 //! Three tiers, all behind `FERRIC_CUDA`:
 //!  1. `QDev::gemv` — one Q5_K GEMV per call (the `matmul_q5_k` hook), verifiable in isolation.
-//!  2. [`DecodeGraph::step`] — a whole dense decode step resident on the device: one `[d]` row in,
-//!     one `[n_vocab]` row out. Weights in Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 (a whole Q4_K_M, Q5_K_M or
-//!     Q8_0 file), q/k/v bias, QK-norm, NEOX or NORM rope with optional per-frequency factors.
-//!  3. [`DecodeGraph::prefill`] — a prompt's rows through every layer on the tensor cores
-//!     (`cuda_prefill.cu`), weights as exact integer codes and activations split hi/lo f16, so it
-//!     rounds nothing the f32 path does not; `FERRIC_CUDA_NO_PREFILL` keeps prompts on WGSL.
+//!  2. [`DecodeGraph::step`] — a whole dense decode step resident on the device, CAPTURED ONCE AS A
+//!     CUDA GRAPH and replayed per token: one step block in (input row, rope row, row/position, K/V
+//!     addresses), one `[n_vocab]` row out into pinned host memory. Weights in Q4_K / Q5_K / Q6_K /
+//!     Q8_0 / Q5_0 (a whole Q4_K_M, Q5_K_M or Q8_0 file), q/k/v bias, QK-norm, NEOX or NORM rope with
+//!     the rope angles built on the HOST exactly as the portable path builds them; split-K attention
+//!     over a fixed grid (flash-decoding), so its cost follows the K/V bytes, not the context's length.
+//!  3. [`DecodeGraph::prefill`] — a prompt's rows through every layer on the INTEGER tensor cores
+//!     (`cuda_prefill.cu` GEMM v3: weights as exact integer codes, activations as three int8 digits of
+//!     a per-row-tile 22-bit fixed point, every in-tile sum exact) and a register-tiled causal
+//!     attention; `FERRIC_CUDA_NO_PREFILL` keeps prompts on WGSL, `FERRIC_CUDA_GEMM=v1` /
+//!     `FERRIC_CUDA_ATTN_PREFILL_V1` the previous kernels.
 //! The K/V rows live in a per-sequence [`DevKv`] owned by the caller's cache, grown on demand (no
 //! context cap), and the WGSL store is brought level lazily in either direction.
-//! `scripts/cuda_conformance.sh` gates all of it against WGSL and the models' authors.
+//! `scripts/cuda_conformance.sh` gates all of it against WGSL and the models' authors;
+//! `scripts/cuda_rope_conformance.sh` the rope angles at position 30,000.
 #![cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 
 use libloading::{Library, Symbol};
@@ -111,11 +117,10 @@ struct GraphApi {
 /// The prefill kernel table, resolved by name from `cuda_prefill.ptx`.
 #[derive(Clone, Copy)]
 pub(crate) struct PrefillK {
-    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format — v1 (64x64 tile, one
-    /// shared stage) and v2 (64x128, two stages, ldmatrix; cuda_prefill.cu GEMM v2).
-    gemm: [CUfunction; 5], gemm2: [CUfunction; 5],
-    /// v3: integer tensor cores, activations as three int8 digits of a per-row-tile fixed point.
-    gemm3: [CUfunction; 5],
+    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format — v1 (f16 hi/lo
+    /// activations, 64x64 tile) and v3 (integer tensor cores, activations as three int8 digits of a
+    /// per-row-tile fixed point; cuda_prefill.cu GEMM v3).
+    gemm: [CUfunction; 5], gemm3: [CUfunction; 5],
     swiglu_rows: CUfunction, attn_prefill: CUfunction,
     /// The register-tiled causal attention (cuda_prefill.cu, v2); `FERRIC_CUDA_ATTN_PREFILL_V1` keeps v1.
     attn_prefill2: CUfunction,
@@ -328,15 +333,13 @@ impl Driver {
 
     fn prefill_kernels(&self) -> Option<&PrefillK> {
         self.prefill.get_or_init(|| {
-            const N: [&[u8]; 18] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
+            const N: [&[u8]; 13] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
                                     b"swiglu_rows\0", b"attn_prefill\0",
-                                    b"q4k_gemm2\0", b"q5k_gemm2\0", b"q6k_gemm2\0", b"q8_0_gemm2\0", b"q5_0_gemm2\0",
                                     b"q4k_gemm3\0", b"q5k_gemm3\0", b"q6k_gemm3\0", b"q8_0_gemm3\0", b"q5_0_gemm3\0",
                                     b"attn_prefill2\0"];
             let v = self.load_ptx("cuda_prefill.ptx", &N)?;
             Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6],
-                            gemm2: [v[7], v[8], v[9], v[10], v[11]], gemm3: [v[12], v[13], v[14], v[15], v[16]],
-                            attn_prefill2: v[17] })
+                            gemm3: [v[7], v[8], v[9], v[10], v[11]], attn_prefill2: v[12] })
         }).as_ref()
     }
     /// 2-D grid launch, same contract as [`Driver::launch`].
@@ -528,13 +531,13 @@ unsafe fn launch_swiglu(d: &Driver, st: CUstream, k: &DecodeK, x: CUdeviceptr, w
 
 /// `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores (f16 in, f32 accumulate; see cuda_prefill.cu).
 /// `ldc` lets several weights write side by side into one wider C (the q|k|v parts). An A value past
-/// f16 range (v1) or is not finite raises `*ovf`. Which kernel: `FERRIC_CUDA_GEMM=v1|v2|v3` (default
+/// f16 range (v1) or is not finite raises `*ovf`. Which kernel: `FERRIC_CUDA_GEMM=v1|v3` (default
 /// [`GEMM_DEFAULT`]) — the A/B, and a fallback.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
                       m: usize, ovf: CUdeviceptr) -> bool {
     static V: OnceLock<u8> = OnceLock::new();
-    let v = *V.get_or_init(|| match std::env::var("FERRIC_CUDA_GEMM").as_deref() { Ok("v1") => 1, Ok("v2") => 2, Ok("v3") => 3, _ => GEMM_DEFAULT });
+    let v = *V.get_or_init(|| match std::env::var("FERRIC_CUDA_GEMM").as_deref() { Ok("v1") => 1, Ok("v3") => 3, _ => GEMM_DEFAULT });
     unsafe { launch_gemm_v(d, pk, v, a, lda, w, c, ldc, m, ovf) }
 }
 /// The prefill GEMM the tier runs unless told otherwise.
@@ -548,7 +551,6 @@ unsafe fn launch_gemm_v(d: &Driver, pk: &PrefillK, v: u8, a: CUdeviceptr, lda: u
     let f = w.fmt as usize;
     match v {
         1 => unsafe { d.launch2(pk.gemm[f], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128, prm) },
-        2 => unsafe { d.launch2(pk.gemm2[f], (w.rows as u32).div_ceil(128), (m as u32).div_ceil(64), 256, prm) },
         _ => unsafe { d.launch2(pk.gemm3[f], (w.rows as u32).div_ceil(128), (m as u32).div_ceil(64), 256, prm) },
     }
 }
@@ -1948,7 +1950,7 @@ mod tests {
                     s += av as f64 * wv as f64; x += av as f64 * h16(wv); g += (av as f64 * wv as f64).abs(); }
                 want[i * n + o] = s; exact[i * n + o] = x; mag = mag.max(g);
             } }
-            for ver in [1u8, 2, 3] {
+            for ver in [1u8, 3] {
                 let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
                 assert!(unsafe { launch_gemm_v(drv, &pk, ver, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
                 let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
@@ -1963,7 +1965,7 @@ mod tests {
             }
         }
         // The range guard. v1 splits the raw activation, so one past f16's 65504 must raise the flag (the
-        // host then runs WGSL). v2 scales each row-tile by a power of two first, so 7e4 is IN range there
+        // host then runs WGSL). v3 scales each row-tile by a power of two first, so 7e4 is IN range there
         // and must come out right; only a non-finite input raises its flag.
         let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);
         let bytes = q_fixture(f, n, k, 5);
@@ -1980,7 +1982,8 @@ mod tests {
         };
         let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
         assert!(run(&a, 1).0, "v1: an activation of 7e4 did NOT raise the f16 overflow flag");
-        for ver in [2u8, 3] {
+        {
+            let ver = 3u8;
             let (flag, c) = run(&a, ver);
             let (mut worst, mut mag) = (0f64, 0f64);
             for i in 0..m { for o in 0..n {
@@ -1991,7 +1994,7 @@ mod tests {
             assert!(!flag && worst <= 2e-6 * mag, "v{ver} must scale 7e4 into range and compute it (flag {flag}, Δ {worst:.3e})");
         }
         a[k + 17] = f32::INFINITY;
-        for ver in [2u8, 3] { assert!(run(&a, ver).0, "v{ver}: an infinite activation did NOT raise the flag"); }
+        assert!(run(&a, 3).0, "v3: an infinite activation did NOT raise the flag");
     }
 
     /// Causal prefill attention with a cache offset (`pos` earlier rows), GQA, row counts that leave
