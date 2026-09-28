@@ -30,12 +30,44 @@ pub(crate) struct Sampling {
     /// (if < 0) by this. 1.0 = off. Window `repeat_last_n` over prompt tail + generated.
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
+    // ── Extended samplers (parity gap S16). Each runs only when set, so the default path is untouched. ──
+    /// OpenAI `logit_bias`: added to a token's logit before anything else; `-inf` bans it.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// DRY (p-e-w): penalise continuing a sequence that already occurred. 0 = off.
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: usize,
+    /// Token ids that break a DRY match (the tokenizer's last id for "a" + each breaker string).
+    pub dry_breakers: Vec<u32>,
+    /// The breaker strings as sent (resolved to ids against the model's tokenizer in `Engine::gen_opts`).
+    pub dry_breaker_strings: Vec<String>,
+    /// Tokens of context DRY looks at; 0 = all.
+    pub dry_range: usize,
+    /// XTC (p-e-w): with probability `xtc_probability`, remove every token above `xtc_threshold` but the
+    /// least likely of them — unless that would remove a newline or EOS (`xtc_specials`).
+    pub xtc_threshold: f32,
+    pub xtc_probability: f32,
+    pub xtc_specials: Vec<u32>,
+    /// Locally typical sampling (Meister et al.; transformers' TypicalLogitsWarper). 1.0 = off.
+    pub typical_p: f32,
+    /// Top-nσ: keep logits within n standard deviations of the maximum. 0 = off.
+    pub top_n_sigma: f32,
+    /// Mirostat v2 (target surprise `tau`, learning rate `eta`). 0 = off.
+    pub mirostat: u8,
+    pub mirostat_tau: f32,
+    pub mirostat_eta: f32,
+    /// Mirostat's running threshold for THIS sequence (NaN until the first step sets it to 2·tau).
+    pub mirostat_mu: std::cell::Cell<f32>,
 }
 
 impl Default for Sampling {
     fn default() -> Self {
         Sampling { temperature: 0.0, top_p: 0.95, top_k: 0, min_p: 0.0, presence_penalty: 0.0,
-                   frequency_penalty: 0.0, repeat_penalty: 1.0, repeat_last_n: 64 }
+                   frequency_penalty: 0.0, repeat_penalty: 1.0, repeat_last_n: 64,
+                   logit_bias: Vec::new(), dry_multiplier: 0.0, dry_base: 1.75, dry_allowed_length: 2,
+                   dry_breakers: Vec::new(), dry_breaker_strings: vec!["\n".into(), ":".into(), "\"".into(), "*".into()],
+                   dry_range: 0, xtc_threshold: 0.1, xtc_probability: 0.0, xtc_specials: Vec::new(), typical_p: 1.0,
+                   top_n_sigma: 0.0, mirostat: 0, mirostat_tau: 5.0, mirostat_eta: 0.1, mirostat_mu: std::cell::Cell::new(f32::NAN) }
     }
 }
 
@@ -58,6 +90,9 @@ pub(crate) struct GenOpts {
     /// Internal: the request's image, decoded and planned (`vision`). It rides with the request rather
     /// than on the engine, because two images of one size produce the same prompt ids.
     pub image: Option<std::sync::Arc<crate::vision::MmInput>>,
+    /// `logit_bias` entries keyed by TEXT (llama-server): every token of the text gets the bias, resolved
+    /// against the model's tokenizer in `Engine::gen_opts`.
+    pub logit_bias_text: Vec<(String, f32)>,
     /// Internal: the LoRA adapters this request runs with (`Engine::gen_opts`); empty = the base model.
     pub lora: Lora,
 }
@@ -76,7 +111,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default() }
+                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default(), logit_bias_text: Vec::new() }
     }
 }
 
@@ -142,6 +177,47 @@ impl GenOpts {
             s.repeat_penalty = p;
         }
         if let Some(n) = req["repeat_last_n"].as_u64() { s.repeat_last_n = n as usize; }
+        // logit_bias: OpenAI's {"<id>": bias}, or llama-server's [[id, bias | false], …] (false = ban). A string
+        // key is a piece of text, resolved against the tokenizer in `Engine::gen_opts`.
+        match &req["logit_bias"] {
+            Value::Null => {}
+            Value::Object(m) => for (k, v) in m {
+                let id: u32 = k.parse().map_err(|_| format!("logit_bias key {k:?} is not a token id"))?;
+                s.logit_bias.push((id, bias_of(v)?));
+            },
+            Value::Array(a) => for x in a {
+                match (&x[0], &x[1]) {
+                    (Value::Number(n), b) => s.logit_bias.push((n.as_u64().ok_or("logit_bias token ids are non-negative integers")? as u32, bias_of(b)?)),
+                    (Value::String(_), _) => o.logit_bias_text.push((x[0].as_str().unwrap().to_string(), bias_of(&x[1])?)),
+                    _ => return Err(format!("logit_bias entries are [token, bias], got {x}")),
+                }
+            },
+            v => return Err(format!("`logit_bias` must be an object or an array, got {v}")),
+        }
+        if let Some(m) = f32_in(req, "dry_multiplier", 0.0, 100.0)? { s.dry_multiplier = m; }
+        if let Some(b) = f32_in(req, "dry_base", 1.0, 100.0)? { s.dry_base = b; }
+        if let Some(n) = req["dry_allowed_length"].as_u64() { s.dry_allowed_length = n as usize; }
+        match &req["dry_penalty_last_n"] { Value::Null => {}, v => s.dry_range = v.as_i64().filter(|&n| n >= -1).map(|n| n.max(0) as usize).ok_or("`dry_penalty_last_n` must be -1, 0 or positive")? }
+        match &req["dry_sequence_breakers"] {
+            Value::Null => {}
+            Value::Array(a) => s.dry_breaker_strings = a.iter().map(|x| x.as_str().map(String::from).ok_or("`dry_sequence_breakers` must be strings")).collect::<Result<_, _>>()?,
+            v => return Err(format!("`dry_sequence_breakers` must be an array of strings, got {v}")),
+        }
+        if let Some(t) = f32_in(req, "xtc_threshold", 0.0, 1.0)? { s.xtc_threshold = t; }
+        if let Some(p) = f32_in(req, "xtc_probability", 0.0, 1.0)? { s.xtc_probability = p; }
+        if let Some(p) = f32_in(req, "typical_p", 0.0, 1.0)? { if p <= 0.0 { return Err("`typical_p` must be greater than 0 (1.0 = off)".into()); } s.typical_p = p; }
+        if let Some(n) = f32_in(req, "top_n_sigma", -1.0, 100.0)? { s.top_n_sigma = n.max(0.0); }
+        match &req["mirostat"] {
+            Value::Null => {}
+            v => match v.as_u64() {
+                Some(0) => s.mirostat = 0,
+                Some(2) => s.mirostat = 2,
+                Some(1) => return Err("`mirostat` 1 is not served; mirostat 2 is (text-generation-webui's, which defines the implementation checked here)".into()),
+                _ => return Err(format!("`mirostat` must be 0 or 2, got {v}")),
+            },
+        }
+        if let Some(t) = f32_in(req, "mirostat_tau", 0.0, 100.0)? { s.mirostat_tau = t; }
+        if let Some(e) = f32_in(req, "mirostat_eta", 0.0, 10.0)? { s.mirostat_eta = e; }
         match &req["seed"] {
             Value::Null => {}
             v => match v.as_i64() {
@@ -185,19 +261,122 @@ impl GenOpts {
     }
 }
 
+/// A `logit_bias` value: a number in [-100, 100] (OpenAI's range), or `false` (llama-server: ban the token).
+fn bias_of(v: &Value) -> Result<f32, String> {
+    match v {
+        Value::Bool(false) => Ok(f32::NEG_INFINITY),
+        v => v.as_f64().filter(|b| (-100.0..=100.0).contains(b)).map(|b| b as f32)
+            .ok_or_else(|| format!("a logit_bias value must be a number in [-100, 100] or false, got {v}")),
+    }
+}
+
+// ─────────────────────────────── Extended samplers (each a pure function) ───────────────────────────────
+// Checked against the code that DEFINES each one (tests/fixtures/samplers: text-generation-webui's
+// sampler_hijack.py for DRY, XTC, top-nσ and Mirostat v2 — p-e-w introduced DRY and XTC there — and
+// transformers' TypicalLogitsWarper for typical-p), on recorded logits and contexts.
+
+/// DRY, as `DRYLogitsProcessor.__call__`: for each earlier occurrence of the last token, extend the match
+/// backwards (at most 50, stopping at a breaker); the token that followed it is penalised by
+/// `multiplier · base^(length − allowed)` when the longest such match reaches `allowed`.
+pub(crate) fn apply_dry(scores: &mut [f32], context: &[u32], multiplier: f32, base: f32, allowed: usize, breakers: &[u32], range: usize) {
+    let ids = if range > 0 && context.len() > range { &context[context.len() - range..] } else { context };
+    let Some(&last) = ids.last() else { return };
+    if breakers.contains(&last) { return; }
+    let mut lengths: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for i in 0..ids.len() - 1 {
+        if ids[i] != last { continue; }
+        let next = ids[i + 1];
+        if breakers.contains(&next) { continue; }
+        let mut len = 1usize;
+        while len < 50 {
+            if len > i { break; }
+            let j = i - len;
+            let prev = ids[ids.len() - (len + 1)];
+            if ids[j] != prev || breakers.contains(&prev) { break; }
+            len += 1;
+        }
+        let e = lengths.entry(next).or_insert(0);
+        *e = (*e).max(len);
+    }
+    for (t, len) in lengths {
+        if len >= allowed {
+            if let Some(x) = scores.get_mut(t as usize) { *x -= multiplier * base.powi((len - allowed) as i32); }
+        }
+    }
+}
+
+/// Top-nσ, as `TopNSigmaLogitsWarper`: the threshold is max − n·std, with the standard deviation (unbiased)
+/// taken over the WHOLE row with removed (non-finite) entries counted as 0 — torch.std over masked_fill.
+pub(crate) fn top_n_sigma_keep(scores: &[f32], n: f32) -> Vec<bool> {
+    let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let v: Vec<f64> = scores.iter().map(|&x| if x.is_finite() { x as f64 } else { 0.0 }).collect();
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let std = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len().max(2) - 1) as f64).sqrt();
+    let thr = max as f64 - n as f64 * std;
+    scores.iter().map(|&x| x as f64 >= thr).collect()
+}
+
+/// Locally typical sampling, as transformers' `TypicalLogitsWarper` on the candidates `cand` (logits already
+/// temperature-scaled in `s`): keep the tokens whose surprise is closest to the entropy until `mass` is
+/// covered. Returns the kept candidates in `cand`'s order.
+pub(crate) fn typical_filter(cand: &[usize], s: &[f32], mass: f32) -> Vec<usize> {
+    let maxv = cand.iter().map(|&i| s[i] as f64).fold(f64::NEG_INFINITY, f64::max);
+    let lse = maxv + cand.iter().map(|&i| (s[i] as f64 - maxv).exp()).sum::<f64>().ln();
+    let norm: Vec<f64> = cand.iter().map(|&i| s[i] as f64 - lse).collect();
+    let ent: f64 = -norm.iter().map(|&n| n * n.exp()).sum::<f64>();
+    let shifted: Vec<f64> = norm.iter().map(|&n| (-n - ent).abs()).collect();
+    let mut order: Vec<usize> = (0..cand.len()).collect();
+    order.sort_by(|&a, &b| shifted[a].partial_cmp(&shifted[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut cum, mut last) = (0f64, 0usize);
+    for &o in &order { cum += norm[o].exp(); if cum < mass as f64 { last += 1; } }
+    let last = last.min(order.len() - 1);
+    let bound = shifted[order[last]];
+    let keep_first = order[0];
+    cand.iter().enumerate().filter(|&(k, _)| shifted[k] <= bound || k == keep_first).map(|(_, &i)| i).collect()
+}
+
+/// XTC's action, as `XTCLogitsWarper` once its random check has passed: among `cand` (sorted by descending
+/// probability `p`, renormalised over `cand`), remove every token whose successor is at or above the
+/// threshold — all above it but the least likely — unless a special token (newline, EOS) would go.
+pub(crate) fn xtc_filter(cand: &[usize], p: &[f32], threshold: f32, specials: &[u32]) -> Option<Vec<usize>> {
+    let tot: f32 = cand.iter().map(|&i| p[i]).sum();
+    let remove: Vec<bool> = (0..cand.len()).map(|k| k + 1 < cand.len() && p[cand[k + 1]] / tot >= threshold).collect();
+    if cand.iter().zip(&remove).any(|(&i, &r)| r && specials.contains(&(i as u32))) { return None; }
+    Some(cand.iter().zip(&remove).filter(|(_, r)| !**r).map(|(&i, _)| i).collect())
+}
+
+/// Mirostat v2's truncation, as `MirostatLogitsWarper`: in descending probability (`probs_sorted`,
+/// normalised), keep up to the first token whose surprise −log2 p exceeds `mu` (at least one).
+pub(crate) fn mirostat_k(probs_sorted: &[f64], mu: f64) -> usize {
+    for (i, &c) in probs_sorted.iter().enumerate() {
+        if c > 0.0 && -c.log2() > mu { return if i == 0 { 1 } else { i }; }
+    }
+    probs_sorted.len()
+}
+
+/// Mirostat v2's update after drawing a token of probability `p_chosen` (within the truncated, renormalised set).
+pub(crate) fn mirostat_update(mu: f64, p_chosen: f64, tau: f64, eta: f64) -> f64 { mu - eta * (-p_chosen.log2() - tau) }
+
 /// xorshift64 — the generator Ferric has always used, kept so default sampled output does not move.
 fn next_unit(rng: &mut u64) -> f32 {
     *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
     (*rng >> 11) as f32 / (1u64 << 53) as f32
 }
 
-/// **One token from one row of logits.** `prompt_tail` feeds `repeat_penalty`; `generated` feeds it and
-/// the OpenAI penalties. Temperature 0 is argmax of the (penalised) row. The sampled path with every
-/// optional control off reproduces the historical `sample_top_p` exactly, RNG stream included.
-pub(crate) fn sample(row: &[f32], s: &Sampling, prompt_tail: &[u32], generated: &[u32], rng: &mut u64) -> u32 {
-    let penalised;
-    let row = if s.presence_penalty != 0.0 || s.frequency_penalty != 0.0 || s.repeat_penalty != 1.0 {
-        let mut r = row.to_vec();
+/// **One token from one row of logits.** `prompt` is the whole prompt (its last `repeat_last_n` tokens feed
+/// `repeat_penalty`, all of it DRY); `generated` feeds those and the OpenAI penalties. Temperature 0 is argmax
+/// of the adjusted row. With every optional control off the sampled path reproduces the historical
+/// `sample_top_p` exactly, RNG stream included; each extended sampler (logit_bias, DRY, top-nσ, typical-p,
+/// Mirostat v2, XTC) runs only when set, in text-generation-webui's default order.
+pub(crate) fn sample(row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> u32 {
+    let prompt_tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
+    let mut owned: Option<Vec<f32>> = None;
+    if !s.logit_bias.is_empty() {
+        let r = owned.get_or_insert_with(|| row.to_vec());
+        for &(t, b) in &s.logit_bias { if let Some(x) = r.get_mut(t as usize) { *x += b; } }
+    }
+    if s.presence_penalty != 0.0 || s.frequency_penalty != 0.0 || s.repeat_penalty != 1.0 {
+        let r = owned.get_or_insert_with(|| row.to_vec());
         if s.presence_penalty != 0.0 || s.frequency_penalty != 0.0 {
             let mut counts = std::collections::HashMap::<u32, u32>::new();
             for &t in generated { *counts.entry(t).or_default() += 1; }
@@ -212,9 +391,13 @@ pub(crate) fn sample(row: &[f32], s: &Sampling, prompt_tail: &[u32], generated: 
                 if let Some(x) = r.get_mut(t as usize) { *x = if *x > 0.0 { *x / s.repeat_penalty } else { *x * s.repeat_penalty }; }
             }
         }
-        penalised = r;
-        &penalised[..]
-    } else { row };
+    }
+    if s.dry_multiplier > 0.0 {
+        let r = owned.get_or_insert_with(|| row.to_vec());
+        let ctx: Vec<u32> = prompt.iter().chain(generated.iter()).copied().collect();
+        apply_dry(r, &ctx, s.dry_multiplier, s.dry_base, s.dry_allowed_length, &s.dry_breakers, s.dry_range);
+    }
+    let row: &[f32] = owned.as_deref().unwrap_or(row);
     let argmax = || (0..row.len()).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap_or(std::cmp::Ordering::Equal)).unwrap_or(0) as u32;
     if s.temperature <= 0.0 { return argmax(); }
     let maxl = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -223,19 +406,49 @@ pub(crate) fn sample(row: &[f32], s: &Sampling, prompt_tail: &[u32], generated: 
     let sum: f32 = probs.iter().sum();
     let mut idx: Vec<usize> = (0..row.len()).collect();
     idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+    // Top-nσ is scale-free, so taking it on the unscaled row equals taking it after temperature.
+    let sigma_cut = s.top_n_sigma > 0.0;
+    if sigma_cut { let keep = top_n_sigma_keep(row, s.top_n_sigma); idx.retain(|&i| keep[i]); }
     if s.top_k > 0 { idx.truncate(s.top_k); }
     if s.min_p > 0.0 {
         let floor = s.min_p * probs[idx[0]];
         idx.retain(|&i| probs[i] >= floor);
     }
-    // Renormalise over what survived top-k / min-p (nothing, with both off — then `sum` is unchanged).
-    let sum = if s.top_k > 0 || s.min_p > 0.0 { idx.iter().map(|&i| probs[i]).sum::<f32>() } else { sum };
+    // Renormalise over what survived top-k / min-p / top-nσ (nothing, with all off — then `sum` is unchanged).
+    let sum = if s.top_k > 0 || s.min_p > 0.0 || sigma_cut { idx.iter().map(|&i| probs[i]).sum::<f32>() } else { sum };
     // nucleus: smallest prefix whose mass reaches top_p
     let (mut cum, mut cut) = (0.0f32, idx.len());
     for (k, &i) in idx.iter().enumerate() { cum += probs[i] / sum; if cum >= s.top_p { cut = k + 1; break; } }
-    let r = next_unit(rng) * cum;
-    let (mut acc, mut pick) = (0.0f32, idx[0]);
-    for &i in &idx[..cut] { acc += probs[i] / sum; if acc >= r { pick = i; break; } }
+    if s.typical_p >= 1.0 && s.mirostat == 0 && s.xtc_probability <= 0.0 {
+        let r = next_unit(rng) * cum;
+        let (mut acc, mut pick) = (0.0f32, idx[0]);
+        for &i in &idx[..cut] { acc += probs[i] / sum; if acc >= r { pick = i; break; } }
+        return pick as u32;
+    }
+    // The extended tail: typical-p, then Mirostat v2 (which draws itself), then XTC, then one draw.
+    let mut cand: Vec<usize> = idx[..cut].to_vec();
+    let scaled: Vec<f32> = row.iter().map(|&l| l / s.temperature).collect();
+    if s.typical_p < 1.0 { cand = typical_filter(&cand, &scaled, s.typical_p); }
+    if s.mirostat == 2 {
+        let mu = if s.mirostat_mu.get().is_nan() { 2.0 * s.mirostat_tau } else { s.mirostat_mu.get() };
+        let m = cand.iter().map(|&i| scaled[i] as f64).fold(f64::NEG_INFINITY, f64::max);
+        let z: f64 = cand.iter().map(|&i| (scaled[i] as f64 - m).exp()).sum();
+        let ps: Vec<f64> = cand.iter().map(|&i| (scaled[i] as f64 - m).exp() / z).collect();
+        let k = mirostat_k(&ps, mu as f64);
+        let zk: f64 = ps[..k].iter().sum();
+        let r = next_unit(rng) as f64;
+        let (mut acc, mut pick) = (0.0f64, 0usize);
+        for j in 0..k { acc += ps[j] / zk; if acc >= r { pick = j; break; } pick = j; }
+        s.mirostat_mu.set(mirostat_update(mu as f64, ps[pick] / zk, s.mirostat_tau as f64, s.mirostat_eta as f64) as f32);
+        return cand[pick] as u32;
+    }
+    if s.xtc_probability > 0.0 && next_unit(rng) < s.xtc_probability {
+        if let Some(kept) = xtc_filter(&cand, &probs, s.xtc_threshold, &s.xtc_specials) { cand = kept; }
+    }
+    let tot: f32 = cand.iter().map(|&i| probs[i]).sum();
+    let r = next_unit(rng) * tot;
+    let (mut acc, mut pick) = (0.0f32, cand[0]);
+    for &i in &cand { acc += probs[i]; if acc >= r { pick = i; break; } }
     pick as u32
 }
 
@@ -416,6 +629,106 @@ pub(crate) fn content_text(c: &Value) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Each extended sampler against the code that defines it (tests/fixtures/samplers/reference.json.gz:
+    /// text-generation-webui's classes copied verbatim, transformers' TypicalLogitsWarper), on seeded logits.
+    #[test]
+    fn extended_samplers_match_the_code_that_defines_them() {
+        use std::io::Read;
+        let gz = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/samplers/reference.json.gz")).unwrap();
+        let mut js = String::new();
+        flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut js).unwrap();
+        let fx: Value = serde_json::from_str(&js).unwrap();
+        let c = &fx["cases"];
+        let f32s = |v: &Value| -> Vec<f32> { v.as_array().unwrap().iter().map(|x| x.as_f64().map(|f| f as f32).unwrap_or(f32::NEG_INFINITY)).collect() };
+        let u32s = |v: &Value| -> Vec<u32> { v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect() };
+        let bools = |v: &Value| -> Vec<bool> { v.as_array().unwrap().iter().map(|x| x.as_bool().unwrap()).collect() };
+        let by_prob = |l: &[f32]| { let mut o: Vec<usize> = (0..l.len()).collect(); o.sort_by(|&a, &b| l[b].partial_cmp(&l[a]).unwrap()); o };
+        let mut n = 0;
+        for d in c["dry"].as_array().unwrap() {
+            let mut l = f32s(&d["logits"]);
+            apply_dry(&mut l, &u32s(&d["context"]), d["multiplier"].as_f64().unwrap() as f32, d["base"].as_f64().unwrap() as f32,
+                      d["allowed_length"].as_u64().unwrap() as usize, &u32s(&d["breakers"]), d["range"].as_u64().unwrap() as usize);
+            let want = f32s(&d["out"]);
+            let err = l.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-4, "DRY off by {err}: {d}"); n += 1;
+        }
+        for d in c["xtc"].as_array().unwrap() {
+            let l = f32s(&d["logits"]);
+            let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let p: Vec<f32> = l.iter().map(|&x| (x - m).exp()).collect();
+            let cand = by_prob(&l);
+            let kept = xtc_filter(&cand, &p, d["threshold"].as_f64().unwrap() as f32, &u32s(&d["specials"])).unwrap_or(cand.clone());
+            let mut mask = vec![false; l.len()];
+            for i in kept { mask[i] = true; }
+            assert_eq!(mask, bools(&d["kept"]), "XTC: {d}"); n += 1;
+        }
+        for d in c["typical"].as_array().unwrap() {
+            let l = f32s(&d["logits"]);
+            let kept = typical_filter(&by_prob(&l), &l, d["mass"].as_f64().unwrap() as f32);
+            let mut mask = vec![false; l.len()];
+            for i in kept { mask[i] = true; }
+            assert_eq!(mask, bools(&d["kept"]), "typical: {d}"); n += 1;
+        }
+        for d in c["top_n_sigma"].as_array().unwrap() {
+            let l = f32s(&d["logits"]);
+            let keep: Vec<bool> = top_n_sigma_keep(&l, d["n"].as_f64().unwrap() as f32).iter().zip(&l).map(|(&k, x)| k && x.is_finite()).collect();
+            assert_eq!(keep, bools(&d["kept"]), "top-n-sigma: {d}"); n += 1;
+        }
+        for d in c["mirostat"].as_array().unwrap() {
+            let (tau, eta) = (d["tau"].as_f64().unwrap(), d["eta"].as_f64().unwrap());
+            for st in d["steps"].as_array().unwrap() {
+                let l = f32s(&st["logits"]);
+                let o = by_prob(&l);
+                let m = l[o[0]] as f64;
+                let z: f64 = o.iter().map(|&i| (l[i] as f64 - m).exp()).sum();
+                let ps: Vec<f64> = o.iter().map(|&i| (l[i] as f64 - m).exp() / z).collect();
+                let mu = st["mu_before"].as_f64().unwrap();
+                let k = mirostat_k(&ps, mu);
+                assert_eq!(k as u64, st["k"].as_u64().unwrap(), "mirostat truncation: {st}");
+                let rank = o.iter().position(|&i| i as u64 == st["chosen"].as_u64().unwrap()).unwrap();
+                let zk: f64 = ps[..k].iter().sum();
+                let mu2 = mirostat_update(mu, ps[rank] / zk, tau, eta);
+                assert!((mu2 - st["mu_after"].as_f64().unwrap()).abs() < 1e-4, "mirostat mu {mu2} vs {st}");
+                n += 1;
+            }
+        }
+        assert_eq!(n, 332, "the fixture changed size");
+    }
+
+    #[test]
+    fn extended_sampler_parameters_are_read_and_bad_ones_refused() {
+        let o = GenOpts::from_req(&json!({"logit_bias": {"5": -100, "7": 2.5}, "dry_multiplier": 0.8, "xtc_probability": 0.5,
+            "typical_p": 0.9, "top_n_sigma": 1.0, "mirostat": 2, "mirostat_tau": 4.0}), true).unwrap();
+        let s = &o.sampling;
+        assert_eq!((s.logit_bias.len(), s.dry_multiplier, s.xtc_probability, s.typical_p, s.top_n_sigma, s.mirostat, s.mirostat_tau), (2, 0.8, 0.5, 0.9, 1.0, 2, 4.0));
+        let o = GenOpts::from_req(&json!({"logit_bias": [[5, false], ["hello", 1.0]]}), true).unwrap();
+        assert_eq!(o.sampling.logit_bias, vec![(5, f32::NEG_INFINITY)]);
+        assert_eq!(o.logit_bias_text, vec![("hello".to_string(), 1.0)]);
+        for bad in [json!({"logit_bias": {"x": 1}}), json!({"logit_bias": {"5": 101}}), json!({"mirostat": 1}), json!({"typical_p": 0}),
+                    json!({"dry_sequence_breakers": "\n"})] {
+            assert!(GenOpts::from_req(&bad, true).is_err(), "{bad} must be refused");
+        }
+        // Off by default, so the default path stays the historical sampler (pinned elsewhere).
+        let d = Sampling::default();
+        assert!(d.logit_bias.is_empty() && d.dry_multiplier == 0.0 && d.xtc_probability == 0.0 && d.typical_p == 1.0 && d.top_n_sigma == 0.0 && d.mirostat == 0);
+    }
+
+    /// Mirostat keeps its threshold per sequence and moves it toward the target surprise.
+    #[test]
+    fn mirostat_state_is_per_sequence_and_moves() {
+        let o = GenOpts::from_req(&json!({"mirostat": 2, "temperature": 1.0, "mirostat_tau": 3.0}), true).unwrap();
+        let row: Vec<f32> = (0..32).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let mut rng = DEFAULT_RNG;
+        assert!(o.sampling.mirostat_mu.get().is_nan());
+        let _ = sample(&row, &o.sampling, &[], &[], &mut rng);
+        let mu1 = o.sampling.mirostat_mu.get();
+        assert!(mu1.is_finite() && mu1 != 6.0, "mu starts at 2*tau and moves after one step: {mu1}");
+        let fresh = o.clone();
+        let other = GenOpts::from_req(&json!({"mirostat": 2, "temperature": 1.0, "mirostat_tau": 3.0}), true).unwrap();
+        assert!(other.sampling.mirostat_mu.get().is_nan(), "a new request starts fresh");
+        assert_eq!(fresh.sampling.mirostat_mu.get(), mu1, "a clone carries its own copy");
+    }
+
     use super::*;
 
     fn run(e: &mut Emitter, pieces: &[&str]) -> String {

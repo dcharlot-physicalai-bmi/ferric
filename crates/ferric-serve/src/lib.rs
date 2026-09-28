@@ -946,6 +946,22 @@ impl Engine {
     ///   the `--lora` flags). Several SUM, as PEFT does; scale 0 drops one; an unknown one is refused.
     pub(crate) fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> {
         let mut o = GenOpts::from_req(req, chat)?;
+        // The tokenizer-dependent sampler inputs, resolved as their reference implementation resolves them:
+        // DRY's breakers are the LAST id of "a" + breaker (so a breaker is tokenized as text-final); XTC's
+        // specials are the last id of "\n" and EOS; a text logit_bias applies to every token of its text.
+        let last_id = |t: &str| self.enc(&format!("a{t}"), false).last().copied();
+        if o.sampling.dry_multiplier > 0.0 {
+            o.sampling.dry_breakers = o.sampling.dry_breaker_strings.iter().filter_map(|b| last_id(b)).collect();
+        }
+        if o.sampling.xtc_probability > 0.0 {
+            o.sampling.xtc_specials = self.enc("\n", false).last().copied().into_iter().chain(self.eos_id).collect();
+        }
+        for (text, b) in std::mem::take(&mut o.logit_bias_text) {
+            for id in self.enc(&text, false) { o.sampling.logit_bias.push((id, b)); }
+        }
+        if let Some(&(t, _)) = o.sampling.logit_bias.iter().find(|(t, _)| *t as usize >= self.model.n_vocab()) {
+            return Err(format!("logit_bias token {t} is outside the vocabulary ({})", self.model.n_vocab()));
+        }
         let find = |n: &str| self.adapters.iter().position(|(a, _, _)| a == n.strip_suffix(":latest").unwrap_or(n));
         let names = || self.adapters.iter().map(|(a, _, _)| a.as_str()).collect::<Vec<_>>().join(", ");
         if let Some(i) = req["model"].as_str().and_then(find) { o.lora.0.push((self.adapters[i].1.clone(), 1.0)); }
@@ -1187,11 +1203,9 @@ impl Engine {
             let mut any = false;
             for i in 0..n_vocab { if ok[i] { masked[i] = row[i]; any = true; } }
             if !any { return None; } // no legal continuation (shouldn't happen for a valid schema)
-            let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
-            Some(genopts::sample(&masked, s, tail, generated, rng))
+            Some(genopts::sample(&masked, s, prompt, generated, rng))
         } else {
-            let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
-            Some(genopts::sample(row, s, tail, generated, rng))
+            Some(genopts::sample(row, s, prompt, generated, rng))
         }
     }
 

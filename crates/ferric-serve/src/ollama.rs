@@ -169,7 +169,7 @@ fn to_openai(req: &Value) -> Result<Value, String> {
         Some(n) => return Err(format!("options.num_predict {n}: use a positive count, or -1 for unlimited")),
     }
     for k in ["temperature", "top_p", "top_k", "min_p", "seed", "stop", "repeat_penalty", "repeat_last_n",
-              "presence_penalty", "frequency_penalty"] {
+              "presence_penalty", "frequency_penalty", "typical_p", "mirostat", "mirostat_tau", "mirostat_eta"] {
         if !o[k].is_null() { r[k] = o[k].clone(); }
     }
     match &req["format"] {
