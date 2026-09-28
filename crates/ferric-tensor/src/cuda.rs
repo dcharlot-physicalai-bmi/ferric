@@ -2003,10 +2003,13 @@ mod tests {
     fn prefill_attention_matches_f64_causal_softmax() {
         if driver().is_none() { eprintln!("SKIPPED prefill_attention_matches_f64_causal_softmax: no CUDA driver / FERRIC_CUDA unset."); return; }
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
-        for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3),
-                                         (7, 1, 128, 100, 61), (6, 2, 96, 37, 5)] {
+        // `amp` scales q: 1 = scores O(1); 12 = scores O(50), a peaked softmax — what a model with large
+        // q/k biases (Qwen2.5) feeds attention, and where a kernel's score precision shows.
+        for &(nh, nkv, dh, t, pos, amp) in &[(8usize, 2usize, 64usize, 45usize, 37usize, 1.0f32), (4, 4, 128, 33, 0, 1.0), (14, 2, 64, 20, 530, 1.0),
+                                              (32, 8, 64, 70, 3, 1.0), (7, 1, 128, 100, 61, 1.0), (6, 2, 96, 37, 5, 1.0),
+                                              (14, 2, 64, 90, 40, 12.0), (8, 8, 128, 64, 0, 12.0)] {
             let (qw, kw) = (nh * dh, nkv * dh); let s = pos + t;
-            let (q, vc) = (rndx(t * qw, 1 + t as u64), rndx(s * kw, 3 + s as u64));
+            let (q, vc) = (rndx(t * qw, 1 + t as u64).iter().map(|v| v * amp).collect::<Vec<f32>>(), rndx(s * kw, 3 + s as u64));
             let kc: Vec<f32> = rndx(s * kw, 2 + s as u64).iter().enumerate().map(|(i, &v)| v * (1.0 + 2.0 * (i / kw) as f32 / s as f32)).collect();
             let mut want = vec![0f64; t * qw];
             for i in 0..t { for h in 0..nh {
@@ -2028,7 +2031,7 @@ mod tests {
                 unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
                 let d = max_abs_diff(&got, &want);
                 let vn = if v2 { "attn_prefill2" } else { "attn_prefill" };
-                eprintln!("{vn} nh={nh} nkv={nkv} dh={dh} T={t} pos={pos}: max|Δ| vs f64 {d:.3e}");
+                eprintln!("{vn} nh={nh} nkv={nkv} dh={dh} T={t} pos={pos} amp={amp}: max|Δ| vs f64 {d:.3e}");
                 assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "{vn} diverges from the f64 causal softmax by {d:.3e}");
             }
         }
