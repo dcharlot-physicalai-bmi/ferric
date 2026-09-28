@@ -363,6 +363,12 @@ impl GgufWriter {
                 "tensor '{name}': {F8_E4M3_B128} is this crate's INTERNAL id for F8_E4M3_B128. The \
                  file must say 42 — the reader resolves it back by stride."));
         }
+        // Same for mainline group-64 Q2_0, whose internal id is 2042 (`prism::Q2_0_G64`).
+        if ggml_type == crate::prism::Q2_0_G64 {
+            return self.fail(format!(
+                "tensor '{name}': {} is this crate's INTERNAL id for mainline group-64 Q2_0. The file \
+                 must say 42 — the reader resolves it back by stride.", crate::prism::Q2_0_G64));
+        }
         let n = match dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d)) {
             Some(n) => n as usize,
             None => return self.fail(format!("tensor '{name}': dims {dims:?} overflow a u64 element count")),
