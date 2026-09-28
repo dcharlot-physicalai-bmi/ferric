@@ -305,7 +305,15 @@ extern "C" __global__ void q5_0_gemm(GEMM_ARGS) { gemm_t<4>(A, lda, codes, aux, 
 //  • fragments by `ldmatrix.x4` (sm_75): A hi, A lo and four B tiles in three instructions per k8 step;
 //  • the fold reads its 8 column scales and 4 row sums per thread ONCE per tile, and Q6_K folds after
 //    each 16-wide half instead of carrying a second partial — 32 fewer live registers;
-//  • f16 -> f32 by the hardware `cvt` (exact, as the bit-twiddling f16_to_f32 is) in the split.
+//  • f16 -> f32 by the hardware `cvt` (exact, as the bit-twiddling f16_to_f32 is) in the split;
+//  • ⭐ each row's 32 activations of a K tile are scaled by a POWER OF TWO that puts their largest near
+//    2^14 before the split, and the fold multiplies it back out (exact both ways). ⛔ Without it the lo
+//    half of every activation below 2^-3 falls into f16's SUBNORMAL range and keeps only an absolute
+//    2^-25: on Qwen2.5-0.5B Q4_K_M under the gate's wrong-rope-pairing control (a model whose hidden
+//    states run small) the native prefill landed 1.57e-2 logits from WGSL while WGSL's own prefill and
+//    decode schedules agreed to 1.8e-4 and native decode to 8e-5. Scaling by 64 alone took it to
+//    3.9e-3; the per-row-tile exponent is the general form. It also makes an f16 OVERFLOW impossible
+//    (the flag now only catches inf/NaN inputs).
 // Still compute_75 PTX: no cp.async / m16n8k16 (sm_80), so the tier's "the driver alone loads it on
 // Turing and newer" holds.
 #define B2M 64u
@@ -408,7 +416,7 @@ __device__ __forceinline__ void decode16(const Raw16& r, unsigned n, unsigned K,
 }
 struct __align__(16) Stage2 {
     unsigned short As[B2M * LDS], Al[B2M * LDS], Ws[B2N * LDS];
-    float Sc[2][B2N], Mn[B2N], Rs[B2M];
+    float Sc[2][B2N], Mn[B2N], Rs[B2M], Ri[B2M];     // Ri: 2^-e, the row's activation scale undone
 };
 template <int F>
 __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned lda,
@@ -443,12 +451,23 @@ __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned ld
     auto store = [&](Stage2& s, unsigned k0) {
         unsigned a[4], al[4];
         const float x[8] = {ra0.x, ra0.y, ra0.z, ra0.w, ra1.x, ra1.y, ra1.z, ra1.w};
+        // The row's power-of-two scale for this tile: its largest |a| over the 32 values (the 4 loader
+        // lanes of the row) lands in [2^14, 2^15).
+        float amax = 0.f;
+        #pragma unroll
+        for (unsigned j = 0u; j < 8u; ++j) amax = fmaxf(amax, fabsf(x[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        bad |= !(amax <= 3.0e38f);                                         // inf / NaN
+        int e = amax > 0.f ? 14 - ((int)((__float_as_uint(amax) >> 23u) & 0xffu) - 127) : 0;
+        e = max(-100, min(100, e));
+        const float up = __uint_as_float((unsigned)(127 + e) << 23u), dn = __uint_as_float((unsigned)(127 - e) << 23u);
         float rsum = 0.f;
         #pragma unroll
         for (unsigned j = 0u; j < 4u; ++j) {
-            bad |= fabsf(x[2u * j]) > 65504.f || fabsf(x[2u * j + 1u]) > 65504.f;
-            a[j] = pack2(x[2u * j], x[2u * j + 1u]);
-            al[j] = resid2h(x[2u * j], x[2u * j + 1u], a[j]);
+            const float u0 = x[2u * j] * up, u1 = x[2u * j + 1u] * up;       // exact: a power of two
+            a[j] = pack2(u0, u1);
+            al[j] = resid2h(u0, u1, a[j]);
         }
         if (MIN) {
             rsum = ((x[0] + x[1]) + (x[2] + x[3])) + ((x[4] + x[5]) + (x[6] + x[7]));
@@ -457,7 +476,7 @@ __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned ld
         }
         *reinterpret_cast<uint4*>(s.As + ar * LDS + 8u * aq) = make_uint4(a[0], a[1], a[2], a[3]);
         *reinterpret_cast<uint4*>(s.Al + ar * LDS + 8u * aq) = make_uint4(al[0], al[1], al[2], al[3]);
-        if (aq == 0u) s.Rs[ar] = rsum;
+        if (aq == 0u) { s.Rs[ar] = rsum; s.Ri[ar] = dn; }
         unsigned w[8]; float sc = 0.f, mn = 0.f;
         if (n0 + wr < N) decode16<F>(rw, n0 + wr, K, k0 / 32u, wh, w, sc, mn);
         else {
@@ -476,7 +495,7 @@ __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned ld
         const Stage2& s = st[kt & 1u];
         if (kt + 1u < nk) fetch((kt + 1u) * BK);
         // this thread's fold operands, read once per tile
-        float2 sc0[4], sc1[4], mnv[4]; float rs[2][2];
+        float2 sc0[4], sc1[4], mnv[4]; float rs[2][2], ri[2][2];
         #pragma unroll
         for (unsigned ni = 0u; ni < 4u; ++ni) {
             const unsigned col = wn * 32u + ni * 8u + 2u * t4;
@@ -488,6 +507,7 @@ __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned ld
         for (unsigned mi = 0u; mi < 2u; ++mi) {
             const unsigned row = wm * 32u + mi * 16u + g;
             rs[mi][0] = MIN ? s.Rs[row] : 0.f; rs[mi][1] = MIN ? s.Rs[row + 8u] : 0.f;
+            ri[mi][0] = s.Ri[row]; ri[mi][1] = s.Ri[row + 8u];
         }
         auto zero_p = [&]() {
             #pragma unroll
@@ -504,7 +524,7 @@ __device__ __forceinline__ void gemm2_t(const float* __restrict__ A, unsigned ld
                 for (unsigned ni = 0u; ni < 4u; ++ni)
                     #pragma unroll
                     for (unsigned c = 0u; c < 4u; ++c) {
-                        float v = ((c & 1u) ? scv[ni].y : scv[ni].x) * p[mi][ni][c];
+                        float v = ((c & 1u) ? scv[ni].y : scv[ni].x) * p[mi][ni][c] * ri[mi][c >> 1u];
                         if (MIN && with_min) v -= ((c & 1u) ? mnv[ni].y : mnv[ni].x) * rs[mi][c >> 1u];
                         acc[mi][ni][c] += v;
                     }

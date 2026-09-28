@@ -1159,7 +1159,7 @@ impl DecodeGraph {
         if !drv.sync() { return None; }
         let mut flag = [0f32]; if !drv.dtoh(&mut flag, b[POVF]) { return None; }
         if flag[0].to_bits() != 0 {
-            eprintln!("cuda: a prefill activation exceeded f16 range (65504); discarding the native prefill — WGSL runs it");
+            eprintln!("cuda: a prefill activation was not finite (GEMM v1: or past f16's 65504); discarding the native prefill — WGSL runs it");
             return None;
         }
         kv.len = row0 + t;
@@ -1871,17 +1871,34 @@ mod tests {
                 assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?} {vn}: tensor-core GEMM diverges from the f64 host GEMM");
             }
         }
-        // The f16-range guard: one activation past 65504 must raise the flag (the host then runs WGSL).
+        // The range guard. v1 splits the raw activation, so one past f16's 65504 must raise the flag (the
+        // host then runs WGSL). v2 scales each row-tile by a power of two first, so 7e4 is IN range there
+        // and must come out right; only a non-finite input raises its flag.
         let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);
         let bytes = q_fixture(f, n, k, 5);
         let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).unwrap();
-        let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
-        for v1 in [true, false] {
-            let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+        let rb = bytes.len() / n;
+        let wrows: Vec<Vec<f32>> = (0..n).map(|o| ferric_gguf::deq_raw(&bytes[o * rb..(o + 1) * rb], k, f.ggml_type()).unwrap()).collect();
+        let run = |a: &[f32], v1: bool| -> (bool, Vec<f32>) {
+            let (ad, cd, ovf) = (drv.upload_f32(a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
             assert!(unsafe { launch_gemm_v(drv, &pk, v1, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
-            let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
-            assert!(flag[0].to_bits() != 0, "an activation of 7e4 did NOT raise the f16 overflow flag (v1 = {v1})");
-        }
+            let (mut flag, mut c) = ([0f32], vec![0f32; m * n]);
+            assert!(drv.dtoh(&mut flag, ovf) && drv.dtoh(&mut c, cd));
+            unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+            (flag[0].to_bits() != 0, c)
+        };
+        let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
+        assert!(run(&a, true).0, "v1: an activation of 7e4 did NOT raise the f16 overflow flag");
+        let (flag, c) = run(&a, false);
+        let (mut worst, mut mag) = (0f64, 0f64);
+        for i in 0..m { for o in 0..n {
+            let (s, g): (f64, f64) = (0..k).fold((0.0, 0.0), |(s, g), j| (s + a[i * k + j] as f64 * wrows[o][j] as f64, g + (a[i * k + j] as f64 * wrows[o][j] as f64).abs()));
+            worst = worst.max((c[i * n + o] as f64 - s).abs()); mag = mag.max(g);
+        } }
+        eprintln!("v2 with a 7e4 activation: flag {flag}, max|Δ| vs f64 {worst:.3e} (Σ|a·w| {mag:.3e})");
+        assert!(!flag && worst <= 2e-6 * mag, "v2 must scale 7e4 into range and compute it (flag {flag}, Δ {worst:.3e})");
+        a[k + 17] = f32::INFINITY;
+        assert!(run(&a, false).0, "v2: an infinite activation did NOT raise the flag");
     }
 
     /// Causal prefill attention with a cache offset (`pos` earlier rows), GQA, row counts that leave
