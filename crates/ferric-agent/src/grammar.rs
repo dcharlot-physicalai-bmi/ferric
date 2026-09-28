@@ -265,6 +265,10 @@ impl<'a> Parser<'a> {
                     return Err(self.err("expecting ','", p));
                 }
                 if min > MAX_REPETITION_THRESHOLD { return Err("number of repetitions exceeds sane defaults".into()); }
+                // Not in llama.cpp: there `{m,n}` with n < m makes `max - min` wrap, and the loop that adds
+                // the optional copies then runs ~2^64 times, allocating a rule each time. A JSON schema with
+                // minItems > maxItems (or minLength > maxLength) converts to exactly that.
+                if max < min { return Err(format!("repetition {{{min},{max}}}: the maximum is below the minimum")); }
                 if max != u64::MAX && max > MAX_REPETITION_THRESHOLD { max = u64::MAX; }
                 repeat(self, rule, last_sym_start, &mut n_prev_rules, min, max, p)?;
             } else {
@@ -627,6 +631,18 @@ mod tests {
             assert_eq!(r.is_ok(), f["builds"].as_bool().unwrap(), "{}: {:?}", f["test"], r.err());
         }
         assert_eq!((n_pass, n_fail), (70, 69), "the fixture changed size");
+    }
+
+    /// `{m,n}` with n < m is refused (llama.cpp wraps `n - m` and loops ~2^64 times, allocating), as is the
+    /// grammar a JSON schema with minItems > maxItems converts to; n == m and n > m still build.
+    #[test]
+    fn a_repetition_whose_maximum_is_below_its_minimum_is_refused() {
+        let none = |_: &str| None;
+        let e = Grammar::parse("root ::= \"a\"{5,2}", "root", &none).unwrap_err();
+        assert!(e.contains("{5,2}"), "{e}");
+        assert!(Grammar::parse("root ::= \"a\"{2,2} \"b\"{2,5} \"c\"{0,0}", "root", &none).is_ok());
+        let src = crate::json_schema::schema_to_gbnf(&serde_json::json!({"type": "array", "items": {"type": "integer"}, "minItems": 5, "maxItems": 2})).unwrap();
+        assert!(Grammar::parse(&src, "root", &none).unwrap_err().contains("{4,1}"), "{src}");
     }
 
     #[test]
