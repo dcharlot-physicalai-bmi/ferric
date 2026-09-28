@@ -93,7 +93,7 @@ fn eligible(ctx: &Context, rows: usize, n_out: usize, in_dim: usize) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum Fmt { Q8_0, Q5_0, Q4K, Q5K, Q6K }
+pub(crate) enum Fmt { Q8_0, Q5_0, Q4K, Q5K, Q6K, F16, BF16 }
 
 /// One dispatch's shape: `r` outputs per lane group, `m` rows per workgroup (z-chunks cover the rest).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +112,7 @@ pub(crate) struct Plan { pub r: usize, pub m: usize }
 pub(crate) fn plan(fmt: Fmt, rows: usize, o_dim: usize, swiglu: bool, wbytes: usize) -> Plan {
     let forced = TILE.load(Ordering::Relaxed);
     if forced != 0 { return Plan { r: (forced >> 16) as usize, m: ((forced & 0xffff) as usize).clamp(1, rows) }; }
-    let r = if matches!(fmt, Fmt::Q8_0 | Fmt::Q5_0) && !swiglu && o_dim.div_ceil(2) >= 256 { 2 } else { 1 };
+    let r = if matches!(fmt, Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16) && !swiglu && o_dim.div_ceil(2) >= 256 { 2 } else { 1 };
     let m_target = if wbytes > 32 << 20 { 16 } else { 8 / r };
     let chunks = rows.div_ceil(m_target);
     Plan { r, m: rows.div_ceil(chunks) }
@@ -137,11 +137,23 @@ fn source(fmt: Fmt, swiglu: bool, p: Plan, lanes: u32, opw: u32) -> String {
     let js = || 0..nr;
     let rs = || 0..mm;
     let jr = || (0..nr).flat_map(move |j| (0..mm).map(move |r| (j, r)));
-    let _ = writeln!(s, "@group(0) @binding(0) var<storage,read> x: array<{xt}>;
-@group(0) @binding(1) var<storage,read> codes: array<u32>;
-@group(0) @binding(2) var<storage,read> aux: array<u32>;
-@group(0) @binding(3) var<storage,read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> info: vec4<u32>;   // rows, o_dim, in_dim, grid_w
+    // 16-bit weights bind (x, words, out, info) like `matmul_half`; the block formats add an aux buffer.
+    let half = matches!(fmt, Fmt::F16 | Fmt::BF16);
+    let binds = if half {
+        "@group(0) @binding(0) var<storage,read> x: array<vec4<f32>>;\n@group(0) @binding(1) var<storage,read> codes: array<u32>;\n\
+         @group(0) @binding(2) var<storage,read_write> out: array<f32>;\n@group(0) @binding(3) var<uniform> info: vec4<u32>;".to_string()
+    } else {
+        format!("@group(0) @binding(0) var<storage,read> x: array<{xt}>;\n@group(0) @binding(1) var<storage,read> codes: array<u32>;\n\
+                 @group(0) @binding(2) var<storage,read> aux: array<u32>;\n@group(0) @binding(3) var<storage,read_write> out: array<f32>;\n\
+                 @group(0) @binding(4) var<uniform> info: vec4<u32>;   // rows, o_dim, in_dim, grid_w")
+    };
+    let widen = match fmt {
+        Fmt::F16 => "fn widen(word: u32) -> vec2<f32> { return unpack2x16float(word); }",
+        Fmt::BF16 => "fn widen(word: u32) -> vec2<f32> { return vec2<f32>(bitcast<f32>(word << 16u), bitcast<f32>(word & 0xffff0000u)); }",
+        _ => "",
+    };
+    let _ = writeln!(s, "{binds}
+{widen}
 var<workgroup> partial: array<f32, {}>;
 {helpers}
 @compute @workgroup_size(64)
@@ -158,6 +170,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for r in rs() { let _ = writeln!(s, "    let xr{r} = min(r0 + {r}u, rows - 1u) * in_dim;"); }
     for (j, r) in jr() { let _ = writeln!(s, "    var a{j}_{r} = 0.0;"); }
     match fmt {
+        // Per vec4 `q` of the row (lane t: q = t, t+64, ...): `acc + dot(x, w)`, MATMUL_HALF_SPLITK.
+        Fmt::F16 | Fmt::BF16 => {
+            s.push_str("    let nq = in_dim / 4u;\n    for (var q: u32 = t; q < nq; q = q + 64u) {\n");
+            for j in js() {
+                let _ = writeln!(s, "        let wr{j} = or{j} * (in_dim / 2u); let lo{j} = widen(codes[wr{j} + 2u * q]); let hi{j} = widen(codes[wr{j} + 2u * q + 1u]);
+        let wv{j} = vec4<f32>(lo{j}.x, lo{j}.y, hi{j}.x, hi{j}.y);");
+            }
+            for r in rs() { let _ = writeln!(s, "        let x{r} = x[(xr{r} >> 2u) + q];"); }
+            for (j, r) in jr() { let _ = writeln!(s, "        a{j}_{r} = a{j}_{r} + dot(x{r}, wv{j});"); }
+            s.push_str("    }\n");
+        }
         // Per word `w` of a 32-value block (lane t: w = t, t+64, ...): `acc + d·dot(x, v)`, MATMUL_Q8_0_SPLITK.
         Fmt::Q8_0 => {
             s.push_str("    let nblk = in_dim / 32u; let nwords = nblk * 8u;
@@ -261,7 +284,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// The one-row kernel's lane layout for this format, so the small-M kernel walks blocks identically.
 fn lanes(fmt: Fmt, swiglu: bool, in_dim: usize) -> (u32, u32) {
     match (fmt, swiglu) {
-        (Fmt::Q8_0 | Fmt::Q5_0, _) => (64, 1),          // the 32-value split-K kernels: 64 lanes, one output
+        (Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16, _) => (64, 1), // the 64-lane split-K kernels, one output
         (Fmt::Q4K | Fmt::Q6K, false) => splitk_lanes_wide(in_dim / 256),
         // matmul_q5_k uses splitk_lanes_sub, which is (l, 1, opw) with FERRIC_SUBBLK unset (required above)
         (Fmt::Q5K, _) => { let (l, _, opw) = splitk_lanes_sub(in_dim / 256); (l, opw) }
@@ -276,7 +299,8 @@ fn dispatch(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, 
     let rows = x.shape[0];
     let o_dim = if swiglu { n_out / 2 } else { n_out };
     let (l, opw) = lanes(fmt, swiglu, in_dim);
-    let wbytes = codes.size() as usize + aux.size() as usize;
+    let half = matches!(fmt, Fmt::F16 | Fmt::BF16);
+    let wbytes = codes.size() as usize + if half { 0 } else { aux.size() as usize };
     let p = p.unwrap_or_else(|| plan(fmt, rows, o_dim, swiglu, wbytes));
     let out = empty(ctx, rows * o_dim);
     let nwg = o_dim.div_ceil(p.r).div_ceil(opw as usize);
@@ -286,10 +310,20 @@ fn dispatch(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, 
         (Fmt::Q8_0, _) => "matmul_q8_0_mr", (Fmt::Q5_0, _) => "matmul_q5_0_mr",
         (Fmt::Q4K, false) => "matmul_q4_k_mr", (Fmt::Q5K, false) => "matmul_q5_k_mr", (Fmt::Q6K, false) => "matmul_q6_k_mr",
         (Fmt::Q4K, true) => "matmul_q4_k_swiglu_mr", (Fmt::Q5K, true) => "matmul_q5_k_swiglu_mr", (Fmt::Q6K, true) => "matmul_q6_k_swiglu_mr",
+        (Fmt::F16, _) => "matmul_half_mr_f16", (Fmt::BF16, _) => "matmul_half_mr_bf16",
     };
-    run(ctx, &source(fmt, swiglu, p, l, opw), label,
-        &[x.buf.as_ref(), codes, aux, &out, &unibuf(ctx, &[rows as u32, o_dim as u32, in_dim as u32, gw as u32])], grid);
+    let info = unibuf(ctx, &[rows as u32, o_dim as u32, in_dim as u32, gw as u32]);
+    let src = source(fmt, swiglu, p, l, opw);
+    if half { run(ctx, &src, label, &[x.buf.as_ref(), codes, &out, &info], grid); }
+    else { run(ctx, &src, label, &[x.buf.as_ref(), codes, aux, &out, &info], grid); }
     Tensor::from_parts(ctx, out, vec![rows, o_dim])
+}
+
+/// Small-M `x·Wᵀ` over 16-bit weights (`words` two values per u32), if this call qualifies. The one-row
+/// path is `matmul_half`'s split-K kernel unless `FERRIC_HALF_KERNEL` pins another.
+pub(super) fn matmul_half(x: &Tensor, words: &wgpu::Buffer, n_out: usize, in_dim: usize, bf16: bool) -> Option<Tensor> {
+    if std::env::var_os("FERRIC_HALF_KERNEL").is_some() || !eligible(&x.ctx, x.shape[0], n_out, in_dim) { return None; }
+    Some(dispatch(x, words, words, n_out, in_dim, if bf16 { Fmt::BF16 } else { Fmt::F16 }, false, None))
 }
 
 /// Small-M `x·Wᵀ` if this call qualifies, else `None` (touching nothing). `x` must be contiguous.
@@ -316,7 +350,7 @@ pub(crate) fn forced(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out
 #[cfg(test)]
 mod tests {
     use super::{forced, Fmt, Plan};
-    use crate::dtype::{Q4_KWeights, Q5_0Weights, Q5_KWeights, Q6_KWeights, Q8_0Weights};
+    use crate::dtype::{HalfWeights, Q4_KWeights, Q5_0Weights, Q5_KWeights, Q6_KWeights, Q8_0Weights};
     use crate::Tensor;
     use std::sync::Arc;
 
@@ -334,6 +368,12 @@ mod tests {
     fn deq(fmt: Fmt, raw: &[u8], wrong: bool) -> Vec<f64> {
         let mut w = Vec::new();
         match fmt {
+            // wrong: the two values of each 32-bit word exchanged
+            Fmt::F16 | Fmt::BF16 => for pair in raw.chunks(4) {
+                let v = |o: usize| { let b = u16::from_le_bytes([pair[o], pair[o + 1]]);
+                    if fmt == Fmt::F16 { half::f16::from_bits(b).to_f64() } else { f32::from_bits((b as u32) << 16) as f64 } };
+                if wrong { w.push(v(2)); w.push(v(0)); } else { w.push(v(0)); w.push(v(2)); }
+            },
             // wrong: the scale of the NEXT block
             Fmt::Q8_0 => { let nb = raw.len() / 34; for b in 0..nb {
                 let blk = &raw[b * 34..]; let d = if wrong { h(raw, ((b + 1) % nb) * 34) } else { h(blk, 0) };
@@ -406,21 +446,26 @@ mod tests {
                     for _ in 0..(if fmt == Fmt::Q4K { 140 } else { 172 }) { raw.push(rng.byte()); }
                 }
                 Fmt::Q6K => { for _ in 0..208 { raw.push(rng.byte()); } raw.extend(f16le(0.0005 + 0.0002 * rng.unit())); }
+                // one value per "block": a finite weight, not random bits (random f16/bf16 bits are NaN/inf)
+                Fmt::F16 => raw.extend(f16le(0.05 * rng.unit())),
+                Fmt::BF16 => raw.extend((((0.05 * rng.unit()) as f32).to_bits() >> 16).to_le_bytes()[..2].to_vec()),
             }
         }
         raw
     }
     fn block(fmt: Fmt) -> (usize, usize) {
-        match fmt { Fmt::Q8_0 => (32, 34), Fmt::Q5_0 => (32, 22), Fmt::Q4K => (256, 144), Fmt::Q5K => (256, 176), Fmt::Q6K => (256, 210) }
+        match fmt { Fmt::Q8_0 => (32, 34), Fmt::Q5_0 => (32, 22), Fmt::Q4K => (256, 144), Fmt::Q5K => (256, 176), Fmt::Q6K => (256, 210),
+                    Fmt::F16 | Fmt::BF16 => (1, 2) }
     }
 
-    enum W { Q8(Q8_0Weights), Q50(Q5_0Weights), Q4(Q4_KWeights), Q5(Q5_KWeights), Q6(Q6_KWeights) }
+    enum W { Q8(Q8_0Weights), Q50(Q5_0Weights), Q4(Q4_KWeights), Q5(Q5_KWeights), Q6(Q6_KWeights), H(HalfWeights) }
     impl W {
         fn new(ctx: &Arc<ferric_core::Context>, fmt: Fmt, raw: &[u8], n: usize, k: usize) -> W {
             match fmt {
                 Fmt::Q8_0 => W::Q8(Q8_0Weights::from_bytes(ctx, raw, n, k)), Fmt::Q5_0 => W::Q50(Q5_0Weights::from_bytes(ctx, raw, n, k)),
                 Fmt::Q4K => W::Q4(Q4_KWeights::from_bytes(ctx, raw, n, k)), Fmt::Q5K => W::Q5(Q5_KWeights::from_bytes(ctx, raw, n, k)),
                 Fmt::Q6K => W::Q6(Q6_KWeights::from_bytes(ctx, raw, n, k)),
+                Fmt::F16 | Fmt::BF16 => W::H(HalfWeights::from_bytes(ctx, raw, n, k, fmt == Fmt::BF16)),
             }
         }
         fn bufs(&self) -> (&wgpu::Buffer, &wgpu::Buffer, usize, usize) {
@@ -428,6 +473,7 @@ mod tests {
                 W::Q8(w) => (&w.codes, &w.scales, w.rows, w.cols), W::Q50(w) => (&w.codes, &w.scales, w.rows, w.cols),
                 W::Q4(w) => (&w.codes, &w.aux, w.rows, w.cols), W::Q5(w) => (&w.codes, &w.aux, w.rows, w.cols),
                 W::Q6(w) => (&w.codes, &w.aux, w.rows, w.cols),
+                W::H(w) => (&w.words, &w.words, w.rows, w.cols),
             }
         }
         /// The ONE-ROW decode path — what serial decode runs today (split-K by default).
@@ -436,6 +482,7 @@ mod tests {
                 (W::Q8(w), false) => x.matmul_q8_0(w), (W::Q50(w), false) => x.matmul_q5_0(w),
                 (W::Q4(w), false) => x.matmul_q4_k(w), (W::Q5(w), false) => x.matmul_q5_k(w), (W::Q6(w), false) => x.matmul_q6_k(w),
                 (W::Q4(w), true) => x.matmul_q4_k_swiglu(w), (W::Q5(w), true) => x.matmul_q5_k_swiglu(w), (W::Q6(w), true) => x.matmul_q6_k_swiglu(w),
+                (W::H(w), false) => x.matmul_half(w),
                 _ => unreachable!(),
             }
         }
@@ -457,7 +504,7 @@ mod tests {
         let cases: &[(Fmt, bool, usize, usize)] = &[
             (Fmt::Q8_0, false, 130, 896), (Fmt::Q8_0, false, 67, 224), (Fmt::Q5_0, false, 130, 896), (Fmt::Q5_0, false, 67, 96),
             (Fmt::Q4K, false, 70, 1024), (Fmt::Q4K, false, 33, 4864), (Fmt::Q5K, false, 70, 1024), (Fmt::Q5K, false, 41, 2304),
-            (Fmt::Q6K, false, 70, 1024), (Fmt::Q6K, false, 29, 256),
+            (Fmt::Q6K, false, 70, 1024), (Fmt::Q6K, false, 29, 256), (Fmt::F16, false, 130, 896), (Fmt::BF16, false, 67, 1024),
             (Fmt::Q4K, true, 2 * 37, 512), (Fmt::Q5K, true, 2 * 37, 512), (Fmt::Q6K, true, 2 * 21, 768),
         ];
         let tiles: &[Option<Plan>] = &[None, Some(Plan { r: 1, m: 1 }), Some(Plan { r: 4, m: 8 }), Some(Plan { r: 2, m: 3 }), Some(Plan { r: 3, m: 5 })];
@@ -498,7 +545,8 @@ mod tests {
     fn small_m_matches_the_format_definition() {
         let Some(ctx) = ctx() else { return };
         let mut rng = Rng(0xdec0_de5);
-        for &(fmt, n, k, m) in &[(Fmt::Q8_0, 96, 896, 9), (Fmt::Q5_0, 96, 896, 9), (Fmt::Q4K, 50, 1024, 7), (Fmt::Q5K, 50, 1024, 7), (Fmt::Q6K, 50, 1024, 7)] {
+        for &(fmt, n, k, m) in &[(Fmt::Q8_0, 96, 896, 9), (Fmt::Q5_0, 96, 896, 9), (Fmt::Q4K, 50, 1024, 7), (Fmt::Q5K, 50, 1024, 7), (Fmt::Q6K, 50, 1024, 7),
+                                   (Fmt::F16, 96, 896, 9), (Fmt::BF16, 96, 896, 9)] {
             let (bs, _) = block(fmt);
             let raw = rand_blocks(&mut rng, fmt, n * k / bs);
             let w = W::new(&ctx, fmt, &raw, n, k);

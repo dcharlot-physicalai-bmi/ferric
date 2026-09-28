@@ -1897,6 +1897,8 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch: x[..,{inn}] vs W[..,{}]", w.cols);
+        // Few rows (batched decode, a verify step): each row bit-identical to the one-row kernel below.
+        if let Some(y) = mrgemv::matmul_half(&x, &w.words, w.rows, w.cols, w.bf16) { return y; }
         let out = empty(&self.ctx, rows * w.rows);
         let n = rows * w.rows;
         let unpack = if w.bf16 { "return vec2<f32>(bitcast<f32>(word << 16u), bitcast<f32>(word & 0xffff0000u));" }

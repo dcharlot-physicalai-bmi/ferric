@@ -1966,7 +1966,14 @@ impl Qwen3 {
     /// ⚠ NOT with LongRoPE: the table is a per-sequence choice by position, and a sequence crossing
     /// `original_max_position_embeddings` must recompute its whole cache (`longrope_refill`), which a
     /// one-token batched step cannot do. Such a model decodes serially — correct, and slower.
-    pub fn batching_supported(&self) -> bool { self.longrope.is_none() }
+    ///
+    /// ⚠ NOR with a gated-attention or NoPE layer (Muse Glimmer): `attn_batch` applies neither the sigmoid
+    /// gate nor the skipped rotation that `attn` does, so a batched step would be a different model with
+    /// no error. Such a model decodes serially until `attn_batch` carries both. (Found reading attn_batch
+    /// for batch invariance; not exercised here — no gated/NoPE checkpoint small enough to run.)
+    pub fn batching_supported(&self) -> bool {
+        self.longrope.is_none() && self.layers.iter().all(|l| l.attn_gate.is_none() && (l.rope || std::env::var("FERRIC_NONOPE").is_ok()))
+    }
 
     /// **Batched decode**: advance N independent sequences by one token each, in one forward pass.
     ///
