@@ -340,6 +340,18 @@ impl Prof {
     }
 }
 
+/// The matmul options for one projection role. `FERRIC_CPU_F32ACT_ROLES=qkv,wo,gateup,down,head` keeps f32
+/// activations for the listed roles only (the rest at `FERRIC_CPU_ACT`) — the instrument that attributed
+/// the int8 activation error: it is spread over every role (Qwen3-0.6B Q8_0, mean |dlogit| to the
+/// authors 0.1055 int8 everywhere, 0.0644 f32; f32 at any ONE role still 0.089..0.104).
+fn role_opts(role: &str) -> cpu_q::Opts {
+    let mut o = cpu_q::Opts::from_env();
+    if let Ok(list) = std::env::var("FERRIC_CPU_F32ACT_ROLES") {
+        if list.split(',').any(|r| r.trim() == role) { o.act = cpu_q::ActPrec::F32; }
+    }
+    o
+}
+
 #[inline]
 fn silu(v: f32) -> f32 { v / (1.0 + (-v).exp()) }
 #[inline]
@@ -424,7 +436,7 @@ impl Qwen3 {
             // ---- attention ----
             rmsnorm_rows(&x, &l.attn_norm, c.eps, d, &mut h);
             pf.mark(0);
-            cpu_q::matmul_many(&mut [(&l.wq, &mut q), (&l.wk, &mut k), (&l.wv, &mut v)], &h, t);
+            cpu_q::matmul_opts(&mut [(&l.wq, &mut q), (&l.wk, &mut k), (&l.wv, &mut v)], &h, t, role_opts("qkv"));
             pf.mark(1);
             if let Some((bq, bk, bv)) = &l.bias {
                 for r in 0..t {
@@ -472,7 +484,7 @@ impl Qwen3 {
                 for (a, g) in o.iter_mut().zip(&gt) { *a *= 1.0 / (1.0 + (-g).exp()); }
             }
             pf.mark(0);
-            cpu_q::matmul(&l.wo, &o, t, &mut ao);
+            cpu_q::matmul_opts(&mut [(&l.wo, &mut ao)], &o, t, role_opts("wo"));
             pf.mark(4);
             // ---- residual + FFN ----
             if let (Some(pa), Some(pfn)) = (&l.post_attn_norm, &l.post_ffn_norm) {
@@ -498,7 +510,7 @@ impl Qwen3 {
         let c = &self.cfg;
         rmsnorm_rows(x, &l.ffn_norm, c.eps, c.n_embd, h);
         pf.mark(0);
-        cpu_q::matmul_many(&mut [(&l.gate, &mut *gb), (&l.up, &mut *ub)], h, t);
+        cpu_q::matmul_opts(&mut [(&l.gate, &mut *gb), (&l.up, &mut *ub)], h, t, role_opts("gateup"));
         pf.mark(5);
         let gemma = c.is_gemma;
         let gp = SyncPtr(gb.as_mut_ptr());
@@ -509,7 +521,7 @@ impl Qwen3 {
             if gemma { for (a, &b) in g.iter_mut().zip(u) { *a = gelu_tanh(*a) * b; } }
             else { for (a, &b) in g.iter_mut().zip(u) { *a = silu(*a) * b; } }
         });
-        cpu_q::matmul(&l.down, gb, t, f);
+        cpu_q::matmul_opts(&mut [(&l.down, &mut *f)], gb, t, role_opts("down"));
         pf.mark(6);
     }
 
@@ -521,7 +533,7 @@ impl Qwen3 {
         let mut n = vec![0f32; rows * c.n_embd];
         rmsnorm_rows(x, &cm.out_norm, c.eps, c.n_embd, &mut n);
         let mut lg = vec![0f32; rows * cm.lm_head.rows];
-        cpu_q::matmul(&cm.lm_head, &n, rows, &mut lg);
+        cpu_q::matmul_opts(&mut [(&cm.lm_head, &mut lg)], &n, rows, role_opts("head"));
         if c.logit_scale != 1.0 && std::env::var("FERRIC_NOLOGITSCALE").is_err() {
             for v in lg.iter_mut() { *v *= c.logit_scale; }
         }

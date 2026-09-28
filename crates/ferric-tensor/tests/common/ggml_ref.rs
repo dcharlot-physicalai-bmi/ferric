@@ -184,23 +184,31 @@ fn deq(t: u32, row: &[u8], n: usize, wrong: bool) -> Vec<f64> {
     y
 }
 
-/// The activation rounding the int8 kernels are SPECIFIED to apply (cpu_q's module doc): per block of
-/// `block` values, `d = amax/127` (f32), codes `round_ties_even(x / d)` computed as `x * (1/d)` in f32.
-/// Written here from that specification, not by calling the library; the tests assert the library's
-/// codes and scales equal these exactly. Returns (codes, scales, reconstruction in f64).
-pub fn quantize_act(x: &[f32], block: usize) -> (Vec<i8>, Vec<f32>, Vec<f64>) {
+/// The activation rounding the int8 kernels are SPECIFIED to apply (cpu_q's `quantize_row`): per block
+/// of `block` values, `d = amax/127` (f32), codes `round_ties_even(x * (1/d))` computed in f32. With
+/// `split` (the Int16 precision) a second row of codes follows: `round_ties_even((x * (1/d) - code) *
+/// 254)` clamped to +-127, scale `d / 254`. Written here from that specification, not by calling the
+/// library; the tests assert the library's codes and scales equal these exactly.
+/// Returns (codes, scales, reconstruction in f64) — codes/scales as the library lays them out (the
+/// high row, then the residual row).
+pub fn quantize_act(x: &[f32], block: usize, split: bool) -> (Vec<i8>, Vec<f32>, Vec<f64>) {
     let (mut q, mut ds, mut out) = (Vec::with_capacity(x.len()), Vec::new(), Vec::with_capacity(x.len()));
+    let (mut lq, mut lds) = (Vec::new(), Vec::new());
     for b in x.chunks(block) {
         let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let id = if d > 0.0 { 1.0 / d } else { 0.0 };
         ds.push(d);
+        lds.push(d / 254.0);
         for &v in b {
             let c = (v * id).round_ties_even() as i8;
             q.push(c);
-            out.push(c as f64 * d as f64);
+            let r = ((v * id - c as f32) * 254.0).round_ties_even().clamp(-127.0, 127.0) as i8;
+            lq.push(r);
+            out.push(c as f64 * d as f64 + if split { r as f64 * (d / 254.0) as f64 } else { 0.0 });
         }
     }
+    if split { q.extend(lq); ds.extend(lds); }
     (q, ds, out)
 }
 

@@ -6,9 +6,11 @@
 //! activation rows x 8 weight rows: the 4x1, 2x1, 2x4, 1x4 and 1x1 tiles).
 //!
 //! What "agrees" means, stated per arm:
-//!  - int8 activations: the kernel must equal `Σ w·q(x)` — the f64 reference applied to `x` rounded
-//!    the way the kernels are specified to round it — to 5e-7 of `Σ|w·q(x)|`. The rounding itself is
-//!    a SEPARATE, reported number (the int8 activation error), bounded only loosely.
+//!  - int8 / int16 activations: the kernel must equal `Σ w·q(x)` — the f64 reference applied to `x`
+//!    rounded the way the kernels are specified to round it (int16 = an int8 row plus its rounding
+//!    residual as a second int8 row) — to 5e-7 of `Σ|w·q(x)|`. The rounding itself is a SEPARATE,
+//!    reported number (the activation error): bounded loosely at int8, and at int16 required to be
+//!    at least 100x smaller than int8's, or the residual row is not doing its job.
 //!  - f32 activations (and F32/F16/BF16 weights): `Σ w·x` to the same bound.
 //!
 //! Negative controls: for each format one plausible WRONG reading (`common/ggml_ref.rs`) must sit >= 20x
@@ -16,7 +18,7 @@
 #[path = "common/ggml_ref.rs"]
 mod ggml_ref;
 
-use ferric_tensor::cpu_q::{self, Opts, QWeight, WType};
+use ferric_tensor::cpu_q::{self, ActPrec, Opts, QWeight, WType};
 use ggml_ref as r;
 
 struct Rng(u64);
@@ -79,9 +81,9 @@ fn check(t: u32, opts: Opts, rng: &mut Rng) -> Worst {
         for a in 0..m {
             let xa = &x[a * k..(a + 1) * k];
             let exact: Vec<f64> = xa.iter().map(|&v| v as f64).collect();
-            let seen = match (r::act_block(t), opts.f32act) {
+            let seen = match (r::act_block(t), opts.act == ActPrec::F32) {
                 (Some(b), false) => {
-                    let (codes, scales, q) = r::quantize_act(xa, b);
+                    let (codes, scales, q) = r::quantize_act(xa, b, opts.act == ActPrec::Int16);
                     // The library's quantizer must BE the specified one, code for code, scale for scale.
                     let (lc, ls) = cpu_q::quantized_activation(ty, xa, opts).expect("an int8 arm quantizes");
                     assert_eq!(lc, codes, "{}: the library's activation codes differ from their specification", r::name(t));
@@ -106,10 +108,13 @@ fn check(t: u32, opts: Opts, rng: &mut Rng) -> Worst {
 }
 
 fn arms() -> Vec<(&'static str, Opts)> {
-    let mut v = vec![("scalar/int8", Opts { neon: false, f32act: false }), ("scalar/f32act", Opts { neon: false, f32act: true })];
+    let mut v = vec![("scalar/int8", Opts { neon: false, act: ActPrec::Int8 }),
+                     ("scalar/int16", Opts { neon: false, act: ActPrec::Int16 }),
+                     ("scalar/f32", Opts { neon: false, act: ActPrec::F32 })];
     if cfg!(target_arch = "aarch64") && cpu_q::kernel_family() == "neon+dotprod" {
-        v.push(("neon/int8", Opts { neon: true, f32act: false }));
-        v.push(("neon/f32act", Opts { neon: true, f32act: true }));
+        v.push(("neon/int8", Opts { neon: true, act: ActPrec::Int8 }));
+        v.push(("neon/int16", Opts { neon: true, act: ActPrec::Int16 }));
+        v.push(("neon/f32", Opts { neon: true, act: ActPrec::F32 }));
     }
     v
 }
@@ -127,12 +132,16 @@ fn every_format_every_arm_matches_the_f64_reference() {
             let ok_right = w.right <= tol;
             // The control holds when this test would reject the wrong reading by >= 20x its own bound.
             let ok_ctrl = w.wrong >= 20.0 * tol;
-            println!("{arm:<14} {:<5} right {:.2e}  wrong-reading {:.2e} ({:>9.0}x)  int8-activation error {:.2e}",
+            println!("{arm:<14} {:<5} right {:.2e}  wrong-reading {:.2e} ({:>9.0}x)  activation error {:.2e}",
                      r::name(t), w.right, w.wrong, w.wrong / w.right.max(1e-12), w.act);
             if !ok_right { failures.push(format!("{arm} {}: {:.3e} > {tol:e}", r::name(t), w.right)); }
             if !ok_ctrl { failures.push(format!("{arm} {}: wrong reading only {:.3e} away — the control cannot see it", r::name(t), w.wrong)); }
-            // The int8 rounding is a specified approximation; anything near 1% of |w·x| is a defect.
-            if w.act > 2e-2 { failures.push(format!("{arm} {}: int8 activation error {:.3e}", r::name(t), w.act)); }
+            // The activation rounding is a specified approximation; anything near 1% of |w·x| is a
+            // defect at int8, and the int16 split must buy >= 100x of it back (measured: ~250x).
+            if w.act > 2e-2 { failures.push(format!("{arm} {}: activation error {:.3e}", r::name(t), w.act)); }
+            if opts.act == ActPrec::Int16 && w.act > 1e-4 {
+                failures.push(format!("{arm} {}: int16 activation error {:.3e} — the residual row is not doing its job", r::name(t), w.act));
+            }
         }
     }
     assert!(failures.is_empty(), "CPU kernel conformance failed:\n  {}", failures.join("\n  "));

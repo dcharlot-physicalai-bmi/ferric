@@ -564,7 +564,13 @@ fn k4_scales(s: &[u8]) -> ([u8; 8], [u8; 8]) {
 // 3. Activation quantization
 // =====================================================================================================
 
-/// `m` activation rows quantized to int8 blocks: `qs` [m, k], one `d` per block, a sum per 16 codes.
+/// Activation rows quantized to int8 blocks: `qs` [rows, k], one `d` per block, a sum per 16 codes.
+///
+/// With `split` (the `Int16` precision) every input row becomes TWO physical rows, `2a` and `2a + 1`:
+/// the int8 codes, and the rounding residual they left scaled by 254 into int8 again, with scale
+/// `d / 254` — so `x ~ d * (hi + lo / 254)`, ~16 bits relative to the block's largest value. The
+/// kernels need no change: the residual is one more activation row that shares every unpacked weight
+/// block, and the driver adds the pair.
 pub struct QAct {
     block: usize,
     k: usize,
@@ -574,15 +580,20 @@ pub struct QAct {
 }
 
 impl QAct {
-    fn quantize(x: &[f32], m: usize, k: usize, block: usize) -> QAct {
+    fn quantize(x: &[f32], m: usize, k: usize, block: usize, split: bool) -> QAct {
         let nb = k / block;
-        let mut a = QAct { block, k, qs: vec![0; m * k], d: vec![0.0; m * nb], bsums: vec![0; m * k / 16] };
+        let s = if split { 2 } else { 1 };
+        let mut a = QAct { block, k, qs: vec![0; s * m * k], d: vec![0.0; s * m * nb], bsums: vec![0; s * m * k / 16] };
         let (qp, dp, bp) = (SyncPtr(a.qs.as_mut_ptr()), SyncPtr(a.d.as_mut_ptr()), SyncPtr(a.bsums.as_mut_ptr()));
         let row = |r: usize| unsafe {
-            let q = std::slice::from_raw_parts_mut(qp.get().add(r * k), k);
-            let d = std::slice::from_raw_parts_mut(dp.get().add(r * nb), nb);
-            let bs = std::slice::from_raw_parts_mut(bp.get().add(r * k / 16), k / 16);
-            quantize_row(&x[r * k..(r + 1) * k], block, q, d, bs);
+            let pr = r * s;
+            let q = std::slice::from_raw_parts_mut(qp.get().add(pr * k), s * k);
+            let d = std::slice::from_raw_parts_mut(dp.get().add(pr * nb), s * nb);
+            let bs = std::slice::from_raw_parts_mut(bp.get().add(pr * k / 16), s * k / 16);
+            let (q0, q1) = q.split_at_mut(k);
+            let (d0, d1) = d.split_at_mut(nb);
+            let (b0, b1) = bs.split_at_mut(k / 16);
+            quantize_row(&x[r * k..(r + 1) * k], block, q0, d0, b0, if split { Some((q1, d1, b1)) } else { None });
         };
         if m * k >= 1 << 16 { pool().for_each(m, row); } else { for r in 0..m { row(r); } }
         a
@@ -596,10 +607,14 @@ impl QAct {
     }
 }
 
-/// One row → int8 blocks. `d = amax/127`, codes rounded to nearest (ties to even), so |code| <= 127
-/// and `d * code` is the reconstruction. (llama.cpp's Q8_K picks the sign of `d` from the extreme
-/// value; the magnitude is the same, and this is an internal format, never written to a file.)
-fn quantize_row(x: &[f32], block: usize, q: &mut [i8], d: &mut [f32], bs: &mut [i16]) {
+/// One row → int8 blocks. `d = amax/127`, codes `round_ties_even(x * (1/d))`, so |code| <= 127 and
+/// `d * code` is the reconstruction. (llama.cpp's Q8_K picks the sign of `d` from the extreme value;
+/// the magnitude is the same, and this is an internal format, never written to a file.)
+///
+/// `lo` (the `Int16` precision): the residual `x * (1/d) - code`, in [-0.5, 0.5], times 254, rounded the
+/// same way — codes in [-127, 127] with scale `d / 254`.
+type Lo<'a> = Option<(&'a mut [i8], &'a mut [f32], &'a mut [i16])>;
+fn quantize_row(x: &[f32], block: usize, q: &mut [i8], d: &mut [f32], bs: &mut [i16], mut lo: Lo<'_>) {
     for (b, xb) in x.chunks_exact(block).enumerate() {
         let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
         let db = amax / 127.0;
@@ -607,8 +622,18 @@ fn quantize_row(x: &[f32], block: usize, q: &mut [i8], d: &mut [f32], bs: &mut [
         d[b] = db;
         let qb = &mut q[b * block..(b + 1) * block];
         for (o, &v) in qb.iter_mut().zip(xb) { *o = (v * id).round_ties_even() as i8; }
+        if let Some((lq, ld, _)) = lo.as_mut() {
+            ld[b] = db / 254.0;
+            let lb = &mut lq[b * block..(b + 1) * block];
+            for ((o, &v), &h) in lb.iter_mut().zip(xb).zip(qb.iter()) {
+                *o = ((v * id - h as f32) * 254.0).round_ties_even().clamp(-127.0, 127.0) as i8;
+            }
+        }
     }
     for (s, c) in bs.iter_mut().zip(q.chunks_exact(16)) { *s = c.iter().map(|&v| v as i16).sum(); }
+    if let Some((lq, _, lbs)) = lo {
+        for (s, c) in lbs.iter_mut().zip(lq.chunks_exact(16)) { *s = c.iter().map(|&v| v as i16).sum(); }
+    }
 }
 
 /// One activation row as the kernels read it (int8 codes / block scales / 16-sums, or f32 values).
@@ -1031,30 +1056,58 @@ fn use_neon() -> bool {
 /// The kernel family in force, for reports: "neon+dotprod" or "scalar".
 pub fn kernel_family() -> &'static str { if use_neon() { "neon+dotprod" } else { "scalar" } }
 
-/// Whether activations meeting quantized weights stay f32 (`FERRIC_CPU_F32ACT=1`). See the module doc.
-pub fn f32_activations() -> bool {
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("FERRIC_CPU_F32ACT").is_ok())
+/// What quantized weights multiply: the activation precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActPrec {
+    /// int8 per block (`d = amax/127`) — llama.cpp's CPU scheme, the fastest.
+    Int8,
+    /// Two int8 rows per activation row, the second the first's rounding residual (see [`QAct`]):
+    /// ~16 bits relative to each block's largest value, at the int8 dot product's throughput.
+    Int16,
+    /// f32, weights dequantized row by row — the GPU path's arithmetic, the slowest.
+    F32,
 }
+
+impl ActPrec {
+    pub fn name(self) -> &'static str { match self { ActPrec::Int8 => "int8", ActPrec::Int16 => "int16", ActPrec::F32 => "f32" } }
+}
+
+/// The activation precision in force: `FERRIC_CPU_ACT=int8|int16|f32` (default int16 — see the module
+/// doc for what int8 cost against the authors), or `FERRIC_CPU_F32ACT=1` for f32. An unknown value
+/// panics rather than silently running a precision the operator did not ask for.
+pub fn act_precision() -> ActPrec {
+    static P: OnceLock<ActPrec> = OnceLock::new();
+    *P.get_or_init(|| {
+        if std::env::var("FERRIC_CPU_F32ACT").is_ok() { return ActPrec::F32; }
+        match std::env::var("FERRIC_CPU_ACT").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "" | "int16" | "i16" => ActPrec::Int16,
+            "int8" | "i8" => ActPrec::Int8,
+            "f32" => ActPrec::F32,
+            other => panic!("FERRIC_CPU_ACT={other:?}: use int8, int16 or f32"),
+        }
+    })
+}
+
+/// Whether activations meeting quantized weights stay f32. See [`act_precision`].
+pub fn f32_activations() -> bool { act_precision() == ActPrec::F32 }
 
 // =====================================================================================================
 // 6. The matmul driver
 // =====================================================================================================
 
-/// How a matmul runs: which kernel family, and whether quantized weights meet int8 or f32
-/// activations. [`Opts::from_env`] is what the model uses; tests pass both arms explicitly, because an
-/// env var read once per process cannot reach both in one test binary.
+/// How a matmul runs: which kernel family, and the activation precision quantized weights meet.
+/// [`Opts::from_env`] is what the model uses; tests pass every arm explicitly, because an env var read
+/// once per process cannot reach them all in one test binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opts {
     /// NEON+DotProd kernels (aarch64 with FEAT_DotProd only; ignored elsewhere).
     pub neon: bool,
-    /// Keep activations f32 against quantized weights (weights dequantized row by row).
-    pub f32act: bool,
+    pub act: ActPrec,
 }
 
 impl Opts {
-    pub fn from_env() -> Opts { Opts { neon: use_neon(), f32act: f32_activations() } }
-    pub fn scalar() -> Opts { Opts { neon: false, f32act: false } }
+    pub fn from_env() -> Opts { Opts { neon: use_neon(), act: act_precision() } }
+    pub fn scalar() -> Opts { Opts { neon: false, act: ActPrec::Int16 } }
 }
 
 /// `y[m, w.rows] = x[m, w.cols] · wᵀ`.
@@ -1077,10 +1130,14 @@ pub fn matmul_opts(jobs: &mut [(&QWeight, &mut [f32])], x: &[f32], m: usize, opt
         assert_eq!(w.cols, k, "matmul_many: every weight must take the same input width");
         assert_eq!(y.len(), m * w.rows, "output for [{}, {}] must hold {} values", m, w.rows, m * w.rows);
     }
-    let f32act = opts.f32act;
+    let f32act = opts.act == ActPrec::F32;
+    let split = opts.act == ActPrec::Int16;
     let need = |a: Act| jobs.iter().any(|(w, _)| !f32act && w.ty.act() == a);
-    let q32 = need(Act::Q8x32).then(|| QAct::quantize(x, m, k, 32));
-    let q256 = need(Act::Q8x256).then(|| QAct::quantize(x, m, k, 256));
+    let q32 = need(Act::Q8x32).then(|| QAct::quantize(x, m, k, 32, split));
+    let q256 = need(Act::Q8x256).then(|| QAct::quantize(x, m, k, 256, split));
+    // PHYSICAL activation rows per logical row for a weight: 2 when its activations are split.
+    let per = |ty: WType| if split && ty.act() != Act::F32 { 2 } else { 1 };
+    // Physical activation row `r` for a weight of format `ty`.
     let arow = |ty: WType, r: usize| -> ARow {
         match (f32act, ty.act()) {
             (false, Act::Q8x32) => q32.as_ref().unwrap().row(r),
@@ -1130,43 +1187,54 @@ pub fn matmul_opts(jobs: &mut [(&QWeight, &mut [f32])], x: &[f32], m: usize, opt
             }
             return;
         }
+        // Physical activation rows: `s` per logical row (the Int16 residual pair lives in one tile).
+        let s = per(w.ty);
         if !neon {
             for r in it.r0..it.r1 {
                 for a in it.a0..it.a1 {
-                    put(r, a, unsafe { scalar::dot(w.ty, base.add(r * rb), k, arow(w.ty, a)) });
+                    let v: f32 = (0..s).map(|h| unsafe { scalar::dot(w.ty, base.add(r * rb), k, arow(w.ty, a * s + h)) }).sum();
+                    put(r, a, v);
                 }
             }
             return;
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let mut a = it.a0;
-            while a < it.a1 {
-                let na = if it.a1 - a >= 4 { 4 } else { 1 };
+            // Tiles of NR weight rows x NA physical activation rows; `NA / s` logical rows each.
+            macro_rules! tile {
+                ($nr:literal, $na:literal, $r:expr, $pa:expr) => {{
+                    let mut ar = [arow(w.ty, $pa); $na];
+                    for j in 1..$na { ar[j] = arow(w.ty, $pa + j); }
+                    let mut o = [[0f32; $na]; $nr];
+                    neon::tile::<$nr, $na>(w.ty, base.add($r * rb), rb, k, &ar, &mut o);
+                    for i in 0..$nr {
+                        for j in (0..$na).step_by(s) {
+                            let v = if s == 2 { o[i][j] + o[i][j + 1] } else { o[i][j] };
+                            put($r + i, ($pa + j) / s, v);
+                        }
+                    }
+                }};
+            }
+            let (p0, p1) = (it.a0 * s, it.a1 * s);
+            let mut pa = p0;
+            while pa < p1 {
+                let na = if p1 - pa >= 4 { 4 } else if s == 2 { 2 } else { 1 };
                 let mut r = it.r0;
                 while r < it.r1 {
-                    let nr = if it.r1 - r >= 4 && na == 1 { 4 } else if it.r1 - r >= 2 { 2 } else { 1 };
-                    let wp = base.add(r * rb);
+                    let nr = if it.r1 - r >= 4 && na <= 2 { 4 } else if it.r1 - r >= 2 { 2 } else { 1 };
                     match (nr, na) {
-                        (4, 1) => { let mut o = [[0f32; 1]; 4]; neon::tile::<4, 1>(w.ty, wp, rb, k, &[arow(w.ty, a)], &mut o); for i in 0..4 { put(r + i, a, o[i][0]); } }
-                        (2, 1) => { let mut o = [[0f32; 1]; 2]; neon::tile::<2, 1>(w.ty, wp, rb, k, &[arow(w.ty, a)], &mut o); for i in 0..2 { put(r + i, a, o[i][0]); } }
-                        (1, 1) => { let mut o = [[0f32; 1]; 1]; neon::tile::<1, 1>(w.ty, wp, rb, k, &[arow(w.ty, a)], &mut o); put(r, a, o[0][0]); }
-                        (2, 4) => {
-                            let ar = [arow(w.ty, a), arow(w.ty, a + 1), arow(w.ty, a + 2), arow(w.ty, a + 3)];
-                            let mut o = [[0f32; 4]; 2];
-                            neon::tile::<2, 4>(w.ty, wp, rb, k, &ar, &mut o);
-                            for i in 0..2 { for j in 0..4 { put(r + i, a + j, o[i][j]); } }
-                        }
-                        _ => {
-                            let ar = [arow(w.ty, a), arow(w.ty, a + 1), arow(w.ty, a + 2), arow(w.ty, a + 3)];
-                            let mut o = [[0f32; 4]; 1];
-                            neon::tile::<1, 4>(w.ty, wp, rb, k, &ar, &mut o);
-                            for j in 0..4 { put(r, a + j, o[0][j]); }
-                        }
+                        (4, 1) => tile!(4, 1, r, pa),
+                        (2, 1) => tile!(2, 1, r, pa),
+                        (1, 1) => tile!(1, 1, r, pa),
+                        (4, 2) => tile!(4, 2, r, pa),
+                        (2, 2) => tile!(2, 2, r, pa),
+                        (1, 2) => tile!(1, 2, r, pa),
+                        (2, 4) => tile!(2, 4, r, pa),
+                        _ => tile!(1, 4, r, pa),
                     }
                     r += nr;
                 }
-                a += na;
+                pa += na;
             }
         }
     };
@@ -1185,9 +1253,11 @@ pub fn dot_row(w: &QWeight, r: usize, x: &[f32], opts: Opts) -> f32 {
 /// block (`None` when that format meets f32 activations). A test comparing a kernel against an exact
 /// reference needs this to separate the kernel's own error from the activation rounding it is
 /// specified to have, and to check the quantizer against its specification code for code.
+///
+/// Under `Int16` the codes and scales hold the high row then the residual row (`2 * x.len()` codes).
 pub fn quantized_activation(ty: WType, x: &[f32], opts: Opts) -> Option<(Vec<i8>, Vec<f32>)> {
     let block = match ty.act() { Act::F32 => return None, Act::Q8x32 => 32, Act::Q8x256 => 256 };
-    if opts.f32act { return None; }
-    let a = QAct::quantize(x, 1, x.len(), block);
+    if opts.act == ActPrec::F32 { return None; }
+    let a = QAct::quantize(x, 1, x.len(), block, opts.act == ActPrec::Int16);
     Some((a.qs, a.d))
 }
