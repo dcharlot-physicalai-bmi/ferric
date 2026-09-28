@@ -3,6 +3,7 @@
 //!
 //!   quant_logits <model.gguf | hf_dir> <ids.json>             ROW lines, as `lm_logits` prints them
 //!   quant_logits <model.gguf | hf_dir> --weights <out.bin>     every quantized weight, dequantized
+//!   quant_logits <model.gguf | hf_dir> --bench [N]             decode ms/token, three rounds
 //!
 //! The model is either a GGUF file (IQ1_S/IQ1_M/IQ2_XS/IQ2_S/IQ3_S/NVFP4 and the rest) or a Hugging Face
 //! checkpoint directory holding GPTQ / AWQ / compressed-tensors / FP8 / ModelOpt weights, opened by
@@ -49,6 +50,26 @@ async fn go<G: GgufSource>(g: &G, a: &[String]) {
             quantized += 1;
         }
         eprintln!("wrote {quantized} quantized weights of {} projections", names.len());
+        return;
+    }
+    // `--bench N`: decode throughput on this weight format — a 64-token prefill, then N one-token
+    // decode steps, three rounds; prints ms/token per round (a shared machine: report the range).
+    if a.get(2).map(String::as_str) == Some("--bench") {
+        let n: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(32);
+        let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
+        let m = Qwen3::load(&ctx, g).expect("load");
+        let prompt: Vec<u32> = (0..64u32).map(|i| 1000 + i * 37).collect();
+        for round in 0..3 {
+            let mut cache = ferric_llama::qwen3::Cache::new(&m.cfg);
+            let _ = m.forward_cached(&prompt, &mut cache).to_vec().await;
+            let t0 = std::time::Instant::now();
+            let mut tok = 1234u32;
+            for _ in 0..n {
+                let lg = m.forward_cached(&[tok], &mut cache).to_vec().await;
+                tok = lg.iter().enumerate().fold((0, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32;
+            }
+            println!("BENCH round {round}: {:.2} ms/token over {n} decode steps", t0.elapsed().as_secs_f64() * 1e3 / n as f64);
+        }
         return;
     }
     let fx = std::fs::read_to_string(a.get(2).expect("ids.json")).expect("read ids");
