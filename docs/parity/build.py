@@ -58,6 +58,7 @@ UPDATES = {
     "S26": ("verified", "64d495c: --api-key (Bearer or x-api-key); 401 otherwise"),
     "S22": ("implemented", "15e605c: /tokenize, /detokenize in llama-server and vLLM shapes"),
     "S27": ("implemented", "15e605c: Prometheus /metrics incl. ferric_energy_joules_total"),
+    "S10": ("verified", "2323cf7: GBNF (a port of llama.cpp's grammar engine: 70/70 + 69/69 of its own integration strings, 9/9 build checks), regex (= Python re.fullmatch on 982 strings), choice; every peer spelling (grammar, guided_*, structured_outputs, response_format) on chat and completions; trie mask"),
     "E10": ("implemented", "5154e47: prompt-lookup (n-gram) drafts on any dense model, FERRIC_LOOKUP=k; answers identical 6/6, 7.3 tokens/forward on copying — ⚠ not yet faster: a few-row verify forward runs the prefill matmul path (~34 ms vs ~10 ms decode)"),
     "S30": ("verified", "0f0605d: prompt caching across requests on the dense runtime (radix-indexed PrefixCache, 16-token chunks, keyed on the LoRA selection and LongRoPE table); follow-up turns 5.2 s → 0.3 s and 73 J → 2.7 J, answers identical (scripts/prefix_cache_check.py)"),
     "E03": ("verified", "0f0605d: the radix PrefixCache is the server's (dense runtime; hybrid/MoE runtimes keep the one-slot MTP path); entries keyed on adapter + LongRoPE table (8a42c8b, 210382c)"),
