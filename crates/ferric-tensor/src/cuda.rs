@@ -738,7 +738,12 @@ pub struct DecodeGraph {
     exec: Option<CUgraphExec>,
     /// Replay the graph: `FERRIC_CUDA_NO_GRAPH` unset, the driver has the API, capture has not failed.
     graph_on: bool,
+    /// `FERRIC_CUDA_STEPTIME=1`: GPU time of each whole step (two events on the decode stream, no extra
+    /// sync) against the wall time of `step` — the split that says whether a step is waiting on the GPU
+    /// or the GPU is waiting on the host.
+    steptime: Option<StepTime>,
 }
+struct StepTime { ev: [CUevent; 2], gpu_ms: f64, wall_ms: f64, n: u32 }
 
 /// Rows per prefill chunk. A prompt longer than this is run in chunks, each attending to the cache the
 /// previous ones wrote — causal attention makes that exact — so scratch stays bounded (≈85 MB at 512
@@ -825,6 +830,11 @@ impl DecodeGraph {
             std::ptr::write_bytes(hb as *mut u8, 0, lay.bytes);
         }
         let graph_on = std::env::var("FERRIC_CUDA_NO_GRAPH").is_err() && drv.graph.is_some();
+        let steptime = std::env::var("FERRIC_CUDA_STEPTIME").is_ok().then(|| {
+            let mut ev: [CUevent; 2] = [std::ptr::null_mut(); 2];
+            unsafe { (drv.cu_event_create)(&mut ev[0], 0); (drv.cu_event_create)(&mut ev[1], 0); }
+            StepTime { ev, gpu_ms: 0.0, wall_ms: 0.0, n: 0 }
+        });
         Some(DecodeGraph {
             d, nh, nkv, dh, n_ff: spec.n_ff, n_vocab: spec.n_vocab, eps: spec.eps, rope_base: spec.rope_base,
             has_qk_norm: spec.has_qk_norm, norm_pairs: spec.norm_pairs, rope_ff, rope_host: spec.rope_host, layers,
@@ -834,7 +844,7 @@ impl DecodeGraph {
             q8x: std::env::var("FERRIC_CUDA_Q8X").is_ok(),
             xq, xs,
             owned, pf: None,
-            stream, sb, hb: hb as *mut u8, lay, hl: hl as *mut f32, exec: None, graph_on,
+            stream, sb, hb: hb as *mut u8, lay, hl: hl as *mut f32, exec: None, graph_on, steptime,
             drv,
         })
     }
@@ -874,8 +884,11 @@ impl DecodeGraph {
         }
         let drv = self.drv.clone();
         drv.bind();
+        let t0 = std::time::Instant::now();
+        if let Some(st) = &self.steptime { unsafe { (drv.cu_event_record)(st.ev[0], self.stream); } }
         let mut prof = std::mem::replace(&mut self.prof, Prof::off());
         let ok = if prof.on || !self.graph_on { unsafe { self.record(&drv, &k, &mut prof) } } else { self.replay(&drv, &k) };
+        if let Some(st) = &self.steptime { unsafe { (drv.cu_event_record)(st.ev[1], self.stream); } }
         let ok = ok && {
             let r = unsafe { (drv.cu_stream_synchronize)(self.stream) };
             if r != 0 { eprintln!("{}", drv.err("cuStreamSynchronize", r)); }
@@ -886,6 +899,15 @@ impl DecodeGraph {
         if !ok { return None; }
         // SAFETY: `hl` holds `n_vocab` f32, written by the step's last copy, which the sync completed.
         let out = unsafe { std::slice::from_raw_parts(self.hl, self.n_vocab) }.to_vec();
+        if let Some(st) = &mut self.steptime {
+            let mut ms = 0f32;
+            unsafe { (drv.cu_event_elapsed)(&mut ms, st.ev[0], st.ev[1]); }
+            st.gpu_ms += ms as f64; st.wall_ms += t0.elapsed().as_secs_f64() * 1e3; st.n += 1;
+            if st.n % 128 == 0 {
+                eprintln!("cuda steptime: {} steps ({}): GPU {:.3} ms/step, DecodeGraph::step wall {:.3} ms/step",
+                          st.n, if self.graph_on { "graph" } else { "eager" }, st.gpu_ms / st.n as f64, st.wall_ms / st.n as f64);
+            }
+        }
         kv.len = row + 1;
         NATIVE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(out)
@@ -1146,6 +1168,26 @@ pub fn bench_gemv(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f
 pub fn bench_gemv_q8(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> { bench_launch(ws, x, iters, false, true) }
 /// Fused gate|up+SwiGLU microbench, same contract; `w` has `2*n_ff` rows, any format.
 pub fn bench_swiglu(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> { bench_launch(ws, x, iters, true, false) }
+/// **Prefill GEMM microbench** — `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores, `iters`
+/// back-to-back launches rotating over `ws` (weights past L2, as the GEMV bench), one sync. Returns
+/// (µs per GEMM, the last C). The number `examples/cuda_gemm_bench.rs` turns into useful TFLOPS.
+pub fn bench_gemm(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone(); drv.bind();
+    let w0 = ws.first()?;
+    let (n, k) = (w0.rows, w0.cols);
+    if a.len() != m * k || ws.iter().any(|w| w.rows != n || w.cols != k) { return None; }
+    let pk = *drv.prefill_kernels()?;
+    let (ad, cd, ovf) = (drv.upload_f32(a)?, drv.alloc(m * n * 4)?, drv.upload_f32(&[0.0])?);
+    let run = |w: &NativeWeight<'_>| unsafe { launch_gemm(&drv, &pk, ad, k, w.dw(), cd, n, m, ovf) };
+    if !run(w0) || !drv.sync() { return None; }      // warm (PTX JIT)
+    let t0 = std::time::Instant::now();
+    for i in 0..iters { if !run(&ws[i % ws.len()]) { return None; } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; m * n]; if !drv.dtoh(&mut out, cd) { return None; }
+    unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+    Some((us, out))
+}
 /// Fused gate|up+SwiGLU with int8 activations (FERRIC_CUDA_Q8X). Same contract as `bench_swiglu`,
 /// so the two are directly comparable — the swiglu shape is the LARGEST per-layer weight read, and
 /// leaving it out of the table let the q8x rows cover under half of that traffic.

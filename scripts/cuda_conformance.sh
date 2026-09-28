@@ -10,8 +10,10 @@
 # in TWO native modes: DECODE (FERRIC_CUDA_NO_PREFILL=1: multi-token calls stay on WGSL, so the K/V cache
 # is handed device -> WGSL -> device mid-sequence) and FULL (prefill on the tensor cores too).
 #
-#   1. ENGAGEMENT: every single-token call must have been a native step (`NATIVE_STEPS n OF n`), and in
-#      FULL mode every multi-token row a native prefill row. A WGSL fallback prints the same kind of
+#   1. ENGAGEMENT: every single-token call must have been a native step (`NATIVE_STEPS n OF n`) replayed
+#      from the captured CUDA graph (`NATIVE_GRAPH n`), and in FULL mode every multi-token row a native
+#      prefill row. The graph's eager twin (FERRIC_CUDA_NO_GRAPH=1) must print the SAME logits to the last
+#      printed digit — the two launch the same kernels on the same inputs. A WGSL fallback prints the same kind of
 #      rows, so without this the gate would pass on a tier that never ran — the fate of the first CUDA
 #      check, whose "reference" had been routed to CUDA too.
 #   2. NATIVE vs WGSL, same weights: max |Δ logit| within TOL_NW (decode: two f32 reduction orders) or
@@ -66,7 +68,7 @@ def gguf(path):
 ARCH, NAMES = gguf(M)
 
 # ⚠ Clear every knob that changes the math, so an inherited shell variable cannot make both arms wrong alike.
-KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_Q8X", "FERRIC_CUDA_NO_PREFILL", "FERRIC_NEOX", "FERRIC_ROPE_NORM", "FERRIC_NO_ROPE_FREQS", "FERRIC_NO_QKV_BIAS",
+KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_Q8X", "FERRIC_CUDA_NO_PREFILL", "FERRIC_CUDA_NO_GRAPH", "FERRIC_CUDA_ROPE_DEVICE", "FERRIC_ROPE_DEVICE", "FERRIC_NEOX", "FERRIC_ROPE_NORM", "FERRIC_NO_ROPE_FREQS", "FERRIC_NO_QKV_BIAS",
          "FERRIC_KVQ", "FERRIC_NOFUSE", "FERRIC_NO_QK_FUSE", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA")
 def run(cuda, extra=None, total=0, prefill=8, chunk_at=64, chunk=5):
     env = {k: v for k, v in os.environ.items() if k not in KNOBS}
@@ -74,14 +76,15 @@ def run(cuda, extra=None, total=0, prefill=8, chunk_at=64, chunk=5):
     env.update(extra or {})
     r = subprocess.run([BIN, M, FX, str(prefill), str(chunk_at), str(chunk), str(total)], capture_output=True, text=True, env=env)
     if r.returncode: print(r.stderr[-2000:]); sys.exit(1)
-    rows, steps, pf = {}, None, None
+    rows, steps, pf, graph = {}, None, None, None
     for l in r.stdout.splitlines():
         p = l.split(" ")
         if p[0] == "ROW": rows[int(p[1])] = (int(p[2]), float(p[4]), [float(x) for x in p[5:]])
         elif p[0] == "NATIVE_STEPS": steps = (int(p[1]), int(p[3]))
         elif p[0] == "NATIVE_PREFILL": pf = (int(p[1]), int(p[3]))
+        elif p[0] == "NATIVE_GRAPH": graph = int(p[1])
     dev = [l for l in r.stderr.splitlines() if l.startswith(("adapter", "native"))]
-    return rows, (steps, pf), dev, r.stderr
+    return rows, (steps, pf, graph), dev, r.stderr
 
 def diff(a, b):
     """max |Δ| over the sampled logits, worst position, worst relative Δ of the full-row sum of squares."""
@@ -124,11 +127,18 @@ for mode, extra, tol in (("DECODE", {"FERRIC_CUDA_NO_PREFILL": "1"}, TOL_NW), ("
     cr, cs, cdev, cerr = run(True, extra)
     if not any(l.startswith("native") for l in cdev):
         print("⛔ no CUDA device line: FERRIC_CUDA had no driver to open. NOTHING native was checked."); sys.exit(1)
-    (n_steps, n_single), (n_pf, n_multi) = cs
+    (n_steps, n_single), (n_pf, n_multi), n_graph = cs
     want_pf = n_multi if mode == "FULL" else 0
-    print(f"  [{mode}] engagement: {n_steps}/{n_single} decode steps native, {n_pf}/{n_multi} prompt rows native (want {want_pf})")
-    if n_steps == 0 or n_steps != n_single or n_pf != want_pf:
+    print(f"  [{mode}] engagement: {n_steps}/{n_single} decode steps native ({n_graph} replayed from the CUDA graph), "
+          f"{n_pf}/{n_multi} prompt rows native (want {want_pf})")
+    if n_steps == 0 or n_steps != n_single or n_pf != want_pf or n_graph != n_steps:
         print("  ⛔ the native tier did not serve what it should have"); print("\n".join(l for l in cerr.splitlines() if "cuda" in l)[-800:]); ok = False
+    if mode == "DECODE":
+        er, es, _, _ = run(True, {**extra, "FERRIC_CUDA_NO_GRAPH": "1"})
+        ed, et, essq = diff(er, cr)
+        print(f"  [{mode}] eager launches (FERRIC_CUDA_NO_GRAPH) vs graph replay: max |Δ logit| {ed:.1e}   "
+              f"({es[0][0]} steps, {es[2]} replays; want identical printed logits and 0 replays)")
+        if ed != 0.0 or essq != 0.0 or es[2] != 0 or es[0][0] != n_steps: print("  ⛔ the graph replay and its eager twin differ"); ok = False
     d, dt, ssq = diff(cr, wr)
     arg = sum(cr[t][0] == wr[t][0] for t in cr)
     print(f"  [{mode}] native vs WGSL (same weights)   max |Δ logit| {d:.3e} at position {dt}   ssq rel {ssq:.2e}   argmax {arg}/{len(cr)}   (tol {tol:g})")

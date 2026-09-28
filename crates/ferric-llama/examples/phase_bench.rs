@@ -40,7 +40,7 @@ async fn run() {
     println!("logits    : {}", if tensor_logits { "forward_cached(..).to_vec() — a wgpu Tensor round trip (PHASE_TENSOR_LOGITS)" } else { "host (forward_cached_host)" });
     // Warm-up: compile every pipeline / JIT every kernel both phases use.
     { let mut c = Cache::new(&m.cfg); let v = last(&mut c); let _ = step(am(&v), &mut c); }
-    let (mut tp, mut td, mut ids) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut tp, mut td, mut ids, mut ta_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..reps {
         let mut c = Cache::new(&m.cfg);
         mark("prefill", "begin");
@@ -52,11 +52,15 @@ async fn run() {
         let mut generated = vec![tok];
         mark("decode", "begin");
         let t1 = Instant::now();
+        let mut t_am = 0f64;
         for _ in 0..d {
             let v = step(tok, &mut c);
+            let ta = Instant::now();
             tok = am(&v); generated.push(tok);
+            t_am += ta.elapsed().as_secs_f64();
         }
         td.push(t1.elapsed().as_secs_f64());
+        ta_all.push(t_am / d.max(1) as f64);
         mark("decode", "end");
         ids = generated;
     }
@@ -65,6 +69,7 @@ async fn run() {
     println!("  decode  {d} tok  per rep (s): {:?}", td.iter().map(|x| (x * 1e4).round() / 1e4).collect::<Vec<_>>());
     println!("  PREFILL_TOKS_PER_S {:.1}  (median of {reps})", n as f64 / median(tp));
     println!("  DECODE_TOKS_PER_S {:.1}  (median of {reps})", d as f64 / median(td));
+    println!("  host argmax over the logits row: {:.3} ms/token (median of {reps}; inside the decode time)", median(ta_all) * 1e3);
     println!("  last rep's greedy ids (first 24): {:?}", &ids[..ids.len().min(24)]);
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     println!("  native steps {}  native prefill rows {}  graph replays {}", ferric_tensor::cuda::native_steps(),
