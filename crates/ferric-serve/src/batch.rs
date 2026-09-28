@@ -98,6 +98,10 @@ pub(crate) trait ServeModel {
     /// logits, row `i` belonging to sequence `i`.
     fn decode(&self, toks: &[u32], states: &mut [&mut Self::State]) -> Vec<f32>;
 
+    /// [`Self::decode`] leaving the logits ON THE DEVICE, for device token selection (`gpu_sample`).
+    /// `None` = not offered (decided before running anything); the caller then runs `decode`.
+    fn decode_device(&self, _toks: &[u32], _states: &mut [&mut Self::State]) -> Option<ferric_tensor::Tensor> { None }
+
     /// Sample one token from one row. `None` = stop with nothing further emitted.
     fn pick(&self, row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32>;
     fn is_stop(&self, tok: u32) -> bool;
@@ -766,6 +770,9 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
     let running: HashSet<SeqId> = sched.running().iter().map(|s| s.id).collect();
     let mut idxs: Vec<usize> = Vec::new();
     let mut toks: Vec<u32> = Vec::new();
+    // Device token selection (gpu_sample) when no running sequence needs its row back (logprobs).
+    let dev_ok = gens.iter().all(|g| !(running.contains(&g.id) && g.ready && g.opts.logprobs));
+    let mut on_device: Option<ferric_tensor::Tensor> = None;
     let logits = {
         // `states` borrows into `gens`; the block scopes those borrows so the sampling pass below
         // can take `gens` mutably again.
@@ -779,8 +786,28 @@ fn step<M: ServeModel>(m: &M, sched: &mut Scheduler, gens: &mut Vec<Gen<M::State
             toks.push(t);
             states.push(st);
         }
-        if states.is_empty() { Vec::new() } else { m.decode(&toks, &mut states) }
+        if states.is_empty() { Vec::new() }
+        else if let Some(lg) = dev_ok.then(|| m.decode_device(&toks, &mut states)).flatten() { on_device = Some(lg); Vec::new() }
+        else { m.decode(&toks, &mut states) }
     };
+    if let Some(lg) = on_device {
+        let pk = crate::gpu_sample::Picker::new(lg, &idxs.iter().map(|&i| (&gens[i].opts.sampling, &gens[i].prompt[..], &gens[i].r#gen[..])).collect::<Vec<_>>());
+        let mut rec: Vec<(SeqId, u32, bool)> = Vec::new();
+        for (row, &i) in idxs.iter().enumerate() {
+            let g = &mut gens[i];
+            let t = pk.pick(row, &g.opts.sampling, &g.prompt, &g.r#gen, &mut g.rng, |r, rng| m.pick(r, &g.opts.sampling, &g.prompt, &g.r#gen, rng));
+            match t {
+                Some(t) if !m.is_stop(t) => {
+                    g.next = t;
+                    let hit = g.commit(m, t, &[]);
+                    if !g.gone && !g.streaming && g.r#gen.len() % 16 == 0 && crate::peer_closed(&g.stream) { g.gone = true; }
+                    rec.push((g.id, t, hit || g.gone));
+                }
+                _ => rec.push((g.id, 0, true)),
+            }
+        }
+        for (id, t, stop) in rec { sched.record(id, t, stop); }
+    }
     if !logits.is_empty() {
         let nv = m.n_vocab();
         assert_eq!(logits.len(), idxs.len() * nv,
@@ -904,6 +931,10 @@ impl ServeModel for Engine {
             return out;
         }
         pollster::block_on(self.model.forward_batch(toks, states).to_vec())
+    }
+
+    fn decode_device(&self, toks: &[u32], states: &mut [&mut ModelCache]) -> Option<ferric_tensor::Tensor> {
+        (self.batchable() && crate::gpu_sample::enabled()).then(|| self.model.forward_batch(toks, states))
     }
 
     fn pick(&self, row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {

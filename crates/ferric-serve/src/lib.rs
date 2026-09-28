@@ -62,6 +62,7 @@ mod vision;
 mod constrain;
 pub mod template;
 mod specgate;
+mod gpu_sample;
 use genopts::{GenOpts, Emitter};
 use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
@@ -1103,6 +1104,7 @@ impl Engine {
         let mut finish = "length";
         for step in 0..max_tokens {
             let input: Vec<u32> = if step == 0 { prompt[skip..].to_vec() } else { vec![*r#gen.last().unwrap()] };
+            let mut dev: Option<u32> = None; // the token, when the device selected it (gpu_sample)
             let v = match (&mm, &mut cache) {
                 (Some(mm), ModelCache::Dense(c)) if step == 0 => {
                     let (row, d) = self.vision_prefill(prompt, mm, c).unwrap_or_else(|e| panic!("vision prefill: {e}"));
@@ -1111,10 +1113,16 @@ impl Engine {
                 }
                 // Generated token k-1 sits at position len + delta + (k-1) — see `vision_decode`.
                 (Some(_), ModelCache::Dense(c)) => self.vision_decode(input[0], prompt.len() as i64 + delta + step as i64 - 1, c),
+                // Device token selection (gpu_sample): the row stays on the GPU unless a guide or logprobs need it.
+                _ if guide.is_none() && !opts.logprobs && crate::gpu_sample::enabled() => {
+                    let pk = crate::gpu_sample::Picker::new(self.model.forward_cached_last(&input, &mut cache), &[(&opts.sampling, prompt, &r#gen)]);
+                    dev = pk.pick(0, &opts.sampling, prompt, &r#gen, &mut rng, |row, rng| self.select_token(row, &None, &opts.sampling, prompt, &r#gen, rng));
+                    Vec::new()
+                }
                 _ => self.model.forward_cached_last_host(&input, &mut cache),
             };
-            let row = &v[v.len() - n_vocab..];
-            let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };
+            let row = if v.is_empty() { &[][..] } else { &v[v.len() - n_vocab..] };
+            let Some(next) = (if v.is_empty() { dev } else { self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) }) else { finish = "stop"; break };
             if self.eos.contains(&next) { finish = "stop"; break; }
             if let Some(g) = guide.as_mut() { g.commit(next, self.token_bytes[next as usize].as_deref()); }
             if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
@@ -1153,17 +1161,31 @@ impl Engine {
         let mut finish = "length";
         let (mut steps, mut drafted, mut kept) = (1usize, 0usize, 0usize);
         let (t0, mut t_fwd) = (std::time::Instant::now(), 0f64);
-        let v = pollster::block_on(self.model.forward_cached_last(&prompt[skip..], &mut cache).to_vec());
-        let mut rows: Vec<Vec<f32>> = vec![v[v.len() - n_vocab..].to_vec()];
+        // Device token selection (gpu_sample) keeps every verify row on the GPU; each row's request carries
+        // the history that row is sampled with (the drafts before it, accepted by then or never reached).
+        let dev_ok = !opts.logprobs && crate::gpu_sample::enabled();
+        let device = |lg: Tensor, r#gen: &[u32], draft: &[u32]| -> crate::gpu_sample::Picker {
+            let n = lg.shape[0];
+            let hist: Vec<Vec<u32>> = (0..n).map(|i| r#gen.iter().chain(&draft[..i.min(draft.len())]).copied().collect()).collect();
+            crate::gpu_sample::Picker::new(lg, &hist.iter().map(|h| (&opts.sampling, prompt, &h[..])).collect::<Vec<_>>())
+        };
+        let lg0 = self.model.forward_cached_last(&prompt[skip..], &mut cache);
+        let (mut rows, mut picker): (Vec<Vec<f32>>, Option<crate::gpu_sample::Picker>) = if dev_ok { (Vec::new(), Some(device(lg0, &[], &[]))) }
+            else { let v = pollster::block_on(lg0.to_vec()); (vec![v[v.len() - n_vocab..].to_vec()], None) };
+        let mut n_rows = 1usize;
         let mut draft: Vec<u32> = Vec::new();
         let mut base = match &cache { ModelCache::Dense(c) => c.pos, _ => unreachable!() };
         'run: loop {
             // Emit from each row in turn while the drafts hold. Row i predicts the token after feed[..=i].
             let mut held = 0usize;
-            for (i, row) in rows.iter().enumerate() {
-                let Some(next) = self.select_token(row, &None, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break 'run };
+            for i in 0..n_rows {
+                let next = match &picker {
+                    Some(pk) => pk.pick(i, &opts.sampling, prompt, &r#gen, &mut rng, |row, rng| self.select_token(row, &None, &opts.sampling, prompt, &r#gen, rng)),
+                    None => self.select_token(&rows[i], &None, &opts.sampling, prompt, &r#gen, &mut rng),
+                };
+                let Some(next) = next else { finish = "stop"; break 'run };
                 if self.eos.contains(&next) { finish = "stop"; break 'run; }
-                if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
+                if opts.logprobs { lps.push(self.lp_entry(&rows[i], next, opts)); }
                 r#gen.push(next);
                 let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
                 if let Some(d) = em.update(&full) { on_delta(&d, &lps[lp_sent..]); lp_sent = lps.len(); }
@@ -1183,10 +1205,12 @@ impl Engine {
             let feed: Vec<u32> = std::iter::once(*r#gen.last().unwrap()).chain(draft.iter().copied()).collect();
             base = match &cache { ModelCache::Dense(c) => c.pos, _ => unreachable!() };
             let tf = std::time::Instant::now();
-            let v = pollster::block_on(self.model.forward_cached(&feed, &mut cache).to_vec());
+            let lg = self.model.forward_cached(&feed, &mut cache);
+            n_rows = feed.len();
+            if dev_ok { picker = Some(device(lg, &r#gen, &draft)); }
+            else { rows = pollster::block_on(lg.to_vec()).chunks(n_vocab).map(|r| r.to_vec()).collect(); }
             t_fwd += tf.elapsed().as_secs_f64();
             steps += 1;
-            rows = v.chunks(n_vocab).map(|r| r.to_vec()).collect();
         }
         // Leave the cache holding exactly what it verified — the prompt and every emitted token but the
         // last (never fed) — so the prompt cache is offered no rejected draft.

@@ -81,7 +81,7 @@ async fn run() {
         let (a, b) = (stats(&mut s[0]), stats(&mut s[1]));
         println!("{:>10} {:>8}  {:>8.2}..{:>6.2}..{:>7.2}  {:>8.2}..{:>6.2}..{:>7.2}", "verify", t, a.0, a.1, a.2, b.0, b.1, b.2);
     }
-    for n in [2usize, 4, 8, 16] {
+    for n in [1usize, 2, 4, 8, 16] {
         let mut caches: Vec<Cache> = (0..n).map(|i| {
             let mut ci = Cache::new(&m.cfg);
             let _ = pollster::block_on(m.forward_cached_last(&prompt[..40 + 7 * i], &mut ci).to_vec());
