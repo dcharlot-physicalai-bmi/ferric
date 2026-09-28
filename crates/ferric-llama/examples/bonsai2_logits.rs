@@ -51,6 +51,8 @@ async fn run() {
     if time { eprintln!("prefill {} tokens (+load) in {t_prefill:.2?}", ids.len()); ferric_tensor::prof_report(); }
     let mut gen_ids = Vec::new();
     let mut step_ms = Vec::new();
+    // Dispatch accounting over the decode steps only: FERRIC_CENSUS=1 names the kernels behind the count.
+    ferric_tensor::reset_op_counters(); ferric_tensor::reset_op_census();
     for s in 0..n_gen {
         gen_ids.push(next);
         if s + 1 == n_gen { break; }
@@ -67,6 +69,11 @@ async fn run() {
         let mut s = step_ms.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("decode ms/token: median {:.1}  min {:.1}  max {:.1}  (n={})", s[s.len() / 2], s[0], s[s.len() - 1], s.len());
+        let (d, sub) = ferric_tensor::op_counters();
+        println!("per decode token: {:.0} dispatches, {:.1} submits", d as f64 / s.len() as f64, sub as f64 / s.len() as f64);
+        let mut c = ferric_tensor::op_census();
+        c.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, v) in c.iter().take(40) { println!("  {:>8.1}/token  {k}", *v as f64 / s.len() as f64); }
         ferric_tensor::prof_report();
     }
 }

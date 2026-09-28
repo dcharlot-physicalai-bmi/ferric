@@ -2441,8 +2441,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let row = wg.x + wg.y * 32768u;
     if (row >= rows) { return; }
     let t = lid.x; let base = row * d;
+    // ⭐ LATENCY, NOT BANDWIDTH. A thread walks d/64 elements (80 at d = 5120), and a loop that loads one
+    // value and then consumes it waits a full memory latency per element: 88 us per row measured on the
+    // M3 Ultra (examples/gdn_decode_bench.rs), 161 rows a Bonsai 2 decode step. Eight loads are issued
+    // before the first is consumed; the ADDS keep the one-at-a-time order, so the result is the same bits.
     var ms = 0.0;
-    for (var j: u32 = t; j < d; j = j + 64u) { let v = x[base + j]; ms = ms + v * v; }
+    var j = t;
+    loop {
+        if (j + 448u >= d) { break; }
+        let v0 = x[base + j]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u];
+        let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u];
+        ms = ms + v0 * v0; ms = ms + v1 * v1; ms = ms + v2 * v2; ms = ms + v3 * v3;
+        ms = ms + v4 * v4; ms = ms + v5 * v5; ms = ms + v6 * v6; ms = ms + v7 * v7;
+        j = j + 512u;
+    }
+    for (; j < d; j = j + 64u) { let v = x[base + j]; ms = ms + v * v; }
     part[t] = ms;
     workgroupBarrier();
     for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
@@ -2450,7 +2463,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         workgroupBarrier();
     }
     let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
-    for (var j: u32 = t; j < d; j = j + 64u) { out[base + j] = x[base + j] * inv * weight[j]; }
+    j = t;
+    loop {
+        if (j + 448u >= d) { break; }
+        let v0 = x[base + j]; let v1 = x[base + j + 64u]; let v2 = x[base + j + 128u]; let v3 = x[base + j + 192u];
+        let v4 = x[base + j + 256u]; let v5 = x[base + j + 320u]; let v6 = x[base + j + 384u]; let v7 = x[base + j + 448u];
+        let w0 = weight[j]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u];
+        let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u];
+        out[base + j] = v0 * inv * w0; out[base + j + 64u] = v1 * inv * w1; out[base + j + 128u] = v2 * inv * w2;
+        out[base + j + 192u] = v3 * inv * w3; out[base + j + 256u] = v4 * inv * w4; out[base + j + 320u] = v5 * inv * w5;
+        out[base + j + 384u] = v6 * inv * w6; out[base + j + 448u] = v7 * inv * w7;
+        j = j + 512u;
+    }
+    for (; j < d; j = j + 64u) { out[base + j] = x[base + j] * inv * weight[j]; }
 }
 "#;
 
@@ -2509,8 +2534,24 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     let row = wg.x + wg.y * 32768u;
     if (row >= rows) { return; }        // uniform per workgroup: barriers below stay uniform
     let t = lid.x; let base = row * d;
+    // Eight loads in flight before the first is consumed — see RMSNORM_WGSL; same order of adds.
     var ms = 0.0;
-    for (var j: u32 = t; j < d; j = j + 64u) {
+    var j = t;
+    loop {
+        if (j + 448u >= d) { break; }
+        let a0 = a[base + j]; let a1 = a[base + j + 64u]; let a2 = a[base + j + 128u]; let a3 = a[base + j + 192u];
+        let a4 = a[base + j + 256u]; let a5 = a[base + j + 320u]; let a6 = a[base + j + 384u]; let a7 = a[base + j + 448u];
+        let b0 = b[base + j]; let b1 = b[base + j + 64u]; let b2 = b[base + j + 128u]; let b3 = b[base + j + 192u];
+        let b4 = b[base + j + 256u]; let b5 = b[base + j + 320u]; let b6 = b[base + j + 384u]; let b7 = b[base + j + 448u];
+        let s0 = a0 + b0; let s1 = a1 + b1; let s2 = a2 + b2; let s3 = a3 + b3;
+        let s4 = a4 + b4; let s5 = a5 + b5; let s6 = a6 + b6; let s7 = a7 + b7;
+        sumo[base + j] = s0; sumo[base + j + 64u] = s1; sumo[base + j + 128u] = s2; sumo[base + j + 192u] = s3;
+        sumo[base + j + 256u] = s4; sumo[base + j + 320u] = s5; sumo[base + j + 384u] = s6; sumo[base + j + 448u] = s7;
+        ms = ms + s0 * s0; ms = ms + s1 * s1; ms = ms + s2 * s2; ms = ms + s3 * s3;
+        ms = ms + s4 * s4; ms = ms + s5 * s5; ms = ms + s6 * s6; ms = ms + s7 * s7;
+        j = j + 512u;
+    }
+    for (; j < d; j = j + 64u) {
         let sv = a[base + j] + b[base + j];
         sumo[base + j] = sv;
         ms = ms + sv * sv;
@@ -2522,7 +2563,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         workgroupBarrier();
     }
     let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
-    for (var j: u32 = t; j < d; j = j + 64u) { normo[base + j] = sumo[base + j] * inv * weight[j]; }
+    j = t;
+    loop {
+        if (j + 448u >= d) { break; }
+        let v0 = sumo[base + j]; let v1 = sumo[base + j + 64u]; let v2 = sumo[base + j + 128u]; let v3 = sumo[base + j + 192u];
+        let v4 = sumo[base + j + 256u]; let v5 = sumo[base + j + 320u]; let v6 = sumo[base + j + 384u]; let v7 = sumo[base + j + 448u];
+        let w0 = weight[j]; let w1 = weight[j + 64u]; let w2 = weight[j + 128u]; let w3 = weight[j + 192u];
+        let w4 = weight[j + 256u]; let w5 = weight[j + 320u]; let w6 = weight[j + 384u]; let w7 = weight[j + 448u];
+        normo[base + j] = v0 * inv * w0; normo[base + j + 64u] = v1 * inv * w1; normo[base + j + 128u] = v2 * inv * w2;
+        normo[base + j + 192u] = v3 * inv * w3; normo[base + j + 256u] = v4 * inv * w4; normo[base + j + 320u] = v5 * inv * w5;
+        normo[base + j + 384u] = v6 * inv * w6; normo[base + j + 448u] = v7 * inv * w7;
+        j = j + 512u;
+    }
+    for (; j < d; j = j + 64u) { normo[base + j] = sumo[base + j] * inv * weight[j]; }
 }
 "#;
 
@@ -4304,6 +4357,96 @@ mod rope_partial_tests {
 #[cfg(test)]
 mod norm_tests {
     use super::*;
+
+    // The kernels as they were before the eight-loads-in-flight rewrite — kept here only as the
+    // reference the rewrite must equal BIT FOR BIT.
+    const OLD_RMSNORM_WGSL: &str = r#"
+    @group(0) @binding(0) var<storage,read>        x: array<f32>;
+    @group(0) @binding(1) var<storage,read>        weight: array<f32>;
+    @group(0) @binding(2) var<storage,read_write>  out: array<f32>;
+    @group(0) @binding(3) var<storage,read>        info: array<u32>; // rows, d, bitcast(eps)
+    var<workgroup> part: array<f32, 64>;
+    @compute @workgroup_size(64)
+    fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+        let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+        // `row` is uniform across the workgroup, so this early return keeps the barriers below in
+        // uniform control flow — a per-thread guard around a barrier is undefined behaviour.
+        let row = wg.x + wg.y * 32768u;
+        if (row >= rows) { return; }
+        let t = lid.x; let base = row * d;
+        var ms = 0.0;
+        for (var j: u32 = t; j < d; j = j + 64u) { let v = x[base + j]; ms = ms + v * v; }
+        part[t] = ms;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+            if (t < s) { part[t] = part[t] + part[t + s]; }
+            workgroupBarrier();
+        }
+        let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
+        for (var j: u32 = t; j < d; j = j + 64u) { out[base + j] = x[base + j] * inv * weight[j]; }
+    }
+    "#;
+    const OLD_ADD_RMSNORM_WGSL: &str = r#"
+    @group(0) @binding(0) var<storage,read>        a: array<f32>;
+    @group(0) @binding(1) var<storage,read>        b: array<f32>;
+    @group(0) @binding(2) var<storage,read>        weight: array<f32>;
+    @group(0) @binding(3) var<storage,read_write>  sumo:  array<f32>;   // a + b (the next residual)
+    @group(0) @binding(4) var<storage,read_write>  normo: array<f32>;   // rmsnorm(a+b)·weight
+    @group(0) @binding(5) var<storage,read>        info: array<u32>;    // rows, d, bitcast(eps)
+    // ⛔ Same defect as RMSNORM_WGSL, and worse: this walks `d` TWICE on one thread. One workgroup per
+    // row, cooperative reduction. `sumo` is written in the first pass so the second can re-read it
+    // instead of recomputing a+b.
+    var<workgroup> part: array<f32, 64>;
+    @compute @workgroup_size(64)
+    fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+        let rows = info[0]; let d = info[1]; let eps = bitcast<f32>(info[2]);
+        let row = wg.x + wg.y * 32768u;
+        if (row >= rows) { return; }        // uniform per workgroup: barriers below stay uniform
+        let t = lid.x; let base = row * d;
+        var ms = 0.0;
+        for (var j: u32 = t; j < d; j = j + 64u) {
+            let sv = a[base + j] + b[base + j];
+            sumo[base + j] = sv;
+            ms = ms + sv * sv;
+        }
+        part[t] = ms;
+        workgroupBarrier();
+        for (var s: u32 = 32u; s > 0u; s = s >> 1u) {
+            if (t < s) { part[t] = part[t] + part[t + s]; }
+            workgroupBarrier();
+        }
+        let inv = 1.0 / sqrt(part[0] / f32(d) + eps);
+        for (var j: u32 = t; j < d; j = j + 64u) { normo[base + j] = sumo[base + j] * inv * weight[j]; }
+    }
+    "#;
+
+    /// ⭐ The unrolled norm kernels issue eight loads before consuming one, and must change NOTHING else:
+    /// every output bit equal to the one-load loop's, at widths below, at and across the 512-element
+    /// unroll step (the tail loop), several rows. A reordered add would show here as a last-bit diff.
+    #[test]
+    fn unrolled_norms_are_bit_identical_to_the_one_load_loop() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else { return };
+        let ctx = Arc::new(ctx);
+        for (rows, d) in [(1usize, 5120usize), (1, 896), (3, 17408), (2, 511), (2, 512), (1, 513), (4, 64), (1, 100), (2, 6144), (1, 1)] {
+            let xv: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.731).sin() * 3.0 + 0.1).collect();
+            let yv: Vec<f32> = (0..rows * d).map(|i| ((i as f32) * 0.193).cos() * 2.0).collect();
+            let wv: Vec<f32> = (0..d).map(|i| 1.0 + ((i as f32) * 0.05).sin() * 0.3).collect();
+            let (x, y, w) = (Tensor::from_vec(&ctx, &xv, &[rows, d]), Tensor::from_vec(&ctx, &yv, &[rows, d]), Tensor::from_vec(&ctx, &wv, &[d]));
+            let info = u32buf(&ctx, &[rows as u32, d as u32, 1e-6f32.to_bits()]);
+            let old = empty(&ctx, rows * d);
+            run(&ctx, OLD_RMSNORM_WGSL, "old_rmsnorm", &[x.buf.as_ref(), w.buf.as_ref(), &old, &info], (rows as u32, 1, 1));
+            let old = pollster::block_on(readback(&ctx, &old, rows * d));
+            let new = pollster::block_on(x.rmsnorm(&w, 1e-6).to_vec());
+            assert!(old.iter().zip(&new).all(|(a, b)| a.to_bits() == b.to_bits()), "rmsnorm rows={rows} d={d}: not bit-identical");
+            let (os, on) = (empty(&ctx, rows * d), empty(&ctx, rows * d));
+            run(&ctx, OLD_ADD_RMSNORM_WGSL, "old_add_rmsnorm", &[x.buf.as_ref(), y.buf.as_ref(), w.buf.as_ref(), &os, &on, &info], (rows as u32, 1, 1));
+            let (os, on) = (pollster::block_on(readback(&ctx, &os, rows * d)), pollster::block_on(readback(&ctx, &on, rows * d)));
+            let (ns, nn) = x.add_rmsnorm(&y, &w, 1e-6);
+            let (ns, nn) = (pollster::block_on(ns.to_vec()), pollster::block_on(nn.to_vec()));
+            assert!(os.iter().zip(&ns).all(|(a, b)| a.to_bits() == b.to_bits()), "add_rmsnorm sum rows={rows} d={d}");
+            assert!(on.iter().zip(&nn).all(|(a, b)| a.to_bits() == b.to_bits()), "add_rmsnorm norm rows={rows} d={d}: not bit-identical");
+        }
+    }
 
     /// Softmax and LayerNorm carried the SAME one-thread-per-row defect and had no reference test
     /// either. Both do three serial passes over `d`, so the cooperative rewrite has two reductions
