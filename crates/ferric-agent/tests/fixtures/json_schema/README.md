@@ -77,8 +77,8 @@ counterfactual, or the script stops. There are three kinds:
 
 `causes` in the file explains each one.
 
-Result: 8222 instances (5344 valid and 2878 invalid according to jsonschema). The grammar agrees on 6999. The
-other 1223 depart for a recorded cause:
+Result: 8316 instances (5436 valid and 2880 invalid according to jsonschema). The grammar agrees on 7087. The
+other 1229 depart for a recorded cause:
 
 | Cause | Instances |
 |---|---:|
@@ -86,10 +86,10 @@ other 1223 depart for a recorded cause:
 | type-inferred | 194 |
 | key-order | 191 |
 | number-spelling | 137 |
-| additional-properties-default | 119 |
-| empty-name-is-root | 75 |
+| additional-properties-default | 121 |
+| empty-name-is-root | 77 |
 | tuple-exact | 64 |
-| number-bounds-ignored | 48 |
+| number-bounds-ignored | 50 |
 | integer-digits | 40 |
 | raw-del | 33 |
 | pattern-widened | 31 |
@@ -102,9 +102,29 @@ other 1223 depart for a recorded cause:
 | additional-key-prefix | 1 |
 | all-of-merged | 1 |
 
+The probes include the edges of the `space` rule that it accepts (two newlines; a newline and exactly 20
+blanks), so a wrong space rule fails this check too, not only the byte-identical ones.
+
 To regenerate (the output is deterministic):
 
 ```
 cargo build -p ferric-agent --release --example json_schema_accepts --example json_schema_to_gbnf
 <venv>/bin/python make_semantic.py target/release/examples/json_schema_accepts semantic.json.gz
+```
+
+## `mutate.py`: can these tests fail?
+
+`mutate.py` breaks the port in 8 plausible ways, one at a time, runs the tests, and restores the source:
+- an array's item rule misnamed;
+- `required` dropped;
+- a digit range reaching one past the bound;
+- `exclusiveMinimum` taken as inclusive;
+- the space rule allowing 19 blanks, or one newline at most;
+- Grisu2's rounding step skipped;
+- optional properties emitted before required ones.
+
+Every mutation must be caught. Run it from the repository root:
+
+```
+python3 crates/ferric-agent/tests/fixtures/json_schema/mutate.py
 ```

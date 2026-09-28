@@ -121,7 +121,7 @@ fn gunzip(name: &str) -> Value {
 }
 
 /// What the grammars mean, against the `jsonschema` package (make_semantic.py): for 109 schemas (the authors'
-/// and 16 realistic API ones), 8222 JSON texts labelled valid or invalid by jsonschema. The grammar accepts
+/// and 16 realistic API ones), 8316 JSON texts labelled valid or invalid by jsonschema. The grammar accepts
 /// exactly the valid ones, except where the fixture names the llama.cpp departure that makes them differ (each
 /// established there by a counterfactual). Such an instance must then disagree; where the counterfactual is a
 /// respelling of the same value, the grammar must take the respelled text exactly when jsonschema takes the
@@ -158,7 +158,7 @@ fn semantic_verdicts_match_jsonschema_within_documented_departures() {
     }
     assert!(wrong.is_empty(), "{} of {n} instances:\n{}", wrong.len(), wrong.iter().take(30).cloned().collect::<Vec<_>>().join("\n"));
     eprintln!("{n} instances: {agree} agree with jsonschema, {depart} depart as documented: {per_cause:?}");
-    assert_eq!((n, agree, depart, skipped), (8222, 6999, 1223, 3), "the fixture changed size");
+    assert_eq!((n, agree, depart, skipped), (8316, 7087, 1229, 3), "the fixture changed size");
 }
 
 /// Guards the port adds where llama.cpp would exhaust the stack: each is an error, never a crash.

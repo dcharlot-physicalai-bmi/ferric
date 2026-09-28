@@ -342,6 +342,9 @@ for si, (name, text) in enumerate(schemas):
         inst.append((v, t + "\n", "probe/trailing newline"))
         inst.append((v, dumps(v, "indent").replace("\n  ", "\n" + " " * 22, 1) if "\n  " in dumps(v, "indent") else t, "probe/22 blanks of indent"))
         inst.append((v, dumps(v, "default").replace(", ", ",\n\n\n", 1), "probe/three newlines"))
+        # the space rule's edges, which it accepts: two newlines, and a newline then exactly 20 blanks
+        inst.append((v, dumps(v, "default").replace(", ", ",\n\n", 1), "probe/two newlines"))
+        inst.append((v, dumps(v, "default").replace(", ", ",\n" + " " * 20, 1), "probe/20 blanks of indent"))
     for b in base:
         if isinstance(b, dict) and len(b) >= 2:
             w = dict(reversed(list(b.items()))); inst.append((w, dumps(w, "default"), "probe/keys reversed")); break
