@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferric chat</title>
+<style>
+:root {
+  --ground: #f5f6f7; --panel: #ffffff; --ink: #1c2024; --muted: #5d6670; --line: #d9dde1;
+  --accent: #0e6f5c; --accent-ink: #ffffff; --user: #e7f1ee; --energy: #8a5a12; --energy-bg: #fbf1df;
+  --danger: #a3261b; --code: #eef0f2;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #111416; --panel: #181c1f; --ink: #e5e8ea; --muted: #98a2ab; --line: #2b3136;
+    --accent: #3fb59b; --accent-ink: #0b1311; --user: #1b2a26; --energy: #e2b46a; --energy-bg: #2a2214;
+    --danger: #ff8a7a; --code: #22282c;
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #111416; --panel: #181c1f; --ink: #e5e8ea; --muted: #98a2ab; --line: #2b3136;
+  --accent: #3fb59b; --accent-ink: #0b1311; --user: #1b2a26; --energy: #e2b46a; --energy-bg: #2a2214;
+  --danger: #ff8a7a; --code: #22282c;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--ground); color: var(--ink); font: 15px/1.55 var(--sans); display: flex; flex-direction: column; }
+header { display: flex; gap: 10px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0 8px 0 0; letter-spacing: .02em; }
+header h1 span { color: var(--muted); font-weight: 400; }
+select, input, textarea, button { font: inherit; color: inherit; }
+select, input[type=text], input[type=password], input[type=number], textarea {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.spacer { flex: 1; }
+#settings { display: none; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+#settings.open { display: flex; }
+#settings label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+#settings textarea { width: min(520px, 90vw); min-height: 56px; color: var(--ink); }
+#settings input[type=number] { width: 96px; color: var(--ink); }
+main { flex: 1; overflow-y: auto; padding: 20px 16px 8px; }
+#log { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+.msg { padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); overflow-wrap: anywhere; }
+.msg.user { background: var(--user); align-self: flex-end; max-width: 85%; white-space: pre-wrap; }
+.msg.error { border-color: var(--danger); color: var(--danger); }
+.msg pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; font: 13px/1.45 var(--mono); }
+.msg code { font-family: var(--mono); font-size: 13px; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.msg pre code { background: none; padding: 0; }
+.msg p { margin: 0 0 8px; } .msg p:last-child { margin: 0; }
+details.think { margin-bottom: 8px; color: var(--muted); font-size: 14px; }
+details.think summary { cursor: pointer; }
+details.think div { white-space: pre-wrap; border-left: 2px solid var(--line); padding-left: 10px; margin-top: 6px; }
+.meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; font: 12px/1.4 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.chip { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
+.chip.energy { background: var(--energy-bg); color: var(--energy); border-color: transparent; }
+.empty { color: var(--muted); text-align: center; margin-top: 12vh; }
+.empty strong { color: var(--ink); }
+footer { padding: 10px 16px 16px; }
+form { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+form textarea { flex: 1; resize: none; min-height: 44px; max-height: 40vh; color: var(--ink); }
+.sr { position: absolute; left: -9999px; }
+@media (prefers-reduced-motion: no-preference) { .msg { animation: in .12s ease-out; } @keyframes in { from { opacity: 0; transform: translateY(3px); } } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ferric <span>chat</span></h1>
+  <label class="sr" for="model">Model</label>
+  <select id="model" aria-label="Model"></select>
+  <span class="spacer"></span>
+  <button id="clear" type="button">New chat</button>
+  <button id="toggle" type="button" aria-expanded="false" aria-controls="settings">Settings</button>
+</header>
+<section id="settings" aria-label="Settings">
+  <label>System prompt<textarea id="system" placeholder="Optional instructions for the model"></textarea></label>
+  <label>Temperature<input id="temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+  <label>Max tokens<input id="max" type="number" min="1" max="32768" step="1" value="1024"></label>
+  <label>API key<input id="key" type="password" autocomplete="off" placeholder="only if the server has one"></label>
+</section>
+<main id="scroll">
+  <div id="log" aria-live="polite"></div>
+</main>
+<footer>
+  <form id="form">
+    <label class="sr" for="input">Message</label>
+    <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for a new line"></textarea>
+    <button id="send" class="primary" type="submit">Send</button>
+  </form>
+</footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("ferric." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("ferric." + k, JSON.stringify(v)); } catch {} },
+};
+let history = store.get("history", []);
+let busy = null; // the AbortController of the request in flight
+
+for (const [id, key] of [["system", "system"], ["temp", "temp"], ["max", "max"], ["key", "key"]]) {
+  const el = $(id), v = store.get(key, null);
+  if (v !== null) el.value = v;
+  el.addEventListener("change", () => store.set(key, el.value));
+}
+$("toggle").onclick = () => {
+  const open = $("settings").classList.toggle("open");
+  $("toggle").setAttribute("aria-expanded", String(open));
+};
+$("clear").onclick = () => { if (busy) busy.abort(); history = []; store.set("history", history); render(); $("input").focus(); };
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if ($("key").value) h["Authorization"] = "Bearer " + $("key").value;
+  return h;
+}
+
+async function loadModels() {
+  const sel = $("model");
+  try {
+    const r = await fetch("/v1/models", { headers: headers() });
+    const d = await r.json();
+    sel.innerHTML = "";
+    for (const m of d.data || []) {
+      const o = document.createElement("option");
+      o.value = m.id; o.textContent = m.id + (m.loaded === false ? " (loads on first use)" : "");
+      sel.appendChild(o);
+    }
+    const want = store.get("model", null);
+    if (want && [...sel.options].some((o) => o.value === want)) sel.value = want;
+  } catch (e) {
+    sel.innerHTML = "<option>(no model list)</option>";
+  }
+}
+$("model").onchange = () => store.set("model", $("model").value);
+
+// Text is escaped first; then code fences, inline code, bold, paragraphs. Nothing the model writes becomes markup.
+function esc(s) { return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function markdown(src) {
+  const parts = src.split(/```/);
+  let out = "";
+  parts.forEach((p, i) => {
+    if (i % 2 === 1) {
+      const nl = p.indexOf("\n");
+      const body = nl >= 0 && /^[\w+-]*$/.test(p.slice(0, nl)) ? p.slice(nl + 1) : p;
+      out += "<pre><code>" + esc(body.replace(/\n$/, "")) + "</code></pre>";
+    } else {
+      out += esc(p).split(/\n{2,}/).filter((x) => x.trim()).map((para) =>
+        "<p>" + para.replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>").replace(/\n/g, "<br>") + "</p>").join("");
+    }
+  });
+  return out;
+}
+
+function energyChips(meta) {
+  const chips = [];
+  if (meta.tokens != null) chips.push(`${meta.tokens} tokens`);
+  if (meta.tps) chips.push(`${meta.tps.toFixed(1)} tok/s`);
+  if (meta.ttft != null) chips.push(`first token ${(meta.ttft * 1000).toFixed(0)} ms`);
+  const e = meta.energy;
+  let energy = null;
+  if (e && e.joules != null) {
+    energy = { text: `${e.joules.toFixed(2)} J` + (e.joules_per_token != null ? ` · ${(e.joules_per_token * 1000).toFixed(1)} mJ/token` : ""), title: e.meter || "" };
+  } else if (e && e.why) {
+    energy = { text: "energy not attributed", title: e.why };
+  }
+  return { chips, energy };
+}
+
+function bubble(m) {
+  const div = document.createElement("div");
+  div.className = "msg " + (m.role === "user" ? "user" : m.error ? "error" : "assistant");
+  if (m.role === "user") { div.textContent = m.content; return div; }
+  if (m.reasoning) {
+    const d = document.createElement("details");
+    d.className = "think";
+    d.innerHTML = "<summary>Thinking</summary><div></div>";
+    d.querySelector("div").textContent = m.reasoning;
+    div.appendChild(d);
+  }
+  const body = document.createElement("div");
+  body.className = "body";
+  body.innerHTML = m.error ? esc(m.error) : markdown(m.content || "");
+  div.appendChild(body);
+  if (m.meta) {
+    const { chips, energy } = energyChips(m.meta);
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    for (const c of chips) { const s = document.createElement("span"); s.className = "chip"; s.textContent = c; meta.appendChild(s); }
+    if (energy) { const s = document.createElement("span"); s.className = "chip energy"; s.textContent = energy.text; s.title = energy.title; meta.appendChild(s); }
+    div.appendChild(meta);
+  }
+  return div;
+}
+
+function render() {
+  const log = $("log");
+  log.innerHTML = "";
+  if (!history.length) {
+    log.innerHTML = '<div class="empty"><strong>Ask anything.</strong><br>Answers stream from this machine, with the joules each one cost.</div>';
+    return;
+  }
+  for (const m of history) log.appendChild(bubble(m));
+  $("scroll").scrollTop = $("scroll").scrollHeight;
+}
+
+async function send(text) {
+  history.push({ role: "user", content: text });
+  const reply = { role: "assistant", content: "", reasoning: "" };
+  history.push(reply);
+  render();
+  const node = $("log").lastChild;
+  const msgs = [];
+  if ($("system").value.trim()) msgs.push({ role: "system", content: $("system").value.trim() });
+  for (const m of history.slice(0, -1)) if (!m.error) msgs.push({ role: m.role, content: m.content });
+  const body = {
+    model: $("model").value || undefined, messages: msgs, stream: true, stream_options: { include_usage: true },
+    temperature: Number($("temp").value), max_tokens: Number($("max").value),
+  };
+  busy = new AbortController();
+  $("send").textContent = "Stop";
+  const t0 = performance.now();
+  let first = null, usage = null, energy = null;
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(body), signal: busy.signal });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const e = await r.json(); msg = (e.error && (e.error.message || e.error)) || msg; } catch {}
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line.startsWith("data: {")) continue;
+        const d = JSON.parse(line.slice(6));
+        if (d.error) throw new Error(d.error.message || String(d.error));
+        if (d.usage) usage = d.usage;
+        if (d.energy) energy = d.energy;
+        for (const c of d.choices || []) {
+          const delta = c.delta || {};
+          if (delta.content || delta.reasoning_content) { if (first === null) first = performance.now(); }
+          if (delta.content) reply.content += delta.content;
+          if (delta.reasoning_content) reply.reasoning += delta.reasoning_content;
+        }
+        const fresh = bubble(reply);
+        node.replaceChildren(...fresh.childNodes);
+        $("scroll").scrollTop = $("scroll").scrollHeight;
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") { reply.error = e.message; }
+  }
+  const t1 = performance.now();
+  const n = usage ? usage.completion_tokens : null;
+  reply.meta = { tokens: n, tps: n && first !== null && t1 > first ? (n - 1) / ((t1 - first) / 1000) : null,
+                 ttft: first !== null ? (first - t0) / 1000 : null, energy };
+  busy = null;
+  $("send").textContent = "Send";
+  store.set("history", history);
+  render();
+}
+
+$("form").onsubmit = (ev) => {
+  ev.preventDefault();
+  if (busy) { busy.abort(); return; }
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  $("input").style.height = "";
+  send(text);
+};
+$("input").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("form").requestSubmit(); }
+});
+$("input").addEventListener("input", () => { const t = $("input"); t.style.height = ""; t.style.height = t.scrollHeight + "px"; });
+
+render();
+loadModels();
+$("input").focus();
+</script>
+</body>
+</html>

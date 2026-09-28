@@ -273,6 +273,16 @@ pub(crate) struct ServeOpts {
     pub fallback: bool,
 }
 
+/// The bundled chat page (src/ui.html): one self-contained file — no fonts, scripts or styles from anywhere
+/// else, so it works on a machine with no network.
+fn write_ui(stream: &mut TcpStream, body: bool) {
+    use std::io::Write;
+    const UI: &str = include_str!("ui.html");
+    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n", UI.len()).as_bytes());
+    if body { let _ = stream.write_all(UI.as_bytes()); }
+    let _ = stream.flush();
+}
+
 fn authorized(headers: &[(String, String)], key: &str) -> bool {
     headers.iter().any(|(k, v)| (k == "authorization" && v.strip_prefix("Bearer ").map(str::trim) == Some(key)) || (k == "x-api-key" && v.trim() == key))
 }
@@ -623,7 +633,9 @@ impl<S: Source> Pool<S> {
         crate::trace::enter(j.span.take());
         let _current = crate::trace::Current;
         if let Some(key) = &opts.api_key {
-            if j.path != "/health" && !authorized(&j.headers, key) {
+            // The chat page itself is static and public; the API calls it makes carry the key.
+            let public = j.path == "/health" || (j.method == "GET" && (j.path == "/" || j.path == "/ui"));
+            if !public && !authorized(&j.headers, key) {
                 write_json(&mut j.stream, 401, &json!({"error": {"message": "missing or wrong API key: send Authorization: Bearer <key> or x-api-key", "type": "authentication_error"}}));
                 return None;
             }
@@ -633,6 +645,13 @@ impl<S: Source> Pool<S> {
             else { write_json(s, code, &json!({"error": {"message": m, "type": "invalid_request_error", "code": if code == 404 { "model_not_found" } else { "invalid_request" }}})) };
         match (j.method.as_str(), j.path.as_str()) {
             ("GET", "/health") => { write_json(&mut j.stream, 200, &json!({"status": "ok"})); return None; }
+            // The bundled chat page: at /ui, and at / for a browser (an Accept that names text/html). Other
+            // clients asking / keep the one-line text Ollama-style clients probe for.
+            ("GET", "/ui") | ("HEAD", "/ui") => { write_ui(&mut j.stream, j.method == "GET"); return None; }
+            ("GET", "/") | ("HEAD", "/") if j.headers.iter().any(|(k, v)| k == "accept" && v.contains("text/html")) => {
+                write_ui(&mut j.stream, j.method == "GET");
+                return None;
+            }
             ("GET", "/") | ("HEAD", "/") => {
                 use std::io::Write;
                 let b = b"ferric-serve is running (OpenAI /v1 and Ollama /api)";
