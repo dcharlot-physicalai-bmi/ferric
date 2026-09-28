@@ -44,15 +44,20 @@ pub const OUT_MAX: usize = 32768;
 const HDR: usize = 8;
 const NBUCKET: usize = 1024;
 
-/// An approximate penalty on one token, for the device's FILTER only. The host applies the exact
-/// penalties to the reduced row itself; this lets the device rank a penalized token about right.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// An approximate adjustment of one token's logit, for the device's FILTER only. The host applies the
+/// exact adjustments to the reduced row itself; this lets the device rank an adjusted token about right.
+/// Applied in the host sampler's order: `add`, `sub`, `rep`, `sub2`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Patch {
     pub token: u32,
-    /// `x - sub` (OpenAI presence/frequency), applied first.
+    /// `x + add` (OpenAI `logit_bias`; `-inf` bans the token).
+    pub add: Option<f32>,
+    /// `x - sub` (OpenAI presence/frequency).
     pub sub: Option<f32>,
-    /// `x > 0 ? x / rep : x * rep` (llama.cpp repeat penalty), applied second.
+    /// `x > 0 ? x / rep : x * rep` (llama.cpp repeat penalty).
     pub rep: Option<f32>,
+    /// `x - sub2` (DRY).
+    pub sub2: Option<f32>,
 }
 
 /// What one row asks for. `temperature <= 0` is greedy.
@@ -80,7 +85,7 @@ pub enum RowOut {
 
 // ------------------------------------------------------------------------------------------------
 // Kernels. Specs: 8 u32 per request [row, mode(0 greedy|1 sample), T, top_p, top_k, min_p, patch_off,
-// patch_n]. Patches: 4 u32 [token, flags(1 sub|2 rep), sub, rep], sorted by token within a request.
+// patch_n]. Patches: 6 u32 [token, flags(1 add|2 sub|4 rep|8 sub2), add, sub, rep, sub2], sorted by token.
 // `work` per request: [0..16) row stats (max, eps), then NB x 8 block partials.
 // `outb` per request: [status(0 pending|1 id|2 reduced|3 fallback), count, tau_hi, eps, id, ..] + pairs.
 // ------------------------------------------------------------------------------------------------
@@ -97,13 +102,15 @@ fn yval(q: u32, i: u32, raw: f32) -> vec2<f32> {      // (value, 1 if penalized)
     loop {
         if (lo >= hi) { break; }
         let mid = (lo + hi) / 2u;
-        if (patches[(off + mid) * 4u] < i) { lo = mid + 1u; } else { hi = mid; }
+        if (patches[(off + mid) * 6u] < i) { lo = mid + 1u; } else { hi = mid; }
     }
-    if (lo < n && patches[(off + lo) * 4u] == i) {
-        let b = (off + lo) * 4u; let fl = patches[b + 1u];
+    if (lo < n && patches[(off + lo) * 6u] == i) {
+        let b = (off + lo) * 6u; let fl = patches[b + 1u];
         var v = raw;
-        if ((fl & 1u) != 0u) { v = v - bitcast<f32>(patches[b + 2u]); }
-        if ((fl & 2u) != 0u) { let r = bitcast<f32>(patches[b + 3u]); v = select(v * r, v / r, v > 0.0); }
+        if ((fl & 1u) != 0u) { v = v + bitcast<f32>(patches[b + 2u]); }
+        if ((fl & 2u) != 0u) { v = v - bitcast<f32>(patches[b + 3u]); }
+        if ((fl & 4u) != 0u) { let r = bitcast<f32>(patches[b + 4u]); v = select(v * r, v / r, v > 0.0); }
+        if ((fl & 8u) != 0u) { v = v - bitcast<f32>(patches[b + 5u]); }
         return vec2<f32>(v, 1.0);
     }
     return vec2<f32>(raw, 0.0);
@@ -140,7 +147,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             else {
                 if (better(y, i, mv, mi)) { mv = y; mi = i; }
                 if (yv.y == 0.0) { if (better(y, i, uv, ui)) { uv = y; ui = i; } }
-                else { pabs = max(pabs, max(abs(y), abs(raw))); }
+                // A banned token (-inf) is exact on both sides; only finite adjusted values carry error.
+                else if (abs(y) <= 3.4028235e38) { pabs = max(pabs, max(abs(y), abs(raw))); }
             }
         }
     }
@@ -220,7 +228,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             outb[ob] = 2u; outb[ob + 1u] = pn + 1u;
             outb[ob + 8u] = sj[0]; outb[ob + 9u] = bitcast<u32>(logits[rb + sj[0]]);
             for (var k: u32 = 0u; k < pn; k = k + 1u) {
-                let tk = patches[(off + k) * 4u];
+                let tk = patches[(off + k) * 6u];
                 outb[ob + 10u + 2u * k] = tk; outb[ob + 11u + 2u * k] = bitcast<u32>(logits[rb + tk]);
             }
         }
@@ -402,11 +410,12 @@ pub fn select_rows(logits: &Tensor, reqs: &[RowReq]) -> Vec<RowOut> {
     let mut patches: Vec<u32> = Vec::new();
     for r in reqs {
         assert!((r.row + 1) * v <= lg.numel(), "row {} outside the logits", r.row);
-        let off = patches.len() / 4;
+        let off = patches.len() / 6;
         for w in r.patches.windows(2) { assert!(w[0].token < w[1].token, "patches must be sorted by token, one entry each"); }
         for p in &r.patches {
-            let fl = (p.sub.is_some() as u32) | ((p.rep.is_some() as u32) << 1);
-            patches.extend([p.token, fl, p.sub.unwrap_or(0.0).to_bits(), p.rep.unwrap_or(1.0).to_bits()]);
+            let fl = (p.add.is_some() as u32) | ((p.sub.is_some() as u32) << 1) | ((p.rep.is_some() as u32) << 2) | ((p.sub2.is_some() as u32) << 3);
+            patches.extend([p.token, fl, p.add.unwrap_or(0.0).to_bits(), p.sub.unwrap_or(0.0).to_bits(),
+                            p.rep.unwrap_or(1.0).to_bits(), p.sub2.unwrap_or(0.0).to_bits()]);
         }
         specs.extend([r.row as u32, (r.temperature > 0.0) as u32, r.temperature.to_bits(), r.top_p.to_bits(),
                       r.top_k as u32, r.min_p.to_bits(), off as u32, r.patches.len() as u32]);

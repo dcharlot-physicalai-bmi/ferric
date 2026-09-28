@@ -14,65 +14,91 @@ use crate::genopts::{self, Sampling};
 use ferric_tensor::sample::{Patch, RowOut, RowReq};
 use ferric_tensor::Tensor;
 
-/// Device selection on unless `FERRIC_GPU_SAMPLE=0`.
+/// Device selection on unless `FERRIC_GPU_SAMPLE=0` — and not while the NVIDIA native tier is live
+/// (`FERRIC_CUDA`): there the dense model's logits already land in HOST memory
+/// (`Qwen3::forward_cached_last_host`), and selecting on the wgpu device would first upload the row the
+/// host-logits path exists to not move. That tier samples on the host until selection runs in CUDA.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FERRIC_GPU_SAMPLE").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("FERRIC_GPU_SAMPLE").map(|v| v != "0").unwrap_or(true) && !native_host_logits())
 }
 
-/// The prompt tail `select_token` hands the sampler.
-fn tail<'a>(s: &Sampling, prompt: &'a [u32]) -> &'a [u32] { &prompt[prompt.len().saturating_sub(s.repeat_last_n)..] }
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+fn native_host_logits() -> bool { ferric_tensor::cuda::driver().is_some() }
+#[cfg(not(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32"))))]
+fn native_host_logits() -> bool { false }
 
-/// The penalties `genopts::sample` would apply, per token, in its order (presence/frequency, then
-/// repeat) — as the device's approximate filter input, and as the host's exact arithmetic below.
-fn penalties(s: &Sampling, prompt_tail: &[u32], generated: &[u32]) -> Vec<Patch> {
-    let mut m: std::collections::BTreeMap<u32, Patch> = std::collections::BTreeMap::new();
+/// Every per-token logit adjustment `genopts::sample` makes before it samples, in its order:
+/// `logit_bias` (each entry, in list order), presence/frequency, repeat, DRY. Returned per token with
+/// the exact operands, so the host can replay them bit for bit on a reduced row; `patch` is the device's
+/// approximate copy for its filter.
+#[derive(Default)]
+struct Adjust { bias: Vec<f32>, sub: Option<f32>, rep: Option<f32>, dry: Option<f32> }
+
+fn adjustments(s: &Sampling, prompt: &[u32], generated: &[u32], n_vocab: usize) -> std::collections::BTreeMap<u32, Adjust> {
+    let mut m: std::collections::BTreeMap<u32, Adjust> = std::collections::BTreeMap::new();
+    for &(t, b) in &s.logit_bias { if (t as usize) < n_vocab { m.entry(t).or_default().bias.push(b); } }
     if s.presence_penalty != 0.0 || s.frequency_penalty != 0.0 {
         let mut counts = std::collections::HashMap::<u32, u32>::new();
         for &t in generated { *counts.entry(t).or_default() += 1; }
         for (&t, &c) in &counts {
-            m.entry(t).or_insert(Patch { token: t, sub: None, rep: None }).sub = Some(s.presence_penalty + s.frequency_penalty * c as f32);
+            if (t as usize) < n_vocab { m.entry(t).or_default().sub = Some(s.presence_penalty + s.frequency_penalty * c as f32); }
         }
     }
     if s.repeat_penalty != 1.0 && s.repeat_last_n > 0 {
-        for &t in prompt_tail.iter().chain(generated.iter()).rev().take(s.repeat_last_n) {
-            m.entry(t).or_insert(Patch { token: t, sub: None, rep: None }).rep = Some(s.repeat_penalty);
+        let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
+        for &t in tail.iter().chain(generated.iter()).rev().take(s.repeat_last_n) {
+            if (t as usize) < n_vocab { m.entry(t).or_default().rep = Some(s.repeat_penalty); }
         }
     }
-    m.into_values().collect()
+    if s.dry_multiplier > 0.0 {
+        // DRY's penalty depends on the context, not on the row: run the reference on a zero row and read
+        // it back (`0 - pen` is `-pen` exactly), so the replay below subtracts the very same operand.
+        let mut z = vec![0f32; n_vocab];
+        let ctx: Vec<u32> = prompt.iter().chain(generated.iter()).copied().collect();
+        genopts::apply_dry(&mut z, &ctx, s.dry_multiplier, s.dry_base, s.dry_allowed_length, &s.dry_breakers, s.dry_range);
+        for (t, &x) in z.iter().enumerate() { if x != 0.0 { m.entry(t as u32).or_default().dry = Some(-x); } }
+    }
+    m
 }
 
-/// The device request for row `row`, or `None` when these settings are not served on the device.
+/// The device request for row `row`, or `None` when these settings are not served on the device:
+/// top-nσ takes the standard deviation of the WHOLE row, which a reduced row does not carry.
 pub(crate) fn request(row: usize, s: &Sampling, prompt: &[u32], generated: &[u32], n_vocab: usize) -> Option<RowReq> {
-    // A NaN or non-finite temperature takes a branch of the reference nobody should rely on; leave it there.
-    if !(s.temperature.is_finite()) || !(s.top_p.is_finite()) || !(s.min_p.is_finite()) { return None; }
-    let patches: Vec<Patch> = penalties(s, tail(s, prompt), generated).into_iter().filter(|p| (p.token as usize) < n_vocab).collect();
+    if !(s.temperature.is_finite() && s.top_p.is_finite() && s.min_p.is_finite()) || s.top_n_sigma > 0.0 { return None; }
+    let patches = adjustments(s, prompt, generated, n_vocab).into_iter().map(|(t, a)| Patch {
+        token: t,
+        add: (!a.bias.is_empty()).then(|| a.bias.iter().sum()),
+        sub: a.sub, rep: a.rep, sub2: a.dry,
+    }).collect();
     Some(RowReq { row, temperature: s.temperature, top_p: s.top_p, top_k: s.top_k, min_p: s.min_p, patches })
 }
 
 /// The token `genopts::sample` picks from the full row, from what the device returned — or `None` if
 /// the device's answer cannot be verified, in which case the caller samples the full row. On `Some`,
-/// `rng` has advanced exactly as `genopts::sample` on the full row advances it.
+/// `rng` (and Mirostat's running `mu`) have advanced exactly as `genopts::sample` on the full row
+/// advances them.
 pub(crate) fn finish(out: &RowOut, s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
     let (ids, raw, tau_hi) = match out {
         RowOut::Id(t) => return Some(*t),
         RowOut::Fallback => return None,
         RowOut::Reduced { ids, raw, tau_hi, .. } => (ids, raw, *tau_hi),
     };
-    if ids.is_empty() || ids.windows(2).any(|w| w[0] >= w[1]) {
-        // greedy-with-penalties rows come unsorted; anything else must be strictly increasing
-        if s.temperature > 0.0 { return None; }
-    }
-    // (1) The penalties, with genopts::sample's arithmetic, on the tokens present.
+    if s.top_n_sigma > 0.0 { return None; }
+    // (1) The adjustments, with genopts::sample's arithmetic and order, on the tokens present.
     let mut order: Vec<usize> = (0..ids.len()).collect();
     order.sort_by_key(|&k| ids[k]);
     let (ids, mut row): (Vec<u32>, Vec<f32>) = order.iter().map(|&k| (ids[k], raw[k])).unzip();
-    if ids.windows(2).any(|w| w[0] == w[1]) { return None; }
-    for p in penalties(s, tail(s, prompt), generated) {
-        let Ok(k) = ids.binary_search(&p.token) else { continue };
+    if ids.is_empty() || ids.windows(2).any(|w| w[0] == w[1]) { return None; }
+    // Only tokens present are adjusted, so the adjustment table need not reach past the largest id here.
+    let adj = adjustments(s, prompt, generated, ids[ids.len() - 1] as usize + 1);
+    for (&t, a) in &adj {
+        let Ok(k) = ids.binary_search(&t) else { continue };
         let x = &mut row[k];
-        if let Some(sub) = p.sub { *x -= sub; }
-        if let Some(rep) = p.rep { *x = if *x > 0.0 { *x / rep } else { *x * rep }; }
+        for &b in &a.bias { *x += b; }
+        if let Some(sub) = a.sub { *x -= sub; }
+        if let Some(rep) = a.rep { *x = if *x > 0.0 { *x / rep } else { *x * rep }; }
+        if let Some(d) = a.dry { *x -= d; }
     }
     if row.iter().any(|x| x.is_nan()) { return None; }
     // (2) Coverage, with the host's own exp: everything the sorted prefix reaches must be here. Every
@@ -94,9 +120,13 @@ pub(crate) fn finish(out: &RowOut, s: &Sampling, prompt: &[u32], generated: &[u3
             if !idx.iter().any(|&i| { cum += probs[i] / sum; cum >= s.top_p }) { return None; }
         }
     }
-    // (3) The reference, on the reduced row; the penalties are already in it.
-    let s2 = Sampling { presence_penalty: 0.0, frequency_penalty: 0.0, repeat_penalty: 1.0, ..s.clone() };
+    // (3) The reference, on the reduced row. The adjustments are already in it; XTC's special tokens
+    // are named by position in THIS row (the reference compares candidate indices against them).
+    let xtc_specials = s.xtc_specials.iter().filter_map(|t| ids.binary_search(t).ok().map(|k| k as u32)).collect();
+    let s2 = Sampling { presence_penalty: 0.0, frequency_penalty: 0.0, repeat_penalty: 1.0, logit_bias: Vec::new(),
+                        dry_multiplier: 0.0, xtc_specials, ..s.clone() };
     let pos = genopts::sample(&row, &s2, &[], &[], rng) as usize;
+    s.mirostat_mu.set(s2.mirostat_mu.get());
     Some(ids[pos])
 }
 
@@ -155,7 +185,8 @@ mod tests {
         row
     }
 
-    fn settings() -> Vec<Sampling> {
+    /// `hot`: a token the rows make likely, so DRY's penalty and XTC's special-token rule change picks.
+    fn settings(hot: u32) -> Vec<Sampling> {
         let d = Sampling::default();
         let mut v = vec![
             Sampling { temperature: 0.0, ..d.clone() },                                   // greedy
@@ -172,7 +203,18 @@ mod tests {
             Sampling { temperature: 1.5, ..d.clone() },                                   // flat: exercises Fallback
             Sampling { temperature: 0.8, top_p: 1.0, ..d.clone() },                       // needs the whole row
         ];
-        v.push(Sampling { temperature: 0.8, repeat_penalty: 0.8, repeat_last_n: 8, ..d });
+        v.push(Sampling { temperature: 0.8, repeat_penalty: 0.8, repeat_last_n: 8, ..d.clone() });
+        // main's extended samplers (S16): each changes what the device must carry or the host must replay
+        v.push(Sampling { temperature: 0.8, logit_bias: vec![(1, 5.0), (2, f32::NEG_INFINITY), (1, -0.25), (70_000, 3.5)], ..d.clone() });
+        v.push(Sampling { temperature: 0.0, logit_bias: vec![(3, 40.0), (4, f32::NEG_INFINITY)], ..d.clone() });
+        v.push(Sampling { temperature: 0.9, dry_multiplier: 0.8, dry_allowed_length: 1, ..d.clone() });
+        v.push(Sampling { temperature: 0.9, dry_multiplier: 6.0, dry_allowed_length: 2, ..d.clone() });
+        v.push(Sampling { temperature: 0.0, dry_multiplier: 6.0, dry_allowed_length: 2, ..d.clone() });
+        v.push(Sampling { temperature: 1.0, xtc_probability: 1.0, xtc_threshold: 0.02, xtc_specials: vec![hot], ..d.clone() });
+        v.push(Sampling { temperature: 1.0, typical_p: 0.7, ..d.clone() });
+        v.push(Sampling { temperature: 1.0, mirostat: 2, mirostat_tau: 3.0, ..d.clone() });
+        v.push(Sampling { temperature: 1.0, xtc_probability: 0.9, xtc_threshold: 0.05, xtc_specials: vec![5, 6], ..d.clone() });
+        v.push(Sampling { temperature: 1.0, top_n_sigma: 1.5, ..d });
         v
     }
 
@@ -186,21 +228,31 @@ mod tests {
         let Some(ctx) = ctx() else { return };
         let v = 151_936;
         let mut rng = Rng(0xfeed_5eed);
-        let (mut same, mut fell_back, mut device, mut sums) = (0usize, 0usize, 0usize, 0usize);
+        let (mut same, mut fell_back, mut device, mut sums, mut declined) = (0usize, 0usize, 0usize, 0usize, 0usize);
         for round in 0..6 {
-            let rows: Vec<Vec<f32>> = (0..4).map(|k| lm_row(&mut rng, v, [11.0, 9.0, 13.0, 7.0][k])).collect();
+            let mut rows: Vec<Vec<f32>> = (0..4).map(|k| lm_row(&mut rng, v, [11.0, 9.0, 13.0, 7.0][k])).collect();
+            let mut prompt: Vec<u32> = (0..50).map(|_| (rng.next() as u32) % v as u32).collect();
+            let mut generated: Vec<u32> = (0..12).map(|i| if i % 3 == 0 { prompt[i] } else { (rng.next() as u32) % v as u32 }).collect();
+            // A repeat DRY must see: the prompt holds [x, y, hot] and the generation ends [x, y], so DRY
+            // penalises `hot` — which every row makes the argmax, so the penalty moves picks. XTC's special
+            // token is `hot` too, so its keep-the-special rule decides.
+            let hot = (rng.next() as u32) % v as u32;
+            let (x, y) = ((rng.next() as u32) % v as u32, (rng.next() as u32) % v as u32);
+            prompt[20..23].copy_from_slice(&[x, y, hot]);
+            generated[10] = x; generated[11] = y;
+            for row in rows.iter_mut() { let m = row.iter().cloned().fold(f32::MIN, f32::max); row[hot as usize] = m + 0.25; }
             let flat: Vec<f32> = rows.concat();
             let t = ferric_tensor::Tensor::from_vec(&ctx, &flat, &[rows.len(), v]);
-            let prompt: Vec<u32> = (0..50).map(|_| (rng.next() as u32) % v as u32).collect();
-            let generated: Vec<u32> = (0..12).map(|i| if i % 3 == 0 { prompt[i] } else { (rng.next() as u32) % v as u32 }).collect();
-            for s in settings() {
-                let reqs: Vec<RowReq> = (0..rows.len()).map(|r| request(r, &s, &prompt, &generated, v).unwrap()).collect();
+            for s in settings(hot) {
+                let Some(reqs) = (0..rows.len()).map(|r| request(r, &s, &prompt, &generated, v)).collect::<Option<Vec<RowReq>>>() else {
+                    declined += 1; continue };
                 let outs = ferric_tensor::sample::select_rows(&t, &reqs);
                 if std::env::var("GS_DEBUG").is_ok() { eprintln!("{s:?} -> {:?}", outs.iter().map(|o| match o { RowOut::Reduced { ids, .. } => format!("R{}", ids.len()), o => format!("{o:?}") }).collect::<Vec<_>>()); }
                 // The invariant the reduced row rests on, checked directly: over a plain-nucleus row the
                 // host's sequential Σp over the reduced row is the full row's Σp, to the bit. (Token
                 // equality alone would miss most wrong sums: a sum off by an ulp rarely moves a pick.)
-                if s.temperature > 0.0 && s.top_k == 0 && s.min_p == 0.0 && s.presence_penalty == 0.0 && s.frequency_penalty == 0.0 && s.repeat_penalty == 1.0 {
+                if s.temperature > 0.0 && s.top_k == 0 && s.min_p == 0.0 && s.presence_penalty == 0.0 && s.frequency_penalty == 0.0 && s.repeat_penalty == 1.0
+                    && s.logit_bias.is_empty() && s.dry_multiplier == 0.0 {
                     for (r, out) in outs.iter().enumerate() {
                         let RowOut::Reduced { ids, .. } = out else { continue };
                         let row = &rows[r];
@@ -214,12 +266,14 @@ mod tests {
                 for (r, out) in outs.iter().enumerate() {
                     for seed in [DEFAULT_RNG, 1, 0x9E37_79B9_7F4A_7C15 ^ round as u64] {
                         let (mut a, mut b) = (seed, seed);
-                        let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
-                        let want = sample(&rows[r], &s, tail, &generated, &mut a);
-                        let got = match finish(out, &s, &prompt, &generated, &mut b) {
+                        // Two copies of the settings: Mirostat's running mu must evolve identically on both paths.
+                        let (sa, sb) = (s.clone(), s.clone());
+                        let want = sample(&rows[r], &sa, &prompt, &generated, &mut a);
+                        let got = match finish(out, &sb, &prompt, &generated, &mut b) {
                             Some(tok) => { device += 1; tok }
-                            None => { fell_back += 1; sample(&rows[r], &s, tail, &generated, &mut b) }
+                            None => { fell_back += 1; sample(&rows[r], &sb, &prompt, &generated, &mut b) }
                         };
+                        assert_eq!(sa.mirostat_mu.get().to_bits(), sb.mirostat_mu.get().to_bits(), "{s:?}: Mirostat's mu diverged");
                         assert_eq!(got, want, "row {r} {s:?} seed {seed:#x}: device {got} vs reference {want} (out {:?})",
                                    match out { RowOut::Reduced { ids, .. } => format!("reduced {}", ids.len()), o => format!("{o:?}") });
                         assert_eq!(a, b, "row {r} {s:?}: the RNG must advance exactly as the reference advances it");
@@ -228,7 +282,8 @@ mod tests {
                 }
             }
         }
-        eprintln!("device selection: {same} picks identical to genopts::sample ({device} finished from the device's answer, {fell_back} fell back); {sums} reduced-row sums equal to the full row's");
+        eprintln!("device selection: {same} picks identical to genopts::sample ({device} finished from the device's answer, {fell_back} fell back); {sums} reduced-row sums equal to the full row's; {declined} (setting, batch) pairs declined (top-nσ)");
+        assert!(declined > 0, "the top-nσ setting must be declined, not served from a reduced row");
         assert!(device >= 2 * fell_back, "the device path must carry most picks, or this compares the reference to itself");
     }
 
@@ -247,14 +302,14 @@ mod tests {
         let mut r5 = vec![f32::NEG_INFINITY; v]; r5[4999] = 7.0; rows.push(r5);
         let flat: Vec<f32> = rows.concat();
         let t = ferric_tensor::Tensor::from_vec(&ctx, &flat, &[rows.len(), v]);
-        for s in settings() {
-            let reqs: Vec<RowReq> = (0..rows.len()).map(|r| request(r, &s, &[1, 2, 3, 4000], &[20, 3000], v).unwrap()).collect();
+        for s in settings(4000) {
+            let Some(reqs) = (0..rows.len()).map(|r| request(r, &s, &[1, 2, 3, 4000], &[20, 3000], v)).collect::<Option<Vec<RowReq>>>() else { continue };
             let outs = ferric_tensor::sample::select_rows(&t, &reqs);
             for (r, out) in outs.iter().enumerate() {
                 let (mut a, mut b) = (DEFAULT_RNG, DEFAULT_RNG);
-                let tail = &[1u32, 2, 3, 4000][4usize.saturating_sub(s.repeat_last_n)..];
-                let want = sample(&rows[r], &s, tail, &[20, 3000], &mut a);
-                let got = finish(out, &s, &[1, 2, 3, 4000], &[20, 3000], &mut b).unwrap_or_else(|| sample(&rows[r], &s, tail, &[20, 3000], &mut b));
+                let (sa, sb) = (s.clone(), s.clone());
+                let want = sample(&rows[r], &sa, &[1, 2, 3, 4000], &[20, 3000], &mut a);
+                let got = finish(out, &sb, &[1, 2, 3, 4000], &[20, 3000], &mut b).unwrap_or_else(|| sample(&rows[r], &sb, &[1, 2, 3, 4000], &[20, 3000], &mut b));
                 assert_eq!((got, b), (want, a), "row {r} {s:?}: {out:?}");
                 if r == 3 { assert_eq!(out, &RowOut::Fallback, "a NaN row must come back as Fallback"); }
             }
@@ -299,20 +354,21 @@ mod tests {
                     (t, 6)
                 } else { (lg.clone(), 1) };
                 let host = pollster::block_on(t.to_vec());
-                for s in settings() {
-                    let reqs: Vec<RowReq> = (0..rows_n).map(|k| request(k, &s, &prompt, &generated, v).unwrap()).collect();
+                for s in settings(generated.last().copied().unwrap_or(0)) {
+                    let Some(reqs) = (0..rows_n).map(|k| request(k, &s, &prompt, &generated, v)).collect::<Option<Vec<RowReq>>>() else { continue };
                     let outs = ferric_tensor::sample::select_rows(&t, &reqs);
                     if std::env::var("GS_DEBUG").is_ok() { eprintln!("T={} p={} k={} mp={} -> {:?}", s.temperature, s.top_p, s.top_k, s.min_p, outs.iter().map(|o| match o { RowOut::Reduced { ids, .. } => format!("R{}", ids.len()), o => format!("{o:?}") }).collect::<Vec<_>>()); }
                     for (k, out) in outs.iter().enumerate() {
                         let row = &host[k * v..(k + 1) * v];
                         for seed in [DEFAULT_RNG, 7, 0xABCDEF ^ step as u64] {
                             let (mut a, mut b) = (seed, seed);
-                            let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
-                            let want = sample(row, &s, tail, &generated, &mut a);
-                            let got = match finish(out, &s, &prompt, &generated, &mut b) {
+                            let (sa, sb) = (s.clone(), s.clone());
+                            let want = sample(row, &sa, &prompt, &generated, &mut a);
+                            let got = match finish(out, &sb, &prompt, &generated, &mut b) {
                                 Some(x) => { device += 1; x }
-                                None => { fell_back += 1; sample(row, &s, tail, &generated, &mut b) }
+                                None => { fell_back += 1; sample(row, &sb, &prompt, &generated, &mut b) }
                             };
+                            assert_eq!(sa.mirostat_mu.get().to_bits(), sb.mirostat_mu.get().to_bits());
                             assert_eq!((got, b), (want, a), "prompt {p} step {step} row {k} {s:?} seed {seed:#x}");
                             same += 1;
                         }
