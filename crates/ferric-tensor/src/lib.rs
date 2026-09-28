@@ -21,6 +21,7 @@ use wgpu::util::DeviceExt;
 pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod cpu_simd; // CPU vector-unit kernels + worker pool: the fabric's second compute unit
+pub mod cpu_q; // the CPU fabric: GGUF block-format matmul (NEON+dotprod / scalar) on a persistent pool
 pub mod iq_grids;
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)

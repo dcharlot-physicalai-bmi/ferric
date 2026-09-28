@@ -18,6 +18,9 @@ use ferric_tensor::{nn, KvBuf, QMatrix, Tensor};
 use crate::lora::{Active, DeviceLora, Slot};
 use std::sync::Arc;
 
+/// The CPU fabric's tier for this runtime (`FERRIC_CPU=1`). A child module so it reuses the private
+/// decisions below instead of copying them — see its module doc.
+mod cpu;
 
 /// Env-gated dump matching `llama-eval-callback`'s tensor names, for bisecting a divergence against
 /// the reference one tensor at a time. `FERRIC_DUMP=<block index>`.
@@ -573,6 +576,9 @@ pub struct Cache {
     /// Which LongRoPE table the cached rows were rotated with (`Some(true)` = long); `None` on a model
     /// without LongRoPE, or for rows installed from outside (`set_layers`).
     rope_long: Option<bool>,
+    /// CPU fabric: THIS sequence's K/V as host rows. `None` until a CPU forward runs on it; brought to
+    /// `pos` lazily (rows past it dropped) at the start of each CPU forward — see `CpuKv::sync`.
+    cpu: Option<cpu::CpuKv>,
 }
 /// The device half of a [`Cache`] (see its `native` field) and the context its rows are pulled with.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
@@ -946,7 +952,8 @@ pub struct Qwen3 {
     tok_embd: EmbdTable,
     layers: Vec<Layer>,
     out_norm: Tensor,
-    lm_head: QMatrix,
+    /// `None` when the weights live on the CPU fabric (`cpu`), which holds its own head.
+    lm_head: Option<QMatrix>,
     embd_type: u32,
     rope_freqs: Option<Tensor>, // Llama-3 rope-scaling factors [head_dim/2]; None for Qwen
     /// Phi-3 LongRoPE: two tables switched per forward, plus a cos/sin scale. See [`LongRope`].
@@ -968,6 +975,9 @@ pub struct Qwen3 {
     /// target the weights as stored.
     fused_qkv: bool,
     fused_gate_up: bool,
+    /// The CPU fabric's copy of the weights (`FERRIC_CPU=1` at load) — INSTEAD of `layers`/`lm_head`,
+    /// not beside them. See `qwen3::cpu`.
+    cpu: Option<cpu::CpuModel>,
 }
 /// The NVIDIA decode graph's lifecycle on one model: built on the first eligible step, or refused
 /// ONCE with the reason printed — a refusal used to retry (and re-read every norm from the GPU) on
@@ -975,6 +985,43 @@ pub struct Qwen3 {
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 #[derive(Default)]
 enum NativeSlot { #[default] Untried, Refused, Ready(ferric_tensor::cuda::DecodeGraph) }
+/// **Per-layer attention geometry**: (rope θ, sliding window, whether the layer ropes at all).
+///
+/// Extracted from [`build_layer`] unchanged so the CPU fabric (`qwen3::cpu`) builds its layers from the
+/// SAME decisions — the Gemma dual base, the windows, NoPE, and the `FERRIC_ONE_ROPE` / `FERRIC_NO_SWA`
+/// negative controls — rather than a second copy that could drift.
+pub(crate) fn layer_attn_plan(g: &impl GgufSource, cfg: &Cfg, il: usize) -> (f32, usize, bool) {
+    // Gemma alternates attention: 1 global layer every 6 (full attn, θ=rope_base=1e6), the rest
+    // local (sliding-window, θ=1e4). Non-Gemma layers are always full causal (window 0).
+    // Local (sliding-window) layer unless it's the global one every `sliding_pattern` layers.
+    let is_local = cfg.swa.get(il).copied().unwrap_or(false);
+    // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
+    // Gemma-3 alone uses a DUAL theta: local layers rotate at 1e4 while global layers use
+    // rope_base (1e6). Gemma-2 is uniform. This rule must stay keyed on `is_gemma` — it was
+    // keyed on `is_local` alone, and the moment `is_local` stopped meaning "Gemma local layer"
+    // every other windowed architecture silently had its theta replaced by 10000. Muse Glimmer
+    // rotates its local layers at rope_base = 500000; at 1e4 the model loads, produces finite
+    // logits, and emits newlines forever.
+    //
+    // The local θ is DECLARED by current converters as `rope.freq_base_swa` (from the authors'
+    // `rope_local_base_freq`, 10000 on every released Gemma 3) and is read from there; a file
+    // without the key gets the authors' 10000. ModernBERT is the reason not to hardcode it: two
+    // bases that happen to match on one checkpoint make a one-base port exact there and wrong
+    // on the next.
+    //
+    // Negative controls for `scripts/lm_conformance.sh`: `FERRIC_ONE_ROPE` rotates the local
+    // layers at the global base, `FERRIC_NO_SWA` lets them see the whole sequence. Each must
+    // move the logits, or the gate has not shown it can see that mechanism.
+    let local_base = || -> f32 {
+        let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => String::new() };
+        match g.metadata().get(&format!("{arch}.rope.freq_base_swa")) { Some(Meta::F(v)) => *v as f32, _ => 10000.0 }
+    };
+    let one_rope = std::env::var("FERRIC_ONE_ROPE").is_ok();
+    let rope_base = if cfg.is_gemma && !cfg.gemma2 && is_local && !one_rope { local_base() } else { cfg.rope_base };
+    let window = if is_local && std::env::var("FERRIC_NO_SWA").is_err() { cfg.sliding_window } else { 0 };
+    (rope_base, window, !cfg.nope_global || is_local)
+}
+
 /// Build one transformer layer from a weight source.
 ///
 /// Extracted from `Qwen3::load` unchanged, so a layer can also be built **on demand** from bytes a tier
@@ -1014,34 +1061,7 @@ pub fn build_layer(
             } else {
                 (Proj::load(ctx, g, &[&b("ffn_up.weight")])?, cfg.n_ff)
             };
-            // Gemma alternates attention: 1 global layer every 6 (full attn, θ=rope_base=1e6), the rest
-            // local (sliding-window, θ=1e4). Non-Gemma layers are always full causal (window 0).
-            // Local (sliding-window) layer unless it's the global one every `sliding_pattern` layers.
-            let is_local = cfg.swa.get(il).copied().unwrap_or(false);
-            // Gemma-3 alternates rope θ (local 1e4 / global rope_base=1e6); Gemma-2 is uniform (rope_base=1e4).
-            // Gemma-3 alone uses a DUAL theta: local layers rotate at 1e4 while global layers use
-            // rope_base (1e6). Gemma-2 is uniform. This rule must stay keyed on `is_gemma` — it was
-            // keyed on `is_local` alone, and the moment `is_local` stopped meaning "Gemma local layer"
-            // every other windowed architecture silently had its theta replaced by 10000. Muse Glimmer
-            // rotates its local layers at rope_base = 500000; at 1e4 the model loads, produces finite
-            // logits, and emits newlines forever.
-            //
-            // The local θ is DECLARED by current converters as `rope.freq_base_swa` (from the authors'
-            // `rope_local_base_freq`, 10000 on every released Gemma 3) and is read from there; a file
-            // without the key gets the authors' 10000. ModernBERT is the reason not to hardcode it: two
-            // bases that happen to match on one checkpoint make a one-base port exact there and wrong
-            // on the next.
-            //
-            // Negative controls for `scripts/lm_conformance.sh`: `FERRIC_ONE_ROPE` rotates the local
-            // layers at the global base, `FERRIC_NO_SWA` lets them see the whole sequence. Each must
-            // move the logits, or the gate has not shown it can see that mechanism.
-            let local_base = || -> f32 {
-                let arch = match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => String::new() };
-                match g.metadata().get(&format!("{arch}.rope.freq_base_swa")) { Some(Meta::F(v)) => *v as f32, _ => 10000.0 }
-            };
-            let one_rope = std::env::var("FERRIC_ONE_ROPE").is_ok();
-            let rope_base = if cfg.is_gemma && !cfg.gemma2 && is_local && !one_rope { local_base() } else { cfg.rope_base };
-            let window = if is_local && std::env::var("FERRIC_NO_SWA").is_err() { cfg.sliding_window } else { 0 };
+            let (rope_base, window, layer_ropes) = layer_attn_plan(g, cfg, il);
             Ok(Layer {
                 attn_norm: nrm(&b("attn_norm.weight"), cfg.n_embd)?,
                 ffn_norm: nrm(&b("ffn_norm.weight"), cfg.n_embd)?,
@@ -1060,7 +1080,7 @@ pub fn build_layer(
                     None => None,
                 },
                 // NoPE on the global layers; every other architecture ropes every layer.
-                rope: !cfg.nope_global || is_local,
+                rope: layer_ropes,
                 post_attn_norm: if cfg.post_norms { Some(nrm(&b("post_attention_norm.weight"), cfg.n_embd)?) } else { None },
                 post_ffn_norm: if cfg.post_norms { Some(nrm(&b("post_ffw_norm.weight"), cfg.n_embd)?) } else { None },
                 rope_base,
@@ -1189,6 +1209,15 @@ impl Qwen3 {
         embd: Option<(Arc<dyn ferric_tier::Backing + Send + Sync>, u64)>,
     ) -> Result<Qwen3, String> {
         let cfg = Cfg::from_gguf(g)?;
+        // The CPU fabric loads its own copy of the weights INSTEAD of the GPU's (resident loads only: a
+        // streamed load is the browser's path). A model it cannot run is loaded for the GPU, said once.
+        let cpu = if resident && embd.is_none() && cpu::selected() {
+            match cpu::CpuModel::load(g, &cfg) {
+                Ok(m) => Some(m),
+                Err(why) => { eprintln!("cpu: FERRIC_CPU is set but this model stays on the GPU — {why}"); None }
+            }
+        } else { None };
+        let resident = resident && cpu.is_none();
         let mut layers = Vec::with_capacity(cfg.n_layer);
         // Gemma's `(1+w)` RMSNorm is folded into the weight at GGUF-conversion time (llama.cpp adds 1 to
         // every `*_norm` weight), so at runtime it's a plain rmsnorm·weight — no offset here. `nrm` just
@@ -1234,7 +1263,7 @@ impl Qwen3 {
                 None => EmbdTable::Resident(g.raw("token_embd.weight")?),
             },
             out_norm: nrm("output_norm.weight", cfg.n_embd)?,
-            lm_head: qm(ctx, g, head)?,
+            lm_head: if cpu.is_some() { None } else { Some(qm(ctx, g, head)?) },
             embd_type: g.tensor("token_embd.weight").ok_or("no token_embd")?.ggml_type,
             // The device path's multiplier table (`FERRIC_ROPE_DEVICE`, and the `rope_freqs.is_some()` guards
             // on the fused and native paths), derived from the host record above: DIVISORS inverted.
@@ -1249,7 +1278,7 @@ impl Qwen3 {
             arch: match g.metadata().get("general.architecture") { Some(Meta::Str(a)) => a.clone(), _ => "qwen3".into() },
             fused_qkv: g.tensor("blk.0.attn_qkv.weight").is_some(),
             fused_gate_up: g.tensor("blk.0.ffn_gate.weight").is_none(),
-            cfg, ctx: ctx.clone(), layers, stream: None,
+            cfg, ctx: ctx.clone(), layers, stream: None, cpu,
         })
     }
 
@@ -1310,6 +1339,17 @@ impl Qwen3 {
         if let Some((_, c, sn)) = cache.iter().find(|(k, _, _)| *k == key) { return (c.clone(), sn.clone()); }
         // A new forward (other rows) retires the previous one's tables.
         cache.retain(|((r, _, _), _, _)| *r == key.0);
+        let (cv, sv) = self.rope_host(rows, t, base, long);
+        let half = self.cfg.head_dim / 2;
+        let (c, sn) = (Tensor::from_vec(&self.ctx, &cv, &[t, half]), Tensor::from_vec(&self.ctx, &sv, &[t, half]));
+        cache.push((key, c.clone(), sn.clone()));
+        (c, sn)
+    }
+
+    /// The cos/sin values of [`Self::rope_table`], on the host: `t` rows of `head_dim/2`, for the
+    /// LongRoPE table `long` (`None` without LongRoPE). Shared with the CPU fabric (`qwen3::cpu`), so
+    /// both fabrics rotate by the identical angles.
+    pub(crate) fn rope_host(&self, rows: &RopeRows, t: usize, base: f32, long: Option<bool>) -> (Vec<f32>, Vec<f32>) {
         let inv = match (&self.longrope, long) {
             (Some(lr), Some(l)) => rope_inv_freq(base, self.cfg.head_dim, &RopeScale::Ext(if l { lr.long_ext.clone() } else { lr.short_ext.clone() })),
             _ => rope_inv_freq(base, self.cfg.head_dim, &self.rope_scale),
@@ -1328,9 +1368,7 @@ impl Qwen3 {
                 sv.push(a.sin() as f32 * af);
             }
         }
-        let (c, sn) = (Tensor::from_vec(&self.ctx, &cv, &[t, half]), Tensor::from_vec(&self.ctx, &sv, &[t, half]));
-        cache.push((key, c.clone(), sn.clone()));
-        (c, sn)
+        (cv, sv)
     }
 
     /// Which LongRoPE table a forward of `t` rows starting at position `first_pos` uses: `None` on a
@@ -1959,6 +1997,7 @@ impl Qwen3 {
                 self.longrope.is_some());
         assert_eq!(tokens.len(), caches.len(), "one token per sequence");
         assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
+        if self.cpu.is_some() { return self.cpu_forward_batch(tokens, caches); }
         let mut x = self.embed(tokens);
         // Each row's adapters come from ITS cache — the per-request selection. Resolved once here,
         // before the layers borrow the caches mutably.
@@ -1976,6 +2015,10 @@ impl Qwen3 {
 
     /// The layer at `il`: resident, or materialised from the tier.
     fn layer_ref(&self, il: usize) -> crate::stream::LayerRef<'_> {
+        // The stepped, embeddings-in and GPU-profiling forwards read GPU layers, which a CPU-fabric load
+        // does not build. Name that rather than index an empty vector.
+        assert!(self.cpu.is_none(), "this forward is not on the CPU fabric (FERRIC_CPU): only forward, \
+                                     forward_cached(_last), forward_hidden and forward_batch are");
         match &self.stream {
             Some(s) => s.layer(il).expect("streamed layer"),
             None => crate::stream::LayerRef::Borrowed(&self.layers[il]),
@@ -2155,7 +2198,7 @@ impl Qwen3 {
     /// whatever this architecture applies after it (logit scale, final softcap), without the final
     /// norm, which that hidden state already carries.
     pub fn logits_from_normed(&self, normed: &Tensor) -> Tensor {
-        let lg = normed.matmul_q(&self.lm_head);
+        let lg = normed.matmul_q(self.lm_head.as_ref().expect("the LM head is on the CPU fabric (FERRIC_CPU): use forward_cached"));
         let lg = if self.cfg.logit_scale != 1.0 && std::env::var("FERRIC_NOLOGITSCALE").is_err() {
             lg.mul(&lg.scalar(self.cfg.logit_scale))
         } else { lg };
@@ -2172,6 +2215,7 @@ impl Qwen3 {
     /// Feed `tokens`, carrying K/V in `cache`. Prompt once, then one token per step. Returns logits.
     pub fn forward_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
+        if self.cpu.is_some() { return self.cpu_forward(tokens, cache, cpu::Out::All); }
         // NVIDIA tier 2 (opt-in, FERRIC_CUDA): one resident decode step per token after a WGSL prefill.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
         {
@@ -2196,6 +2240,7 @@ impl Qwen3 {
     /// readback, 16% of the prefill's GPU time on its own. Returns `[1, vocab]`.
     pub fn forward_cached_last(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         use ferric_tensor::{batch, prof};
+        if self.cpu.is_some() { return self.cpu_forward(tokens, cache, cpu::Out::Last); }
         if tokens.len() == 1 { return self.forward_cached(tokens, cache); }
         let refill;
         let tokens = match self.longrope_refill(tokens, cache) { Some(all) => { refill = all; &refill[..] } None => tokens };
@@ -2338,7 +2383,7 @@ impl Qwen3 {
             d: c.n_embd, nh: c.n_head, nkv: c.n_head_kv, dh: c.head_dim, n_ff: c.n_ff, n_vocab: c.n_vocab,
             eps: c.eps, rope_base: c.rope_base, has_qk_norm: qk_norm,
             rope_ff: self.rope_freqs.as_ref().map(tv), norm_pairs,
-            layers, out_norm: tv(&self.out_norm), lm_head: nw(&self.lm_head, "the LM head")?,
+            layers, out_norm: tv(&self.out_norm), lm_head: nw(self.lm_head.as_ref().ok_or("the LM head is on the CPU fabric")?, "the LM head")?,
         })
     }
     /// Fetch embedding rows on demand instead of holding the whole table.
@@ -2361,12 +2406,13 @@ impl Qwen3 {
 
     /// The frozen quantized LM head [n_vocab, n_embd] — for `Var::matmul_qf` (LoRA around it without
     /// dequantizing to fp).
-    pub fn lm_head(&self) -> &ferric_tensor::QMatrix { &self.lm_head }
+    pub fn lm_head(&self) -> &ferric_tensor::QMatrix { self.lm_head.as_ref().expect("the LM head is on the CPU fabric (FERRIC_CPU)") }
 
     /// The hidden state ENTERING block `first` (output of block `first−1`, before its attn_norm) — the
     /// frozen input a multi-block fine-tuner reconstructs the last `n_layer−first` blocks on top of.
     pub fn hidden_before_block(&self, tokens: &[u32], first: usize) -> Tensor {
         use ferric_tensor::batch;
+        assert!(self.cpu.is_none(), "hidden_before_block is not on the CPU fabric (FERRIC_CPU)");
         let mut cache = Cache::new(&self.cfg);
         let mut x = self.embed(tokens);
         let pos = cache.pos;
@@ -2393,6 +2439,7 @@ impl Qwen3 {
     /// (Non-Gemma path; Qwen3 is non-Gemma.)
     pub fn ffn_input_last(&self, tokens: &[u32]) -> Tensor {
         use ferric_tensor::batch;
+        assert!(self.cpu.is_none(), "ffn_input_last is not on the CPU fabric (FERRIC_CPU)");
         let mut cache = Cache::new(&self.cfg);
         let mut x = self.embed(tokens);
         let pos = cache.pos;
@@ -2420,6 +2467,7 @@ impl Qwen3 {
     pub fn forward_hidden(&self, tokens: &[u32]) -> Tensor {
         use ferric_tensor::batch;
         let mut cache = Cache::new(&self.cfg);
+        if self.cpu.is_some() { return self.cpu_forward(tokens, &mut cache, cpu::Out::Hidden); }
         let x = self.run_layers(tokens, &mut cache);
         batch(&self.ctx, || x.rmsnorm(&self.out_norm, self.cfg.eps))
     }
