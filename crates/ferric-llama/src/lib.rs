@@ -88,6 +88,7 @@ pub mod prefix;
 pub mod stream;
 pub mod cosmos;
 pub mod qwen35;
+pub mod prism_rot; // PrismML Bonsai 2: Hadamard-folded weights that carry their activation transform
 pub mod qwen3;
 pub mod lora; // unmerged LoRA for the Dense runtime: per-sequence adapter selection
 pub mod lfm2; // Liquid LFM2/LFM2.5 with real KV + conv state
