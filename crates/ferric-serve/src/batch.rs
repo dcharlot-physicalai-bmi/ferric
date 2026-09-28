@@ -887,9 +887,8 @@ impl ServeModel for Engine {
     /// A chunk continues the cache exactly as a prompt-cache hit does (the suffix after a seeded prefix),
     /// so chunked and whole prefill feed the same tokens through the same cached forward.
     fn feed(&self, c: &mut ModelCache, toks: &[u32], last: bool) -> Option<Vec<f32>> {
-        let v = pollster::block_on(self.model.forward_cached_last(toks, c).to_vec());
-        let nv = self.model.n_vocab();
-        last.then(|| v[v.len() - nv..].to_vec())
+        let v = self.model.forward_cached_last_host(toks, c);
+        last.then_some(v)
     }
 
     fn decode(&self, toks: &[u32], states: &mut [&mut ModelCache]) -> Vec<f32> {
@@ -900,8 +899,7 @@ impl ServeModel for Engine {
             // with N=1.
             let mut out = Vec::with_capacity(toks.len() * nv);
             for (i, &t) in toks.iter().enumerate() {
-                let v = pollster::block_on(self.model.forward_cached(&[t], &mut *states[i]).to_vec());
-                out.extend_from_slice(&v[v.len() - nv..]);
+                out.extend_from_slice(&self.model.forward_cached_last_host(&[t], &mut *states[i]));
             }
             return out;
         }

@@ -15,15 +15,21 @@
 //!
 //! Three tiers, all behind `FERRIC_CUDA`:
 //!  1. `QDev::gemv` — one Q5_K GEMV per call (the `matmul_q5_k` hook), verifiable in isolation.
-//!  2. [`DecodeGraph::step`] — a whole dense decode step resident on the device: one `[d]` row in,
-//!     one `[n_vocab]` row out. Weights in Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 (a whole Q4_K_M, Q5_K_M or
-//!     Q8_0 file), q/k/v bias, QK-norm, NEOX or NORM rope with optional per-frequency factors.
-//!  3. [`DecodeGraph::prefill`] — a prompt's rows through every layer on the tensor cores
-//!     (`cuda_prefill.cu`), weights as exact integer codes and activations split hi/lo f16, so it
-//!     rounds nothing the f32 path does not; `FERRIC_CUDA_NO_PREFILL` keeps prompts on WGSL.
+//!  2. [`DecodeGraph::step`] — a whole dense decode step resident on the device, CAPTURED ONCE AS A
+//!     CUDA GRAPH and replayed per token: one step block in (input row, rope row, row/position, K/V
+//!     addresses), one `[n_vocab]` row out into pinned host memory. Weights in Q4_K / Q5_K / Q6_K /
+//!     Q8_0 / Q5_0 (a whole Q4_K_M, Q5_K_M or Q8_0 file), q/k/v bias, QK-norm, NEOX or NORM rope with
+//!     the rope angles built on the HOST exactly as the portable path builds them; split-K attention
+//!     over a fixed grid (flash-decoding), so its cost follows the K/V bytes, not the context's length.
+//!  3. [`DecodeGraph::prefill`] — a prompt's rows through every layer on the INTEGER tensor cores
+//!     (`cuda_prefill.cu` GEMM v3: weights as exact integer codes, activations as three int8 digits of
+//!     a per-row-tile 22-bit fixed point, every in-tile sum exact) and a register-tiled causal
+//!     attention; `FERRIC_CUDA_NO_PREFILL` keeps prompts on WGSL, `FERRIC_CUDA_GEMM=v1` /
+//!     `FERRIC_CUDA_ATTN_PREFILL_V1` the previous kernels.
 //! The K/V rows live in a per-sequence [`DevKv`] owned by the caller's cache, grown on demand (no
 //! context cap), and the WGSL store is brought level lazily in either direction.
-//! `scripts/cuda_conformance.sh` gates all of it against WGSL and the models' authors.
+//! `scripts/cuda_conformance.sh` gates all of it against WGSL and the models' authors;
+//! `scripts/cuda_rope_conformance.sh` the rope angles at position 30,000.
 #![cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 
 use libloading::{Library, Symbol};
@@ -38,6 +44,8 @@ type CUfunction = *mut c_void;
 type CUdeviceptr = u64;
 type CUstream = *mut c_void;
 type CUevent = *mut c_void;
+type CUgraph = *mut c_void;
+type CUgraphExec = *mut c_void;
 
 macro_rules! sym {
     ($lib:expr, $name:literal, $ty:ty) => {{
@@ -72,6 +80,19 @@ pub struct Driver {
     cu_event_record: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
     cu_event_synchronize: unsafe extern "C" fn(CUevent) -> CUresult,
     cu_event_elapsed: unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult,
+    /// Streams, pinned host memory and async copies — the decode step's own stream (see [`DecodeGraph`]).
+    cu_stream_create: unsafe extern "C" fn(*mut CUstream, u32) -> CUresult,
+    cu_stream_destroy: unsafe extern "C" fn(CUstream) -> CUresult,
+    cu_stream_synchronize: unsafe extern "C" fn(CUstream) -> CUresult,
+    cu_mem_alloc_host: unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult,
+    cu_mem_free_host: unsafe extern "C" fn(*mut c_void) -> CUresult,
+    cu_memcpy_htod_async: unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
+    cu_memcpy_dtoh_async: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
+    /// Stream capture + graph replay (CUDA 11.4+ drivers). `None` on an older driver: the step then
+    /// runs its launches eagerly on the same stream — same kernels, same numbers, more host time.
+    graph: Option<GraphApi>,
+    /// Streaming multiprocessors on device 0 — sizes the split attention's fixed grid.
+    pub sm_count: u32,
     /// `cuDeviceGetName` of device 0, so the native tier can be NAMED in every harness header — the
     /// wgpu adapter line says nothing about which GPU libcuda opened.
     pub name: String,
@@ -82,12 +103,27 @@ pub struct Driver {
     prefill: OnceLock<Option<PrefillK>>,
 }
 
+/// The driver's stream-capture and graph entry points (see [`Driver::graph`]).
+#[derive(Clone, Copy)]
+struct GraphApi {
+    begin_capture: unsafe extern "C" fn(CUstream, u32) -> CUresult,
+    end_capture: unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult,
+    instantiate: unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult,
+    launch: unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult,
+    destroy: unsafe extern "C" fn(CUgraph) -> CUresult,
+    exec_destroy: unsafe extern "C" fn(CUgraphExec) -> CUresult,
+}
+
 /// The prefill kernel table, resolved by name from `cuda_prefill.ptx`.
 #[derive(Clone, Copy)]
 pub(crate) struct PrefillK {
-    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format.
-    gemm: [CUfunction; 5],
+    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format — v1 (f16 hi/lo
+    /// activations, 64x64 tile) and v3 (integer tensor cores, activations as three int8 digits of a
+    /// per-row-tile fixed point; cuda_prefill.cu GEMM v3).
+    gemm: [CUfunction; 5], gemm3: [CUfunction; 5],
     swiglu_rows: CUfunction, attn_prefill: CUfunction,
+    /// The register-tiled causal attention (cuda_prefill.cu, v2); `FERRIC_CUDA_ATTN_PREFILL_V1` keeps v1.
+    attn_prefill2: CUfunction,
 }
 unsafe impl Send for PrefillK {}
 unsafe impl Sync for PrefillK {}
@@ -99,7 +135,16 @@ unsafe impl Sync for PrefillK {}
 /// words: finite output, wrong model, no error. Named fields make that a compile error instead.
 #[derive(Clone, Copy)]
 pub(crate) struct DecodeK {
-    rmsnorm: CUfunction, add_rmsnorm: CUfunction, qk_norm_rope: CUfunction, attn_decode: CUfunction,
+    rmsnorm: CUfunction, add_rmsnorm: CUfunction, qk_norm_rope: CUfunction,
+    /// The argument form of `attn_decode_step` — the step reads through the step block now, and the
+    /// tests hold the two to bit-identity, which is what ties the step kernel to the f64-checked one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    attn_decode: CUfunction,
+    /// The decode step's rope and attention: row, position and K/V addresses read from the step block,
+    /// so one captured graph serves every token of every sequence (cuda_decode.cu, THE STEP BLOCK).
+    qk_norm_rope_step: CUfunction, attn_decode_step: CUfunction,
+    /// Split-K decode attention over a fixed (G, n_kv) grid and its chunk merge (cuda_decode.cu).
+    attn_split: CUfunction, attn_split_step: CUfunction, attn_combine: CUfunction,
     quant_x_q8: CUfunction, q5k_gemv_q8: CUfunction, q5k_swiglu_gemv_q8: CUfunction,
     /// Indexed by `QFmt as usize`: the GEMV and the fused gate|up + SwiGLU for each weight format.
     gemv: [CUfunction; 5], swiglu: [CUfunction; 5],
@@ -145,8 +190,24 @@ impl Driver {
             cu_event_record: sym!(lib, "cuEventRecord", unsafe extern "C" fn(CUevent, CUstream) -> CUresult),
             cu_event_synchronize: sym!(lib, "cuEventSynchronize", unsafe extern "C" fn(CUevent) -> CUresult),
             cu_event_elapsed: sym!(lib, "cuEventElapsedTime", unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult),
+            cu_stream_create: sym!(lib, "cuStreamCreate", unsafe extern "C" fn(*mut CUstream, u32) -> CUresult),
+            cu_stream_destroy: sym!(lib, "cuStreamDestroy_v2", unsafe extern "C" fn(CUstream) -> CUresult),
+            cu_stream_synchronize: sym!(lib, "cuStreamSynchronize", unsafe extern "C" fn(CUstream) -> CUresult),
+            cu_mem_alloc_host: sym!(lib, "cuMemAllocHost_v2", unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult),
+            cu_mem_free_host: sym!(lib, "cuMemFreeHost", unsafe extern "C" fn(*mut c_void) -> CUresult),
+            cu_memcpy_htod_async: sym!(lib, "cuMemcpyHtoDAsync_v2", unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult),
+            cu_memcpy_dtoh_async: sym!(lib, "cuMemcpyDtoHAsync_v2", unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult),
+            graph: (|| Some(GraphApi {
+                begin_capture: sym!(lib, "cuStreamBeginCapture_v2", unsafe extern "C" fn(CUstream, u32) -> CUresult),
+                end_capture: sym!(lib, "cuStreamEndCapture", unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult),
+                instantiate: sym!(lib, "cuGraphInstantiateWithFlags", unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult),
+                launch: sym!(lib, "cuGraphLaunch", unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult),
+                destroy: sym!(lib, "cuGraphDestroy", unsafe extern "C" fn(CUgraph) -> CUresult),
+                exec_destroy: sym!(lib, "cuGraphExecDestroy", unsafe extern "C" fn(CUgraphExec) -> CUresult),
+            }))(),
             _ctx: std::ptr::null_mut(),
             name: String::new(),
+            sm_count: 0,
             gemv_q5k: OnceLock::new(),
             decode: OnceLock::new(),
             prefill: OnceLock::new(),
@@ -166,7 +227,11 @@ impl Driver {
             let name = if get_name(buf.as_mut_ptr() as *mut c_char, 128, dev) == 0 {
                 CStr::from_ptr(buf.as_ptr() as *const c_char).to_string_lossy().into_owned()
             } else { String::from("?") };
-            Some(Driver { _ctx: ctx, name, ..d })
+            let get_attr = sym!(d._lib, "cuDeviceGetAttribute", unsafe extern "C" fn(*mut i32, i32, CUdevice) -> CUresult);
+            const MULTIPROCESSOR_COUNT: i32 = 16;
+            let mut sms = 0i32;
+            let sm_count = if get_attr(&mut sms, MULTIPROCESSOR_COUNT, dev) == 0 && sms > 0 { sms as u32 } else { 16 };
+            Some(Driver { _ctx: ctx, name, sm_count, ..d })
         }
     }
 
@@ -251,39 +316,50 @@ impl Driver {
     }
     fn decode_kernels(&self) -> Option<&DecodeK> {
         self.decode.get_or_init(|| {
-            const N: [&[u8]; 17] = [b"rmsnorm\0", b"add_rmsnorm\0", b"qk_norm_rope\0", b"attn_decode\0",
+            const N: [&[u8]; 22] = [b"rmsnorm\0", b"add_rmsnorm\0", b"qk_norm_rope\0", b"attn_decode\0",
                 b"quant_x_q8\0", b"q5k_gemv_q8\0", b"q5k_swiglu_gemv_q8\0",
                 // gemv, in QFmt order: Q4_K, Q5_K (the coalesced one, not tier 1's), Q6_K, Q8_0, Q5_0
                 b"q4k_gemv\0", b"q5k_gemv\0", b"q6k_gemv\0", b"q8_0_gemv\0", b"q5_0_gemv\0",
-                b"q4k_swiglu_gemv\0", b"q5k_swiglu_gemv\0", b"q6k_swiglu_gemv\0", b"q8_0_swiglu_gemv\0", b"q5_0_swiglu_gemv\0"];
+                b"q4k_swiglu_gemv\0", b"q5k_swiglu_gemv\0", b"q6k_swiglu_gemv\0", b"q8_0_swiglu_gemv\0", b"q5_0_swiglu_gemv\0",
+                b"qk_norm_rope_step\0", b"attn_decode_step\0", b"attn_split\0", b"attn_split_step\0", b"attn_combine\0"];
             let v = self.load_ptx("cuda_decode.ptx", &N)?;
             Some(DecodeK { rmsnorm: v[0], add_rmsnorm: v[1], qk_norm_rope: v[2], attn_decode: v[3],
                            quant_x_q8: v[4], q5k_gemv_q8: v[5], q5k_swiglu_gemv_q8: v[6],
-                           gemv: [v[7], v[8], v[9], v[10], v[11]], swiglu: [v[12], v[13], v[14], v[15], v[16]] })
+                           gemv: [v[7], v[8], v[9], v[10], v[11]], swiglu: [v[12], v[13], v[14], v[15], v[16]],
+                           qk_norm_rope_step: v[17], attn_decode_step: v[18],
+                           attn_split: v[19], attn_split_step: v[20], attn_combine: v[21] })
         }).as_ref()
     }
 
     fn prefill_kernels(&self) -> Option<&PrefillK> {
         self.prefill.get_or_init(|| {
-            const N: [&[u8]; 7] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
-                                   b"swiglu_rows\0", b"attn_prefill\0"];
+            const N: [&[u8]; 13] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
+                                    b"swiglu_rows\0", b"attn_prefill\0",
+                                    b"q4k_gemm3\0", b"q5k_gemm3\0", b"q6k_gemm3\0", b"q8_0_gemm3\0", b"q5_0_gemm3\0",
+                                    b"attn_prefill2\0"];
             let v = self.load_ptx("cuda_prefill.ptx", &N)?;
-            Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6] })
+            Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6],
+                            gemm3: [v[7], v[8], v[9], v[10], v[11]], attn_prefill2: v[12] })
         }).as_ref()
     }
     /// 2-D grid launch, same contract as [`Driver::launch`].
     unsafe fn launch2(&self, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
+        unsafe { self.launch2_on(std::ptr::null_mut(), f, gx, gy, block, params) }
+    }
+    unsafe fn launch2_on(&self, s: CUstream, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
-        let r = unsafe { (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(),
-                                                 params.as_mut_ptr(), std::ptr::null_mut()) };
+        let r = unsafe { (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, s, params.as_mut_ptr(), std::ptr::null_mut()) };
         if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
         true
     }
     /// 1-D launch with pointer-to-argument slots; errors print here, completion is checked by `sync`.
     unsafe fn launch(&self, f: CUfunction, grid: u32, block: u32, params: &mut [*mut c_void]) -> bool {
+        unsafe { self.launch_on(std::ptr::null_mut(), f, grid, block, params) }
+    }
+    /// [`Driver::launch`] onto stream `s` (null = the legacy stream).
+    unsafe fn launch_on(&self, s: CUstream, f: CUfunction, grid: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
-        let r = (self.cu_launch_kernel)(f, grid, 1, 1, block, 1, 1, 0, std::ptr::null_mut(),
-                                        params.as_mut_ptr(), std::ptr::null_mut());
+        let r = unsafe { (self.cu_launch_kernel)(f, grid, 1, 1, block, 1, 1, 0, s, params.as_mut_ptr(), std::ptr::null_mut()) };
         if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
         true
     }
@@ -422,47 +498,61 @@ struct DW { codes: CUdeviceptr, aux: CUdeviceptr, fmt: QFmt, rows: usize, cols: 
 macro_rules! p { ($($e:expr),*) => { [$( &mut $e as *mut _ as *mut c_void ),*] } }
 
 /// Quantise `x[n]` (f32, device) into `xq` (4 int8 per u32) + `xs` (n/32 scales), n % 32 == 0.
-unsafe fn quant_x(d: &Driver, k: &DecodeK, x: CUdeviceptr, xq: CUdeviceptr, xs: CUdeviceptr, n: usize) -> bool {
+unsafe fn quant_x(d: &Driver, st: CUstream, k: &DecodeK, x: CUdeviceptr, xq: CUdeviceptr, xs: CUdeviceptr, n: usize) -> bool {
     let (mut xp, mut qp, mut sp, mut n32) = (x, xq, xs, n as u32);
-    unsafe { d.launch(k.quant_x_q8, ((n / 32) as u32).div_ceil(4), 128, &mut p!(xp, qp, sp, n32)) }
+    unsafe { d.launch_on(st, k.quant_x_q8, ((n / 32) as u32).div_ceil(4), 128, &mut p!(xp, qp, sp, n32)) }
 }
 /// `out[w.rows] = W · x` for one activation row, any format. `q8 = Some((xq, xs))` routes a Q5_K weight
 /// through the int8-activation dp4a kernel (the FERRIC_CUDA_Q8X numerics trade); other formats ignore it.
-unsafe fn launch_gemv(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdeviceptr,
+unsafe fn launch_gemv(d: &Driver, st: CUstream, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdeviceptr,
                       q8: Option<(CUdeviceptr, CUdeviceptr)>) -> bool {
     let (mut cp, mut ap, mut op, mut o32, mut i32_) = (w.codes, w.aux, out, w.rows as u32, w.cols as u32);
     if let (QFmt::Q5K, Some((xq, xs))) = (w.fmt, q8) {
-        if !unsafe { quant_x(d, k, x, xq, xs, w.cols) } { return false; }
+        if !unsafe { quant_x(d, st, k, x, xq, xs, w.cols) } { return false; }
         let (mut qp, mut sp) = (xq, xs);
-        return unsafe { d.launch(k.q5k_gemv_q8, (w.rows as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, o32, i32_)) };
+        return unsafe { d.launch_on(st, k.q5k_gemv_q8, (w.rows as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, o32, i32_)) };
     }
     let mut xp = x;
-    unsafe { d.launch(k.gemv[w.fmt as usize], (w.rows as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, o32, i32_)) }
+    unsafe { d.launch_on(st, k.gemv[w.fmt as usize], (w.rows as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, o32, i32_)) }
 }
 /// Fused gate|up + SwiGLU: `out[o] = silu(W[o]·x) · W[o + n_ff]·x`, `w.rows == 2·n_ff`. Any format.
-unsafe fn launch_swiglu(d: &Driver, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdeviceptr,
+unsafe fn launch_swiglu(d: &Driver, st: CUstream, k: &DecodeK, x: CUdeviceptr, w: DW, out: CUdeviceptr,
                         q8: Option<(CUdeviceptr, CUdeviceptr)>) -> bool {
     let n_ff = w.rows / 2;
     let (mut cp, mut ap, mut op, mut nff, mut din) = (w.codes, w.aux, out, n_ff as u32, w.cols as u32);
     if let (QFmt::Q5K, Some((xq, xs))) = (w.fmt, q8) {
-        if !unsafe { quant_x(d, k, x, xq, xs, w.cols) } { return false; }
+        if !unsafe { quant_x(d, st, k, x, xq, xs, w.cols) } { return false; }
         let (mut qp, mut sp) = (xq, xs);
-        return unsafe { d.launch(k.q5k_swiglu_gemv_q8, (n_ff as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, nff, din)) };
+        return unsafe { d.launch_on(st, k.q5k_swiglu_gemv_q8, (n_ff as u32).div_ceil(4), 128, &mut p!(qp, sp, cp, ap, op, nff, din)) };
     }
     let mut xp = x;
-    unsafe { d.launch(k.swiglu[w.fmt as usize], (n_ff as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, nff, din)) }
+    unsafe { d.launch_on(st, k.swiglu[w.fmt as usize], (n_ff as u32).div_ceil(4), 128, &mut p!(xp, cp, ap, op, nff, din)) }
 }
 
 /// `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores (f16 in, f32 accumulate; see cuda_prefill.cu).
 /// `ldc` lets several weights write side by side into one wider C (the q|k|v parts). An A value past
-/// f16 range raises `*ovf`.
+/// f16 range (v1) or is not finite raises `*ovf`. Which kernel: `FERRIC_CUDA_GEMM=v1|v3` (default
+/// [`GEMM_DEFAULT`]) — the A/B, and a fallback.
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
                       m: usize, ovf: CUdeviceptr) -> bool {
+    static V: OnceLock<u8> = OnceLock::new();
+    let v = *V.get_or_init(|| match std::env::var("FERRIC_CUDA_GEMM").as_deref() { Ok("v1") => 1, Ok("v3") => 3, _ => GEMM_DEFAULT });
+    unsafe { launch_gemm_v(d, pk, v, a, lda, w, c, ldc, m, ovf) }
+}
+/// The prefill GEMM the tier runs unless told otherwise.
+const GEMM_DEFAULT: u8 = 3;
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_gemm_v(d: &Driver, pk: &PrefillK, v: u8, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
+                        m: usize, ovf: CUdeviceptr) -> bool {
     let (mut ap, mut la, mut cp, mut xp, mut cc, mut lc) = (a, lda as u32, w.codes, w.aux, c, ldc as u32);
     let (mut mm, mut nn, mut kk, mut of) = (m as u32, w.rows as u32, w.cols as u32, ovf);
-    unsafe { d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128,
-                       &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of)) }
+    let prm = &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of);
+    let f = w.fmt as usize;
+    match v {
+        1 => unsafe { d.launch2(pk.gemm[f], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128, prm) },
+        _ => unsafe { d.launch2(pk.gemm3[f], (w.rows as u32).div_ceil(128), (m as u32).div_ceil(64), 256, prm) },
+    }
 }
 
 /// **The K/V cache on the device — one per SEQUENCE, owned by the caller's cache, not by the graph.**
@@ -476,15 +566,20 @@ unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: 
 /// A failed growth changes nothing and returns `false`; the caller then falls back with every row
 /// still intact.
 pub struct DevKv { drv: Arc<Driver>, k: Vec<CUdeviceptr>, v: Vec<CUdeviceptr>, width: usize, cap: usize,
-                   /// Rows valid on the device (== the position of the next token it will write).
-                   pub len: usize }
+                   /// Rows valid on the device (== the ROW the next token writes).
+                   pub len: usize,
+                   /// The absolute position of row 0 — 0 for every real conversation. A cache that
+                   /// STARTS at position P with no rows (the floor fixtures' `position_offset`: the
+                   /// authors' `position_ids = P..P+T-1` with no cache) has `base = P`: rows index the
+                   /// K/V buffers and the causal mask, positions only the rope angles.
+                   pub base: usize }
 unsafe impl Send for DevKv {}
 impl DevKv {
     /// An empty cache for `n_layer` layers of `width` (= n_kv_heads · head_dim) floats per row.
     /// Allocates nothing until [`DevKv::reserve`].
     pub fn new(n_layer: usize, width: usize) -> Option<DevKv> {
         let drv = driver()?.clone();
-        Some(DevKv { drv, k: vec![0; n_layer], v: vec![0; n_layer], width, cap: 0, len: 0 })
+        Some(DevKv { drv, k: vec![0; n_layer], v: vec![0; n_layer], width, cap: 0, len: 0, base: 0 })
     }
     pub fn cap(&self) -> usize { self.cap }
     pub fn width(&self) -> usize { self.width }
@@ -575,13 +670,18 @@ pub struct GraphSpec<'a> {
     pub rope_ff: Option<Vec<f32>>,
     /// ggml NORM pairing `(2c, 2c+1)` (`llama`) instead of NEOX `(c, c + dh/2)` (the Qwen family).
     pub norm_pairs: bool,
+    /// The caller hands in every row's rope cos|sin (`[dh]` per row), built on the host exactly as its
+    /// portable path builds its rope table; `rope_base` / `rope_ff` are then unused. `false` = the
+    /// device derives the angles (the pre-table formula, kept as a negative control).
+    pub rope_host: bool,
     pub layers: Vec<LayerSpec<'a>>,
     pub out_norm: Vec<f32>,
     pub lm_head: NativeWeight<'a>,
 }
 
 /// `FERRIC_CUDA_PROFILE=1`: time each kernel CLASS of a step with cuEvents (a sync per class, so the
-/// profiled step is slower; the per-class numbers are what matter). Printed every 16 steps.
+/// profiled step is slower, and it runs WITHOUT the graph; the per-class numbers are what matter).
+/// Printed every 16 steps.
 struct Prof { on: bool, ev: [CUevent; 2], acc: [f64; 14], steps: u32 }
 const PROF_NAMES: [&str; 14] = ["attn_norm", "qkv_gemv", "qk_norm_rope", "kv_copy", "attn", "wo_gemv",
                                 "add_rmsnorm", "swiglu_gemv", "down_gemv", "resid+next_norm", "head_norm(fused)", "lm_head", "d2h", "h2d"];
@@ -593,11 +693,11 @@ impl Prof {
         if on { unsafe { (drv.cu_event_create)(&mut ev[0], 0); (drv.cu_event_create)(&mut ev[1], 0); } }
         Prof { on, ev, acc: [0.0; 14], steps: 0 }
     }
-    #[inline] fn start(&self, drv: &Driver) { if self.on { unsafe { (drv.cu_event_record)(self.ev[0], std::ptr::null_mut()); } } }
-    #[inline] fn stop(&mut self, drv: &Driver, cls: usize) {
+    #[inline] fn start(&self, drv: &Driver, st: CUstream) { if self.on { unsafe { (drv.cu_event_record)(self.ev[0], st); } } }
+    #[inline] fn stop(&mut self, drv: &Driver, st: CUstream, cls: usize) {
         if !self.on { return; }
         unsafe {
-            (drv.cu_event_record)(self.ev[1], std::ptr::null_mut());
+            (drv.cu_event_record)(self.ev[1], st);
             (drv.cu_event_synchronize)(self.ev[1]);
             let mut ms = 0f32; (drv.cu_event_elapsed)(&mut ms, self.ev[0], self.ev[1]);
             self.acc[cls] += ms as f64;
@@ -616,16 +716,52 @@ impl Prof {
     }
 }
 
+/// Byte layout of the STEP BLOCK (cuda_decode.cu, THE STEP BLOCK): a 16-byte header (row, position),
+/// `2·n_layer` u64 K/V base addresses, the rope row `[dh]`, then the input row `[d]` on a 256-byte
+/// boundary (the GEMVs read x as float4). The host fills a pinned twin and the step's first copy
+/// moves all of it: one transfer carries everything that differs between two tokens.
+#[derive(Clone, Copy, Debug)]
+struct StepLayout { kvp: usize, rope: usize, x: usize, bytes: usize }
+impl StepLayout {
+    fn new(n_layer: usize, dh: usize, d: usize) -> StepLayout {
+        let kvp = 16;
+        let rope = kvp + 16 * n_layer;
+        let x = (rope + 4 * dh).next_multiple_of(256);
+        StepLayout { kvp, rope, x, bytes: x + 4 * d }
+    }
+}
+
+/// Chunks per kv head for the split attention: enough blocks for ~4 per SM across the kv heads — the
+/// grid is FIXED (the graph captures it), and a chunk past the context's end exits at once, so a short
+/// context pays only the launch. 2..=128.
+fn split_chunks(sm_count: u32, nkv: usize) -> u32 { (4 * sm_count).div_ceil(nkv as u32).clamp(2, 128) }
+
+/// Decode steps replayed from the captured graph (not launched one kernel at a time) — so a harness
+/// can prove which way the step ran, as [`native_steps`] does for the tier itself.
+static GRAPH_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn native_graph_steps() -> u64 { GRAPH_STEPS.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// **Tier 2: one dense decode step, fully resident.** Weights, activations and scratch live in device
-/// memory, and the K/V rows in the caller's [`DevKv`]; per token the host copies ONE `[d]` embedding
-/// row in and ONE `[n_vocab]` logits row out. Nothing else crosses the bus.
+/// memory, and the K/V rows in the caller's [`DevKv`]; per token ONE block goes in (the input row, the
+/// rope row, the row/position and the K/V addresses) and ONE `[n_vocab]` logits row comes out.
+///
+/// ⭐ **Replayed as a CUDA graph.** Every launch of a step reads its per-token inputs from the step
+/// block in device memory — no kernel argument changes from one token to the next, and none depends
+/// on which sequence is stepping or where its K/V was last reallocated — so the whole step (copy in,
+/// ~9 launches per layer, copy out) is captured ONCE on the first step and replayed with one
+/// `cuGraphLaunch` per token. `FERRIC_CUDA_NO_GRAPH=1` launches the same list one call at a time (the
+/// A/B, and what `FERRIC_CUDA_PROFILE` does to time each class); the two are bit-identical by
+/// construction and a test holds them to it.
 pub struct DecodeGraph {
     drv: Arc<Driver>,
     d: usize, nh: usize, nkv: usize, dh: usize, n_ff: usize, n_vocab: usize, eps: f32, rope_base: f32,
     has_qk_norm: bool, norm_pairs: bool, rope_ff: Option<CUdeviceptr>,
+    /// The caller hands every step (and prefill row) its rope cos|sin row, built on the host the way
+    /// the WGSL path builds its table; `false` = derive the angles on the device (the old formula).
+    rope_host: bool,
     layers: Vec<LayerDev>,
     out_norm: CUdeviceptr, lm_head: DW,
-    x: CUdeviceptr, xn: CUdeviceptr, qkv: CUdeviceptr, q: CUdeviceptr, k: CUdeviceptr,
+    xn: CUdeviceptr, qkv: CUdeviceptr, q: CUdeviceptr, k: CUdeviceptr,
     attn: CUdeviceptr, y: CUdeviceptr, xy: CUdeviceptr, h: CUdeviceptr, dn: CUdeviceptr, logits: CUdeviceptr,
     q_out: usize, kv_out: usize,
     prof: Prof,
@@ -635,7 +771,27 @@ pub struct DecodeGraph {
     owned: Vec<CUdeviceptr>,
     /// Prefill scratch, allocated on the first prefill and grown on demand (see [`PrefillBufs`]).
     pf: Option<PrefillBufs>,
+    /// The decode stream. A BLOCKING stream (flags 0): it orders with the legacy stream that the
+    /// prefill and the K/V hand-over use, so a step can never read a row a prefill is still writing.
+    stream: CUstream,
+    /// The step block on the device (`x` lives inside it) and its pinned host twin.
+    sb: CUdeviceptr, hb: *mut u8, lay: StepLayout,
+    /// Pinned host logits row — the step's last copy lands here, and `step` hands it back.
+    hl: *mut f32,
+    /// The instantiated step graph, captured on the first step.
+    exec: Option<CUgraphExec>,
+    /// Replay the graph: `FERRIC_CUDA_NO_GRAPH` unset, the driver has the API, capture has not failed.
+    graph_on: bool,
+    /// Split-K attention: `Some(G)` chunks per kv head (cuda_decode.cu SPLIT-K DECODE ATTENTION) with its
+    /// partials buffer; `None` = the one-block-per-head `attn_decode` (FERRIC_CUDA_ATTN_SERIAL, or a head
+    /// group wider than the split kernel holds).
+    split: Option<(u32, CUdeviceptr)>,
+    /// `FERRIC_CUDA_STEPTIME=1`: GPU time of each whole step (two events on the decode stream, no extra
+    /// sync) against the wall time of `step` — the split that says whether a step is waiting on the GPU
+    /// or the GPU is waiting on the host.
+    steptime: Option<StepTime>,
 }
+struct StepTime { ev: [CUevent; 2], gpu_ms: f64, wall_ms: f64, n: u32 }
 
 /// Rows per prefill chunk. A prompt longer than this is run in chunks, each attending to the cache the
 /// previous ones wrote — causal attention makes that exact — so scratch stays bounded (≈85 MB at 512
@@ -646,19 +802,21 @@ fn prefill_chunk() -> usize {
 /// Prefill scratch for up to `rows` rows (and `logit_rows` rows of logits). Indices into `b`:
 const PX: usize = 0; const PXN: usize = 1; const PQKV: usize = 2; const PQ: usize = 3; const PK: usize = 4;
 const PATT: usize = 5; const PY: usize = 6; const PXY: usize = 7; const PGU: usize = 8; const PH: usize = 9;
-const PDN: usize = 10; const POVF: usize = 11; const PLOG: usize = 12;
-struct PrefillBufs { rows: usize, logit_rows: usize, b: [CUdeviceptr; 13] }
+const PDN: usize = 10; const POVF: usize = 11; const PLOG: usize = 12; const PROPE: usize = 13;
+struct PrefillBufs { rows: usize, logit_rows: usize, b: [CUdeviceptr; 14] }
 /// ⛔ **`ferric-serve` asserts `Engine: Send` at compile time, and `Qwen3` owns a
 /// `RefCell<Option<DecodeGraph>>`.** Without this impl the raw handles inside (`CUdeviceptr`,
-/// `CUfunction`, the two `CUevent`s in `Prof`) make `Qwen3` — and therefore the whole server —
-/// `!Send`, which broke `origin/main`'s CI for five pushes. ⚠ It is invisible on macOS: this module
-/// is `#![cfg(linux/windows)]`, so `DecodeGraph` does not exist there and the local Mac gate cannot
-/// see the violation. Cross-check with `--target x86_64-unknown-linux-gnu` before pushing.
+/// `CUfunction`, the two `CUevent`s in `Prof`, the stream, the graph, the pinned buffers) make `Qwen3`
+/// — and therefore the whole server — `!Send`, which broke `origin/main`'s CI for five pushes. ⚠ It is
+/// invisible on macOS: this module is `#![cfg(linux/windows)]`, so `DecodeGraph` does not exist there
+/// and the local Mac gate cannot see the violation. Cross-check with `--target x86_64-unknown-linux-gnu`
+/// before pushing.
 ///
 /// **Why it is sound.** These handles belong to the CUDA *context*, not to a thread, and every entry
 /// point — `launch`, `sync`, `alloc`, `htod`, `dtoh`, and `step` itself — calls `Driver::bind()`
 /// first, which makes the context current on whatever thread is using it (thread_local, once per
-/// thread). `Driver` already carries the same pair of impls for the same reason.
+/// thread). `Driver` already carries the same pair of impls for the same reason. The pinned buffers are
+/// only touched by `step`, through `&mut self`.
 /// ⛔ **`Send`, deliberately NOT `Sync`**: the graph owns mutable device scratch (`x`, `xn`, `qkv`,
 /// `xq`, …) that two threads must never drive at once. The `RefCell` around it already forbids that;
 /// this keeps the type system saying so too.
@@ -697,93 +855,213 @@ impl DecodeGraph {
         let out_norm = up(&spec.out_norm)?;
         let rope_ff = match &spec.rope_ff { Some(v) => Some(up(v)?), None => None };
         let widest = d.max(q_out).max(spec.n_ff);
+        let lay = StepLayout::new(spec.layers.len(), dh, d);
         let mut al = |bytes: usize| -> Option<CUdeviceptr> { let p = drv.alloc(bytes)?; owned.push(p); Some(p) };
+        let (xn, qkv, q, k) = (al(d * 4)?, al((q_out + 2 * kv_out) * 4)?, al(q_out * 4)?, al(kv_out * 4)?);
+        let (attn, y, xy, h, dn) = (al(q_out * 4)?, al(d * 4)?, al(d * 4)?, al(spec.n_ff * 4)?, al(d * 4)?);
+        let logits = al(spec.n_vocab * 4)?;
+        // ⛔ Sized by the WIDEST input a Q5_K GEMV can see. It was `d.max(q_out)`, which a Q5_K
+        // ffn_down (input n_ff) would have overrun under FERRIC_CUDA_Q8X — Qwen3-0.6B's down is
+        // Q6_K, which is the only reason it never fired.
+        let (xq, xs) = (al(widest)?, al(widest / 32 * 4 + 4)?);
+        let sb = al(lay.bytes)?;
+        let g = nh / nkv;
+        let split = if std::env::var("FERRIC_CUDA_ATTN_SERIAL").is_err() && g <= 16 && g * dh <= 2048 {
+            let chunks = split_chunks(drv.sm_count, nkv);
+            Some((chunks, al(nh * chunks as usize * (dh + 2) * 4)?))
+        } else { None };
+        drv.bind();
+        let mut stream: CUstream = std::ptr::null_mut();
+        let (mut hb, mut hl): (*mut c_void, *mut c_void) = (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            let free_all = |owned: &[CUdeviceptr]| for &p in owned { (drv.cu_mem_free)(p); };
+            if (drv.cu_stream_create)(&mut stream, 0) != 0 { free_all(&owned); return None; }
+            if (drv.cu_mem_alloc_host)(&mut hb, lay.bytes) != 0 || (drv.cu_mem_alloc_host)(&mut hl, spec.n_vocab * 4) != 0 {
+                if !hb.is_null() { (drv.cu_mem_free_host)(hb); }
+                (drv.cu_stream_destroy)(stream); free_all(&owned); return None;
+            }
+            std::ptr::write_bytes(hb as *mut u8, 0, lay.bytes);
+        }
+        let graph_on = std::env::var("FERRIC_CUDA_NO_GRAPH").is_err() && drv.graph.is_some();
+        let steptime = std::env::var("FERRIC_CUDA_STEPTIME").is_ok().then(|| {
+            let mut ev: [CUevent; 2] = [std::ptr::null_mut(); 2];
+            unsafe { (drv.cu_event_create)(&mut ev[0], 0); (drv.cu_event_create)(&mut ev[1], 0); }
+            StepTime { ev, gpu_ms: 0.0, wall_ms: 0.0, n: 0 }
+        });
         Some(DecodeGraph {
             d, nh, nkv, dh, n_ff: spec.n_ff, n_vocab: spec.n_vocab, eps: spec.eps, rope_base: spec.rope_base,
-            has_qk_norm: spec.has_qk_norm, norm_pairs: spec.norm_pairs, rope_ff, layers,
+            has_qk_norm: spec.has_qk_norm, norm_pairs: spec.norm_pairs, rope_ff, rope_host: spec.rope_host, layers,
             out_norm, lm_head: spec.lm_head.dw(),
-            x: al(d * 4)?, xn: al(d * 4)?, qkv: al((q_out + 2 * kv_out) * 4)?,
-            q: al(q_out * 4)?, k: al(kv_out * 4)?, attn: al(q_out * 4)?,
-            y: al(d * 4)?, xy: al(d * 4)?, h: al(spec.n_ff * 4)?, dn: al(d * 4)?,
-            logits: al(spec.n_vocab * 4)?,
+            xn, qkv, q, k, attn, y, xy, h, dn, logits,
             q_out, kv_out, prof: Prof::new(&drv),
             q8x: std::env::var("FERRIC_CUDA_Q8X").is_ok(),
-            // ⛔ Sized by the WIDEST input a Q5_K GEMV can see. It was `d.max(q_out)`, which a Q5_K
-            // ffn_down (input n_ff) would have overrun under FERRIC_CUDA_Q8X — Qwen3-0.6B's down is
-            // Q6_K, which is the only reason it never fired.
-            xq: al(widest)?, xs: al(widest / 32 * 4 + 4)?,
-            owned, drv, pf: None,
+            xq, xs,
+            owned, pf: None,
+            stream, sb, hb: hb as *mut u8, lay, hl: hl as *mut f32, exec: None, graph_on, steptime, split,
+            drv,
         })
     }
     /// A [`DevKv`] shaped for this graph.
     pub fn new_kv(&self) -> Option<DevKv> { DevKv::new(self.layers.len(), self.kv_out) }
     /// Rows per layer of K (= of V): `n_kv_heads · head_dim`.
     pub fn kv_width(&self) -> usize { self.kv_out }
+    /// Whether the caller must hand in rope rows (host-built angles) — see [`GraphSpec::rope_host`].
+    pub fn rope_host(&self) -> bool { self.rope_host }
+    /// Turn graph replay off (or back on, if the driver has it) for THIS graph — the eager twin a test
+    /// compares the replay against. A captured graph is kept and reused when turned back on.
+    pub fn set_graph(&mut self, on: bool) { self.graph_on = on && self.drv.graph.is_some(); }
     fn q8(&self) -> Option<(CUdeviceptr, CUdeviceptr)> { self.q8x.then_some((self.xq, self.xs)) }
-    /// One decode step: `x_row` is the (already scaled/normed) embedding of the token at position
-    /// `kv.len`. Returns the logits row and advances `kv.len`. `None` on any failure — including a
-    /// K/V growth that could not allocate — with `kv` unchanged, so the caller can fall back.
-    pub fn step(&mut self, kv: &mut DevKv, x_row: &[f32]) -> Option<Vec<f32>> {
+
+    /// One decode step: `x_row` is the (already scaled/normed) embedding of the token at row `kv.len`
+    /// (position `kv.base + kv.len`); `rope` its cos|sin row `[dh]` when [`DecodeGraph::rope_host`].
+    /// Returns the logits row and advances `kv.len`. `None` on any failure — including a K/V growth
+    /// that could not allocate — with `kv.len` unchanged, so the caller can fall back.
+    pub fn step(&mut self, kv: &mut DevKv, x_row: &[f32], rope: Option<&[f32]>) -> Option<Vec<f32>> {
         if x_row.len() != self.d || kv.n_layer() != self.layers.len() || kv.width() != self.kv_out { return None; }
-        let pos = kv.len;
-        if !kv.reserve(pos + 1) { return None; }
+        if rope.is_some() != self.rope_host || rope.is_some_and(|r| r.len() != self.dh) { return None; }
+        let row = kv.len;
+        let pos = kv.base + row;
+        if pos >= u32::MAX as usize || !kv.reserve(row + 1) { return None; }
         let k = *self.drv.decode_kernels()?;
-        let d = self.d;
+        let nl = self.layers.len();
+        // SAFETY: `hb` is a pinned allocation of `lay.bytes` owned by this graph; every offset written
+        // lies inside it (StepLayout), and no copy is in flight — the previous step synchronised.
+        unsafe {
+            let hb = self.hb;
+            let hdr = hb as *mut u32;
+            *hdr = row as u32; *hdr.add(1) = pos as u32;
+            let kvp = hb.add(self.lay.kvp) as *mut u64;
+            for il in 0..nl { *kvp.add(il) = kv.k[il]; *kvp.add(nl + il) = kv.v[il]; }
+            if let Some(r) = rope { std::ptr::copy_nonoverlapping(r.as_ptr(), hb.add(self.lay.rope) as *mut f32, r.len()); }
+            std::ptr::copy_nonoverlapping(x_row.as_ptr(), hb.add(self.lay.x) as *mut f32, x_row.len());
+        }
         let drv = self.drv.clone();
         drv.bind();
-        let q8 = self.q8();
+        let t0 = std::time::Instant::now();
+        if let Some(st) = &self.steptime { unsafe { (drv.cu_event_record)(st.ev[0], self.stream); } }
         let mut prof = std::mem::replace(&mut self.prof, Prof::off());
-        prof.start(&drv);
-        if !drv.htod(self.x, x_row) { self.prof = prof; return None; }
-        prof.stop(&drv, 13);
-        macro_rules! timed { ($cls:expr, $body:expr) => {{ prof.start(&drv); let ok: bool = $body; prof.stop(&drv, $cls); if !ok { self.prof = prof; return None; } }} }
+        let ok = if prof.on || !self.graph_on { unsafe { self.record(&drv, &k, &mut prof) } } else { self.replay(&drv, &k) };
+        if let Some(st) = &self.steptime { unsafe { (drv.cu_event_record)(st.ev[1], self.stream); } }
+        let ok = ok && {
+            let r = unsafe { (drv.cu_stream_synchronize)(self.stream) };
+            if r != 0 { eprintln!("{}", drv.err("cuStreamSynchronize", r)); }
+            r == 0
+        };
+        prof.tick();
+        self.prof = prof;
+        if !ok { return None; }
+        // SAFETY: `hl` holds `n_vocab` f32, written by the step's last copy, which the sync completed.
+        let out = unsafe { std::slice::from_raw_parts(self.hl, self.n_vocab) }.to_vec();
+        if let Some(st) = &mut self.steptime {
+            let mut ms = 0f32;
+            unsafe { (drv.cu_event_elapsed)(&mut ms, st.ev[0], st.ev[1]); }
+            st.gpu_ms += ms as f64; st.wall_ms += t0.elapsed().as_secs_f64() * 1e3; st.n += 1;
+            if st.n % 128 == 0 {
+                eprintln!("cuda steptime: {} steps ({}): GPU {:.3} ms/step, DecodeGraph::step wall {:.3} ms/step",
+                          st.n, if self.graph_on { "graph" } else { "eager" }, st.gpu_ms / st.n as f64, st.wall_ms / st.n as f64);
+            }
+        }
+        kv.len = row + 1;
+        NATIVE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(out)
+    }
+
+    /// Enqueue one whole step on the decode stream: step block in, every layer, the head, logits out.
+    /// Called directly (eager, and under FERRIC_CUDA_PROFILE) or once inside a stream capture.
+    unsafe fn record(&self, drv: &Driver, k: &DecodeK, prof: &mut Prof) -> bool {
+        let st = self.stream;
+        let (d, nl) = (self.d, self.layers.len());
+        let q8 = self.q8();
+        macro_rules! timed { ($cls:expr, $body:expr) => {{ prof.start(drv, st); let ok: bool = $body; prof.stop(drv, st, $cls); if !ok { return false; } }} }
         unsafe {
+            timed!(13, (drv.cu_memcpy_htod_async)(self.sb, self.hb as *const c_void, self.lay.bytes, st) == 0);
+            let x = self.sb + self.lay.x as u64;
+            let tab = if self.rope_host { self.sb + self.lay.rope as u64 } else { 0 };
             let (mut d32, mut eps) = (d as u32, self.eps);
+            let (mut nh, mut nkv, mut dh, mut nl32, mut sp) = (self.nh as u32, self.nkv as u32, self.dh as u32, nl as u32, self.sb);
             // Layer 0's attn_norm is a plain rmsnorm; every later layer's is fused into the previous
             // layer's residual add (one add_rmsnorm instead of vadd + rmsnorm), and the last layer's
             // residual add is fused with out_norm the same way. 56 fewer launches per token.
-            let nl = self.layers.len();
             for (li, l) in self.layers.iter().enumerate() {
                 if li == 0 {
-                    let (mut x, mut w, mut o) = (self.x, l.attn_norm, self.xn);
-                    timed!(0, drv.launch(k.rmsnorm, 1, 256, &mut p!(x, w, o, d32, eps)));
+                    let (mut xp, mut w, mut o) = (x, l.attn_norm, self.xn);
+                    timed!(0, drv.launch_on(st, k.rmsnorm, 1, 256, &mut p!(xp, w, o, d32, eps)));
                 }
                 timed!(1, { let mut off = 0usize; let mut ok = true;
-                    for &w in &l.qkv { ok &= launch_gemv(&drv, &k, self.xn, w, self.qkv + (off * 4) as u64, q8); off += w.rows; } ok });
+                    for &w in &l.qkv { ok &= launch_gemv(drv, st, k, self.xn, w, self.qkv + (off * 4) as u64, q8); off += w.rows; } ok });
                 let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (self.qkv, l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), self.q, self.k);
-                let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
-                let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, self.q_out as u32, self.has_qk_norm as u32);
-                let rowb = (self.kv_out * 4) as u64;
-                // K and V rows go straight into the cache from the kernel: no D2D copies (class 3 is 0).
-                let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + pos as u64 * rowb, kv.v[li] + pos as u64 * rowb, (self.q_out + self.kv_out) as u32);
-                let (mut bias, mut ff, mut np, mut roww) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, (self.q_out + 2 * self.kv_out) as u32);
-                let heads = (self.nh + self.nkv) as u32;
-                timed!(2, drv.launch(k.qk_norm_rope, heads, 128,
-                                     &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww)));
-                let (mut q, mut kc, mut vc, mut ao, mut s, mut scale) = (self.q, kv.k[li], kv.v[li], self.attn, (pos + 1) as u32, 1.0f32 / (self.dh as f32).sqrt());
-                timed!(4, drv.launch(k.attn_decode, self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh, s, scale)));
-                timed!(5, launch_gemv(&drv, &k, self.attn, l.wo, self.y, q8));
-                let (mut x2, mut y2, mut fw, mut xy, mut xn) = (self.x, self.y, l.ffn_norm, self.xy, self.xn);
-                timed!(6, drv.launch(k.add_rmsnorm, 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
-                timed!(7, launch_swiglu(&drv, &k, self.xn, l.gate_up, self.h, q8));
-                timed!(8, launch_gemv(&drv, &k, self.h, l.down, self.dn, q8));
+                let (mut base, mut qoff, mut koff, mut hn) = (self.rope_base, 0u32, self.q_out as u32, self.has_qk_norm as u32);
+                let (mut voff, mut bias, mut ff, mut np, mut tb, mut li32) =
+                    ((self.q_out + self.kv_out) as u32, l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, tab, li as u32);
+                // K and V rows go straight into the cache from the kernel (class 3 stays 0), at the row
+                // and K/V addresses the step block names.
+                timed!(2, drv.launch_on(st, k.qk_norm_rope_step, (self.nh + self.nkv) as u32, 128,
+                                        &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, eps, qoff, koff, hn, voff, bias, ff, np, tb, sp, li32, nl32)));
+                let (mut q, mut ao, mut scale) = (self.q, self.attn, 1.0f32 / (self.dh as f32).sqrt());
+                match self.split {
+                    Some((chunks, part)) => {
+                        let (mut pp, mut gg) = (part, chunks);
+                        timed!(4, drv.launch2_on(st, k.attn_split_step, chunks, self.nkv as u32, 128, &mut p!(q, pp, nh, nkv, dh, scale, sp, li32, nl32))
+                                  && drv.launch_on(st, k.attn_combine, self.nh as u32, (self.dh as u32).next_multiple_of(32), &mut p!(pp, ao, dh, gg)));
+                    }
+                    None => timed!(4, drv.launch_on(st, k.attn_decode_step, self.nh as u32, 128, &mut p!(q, ao, nh, nkv, dh, scale, sp, li32, nl32))),
+                }
+                timed!(5, launch_gemv(drv, st, k, self.attn, l.wo, self.y, q8));
+                let (mut x2, mut y2, mut fw, mut xy, mut xn) = (x, self.y, l.ffn_norm, self.xy, self.xn);
+                timed!(6, drv.launch_on(st, k.add_rmsnorm, 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
+                timed!(7, launch_swiglu(drv, st, k, self.xn, l.gate_up, self.h, q8));
+                timed!(8, launch_gemv(drv, st, k, self.h, l.down, self.dn, q8));
                 // x = xy + dn, and in the same kernel xn = rmsnorm(x) * (next attn_norm | out_norm)
                 let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
-                let (mut a, mut b, mut nw, mut xo, mut xno) = (self.xy, self.dn, next_w, self.x, self.xn);
-                timed!(9, drv.launch(k.add_rmsnorm, 1, 256, &mut p!(a, b, nw, xo, xno, d32, eps)));
+                let (mut a, mut b, mut nw, mut xo, mut xno) = (self.xy, self.dn, next_w, x, self.xn);
+                timed!(9, drv.launch_on(st, k.add_rmsnorm, 1, 256, &mut p!(a, b, nw, xo, xno, d32, eps)));
             }
-            timed!(11, launch_gemv(&drv, &k, self.xn, self.lm_head, self.logits, q8));
+            timed!(11, launch_gemv(drv, st, k, self.xn, self.lm_head, self.logits, q8));
+            timed!(12, (drv.cu_memcpy_dtoh_async)(self.hl as *mut c_void, self.logits, self.n_vocab * 4, st) == 0);
         }
-        if !drv.sync() { self.prof = prof; return None; }
-        let mut out = vec![0f32; self.n_vocab];
-        prof.start(&drv);
-        if !drv.dtoh(&mut out, self.logits) { self.prof = prof; return None; }
-        prof.stop(&drv, 12);
-        prof.tick();
-        self.prof = prof;
-        kv.len = pos + 1;
-        NATIVE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(out)
+        true
+    }
+
+    /// Launch the step as ONE graph, capturing it first if this is the first step. A capture that
+    /// fails turns replay off for this graph (said once) and the step runs eagerly instead.
+    fn replay(&mut self, drv: &Driver, k: &DecodeK) -> bool {
+        let Some(g) = drv.graph else { return unsafe { self.record(drv, k, &mut Prof::off()) } };
+        if self.exec.is_none() {
+            match unsafe { self.capture(drv, k, &g) } {
+                Some(e) => self.exec = Some(e),
+                None => {
+                    eprintln!("cuda: capturing the decode step as a graph failed — its launches run one at a time (same kernels, same numbers)");
+                    self.graph_on = false;
+                    return unsafe { self.record(drv, k, &mut Prof::off()) };
+                }
+            }
+        }
+        let r = unsafe { (g.launch)(self.exec.unwrap(), self.stream) };
+        if r != 0 { eprintln!("{}", drv.err("cuGraphLaunch", r)); return false; }
+        GRAPH_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+    unsafe fn capture(&self, drv: &Driver, k: &DecodeK, g: &GraphApi) -> Option<CUgraphExec> {
+        // THREAD_LOCAL: only this thread's calls are checked against the capture, so a request thread
+        // elsewhere in ferric-serve allocating memory does not invalidate it.
+        const CAPTURE_THREAD_LOCAL: u32 = 1;
+        unsafe {
+            let r = (g.begin_capture)(self.stream, CAPTURE_THREAD_LOCAL);
+            if r != 0 { eprintln!("{}", drv.err("cuStreamBeginCapture", r)); return None; }
+            let ok = self.record(drv, k, &mut Prof::off());
+            let mut graph: CUgraph = std::ptr::null_mut();
+            let r = (g.end_capture)(self.stream, &mut graph);
+            if !ok || r != 0 || graph.is_null() {
+                if r != 0 { eprintln!("{}", drv.err("cuStreamEndCapture", r)); }
+                if !graph.is_null() { (g.destroy)(graph); }
+                return None;
+            }
+            let mut exec: CUgraphExec = std::ptr::null_mut();
+            let r = (g.instantiate)(&mut exec, graph, 0);
+            (g.destroy)(graph);
+            if r != 0 { eprintln!("{}", drv.err("cuGraphInstantiate", r)); return None; }
+            Some(exec)
+        }
     }
 }
 impl DecodeGraph {
@@ -797,8 +1075,8 @@ impl DecodeGraph {
         self.free_prefill();
         let (d, w, ff) = (self.d, self.q_out + 2 * self.kv_out, self.n_ff);
         let sizes = [rows * d, rows * d, rows * w, rows * self.q_out, rows * self.kv_out, rows * self.q_out,
-                     rows * d, rows * d, rows * 2 * ff, rows * ff, rows * d, 1, logit_rows * self.n_vocab];
-        let mut b = [0 as CUdeviceptr; 13];
+                     rows * d, rows * d, rows * 2 * ff, rows * ff, rows * d, 1, logit_rows * self.n_vocab, rows * self.dh];
+        let mut b = [0 as CUdeviceptr; 14];
         for (i, n) in sizes.into_iter().enumerate() {
             match self.drv.alloc(n * 4) {
                 Some(p) => b[i] = p,
@@ -810,68 +1088,81 @@ impl DecodeGraph {
     }
 
     /// **Prefill: T prompt rows through every layer on the device**, K/V rows written straight into
-    /// `kv` at `[kv.len, kv.len + T)`. `x_rows` is `[T, d]` (already scaled/normed embeddings).
-    /// Returns the logits of every row (`all_logits`, `[T, n_vocab]`) or of the last row only.
+    /// `kv` at rows `[kv.len, kv.len + T)` (positions from `kv.base + kv.len`). `x_rows` is `[T, d]`
+    /// (already scaled/normed embeddings), `rope` the rows' cos|sin table `[T, dh]` when
+    /// [`DecodeGraph::rope_host`]. Returns the logits of every row (`all_logits`, `[T, n_vocab]`) or of
+    /// the last row only.
     ///
     /// The matmuls run on the tensor cores (`cuda_prefill.cu`: f16 in, f32 accumulate); norms, rope,
     /// bias and the residual adds are the decode kernels with a row grid, so the two paths share them.
     /// `None` on any failure — including an activation past f16 range, detected in the GEMM — with
     /// `kv.len` unchanged: rows written past it are dead, and the caller's WGSL prefill runs instead.
-    pub fn prefill(&mut self, kv: &mut DevKv, x_rows: &[f32], all_logits: bool) -> Option<Vec<f32>> {
+    pub fn prefill(&mut self, kv: &mut DevKv, x_rows: &[f32], rope: Option<&[f32]>, all_logits: bool) -> Option<Vec<f32>> {
         let d = self.d;
         if x_rows.is_empty() || x_rows.len() % d != 0 || kv.n_layer() != self.layers.len() || kv.width() != self.kv_out { return None; }
         let t = x_rows.len() / d;
+        if rope.is_some() != self.rope_host || rope.is_some_and(|r| r.len() != t * self.dh) { return None; }
         let k = *self.drv.decode_kernels()?;
         let pk = *self.drv.prefill_kernels()?;
-        let pos0 = kv.len;
-        if !kv.reserve(pos0 + t) { return None; }
+        let row0 = kv.len;
+        let pos0 = kv.base + row0;
+        if pos0 + t >= u32::MAX as usize || !kv.reserve(row0 + t) { return None; }
         let chunk = prefill_chunk().min(t);
         if !self.prefill_bufs(chunk, if all_logits { chunk } else { 1 }) { return None; }
         let b = self.pf.as_ref().unwrap().b;
         let drv = self.drv.clone();
         drv.bind();
         if !drv.htod(b[POVF], &[0.0]) { return None; }
-        let (q_out, kv_out, n_ff, nv) = (self.q_out, self.kv_out, self.n_ff, self.n_vocab);
+        let (q_out, kv_out, n_ff, nv, dh) = (self.q_out, self.kv_out, self.n_ff, self.n_vocab, self.dh);
         let width = q_out + 2 * kv_out;
         let mut out = Vec::with_capacity(if all_logits { t * nv } else { nv });
         let nl = self.layers.len();
+        // FERRIC_CUDA_PROFILE: GPU time per kernel class of this prefill (an event pair + a sync around
+        // each launch, so the profiled prefill is slower; the split is what matters).
+        let mut pp = Prof::new(&drv);
+        let attn_v1 = std::env::var("FERRIC_CUDA_ATTN_PREFILL_V1").is_ok();
+        let null: CUstream = std::ptr::null_mut();
+        macro_rules! pt { ($cls:expr, $body:expr) => {{ pp.start(&drv, null); let ok: bool = $body; pp.stop(&drv, null, $cls); if !ok { return None; } }} }
         unsafe {
             let (mut d32, mut eps) = (d as u32, self.eps);
             for c0 in (0..t).step_by(chunk) {
                 let rows = chunk.min(t - c0);
-                let (pos, r32) = (pos0 + c0, rows as u32);
-                if !drv.htod(b[PX], &x_rows[c0 * d..(c0 + rows) * d]) { return None; }
+                // `row`: where this chunk's K/V go and how many cached rows it attends past; `pos`: the
+                // absolute position of its first row, for the rope angles only.
+                let (row, pos, r32) = (row0 + c0, pos0 + c0, rows as u32);
+                pt!(13, drv.htod(b[PX], &x_rows[c0 * d..(c0 + rows) * d]) && rope.is_none_or(|r| drv.htod(b[PROPE], &r[c0 * dh..(c0 + rows) * dh])));
+                let tab = if rope.is_some() { b[PROPE] } else { 0 };
                 for (li, l) in self.layers.iter().enumerate() {
                     if li == 0 {
                         let (mut x, mut w, mut o) = (b[PX], l.attn_norm, b[PXN]);
-                        if !drv.launch(k.rmsnorm, r32, 256, &mut p!(x, w, o, d32, eps)) { return None; }
+                        pt!(0, drv.launch(k.rmsnorm, r32, 256, &mut p!(x, w, o, d32, eps)));
                     }
                     let mut off = 0usize;
                     for &w in &l.qkv {
-                        if !launch_gemm(&drv, &pk, b[PXN], d, w, b[PQKV] + (off * 4) as u64, width, rows, b[POVF]) { return None; }
+                        pt!(1, launch_gemm(&drv, &pk, b[PXN], d, w, b[PQKV] + (off * 4) as u64, width, rows, b[POVF]));
                         off += w.rows;
                     }
                     let (mut qkv, mut qw, mut kw, mut qo, mut ko) = (b[PQKV], l.q_norm.unwrap_or(0), l.k_norm.unwrap_or(0), b[PQ], b[PK]);
-                    let (mut nh, mut nkv, mut dh) = (self.nh as u32, self.nkv as u32, self.dh as u32);
+                    let (mut nh, mut nkv, mut dh32) = (self.nh as u32, self.nkv as u32, dh as u32);
                     let (mut base, mut posu, mut qoff, mut koff, mut hn) = (self.rope_base, pos as u32, 0u32, q_out as u32, self.has_qk_norm as u32);
                     let rowb = (kv_out * 4) as u64;
-                    let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + pos as u64 * rowb, kv.v[li] + pos as u64 * rowb, (q_out + kv_out) as u32);
-                    let (mut bias, mut ff, mut np, mut roww) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, width as u32);
-                    if !drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
-                                    &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww)) { return None; }
-                    let (mut q, mut kc, mut vc, mut ao, mut tt, mut sc) = (b[PQ], kv.k[li], kv.v[li], b[PATT], r32, 1.0f32 / (self.dh as f32).sqrt());
-                    if !drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128,
-                                    &mut p!(q, kc, vc, ao, nh, nkv, dh, tt, posu, sc)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]) { return None; }
+                    let (mut kc_row, mut vc_row, mut voff) = (kv.k[li] + row as u64 * rowb, kv.v[li] + row as u64 * rowb, (q_out + kv_out) as u32);
+                    let (mut bias, mut ff, mut np, mut roww, mut tb) = (l.qkv_bias.unwrap_or(0), self.rope_ff.unwrap_or(0), self.norm_pairs as u32, width as u32, tab);
+                    pt!(2, drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
+                                    &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh32, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww, tb)));
+                    let (mut q, mut kc, mut vc, mut ao, mut tt, mut rowu, mut sc) = (b[PQ], kv.k[li], kv.v[li], b[PATT], r32, row as u32, 1.0f32 / (dh as f32).sqrt());
+                    pt!(4, if attn_v1 { drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)) }
+                           else { drv.launch2(pk.attn_prefill2, r32.div_ceil(32), self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)) });
+                    pt!(5, launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]));
                     let (mut x2, mut y2, mut fw, mut xy, mut xn) = (b[PX], b[PY], l.ffn_norm, b[PXY], b[PXN]);
-                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PXN], d, l.gate_up, b[PGU], 2 * n_ff, rows, b[POVF]) { return None; }
+                    pt!(6, drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
+                    pt!(7, launch_gemm(&drv, &pk, b[PXN], d, l.gate_up, b[PGU], 2 * n_ff, rows, b[POVF]));
                     let (mut gu, mut h, mut nff) = (b[PGU], b[PH], n_ff as u32);
-                    if !drv.launch(pk.swiglu_rows, ((rows * n_ff) as u32).div_ceil(256), 256, &mut p!(gu, h, nff, tt)) { return None; }
-                    if !launch_gemm(&drv, &pk, b[PH], n_ff, l.down, b[PDN], d, rows, b[POVF]) { return None; }
+                    pt!(10, drv.launch(pk.swiglu_rows, ((rows * n_ff) as u32).div_ceil(256), 256, &mut p!(gu, h, nff, tt)));
+                    pt!(8, launch_gemm(&drv, &pk, b[PH], n_ff, l.down, b[PDN], d, rows, b[POVF]));
                     let next_w = if li + 1 < nl { self.layers[li + 1].attn_norm } else { self.out_norm };
                     let (mut a, mut bb, mut nw, mut xo, mut xno) = (b[PXY], b[PDN], next_w, b[PX], b[PXN]);
-                    if !drv.launch(k.add_rmsnorm, r32, 256, &mut p!(a, bb, nw, xo, xno, d32, eps)) { return None; }
+                    pt!(9, drv.launch(k.add_rmsnorm, r32, 256, &mut p!(a, bb, nw, xo, xno, d32, eps)));
                 }
                 if all_logits {
                     if !launch_gemm(&drv, &pk, b[PXN], d, self.lm_head, b[PLOG], nv, rows, b[POVF]) { return None; }
@@ -880,7 +1171,7 @@ impl DecodeGraph {
                     out.extend_from_slice(&part);
                 } else if c0 + rows == t {
                     let last = b[PXN] + ((rows - 1) * d * 4) as u64;
-                    if !launch_gemv(&drv, &k, last, self.lm_head, b[PLOG], None) { return None; }
+                    if !launch_gemv(&drv, std::ptr::null_mut(), &k, last, self.lm_head, b[PLOG], None) { return None; }
                     let mut row = vec![0f32; nv];
                     if !drv.dtoh(&mut row, b[PLOG]) { return None; }
                     out.extend_from_slice(&row);
@@ -888,12 +1179,21 @@ impl DecodeGraph {
             }
         }
         if !drv.sync() { return None; }
+        if pp.on {
+            let tot: f64 = pp.acc.iter().sum();
+            let names = ["attn_norm", "qkv_gemm", "qk_norm_rope", "-", "attn_prefill", "wo_gemm", "add_rmsnorm", "gate_up_gemm",
+                         "down_gemm", "resid+norm", "swiglu", "-", "-", "h2d x+rope"];
+            let mut rows: Vec<(usize, f64)> = pp.acc.iter().copied().enumerate().filter(|r| r.1 > 0.0).collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("cuda prefill profile: {t} rows, GPU {tot:.2} ms ({:.0} tok/s of GPU time): {}", t as f64 / tot * 1e3,
+                      rows.iter().map(|(i, v)| format!("{} {:.2} ms ({:.0}%)", names[*i], v, v / tot * 100.0)).collect::<Vec<_>>().join(", "));
+        }
         let mut flag = [0f32]; if !drv.dtoh(&mut flag, b[POVF]) { return None; }
         if flag[0].to_bits() != 0 {
-            eprintln!("cuda: a prefill activation exceeded f16 range (65504); discarding the native prefill — WGSL runs it");
+            eprintln!("cuda: a prefill activation was not finite (GEMM v1: or past f16's 65504); discarding the native prefill — WGSL runs it");
             return None;
         }
-        kv.len = pos0 + t;
+        kv.len = row0 + t;
         PREFILL_ROWS.fetch_add(t as u64, std::sync::atomic::Ordering::Relaxed);
         Some(out)
     }
@@ -901,7 +1201,15 @@ impl DecodeGraph {
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
         self.free_prefill();
-        self.drv.bind(); for &p in &self.owned { unsafe { (self.drv.cu_mem_free)(p); } }
+        self.drv.bind();
+        unsafe {
+            if let (Some(e), Some(g)) = (self.exec.take(), self.drv.graph) { (g.exec_destroy)(e); }
+            (self.drv.cu_stream_synchronize)(self.stream);
+            (self.drv.cu_stream_destroy)(self.stream);
+            (self.drv.cu_mem_free_host)(self.hb as *mut c_void);
+            (self.drv.cu_mem_free_host)(self.hl as *mut c_void);
+            for &p in &self.owned { (self.drv.cu_mem_free)(p); }
+        }
     }
 }
 
@@ -918,7 +1226,7 @@ fn bench_launch(ws: &[NativeWeight<'_>], x: &[f32], iters: usize, swiglu: bool, 
     let k = *drv.decode_kernels()?;
     let (xd, xq, xs, od) = (drv.upload_f32(x)?, drv.alloc(cols)?, drv.alloc(cols / 32 * 4 + 4)?, drv.alloc(n_out * 4)?);
     let q8 = q8x.then_some((xq, xs));
-    let run = |w: &NativeWeight<'_>| unsafe { if swiglu { launch_swiglu(&drv, &k, xd, w.dw(), od, q8) } else { launch_gemv(&drv, &k, xd, w.dw(), od, q8) } };
+    let run = |w: &NativeWeight<'_>| unsafe { if swiglu { launch_swiglu(&drv, std::ptr::null_mut(), &k, xd, w.dw(), od, q8) } else { launch_gemv(&drv, std::ptr::null_mut(), &k, xd, w.dw(), od, q8) } };
     if !run(w0) || !drv.sync() { return None; }      // warm (PTX JIT etc.)
     let t0 = std::time::Instant::now();
     for i in 0..iters { if !run(&ws[i % ws.len()]) { return None; } }
@@ -934,6 +1242,28 @@ pub fn bench_gemv(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f
 pub fn bench_gemv_q8(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> { bench_launch(ws, x, iters, false, true) }
 /// Fused gate|up+SwiGLU microbench, same contract; `w` has `2*n_ff` rows, any format.
 pub fn bench_swiglu(ws: &[NativeWeight<'_>], x: &[f32], iters: usize) -> Option<(f64, Vec<f32>)> { bench_launch(ws, x, iters, true, false) }
+/// **Prefill GEMM microbench** — `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores, `iters`
+/// back-to-back launches rotating over `ws` (weights past L2, as the GEMV bench), one sync. Returns
+/// (µs per GEMM, the last C). The number `examples/cuda_gemm_bench.rs` turns into useful TFLOPS.
+pub fn bench_gemm(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize) -> Option<(f64, Vec<f32>)> { bench_gemm_v(ws, a, m, iters, 0) }
+/// [`bench_gemm`] with the kernel version named (1, 2, 3; 0 = what `FERRIC_CUDA_GEMM` / the default picks).
+pub fn bench_gemm_v(ws: &[NativeWeight<'_>], a: &[f32], m: usize, iters: usize, ver: u8) -> Option<(f64, Vec<f32>)> {
+    let drv = driver()?.clone(); drv.bind();
+    let w0 = ws.first()?;
+    let (n, k) = (w0.rows, w0.cols);
+    if a.len() != m * k || ws.iter().any(|w| w.rows != n || w.cols != k) { return None; }
+    let pk = *drv.prefill_kernels()?;
+    let (ad, cd, ovf) = (drv.upload_f32(a)?, drv.alloc(m * n * 4)?, drv.upload_f32(&[0.0])?);
+    let run = |w: &NativeWeight<'_>| unsafe { if ver == 0 { launch_gemm(&drv, &pk, ad, k, w.dw(), cd, n, m, ovf) } else { launch_gemm_v(&drv, &pk, ver, ad, k, w.dw(), cd, n, m, ovf) } };
+    if !run(w0) || !drv.sync() { return None; }      // warm (PTX JIT)
+    let t0 = std::time::Instant::now();
+    for i in 0..iters { if !run(&ws[i % ws.len()]) { return None; } }
+    if !drv.sync() { return None; }
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let mut out = vec![0f32; m * n]; if !drv.dtoh(&mut out, cd) { return None; }
+    unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+    Some((us, out))
+}
 /// Fused gate|up+SwiGLU with int8 activations (FERRIC_CUDA_Q8X). Same contract as `bench_swiglu`,
 /// so the two are directly comparable — the swiglu shape is the LARGEST per-layer weight read, and
 /// leaving it out of the table let the q8x rows cover under half of that traffic.
@@ -1047,7 +1377,7 @@ mod tests {
         let drv = driver().unwrap(); let k = *drv.decode_kernels().expect("decode ptx");
         let n_out = if swiglu { w.rows / 2 } else { w.rows };
         let (xd, od) = (drv.upload_f32(xv).unwrap(), drv.alloc(n_out * 4).unwrap());
-        let ok = unsafe { if swiglu { launch_swiglu(drv, &k, xd, w.dw(), od, None) } else { launch_gemv(drv, &k, xd, w.dw(), od, None) } };
+        let ok = unsafe { if swiglu { launch_swiglu(drv, std::ptr::null_mut(), &k, xd, w.dw(), od, None) } else { launch_gemv(drv, std::ptr::null_mut(), &k, xd, w.dw(), od, None) } };
         assert!(ok && drv.sync(), "launch failed");
         let mut got = vec![0f32; n_out]; assert!(drv.dtoh(&mut got, od));
         unsafe { (drv.cu_mem_free)(xd); (drv.cu_mem_free)(od); }
@@ -1170,20 +1500,21 @@ mod tests {
         (0..n).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 }).collect()
     }
 
-    /// Launch `qk_norm_rope` for one row and return (q, k, k-cache row, v-cache row).
+    /// Launch `qk_norm_rope` for one row and return (q, k, k-cache row, v-cache row). `tab` = the host
+    /// cos|sin row `[dh]` (None = the device formula).
     #[allow(clippy::too_many_arguments)]
     fn run_rope(qkv: &[f32], qw: Option<&[f32]>, kw: Option<&[f32]>, bias: Option<&[f32]>, ff: Option<&[f32]>,
-                norm_pairs: bool, nh: usize, nkv: usize, dh: usize, base: f32, pos: usize, eps: f32)
+                norm_pairs: bool, nh: usize, nkv: usize, dh: usize, base: f32, pos: usize, eps: f32, tab: Option<&[f32]>)
                 -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let drv = driver().unwrap(); let k = *drv.decode_kernels().expect("decode ptx");
         let (q_out, kv_out) = (nh * dh, nkv * dh);
         let up = |v: Option<&[f32]>| v.map(|v| drv.upload_f32(v).unwrap()).unwrap_or(0);
-        let (mut sd, mut qwd, mut kwd, mut bd, mut ffd) = (drv.upload_f32(qkv).unwrap(), up(qw), up(kw), up(bias), up(ff));
+        let (mut sd, mut qwd, mut kwd, mut bd, mut ffd, mut tb) = (drv.upload_f32(qkv).unwrap(), up(qw), up(kw), up(bias), up(ff), up(tab));
         let (mut qo, mut ko, mut kc, mut vc) = (drv.alloc(q_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap(), drv.alloc(kv_out * 4).unwrap());
         let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2) = (nh as u32, nkv as u32, dh as u32, base, pos as u32, eps);
         let (mut qoff, mut koff, mut hn, mut voff, mut np, mut rw) = (0u32, q_out as u32, qw.is_some() as u32, (q_out + kv_out) as u32, norm_pairs as u32, (q_out + 2 * kv_out) as u32);
         assert!(unsafe { drv.launch(k.qk_norm_rope, (nh + nkv) as u32, 128,
-            &mut p!(sd, qwd, kwd, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, kc, vc, voff, bd, ffd, np, rw)) } && drv.sync());
+            &mut p!(sd, qwd, kwd, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, kc, vc, voff, bd, ffd, np, rw, tb)) } && drv.sync());
         let (mut qg, mut kg, mut kcg, mut vcg) = (vec![0f32; q_out], vec![0f32; kv_out], vec![0f32; kv_out], vec![0f32; kv_out]);
         assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko) && drv.dtoh(&mut kcg, kc) && drv.dtoh(&mut vcg, vc));
         (qg, kg, kcg, vcg)
@@ -1222,7 +1553,7 @@ mod tests {
             for &pos in &[11usize, 3001] {
                 let name = format!("rope pairs={} ff={with_ff} bias={with_bias} base={base} pos={pos}", if norm_pairs { "NORM" } else { "NEOX" });
                 let (bo, fo) = (with_bias.then_some(bias.as_slice()), with_ff.then_some(ff.as_slice()));
-                let (qg, kg, kcg, vcg) = run_rope(&qkv, None, None, bo, fo, norm_pairs, nh, nkv, dh, base, pos, eps);
+                let (qg, kg, kcg, vcg) = run_rope(&qkv, None, None, bo, fo, norm_pairs, nh, nkv, dh, base, pos, eps, None);
                 // WGSL composed reference
                 let src = crate::Tensor::from_vec(&ctx, &qkv, &[1, width]);
                 let src = if with_bias { src.add(&crate::Tensor::from_vec(&ctx, &bias, &[1, width])) } else { src };
@@ -1251,6 +1582,268 @@ mod tests {
         }
     }
 
+    /// The authors' float32 inverse frequencies — transformers' `1 / base ** (arange(0, d, 2).float() / d)`,
+    /// Llama-3 divisors applied after (the same three lines as qwen3.rs `rope_inv_freq`, which lives in
+    /// ferric-llama and so cannot be called from here).
+    fn authors_inv(base: f32, dh: usize, div: Option<&[f32]>) -> Vec<f32> {
+        (0..dh / 2).map(|c| {
+            let e = (2 * c) as f32 / dh as f32;
+            let i = 1.0 / ((base as f64).powf(e as f64) as f32);
+            div.map_or(i, |d| i / d[c])
+        }).collect()
+    }
+    /// One row of the host rope table, as qwen3.rs `rope_table` builds it: angle = the float32 product
+    /// `f32(pos) · inv`, then cos and sin in f64, rounded. Layout `[cos half | sin half]`.
+    fn host_tab(inv: &[f32], pos: usize) -> Vec<f32> {
+        let ang: Vec<f64> = inv.iter().map(|&f| (pos as f32 * f) as f64).collect();
+        ang.iter().map(|a| a.cos() as f32).chain(ang.iter().map(|a| a.sin() as f32)).collect()
+    }
+
+    /// **The rope TABLE path reproduces the authors' float32 angles at position 30,000; the device
+    /// formula it replaces does not.** The reference rotates in f64 by exactly the angles the authors'
+    /// float32 forward uses (their f32 inverse frequency times f32(position), rounded as they round it),
+    /// so the table path's only error is its f32 multiply-adds. At 30,000 the device formula's few-ulp
+    /// error in `expf(-2c/dh · logf(base))` is multiplied by the position — the precision the WGSL path
+    /// lost the same way (18-109x the authors' float32 floor there) — and it must sit >= 20x further out.
+    #[test]
+    fn rope_table_reproduces_the_authors_float32_angles_at_30000() {
+        if driver().is_none() { eprintln!("SKIPPED rope_table_reproduces_the_authors_float32_angles_at_30000: no CUDA driver / FERRIC_CUDA unset."); return; }
+        let (nh, nkv, dh, eps) = (8usize, 2usize, 64usize, 1e-6f32);
+        let (q_out, kv_out) = (nh * dh, nkv * dh);
+        let qkv = rndx(q_out + 2 * kv_out, 41);
+        // Llama-3.2's shape of divisors: 1 on the fast dims, up to 32 on the slow ones.
+        let div: Vec<f32> = (0..dh / 2).map(|c| if c < dh / 4 { 1.0 } else { 1.0 + (c - dh / 4) as f32 * 2.0 }).collect();
+        let mult: Vec<f32> = div.iter().map(|&x| 1.0 / x).collect();
+        for &(norm_pairs, with_ff, base) in &[(true, true, 500000.0f32), (false, false, 1e6f32), (false, false, 1e4f32)] {
+            let inv = authors_inv(base, dh, with_ff.then_some(&div[..]));
+            for &pos in &[11usize, 30000] {
+                let tab = host_tab(&inv, pos);
+                let (qt, kt, kct, _) = run_rope(&qkv, None, None, None, None, norm_pairs, nh, nkv, dh, base, pos, eps, Some(&tab));
+                let (qd, kd, _, _) = run_rope(&qkv, None, None, None, with_ff.then_some(&mult[..]), norm_pairs, nh, nkv, dh, base, pos, eps, None);
+                let rot = |x: &[f32], heads: usize| -> Vec<f64> {
+                    let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                    for h in 0..heads { for c in 0..dh / 2 {
+                        let a = (pos as f32 * inv[c]) as f64;
+                        let (s, co) = a.sin_cos();
+                        let (p0, p1) = if norm_pairs { (2 * c, 2 * c + 1) } else { (c, c + dh / 2) };
+                        let (x1, x2) = (x[h * dh + p0] as f64, x[h * dh + p1] as f64);
+                        out[h * dh + p0] = x1 * co - x2 * s; out[h * dh + p1] = x2 * co + x1 * s;
+                    } }
+                    out
+                };
+                let (qh, kh) = (rot(&qkv[..q_out], nh), rot(&qkv[q_out..q_out + kv_out], nkv));
+                let dt = max_abs_diff(&qt, &qh).max(max_abs_diff(&kt, &kh));
+                let dd = max_abs_diff(&qd, &qh).max(max_abs_diff(&kd, &kh));
+                eprintln!("rope {} ff={with_ff} base={base} pos={pos}: max|Δ| vs f64 at the authors' f32 angles  table {dt:.3e}   device formula {dd:.3e} ({:.0}x)",
+                          if norm_pairs { "NORM" } else { "NEOX" }, dd / dt.max(1e-12));
+                assert!(dt <= 1e-6, "rope table path is {dt:.3e} from the authors' float32 angles (only f32 rounding should remain)");
+                assert!(kt.iter().zip(&kct).all(|(a, b)| a.to_bits() == b.to_bits()), "K cache row != roped k (table path)");
+                if pos == 30000 {
+                    assert!(dd >= 20.0 * dt.max(1e-7), "at position 30000 the device formula ({dd:.3e}) should sit >= 20x further from the \
+                                                        authors' angles than the table ({dt:.3e}) — else this test cannot see angle precision");
+                }
+            }
+        }
+    }
+
+    /// **Prefill rows take THEIR row of the rope table.** Three rows at positions 29998, 29999 and 30000 in
+    /// one launch (`blockIdx.y` = row), each against the f64 rotation by its own position's float32 angles:
+    /// a kernel that read row 0's angles for every row, or rows in the wrong order, is 1e-2-scale off.
+    #[test]
+    fn rope_table_rows_follow_their_positions() {
+        if driver().is_none() { eprintln!("SKIPPED rope_table_rows_follow_their_positions: no CUDA driver / FERRIC_CUDA unset."); return; }
+        let drv = driver().unwrap(); let k = *drv.decode_kernels().expect("decode ptx");
+        let (nh, nkv, dh, base, rows, pos0) = (4usize, 2usize, 64usize, 1e6f32, 3usize, 29998usize);
+        let (q_out, kv_out) = (nh * dh, nkv * dh); let width = q_out + 2 * kv_out;
+        let inv = authors_inv(base, dh, None);
+        let qkv = rndx(rows * width, 77);
+        let tab: Vec<f32> = (0..rows).flat_map(|r| host_tab(&inv, pos0 + r)).collect();
+        let (mut sd, mut tb) = (drv.upload_f32(&qkv).unwrap(), drv.upload_f32(&tab).unwrap());
+        let (mut qo, mut ko) = (drv.alloc(rows * q_out * 4).unwrap(), drv.alloc(rows * kv_out * 4).unwrap());
+        let (mut z0, mut z1, mut z2, mut z3, mut z4, mut z5) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2) = (nh as u32, nkv as u32, dh as u32, base, pos0 as u32, 1e-6f32);
+        let (mut qoff, mut koff, mut hn, mut voff, mut np, mut rw) = (0u32, q_out as u32, 0u32, (q_out + kv_out) as u32, 0u32, width as u32);
+        assert!(unsafe { drv.launch2(k.qk_norm_rope, (nh + nkv) as u32, rows as u32, 128,
+            &mut p!(sd, z0, z1, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, z2, z3, voff, z4, z5, np, rw, tb)) } && drv.sync());
+        let (mut qg, mut kg) = (vec![0f32; rows * q_out], vec![0f32; rows * kv_out]);
+        assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko));
+        unsafe { for p in [sd, tb, qo, ko] { (drv.cu_mem_free)(p); } }
+        for r in 0..rows {
+            let pos = pos0 + r;
+            let rot = |x: &[f32], heads: usize| -> Vec<f64> {
+                let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                for h in 0..heads { for c in 0..dh / 2 {
+                    let (s, co) = ((pos as f32 * inv[c]) as f64).sin_cos();
+                    let (x1, x2) = (x[h * dh + c] as f64, x[h * dh + c + dh / 2] as f64);
+                    out[h * dh + c] = x1 * co - x2 * s; out[h * dh + c + dh / 2] = x2 * co + x1 * s;
+                } }
+                out
+            };
+            let row = &qkv[r * width..(r + 1) * width];
+            let d = max_abs_diff(&qg[r * q_out..(r + 1) * q_out], &rot(&row[..q_out], nh))
+                .max(max_abs_diff(&kg[r * kv_out..(r + 1) * kv_out], &rot(&row[q_out..q_out + kv_out], nkv)));
+            eprintln!("rope table row {r} (position {pos}): max|Δ| vs f64 at its own float32 angles {d:.3e}");
+            assert!(d <= 1e-6, "row {r} was not rotated by its own table row ({d:.3e})");
+        }
+    }
+
+    /// **The step-block kernels are their argument twins, bit for bit.** `qk_norm_rope_step` and
+    /// `attn_decode_step` read row, position and the K/V addresses from the step block instead of their
+    /// arguments; they call the same bodies, so any difference is an indexing bug in the indirection
+    /// (a wrong layer's pointer, an off-by-one key count) — which a graph-vs-eager comparison cannot
+    /// see, because both of those use the step kernels.
+    #[test]
+    fn step_kernels_match_their_argument_twins_bit_for_bit() {
+        if driver().is_none() { eprintln!("SKIPPED step_kernels_match_their_argument_twins_bit_for_bit: no CUDA driver / FERRIC_CUDA unset."); return; }
+        let drv = driver().unwrap(); let k = *drv.decode_kernels().expect("decode ptx");
+        let (nh, nkv, dh, nl, eps, base) = (8usize, 2usize, 64usize, 3usize, 1e-6f32, 1e6f32);
+        let (q_out, kv_out) = (nh * dh, nkv * dh); let width = q_out + 2 * kv_out;
+        let (row, cap) = (37usize, 64usize);
+        let pos = 1000 + row;                     // a cache based at position 1000
+        let lay = StepLayout::new(nl, dh, 256);
+        let qkv = rndx(width, 5); let bias: Vec<f32> = rndx(width, 6).iter().map(|v| v * 0.3).collect();
+        let (qw, kw): (Vec<f32>, Vec<f32>) = (rndx(dh, 7).iter().map(|v| 1.0 + 0.1 * v).collect(), rndx(dh, 8).iter().map(|v| 1.0 + 0.1 * v).collect());
+        let tab = host_tab(&authors_inv(base, dh, None), pos);
+        // Two identical copies of a 3-layer cache whose rows [0, row) are filled.
+        let fill: Vec<Vec<f32>> = (0..2 * nl).map(|i| rndx(cap * kv_out, 100 + i as u64)).collect();
+        let caches = || -> Vec<CUdeviceptr> { fill.iter().map(|v| drv.upload_f32(v).unwrap()).collect() };
+        let (cs, ca) = (caches(), caches());
+        let li = 1usize;
+        for use_tab in [true, false] {
+            let mut blk = vec![0u8; lay.bytes];
+            blk[0..4].copy_from_slice(&(row as u32).to_le_bytes()); blk[4..8].copy_from_slice(&(pos as u32).to_le_bytes());
+            for (i, &p) in cs.iter().enumerate() { blk[lay.kvp + 8 * i..lay.kvp + 8 * i + 8].copy_from_slice(&p.to_le_bytes()); }
+            for (i, v) in tab.iter().enumerate() { blk[lay.rope + 4 * i..lay.rope + 4 * i + 4].copy_from_slice(&v.to_le_bytes()); }
+            let words: Vec<u32> = blk.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let sb = drv.upload(&words).unwrap();
+            let (sd, qwd, kwd, bd) = (drv.upload_f32(&qkv).unwrap(), drv.upload_f32(&qw).unwrap(), drv.upload_f32(&kw).unwrap(), drv.upload_f32(&bias).unwrap());
+            let outs = |n: usize| drv.alloc(n * 4).unwrap();
+            let (qs, ks, qa, ka) = (outs(q_out), outs(kv_out), outs(q_out), outs(kv_out));
+            let rowb = (row * kv_out * 4) as u64;
+            unsafe {
+                let (mut a0, mut a1, mut a2, mut a4, mut a5) = (sd, qwd, kwd, bd, 0u64);
+                let (mut nh32, mut nkv32, mut dh32, mut b, mut e2, mut qoff, mut koff, mut hn, mut voff, mut np) =
+                    (nh as u32, nkv as u32, dh as u32, base, eps, 0u32, q_out as u32, 1u32, (q_out + kv_out) as u32, 0u32);
+                let (mut tb, mut spp, mut li32, mut nl32, mut qo, mut ko) = (if use_tab { sb + lay.rope as u64 } else { 0 }, sb, li as u32, nl as u32, qs, ks);
+                assert!(drv.launch(k.qk_norm_rope_step, (nh + nkv) as u32, 128,
+                    &mut p!(a0, a1, a2, qo, ko, nh32, nkv32, dh32, b, e2, qoff, koff, hn, voff, a4, a5, np, tb, spp, li32, nl32)));
+                let (mut qo2, mut ko2, mut p32, mut kc, mut vc, mut rw) = (qa, ka, pos as u32, ca[li] + rowb, ca[nl + li] + rowb, width as u32);
+                let mut tb2 = if use_tab { drv.upload_f32(&tab).unwrap() } else { 0 };
+                let tb2_owned = tb2;
+                assert!(drv.launch(k.qk_norm_rope, (nh + nkv) as u32, 128,
+                    &mut p!(a0, a1, a2, qo2, ko2, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, kc, vc, voff, a4, a5, np, rw, tb2)));
+                assert!(drv.sync());
+                let get = |p: CUdeviceptr, n: usize| { let mut v = vec![0f32; n]; assert!(drv.dtoh(&mut v, p)); v };
+                let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same(&get(qs, q_out), &get(qa, q_out)) && same(&get(ks, kv_out), &get(ka, kv_out)),
+                        "qk_norm_rope_step != qk_norm_rope (tab={use_tab})");
+                for c in [li, nl + li] {
+                    assert!(same(&get(cs[c], cap * kv_out), &get(ca[c], cap * kv_out)), "cache {c} differs after the step kernel (tab={use_tab})");
+                }
+                // attention over rows [0, row] of layer li
+                let (ao_s, ao_a) = (outs(q_out), outs(q_out));
+                let (mut q1, mut o1, mut sc) = (qs, ao_s, 1.0f32 / (dh as f32).sqrt());
+                assert!(drv.launch(k.attn_decode_step, nh as u32, 128, &mut p!(q1, o1, nh32, nkv32, dh32, sc, spp, li32, nl32)));
+                let (mut q2, mut kk, mut vv, mut o2, mut s32) = (qa, ca[li], ca[nl + li], ao_a, (row + 1) as u32);
+                assert!(drv.launch(k.attn_decode, nh as u32, 128, &mut p!(q2, kk, vv, o2, nh32, nkv32, dh32, s32, sc)));
+                assert!(drv.sync());
+                assert!(same(&get(ao_s, q_out), &get(ao_a, q_out)), "attn_decode_step != attn_decode over the same {} keys (tab={use_tab})", row + 1);
+                // the split kernel's step twin: same partials, bit for bit
+                let chunks = 5u32;
+                let pn = nh * chunks as usize * (dh + 2);
+                let (ps_s, ps_a) = (outs(pn), outs(pn));
+                let (mut q3, mut pp3, mut q4, mut pp4) = (qs, ps_s, qa, ps_a);
+                assert!(drv.launch2(k.attn_split_step, chunks, nkv as u32, 128, &mut p!(q3, pp3, nh32, nkv32, dh32, sc, spp, li32, nl32)));
+                let (mut kk2, mut vv2) = (ca[li], ca[nl + li]);
+                assert!(drv.launch2(k.attn_split, chunks, nkv as u32, 128, &mut p!(q4, kk2, vv2, pp4, nh32, nkv32, dh32, s32, sc)));
+                assert!(drv.sync());
+                assert!(same(&get(ps_s, pn), &get(ps_a, pn)), "attn_split_step != attn_split (tab={use_tab})");
+                (drv.cu_mem_free)(ps_s); (drv.cu_mem_free)(ps_a);
+                for p in [sb, sd, qwd, kwd, bd, qs, ks, qa, ka, ao_s, ao_a, tb2_owned] { if p != 0 { (drv.cu_mem_free)(p); } }
+            }
+            eprintln!("step kernels (tab={use_tab}): qk_norm_rope_step == qk_norm_rope, attn_decode_step == attn_decode and attn_split_step == attn_split, bit for bit, at row {row} of layer {li}");
+        }
+        unsafe { for &p in cs.iter().chain(&ca) { (drv.cu_mem_free)(p); } }
+    }
+
+    /// **Graph replay == eager launches, bit for bit, over a whole decode step** — on a small random
+    /// model of mixed formats (Q4_K q|k|v, Q5_K o, Q6_K gate|up, Q8_0 down, Q5_0 head, QK-norm, q/k/v
+    /// bias), with host rope rows, for 300 steps of one sequence interleaved with a second sequence that
+    /// starts at position 5000, and a forced K/V reallocation mid-run. The graph is captured ONCE, so
+    /// every later step differs from the captured one in its row, position, rope row and (after the
+    /// growth, and between the two sequences) its K/V addresses: a replay that froze any of them fails.
+    #[test]
+    fn graph_replay_is_bit_identical_to_eager_launches() {
+        let Some(ctx) = ctx_or_skip("graph_replay_is_bit_identical_to_eager_launches") else { return };
+        assert!(driver().unwrap().graph.is_some(), "this driver has no graph API — the replay path cannot be checked here");
+        let (d, nh, nkv, dh, n_ff, nv, nl) = (256usize, 4usize, 2usize, 64usize, 512usize, 1000usize, 2usize);
+        let (q_out, kv_out) = (nh * dh, nkv * dh);
+        let mk = |f: QFmt, rows: usize, cols: usize, seed: u64| crate::dtype::QMatrix::from_bytes(&ctx, &q_fixture(f, rows, cols, seed), f.ggml_type(), rows, cols).expect("qmatrix");
+        let ws: Vec<[crate::dtype::QMatrix; 4]> = (0..nl as u64).map(|l| [
+            mk(QFmt::Q4K, q_out + 2 * kv_out, d, 10 + l), mk(QFmt::Q5K, d, q_out, 20 + l),
+            mk(QFmt::Q6K, 2 * n_ff, d, 30 + l), mk(QFmt::Q8_0, d, n_ff, 40 + l)]).collect();
+        let head = mk(QFmt::Q5_0, nv, d, 50);
+        let norm = |s: u64, n: usize| -> Vec<f32> { rndx(n, s).iter().map(|v| 1.0 + 0.1 * v).collect() };
+        let layers = ws.iter().enumerate().map(|(l, w)| LayerSpec {
+            attn_norm: norm(60 + l as u64, d), ffn_norm: norm(70 + l as u64, d),
+            q_norm: Some(norm(80 + l as u64, dh)), k_norm: Some(norm(90 + l as u64, dh)),
+            qkv_bias: Some(rndx(q_out + 2 * kv_out, 95 + l as u64).iter().map(|v| 0.1 * v).collect()),
+            qkv_parts: vec![w[0].native_weight().unwrap()], wo: w[1].native_weight().unwrap(),
+            gate_up: w[2].native_weight().unwrap(), down: w[3].native_weight().unwrap(),
+        }).collect();
+        let spec = GraphSpec { d, nh, nkv, dh, n_ff, n_vocab: nv, eps: 1e-6, rope_base: 1e6, has_qk_norm: true,
+                               rope_ff: None, norm_pairs: false, rope_host: true, layers, out_norm: norm(99, d),
+                               lm_head: head.native_weight().unwrap() };
+        // ⛔ TWO graphs, not one toggled. With one object the eager twin shared the host-side fill of the
+        // step block, so a replay that froze the block's row/position or rope row after capture froze the
+        // eager steps identically and still matched bit for bit (a mutation run, 2026-09-28: MISSED).
+        let mut g = DecodeGraph::build(&spec).expect("graph");
+        let mut ge = DecodeGraph::build(&spec).expect("eager twin");
+        ge.set_graph(false);
+        let inv = authors_inv(1e6, dh, None);
+        // (graph, eager) K/V pairs for sequence A (base 0) and B (base 5000)
+        let mut kv = [g.new_kv().unwrap(), ge.new_kv().unwrap(), g.new_kv().unwrap(), ge.new_kv().unwrap()];
+        kv[2].base = 5000; kv[3].base = 5000;
+        let mut steps_a: Vec<Vec<f32>> = Vec::new();
+        let g0 = native_graph_steps();
+        let (mut n_graph, mut worst_scale) = (0u64, 0f32);
+        for s in 0..300usize {
+            let seqs: &[usize] = if s % 3 == 0 { &[0, 2] } else { &[0] };
+            for &a in seqs {
+                if s == 100 { for i in [a, a + 1] { let c = kv[i].cap(); assert!(kv[i].reserve(c + 1)); } }   // move every K/V address
+                let x = rndx(d, 1000 + (s * 7 + a) as u64);
+                let tab = host_tab(&inv, kv[a].base + kv[a].len);
+                let lg = g.step(&mut kv[a], &x, Some(&tab)).expect("graph step");
+                n_graph += 1;
+                let le = ge.step(&mut kv[a + 1], &x, Some(&tab)).expect("eager step");
+                if a == 0 && steps_a.len() < 48 { steps_a.push(lg.clone()); }
+                worst_scale = worst_scale.max(le.iter().fold(0f32, |m, v| m.max(v.abs())));
+                assert!(lg.iter().all(|v| v.is_finite()), "non-finite logits at step {s}");
+                let bad = lg.iter().zip(&le).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                assert!(bad == 0, "step {s} seq {}: graph replay differs from eager launches in {bad} of {nv} logits", a / 2);
+            }
+        }
+        assert!(worst_scale > 1e-3, "logits ~zero — this comparison would pass on anything");
+        // ⭐ And against an INDEPENDENT path: the first 48 rows of sequence A as ONE prefill — the
+        // argument-form kernels (explicit position, cache row and key count), the tensor-core GEMM and the
+        // tiled attention — which shares none of the step block. Not bit-identical (other kernels), so a
+        // tolerance: a replay that froze the row, position or rope row lands O(1) away.
+        let mut kvp = ge.new_kv().unwrap();
+        let xs: Vec<f32> = (0..48usize).flat_map(|s| rndx(d, 1000 + (s * 7) as u64)).collect();
+        let tabs: Vec<f32> = (0..48usize).flat_map(|p| host_tab(&inv, p)).collect();
+        let pf = ge.prefill(&mut kvp, &xs, Some(&tabs), true).expect("prefill");
+        let (mut worst, mut scale) = (0f32, 0f32);
+        for (r, st) in steps_a.iter().enumerate() {
+            for (a, b) in st.iter().zip(&pf[r * nv..(r + 1) * nv]) { worst = worst.max((a - b).abs()); scale = scale.max(b.abs()); }
+        }
+        eprintln!("decode steps (graph) vs one prefill of the same 48 rows: max|Δ| {worst:.3e} of |logit| {scale:.2}");
+        assert!(worst <= 1e-3 * scale, "the graph's decode steps are {worst:.3e} from a prefill of the same rows");
+        assert!(g.step(&mut kv[0], &rndx(d, 1), None).is_none(), "a rope_host graph must refuse a step without its rope row");
+        let replayed = native_graph_steps() - g0;
+        eprintln!("graph replay == eager over {n_graph} steps (two sequences, one at base 5000, K/V moved at step 100); {replayed} replays counted; |logit| up to {worst_scale:.2}");
+        assert_eq!(replayed, n_graph, "every graph-mode step must have been a replay of the captured graph");
+    }
+
     /// rmsnorm, the Qwen3 qk_norm_rope and attn_decode against their WGSL twins — plus attention past
     /// the old 2048-token cap, which the chunked online softmax had never been run at before (the cap
     /// meant `s` could not exceed one 2048-key chunk).
@@ -1277,7 +1870,7 @@ mod tests {
         let (wq, wk) = (crate::Tensor::from_vec(&ctx, &qw, &[dh]), crate::Tensor::from_vec(&ctx, &kw, &[dh]));
         let (q_ref, k_ref) = crate::Tensor::qk_norm_rope(&src, 0, q_out, &wq, &wk, 1, nh, nkv, dh, base, pos, eps);
         let (q_ref, k_ref) = (pollster::block_on(q_ref.to_vec()), pollster::block_on(k_ref.to_vec()));
-        let (qg, kg, _, _) = run_rope(&qkv, Some(&qw), Some(&kw), None, None, false, nh, nkv, dh, base, pos, eps);
+        let (qg, kg, _, _) = run_rope(&qkv, Some(&qw), Some(&kw), None, None, false, nh, nkv, dh, base, pos, eps, None);
         close("qk_norm_rope q", &q_ref, &qg, 1e-4); close("qk_norm_rope k", &k_ref, &kg, 1e-4);
         // attention vs fused_decode_attention, and vs an f64 softmax at lengths across the chunk edge
         let attn = |nh: usize, nkv: usize, dh: usize, s: usize, seed: u64| {
@@ -1301,8 +1894,19 @@ mod tests {
                 let z: f64 = sc.iter().map(|v| (v - m).exp()).sum();
                 for j in 0..s { let p = (sc[j] - m).exp() / z; for e in 0..dh { host[h * dh + e] += p * vv[j * kvo + kvh * dh + e] as f64; } }
             }
-            unsafe { for p in [qd, kd, vd, ad] { (drv.cu_mem_free)(p); } }
             gate(&format!("attn_decode nh={nh} nkv={nkv} dh={dh} S={s}"), &got, &want, &host);
+            // The split-K kernel + merge on the same inputs: the step's own chunk count for this card,
+            // a count that does not divide S (a ragged last chunk), and more chunks than keys (empty ones).
+            for chunks in [split_chunks(drv.sm_count, nkv), 3, (s as u32 + 5).min(128)] {
+                let (mut pd, mut od) = (drv.alloc(nh * chunks as usize * (dh + 2) * 4).unwrap(), drv.alloc(qo * 4).unwrap());
+                let (mut gg, mut kd2, mut vd2, mut qd2) = (chunks, kd, vd, qd);
+                assert!(unsafe { drv.launch2(k.attn_split, chunks, nkv as u32, 128, &mut p!(qd2, kd2, vd2, pd, a, b, c, s32, sc))
+                                 && drv.launch(k.attn_combine, nh as u32, (dh as u32).next_multiple_of(32), &mut p!(pd, od, c, gg)) } && drv.sync());
+                let mut gs = vec![0f32; qo]; assert!(drv.dtoh(&mut gs, od));
+                unsafe { (drv.cu_mem_free)(pd); (drv.cu_mem_free)(od); }
+                gate(&format!("attn_split+combine G={chunks} nh={nh} nkv={nkv} dh={dh} S={s}"), &gs, &want, &host);
+            }
+            unsafe { for p in [qd, kd, vd, ad] { (drv.cu_mem_free)(p); } }
         };
         attn(nh, nkv, dh, s_len, 6);
         // The real head geometry (dh=128 -> 4 elements per lane) and a key count that leaves a
@@ -1311,6 +1915,11 @@ mod tests {
         // Past one 2048-key chunk: 2049 (one key into the second chunk) and 4500 (three chunks).
         attn(14, 2, 64, 2049, 26);
         attn(32, 8, 64, 4500, 36);
+        // Qwen2.5-0.5B's group (7 q-heads per kv head) at the context the split kernel was built for,
+        // a one-key context (all but one chunk empty), and a whole group on one kv head at dh 128.
+        attn(14, 2, 64, 576, 46);
+        attn(14, 2, 64, 1, 56);
+        attn(7, 1, 128, 300, 66);
     }
 
     /// **The tensor-core GEMM, every format**, against the f64 product of the host-dequantised weights
@@ -1325,7 +1934,9 @@ mod tests {
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
         let h16 = |v: f32| half::f16::from_f32(v).to_f32() as f64;
         for (ci, &(f, k)) in [(QFmt::Q4K, 512usize), (QFmt::Q5K, 512), (QFmt::Q6K, 512), (QFmt::Q8_0, 896), (QFmt::Q5_0, 896), (QFmt::Q8_0, 96), (QFmt::Q5_0, 96)].iter().enumerate() {
-            let (m, n) = (70usize, 100usize);
+            // 70 x 100: part-empty tiles in both kernels; 150 x 260: several blocks along M and N (v2's
+            // 64 x 128 tile three times along N, the last one ragged).
+            let (m, n) = if ci % 2 == 0 { (70usize, 100usize) } else { (150, 260) };
             let bytes = q_fixture(f, n, k, 0xF00D + ci as u64);
             let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).expect("qmatrix");
             let w = qm.native_weight().expect("mirror");
@@ -1339,26 +1950,51 @@ mod tests {
                     s += av as f64 * wv as f64; x += av as f64 * h16(wv); g += (av as f64 * wv as f64).abs(); }
                 want[i * n + o] = s; exact[i * n + o] = x; mag = mag.max(g);
             } }
-            let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
-            assert!(unsafe { launch_gemm(drv, &pk, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
-            let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
-            let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
-            unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
-            let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
-            let tol = 2e-6 * mag;
-            eprintln!("{f:?} gemm {m}x{n}x{k}: max|Δ| vs f64 {dr:.3e} (tol {tol:.3e})   [vs f64 on f16-rounded weights {dx:.3e}]   Σ|a·w| {mag:.3e}");
-            assert!(flag[0].to_bits() == 0, "{f:?}: overflow flag raised on in-range inputs");
-            assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?}: tensor-core GEMM diverges from the f64 host GEMM");
+            for ver in [1u8, 3] {
+                let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+                assert!(unsafe { launch_gemm_v(drv, &pk, ver, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
+                let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
+                let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
+                unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+                let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
+                let tol = 2e-6 * mag;
+                let vn = format!("v{ver}");
+                eprintln!("{f:?} gemm {vn} {m}x{n}x{k}: max|Δ| vs f64 {dr:.3e} (tol {tol:.3e})   [vs f64 on f16-rounded weights {dx:.3e}]   Σ|a·w| {mag:.3e}");
+                assert!(flag[0].to_bits() == 0, "{f:?} {vn}: overflow flag raised on in-range inputs");
+                assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?} {vn}: tensor-core GEMM diverges from the f64 host GEMM");
+            }
         }
-        // The f16-range guard: one activation past 65504 must raise the flag (the host then runs WGSL).
+        // The range guard. v1 splits the raw activation, so one past f16's 65504 must raise the flag (the
+        // host then runs WGSL). v3 scales each row-tile by a power of two first, so 7e4 is IN range there
+        // and must come out right; only a non-finite input raises its flag.
         let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);
         let bytes = q_fixture(f, n, k, 5);
         let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).unwrap();
+        let rb = bytes.len() / n;
+        let wrows: Vec<Vec<f32>> = (0..n).map(|o| ferric_gguf::deq_raw(&bytes[o * rb..(o + 1) * rb], k, f.ggml_type()).unwrap()).collect();
+        let run = |a: &[f32], ver: u8| -> (bool, Vec<f32>) {
+            let (ad, cd, ovf) = (drv.upload_f32(a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+            assert!(unsafe { launch_gemm_v(drv, &pk, ver, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
+            let (mut flag, mut c) = ([0f32], vec![0f32; m * n]);
+            assert!(drv.dtoh(&mut flag, ovf) && drv.dtoh(&mut c, cd));
+            unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+            (flag[0].to_bits() != 0, c)
+        };
         let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
-        let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
-        assert!(unsafe { launch_gemm(drv, &pk, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
-        let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
-        assert!(flag[0].to_bits() != 0, "an activation of 7e4 did NOT raise the f16 overflow flag");
+        assert!(run(&a, 1).0, "v1: an activation of 7e4 did NOT raise the f16 overflow flag");
+        {
+            let ver = 3u8;
+            let (flag, c) = run(&a, ver);
+            let (mut worst, mut mag) = (0f64, 0f64);
+            for i in 0..m { for o in 0..n {
+                let (s, g): (f64, f64) = (0..k).fold((0.0, 0.0), |(s, g), j| (s + a[i * k + j] as f64 * wrows[o][j] as f64, g + (a[i * k + j] as f64 * wrows[o][j] as f64).abs()));
+                worst = worst.max((c[i * n + o] as f64 - s).abs()); mag = mag.max(g);
+            } }
+            eprintln!("v{ver} with a 7e4 activation: flag {flag}, max|Δ| vs f64 {worst:.3e} (Σ|a·w| {mag:.3e})");
+            assert!(!flag && worst <= 2e-6 * mag, "v{ver} must scale 7e4 into range and compute it (flag {flag}, Δ {worst:.3e})");
+        }
+        a[k + 17] = f32::INFINITY;
+        assert!(run(&a, 3).0, "v3: an infinite activation did NOT raise the flag");
     }
 
     /// Causal prefill attention with a cache offset (`pos` earlier rows), GQA, row counts that leave
@@ -1367,9 +2003,13 @@ mod tests {
     fn prefill_attention_matches_f64_causal_softmax() {
         if driver().is_none() { eprintln!("SKIPPED prefill_attention_matches_f64_causal_softmax: no CUDA driver / FERRIC_CUDA unset."); return; }
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
-        for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3)] {
+        // `amp` scales q: 1 = scores O(1); 12 = scores O(50), a peaked softmax — what a model with large
+        // q/k biases (Qwen2.5) feeds attention, and where a kernel's score precision shows.
+        for &(nh, nkv, dh, t, pos, amp) in &[(8usize, 2usize, 64usize, 45usize, 37usize, 1.0f32), (4, 4, 128, 33, 0, 1.0), (14, 2, 64, 20, 530, 1.0),
+                                              (32, 8, 64, 70, 3, 1.0), (7, 1, 128, 100, 61, 1.0), (6, 2, 96, 37, 5, 1.0),
+                                              (14, 2, 64, 90, 40, 12.0), (8, 8, 128, 64, 0, 12.0)] {
             let (qw, kw) = (nh * dh, nkv * dh); let s = pos + t;
-            let (q, vc) = (rndx(t * qw, 1 + t as u64), rndx(s * kw, 3 + s as u64));
+            let (q, vc) = (rndx(t * qw, 1 + t as u64).iter().map(|v| v * amp).collect::<Vec<f32>>(), rndx(s * kw, 3 + s as u64));
             let kc: Vec<f32> = rndx(s * kw, 2 + s as u64).iter().enumerate().map(|(i, &v)| v * (1.0 + 2.0 * (i / kw) as f32 / s as f32)).collect();
             let mut want = vec![0f64; t * qw];
             for i in 0..t { for h in 0..nh {
@@ -1380,14 +2020,20 @@ mod tests {
                 for (j, v) in sc.iter().enumerate() { let p = (v - mx).exp() / z;
                     for e in 0..dh { want[i * qw + h * dh + e] += p * vc[j * kw + kvh * dh + e] as f64; } }
             } }
-            let (mut qd, mut kd, mut vd, mut od) = (drv.upload_f32(&q).unwrap(), drv.upload_f32(&kc).unwrap(), drv.upload_f32(&vc).unwrap(), drv.alloc(t * qw * 4).unwrap());
-            let (mut a, mut b, mut c, mut tt, mut pp, mut scl) = (nh as u32, nkv as u32, dh as u32, t as u32, pos as u32, 1.0f32 / (dh as f32).sqrt());
-            assert!(unsafe { drv.launch2(pk.attn_prefill, (t as u32).div_ceil(16), nh as u32, 128, &mut p!(qd, kd, vd, od, a, b, c, tt, pp, scl)) } && drv.sync());
-            let mut got = vec![0f32; t * qw]; assert!(drv.dtoh(&mut got, od));
-            unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
-            let d = max_abs_diff(&got, &want);
-            eprintln!("attn_prefill nh={nh} nkv={nkv} dh={dh} T={t} pos={pos}: max|Δ| vs f64 {d:.3e}");
-            assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "attn_prefill diverges from the f64 causal softmax by {d:.3e}");
+            for v2 in [false, true] {
+                // v1 is checked on the shapes it always was; the dh-96 (Phi-3) case is added for v2.
+                if !v2 && dh % 64 != 0 { continue; }
+                let (mut qd, mut kd, mut vd, mut od) = (drv.upload_f32(&q).unwrap(), drv.upload_f32(&kc).unwrap(), drv.upload_f32(&vc).unwrap(), drv.alloc(t * qw * 4).unwrap());
+                let (mut a, mut b, mut c, mut tt, mut pp, mut scl) = (nh as u32, nkv as u32, dh as u32, t as u32, pos as u32, 1.0f32 / (dh as f32).sqrt());
+                let (f, rows) = if v2 { (pk.attn_prefill2, 32u32) } else { (pk.attn_prefill, 16) };
+                assert!(unsafe { drv.launch2(f, (t as u32).div_ceil(rows), nh as u32, 128, &mut p!(qd, kd, vd, od, a, b, c, tt, pp, scl)) } && drv.sync());
+                let mut got = vec![0f32; t * qw]; assert!(drv.dtoh(&mut got, od));
+                unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
+                let d = max_abs_diff(&got, &want);
+                let vn = if v2 { "attn_prefill2" } else { "attn_prefill" };
+                eprintln!("{vn} nh={nh} nkv={nkv} dh={dh} T={t} pos={pos} amp={amp}: max|Δ| vs f64 {d:.3e}");
+                assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "{vn} diverges from the f64 causal softmax by {d:.3e}");
+            }
         }
     }
 
