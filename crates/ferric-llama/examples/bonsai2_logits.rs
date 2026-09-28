@@ -46,6 +46,9 @@ async fn run() {
     assert!(lg.iter().any(|x| *x != 0.0), "all-zero logits: not a model output");
     if let Some(w) = out.as_mut() { for x in &lg { w.write_all(&x.to_le_bytes()).unwrap(); } }
     let mut next = argmax(&lg[(ids.len() - 1) * nv..]);
+    let t_prefill = t0.elapsed();
+    // FERRIC_PROFILE: drop the prefill's categories so the report below covers the decode steps only.
+    if time { eprintln!("prefill {} tokens (+load) in {t_prefill:.2?}", ids.len()); ferric_tensor::prof_report(); }
     let mut gen_ids = Vec::new();
     let mut step_ms = Vec::new();
     for s in 0..n_gen {
@@ -64,5 +67,6 @@ async fn run() {
         let mut s = step_ms.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("decode ms/token: median {:.1}  min {:.1}  max {:.1}  (n={})", s[s.len() / 2], s[0], s[s.len() - 1], s.len());
+        ferric_tensor::prof_report();
     }
 }
