@@ -117,6 +117,8 @@ pub(crate) struct PrefillK {
     /// v3: integer tensor cores, activations as three int8 digits of a per-row-tile fixed point.
     gemm3: [CUfunction; 5],
     swiglu_rows: CUfunction, attn_prefill: CUfunction,
+    /// The register-tiled causal attention (cuda_prefill.cu, v2); `FERRIC_CUDA_ATTN_PREFILL_V1` keeps v1.
+    attn_prefill2: CUfunction,
 }
 unsafe impl Send for PrefillK {}
 unsafe impl Sync for PrefillK {}
@@ -326,13 +328,15 @@ impl Driver {
 
     fn prefill_kernels(&self) -> Option<&PrefillK> {
         self.prefill.get_or_init(|| {
-            const N: [&[u8]; 17] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
+            const N: [&[u8]; 18] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
                                     b"swiglu_rows\0", b"attn_prefill\0",
                                     b"q4k_gemm2\0", b"q5k_gemm2\0", b"q6k_gemm2\0", b"q8_0_gemm2\0", b"q5_0_gemm2\0",
-                                    b"q4k_gemm3\0", b"q5k_gemm3\0", b"q6k_gemm3\0", b"q8_0_gemm3\0", b"q5_0_gemm3\0"];
+                                    b"q4k_gemm3\0", b"q5k_gemm3\0", b"q6k_gemm3\0", b"q8_0_gemm3\0", b"q5_0_gemm3\0",
+                                    b"attn_prefill2\0"];
             let v = self.load_ptx("cuda_prefill.ptx", &N)?;
             Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6],
-                            gemm2: [v[7], v[8], v[9], v[10], v[11]], gemm3: [v[12], v[13], v[14], v[15], v[16]] })
+                            gemm2: [v[7], v[8], v[9], v[10], v[11]], gemm3: [v[12], v[13], v[14], v[15], v[16]],
+                            attn_prefill2: v[17] })
         }).as_ref()
     }
     /// 2-D grid launch, same contract as [`Driver::launch`].
@@ -1114,6 +1118,7 @@ impl DecodeGraph {
         // FERRIC_CUDA_PROFILE: GPU time per kernel class of this prefill (an event pair + a sync around
         // each launch, so the profiled prefill is slower; the split is what matters).
         let mut pp = Prof::new(&drv);
+        let attn_v1 = std::env::var("FERRIC_CUDA_ATTN_PREFILL_V1").is_ok();
         let null: CUstream = std::ptr::null_mut();
         macro_rules! pt { ($cls:expr, $body:expr) => {{ pp.start(&drv, null); let ok: bool = $body; pp.stop(&drv, null, $cls); if !ok { return None; } }} }
         unsafe {
@@ -1144,8 +1149,8 @@ impl DecodeGraph {
                     pt!(2, drv.launch2(k.qk_norm_rope, (self.nh + self.nkv) as u32, r32, 128,
                                     &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh32, base, posu, eps, qoff, koff, hn, kc_row, vc_row, voff, bias, ff, np, roww, tb)));
                     let (mut q, mut kc, mut vc, mut ao, mut tt, mut rowu, mut sc) = (b[PQ], kv.k[li], kv.v[li], b[PATT], r32, row as u32, 1.0f32 / (dh as f32).sqrt());
-                    pt!(4, drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128,
-                                    &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)));
+                    pt!(4, if attn_v1 { drv.launch2(pk.attn_prefill, r32.div_ceil(16), self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)) }
+                           else { drv.launch2(pk.attn_prefill2, r32.div_ceil(32), self.nh as u32, 128, &mut p!(q, kc, vc, ao, nh, nkv, dh32, tt, rowu, sc)) });
                     pt!(5, launch_gemm(&drv, &pk, b[PATT], q_out, l.wo, b[PY], d, rows, b[POVF]));
                     let (mut x2, mut y2, mut fw, mut xy, mut xn) = (b[PX], b[PY], l.ffn_norm, b[PXY], b[PXN]);
                     pt!(6, drv.launch(k.add_rmsnorm, r32, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
@@ -1935,7 +1940,8 @@ mod tests {
     fn prefill_attention_matches_f64_causal_softmax() {
         if driver().is_none() { eprintln!("SKIPPED prefill_attention_matches_f64_causal_softmax: no CUDA driver / FERRIC_CUDA unset."); return; }
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
-        for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3)] {
+        for &(nh, nkv, dh, t, pos) in &[(8usize, 2usize, 64usize, 45usize, 37usize), (4, 4, 128, 33, 0), (14, 2, 64, 20, 530), (32, 8, 64, 70, 3),
+                                         (7, 1, 128, 100, 61), (6, 2, 96, 37, 5)] {
             let (qw, kw) = (nh * dh, nkv * dh); let s = pos + t;
             let (q, vc) = (rndx(t * qw, 1 + t as u64), rndx(s * kw, 3 + s as u64));
             let kc: Vec<f32> = rndx(s * kw, 2 + s as u64).iter().enumerate().map(|(i, &v)| v * (1.0 + 2.0 * (i / kw) as f32 / s as f32)).collect();
@@ -1948,14 +1954,20 @@ mod tests {
                 for (j, v) in sc.iter().enumerate() { let p = (v - mx).exp() / z;
                     for e in 0..dh { want[i * qw + h * dh + e] += p * vc[j * kw + kvh * dh + e] as f64; } }
             } }
-            let (mut qd, mut kd, mut vd, mut od) = (drv.upload_f32(&q).unwrap(), drv.upload_f32(&kc).unwrap(), drv.upload_f32(&vc).unwrap(), drv.alloc(t * qw * 4).unwrap());
-            let (mut a, mut b, mut c, mut tt, mut pp, mut scl) = (nh as u32, nkv as u32, dh as u32, t as u32, pos as u32, 1.0f32 / (dh as f32).sqrt());
-            assert!(unsafe { drv.launch2(pk.attn_prefill, (t as u32).div_ceil(16), nh as u32, 128, &mut p!(qd, kd, vd, od, a, b, c, tt, pp, scl)) } && drv.sync());
-            let mut got = vec![0f32; t * qw]; assert!(drv.dtoh(&mut got, od));
-            unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
-            let d = max_abs_diff(&got, &want);
-            eprintln!("attn_prefill nh={nh} nkv={nkv} dh={dh} T={t} pos={pos}: max|Δ| vs f64 {d:.3e}");
-            assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "attn_prefill diverges from the f64 causal softmax by {d:.3e}");
+            for v2 in [false, true] {
+                // v1 is checked on the shapes it always was; the dh-96 (Phi-3) case is added for v2.
+                if !v2 && dh % 64 != 0 { continue; }
+                let (mut qd, mut kd, mut vd, mut od) = (drv.upload_f32(&q).unwrap(), drv.upload_f32(&kc).unwrap(), drv.upload_f32(&vc).unwrap(), drv.alloc(t * qw * 4).unwrap());
+                let (mut a, mut b, mut c, mut tt, mut pp, mut scl) = (nh as u32, nkv as u32, dh as u32, t as u32, pos as u32, 1.0f32 / (dh as f32).sqrt());
+                let (f, rows) = if v2 { (pk.attn_prefill2, 32u32) } else { (pk.attn_prefill, 16) };
+                assert!(unsafe { drv.launch2(f, (t as u32).div_ceil(rows), nh as u32, 128, &mut p!(qd, kd, vd, od, a, b, c, tt, pp, scl)) } && drv.sync());
+                let mut got = vec![0f32; t * qw]; assert!(drv.dtoh(&mut got, od));
+                unsafe { for p in [qd, kd, vd, od] { (drv.cu_mem_free)(p); } }
+                let d = max_abs_diff(&got, &want);
+                let vn = if v2 { "attn_prefill2" } else { "attn_prefill" };
+                eprintln!("{vn} nh={nh} nkv={nkv} dh={dh} T={t} pos={pos}: max|Δ| vs f64 {d:.3e}");
+                assert!(got.iter().all(|v| v.is_finite()) && d <= 2e-5, "{vn} diverges from the f64 causal softmax by {d:.3e}");
+            }
         }
     }
 

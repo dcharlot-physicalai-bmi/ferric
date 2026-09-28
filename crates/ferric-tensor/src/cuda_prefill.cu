@@ -902,3 +902,124 @@ extern "C" __global__ void attn_prefill(const float* __restrict__ q, const float
             if (qi < T && e < dpl) out[(size_t)qi * qw + head * dh + lane * dpl + e] = o[r][e] / l[r];
     }
 }
+
+
+// ── Causal prefill attention v2: REGISTER-TILED. ⛔ attn_prefill above gives each lane one key and has
+//    it walk dh one float at a time from shared memory against 4 queries: one shared load per FMA, and
+//    the profiler (FERRIC_CUDA_PROFILE) put it at 24% (Llama-3.2-1B), 33% (Qwen2.5-0.5B) and 46%
+//    (Qwen3-0.6B, dh 128) of a 512-row prefill's GPU time — ~0.5 TFLOPS of f32 work.
+//    Block = 32 query rows x one q-head, 128 threads; thread (tq, tk) = (tid / 8, tid % 8) owns query
+//    rows {2tq, 2tq+1} and, of each 32-key tile, keys {tk, tk+8, tk+16, tk+24}: its 2 x 4 scores come
+//    from float4 shared loads (two Q rows, four K rows per 4 dh) — 32 FMA per 6 loads — and the 8
+//    lanes that share a query row are adjacent, so the row's max and sum are 3 shuffles. P·V: the same
+//    thread owns the same two rows x the float4 columns {4tk + 32c}, taking each key's p by shuffle
+//    from the lane that scored it. K and V share one shared buffer in turn (V loads after the scores):
+//    dh 128 fits in 34 KB. Same f32 math as attn_prefill (online softmax per row, per 32-key tile); only
+//    the order of the dh sum differs. dh <= 128, dh % 32 == 0. ──
+#define AP_BQ 32u
+#define AP_BK 32u
+extern "C" __global__ void attn_prefill2(const float* __restrict__ q, const float* __restrict__ kc,
+                                         const float* __restrict__ vc, float* __restrict__ out,
+                                         unsigned nh, unsigned nkv, unsigned dh, unsigned T, unsigned pos, float scale) {
+    __shared__ __align__(16) float Qs[AP_BQ * 132];
+    __shared__ __align__(16) float KV[AP_BK * 132];
+    const unsigned tid = threadIdx.x, lane = tid & 31u;
+    const unsigned tq = tid >> 3u, tk = tid & 7u;
+    const unsigned head = blockIdx.y, kvh = head / (nh / nkv), q0 = blockIdx.x * AP_BQ;
+    const unsigned qw = nh * dh, kvw = nkv * dh, ld = dh + 4u, d4 = dh / 4u, nc = dh / 32u;
+    for (unsigned i = tid; i < AP_BQ * d4; i += 128u) {
+        const unsigned r = i / d4, e = (i - r * d4) * 4u;
+        const float4 v = (q0 + r < T) ? *reinterpret_cast<const float4*>(q + (size_t)(q0 + r) * qw + head * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(Qs + r * ld + e) = v;
+    }
+    float m[2] = {-3.0e38f, -3.0e38f}, l[2] = {0.f, 0.f};
+    float o[2][4][4];
+    #pragma unroll
+    for (unsigned r = 0u; r < 2u; ++r)
+        #pragma unroll
+        for (unsigned c = 0u; c < 4u; ++c) { o[r][c][0] = o[r][c][1] = o[r][c][2] = o[r][c][3] = 0.f; }
+    const unsigned qa = 2u * tq, kend = pos + min(q0 + AP_BQ, T);   // keys the tile's last query can see
+    for (unsigned k0 = 0u; k0 < kend; k0 += AP_BK) {
+        __syncthreads();                                   // Qs written / the previous V consumed
+        for (unsigned i = tid; i < AP_BK * d4; i += 128u) {
+            const unsigned j = i / d4, e = (i - j * d4) * 4u, kr = k0 + j;
+            *reinterpret_cast<float4*>(KV + j * ld + e) = kr < kend ? *reinterpret_cast<const float4*>(kc + (size_t)kr * kvw + kvh * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        __syncthreads();
+        float sc[2][4];
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r)
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) sc[r][j] = 0.f;
+        for (unsigned e = 0u; e < dh; e += 4u) {
+            const float4 a0 = *reinterpret_cast<const float4*>(Qs + qa * ld + e), a1 = *reinterpret_cast<const float4*>(Qs + (qa + 1u) * ld + e);
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) {
+                const float4 b = *reinterpret_cast<const float4*>(KV + (tk + 8u * j) * ld + e);
+                sc[0][j] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+                sc[1][j] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+            }
+        }
+        // mask, then the online softmax per row (its 8 lanes: xor 1, 2, 4)
+        float corr[2];
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r) {
+            const unsigned qi = q0 + qa + r;
+            float mx = -3.0e38f;
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) {
+                const unsigned key = k0 + tk + 8u * j;
+                const bool vis = qi < T && key <= pos + qi && key < kend;
+                sc[r][j] = vis ? sc[r][j] * scale : -3.0e38f;
+                mx = fmaxf(mx, sc[r][j]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1)); mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+            const float mn = fmaxf(m[r], mx);
+            corr[r] = expf(m[r] - mn);
+            float ps = 0.f;
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) { const float pv = sc[r][j] > -1.0e38f ? expf(sc[r][j] - mn) : 0.f; sc[r][j] = pv; ps += pv; }
+            ps += __shfl_xor_sync(0xffffffffu, ps, 1); ps += __shfl_xor_sync(0xffffffffu, ps, 2); ps += __shfl_xor_sync(0xffffffffu, ps, 4);
+            l[r] = l[r] * corr[r] + ps;
+            m[r] = mn;
+        }
+        __syncthreads();                                   // every thread done reading K
+        for (unsigned i = tid; i < AP_BK * d4; i += 128u) {
+            const unsigned j = i / d4, e = (i - j * d4) * 4u, kr = k0 + j;
+            *reinterpret_cast<float4*>(KV + j * ld + e) = kr < kend ? *reinterpret_cast<const float4*>(vc + (size_t)kr * kvw + kvh * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r)
+            #pragma unroll
+            for (unsigned c = 0u; c < 4u; ++c) { o[r][c][0] *= corr[r]; o[r][c][1] *= corr[r]; o[r][c][2] *= corr[r]; o[r][c][3] *= corr[r]; }
+        const unsigned base = lane & ~7u;
+        #pragma unroll 4
+        for (unsigned jj = 0u; jj < AP_BK; ++jj) {
+            // key jj was scored by lane (base | jj % 8), slot jj / 8
+            const unsigned src = base | (jj & 7u), slot = jj >> 3u;
+            const float s0 = slot == 0u ? sc[0][0] : slot == 1u ? sc[0][1] : slot == 2u ? sc[0][2] : sc[0][3];
+            const float s1 = slot == 0u ? sc[1][0] : slot == 1u ? sc[1][1] : slot == 2u ? sc[1][2] : sc[1][3];
+            const float p0 = __shfl_sync(0xffffffffu, s0, src), p1 = __shfl_sync(0xffffffffu, s1, src);
+            #pragma unroll
+            for (unsigned c = 0u; c < 4u; ++c) {
+                if (c < nc) {
+                    const float4 v = *reinterpret_cast<const float4*>(KV + jj * ld + 4u * tk + 32u * c);
+                    o[0][c][0] += p0 * v.x; o[0][c][1] += p0 * v.y; o[0][c][2] += p0 * v.z; o[0][c][3] += p0 * v.w;
+                    o[1][c][0] += p1 * v.x; o[1][c][1] += p1 * v.y; o[1][c][2] += p1 * v.z; o[1][c][3] += p1 * v.w;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0u; r < 2u; ++r) {
+        const unsigned qi = q0 + qa + r;
+        if (qi >= T) continue;
+        const float inv = 1.f / l[r];
+        #pragma unroll
+        for (unsigned c = 0u; c < 4u; ++c)
+            if (c < nc) *reinterpret_cast<float4*>(out + (size_t)qi * qw + head * dh + 4u * tk + 32u * c) =
+                            make_float4(o[r][c][0] * inv, o[r][c][1] * inv, o[r][c][2] * inv, o[r][c][3] * inv);
+    }
+}
