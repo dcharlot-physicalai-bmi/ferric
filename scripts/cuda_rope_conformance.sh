@@ -81,7 +81,10 @@ w_dec, _, _ = run(False, DEC)
 SCHED = [("FULL", {}, w_full, (0, T, 0)),
          ("DECODE", DEC, w_dec, (T - PRE, PRE, T - PRE)),
          ("HANDOVER", {**DEC, "FERRIC_CUDA_NO_PREFILL": "1"}, w_dec, (T - PRE, 0, T - PRE))]
-# ⭐ The band, MEASURED on the RTX 4050 (sampled logits print at 1e-5): see the commit that added this gate.
+# ⭐ The band, MEASURED on the RTX 4050 (sampled logits print at 1e-5), native vs WGSL, max over all three
+# schedules: Qwen2.5-0.5B Q4_K_M 7e-5, Qwen2.5-0.5B Q8_0 7e-5, Qwen3-0.6B Q5_K_M 2.5e-4, Llama-3.2-1B
+# Q4_K_M 6e-5 (the same at 300,000). TOL = 1e-3 is 4x the widest. The device-formula control at 300,000:
+# 52-203x the clean run.
 TOL = 1e-3
 ok, clean = True, {}
 for name, env, twin, want in SCHED:

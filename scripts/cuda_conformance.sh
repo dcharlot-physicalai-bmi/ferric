@@ -117,6 +117,13 @@ def vs_authors(rows):
 #   1000 rows; split activations + rounded weights, 0.028 there and 4.7e-2 on Qwen2.5 Q8_0.)
 #   For scale: every one of these files sits 2.4-11.7 logits from the authors (quantisation), and the
 #   native tier's distance from them matched WGSL's to within 0.01 in every run.
+#   ⭐ Re-measured 2026-09-28 (feat/cuda2: host rope rows on both paths, CUDA-graph step, split-K decode
+#   attention, int8-digit prefill GEMM v3, tiled prefill attention): decode / full / 1000-row prefill —
+#   Qwen2.5 Q4_K_M 1.0e-4 / 1.7e-4 / 2.0e-4, Qwen2.5 Q8_0 8e-5 / 8e-5 / 9e-5, Qwen3 3e-5 / 2.5e-4 /
+#   5.8e-4, Llama 3e-5 / 4e-5 / 5e-5; at 2300 positions Qwen2.5 1.5e-4 / 1.6e-4 and Llama 8e-5 / 9e-5
+#   — Llama's 1.35e-3 there was the two paths' DIFFERENT rope angles, gone now both take the host
+#   table. Controls under the tensor-core prefill: native vs WGSL-under-control up to 1.9e-3 (Qwen2.5
+#   Q4_K_M, see cuda_prefill.cu GEMM v3 on why it was 1.57e-2 before the per-row-tile exponent).
 TOL_NW = 5e-3
 TOL_PF = TOL_NW
 ok = True
