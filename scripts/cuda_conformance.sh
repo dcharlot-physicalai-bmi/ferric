@@ -182,7 +182,15 @@ for name, env in controls:
         same, _, _ = diff(xc, xw)
         moved, _, _ = diff(xc, {t: base[t] for t in xc})
         ran = xs[0][0] == xs[0][1] > 0 and xs[1][0] == (xs[1][1] if mode == "FULL" else 0)
-        follow = tol
+        # "Honours the mechanism" = the control run sits far closer to WGSL-under-the-same-control than
+        # to the normal run: within the band, or >= 200x closer than it moved. ⛔ The band alone is the
+        # wrong yardstick for a CONTROL: a broken model can be ill-conditioned. Measured 2026-09-28 on
+        # Qwen2.5-0.5B Q4_K_M under the wrong rope pairing (attention scores reach 1673): WGSL against
+        # ITSELF with rope angles perturbed by ~1e-7 (FERRIC_ROPE_DEVICE at positions <= 1024) moved
+        # 6.1e-3 (clean model: 1.5e-4); two native attention kernels each 1.2-1.3e-5 from an f64
+        # recomputation of layer 0's attention landed 2.65e-2 apart in the logits. A native path that
+        # IGNORED the control would sit ~`moved` (19.9 there) away — 200x is far from both.
+        follow = max(tol, moved / 200)
         print(f"  control '{name}' [{mode}]: native vs WGSL-under-control {same:.2e} (≤ {follow:.2e});  moved from normal "
               f"{moved:.2e} = {moved / tol:.0f}x tol;  ran natively: {ran}")
         if same > follow or moved < 20 * tol or not ran: print("  ⛔ the gate cannot see this mechanism on the native path"); ok = False
