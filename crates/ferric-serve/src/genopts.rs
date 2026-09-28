@@ -102,6 +102,51 @@ pub(crate) struct GenOpts {
 /// Most choices one request may ask for.
 pub(crate) const MAX_N: usize = 16;
 
+/// A model's own recommended sampling, from its GGUF's `general.sampling.*` keys (llama.cpp's
+/// `common_init_sampler_from_model` reads the same keys, as server defaults), mapped to request fields.
+/// Values this server does not serve (mirostat 1) are left out, said at load. `general.sampling.sequence`
+/// is not applied: the sampler order here is fixed (see `sample`).
+pub(crate) fn model_sampling_defaults(meta: &std::collections::HashMap<String, ferric_gguf::Meta>) -> serde_json::Map<String, Value> {
+    use ferric_gguf::Meta;
+    let num = |k: &str| match meta.get(&format!("general.sampling.{k}")) {
+        Some(Meta::F(v)) => Some(*v),
+        Some(Meta::U(v)) => Some(*v as f64),
+        Some(Meta::I(v)) => Some(*v as f64),
+        Some(Meta::Str(s)) => s.trim().parse().ok(),
+        _ => None,
+    };
+    let mut out = serde_json::Map::new();
+    // f32 in the file: round-trip through f32 so 0.95 reads as 0.95, not 0.949999988079071.
+    let f = |x: f64| serde_json::json!((x as f32).to_string().parse::<f64>().unwrap_or(x));
+    for (key, field) in [("temp", "temperature"), ("top_p", "top_p"), ("min_p", "min_p"), ("xtc_probability", "xtc_probability"),
+                         ("xtc_threshold", "xtc_threshold"), ("penalty_repeat", "repeat_penalty"), ("mirostat_tau", "mirostat_tau"),
+                         ("mirostat_eta", "mirostat_eta")] {
+        if let Some(v) = num(key) { out.insert(field.into(), f(v)); }
+    }
+    for (key, field) in [("top_k", "top_k"), ("penalty_last_n", "repeat_last_n")] {
+        if let Some(v) = num(key) { if v >= 0.0 { out.insert(field.into(), serde_json::json!(v as i64)); } }
+    }
+    match num("mirostat") {
+        Some(m) if m == 0.0 || m == 2.0 => { out.insert("mirostat".into(), serde_json::json!(m as i64)); }
+        Some(m) => eprintln!("ferric-serve: ⚠ the GGUF asks for mirostat {m}; only 0 and 2 are served, so it is not applied"),
+        None => {}
+    }
+    if meta.contains_key("general.sampling.sequence") {
+        eprintln!("ferric-serve: ⚠ general.sampling.sequence is not applied: the sampler order here is fixed");
+    }
+    out
+}
+
+/// `req` with every default it does not set itself (a field present — even as null — is the request's).
+/// Ollama's `options` are mapped to top-level fields before this, so they count as set.
+pub(crate) fn with_defaults(req: &Value, defaults: &serde_json::Map<String, Value>) -> Value {
+    let mut r = req.clone();
+    if let Some(o) = r.as_object_mut() {
+        for (k, v) in defaults { if !o.contains_key(k) { o.insert(k.clone(), v.clone()); } }
+    }
+    r
+}
+
 /// The request for choice `i` of an `n > 1` request: `n` removed, and for i >= 1 the seed moved to
 /// (seed or 0) + i, so every choice is reproducible and distinct while choice 0 is exactly the n = 1 answer.
 pub(crate) fn choice_request(req: &Value, i: usize) -> Value {
@@ -821,6 +866,24 @@ mod tests {
         assert_eq!(content_text(&Value::Null).unwrap(), "");
         let img = json!([{"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:..."}}]);
         assert!(content_text(&img).unwrap_err().contains("image_url"));
+    }
+
+    /// `general.sampling.*` (Bonsai 2's keys and types: top_k u32, top_p/temp f32) become request defaults;
+    /// a request's own field — even a null or a zero — wins; mirostat 1 is not carried in.
+    #[test]
+    fn a_models_sampling_keys_are_defaults_a_request_overrides() {
+        use ferric_gguf::Meta;
+        let meta: std::collections::HashMap<String, Meta> = [
+            ("general.sampling.top_k", Meta::U(20)), ("general.sampling.top_p", Meta::F(0.949999988079071)),
+            ("general.sampling.temp", Meta::F(1.0)), ("general.sampling.penalty_last_n", Meta::I(-1)),
+            ("general.sampling.mirostat", Meta::I(1)), ("general.architecture", Meta::Str("qwen35".into())),
+        ].into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let d = model_sampling_defaults(&meta);
+        assert_eq!(Value::Object(d.clone()), json!({"temperature": 1.0, "top_p": 0.95, "top_k": 20}));
+        let o = GenOpts::from_req(&with_defaults(&json!({}), &d), true).unwrap();
+        assert_eq!((o.sampling.temperature, o.sampling.top_p, o.sampling.top_k), (1.0, 0.95, 20));
+        let o = GenOpts::from_req(&with_defaults(&json!({"temperature": 0, "top_k": 0}), &d), true).unwrap();
+        assert_eq!((o.sampling.temperature, o.sampling.top_p, o.sampling.top_k), (0.0, 0.95, 0));
     }
 
     /// Choice 0 of an n > 1 request IS the n = 1 request; every later choice differs only in its seed,

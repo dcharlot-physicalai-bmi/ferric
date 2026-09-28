@@ -450,6 +450,8 @@ pub(crate) struct Engine {
     grammars: std::cell::RefCell<Vec<(String, std::sync::Arc<constrain::Masks>)>>,
     /// JSON-object guide masks by guide state (`constrain`).
     json_masks: std::cell::RefCell<HashMap<ferric_agent::guide::Json, Vec<u64>>>,
+    /// The model's own recommended sampling (`general.sampling.*` in the GGUF), as request fields.
+    sampling_defaults: serde_json::Map<String, Value>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -684,6 +686,12 @@ impl Engine {
             specials.iter().filter(|(t, _)| t.starts_with("<|") && t.ends_with("|>") && t != "<|endoftext|>").map(|(_, i)| *i).collect()
         } else { Default::default() };
         let card = ollama::Card::from_gguf(&name, path, &g, false, model.n_embd(), n_ctx, &template);
+        let sampling_defaults = genopts::model_sampling_defaults(&g.metadata);
+        if !sampling_defaults.is_empty() {
+            eprintln!("ferric-serve: sampling defaults from the GGUF (general.sampling.*), used where a request sets none: {}{}",
+                serde_json::Value::Object(sampling_defaults.clone()),
+                if std::env::var("FERRIC_MODEL_SAMPLING").as_deref() == Ok("0") { " — OFF (FERRIC_MODEL_SAMPLING=0)" } else { "" });
+        }
         let tok_str = |id: Option<u32>| id.and_then(|i| tokens.get(i as usize).cloned()).unwrap_or_default();
         let chat_template = if template.is_empty() { None } else {
             match template::ChatTemplate::compile(&template, &tok_str(bos_id), &tok_str(eos_id)) {
@@ -696,7 +704,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default() }
+                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default(), sampling_defaults }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -979,6 +987,11 @@ impl Engine {
     /// - `lora: [{"id": i | "name": n, "scale": s}]` (llama-server's; `id` is the adapter's place among
     ///   the `--lora` flags). Several SUM, as PEFT does; scale 0 drops one; an unknown one is refused.
     pub(crate) fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> {
+        let merged;
+        let req = if self.sampling_defaults.is_empty() || std::env::var("FERRIC_MODEL_SAMPLING").as_deref() == Ok("0") { req } else {
+            merged = genopts::with_defaults(req, &self.sampling_defaults);
+            &merged
+        };
         let mut o = GenOpts::from_req(req, chat)?;
         // The tokenizer-dependent sampler inputs, resolved as their reference implementation resolves them:
         // DRY's breakers are the LAST id of "a" + breaker (so a breaker is tokenized as text-final); XTC's
