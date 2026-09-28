@@ -451,7 +451,18 @@ pub const REGISTRY: &[Arch] = &[
                   for the first time — reading them grouped is 33,804x worse; 0.8B (16 on 16) could \
                   never show it. ⚠ the YaRN long-rope SUB-PATH is unverified: it ran \
                   through rope_scaled, which applied no rotation at all until 2026-08-15. \
-                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/" },
+                  Gate: scripts/lm_conformance.sh vs tests/fixtures/lm/. \
+                  ⭐ PrismML BONSAI 2 (Ternary-Bonsai-2-27B: weights in a Hadamard-ROTATED basis, \
+                  prism.hadamard.* contract) Verified against the AUTHORS' runtime, PrismML's llama.cpp fork \
+                  @ adfffbe on its decode path: max |logit diff| 8.0e-5 over 170 rows of 3 prompts (5/63/441 \
+                  ids) + 32 greedy steps each, identical greedy, within the fork's own flash on/off spread of \
+                  4.5e-3; dropping the Hadamard, the signs or the GDN tiled->grouped gather is ~2e5x worse. All \
+                  three packings (PQ2_0, PTQ1_0, group-64 Q2_0) dequantize bit-identically to the fork over \
+                  every tensor. ⚠ Dense qwen35 only: a contract on qwen35moe/laguna/other is REFUSED, and a \
+                  reader without the transform cannot read the rotated tensors at all (ferric_gguf::prism). \
+                  ⚠ Not verified for Bonsai 2: MTP draft heads (the file has none), long context (head_dim 256 \
+                  disables flash prefill, so prefill attention is the composed O(t^2) path), KV quantization, \
+                  the vision tower (mmproj). Gate: scripts/bonsai2_conformance.sh" },
     // ---- Qwen3-era MoE -------------------------------------------------------------------
     //
     // ⚠ THE MOST-DOWNLOADED GGUF ON HUGGING FACE (Qwen3-Coder-30B-A3B, 12.5M) and this runtime

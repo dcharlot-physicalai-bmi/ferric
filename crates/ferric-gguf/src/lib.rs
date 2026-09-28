@@ -14,6 +14,8 @@ use std::collections::HashMap;
 pub mod backed;
 pub mod imatrix;
 mod iq_grids;
+pub mod prism;
+use prism::{PQ2_0, PTQ1_0, Q2_0_G64};
 pub use iq_grids::{IQ2XXS_GRID, IQ3XXS_GRID};
 pub mod quantize;
 pub mod quantplan;
@@ -78,6 +80,8 @@ pub struct Gguf {
     pub tensors: Vec<TensorInfo>,
     data: Vec<u8>,
     data_start: usize,
+    /// Refuses reads of Hadamard-rotated tensors until a transform-applying runtime unlocks it.
+    prism_lock: prism::PrismLock,
 }
 
 /// Bounds-safe cursor: any read past the end sets `ok = false` and yields a zero value rather than
@@ -157,7 +161,16 @@ pub fn parse(bytes: Vec<u8>) -> Result<Gguf, String> {
     let data_start = c.p.div_ceil(align) * align;
     check_declared_strides(&tensors, bytes.len().saturating_sub(data_start), align)?;
     resolve_ambiguous_types(&mut tensors, bytes.len().saturating_sub(data_start), align)?;
-    Ok(Gguf { metadata, tensors, data: bytes, data_start })
+    // PQ2_0 (fork id 142) IS the group-128 layout this crate has always decoded as 42 — same 34-byte
+    // block, same codes, same arithmetic (`dequantize_row_pq2_0` vs the legacy PrismML Q2_0), so it
+    // rides every Q2_0 kernel as-is. Rewritten AFTER the type-42 resolution, which must only ever see
+    // ids the FILE declared as 42. What makes a Bonsai 2 file special is its Hadamard metadata, not
+    // this id — see `prism::PrismLock`.
+    for t in tensors.iter_mut() { if t.ggml_type == PQ2_0 { t.ggml_type = Q2_0; } }
+    let names: std::collections::HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+    let prism_lock = prism::PrismLock::new(&metadata, |n| names.contains(n));
+    drop(names);
+    Ok(Gguf { metadata, tensors, data: bytes, data_start, prism_lock })
 }
 
 /// **FP8 E4M3** (OCP `float8_e4m3fn`) -> f32, as a 256-entry bit-pattern table.
@@ -246,12 +259,11 @@ pub fn resolve_type_42(n_elements: usize, declared_bytes: usize) -> Result<u32, 
     // Mainline ggml-org Q2_0 (64 values / 18 bytes) is the third claimant, and one this crate does
     // NOT decode. Its stride is only 2 bytes per 128 values away from PrismML's, so name it precisely
     // when it appears instead of folding it into the generic refusal below.
+    // Decoded since 2026-09-28 (`prism::deq_q2_0_g64`, bit-exact vs `dequantize_row_q2_0` in
+    // PrismML's fork @ adfffbe): PrismML's Bonsai 2 ships a group-64 file under this id, and so will
+    // any mainline Q2_0 quantization. Internal id Q2_0_G64 (2042), like F8_E4M3_B128 is 1042.
     if n_elements % 64 == 0 && declared_bytes == n_elements / 64 * 18 {
-        return Err(format!(
-            "ggml type 42 with {declared_bytes} bytes for {n_elements} elements matches mainline \
-             ggml-org Q2_0 (block_q2_0: 64 values / 18 bytes, ggml.h:432 @ b062ba7), which this crate \
-             does not decode. It is NOT PrismML Q2_0 (128 values / 34 bytes) and NOT F8_E4M3_B128 \
-             (128 values / 129 bytes). Refusing rather than mis-decoding."));
+        return Ok(Q2_0_G64);
     }
     if n_elements % 128 != 0 {
         return Err(format!("ggml type 42 needs a multiple of 128 elements, got {n_elements}"));
@@ -263,8 +275,7 @@ pub fn resolve_type_42(n_elements: usize, declared_bytes: usize) -> Result<u32, 
         b => Err(format!(
             "ggml type 42 is ambiguous and this tensor matches none of the three claimants: \
              {n_elements} elements in {b} bytes is {:.3} bits/value, but PrismML Q2_0 is {} bytes \
-             ({blocks} x 34), mainline ggml-org Q2_0 is {} bytes ({n_elements}/64 x 18, undecoded \
-             here), and F8_E4M3_B128 is {} bytes ({blocks} x {F8_E4M3_B128_BYTES}). Refusing rather \
+             ({blocks} x 34), mainline ggml-org Q2_0 is {} bytes ({n_elements}/64 x 18), and F8_E4M3_B128 is {} bytes ({blocks} x {F8_E4M3_B128_BYTES}). Refusing rather \
              than picking one.",
             b as f64 * 8.0 / n_elements as f64, blocks * 34, n_elements / 64 * 18,
             blocks * F8_E4M3_B128_BYTES)),
@@ -488,6 +499,14 @@ pub trait GgufSource {
     /// return `None` and the caller falls back to holding the bytes.
     fn tensor_file_range(&self, _name: &str) -> Option<(std::path::PathBuf, u64, u64)> { None }
 
+    /// **Declare that the caller applies PrismML's Hadamard transforms** (see [`prism`]), unlocking
+    /// the reads of rotated tensors. Returns `false` when this source cannot vouch for that — the
+    /// default, so a wrapper source that does not forward it keeps a Bonsai 2 file refused.
+    ///
+    /// Call it ONLY from a runtime that has validated the contract and will transform the activation
+    /// before every folded matmul (and invert every latent lookup). Anything else fails closed.
+    fn unlock_prism_hadamard(&self) -> bool { false }
+
     fn raw_range(&self, name: &str, off: u64, dst: &mut [u8]) -> Result<(), String> {
         let all = self.raw(name)?;
         let end = off as usize + dst.len();
@@ -504,6 +523,7 @@ impl Gguf {
 
     /// A tensor's raw on-disk bytes (packed, as stored) — the in-memory analogue of `GgufFile::raw`.
     pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
+        self.prism_lock.check(name)?;
         let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
         let n: usize = t.dims.iter().product::<u64>() as usize;
         let sz = type_size(t.ggml_type, n)?;
@@ -513,6 +533,7 @@ impl Gguf {
 
     /// Dequantize a tensor to f32 (row-major), whatever its GGUF block-quant type.
     pub fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
+        self.prism_lock.check(name)?;
         let t = self.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
         let n: usize = t.dims.iter().product::<u64>() as usize;
         deq_raw(&self.data[self.data_start + t.offset as usize..], n, t.ggml_type)
@@ -524,6 +545,7 @@ impl GgufSource for Gguf {
     fn tensor(&self, name: &str) -> Option<&TensorInfo> { Gguf::tensor(self, name) }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> { Gguf::raw(self, name) }
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String> { Gguf::dequant(self, name) }
+    fn unlock_prism_hadamard(&self) -> bool { self.prism_lock.unlock() }
 }
 
 /// On-disk byte size of `n` elements stored as ggml type `ty`.
@@ -567,7 +589,10 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         STQ1_0 => n / 256 * STQ1_0_BLOCK_BYTES,
         MXFP4 => n / 32 * 17,
         Q1_0 => n / 128 * 18,
-        Q2_0 => n / 128 * 34,
+        Q2_0 | PQ2_0 => n / 128 * 34,
+        PTQ1_0 => n / 128 * prism::PTQ1_0_BYTES,
+        // Internal id only — the FILE says 42 at 18 bytes per 64 values; [`resolve_type_42`] maps it.
+        Q2_0_G64 => n / 64 * 18,
         // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
         F8_E4M3_B128 => n / 128 * F8_E4M3_B128_BYTES,
         other => return Err(format!("unsupported ggml type {other}")),
@@ -595,7 +620,7 @@ pub fn type_name(ty: u32) -> Option<&'static str> {
         17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S",
         23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M",
         30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4", 40 => "NVFP4", 41 => "Q1_0", 42 => "Q2_0",
-        43 => "STQ1_0",
+        43 => "STQ1_0", 142 => "PQ2_0", 143 => "PTQ1_0", 2042 => "Q2_0_G64",
         _ => return None,
     })
 }
@@ -608,7 +633,8 @@ pub fn block_elems(ty: u32) -> usize {
     match ty {
         F32 | F16T | BF16T => 1,
         Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | IQ4_NL | MXFP4 => 32,
-        Q1_0 | Q2_0 | F8_E4M3_B128 => 128,
+        Q2_0_G64 => 64,
+        Q1_0 | Q2_0 | F8_E4M3_B128 | PQ2_0 | PTQ1_0 => 128,
         _ => 256,
     }
 }
@@ -637,7 +663,9 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         STQ1_0 => deq_stq1_0(raw, n),
         MXFP4 => deq_mxfp4(raw, n),
         Q1_0 => deq_q1_0(raw, n),
-        Q2_0 => deq_q2_0(raw, n),
+        Q2_0 | PQ2_0 => deq_q2_0(raw, n),
+        PTQ1_0 => prism::deq_ptq1_0(raw, n),
+        Q2_0_G64 => prism::deq_q2_0_g64(raw, n),
         // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
         F8_E4M3_B128 => deq_f8_e4m3_b128(raw, n)?,
         other => return Err(format!("unsupported ggml type {other}")),
@@ -655,6 +683,8 @@ pub struct GgufFile {
     /// `tensors[i]` lives in `shards[owner[i]]`. Parallel to `tensors`, so the merged tensor table
     /// looks exactly like a single file's to every caller while `raw` still reads from the right one.
     owner: Vec<usize>,
+    /// Refuses reads of Hadamard-rotated tensors until a transform-applying runtime unlocks it.
+    prism_lock: prism::PrismLock,
 }
 
 struct Shard { f: std::cell::RefCell<std::fs::File>, data_start: u64, len: u64,
@@ -716,7 +746,8 @@ impl GgufFile {
         let count = match metadata.get("split.count") { Some(Meta::U(v)) => *v as usize, _ => 1 };
         if count <= 1 {
             let owner = vec![0; tensors.len()];
-            return Ok(GgufFile { metadata, tensors, shards: vec![shard], owner });
+            let prism_lock = file_prism_lock(&metadata, &tensors);
+            return Ok(GgufFile { metadata, tensors, shards: vec![shard], owner, prism_lock });
         }
 
         // Shard 0 carries the model metadata — tokenizer, architecture, everything. Later parts
@@ -769,7 +800,8 @@ impl GgufFile {
                 "split.tensors.count declares {want} tensors but the {count} shards hold {}; a part is \
                  missing or truncated", all.len()));
         }
-        Ok(GgufFile { metadata, tensors: all, shards, owner })
+        let prism_lock = file_prism_lock(&metadata, &all);
+        Ok(GgufFile { metadata, tensors: all, shards, owner, prism_lock })
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
@@ -786,6 +818,7 @@ impl GgufFile {
     /// The tensor's raw on-disk bytes — packed, exactly as stored (feed straight to a native
     /// quantized matmul so the weights never round-trip through f32).
     pub fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
+        self.prism_lock.check(name)?;
         // By INDEX, not by reference: `owner` is parallel to `tensors`, and a sharded model's offsets
         // are relative to the data section of the file that holds them, not to the first file's.
         let i = self.tensors.iter().position(|t| t.name == name)
@@ -814,7 +847,10 @@ impl GgufSource for GgufFile {
     fn tensor(&self, name: &str) -> Option<&TensorInfo> { GgufFile::tensor(self, name) }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> { GgufFile::raw(self, name) }
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String> { GgufFile::dequant(self, name) }
+    fn unlock_prism_hadamard(&self) -> bool { self.prism_lock.unlock() }
     fn tensor_file_range(&self, name: &str) -> Option<(std::path::PathBuf, u64, u64)> {
+        // An owned path would let a streaming cache read a locked tensor behind the lock's back.
+        self.prism_lock.check(name).ok()?;
         let idx = self.tensors.iter().position(|t| t.name == name)?;
         let t = &self.tensors[idx];
         let sh = &self.shards[self.owner[idx]];
@@ -826,6 +862,7 @@ impl GgufSource for GgufFile {
     /// one expert's bytes without the other 255 ever entering memory.
     fn raw_range(&self, name: &str, off: u64, dst: &mut [u8]) -> Result<(), String> {
         use std::io::{Read, Seek, SeekFrom};
+        self.prism_lock.check(name)?;
         let idx = self.tensors.iter().position(|t| t.name == name)
             .ok_or_else(|| format!("no tensor '{name}'"))?;
         let t = &self.tensors[idx];
@@ -840,6 +877,11 @@ impl GgufSource for GgufFile {
             .map_err(|e| format!("{name}: seek: {e}"))?;
         f.read_exact(dst).map_err(|e| format!("{name}: read: {e}"))
     }
+}
+
+fn file_prism_lock(metadata: &HashMap<String, Meta>, tensors: &[TensorInfo]) -> prism::PrismLock {
+    let names: std::collections::HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+    prism::PrismLock::new(metadata, |n| names.contains(n))
 }
 
 fn read_prefix(f: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, String> {
@@ -1826,12 +1868,10 @@ mod mxfp4_tests {
         // Same element count at 34 B/block: PrismML ternary keeps meaning what it always meant.
         let q2 = parse(gguf_with_type42(128 * 128, 128 * 34)).expect("Q2_0 stride must load");
         assert_eq!(q2.tensors[0].ggml_type, 42);
-        // Mainline ggml-org Q2_0 (18 B / 64 values = 36 B / 128): refused BY NAME, no decoder exists.
-        let e = match parse(gguf_with_type42(128 * 128, 128 * 36)) {
-            Err(e) => e, Ok(_) => panic!("a mainline-Q2_0 stride must refuse, not load"),
-        };
-        assert!(e.contains("64 values / 18 bytes") || e.contains("mainline"),
-                "mainline must be refused by name, got: {e}");
+        // Mainline ggml-org Q2_0 (18 B / 64 values = 36 B / 128): resolves to its own internal id
+        // (2042) and decodes — PrismML's Bonsai 2 ships a group-64 file under 42 (2026-09-28).
+        let g64 = parse(gguf_with_type42(128 * 128, 128 * 36)).expect("mainline Q2_0 stride must load");
+        assert_eq!(g64.tensors[0].ggml_type, prism::Q2_0_G64, "resolved, not left as the contested 42");
         // ONE block: 34 vs 36 differ by 2 bytes — inside one alignment, so it must REFUSE as
         // ambiguous rather than first-match to PrismML. This is the case a slack-window resolver
         // silently gets wrong.
@@ -1846,11 +1886,8 @@ mod mxfp4_tests {
         assert_eq!(resolve_type_42(n, 8 * 34).unwrap(), 42, "34 bytes/block is PrismML Q2_0");
         assert_eq!(resolve_type_42(n, 8 * F8_E4M3_B128_BYTES).unwrap(), 1042, "129 is F8_E4M3_B128");
         // Mainline ggml-org master ALSO assigns 42 (its own Q2_0: 64 values / 18 bytes = 36 bytes
-        // per 128). This crate cannot decode that layout — the refusal must NAME it, because 36 is
-        // only 2 bytes per 128 values away from PrismML's 34 and a generic message would send the
-        // reader hunting the wrong format.
-        let e = resolve_type_42(n, n / 64 * 18).unwrap_err();
-        assert!(e.contains("mainline") && e.contains("64 values / 18 bytes"), "unexpected: {e}");
+        // per 128) — decoded since 2026-09-28 under internal id 2042.
+        assert_eq!(resolve_type_42(n, n / 64 * 18).unwrap(), prism::Q2_0_G64, "18 bytes/64 is mainline Q2_0");
         // Anything else is a format this crate does not know, and guessing would mis-decode silently.
         let e = resolve_type_42(n, 8 * 64).unwrap_err();
         assert!(e.contains("none of the three"), "unexpected: {e}");
