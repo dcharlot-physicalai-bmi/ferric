@@ -640,6 +640,11 @@ impl<S: Source> Pool<S> {
                 return None;
             }
         }
+        // The Batch API's files and batches belong to the server, not to a model.
+        if crate::batchapi::handles(&j.path) {
+            crate::batchapi::handle(&j.method, &j.path, &j.headers, &j.body, &mut j.stream);
+            return None;
+        }
         let ollama = j.path.starts_with("/api/");
         let refuse = |s: &mut TcpStream, code: u16, m: &str| if ollama { write_json(s, code, &json!({"error": m})) }
             else { write_json(s, code, &json!({"error": {"message": m, "type": "invalid_request_error", "code": if code == 404 { "model_not_found" } else { "invalid_request" }}})) };

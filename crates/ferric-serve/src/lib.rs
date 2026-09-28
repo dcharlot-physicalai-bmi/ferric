@@ -61,6 +61,7 @@ mod images;
 mod vision;
 mod constrain;
 mod trace;
+mod batchapi;
 pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};
@@ -1650,6 +1651,8 @@ pub fn run() {
         match keep_alive { Some(d) => format!("kept {} s after last use", d.as_secs()), None => "kept until evicted".to_string() },
         if mcps.borrow().0.is_empty() { String::new() } else { format!(" · {} MCP tools", mcps.borrow().openai_tools().len()) });
     let listener = TcpListener::bind((host.as_str(), port)).unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
+    // The Batch API sends each line to this server's own endpoint, so a batch runs on the live code path.
+    batchapi::init(&host, port, api_key.clone(), max_batch);
     // The batch loop owns the engine on this thread; anything it declines (guided decoding, the tool
     // loop, embeddings, unknown paths) goes to the untouched serial handler below.
     let fallback = !initial.is_empty();
