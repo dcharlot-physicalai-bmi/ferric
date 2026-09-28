@@ -1792,11 +1792,17 @@ mod tests {
         let spec = GraphSpec { d, nh, nkv, dh, n_ff, n_vocab: nv, eps: 1e-6, rope_base: 1e6, has_qk_norm: true,
                                rope_ff: None, norm_pairs: false, rope_host: true, layers, out_norm: norm(99, d),
                                lm_head: head.native_weight().unwrap() };
+        // ⛔ TWO graphs, not one toggled. With one object the eager twin shared the host-side fill of the
+        // step block, so a replay that froze the block's row/position or rope row after capture froze the
+        // eager steps identically and still matched bit for bit (a mutation run, 2026-09-28: MISSED).
         let mut g = DecodeGraph::build(&spec).expect("graph");
+        let mut ge = DecodeGraph::build(&spec).expect("eager twin");
+        ge.set_graph(false);
         let inv = authors_inv(1e6, dh, None);
         // (graph, eager) K/V pairs for sequence A (base 0) and B (base 5000)
-        let mut kv = [g.new_kv().unwrap(), g.new_kv().unwrap(), g.new_kv().unwrap(), g.new_kv().unwrap()];
+        let mut kv = [g.new_kv().unwrap(), ge.new_kv().unwrap(), g.new_kv().unwrap(), ge.new_kv().unwrap()];
         kv[2].base = 5000; kv[3].base = 5000;
+        let mut steps_a: Vec<Vec<f32>> = Vec::new();
         let g0 = native_graph_steps();
         let (mut n_graph, mut worst_scale) = (0u64, 0f32);
         for s in 0..300usize {
@@ -1805,11 +1811,10 @@ mod tests {
                 if s == 100 { for i in [a, a + 1] { let c = kv[i].cap(); assert!(kv[i].reserve(c + 1)); } }   // move every K/V address
                 let x = rndx(d, 1000 + (s * 7 + a) as u64);
                 let tab = host_tab(&inv, kv[a].base + kv[a].len);
-                g.set_graph(true);
                 let lg = g.step(&mut kv[a], &x, Some(&tab)).expect("graph step");
                 n_graph += 1;
-                g.set_graph(false);
-                let le = g.step(&mut kv[a + 1], &x, Some(&tab)).expect("eager step");
+                let le = ge.step(&mut kv[a + 1], &x, Some(&tab)).expect("eager step");
+                if a == 0 && steps_a.len() < 48 { steps_a.push(lg.clone()); }
                 worst_scale = worst_scale.max(le.iter().fold(0f32, |m, v| m.max(v.abs())));
                 assert!(lg.iter().all(|v| v.is_finite()), "non-finite logits at step {s}");
                 let bad = lg.iter().zip(&le).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
@@ -1817,6 +1822,20 @@ mod tests {
             }
         }
         assert!(worst_scale > 1e-3, "logits ~zero — this comparison would pass on anything");
+        // ⭐ And against an INDEPENDENT path: the first 48 rows of sequence A as ONE prefill — the
+        // argument-form kernels (explicit position, cache row and key count), the tensor-core GEMM and the
+        // tiled attention — which shares none of the step block. Not bit-identical (other kernels), so a
+        // tolerance: a replay that froze the row, position or rope row lands O(1) away.
+        let mut kvp = ge.new_kv().unwrap();
+        let xs: Vec<f32> = (0..48usize).flat_map(|s| rndx(d, 1000 + (s * 7) as u64)).collect();
+        let tabs: Vec<f32> = (0..48usize).flat_map(|p| host_tab(&inv, p)).collect();
+        let pf = ge.prefill(&mut kvp, &xs, Some(&tabs), true).expect("prefill");
+        let (mut worst, mut scale) = (0f32, 0f32);
+        for (r, st) in steps_a.iter().enumerate() {
+            for (a, b) in st.iter().zip(&pf[r * nv..(r + 1) * nv]) { worst = worst.max((a - b).abs()); scale = scale.max(b.abs()); }
+        }
+        eprintln!("decode steps (graph) vs one prefill of the same 48 rows: max|Δ| {worst:.3e} of |logit| {scale:.2}");
+        assert!(worst <= 1e-3 * scale, "the graph's decode steps are {worst:.3e} from a prefill of the same rows");
         assert!(g.step(&mut kv[0], &rndx(d, 1), None).is_none(), "a rope_host graph must refuse a step without its rope row");
         let replayed = native_graph_steps() - g0;
         eprintln!("graph replay == eager over {n_graph} steps (two sequences, one at base 5000, K/V moved at step 100); {replayed} replays counted; |logit| up to {worst_scale:.2}");
