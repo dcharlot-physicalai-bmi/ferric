@@ -4,7 +4,7 @@
 //!
 //!   cargo run -p ferric-tensor --release --example small_m_sweep [reps] [calls]
 use ferric_core::Context;
-use ferric_tensor::{dtype::{set_small_m, set_small_m_tile, QMatrix}, Tensor};
+use ferric_tensor::{dtype::{set_small_m, set_small_m_one, set_small_m_tile, QMatrix}, Tensor};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,11 +28,16 @@ async fn run() {
     println!("adapter: {} [{:?}]  reps {reps} x {calls} calls (median ms per call)", ctx.adapter_name, ctx.backend);
     let tiles: Vec<Option<(usize, usize)>> = vec![None, Some((1, 1)), Some((1, 2)), Some((1, 4)), Some((1, 8)), Some((1, 16)),
         Some((2, 2)), Some((2, 4)), Some((2, 8)), Some((2, 16)), Some((4, 2)), Some((4, 4)), Some((4, 8)), Some((8, 4))];
-    let fmts: &[(u32, &str, usize)] = &[(8, "Q8_0", 0), (6, "Q5_0", 0), (12, "Q4_K", 0), (14, "Q6_K", 208), (13, "Q5_K", 0)];
+    let fmts: &[(u32, &str, usize)] = &[(8, "Q8_0", 0), (6, "Q5_0", 0), (12, "Q4_K", 0), (14, "Q6_K", 208), (13, "Q5_K", 0), (42, "Q2_0", 0)];
+    let rows_list: Vec<usize> = std::env::var("SWEEP_ROWS").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![2, 3, 4, 8, 9, 16]);
     for &(inn, out, who, fused) in &[(896usize, 151936usize, "lm_head", false), (896, 9728, "gate_up", false), (4864, 896, "ffn_down", false),
                               (896, 1152, "qkv", false), (1024, 6144, "q3-0.6b gate_up", false), (1024, 6144, "q3-0.6b gate_up+swiglu", true),
                               (3072, 1024, "q3-0.6b down", false), (1536, 17920, "q2.5-1.5b gate_up", false),
-                              (1536, 17920, "q2.5-1.5b gate_up+swiglu", true), (8960, 1536, "q2.5-1.5b down", false)] {
+                              (1536, 17920, "q2.5-1.5b gate_up+swiglu", true), (8960, 1536, "q2.5-1.5b down", false),
+                              (5120, 34816, "bonsai2 gate_up", false), (17408, 5120, "bonsai2 down", false),
+                              (5120, 10240, "bonsai2 gdn qkv", false), (5120, 12288, "bonsai2 attn q", false),
+                              (6144, 5120, "bonsai2 gdn out", false), (5120, 248320, "bonsai2 lm_head", false)] {
         for &(ty, name, sat) in fmts {
             if fused && !matches!(ty, 12 | 13 | 14) { continue } // the fused portable kernels are the k-quants'
             if let Some(o) = &only { if !format!("{who} {name}").contains(o.as_str()) { continue } }
@@ -43,13 +48,13 @@ async fn run() {
             print!("{:>4} {:>8}", "M", "old");
             for t in &tiles { match t { None => print!(" {:>7}", "plan"), Some((r, mm)) => print!(" {:>7}", format!("{r}x{mm}")) } }
             println!("   best");
-            for mrows in [2usize, 3, 4, 8, 9, 16] {
+            for &mrows in &rows_list {
                 let x = Tensor::from_vec(&ctx, &(0..mrows * inn).map(|i| ((i * 7) as f32 * 0.013).sin()).collect::<Vec<_>>(), &[mrows, inn]);
                 let arms: Vec<(bool, Option<(usize, usize)>)> = std::iter::once((false, None)).chain(tiles.iter().map(|&t| (true, t))).collect();
                 let mut t: Vec<Vec<f64>> = vec![vec![]; arms.len()];
                 for rep in 0..=reps {
                     for (k, &(on, tile)) in arms.iter().enumerate() {
-                        set_small_m(on); set_small_m_tile(tile);
+                        set_small_m(on); set_small_m_tile(tile); set_small_m_one(on && mrows == 1);
                         let call = || if fused { x.try_matmul_swiglu(&m).expect("fused k-quant") } else { x.matmul_q(&m) };
                         if rep == 0 { let _ = call().to_vec().await; continue; }
                         ferric_tensor::device_sync(&ctx);

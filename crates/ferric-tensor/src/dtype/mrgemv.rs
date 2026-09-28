@@ -47,6 +47,29 @@ use super::*;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static SWITCH: AtomicU8 = AtomicU8::new(0); // 0 = follow FERRIC_MR, 1 = on, 2 = off
+static ONE: AtomicU8 = AtomicU8::new(0); // 0 = follow FERRIC_MR_ONE, 1 = on, 2 = off
+/// Route ONE-row calls through the tiled kernels too (`FERRIC_MR_ONE`, or [`set_small_m_one`]). They
+/// are bit-identical to the one-row kernels by construction, so this is purely a speed choice.
+pub fn set_small_m_one(on: bool) { ONE.store(if on { 1 } else { 2 }, Ordering::Relaxed); }
+fn one_row(fmt: Fmt) -> bool {
+    match ONE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+            ON.get_or_init(|| std::env::var("FERRIC_MR_ONE").ok().map(|v| v != "0")).unwrap_or(ONE_ROW_DEFAULT.contains(&fmt))
+        }
+    }
+}
+/// Formats whose ONE-row decode takes the tiled kernel by default — where it measured faster. M3 Ultra,
+/// `examples/small_m_sweep.rs` with SWEEP_ROWS=1 (5 x 30 calls, quiet), one row vs the split-K kernel:
+///   Q2_0 (Bonsai 2 27B shapes) gate_up 5120->34816 0.277 -> 0.140 ms, down 17408->5120 0.114 -> 0.082,
+///        gdn qkv 0.084 -> 0.060, attn q 0.094 -> 0.067, lm_head 5120->248320 1.465 -> 0.864;
+///   Q8_0 / Q5_0 1.1-1.4x on wide outputs (Qwen2.5-0.5B lm_head 0.452 -> 0.319);
+///   Q4_K / Q5_K 1.03-1.3x (the fused gate|up+SwiGLU 1.2-1.3x);
+///   Q6_K 0.98-1.00x — left on its one-row kernel. F16/BF16: not measured, left.
+/// Bit-identical either way (the tiled kernel IS the one-row kernel's arithmetic), so this is speed only.
+const ONE_ROW_DEFAULT: &[Fmt] = &[Fmt::Q2_0, Fmt::Q8_0, Fmt::Q5_0, Fmt::Q4K, Fmt::Q5K];
 static TILE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // (R << 16) | M, 0 = plan
 
 /// Force every small-M dispatch to an `(R outputs, M rows)` tile, or `None` for the planner's choice.
@@ -78,22 +101,22 @@ fn max_rows() -> usize {
 
 /// The row window: `[2, FERRIC_MR_MAX]`, and below the tensor-unit route's floor when that route is on
 /// (it is tried first and takes `rows >= FERRIC_QGEMM_MIN_ROWS`; this fills the gap under it).
-fn in_window(ctx: &Context, rows: usize) -> bool {
+fn in_window(ctx: &Context, rows: usize, fmt: Fmt) -> bool {
     #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
     let cap = if crate::native_qgemm::enabled(ctx) { max_rows().min(crate::native_qgemm::min_rows().saturating_sub(1)) } else { max_rows() };
     #[cfg(not(all(target_os = "macos", not(target_arch = "wasm32"))))]
     let cap = { let _ = ctx; max_rows() };
-    enabled() && rows >= 2 && rows <= cap && std::env::var_os("FERRIC_SUBBLK").is_none()
+    enabled() && (rows >= 2 || (rows == 1 && one_row(fmt))) && rows <= cap && std::env::var_os("FERRIC_SUBBLK").is_none()
 }
 
 /// Whether `rows` rows of an `[n_out, in_dim]` weight go through a small-M kernel. Only when the
 /// ONE-row path is the default split-K kernel, because that is the kernel these reproduce.
-fn eligible(ctx: &Context, rows: usize, n_out: usize, in_dim: usize) -> bool {
-    in_window(ctx, rows) && q2_0_split_k(1, n_out, in_dim) && !use_subgroup(ctx)
+fn eligible(ctx: &Context, rows: usize, n_out: usize, in_dim: usize, fmt: Fmt) -> bool {
+    in_window(ctx, rows, fmt) && q2_0_split_k(1, n_out, in_dim) && !use_subgroup(ctx)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum Fmt { Q8_0, Q5_0, Q4K, Q5K, Q6K, F16, BF16 }
+pub(crate) enum Fmt { Q8_0, Q5_0, Q4K, Q5K, Q6K, F16, BF16, Q2_0 }
 
 /// One dispatch's shape: `r` outputs per lane group, `m` rows per workgroup (z-chunks cover the rest).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +135,11 @@ pub(crate) struct Plan { pub r: usize, pub m: usize }
 pub(crate) fn plan(fmt: Fmt, rows: usize, o_dim: usize, swiglu: bool, wbytes: usize) -> Plan {
     let forced = TILE.load(Ordering::Relaxed);
     if forced != 0 { return Plan { r: (forced >> 16) as usize, m: ((forced & 0xffff) as usize).clamp(1, rows) }; }
-    let r = if matches!(fmt, Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16) && !swiglu && o_dim.div_ceil(2) >= 256 { 2 } else { 1 };
+    // One row has no rows to share a lane group's work, so pairing outputs must not cost workgroups where
+    // outputs are few: at M=1, R=2 lost 6-10% below ~4k outputs (qkv 896->1152 0.020 -> 0.022 ms) and won
+    // 1.2-2x above (gate_up 5120->34816 0.277 -> 0.140).
+    let min_out = if rows == 1 { 4096 } else { 512 };
+    let r = if matches!(fmt, Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16 | Fmt::Q2_0) && !swiglu && o_dim >= min_out { 2 } else { 1 };
     let m_target = if wbytes > 32 << 20 { 16 } else { 8 / r };
     let chunks = rows.div_ceil(m_target);
     Plan { r, m: rows.div_ceil(chunks) }
@@ -179,6 +206,29 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             }
             for r in rs() { let _ = writeln!(s, "        let x{r} = x[(xr{r} >> 2u) + q];"); }
             for (j, r) in jr() { let _ = writeln!(s, "        a{j}_{r} = a{j}_{r} + dot(x{r}, wv{j});"); }
+            s.push_str("    }\n");
+        }
+        // Per word `w` of a 128-value block (lane t: w = t, t+64, ...): `b = Σ_q dot(x_q, c_q)` over the
+        // word's four quads in order, then `acc + b·d` — MATMUL_Q2_0_SPLITK exactly.
+        Fmt::Q2_0 => {
+            s.push_str("    let nblk = in_dim / 128u; let nwords = nblk * 8u;
+    for (var w: u32 = t; w < nwords; w = w + 64u) {
+        let blk = w >> 3u; let xo = (blk * 128u + (w & 7u) * 16u) >> 2u;\n");
+            for j in js() {
+                let _ = writeln!(s, "        let bi{j} = or{j} * nblk + blk; let sw{j} = unpack2x16float(aux[bi{j} >> 1u]);
+        let d{j} = select(sw{j}.y, sw{j}.x, (bi{j} & 1u) == 0u); let c{j} = codes[or{j} * nwords + w];");
+                for q in 0..4 {
+                    let sh = 8 * q;
+                    let _ = writeln!(s, "        let c{j}q{q} = vec4<f32>(f32(i32((c{j} >> {sh}u) & 3u) - 1), f32(i32((c{j} >> {}u) & 3u) - 1), f32(i32((c{j} >> {}u) & 3u) - 1), f32(i32((c{j} >> {}u) & 3u) - 1));",
+                                     sh + 2, sh + 4, sh + 6);
+                }
+            }
+            for r in rs() { for q in 0..4 { let _ = writeln!(s, "        let x{r}q{q} = x[(xr{r} >> 2u) + xo + {q}u];"); } }
+            for (j, r) in jr() {
+                let _ = writeln!(s, "        var b{j}_{r} = 0.0;");
+                for q in 0..4 { let _ = writeln!(s, "        b{j}_{r} = b{j}_{r} + dot(x{r}q{q}, c{j}q{q});"); }
+                let _ = writeln!(s, "        a{j}_{r} = a{j}_{r} + b{j}_{r} * d{j};");
+            }
             s.push_str("    }\n");
         }
         // Per word `w` of a 32-value block (lane t: w = t, t+64, ...): `acc + d·dot(x, v)`, MATMUL_Q8_0_SPLITK.
@@ -284,7 +334,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// The one-row kernel's lane layout for this format, so the small-M kernel walks blocks identically.
 fn lanes(fmt: Fmt, swiglu: bool, in_dim: usize) -> (u32, u32) {
     match (fmt, swiglu) {
-        (Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16, _) => (64, 1), // the 64-lane split-K kernels, one output
+        (Fmt::Q8_0 | Fmt::Q5_0 | Fmt::F16 | Fmt::BF16 | Fmt::Q2_0, _) => (64, 1), // the 64-lane split-K kernels, one output
         (Fmt::Q4K | Fmt::Q6K, false) => splitk_lanes_wide(in_dim / 256),
         // matmul_q5_k uses splitk_lanes_sub, which is (l, 1, opw) with FERRIC_SUBBLK unset (required above)
         (Fmt::Q5K, _) => { let (l, _, opw) = splitk_lanes_sub(in_dim / 256); (l, opw) }
@@ -310,7 +360,7 @@ fn dispatch(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, 
         (Fmt::Q8_0, _) => "matmul_q8_0_mr", (Fmt::Q5_0, _) => "matmul_q5_0_mr",
         (Fmt::Q4K, false) => "matmul_q4_k_mr", (Fmt::Q5K, false) => "matmul_q5_k_mr", (Fmt::Q6K, false) => "matmul_q6_k_mr",
         (Fmt::Q4K, true) => "matmul_q4_k_swiglu_mr", (Fmt::Q5K, true) => "matmul_q5_k_swiglu_mr", (Fmt::Q6K, true) => "matmul_q6_k_swiglu_mr",
-        (Fmt::F16, _) => "matmul_half_mr_f16", (Fmt::BF16, _) => "matmul_half_mr_bf16",
+        (Fmt::F16, _) => "matmul_half_mr_f16", (Fmt::BF16, _) => "matmul_half_mr_bf16", (Fmt::Q2_0, _) => "matmul_q2_0_mr",
     };
     let info = unibuf(ctx, &[rows as u32, o_dim as u32, in_dim as u32, gw as u32]);
     let src = source(fmt, swiglu, p, l, opw);
@@ -322,20 +372,21 @@ fn dispatch(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, 
 /// Small-M `x·Wᵀ` over 16-bit weights (`words` two values per u32), if this call qualifies. The one-row
 /// path is `matmul_half`'s split-K kernel unless `FERRIC_HALF_KERNEL` pins another.
 pub(super) fn matmul_half(x: &Tensor, words: &wgpu::Buffer, n_out: usize, in_dim: usize, bf16: bool) -> Option<Tensor> {
-    if std::env::var_os("FERRIC_HALF_KERNEL").is_some() || !eligible(&x.ctx, x.shape[0], n_out, in_dim) { return None; }
-    Some(dispatch(x, words, words, n_out, in_dim, if bf16 { Fmt::BF16 } else { Fmt::F16 }, false, None))
+    let fmt = if bf16 { Fmt::BF16 } else { Fmt::F16 };
+    if std::env::var_os("FERRIC_HALF_KERNEL").is_some() || !eligible(&x.ctx, x.shape[0], n_out, in_dim, fmt) { return None; }
+    Some(dispatch(x, words, words, n_out, in_dim, fmt, false, None))
 }
 
 /// Small-M `x·Wᵀ` if this call qualifies, else `None` (touching nothing). `x` must be contiguous.
 pub(super) fn matmul(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, in_dim: usize, fmt: Fmt) -> Option<Tensor> {
-    if !eligible(&x.ctx, x.shape[0], n_out, in_dim) { return None; }
+    if !eligible(&x.ctx, x.shape[0], n_out, in_dim, fmt) { return None; }
     Some(dispatch(x, codes, aux, n_out, in_dim, fmt, false, None))
 }
 
 /// Small-M fused gate|up + SwiGLU (`[2·n_ff, in]` weight, gate rows first) if it qualifies.
 pub(super) fn swiglu(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out: usize, in_dim: usize, fmt: Fmt) -> Option<Tensor> {
     // The fused one-row kernels have no flat/split choice, so only the row window applies.
-    if !in_window(&x.ctx, x.shape[0]) { return None; }
+    if !in_window(&x.ctx, x.shape[0], fmt) { return None; }
     Some(dispatch(x, codes, aux, n_out, in_dim, fmt, true, None))
 }
 
@@ -350,7 +401,7 @@ pub(crate) fn forced(x: &Tensor, codes: &wgpu::Buffer, aux: &wgpu::Buffer, n_out
 #[cfg(test)]
 mod tests {
     use super::{forced, Fmt, Plan};
-    use crate::dtype::{HalfWeights, Q4_KWeights, Q5_0Weights, Q5_KWeights, Q6_KWeights, Q8_0Weights};
+    use crate::dtype::{HalfWeights, Q2_0Weights, Q4_KWeights, Q5_0Weights, Q5_KWeights, Q6_KWeights, Q8_0Weights};
     use crate::Tensor;
     use std::sync::Arc;
 
@@ -368,6 +419,14 @@ mod tests {
     fn deq(fmt: Fmt, raw: &[u8], wrong: bool) -> Vec<f64> {
         let mut w = Vec::new();
         match fmt {
+            // wrong: the four 2-bit codes of a byte read most-significant first
+            Fmt::Q2_0 => for blk in raw.chunks(34) {
+                let d = h(blk, 0);
+                for j in 0..32 { for i in 0..4 {
+                    let sh = if wrong { 6 - 2 * i } else { 2 * i };
+                    w.push(d * (((blk[2 + j] >> sh) & 3) as i32 - 1) as f64);
+                } }
+            },
             // wrong: the two values of each 32-bit word exchanged
             Fmt::F16 | Fmt::BF16 => for pair in raw.chunks(4) {
                 let v = |o: usize| { let b = u16::from_le_bytes([pair[o], pair[o + 1]]);
@@ -448,6 +507,7 @@ mod tests {
                 Fmt::Q6K => { for _ in 0..208 { raw.push(rng.byte()); } raw.extend(f16le(0.0005 + 0.0002 * rng.unit())); }
                 // one value per "block": a finite weight, not random bits (random f16/bf16 bits are NaN/inf)
                 Fmt::F16 => raw.extend(f16le(0.05 * rng.unit())),
+                Fmt::Q2_0 => { raw.extend(f16le(0.004 + 0.002 * rng.unit())); for _ in 0..32 { raw.push(rng.byte()); } }
                 Fmt::BF16 => raw.extend((((0.05 * rng.unit()) as f32).to_bits() >> 16).to_le_bytes()[..2].to_vec()),
             }
         }
@@ -455,10 +515,10 @@ mod tests {
     }
     fn block(fmt: Fmt) -> (usize, usize) {
         match fmt { Fmt::Q8_0 => (32, 34), Fmt::Q5_0 => (32, 22), Fmt::Q4K => (256, 144), Fmt::Q5K => (256, 176), Fmt::Q6K => (256, 210),
-                    Fmt::F16 | Fmt::BF16 => (1, 2) }
+                    Fmt::F16 | Fmt::BF16 => (1, 2), Fmt::Q2_0 => (128, 34) }
     }
 
-    enum W { Q8(Q8_0Weights), Q50(Q5_0Weights), Q4(Q4_KWeights), Q5(Q5_KWeights), Q6(Q6_KWeights), H(HalfWeights) }
+    enum W { Q8(Q8_0Weights), Q50(Q5_0Weights), Q4(Q4_KWeights), Q5(Q5_KWeights), Q6(Q6_KWeights), H(HalfWeights), Q2(Q2_0Weights) }
     impl W {
         fn new(ctx: &Arc<ferric_core::Context>, fmt: Fmt, raw: &[u8], n: usize, k: usize) -> W {
             match fmt {
@@ -466,6 +526,7 @@ mod tests {
                 Fmt::Q4K => W::Q4(Q4_KWeights::from_bytes(ctx, raw, n, k)), Fmt::Q5K => W::Q5(Q5_KWeights::from_bytes(ctx, raw, n, k)),
                 Fmt::Q6K => W::Q6(Q6_KWeights::from_bytes(ctx, raw, n, k)),
                 Fmt::F16 | Fmt::BF16 => W::H(HalfWeights::from_bytes(ctx, raw, n, k, fmt == Fmt::BF16)),
+                Fmt::Q2_0 => W::Q2(Q2_0Weights::from_bytes(ctx, raw, n, k)),
             }
         }
         fn bufs(&self) -> (&wgpu::Buffer, &wgpu::Buffer, usize, usize) {
@@ -474,6 +535,7 @@ mod tests {
                 W::Q4(w) => (&w.codes, &w.aux, w.rows, w.cols), W::Q5(w) => (&w.codes, &w.aux, w.rows, w.cols),
                 W::Q6(w) => (&w.codes, &w.aux, w.rows, w.cols),
                 W::H(w) => (&w.words, &w.words, w.rows, w.cols),
+                W::Q2(w) => (&w.codes, &w.scales, w.rows, w.cols),
             }
         }
         /// The ONE-ROW decode path — what serial decode runs today (split-K by default).
@@ -483,6 +545,7 @@ mod tests {
                 (W::Q4(w), false) => x.matmul_q4_k(w), (W::Q5(w), false) => x.matmul_q5_k(w), (W::Q6(w), false) => x.matmul_q6_k(w),
                 (W::Q4(w), true) => x.matmul_q4_k_swiglu(w), (W::Q5(w), true) => x.matmul_q5_k_swiglu(w), (W::Q6(w), true) => x.matmul_q6_k_swiglu(w),
                 (W::H(w), false) => x.matmul_half(w),
+                (W::Q2(w), false) => x.matmul_q2_0(w),
                 _ => unreachable!(),
             }
         }
@@ -500,11 +563,15 @@ mod tests {
     #[test]
     fn small_m_rows_are_bit_identical_to_one_row_decode() {
         let Some(ctx) = ctx() else { return };
+        // ⛔ The reference is the ONE-ROW split-K kernel, so one-row calls must NOT take the tiled kernel
+        // here (it is the default for most formats now) — or this would compare the kernel with itself.
+        super::set_small_m_one(false);
         let mut rng = Rng(0x5eed_0f_5a11);
         let cases: &[(Fmt, bool, usize, usize)] = &[
             (Fmt::Q8_0, false, 130, 896), (Fmt::Q8_0, false, 67, 224), (Fmt::Q5_0, false, 130, 896), (Fmt::Q5_0, false, 67, 96),
             (Fmt::Q4K, false, 70, 1024), (Fmt::Q4K, false, 33, 4864), (Fmt::Q5K, false, 70, 1024), (Fmt::Q5K, false, 41, 2304),
             (Fmt::Q6K, false, 70, 1024), (Fmt::Q6K, false, 29, 256), (Fmt::F16, false, 130, 896), (Fmt::BF16, false, 67, 1024),
+            (Fmt::Q2_0, false, 130, 5120), (Fmt::Q2_0, false, 41, 640),
             (Fmt::Q4K, true, 2 * 37, 512), (Fmt::Q5K, true, 2 * 37, 512), (Fmt::Q6K, true, 2 * 21, 768),
         ];
         let tiles: &[Option<Plan>] = &[None, Some(Plan { r: 1, m: 1 }), Some(Plan { r: 4, m: 8 }), Some(Plan { r: 2, m: 3 }), Some(Plan { r: 3, m: 5 })];
@@ -515,8 +582,9 @@ mod tests {
             let w = W::new(&ctx, fmt, &raw, n, k);
             let (codes, aux, rows_w, cols_w) = w.bufs();
             let o_dim = if sw { n / 2 } else { n };
-            for m in [2usize, 3, 5, 9, 16, 17, 32] {
+            for m in [1usize, 2, 3, 5, 9, 16, 17, 32] {
                 let x: Vec<f32> = (0..m * k).map(|_| rng.unit() as f32).collect();
+                assert_eq!(super::ONE.load(std::sync::atomic::Ordering::Relaxed), 2, "the one-row reference must be the split-K kernel");
                 let solo: Vec<f32> = (0..m).flat_map(|r| {
                     let xr = Tensor::from_vec(&ctx, &x[r * k..(r + 1) * k], &[1, k]);
                     pollster::block_on(w.one_row(&xr, sw).to_vec())
@@ -534,6 +602,7 @@ mod tests {
                 }
             }
         }
+        super::ONE.store(0, std::sync::atomic::Ordering::Relaxed); // back to FERRIC_MR_ONE / the defaults
         eprintln!("small-M: {checked} outputs bit-identical to one-row decode");
     }
 
@@ -546,7 +615,7 @@ mod tests {
         let Some(ctx) = ctx() else { return };
         let mut rng = Rng(0xdec0_de5);
         for &(fmt, n, k, m) in &[(Fmt::Q8_0, 96, 896, 9), (Fmt::Q5_0, 96, 896, 9), (Fmt::Q4K, 50, 1024, 7), (Fmt::Q5K, 50, 1024, 7), (Fmt::Q6K, 50, 1024, 7),
-                                   (Fmt::F16, 96, 896, 9), (Fmt::BF16, 96, 896, 9)] {
+                                   (Fmt::F16, 96, 896, 9), (Fmt::BF16, 96, 896, 9), (Fmt::Q2_0, 64, 1280, 5)] {
             let (bs, _) = block(fmt);
             let raw = rand_blocks(&mut rng, fmt, n * k / bs);
             let w = W::new(&ctx, fmt, &raw, n, k);

@@ -10,7 +10,7 @@ use wgpu::util::DeviceExt;
 
 // Small-M GEMV (2..=32 rows read each weight block once, bit-identical per row to one-row decode).
 mod mrgemv;
-pub use mrgemv::{set_small_m, set_small_m_tile};
+pub use mrgemv::{set_small_m, set_small_m_one, set_small_m_tile};
 
 /// The Metal-4 tensor-unit prefill route (opt-in `FERRIC_QGEMM`, see `native_qgemm`): a multi-row
 /// `x·Wᵀ` on the matrix units straight from the packed blocks. Returns from the enclosing matmul
@@ -2947,6 +2947,11 @@ impl Tensor {
         // path. fp-order/precision dependent, so gated behind FERRIC_COOP, never the default.
         if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q2_0_coop(w);
+        }
+        // Few rows (and, where measured faster, one): R outputs x M rows per lane group, each output in
+        // the split-K kernel's order below — bit-identical to it (dtype/mrgemv.rs).
+        if !q2_0_transposed() {
+            if let Some(y) = mrgemv::matmul(&x, &w.codes, &w.scales, w.rows, w.cols, mrgemv::Fmt::Q2_0) { return y; }
         }
         // NOTE: a model-facing coop16 hook (route prefill Q2_0 through matmul_q2_0_coop16 on Vulkan)
         // was prototyped here but NOT shipped: it dequants each weight to f32 [K,N] per call, and one
