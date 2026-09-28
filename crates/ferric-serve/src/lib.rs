@@ -62,6 +62,8 @@ mod vision;
 mod constrain;
 mod trace;
 mod batchapi;
+mod local;
+pub use local::LocalModel;
 pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};

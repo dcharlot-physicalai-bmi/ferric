@@ -25,7 +25,7 @@ Every feature Ferric lacks or has only in part, most widely shipped first. Preva
 | O10 | Distributed across home devices (exo-style) | 4/6 | partial | A correctness layer only. No Transport implementation exists anywhere (no sockets), and no runtime or server depends on ferric-dist. ferric-serve binds 127.0.0.1 only, so it cannot even be reached from another device. |
 | O07 | Docker images | 9/14 | absent |  |
 | F16 | Writes its own quantized files | 12/19 | partial | No model-level quantize command: nothing takes a checkpoint and writes a quantized GGUF. GgufWriter is used only to emit synthetic test checkpoints (hyv4_synthetic, hyv4_real_block/moe). No Q4_K/Q5_K/Q6_K/IQ encoders. |
-| O08 | Language bindings (Python / JS / Swift / Kotlin / C) | 8.5/14 | partial | C covers one runtime. The C ABI skips the arch registry, so a gemma4 or deepseek2 GGUF would load as a dense Qwen3: the fluent-wrong-text failure arch.rs exists to stop. It also uses Qwen-only stop ids and the GPT-2 pre- |
+| O08 | Language bindings (Python / JS / Swift / Kotlin / C) | 8.5/14 | partial | libferric now wraps ferric-serve's engine (every registered arch, templates, samplers, constraints, energy; was: every GGUF loaded as dense Qwen3) + a Python ctypes binding; scripts/ffi_check.py: binding == HTTP on Qwen2 |
 | T10 | Fine-tuning on Apple silicon | 9/15 | partial | Bounded by T01: example-level fine-tuning, not a general trainer. |
 | T01 | LoRA fine-tuning | 9.5/16 | partial | 8a42c8b: genuine LoRA A/B on q_proj/v_proj with PEFT's scaling, exported as a PEFT adapter; still example-level (qwen2/qwen3 blocks reconstructed by hand) |
 | O04 | Model conversion tool (HF -> own format) | 8/14 | partial | No end-user converter (HF safetensors -> GGUF, or GGUF -> requantised GGUF). ferric-serve accepts GGUF only (lib.rs:314), so safetensors-only models (MiMo, Cosmos, the qwen2vl authors' weights) cannot be served. |
@@ -244,7 +244,7 @@ Not on the feature list, and measured by the audit: **none of the 14 serving pee
 | O05 | Hardware auto-detect and fit-to-memory configuration | 9.5/14 | partial | The backend is auto-detected. Memory is not: nothing reads device or host RAM to pick a budget, quant or context. Every model except hyv4 is loaded resident wit |
 | O06 | Install via package manager (brew / pip / cargo / winget) | 13/14 | partial | `cargo install ferric-serve` works but installs a 6-week-old build: 2 of today's 7 runtimes, no continuous batching, no /v1/rerank. On PyPI the name 'ferric' be |
 | O07 | Docker images | 9/14 | absent |  |
-| O08 | Language bindings (Python / JS / Swift / Kotlin / C) | 8.5/14 | partial | C covers one runtime. The C ABI skips the arch registry, so a gemma4 or deepseek2 GGUF would load as a dense Qwen3: the fluent-wrong-text failure arch.rs exists |
+| O08 | Language bindings (Python / JS / Swift / Kotlin / C) | 8.5/14 | partial | libferric now wraps ferric-serve's engine (every registered arch, templates, samplers, constraints, energy; was: every GGUF loaded as dense Qwen3) + a Python ct |
 | O09 | OpenTelemetry / tracing | 4.5/14 | verified | OTLP/HTTP traces, json + protobuf, one span per request with GenAI semconv attributes and the request's joules; traceparent continued; scripts/otlp_conformance. |
 | O10 | Distributed across home devices (exo-style) | 4/6 | partial | A correctness layer only. No Transport implementation exists anywhere (no sockets), and no runtime or server depends on ferric-dist. ferric-serve binds 127.0.0. |
 

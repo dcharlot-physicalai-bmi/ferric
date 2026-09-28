@@ -1,113 +1,79 @@
-//! **Ferric C ABI (`libferric`)** — the universal on-ramp. Any language with C FFI drives the
-//! pure-Rust cross-fabric runtime through these functions: `ferric_load` a GGUF, then
-//! `ferric_generate` (free text) or `ferric_generate_json` (schema-constrained, guaranteed-conformant
-//! JSON via guided decoding). Zig `@cImport`s the header directly; Mojo/Go/Java/C#/C++ bind the same.
-//! Strings returned by generate must be released with `ferric_free_string`; the handle with `ferric_free`.
-use ferric_core::Context;
-use ferric_gguf::{GgufFile, Meta};
-use ferric_llama::qwen3::{Cache, Qwen3};
-use ferric_tokenizer::Bpe;
-use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
-use std::sync::Arc;
+//! **Ferric C ABI (`libferric`)** — the universal on-ramp. Any language with C FFI drives Ferric through
+//! these functions; Zig `@cImport`s the header, Python uses ctypes (`bindings/python`), Go/Swift/Mojo/C#
+//! bind the same symbols.
+//!
+//! The handle is ferric-serve's own engine (`ferric_serve::LocalModel`): every architecture the registry
+//! serves, the model's own chat template, its tokenizer, the full sampler set, constrained decoding
+//! (JSON Schema, GBNF, regex, choice), reasoning split and per-request energy. So a binding answers exactly
+//! what `ferric-serve` answers over HTTP for the same request (`scripts/ffi_check.py` holds it to that).
+//!
+//! - `ferric_chat` / `ferric_chat_stream`: an OpenAI `/v1/chat/completions` body in, a `chat.completion`
+//!   JSON object out (`energy` included); the stream variant calls back per delta.
+//! - `ferric_complete`: a `/v1/completions` body in, a `text_completion` object out.
+//! - `ferric_generate` / `ferric_generate_json`: the original two calls, now on the same engine (greedy
+//!   completion; schema-constrained JSON).
+//! Every string returned is released with `ferric_free_string`; the handle with `ferric_free`. An error is
+//! returned as `{"error": {"message": ...}}` rather than NULL, so a caller always gets a reason.
+use serde_json::{json, Value};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
-pub struct FerricHandle {
-    ctx: Arc<Context>,
-    model: Qwen3,
-    bpe: Bpe,
-    toks: Vec<String>,
-    u2b: HashMap<char, u8>,
-    token_bytes: Vec<Option<Vec<u8>>>,
-    add_bos: bool,
-    bos_id: Option<u32>,
-}
-
-fn byte_decoder() -> HashMap<char, u8> {
-    let mut m = HashMap::new();
-    let mut n = 0u32;
-    for b in 0u32..256 {
-        let printable = (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
-        let c = if printable { b } else { let c = 256 + n; n += 1; c };
-        m.insert(char::from_u32(c).unwrap(), b as u8);
-    }
-    m
-}
-
-impl FerricHandle {
-    fn load(path: &str) -> Result<FerricHandle, String> {
-        let g = GgufFile::open(path).map_err(|e| format!("{e:?}"))?;
-        let toks: Vec<String> = match g.metadata.get("tokenizer.ggml.tokens") {
-            Some(Meta::Arr(a)) => a.iter().map(|m| if let Meta::Str(s) = m { s.clone() } else { String::new() }).collect(),
-            _ => return Err("no tokens".into()),
-        };
-        let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
-        let merges: Vec<(String, String)> = match g.metadata.get("tokenizer.ggml.merges") {
-            Some(Meta::Arr(a)) => a.iter().filter_map(|m| if let Meta::Str(s) = m { s.split_once(' ').map(|(x, y)| (x.to_string(), y.to_string())) } else { None }).collect(),
-            _ => Vec::new(),
-        };
-        let bpe = Bpe::new(vocab, &merges);
-        let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
-        let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
-        let u2b = byte_decoder();
-        let token_bytes: Vec<Option<Vec<u8>>> = toks.iter().map(|t| {
-            let mut b = Vec::with_capacity(t.len());
-            for c in t.chars() { match u2b.get(&c) { Some(&x) => b.push(x), None => return None } }
-            Some(b)
-        }).collect();
-        let ctx = Arc::new(pollster::block_on(Context::new()).map_err(|e| format!("{e:?}"))?);
-        let model = Qwen3::load(&ctx, &g)?;
-        Ok(FerricHandle { ctx, model, bpe, toks, u2b, token_bytes, add_bos, bos_id })
-    }
-
-    fn detok(&self, ids: &[u32]) -> String {
-        let s: String = ids.iter().map(|&i| self.toks.get(i as usize).cloned().unwrap_or_default()).collect();
-        String::from_utf8_lossy(&s.chars().filter_map(|c| self.u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned()
-    }
-
-    fn run(&self, prompt: &str, max_tokens: usize, mut guide: Option<ferric_agent::guide::Guide>) -> String {
-        let c = &self.model.cfg;
-        let mut ids = self.bpe.encode(prompt);
-        if self.add_bos { if let Some(b) = self.bos_id { ids.insert(0, b); } }
-        if ids.is_empty() { return String::new(); }
-        let eos = |t: u32| t == 151645 || t == 151643;
-        let mut cache = Cache::new(c);
-        let mut seq = ids.clone();
-        for step in 0..max_tokens {
-            let logits = if step == 0 { self.model.forward_cached(&ids, &mut cache) } else { self.model.forward_cached(&seq[seq.len() - 1..], &mut cache) };
-            let v = pollster::block_on(logits.to_vec());
-            let row = &v[v.len() - c.n_vocab..];
-            let next = if let Some(g) = guide.as_ref() {
-                let can_stop = g.can_stop();
-                let (mut best, mut bl) = (None, f32::NEG_INFINITY);
-                for i in 0..c.n_vocab {
-                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = g.clone(); b.iter().all(|&ch| a.step(ch)) } _ => false } };
-                    if ok && row[i] > bl { bl = row[i]; best = Some(i as u32); }
-                }
-                match best { Some(t) => t, None => break }
-            } else { (0..c.n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32 };
-            if eos(next) { break; }
-            if let Some(g) = guide.as_mut() { if let Some(b) = &self.token_bytes[next as usize] { for &ch in b { g.step(ch); } } }
-            seq.push(next);
-        }
-        self.detok(&seq[ids.len()..])
-    }
-}
+pub struct FerricHandle { m: ferric_serve::LocalModel }
 
 fn cstr<'a>(p: *const c_char) -> Option<&'a str> { if p.is_null() { None } else { unsafe { CStr::from_ptr(p) }.to_str().ok() } }
-fn out(s: String) -> *mut c_char { CString::new(s).unwrap_or_default().into_raw() }
+fn out(s: String) -> *mut c_char { CString::new(s.replace('\0', "")).unwrap_or_default().into_raw() }
+fn err(m: &str) -> *mut c_char { out(json!({"error": {"message": m}}).to_string()) }
 
-/// Load a GGUF model. Returns an opaque handle, or NULL on failure.
+/// Streaming callback: `delta` (UTF-8, NUL-terminated, valid only during the call), `is_reasoning` 1 for a
+/// thinking model's reasoning, 0 for the answer; `user` is passed through.
+pub type FerricDeltaCb = Option<extern "C" fn(delta: *const c_char, is_reasoning: c_int, user: *mut c_void)>;
+
+/// Load a GGUF model. Returns an opaque handle, or NULL on failure (the reason goes to stderr).
 #[unsafe(no_mangle)]
 pub extern "C" fn ferric_load(model_path: *const c_char) -> *mut FerricHandle {
     let Some(path) = cstr(model_path) else { return std::ptr::null_mut() };
-    match FerricHandle::load(path) { Ok(h) => Box::into_raw(Box::new(h)), Err(_) => std::ptr::null_mut() }
+    match ferric_serve::LocalModel::load(path) {
+        Ok(m) => Box::into_raw(Box::new(FerricHandle { m })),
+        Err(e) => { eprintln!("ferric_load: {e}"); std::ptr::null_mut() }
+    }
 }
+
+fn chat(h: *mut FerricHandle, request_json: *const c_char, cb: FerricDeltaCb, user: *mut c_void) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else { return err("null handle") };
+    let req: Value = match cstr(request_json).map(serde_json::from_str) { Some(Ok(v)) => v, Some(Err(e)) => return err(&format!("bad json: {e}")), None => return err("null request") };
+    let r = h.m.chat(&req, |d, reasoning| if let Some(f) = cb {
+        let c = CString::new(d.replace('\0', "")).unwrap_or_default();
+        f(c.as_ptr(), reasoning as c_int, user);
+    });
+    match r { Ok(v) => out(v.to_string()), Err(e) => err(&e) }
+}
+
+/// An OpenAI `/v1/chat/completions` request (JSON) → the `chat.completion` object (JSON). Caller frees.
+#[unsafe(no_mangle)]
+pub extern "C" fn ferric_chat(h: *mut FerricHandle, request_json: *const c_char) -> *mut c_char {
+    chat(h, request_json, None, std::ptr::null_mut())
+}
+
+/// `ferric_chat`, calling `cb` with each piece of the answer as it is generated. Returns the final object.
+#[unsafe(no_mangle)]
+pub extern "C" fn ferric_chat_stream(h: *mut FerricHandle, request_json: *const c_char, cb: FerricDeltaCb, user: *mut c_void) -> *mut c_char {
+    chat(h, request_json, cb, user)
+}
+
+/// An OpenAI `/v1/completions` request (JSON, a string `prompt`) → the `text_completion` object. Caller frees.
+#[unsafe(no_mangle)]
+pub extern "C" fn ferric_complete(h: *mut FerricHandle, request_json: *const c_char) -> *mut c_char {
+    let Some(h) = (unsafe { h.as_ref() }) else { return err("null handle") };
+    let req: Value = match cstr(request_json).map(serde_json::from_str) { Some(Ok(v)) => v, Some(Err(e)) => return err(&format!("bad json: {e}")), None => return err("null request") };
+    match h.m.complete(&req, |_| {}) { Ok(v) => out(v.to_string()), Err(e) => err(&e) }
+}
+
+fn text_of(v: &Value) -> String { v["choices"][0]["text"].as_str().unwrap_or_default().to_string() }
 
 /// Greedy free-text completion of `prompt` for up to `max_tokens`. Caller frees the result string.
 #[unsafe(no_mangle)]
 pub extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
-    out(h.run(p, max_tokens as usize, None))
+    out(h.m.complete(&json!({"prompt": p, "max_tokens": max_tokens, "temperature": 0}), |_| {}).map(|v| text_of(&v)).unwrap_or_default())
 }
 
 /// Schema-constrained generation: output is guaranteed-conformant JSON. `schema` is a JSON-Schema
@@ -115,15 +81,16 @@ pub extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, m
 #[unsafe(no_mangle)]
 pub extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_char, schema: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
-    let sch = ferric_agent::guide::compile_str(cstr(schema).unwrap_or(""));
-    let guide = match &sch {
-        Some(prog) => ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog)),
-        None => ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object()),
+    let format = match cstr(schema).map(str::trim).filter(|s| !s.is_empty()).map(serde_json::from_str::<Value>) {
+        Some(Ok(s)) => json!({"type": "json_schema", "json_schema": {"schema": s}}),
+        Some(Err(_)) => return out(String::new()),
+        None => json!({"type": "json_object"}),
     };
-    out(h.run(p, max_tokens as usize, Some(guide)))
+    out(h.m.complete(&json!({"prompt": p, "max_tokens": max_tokens, "temperature": 0, "response_format": format}), |_| {})
+        .map(|v| text_of(&v)).unwrap_or_default())
 }
 
-/// Free a string returned by `ferric_generate*`.
+/// Free a string returned by any `ferric_*` call.
 #[unsafe(no_mangle)]
 pub extern "C" fn ferric_free_string(s: *mut c_char) { if !s.is_null() { unsafe { drop(CString::from_raw(s)); } } }
 
