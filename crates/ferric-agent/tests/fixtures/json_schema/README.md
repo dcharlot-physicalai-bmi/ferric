@@ -51,3 +51,60 @@ python3 make_differential.py /tmp/js2g-ref/js2g differential.json.gz target/rele
 ```
 
 With the port's binary as the third argument, `make_differential.py` also prints every difference.
+
+## `semantic.json.gz`: what the grammars mean, according to `jsonschema`
+
+`make_semantic.py` covers 112 schemas: the authors' success schemas and 16 realistic API ones (nested objects,
+arrays of objects, enums, optional and nullable fields, string lengths, integer ranges, formats, `$defs`, a
+recursive tree, a tuple, a discriminated union, strict all-required). 3 of the authors' schemas are skipped
+because they are not valid Draft 2020-12 (`prefixItems` given as a schema), so jsonschema cannot evaluate them.
+
+The instances come from three sources:
+- values generated from each schema, with keys in the order the grammar emits them;
+- mutations of those values;
+- probes aimed at each known departure.
+
+Each instance is serialized in the ways the `space` rule allows and labelled by jsonschema 4.26.0 (Draft 2020-12,
+or 2019-09 where `items` is a list), using that draft's format checker.
+
+The grammar's verdict comes from `examples/json_schema_accepts`. Every disagreement must be explained by a
+counterfactual, or the script stops. There are three kinds:
+- **Respelling**: the same value written differently (whitespace, number spelling, key order, escapes) and
+  accepted by the grammar.
+- **Reinterpretation**: jsonschema, given the schema rewritten the way llama.cpp reads it, agrees with the
+  grammar. Examples are a dropped keyword, allOf merged llama.cpp's way, and objects closed by default.
+- **Limit**: 17-digit integers, cut to 16 digits.
+
+`causes` in the file explains each one.
+
+Result: 8222 instances (5344 valid and 2878 invalid according to jsonschema). The grammar agrees on 6999. The
+other 1223 depart for a recorded cause:
+
+| Cause | Instances |
+|---|---:|
+| whitespace | 265 |
+| type-inferred | 194 |
+| key-order | 191 |
+| number-spelling | 137 |
+| additional-properties-default | 119 |
+| empty-name-is-root | 75 |
+| tuple-exact | 64 |
+| number-bounds-ignored | 48 |
+| integer-digits | 40 |
+| raw-del | 33 |
+| pattern-widened | 31 |
+| pattern-raw-chars | 8 |
+| pattern-anchored-whole | 6 |
+| keyword-ignored | 5 |
+| keyword-ignored + number-bounds-ignored | 3 |
+| astral-escape-length | 1 |
+| pattern-dot-dialect | 1 |
+| additional-key-prefix | 1 |
+| all-of-merged | 1 |
+
+To regenerate (the output is deterministic):
+
+```
+cargo build -p ferric-agent --release --example json_schema_accepts --example json_schema_to_gbnf
+<venv>/bin/python make_semantic.py target/release/examples/json_schema_accepts semantic.json.gz
+```

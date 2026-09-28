@@ -1,5 +1,6 @@
 //! `ferric_agent::json_schema` against llama.cpp's own tests (tests/fixtures/json_schema/llama_cpp_cases.json,
-//! extracted by extract.py there), and against the `jsonschema` package's verdicts (semantic.json).
+//! extracted by extract.py there), against llama.cpp's own converter (differential.json.gz) and against the
+//! `jsonschema` package's verdicts (semantic.json.gz).
 use ferric_agent::grammar::{Grammar, Matcher};
 use ferric_agent::json_schema::{parse_schema, schema_to_gbnf, Converter, Node};
 use serde_json::Value;
@@ -86,11 +87,7 @@ fn llama_cpp_extra_cases() {
 /// quantifier (invalid UTF-8); there the port's grammar must differ, keep the character whole and parse.
 #[test]
 fn llama_cpp_reference_differential() {
-    use std::io::Read;
-    let gz = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/json_schema/differential.json.gz")).unwrap();
-    let mut text = String::new();
-    flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut text).unwrap();
-    let fx: Value = serde_json::from_str(&text).unwrap();
+    let fx = gunzip("differential.json.gz");
     let (mut same_grammar, mut same_error, mut deviations) = (0, 0, 0);
     let mut wrong = Vec::new();
     for c in fx["cases"].as_array().unwrap() {
@@ -113,6 +110,55 @@ fn llama_cpp_reference_differential() {
     assert!(wrong.is_empty(), "{} of {} schemas differ from llama.cpp's converter:\n{}", wrong.len(), same_grammar + same_error + wrong.len(),
         wrong.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
     assert_eq!((same_grammar, same_error, deviations), (1409, 57, 3), "the fixture changed size");
+}
+
+fn gunzip(name: &str) -> Value {
+    use std::io::Read;
+    let gz = std::fs::read(format!("{}/tests/fixtures/json_schema/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// What the grammars mean, against the `jsonschema` package (make_semantic.py): for 109 schemas (the authors'
+/// and 16 realistic API ones), 8222 JSON texts labelled valid or invalid by jsonschema. The grammar accepts
+/// exactly the valid ones, except where the fixture names the llama.cpp departure that makes them differ (each
+/// established there by a counterfactual). Such an instance must then disagree; where the counterfactual is a
+/// respelling of the same value, the grammar must take the respelled text exactly when jsonschema takes the
+/// value.
+#[test]
+fn semantic_verdicts_match_jsonschema_within_documented_departures() {
+    let fx = gunzip("semantic.json.gz");
+    let causes = fx["causes"].as_object().unwrap();
+    let (mut n, mut agree, mut depart, mut skipped) = (0, 0, 0, 0);
+    let mut per_cause: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut wrong = Vec::new();
+    for s in fx["schemas"].as_array().unwrap() {
+        let name = s["name"].as_str().unwrap();
+        if s.get("skipped").is_some() { skipped += 1; continue; }
+        let schema: Value = serde_json::from_str(s["schema"].as_str().unwrap()).unwrap();
+        let g = grammar(&schema_to_gbnf(&schema).unwrap_or_else(|e| panic!("{name}: {e}")), name);
+        for i in s["instances"].as_array().unwrap() {
+            let (text, valid) = (i["text"].as_str().unwrap(), i["valid"].as_bool().unwrap());
+            let got = accepts(&g, text);
+            n += 1;
+            match i["cause"].as_str() {
+                None => if got == valid { agree += 1 } else { wrong.push(format!("[{name}] {text:?}: jsonschema {valid}, grammar {got}")) },
+                Some(c) => {
+                    for part in c.split('+') { assert!(causes.contains_key(part), "{name}: unknown cause {part}"); }
+                    if got == valid { wrong.push(format!("[{name}] {text:?}: marked `{c}` but the grammar agrees with jsonschema ({valid})")); }
+                    if let Some(r) = i["respelled"].as_str() && accepts(&g, r) != valid {
+                        wrong.push(format!("[{name}] {text:?}: respelled {r:?} still gets {}", !valid));
+                    }
+                    *per_cause.entry(c.to_string()).or_default() += 1;
+                    depart += 1;
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} of {n} instances:\n{}", wrong.len(), wrong.iter().take(30).cloned().collect::<Vec<_>>().join("\n"));
+    eprintln!("{n} instances: {agree} agree with jsonschema, {depart} depart as documented: {per_cause:?}");
+    assert_eq!((n, agree, depart, skipped), (8222, 6999, 1223, 3), "the fixture changed size");
 }
 
 /// Guards the port adds where llama.cpp would exhaust the stack: each is an error, never a crash.
