@@ -587,7 +587,8 @@ extern "C" __global__ void q5_0_gemm2(GEMM_ARGS) { gemm2_t<4>(A, lda, codes, aux
 // truncation — and the tile folds into f32 once: acc += scale_n · 2^-e_m · (2^16 P2 + (2^8 P1 + P0))
 // (− min_n · Σa for Q4_K/Q5_K, the row sum taken in f32 as before). An f16 overflow cannot happen
 // (the exponent absorbs any magnitude); the flag catches inf/NaN only.
-// Cost per product: 3 int8 MACs at 4x the rate = 3/8 of v2's two f16 MACs.
+// Cost per product: 3 int8 MACs at 4x the rate = 3/8 of v2's two f16 MACs. `__launch_bounds__(256, 2)`:
+// two blocks per SM (<= 128 registers), so one block's conversions overlap the other's multiplies.
 #define LDB 48u        // bytes per shared row: 32 codes + 16 pad — ldmatrix rows land on 8 distinct bank quads
 struct __align__(16) Stage3 {
     unsigned char Aq[3][B2M * LDB], Wq[B2N * LDB];
@@ -618,7 +619,7 @@ __device__ __forceinline__ void decode16_s8(const Raw16& r, unsigned n, unsigned
         else { const unsigned a = SCB(s + 4u), lo = SCB(s - 4u), hi = SCB(s);
                sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); m6 = (a >> 4u) | ((hi >> 6u) << 4u); }
         #undef SCB
-        scale = f16_to_f32(axw[0] & 0xffffu) * (float)sc; mn = f16_to_f32(axw[0] >> 16u) * (float)m6;
+        scale = h2f(axw[0] & 0xffffu) * (float)sc; mn = h2f(axw[0] >> 16u) * (float)m6;
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
@@ -629,7 +630,7 @@ __device__ __forceinline__ void decode16_s8(const Raw16& r, unsigned n, unsigned
             }
     } else if (F == 2) {
         const unsigned j = kc & 7u, hf = j >> 2u, qq = j & 3u, si = 8u * hf + 2u * qq + h;
-        scale = f16_to_f32(r.ax.x & 0xffffu) * (float)((int)(((r.ax.y >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
+        scale = h2f(r.ax.x & 0xffffu) * (float)((int)(((r.ax.y >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
         const unsigned nsh = 4u * (qq >> 1u), hsh = 2u * qq;
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
@@ -638,14 +639,14 @@ __device__ __forceinline__ void decode16_s8(const Raw16& r, unsigned n, unsigned
                 v[4u * w + k] = (int)(((qw[w] >> (8u * k + nsh)) & 0xfu) | (((hw[w] >> (8u * k + hsh)) & 3u) << 4u)) - 32;
     } else if (F == 3) {
         const unsigned bi = n * (K / 32u) + kc;
-        scale = f16_to_f32((bi & 1u) ? (r.ax.x >> 16u) : (r.ax.x & 0xffffu));
+        scale = h2f((bi & 1u) ? (r.ax.x >> 16u) : (r.ax.x & 0xffffu));
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
             for (unsigned k = 0u; k < 4u; ++k) v[4u * w + k] = (int)(qw[w] << (24u - 8u * k)) >> 24;
     } else {
         const unsigned qh = r.ax.x;
-        scale = f16_to_f32(r.ax.y & 0xffffu);
+        scale = h2f(r.ax.y & 0xffffu);
         #pragma unroll
         for (unsigned w = 0u; w < 4u; ++w)
             #pragma unroll
@@ -814,11 +815,11 @@ __device__ __forceinline__ void gemm3_t(const float* __restrict__ A, unsigned ld
 #define GEMM_ARGS const float* __restrict__ A, unsigned lda, const unsigned* __restrict__ codes, \
                   const unsigned* __restrict__ aux, float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, \
                   unsigned K, int* __restrict__ ovf
-extern "C" __global__ void q4k_gemm3(GEMM_ARGS)  { gemm3_t<0>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
-extern "C" __global__ void q5k_gemm3(GEMM_ARGS)  { gemm3_t<1>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
-extern "C" __global__ void q6k_gemm3(GEMM_ARGS)  { gemm3_t<2>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
-extern "C" __global__ void q8_0_gemm3(GEMM_ARGS) { gemm3_t<3>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
-extern "C" __global__ void q5_0_gemm3(GEMM_ARGS) { gemm3_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q4k_gemm3(GEMM_ARGS)  { gemm3_t<0>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q5k_gemm3(GEMM_ARGS)  { gemm3_t<1>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q6k_gemm3(GEMM_ARGS)  { gemm3_t<2>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q8_0_gemm3(GEMM_ARGS) { gemm3_t<3>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q5_0_gemm3(GEMM_ARGS) { gemm3_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
 #undef GEMM_ARGS
 
 // ── h[t, i] = silu(gu[t, i]) · gu[t, n_ff + i] — the same expression the fused decode kernels use. ──

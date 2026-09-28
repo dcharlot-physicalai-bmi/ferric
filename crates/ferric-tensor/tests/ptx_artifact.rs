@@ -30,6 +30,9 @@ fn check(stem: &str, cu: &str, ptx: &str, floor: usize) {
         .filter_map(|l| {
             let l = l.trim_start();
             let r = l.strip_prefix("extern \"C\" ").unwrap_or(l).strip_prefix("__global__ void ")?;
+            // `__launch_bounds__(...)` sits between the return type and the name on the kernels that
+            // cap their registers; the NAME is what follows it.
+            let r = match r.strip_prefix("__launch_bounds__(") { Some(x) => x.split_once(") ")?.1, None => r };
             let n = r.split(|c: char| !(c.is_alphanumeric() || c == '_')).next()?;
             (!n.is_empty()).then_some(n)
         })
