@@ -407,21 +407,26 @@ extern "C" __global__ void q5_0_swiglu_gemv(GEMV_ARGS) { swiglu_t<4>(x, codes, a
 //                 0 = NEOX split-half, partners (c, c + dh/2). The frequency index is c in both.
 //                 ⛔ The wrong pairing is the classic silent RoPE failure: finite logits, fluent text.
 //    ROWS: blockIdx.y is the row (prefill); row i sits at position pos + i, reads qkv row i (width
-//    row_w) and writes q/k row i and cache row i. Decode launches gridDim.y = 1 (row 0, same math). ──
-extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
-                                        const float* __restrict__ kw, float* __restrict__ qo,
-                                        float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
-                                        float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
-                                        unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
-                                        unsigned v_off, const float* __restrict__ bias,
-                                        const float* __restrict__ ff, unsigned norm_pairs, unsigned row_w) {
-    __shared__ float red[4]; __shared__ float s_inv;
-    const unsigned id = blockIdx.x, t = threadIdx.x, row = blockIdx.y;
+//    row_w) and writes q/k row i and cache row i. Decode launches gridDim.y = 1 (row 0, same math).
+//
+//    ⭐ THE ANGLES. `tab` [rows, dh] = cos of each pair's angle in [0, dh/2), sin in [dh/2, dh), built on
+//    the HOST exactly as the WGSL path builds its rope table (qwen3.rs `rope_table`: the authors' float32
+//    inverse frequencies from `rope_inv_freq`, angle = f32(position) · inv, cos/sin in f64 then rounded).
+//    ⛔ The device formula below (`tab` null) is what this kernel did before: `expf(-2c/dh · logf(base))`
+//    misses the authors' float32 inverse frequency by a few ulp, and the position multiplies that — at
+//    position 30,000 the WGSL path's copy of it sat 18-109x the authors' float32-vs-float64 distance.
+//    It stays reachable (FERRIC_CUDA_ROPE_DEVICE / FERRIC_ROPE_DEVICE) as the gates' negative control. ──
+__device__ __forceinline__ void qk_norm_rope_row(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                                 const float* __restrict__ kw, float* __restrict__ qo,
+                                                 float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                                 float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
+                                                 unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
+                                                 unsigned v_off, const float* __restrict__ bias,
+                                                 const float* __restrict__ ff, unsigned norm_pairs,
+                                                 const float* __restrict__ tab, float* red, float& s_inv) {
+    const unsigned id = blockIdx.x, t = threadIdx.x;
     const bool is_k = id >= nh;
     const unsigned head = is_k ? id - nh : id;
-    qkv += (size_t)row * row_w; qo += (size_t)row * nh * dh; ko += (size_t)row * nkv * dh; pos += row;
-    if (kc_row != 0) kc_row += (size_t)row * nkv * dh;
-    if (vc_row != 0) vc_row += (size_t)row * nkv * dh;
     const unsigned so = (is_k ? k_off : q_off) + head * dh;
     const float* src = qkv + so;
     const float* bsrc = bias != 0 ? bias + so : 0;
@@ -442,9 +447,14 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
     if (t < half) {
         const unsigned c = t;
         const unsigned p0 = norm_pairs ? 2u * c : c, p1 = norm_pairs ? 2u * c + 1u : c + half;
-        float fr = expf(-2.f * (float)c / (float)dh * logf(base));
-        if (ff != 0) fr = fr * ff[c];
-        const float ang = (float)pos * fr, cs = cosf(ang), sn = sinf(ang);
+        float cs, sn;
+        if (tab != 0) { cs = tab[c]; sn = tab[half + c]; }
+        else {
+            float fr = expf(-2.f * (float)c / (float)dh * logf(base));
+            if (ff != 0) fr = fr * ff[c];
+            const float ang = (float)pos * fr;
+            cs = cosf(ang); sn = sinf(ang);
+        }
         const float w1 = has_norm ? w[p0] : 1.f, w2 = has_norm ? w[p1] : 1.f;
         const float a = bsrc != 0 ? src[p0] + bsrc[p0] : src[p0];
         const float b = bsrc != 0 ? src[p1] + bsrc[p1] : src[p1];
@@ -458,6 +468,47 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
         vc_row[head * dh + t] = bias != 0 ? qkv[vi] + bias[vi] : qkv[vi];
     }
 }
+extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                        const float* __restrict__ kw, float* __restrict__ qo,
+                                        float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                        float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
+                                        unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
+                                        unsigned v_off, const float* __restrict__ bias,
+                                        const float* __restrict__ ff, unsigned norm_pairs, unsigned row_w,
+                                        const float* __restrict__ tab) {
+    __shared__ float red[4]; __shared__ float s_inv;
+    const unsigned row = blockIdx.y;
+    qkv += (size_t)row * row_w; qo += (size_t)row * nh * dh; ko += (size_t)row * nkv * dh; pos += row;
+    if (kc_row != 0) kc_row += (size_t)row * nkv * dh;
+    if (vc_row != 0) vc_row += (size_t)row * nkv * dh;
+    if (tab != 0) tab += (size_t)row * dh;
+    qk_norm_rope_row(qkv, qw, kw, qo, ko, nh, nkv, dh, base, pos, eps, q_off, k_off, has_norm, kc_row, vc_row,
+                     v_off, bias, ff, norm_pairs, tab, red, s_inv);
+}
+
+// ── THE STEP BLOCK: what changes from one decode token to the next, read from DEVICE memory so a
+//    CUDA graph captured once replays every later token unchanged (cuda.rs `DecodeGraph::step`).
+//    u32 words: [0] the row this token writes (= rows already cached), [1] its absolute position,
+//    [2..4) pad, then 2·n_layer u64 K/V base pointers (K of layer l at [l], V at [n_layer + l]) — the
+//    cache is per SEQUENCE and regrows by reallocation, so its addresses cannot be graph constants.
+//    The rope row and the input x row follow; the host fills the whole block and ONE copy moves it. ──
+#define STEP_KVP(step) (reinterpret_cast<const unsigned long long*>((step) + 4))
+extern "C" __global__ void qk_norm_rope_step(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                             const float* __restrict__ kw, float* __restrict__ qo,
+                                             float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                             float base, float eps, unsigned q_off, unsigned k_off,
+                                             unsigned has_norm, unsigned v_off, const float* __restrict__ bias,
+                                             const float* __restrict__ ff, unsigned norm_pairs,
+                                             const float* __restrict__ tab, const unsigned* __restrict__ step,
+                                             unsigned li, unsigned nl) {
+    __shared__ float red[4]; __shared__ float s_inv;
+    const unsigned row = step[0], pos = step[1];
+    const size_t ro = (size_t)row * nkv * dh;
+    float* kc_row = reinterpret_cast<float*>(STEP_KVP(step)[li]) + ro;
+    float* vc_row = reinterpret_cast<float*>(STEP_KVP(step)[nl + li]) + ro;
+    qk_norm_rope_row(qkv, qw, kw, qo, ko, nh, nkv, dh, base, pos, eps, q_off, k_off, has_norm, kc_row, vc_row,
+                     v_off, bias, ff, norm_pairs, tab, red, s_inv);
+}
 
 // ── Fused single-query attention over an [S, nkv*dh] K/V cache: one block (128 threads = 4 warps)
 //    per q-head, GQA head -> kv head, chunked online softmax. dh <= 128.
@@ -467,9 +518,9 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
 //    lanes x 4 dh elements, shuffle-reduced), warps reduce max/sum with one shuffle tree each, and V is
 //    accumulated per warp over a strided key subset (lane covers 4 consecutive dh elements: coalesced
 //    128 B per key per warp), then combined across the 4 warps once. Mirrors FUSED_ATTN_WGSL's math. ──
-extern "C" __global__ void attn_decode(const float* __restrict__ q, const float* __restrict__ k,
-                                       const float* __restrict__ v, float* __restrict__ out,
-                                       unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+__device__ __forceinline__ void attn_decode_body(const float* __restrict__ q, const float* __restrict__ k,
+                                                 const float* __restrict__ v, float* __restrict__ out,
+                                                 unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
     __shared__ float sc[2048];
     __shared__ float red[4];
     __shared__ float vacc[4][128];
@@ -521,6 +572,128 @@ extern "C" __global__ void attn_decode(const float* __restrict__ q, const float*
     for (unsigned e = 0u; e < dpl; ++e) vacc[warp][lane * dpl + e] = acc[e];
     __syncthreads();
     if (t < dh) out[head * dh + t] = (vacc[0][t] + vacc[1][t] + vacc[2][t] + vacc[3][t]) / l_run;
+}
+extern "C" __global__ void attn_decode(const float* __restrict__ q, const float* __restrict__ k,
+                                       const float* __restrict__ v, float* __restrict__ out,
+                                       unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+    attn_decode_body(q, k, v, out, nh, nkv, dh, s, scale);
+}
+// The graph's attention: this layer's K/V base and the key count come from the step block.
+extern "C" __global__ void attn_decode_step(const float* __restrict__ q, float* __restrict__ out,
+                                            unsigned nh, unsigned nkv, unsigned dh, float scale,
+                                            const unsigned* __restrict__ step, unsigned li, unsigned nl) {
+    attn_decode_body(q, reinterpret_cast<const float*>(STEP_KVP(step)[li]),
+                     reinterpret_cast<const float*>(STEP_KVP(step)[nl + li]), out, nh, nkv, dh, step[0] + 1u, scale);
+}
+
+
+// ── SPLIT-K DECODE ATTENTION (flash-decoding): the step's attention since the step became a graph.
+//    ⛔ `attn_decode` gives the whole key range of a q-head to ONE block: 14 blocks on a 20-SM card for
+//    Qwen2.5-0.5B, each walking every key serially, and the SAME K/V rows read once per q-head of a GQA
+//    group (7x there). At 576 cached rows the profiler put it at 2.62 of 5.51 ms/token (48%), on a
+//    layer's 0.6 MB of K/V — ~35x its DRAM time — and it grows with the context.
+//    Here block (c, kvh) of a FIXED grid (G, nkv) takes chunk c of the keys — [c·⌈S/G⌉, …) — for ALL
+//    g = nh/nkv query heads sharing kv head kvh, so each K/V row is read once per group, and the chunks
+//    run in parallel. Keys stream through shared memory 32 at a time; per head an online softmax (max,
+//    sum, rescale) exactly as attn_decode's; the chunk writes its running max, sum and UNNORMALISED
+//    output to `part`, and `attn_combine` merges the G chunks. S comes from the step block, so G being
+//    fixed is what lets one captured graph serve every context length. g·dh <= 2048, dh <= 128.
+#define AS_KT 32u
+__device__ __forceinline__ void attn_split_body(const float* __restrict__ q, const float* __restrict__ k,
+                                                const float* __restrict__ v, float* __restrict__ part,
+                                                unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+    __shared__ float qs[2048];
+    __shared__ float Ks[AS_KT][129];
+    __shared__ float Vs[AS_KT][128];
+    __shared__ float ps[16][AS_KT];
+    __shared__ float m_s[16], l_s[16], corr_s[16];
+    const unsigned t = threadIdx.x, lane = t & 31u, warp = t >> 5u;
+    const unsigned c = blockIdx.x, G = gridDim.x, kvh = blockIdx.y;
+    const unsigned g = nh / nkv, kvw = nkv * dh, n_out = g * dh;
+    const unsigned csz = (s + G - 1u) / G, c0 = c * csz, c1 = min(s, c0 + csz);
+    for (unsigned i = t; i < n_out; i += 128u) qs[i] = q[kvh * g * dh + i];     // the group's heads are contiguous
+    if (t < g) { m_s[t] = -3.0e38f; l_s[t] = 0.f; }
+    float acc[16];
+    #pragma unroll
+    for (unsigned i = 0u; i < 16u; ++i) acc[i] = 0.f;
+    for (unsigned k0 = c0; k0 < c1; k0 += AS_KT) {
+        const unsigned kn = min(AS_KT, c1 - k0);
+        __syncthreads();                                   // qs written / the previous tile consumed
+        for (unsigned i = t; i < AS_KT * dh; i += 128u) {
+            const unsigned j = i / dh, e = i - j * dh;
+            const bool in = j < kn;
+            Ks[j][e] = in ? k[(size_t)(k0 + j) * kvw + kvh * dh + e] : 0.f;
+            Vs[j][e] = in ? v[(size_t)(k0 + j) * kvw + kvh * dh + e] : 0.f;
+        }
+        __syncthreads();
+        // scores: pair p = (head p/32, key p%32); a warp holds one head, lane = key
+        for (unsigned p = t; p < g * AS_KT; p += 128u) {
+            const unsigned h = p / AS_KT, j = p - h * AS_KT;
+            float d = 0.f;
+            for (unsigned e = 0u; e < dh; ++e) d += qs[h * dh + e] * Ks[j][e];
+            ps[h][j] = j < kn ? d * scale : -3.0e38f;
+        }
+        __syncthreads();
+        // per head: tile max, rescale, exponentiate, sum — one warp per head
+        for (unsigned h = warp; h < g; h += 4u) {
+            const float sc = ps[h][lane];
+            const float m_new = fmaxf(m_s[h], warp_max(sc));
+            const float e = lane < kn ? expf(sc - m_new) : 0.f;
+            const float cs = warp_sum(e);
+            ps[h][lane] = e;
+            if (lane == 0u) { const float corr = expf(m_s[h] - m_new); corr_s[h] = corr; l_s[h] = l_s[h] * corr + cs; m_s[h] = m_new; }
+        }
+        __syncthreads();
+        // P·V: output (h, e) = idx t + 128i
+        #pragma unroll
+        for (unsigned i = 0u; i < 16u; ++i) {
+            const unsigned o = t + 128u * i;
+            if (o < n_out) {
+                const unsigned h = o / dh, e = o - h * dh;
+                float a = acc[i] * corr_s[h];
+                for (unsigned j = 0u; j < kn; ++j) a += ps[h][j] * Vs[j][e];
+                acc[i] = a;
+            }
+        }
+    }
+    __syncthreads();
+    // part[(head · G + c) · (dh + 2)]: o[dh], m, l — head = kvh·g + h
+    #pragma unroll
+    for (unsigned i = 0u; i < 16u; ++i) {
+        const unsigned o = t + 128u * i;
+        if (o < n_out) { const unsigned h = o / dh, e = o - h * dh; part[((size_t)(kvh * g + h) * G + c) * (dh + 2u) + e] = acc[i]; }
+    }
+    if (t < g) {
+        float* pm = part + ((size_t)(kvh * g + t) * G + c) * (dh + 2u) + dh;
+        pm[0] = m_s[t]; pm[1] = l_s[t];
+    }
+}
+extern "C" __global__ void attn_split(const float* __restrict__ q, const float* __restrict__ k,
+                                      const float* __restrict__ v, float* __restrict__ part,
+                                      unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+    attn_split_body(q, k, v, part, nh, nkv, dh, s, scale);
+}
+extern "C" __global__ void attn_split_step(const float* __restrict__ q, float* __restrict__ part,
+                                           unsigned nh, unsigned nkv, unsigned dh, float scale,
+                                           const unsigned* __restrict__ step, unsigned li, unsigned nl) {
+    attn_split_body(q, reinterpret_cast<const float*>(STEP_KVP(step)[li]),
+                    reinterpret_cast<const float*>(STEP_KVP(step)[nl + li]), part, nh, nkv, dh, step[0] + 1u, scale);
+}
+// ── Merge the G chunks of each head: out = Σ_c e^(m_c − M) o_c / Σ_c e^(m_c − M) l_c, M = max_c m_c.
+//    An empty chunk carries m = −3e38, l = 0, o = 0 and weighs exactly 0. One block per head, dh threads. ──
+extern "C" __global__ void attn_combine(const float* __restrict__ part, float* __restrict__ out,
+                                        unsigned dh, unsigned G) {
+    const unsigned h = blockIdx.x, e = threadIdx.x;
+    if (e >= dh) return;
+    const float* ph = part + (size_t)h * G * (dh + 2u);
+    float M = -3.0e38f;
+    for (unsigned c = 0u; c < G; ++c) M = fmaxf(M, ph[c * (dh + 2u) + dh]);
+    float num = 0.f, den = 0.f;
+    for (unsigned c = 0u; c < G; ++c) {
+        const float w = expf(ph[c * (dh + 2u) + dh] - M);
+        num += w * ph[c * (dh + 2u) + e]; den += w * ph[c * (dh + 2u) + dh + 1u];
+    }
+    out[h * dh + e] = num / den;
 }
 
 

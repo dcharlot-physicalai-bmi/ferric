@@ -10,8 +10,10 @@
 # in TWO native modes: DECODE (FERRIC_CUDA_NO_PREFILL=1: multi-token calls stay on WGSL, so the K/V cache
 # is handed device -> WGSL -> device mid-sequence) and FULL (prefill on the tensor cores too).
 #
-#   1. ENGAGEMENT: every single-token call must have been a native step (`NATIVE_STEPS n OF n`), and in
-#      FULL mode every multi-token row a native prefill row. A WGSL fallback prints the same kind of
+#   1. ENGAGEMENT: every single-token call must have been a native step (`NATIVE_STEPS n OF n`) replayed
+#      from the captured CUDA graph (`NATIVE_GRAPH n`), and in FULL mode every multi-token row a native
+#      prefill row. The graph's eager twin (FERRIC_CUDA_NO_GRAPH=1) must print the SAME logits to the last
+#      printed digit — the two launch the same kernels on the same inputs. A WGSL fallback prints the same kind of
 #      rows, so without this the gate would pass on a tier that never ran — the fate of the first CUDA
 #      check, whose "reference" had been routed to CUDA too.
 #   2. NATIVE vs WGSL, same weights: max |Δ logit| within TOL_NW (decode: two f32 reduction orders) or
@@ -66,7 +68,7 @@ def gguf(path):
 ARCH, NAMES = gguf(M)
 
 # ⚠ Clear every knob that changes the math, so an inherited shell variable cannot make both arms wrong alike.
-KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_Q8X", "FERRIC_CUDA_NO_PREFILL", "FERRIC_NEOX", "FERRIC_ROPE_NORM", "FERRIC_NO_ROPE_FREQS", "FERRIC_NO_QKV_BIAS",
+KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_Q8X", "FERRIC_CUDA_NO_PREFILL", "FERRIC_CUDA_NO_GRAPH", "FERRIC_CUDA_ROPE_DEVICE", "FERRIC_ROPE_DEVICE", "FERRIC_NEOX", "FERRIC_ROPE_NORM", "FERRIC_NO_ROPE_FREQS", "FERRIC_NO_QKV_BIAS",
          "FERRIC_KVQ", "FERRIC_NOFUSE", "FERRIC_NO_QK_FUSE", "FERRIC_ONE_ROPE", "FERRIC_NO_SWA")
 def run(cuda, extra=None, total=0, prefill=8, chunk_at=64, chunk=5):
     env = {k: v for k, v in os.environ.items() if k not in KNOBS}
@@ -74,14 +76,15 @@ def run(cuda, extra=None, total=0, prefill=8, chunk_at=64, chunk=5):
     env.update(extra or {})
     r = subprocess.run([BIN, M, FX, str(prefill), str(chunk_at), str(chunk), str(total)], capture_output=True, text=True, env=env)
     if r.returncode: print(r.stderr[-2000:]); sys.exit(1)
-    rows, steps, pf = {}, None, None
+    rows, steps, pf, graph = {}, None, None, None
     for l in r.stdout.splitlines():
         p = l.split(" ")
         if p[0] == "ROW": rows[int(p[1])] = (int(p[2]), float(p[4]), [float(x) for x in p[5:]])
         elif p[0] == "NATIVE_STEPS": steps = (int(p[1]), int(p[3]))
         elif p[0] == "NATIVE_PREFILL": pf = (int(p[1]), int(p[3]))
+        elif p[0] == "NATIVE_GRAPH": graph = int(p[1])
     dev = [l for l in r.stderr.splitlines() if l.startswith(("adapter", "native"))]
-    return rows, (steps, pf), dev, r.stderr
+    return rows, (steps, pf, graph), dev, r.stderr
 
 def diff(a, b):
     """max |Δ| over the sampled logits, worst position, worst relative Δ of the full-row sum of squares."""
@@ -114,6 +117,13 @@ def vs_authors(rows):
 #   1000 rows; split activations + rounded weights, 0.028 there and 4.7e-2 on Qwen2.5 Q8_0.)
 #   For scale: every one of these files sits 2.4-11.7 logits from the authors (quantisation), and the
 #   native tier's distance from them matched WGSL's to within 0.01 in every run.
+#   ⭐ Re-measured 2026-09-28 (feat/cuda2: host rope rows on both paths, CUDA-graph step, split-K decode
+#   attention, int8-digit prefill GEMM v3, tiled prefill attention): decode / full / 1000-row prefill —
+#   Qwen2.5 Q4_K_M 1.0e-4 / 1.7e-4 / 2.0e-4, Qwen2.5 Q8_0 8e-5 / 8e-5 / 9e-5, Qwen3 3e-5 / 2.5e-4 /
+#   5.8e-4, Llama 3e-5 / 4e-5 / 5e-5; at 2300 positions Qwen2.5 1.5e-4 / 1.6e-4 and Llama 8e-5 / 9e-5
+#   — Llama's 1.35e-3 there was the two paths' DIFFERENT rope angles, gone now both take the host
+#   table. Controls under the tensor-core prefill: native vs WGSL-under-control up to 1.9e-3 (Qwen2.5
+#   Q4_K_M, see cuda_prefill.cu GEMM v3 on why it was 1.57e-2 before the per-row-tile exponent).
 TOL_NW = 5e-3
 TOL_PF = TOL_NW
 ok = True
@@ -124,11 +134,18 @@ for mode, extra, tol in (("DECODE", {"FERRIC_CUDA_NO_PREFILL": "1"}, TOL_NW), ("
     cr, cs, cdev, cerr = run(True, extra)
     if not any(l.startswith("native") for l in cdev):
         print("⛔ no CUDA device line: FERRIC_CUDA had no driver to open. NOTHING native was checked."); sys.exit(1)
-    (n_steps, n_single), (n_pf, n_multi) = cs
+    (n_steps, n_single), (n_pf, n_multi), n_graph = cs
     want_pf = n_multi if mode == "FULL" else 0
-    print(f"  [{mode}] engagement: {n_steps}/{n_single} decode steps native, {n_pf}/{n_multi} prompt rows native (want {want_pf})")
-    if n_steps == 0 or n_steps != n_single or n_pf != want_pf:
+    print(f"  [{mode}] engagement: {n_steps}/{n_single} decode steps native ({n_graph} replayed from the CUDA graph), "
+          f"{n_pf}/{n_multi} prompt rows native (want {want_pf})")
+    if n_steps == 0 or n_steps != n_single or n_pf != want_pf or n_graph != n_steps:
         print("  ⛔ the native tier did not serve what it should have"); print("\n".join(l for l in cerr.splitlines() if "cuda" in l)[-800:]); ok = False
+    if mode == "DECODE":
+        er, es, _, _ = run(True, {**extra, "FERRIC_CUDA_NO_GRAPH": "1"})
+        ed, et, essq = diff(er, cr)
+        print(f"  [{mode}] eager launches (FERRIC_CUDA_NO_GRAPH) vs graph replay: max |Δ logit| {ed:.1e}   "
+              f"({es[0][0]} steps, {es[2]} replays; want identical printed logits and 0 replays)")
+        if ed != 0.0 or essq != 0.0 or es[2] != 0 or es[0][0] != n_steps: print("  ⛔ the graph replay and its eager twin differ"); ok = False
     d, dt, ssq = diff(cr, wr)
     arg = sum(cr[t][0] == wr[t][0] for t in cr)
     print(f"  [{mode}] native vs WGSL (same weights)   max |Δ logit| {d:.3e} at position {dt}   ssq rel {ssq:.2e}   argmax {arg}/{len(cr)}   (tol {tol:g})")
@@ -165,7 +182,15 @@ for name, env in controls:
         same, _, _ = diff(xc, xw)
         moved, _, _ = diff(xc, {t: base[t] for t in xc})
         ran = xs[0][0] == xs[0][1] > 0 and xs[1][0] == (xs[1][1] if mode == "FULL" else 0)
-        follow = tol
+        # "Honours the mechanism" = the control run sits far closer to WGSL-under-the-same-control than
+        # to the normal run: within the band, or >= 200x closer than it moved. ⛔ The band alone is the
+        # wrong yardstick for a CONTROL: a broken model can be ill-conditioned. Measured 2026-09-28 on
+        # Qwen2.5-0.5B Q4_K_M under the wrong rope pairing (attention scores reach 1673): WGSL against
+        # ITSELF with rope angles perturbed by ~1e-7 (FERRIC_ROPE_DEVICE at positions <= 1024) moved
+        # 6.1e-3 (clean model: 1.5e-4); two native attention kernels each 1.2-1.3e-5 from an f64
+        # recomputation of layer 0's attention landed 2.65e-2 apart in the logits. A native path that
+        # IGNORED the control would sit ~`moved` (19.9 there) away — 200x is far from both.
+        follow = max(tol, moved / 200)
         print(f"  control '{name}' [{mode}]: native vs WGSL-under-control {same:.2e} (≤ {follow:.2e});  moved from normal "
               f"{moved:.2e} = {moved / tol:.0f}x tol;  ran natively: {ran}")
         if same > follow or moved < 20 * tol or not ran: print("  ⛔ the gate cannot see this mechanism on the native path"); ok = False

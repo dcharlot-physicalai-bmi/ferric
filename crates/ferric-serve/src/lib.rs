@@ -134,6 +134,15 @@ impl Model {
         full.reshape(&[rows, n]).narrow(0, rows - 1, 1).contiguous()
     }
 
+    /// [`Model::forward_cached_last`] as a HOST row `[n_vocab]` — what the sampler reads. The dense runtime
+    /// hands it over directly (on the NVIDIA tier that skips a wgpu upload + readback of the row per token,
+    /// `Qwen3::forward_cached_last_host`); the others read their tensor back as before.
+    fn forward_cached_last_host(&self, tokens: &[u32], cache: &mut ModelCache) -> Vec<f32> {
+        if let (Model::Dense(m), ModelCache::Dense(c)) = (self, &mut *cache) { return m.forward_cached_last_host(tokens, c); }
+        let v = pollster::block_on(self.forward_cached_last(tokens, cache).to_vec());
+        v[v.len() - self.n_vocab()..].to_vec()
+    }
+
     fn forward_cached(&self, tokens: &[u32], cache: &mut ModelCache) -> Tensor {
         match (self, cache) {
             (Model::Dense(m), ModelCache::Dense(c)) => m.forward_cached(tokens, c),
@@ -1109,7 +1118,7 @@ impl Engine {
                 }
                 // Generated token k-1 sits at position len + delta + (k-1) — see `vision_decode`.
                 (Some(_), ModelCache::Dense(c)) => self.vision_decode(input[0], prompt.len() as i64 + delta + step as i64 - 1, c),
-                _ => pollster::block_on(self.model.forward_cached_last(&input, &mut cache).to_vec()),
+                _ => self.model.forward_cached_last_host(&input, &mut cache),
             };
             let row = &v[v.len() - n_vocab..];
             let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };

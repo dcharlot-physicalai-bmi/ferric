@@ -289,6 +289,308 @@ extern "C" __global__ void q8_0_gemm(GEMM_ARGS) { gemm_t<3>(A, lda, codes, aux, 
 extern "C" __global__ void q5_0_gemm(GEMM_ARGS) { gemm_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
 #undef GEMM_ARGS
 
+// ═══════════ Shared by GEMM v3 below: tile shape, hardware f16 convert, ldmatrix, the weight fetch ═══════════
+#define B2M 64u
+#define B2N 128u
+__device__ __forceinline__ float h2f(unsigned h) {
+    float f; asm("{ .reg .f16 t; mov.b16 t, %1; cvt.f32.f16 %0, t; }" : "=f"(f) : "h"((unsigned short)h)); return f;
+}
+__device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+// The raw words of 16 weights (one half of a 32-wide K block of row n), fetched from global memory
+// ahead of their decode — the register half of the double buffer.
+struct Raw16 { uint4 q, qh, ax; };
+template <int F>
+__device__ __forceinline__ void fetch16(const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                        unsigned n, unsigned K, unsigned kc, unsigned h, Raw16& r) {
+    r.qh = make_uint4(0u, 0u, 0u, 0u); r.ax = make_uint4(0u, 0u, 0u, 0u);
+    if (F == 0 || F == 1) {
+        const unsigned nblk = K / 256u, b = kc >> 3u, s = kc & 7u, bi = n * nblk + b, c = s >> 1u;
+        const unsigned cb = bi * (F == 0 ? 32u : 40u);
+        r.q = *reinterpret_cast<const uint4*>(codes + cb + 8u * c + 4u * h);
+        if (F == 1) r.qh = *reinterpret_cast<const uint4*>(codes + cb + 32u + 4u * h);
+        r.ax = *reinterpret_cast<const uint4*>(aux + bi * 4u);                  // d|dmin, 12 scale bytes
+    } else if (F == 2) {
+        const unsigned nblk = K / 256u, b = kc >> 3u, j = kc & 7u, bi = n * nblk + b;
+        const unsigned hf = j >> 2u, qq = j & 3u, cb = bi * 48u, ab = bi * 5u;
+        r.q = *reinterpret_cast<const uint4*>(codes + cb + (64u * hf + 32u * (qq & 1u) + 16u * h) / 4u);
+        r.qh = *reinterpret_cast<const uint4*>(codes + cb + 32u + (32u * hf + 16u * h) / 4u);
+        const unsigned si = 8u * hf + 2u * qq + h;
+        r.ax.x = aux[ab]; r.ax.y = aux[ab + 1u + (si >> 2u)];
+    } else if (F == 3) {
+        const unsigned bi = n * (K / 32u) + kc;
+        r.q = *reinterpret_cast<const uint4*>(codes + bi * 8u + 4u * h);
+        r.ax.x = aux[bi >> 1u];
+    } else {
+        const unsigned bi = n * (K / 32u) + kc;
+        r.q = *reinterpret_cast<const uint4*>(codes + bi * 4u);
+        r.ax.x = aux[bi * 2u]; r.ax.y = aux[bi * 2u + 1u];
+    }
+}
+// ═══════════ GEMM v3: INTEGER tensor cores — fixed-point activations in three int8 digits ═══════════
+// Measured on the RTX 4050 (a 20-line mma loop): f16 x f16 -> f32 `mma` peaks at 16.4 TFLOPS, s8 x s8 -> s32
+// at 65.7 TOPS — 4x — and the sm_75 `mma.m8n8k16.s8` reaches it (65.5), so this stays compute_75 PTX.
+// v1 spends TWO f16 mma per product (the hi and lo halves) and already runs the tensor pipe at 60-85%
+// of that 16.4 (examples/cuda_gemm_bench.rs), so no feeding change can buy much; the instruction must.
+// Tile 64 (rows of A) x 128 (weight rows) x 32, 256 threads = 2 x 4 warps of 32 x 32; two shared stages
+// (tile k+1's global loads issued into registers before tile k's multiplies, converted after them);
+// fragments by `ldmatrix.x4` (sm_75).
+//
+// ⚠ NUMERICS (what differs from v1): each row's 32 activations of a K tile become ONE 22-bit signed
+// integer each, q = round(a · 2^e), with e the power of two that puts the row-tile's largest |a| in
+// [2^21, 2^22): an absolute error <= 2^-22 of that largest value — the same order as the f32 rounding
+// of the sum it is about to join, and 2^-22 RELATIVE for values near the maximum (v1's hi+lo: 2^-22
+// relative for every value above f16's subnormal range — see below). q is split EXACTLY into three balanced digits q = 2^16 q2 + 2^8 q1 + q0,
+// each in [-128, 127]; the weights enter as their exact integer codes (every format's fit int8). Every
+// product and every sum inside a K tile is then an INTEGER — exact, no rounding, no tensor-core
+// truncation — and the tile folds into f32 once: acc += scale_n · 2^-e_m · (2^16 P2 + (2^8 P1 + P0))
+// (− min_n · Σa for Q4_K/Q5_K, the row sum taken in f32 as before). An f16 overflow cannot happen
+// (the exponent absorbs any magnitude); the flag catches inf/NaN only.
+// ⛔ Found on the way here, and the reason for the per-row-tile exponent: a first double-buffered f16
+// version (v2, since removed: it was no faster than v1) split the RAW activation like v1, and every
+// activation below 2^-3 then has its lo half in f16's SUBNORMAL range, keeping only an absolute 2^-25.
+// On Qwen2.5-0.5B Q4_K_M under cuda_conformance.sh's wrong-rope-pairing control (hidden states run
+// small) the native prefill landed 1.57e-2 logits from WGSL while WGSL's own prefill and decode
+// schedules agreed to 1.8e-4; scaling each row-tile by a power of two first took it to 2.6e-3, and
+// v3 sits at 1.5e-3 there. v1 keeps the limitation (FERRIC_CUDA_GEMM=v1 is the A/B, not the default).
+// Cost per product: 3 int8 MACs at 4x the rate = 3/8 of v1's two f16 MACs. `__launch_bounds__(256, 2)`:
+// two blocks per SM (<= 128 registers), so one block's conversions overlap the other's multiplies.
+#define LDB 48u        // bytes per shared row: 32 codes + 16 pad — ldmatrix rows land on 8 distinct bank quads
+struct __align__(16) Stage3 {
+    unsigned char Aq[3][B2M * LDB], Wq[B2N * LDB];
+    float Sc[2][B2N], Mn[B2N], Rs[B2M], Ri[B2M];
+};
+__device__ __forceinline__ void mma8816(int (&c)[2], unsigned a, unsigned b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a), "r"(b));
+}
+// Four small integers (each in [-128, 127]) as the four bytes of a word.
+__device__ __forceinline__ unsigned pack4s8(int a, int b, int c, int d) {
+    return (unsigned)(a & 0xff) | ((unsigned)(b & 0xff) << 8u) | ((unsigned)(c & 0xff) << 16u) | ((unsigned)(d & 0xff) << 24u);
+}
+template <int F>
+__device__ __forceinline__ void decode16_s8(const Raw16& r, unsigned n, unsigned K, unsigned kc, unsigned h,
+                                            unsigned (&o)[4], float& scale, float& mn) {
+    // The codes decode16 makes as f16, here as bytes. ⚠ Q5_K's high bit and Q6_K's sign are the same
+    // expressions; only the packing differs.
+    int v[16];
+    mn = 0.f;
+    const unsigned qw[4] = {r.q.x, r.q.y, r.q.z, r.q.w}, hw[4] = {r.qh.x, r.qh.y, r.qh.z, r.qh.w};
+    if (F == 0 || F == 1) {
+        const unsigned s = kc & 7u, sh = 4u * (s & 1u);
+        const unsigned axw[4] = {r.ax.x, r.ax.y, r.ax.z, r.ax.w};
+        #define SCB(i) ((axw[1u + ((i) >> 2u)] >> (8u * ((i) & 3u))) & 0xffu)
+        unsigned sc, m6;
+        if (s < 4u) { sc = SCB(s) & 63u; m6 = SCB(s + 4u) & 63u; }
+        else { const unsigned a = SCB(s + 4u), lo = SCB(s - 4u), hi = SCB(s);
+               sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); m6 = (a >> 4u) | ((hi >> 6u) << 4u); }
+        #undef SCB
+        scale = h2f(axw[0] & 0xffffu) * (float)sc; mn = h2f(axw[0] >> 16u) * (float)m6;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) {
+                unsigned qq = (qw[w] >> (8u * k + sh)) & 0xfu;
+                if (F == 1) qq |= ((hw[w] >> (8u * k + s)) & 1u) << 4u;
+                v[4u * w + k] = (int)qq;
+            }
+    } else if (F == 2) {
+        const unsigned j = kc & 7u, hf = j >> 2u, qq = j & 3u, si = 8u * hf + 2u * qq + h;
+        scale = h2f(r.ax.x & 0xffffu) * (float)((int)(((r.ax.y >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
+        const unsigned nsh = 4u * (qq >> 1u), hsh = 2u * qq;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k)
+                v[4u * w + k] = (int)(((qw[w] >> (8u * k + nsh)) & 0xfu) | (((hw[w] >> (8u * k + hsh)) & 3u) << 4u)) - 32;
+    } else if (F == 3) {
+        const unsigned bi = n * (K / 32u) + kc;
+        scale = h2f((bi & 1u) ? (r.ax.x >> 16u) : (r.ax.x & 0xffffu));
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) v[4u * w + k] = (int)(qw[w] << (24u - 8u * k)) >> 24;
+    } else {
+        const unsigned qh = r.ax.x;
+        scale = h2f(r.ax.y & 0xffffu);
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) {
+                const unsigned e = 4u * w + k;
+                v[e] = (int)(((qw[w] >> (8u * k + 4u * h)) & 0xfu) | (((qh >> (e + 16u * h)) & 1u) << 4u)) - 16;
+            }
+    }
+    #pragma unroll
+    for (unsigned i = 0u; i < 4u; ++i) o[i] = pack4s8(v[4u * i], v[4u * i + 1u], v[4u * i + 2u], v[4u * i + 3u]);
+}
+template <int F>
+__device__ __forceinline__ void gemm3_t(const float* __restrict__ A, unsigned lda,
+                                        const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                        float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, unsigned K,
+                                        int* __restrict__ ovf) {
+    constexpr bool TWO = F == 2;
+    constexpr bool MIN = F == 0 || F == 1;
+    __shared__ Stage3 st[2];
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned wm = warp >> 2u, wn = warp & 3u;                  // 2 x 4 warps of 32 x 32
+    const unsigned m0 = blockIdx.y * B2M, n0 = blockIdx.x * B2N;
+    const unsigned g = lane >> 2u, t4 = lane & 3u;
+    const unsigned ar = tid >> 2u, aq = tid & 3u, wr = tid >> 1u, wh = tid & 1u;
+    float acc[4][4][2];                                              // [m8 tile][n8 tile][2]
+    #pragma unroll
+    for (unsigned i = 0u; i < 4u; ++i)
+        #pragma unroll
+        for (unsigned j = 0u; j < 4u; ++j) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; }
+    bool bad = false;
+    float4 ra0, ra1; Raw16 rw;
+    auto fetch = [&](unsigned k0) {
+        if (m0 + ar < M) {
+            const float* src = A + (size_t)(m0 + ar) * lda + k0 + 8u * aq;
+            ra0 = *reinterpret_cast<const float4*>(src); ra1 = *reinterpret_cast<const float4*>(src + 4u);
+        } else { ra0 = make_float4(0.f, 0.f, 0.f, 0.f); ra1 = ra0; }
+        if (n0 + wr < N) fetch16<F>(codes, aux, n0 + wr, K, k0 / 32u, wh, rw);
+    };
+    auto store = [&](Stage3& s, unsigned k0) {
+        const float x[8] = {ra0.x, ra0.y, ra0.z, ra0.w, ra1.x, ra1.y, ra1.z, ra1.w};
+        float amax = 0.f;
+        #pragma unroll
+        for (unsigned j = 0u; j < 8u; ++j) amax = fmaxf(amax, fabsf(x[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        bad |= !(amax <= 3.0e38f);                                          // inf / NaN
+        // e: largest |a| · 2^e in [2^21, 2^22)
+        int e = amax > 0.f ? 21 - ((int)((__float_as_uint(amax) >> 23u) & 0xffu) - 127) : 0;
+        e = max(-100, min(100, e));
+        const float up = __uint_as_float((unsigned)(127 + e) << 23u), dn = __uint_as_float((unsigned)(127 - e) << 23u);
+        int d0[8], d1[8], d2[8];
+        #pragma unroll
+        for (unsigned j = 0u; j < 8u; ++j) {
+            const int q = __float2int_rn(x[j] * up);                       // |q| <= 2^22; the scaling is exact
+            const int q0 = ((q + 128) & 255) - 128, r1 = (q - q0) >> 8;      // balanced base-256 digits:
+            const int q1 = ((r1 + 128) & 255) - 128, q2 = (r1 - q1) >> 8;    // q = 65536 q2 + 256 q1 + q0
+            d0[j] = q0; d1[j] = q1; d2[j] = q2;
+        }
+        *reinterpret_cast<uint2*>(s.Aq[0] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d0[0], d0[1], d0[2], d0[3]), pack4s8(d0[4], d0[5], d0[6], d0[7]));
+        *reinterpret_cast<uint2*>(s.Aq[1] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d1[0], d1[1], d1[2], d1[3]), pack4s8(d1[4], d1[5], d1[6], d1[7]));
+        *reinterpret_cast<uint2*>(s.Aq[2] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d2[0], d2[1], d2[2], d2[3]), pack4s8(d2[4], d2[5], d2[6], d2[7]));
+        float rsum = 0.f;
+        if (MIN) {
+            rsum = ((x[0] + x[1]) + (x[2] + x[3])) + ((x[4] + x[5]) + (x[6] + x[7]));
+            rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
+            rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
+        }
+        if (aq == 0u) { s.Rs[ar] = rsum; s.Ri[ar] = dn; }
+        unsigned w[4]; float sc = 0.f, mn = 0.f;
+        if (n0 + wr < N) decode16_s8<F>(rw, n0 + wr, K, k0 / 32u, wh, w, sc, mn);
+        else { w[0] = w[1] = w[2] = w[3] = 0u; }
+        *reinterpret_cast<uint4*>(s.Wq + wr * LDB + 16u * wh) = make_uint4(w[0], w[1], w[2], w[3]);
+        s.Sc[wh][wr] = sc;
+        if (wh == 0u) s.Mn[wr] = mn;
+    };
+    fetch(0u); store(st[0], 0u);
+    __syncthreads();
+    const unsigned nk = K / BK;
+    // ldmatrix row addresses: A — matrix mi = lane>>3 is rows [wm·32 + 8·mi, +8); B — matrix ni is rows [wn·32 + 8·ni, +8)
+    const unsigned arow = wm * 32u + (lane >> 3u) * 8u + (lane & 7u), brow = wn * 32u + (lane >> 3u) * 8u + (lane & 7u);
+    for (unsigned kt = 0u; kt < nk; ++kt) {
+        const Stage3& s = st[kt & 1u];
+        if (kt + 1u < nk) fetch((kt + 1u) * BK);
+        float2 sc[2][4], mnv[4]; float rs[4], ri[4];
+        #pragma unroll
+        for (unsigned ni = 0u; ni < 4u; ++ni) {
+            const unsigned col = wn * 32u + ni * 8u + 2u * t4;
+            sc[0][ni] = *reinterpret_cast<const float2*>(&s.Sc[0][col]);
+            sc[1][ni] = TWO ? *reinterpret_cast<const float2*>(&s.Sc[1][col]) : sc[0][ni];
+            if (MIN) mnv[ni] = *reinterpret_cast<const float2*>(&s.Mn[col]);
+        }
+        #pragma unroll
+        for (unsigned mi = 0u; mi < 4u; ++mi) { const unsigned row = wm * 32u + mi * 8u + g; rs[mi] = MIN ? s.Rs[row] : 0.f; ri[mi] = s.Ri[row]; }
+        int chi[4][4][2], clo[4][4][2];                              // 2^16 digit / (2^8 digit, 1 digit)
+        auto zero = [&]() {
+            #pragma unroll
+            for (unsigned i = 0u; i < 4u; ++i)
+                #pragma unroll
+                for (unsigned j = 0u; j < 4u; ++j) { chi[i][j][0] = chi[i][j][1] = 0; clo[i][j][0] = clo[i][j][1] = 0; }
+        };
+        auto fold = [&](unsigned half, bool with_min) {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni)
+                    #pragma unroll
+                    for (unsigned c = 0u; c < 2u; ++c) {
+                        const float pv = (float)chi[mi][ni][c] * 65536.f + (float)clo[mi][ni][c];
+                        float v = (c ? sc[half][ni].y : sc[half][ni].x) * pv * ri[mi];
+                        if (MIN && with_min) v -= (c ? mnv[ni].y : mnv[ni].x) * rs[mi];
+                        acc[mi][ni][c] += v;
+                    }
+        };
+        auto mma_all = [&](int (&cc)[4][4][2], const unsigned (&a)[4], const unsigned (&bf)[4]) {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni) mma8816(cc[mi][ni], a[mi], bf[ni]);
+        };
+        auto times256 = [&]() {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni) { clo[mi][ni][0] *= 256; clo[mi][ni][1] *= 256; }
+        };
+        zero();
+        if (TWO) {
+            // Q6_K: each 16-wide half has its own scale — fold per half.
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) {
+                unsigned bf[4], ad[4];
+                ldsm_x4(bf, s.Wq + brow * LDB + 16u * kh);
+                ldsm_x4(ad, s.Aq[2] + arow * LDB + 16u * kh); mma_all(chi, ad, bf);
+                ldsm_x4(ad, s.Aq[1] + arow * LDB + 16u * kh); mma_all(clo, ad, bf);
+                times256();                                             // clo = 256·Σq1·w, exact (|.| < 2^27)
+                ldsm_x4(ad, s.Aq[0] + arow * LDB + 16u * kh); mma_all(clo, ad, bf);
+                fold(kh, false); zero();
+            }
+        } else {
+            // One scale per 32: the 2^16 digit into chi, the 2^8 digit into clo over BOTH halves, then
+            // clo·256 and the unit digit — every sum an exact integer (|chi| < 2^19, |clo| < 2^28).
+            unsigned bf[2][4], ad[4];
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) {
+                ldsm_x4(bf[kh], s.Wq + brow * LDB + 16u * kh);
+                ldsm_x4(ad, s.Aq[2] + arow * LDB + 16u * kh); mma_all(chi, ad, bf[kh]);
+                ldsm_x4(ad, s.Aq[1] + arow * LDB + 16u * kh); mma_all(clo, ad, bf[kh]);
+            }
+            times256();
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) { ldsm_x4(ad, s.Aq[0] + arow * LDB + 16u * kh); mma_all(clo, ad, bf[kh]); }
+            fold(0u, true);
+        }
+        if (kt + 1u < nk) store(st[(kt + 1u) & 1u], (kt + 1u) * BK);
+        __syncthreads();
+    }
+    if (bad) atomicOr(ovf, 1);
+    #pragma unroll
+    for (unsigned mi = 0u; mi < 4u; ++mi)
+        #pragma unroll
+        for (unsigned ni = 0u; ni < 4u; ++ni) {
+            const unsigned r = m0 + wm * 32u + mi * 8u + g, c = n0 + wn * 32u + ni * 8u + 2u * t4;
+            if (r < M) { if (c < N) C[(size_t)r * ldc + c] = acc[mi][ni][0]; if (c + 1u < N) C[(size_t)r * ldc + c + 1u] = acc[mi][ni][1]; }
+        }
+}
+#define GEMM_ARGS const float* __restrict__ A, unsigned lda, const unsigned* __restrict__ codes, \
+                  const unsigned* __restrict__ aux, float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, \
+                  unsigned K, int* __restrict__ ovf
+extern "C" __global__ void __launch_bounds__(256, 2) q4k_gemm3(GEMM_ARGS)  { gemm3_t<0>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q5k_gemm3(GEMM_ARGS)  { gemm3_t<1>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q6k_gemm3(GEMM_ARGS)  { gemm3_t<2>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q8_0_gemm3(GEMM_ARGS) { gemm3_t<3>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void __launch_bounds__(256, 2) q5_0_gemm3(GEMM_ARGS) { gemm3_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+#undef GEMM_ARGS
+
 // ── h[t, i] = silu(gu[t, i]) · gu[t, n_ff + i] — the same expression the fused decode kernels use. ──
 extern "C" __global__ void swiglu_rows(const float* __restrict__ gu, float* __restrict__ h, unsigned n_ff, unsigned rows) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -367,5 +669,126 @@ extern "C" __global__ void attn_prefill(const float* __restrict__ q, const float
         #pragma unroll
         for (unsigned e = 0u; e < 4u; ++e)
             if (qi < T && e < dpl) out[(size_t)qi * qw + head * dh + lane * dpl + e] = o[r][e] / l[r];
+    }
+}
+
+
+// ── Causal prefill attention v2: REGISTER-TILED. ⛔ attn_prefill above gives each lane one key and has
+//    it walk dh one float at a time from shared memory against 4 queries: one shared load per FMA, and
+//    the profiler (FERRIC_CUDA_PROFILE) put it at 24% (Llama-3.2-1B), 33% (Qwen2.5-0.5B) and 46%
+//    (Qwen3-0.6B, dh 128) of a 512-row prefill's GPU time — ~0.5 TFLOPS of f32 work.
+//    Block = 32 query rows x one q-head, 128 threads; thread (tq, tk) = (tid / 8, tid % 8) owns query
+//    rows {2tq, 2tq+1} and, of each 32-key tile, keys {tk, tk+8, tk+16, tk+24}: its 2 x 4 scores come
+//    from float4 shared loads (two Q rows, four K rows per 4 dh) — 32 FMA per 6 loads — and the 8
+//    lanes that share a query row are adjacent, so the row's max and sum are 3 shuffles. P·V: the same
+//    thread owns the same two rows x the float4 columns {4tk + 32c}, taking each key's p by shuffle
+//    from the lane that scored it. K and V share one shared buffer in turn (V loads after the scores):
+//    dh 128 fits in 34 KB. Same f32 math as attn_prefill (online softmax per row, per 32-key tile); only
+//    the order of the dh sum differs. dh <= 128, dh % 32 == 0. ──
+#define AP_BQ 32u
+#define AP_BK 32u
+extern "C" __global__ void attn_prefill2(const float* __restrict__ q, const float* __restrict__ kc,
+                                         const float* __restrict__ vc, float* __restrict__ out,
+                                         unsigned nh, unsigned nkv, unsigned dh, unsigned T, unsigned pos, float scale) {
+    __shared__ __align__(16) float Qs[AP_BQ * 132];
+    __shared__ __align__(16) float KV[AP_BK * 132];
+    const unsigned tid = threadIdx.x, lane = tid & 31u;
+    const unsigned tq = tid >> 3u, tk = tid & 7u;
+    const unsigned head = blockIdx.y, kvh = head / (nh / nkv), q0 = blockIdx.x * AP_BQ;
+    const unsigned qw = nh * dh, kvw = nkv * dh, ld = dh + 4u, d4 = dh / 4u, nc = dh / 32u;
+    for (unsigned i = tid; i < AP_BQ * d4; i += 128u) {
+        const unsigned r = i / d4, e = (i - r * d4) * 4u;
+        const float4 v = (q0 + r < T) ? *reinterpret_cast<const float4*>(q + (size_t)(q0 + r) * qw + head * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(Qs + r * ld + e) = v;
+    }
+    float m[2] = {-3.0e38f, -3.0e38f}, l[2] = {0.f, 0.f};
+    float o[2][4][4];
+    #pragma unroll
+    for (unsigned r = 0u; r < 2u; ++r)
+        #pragma unroll
+        for (unsigned c = 0u; c < 4u; ++c) { o[r][c][0] = o[r][c][1] = o[r][c][2] = o[r][c][3] = 0.f; }
+    const unsigned qa = 2u * tq, kend = pos + min(q0 + AP_BQ, T);   // keys the tile's last query can see
+    for (unsigned k0 = 0u; k0 < kend; k0 += AP_BK) {
+        __syncthreads();                                   // Qs written / the previous V consumed
+        for (unsigned i = tid; i < AP_BK * d4; i += 128u) {
+            const unsigned j = i / d4, e = (i - j * d4) * 4u, kr = k0 + j;
+            *reinterpret_cast<float4*>(KV + j * ld + e) = kr < kend ? *reinterpret_cast<const float4*>(kc + (size_t)kr * kvw + kvh * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        __syncthreads();
+        float sc[2][4];
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r)
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) sc[r][j] = 0.f;
+        for (unsigned e = 0u; e < dh; e += 4u) {
+            const float4 a0 = *reinterpret_cast<const float4*>(Qs + qa * ld + e), a1 = *reinterpret_cast<const float4*>(Qs + (qa + 1u) * ld + e);
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) {
+                const float4 b = *reinterpret_cast<const float4*>(KV + (tk + 8u * j) * ld + e);
+                sc[0][j] += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+                sc[1][j] += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+            }
+        }
+        // mask, then the online softmax per row (its 8 lanes: xor 1, 2, 4)
+        float corr[2];
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r) {
+            const unsigned qi = q0 + qa + r;
+            float mx = -3.0e38f;
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) {
+                const unsigned key = k0 + tk + 8u * j;
+                const bool vis = qi < T && key <= pos + qi && key < kend;
+                sc[r][j] = vis ? sc[r][j] * scale : -3.0e38f;
+                mx = fmaxf(mx, sc[r][j]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1)); mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+            const float mn = fmaxf(m[r], mx);
+            corr[r] = expf(m[r] - mn);
+            float ps = 0.f;
+            #pragma unroll
+            for (unsigned j = 0u; j < 4u; ++j) { const float pv = sc[r][j] > -1.0e38f ? expf(sc[r][j] - mn) : 0.f; sc[r][j] = pv; ps += pv; }
+            ps += __shfl_xor_sync(0xffffffffu, ps, 1); ps += __shfl_xor_sync(0xffffffffu, ps, 2); ps += __shfl_xor_sync(0xffffffffu, ps, 4);
+            l[r] = l[r] * corr[r] + ps;
+            m[r] = mn;
+        }
+        __syncthreads();                                   // every thread done reading K
+        for (unsigned i = tid; i < AP_BK * d4; i += 128u) {
+            const unsigned j = i / d4, e = (i - j * d4) * 4u, kr = k0 + j;
+            *reinterpret_cast<float4*>(KV + j * ld + e) = kr < kend ? *reinterpret_cast<const float4*>(vc + (size_t)kr * kvw + kvh * dh + e) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned r = 0u; r < 2u; ++r)
+            #pragma unroll
+            for (unsigned c = 0u; c < 4u; ++c) { o[r][c][0] *= corr[r]; o[r][c][1] *= corr[r]; o[r][c][2] *= corr[r]; o[r][c][3] *= corr[r]; }
+        const unsigned base = lane & ~7u;
+        #pragma unroll 4
+        for (unsigned jj = 0u; jj < AP_BK; ++jj) {
+            // key jj was scored by lane (base | jj % 8), slot jj / 8
+            const unsigned src = base | (jj & 7u), slot = jj >> 3u;
+            const float s0 = slot == 0u ? sc[0][0] : slot == 1u ? sc[0][1] : slot == 2u ? sc[0][2] : sc[0][3];
+            const float s1 = slot == 0u ? sc[1][0] : slot == 1u ? sc[1][1] : slot == 2u ? sc[1][2] : sc[1][3];
+            const float p0 = __shfl_sync(0xffffffffu, s0, src), p1 = __shfl_sync(0xffffffffu, s1, src);
+            #pragma unroll
+            for (unsigned c = 0u; c < 4u; ++c) {
+                if (c < nc) {
+                    const float4 v = *reinterpret_cast<const float4*>(KV + jj * ld + 4u * tk + 32u * c);
+                    o[0][c][0] += p0 * v.x; o[0][c][1] += p0 * v.y; o[0][c][2] += p0 * v.z; o[0][c][3] += p0 * v.w;
+                    o[1][c][0] += p1 * v.x; o[1][c][1] += p1 * v.y; o[1][c][2] += p1 * v.z; o[1][c][3] += p1 * v.w;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0u; r < 2u; ++r) {
+        const unsigned qi = q0 + qa + r;
+        if (qi >= T) continue;
+        const float inv = 1.f / l[r];
+        #pragma unroll
+        for (unsigned c = 0u; c < 4u; ++c)
+            if (c < nc) *reinterpret_cast<float4*>(out + (size_t)qi * qw + head * dh + 4u * tk + 32u * c) =
+                            make_float4(o[r][c][0] * inv, o[r][c][1] * inv, o[r][c][2] * inv, o[r][c][3] * inv);
     }
 }

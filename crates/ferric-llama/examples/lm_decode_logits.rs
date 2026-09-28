@@ -18,8 +18,10 @@
 //!   cargo run -p ferric-llama --release --example lm_decode_logits -- \
 //!       <model.gguf> <fixture.json> [prefill=8] [chunk_at=64] [chunk=5] [total=0]
 //!
-//! Prints `NATIVE_STEPS <n> OF <m>` (native decode steps / single-token calls) and `NATIVE_PREFILL <r>
-//! OF <R>` (rows the native prefill served / rows fed in multi-token calls) last. A gate must check
+//! Prints `NATIVE_STEPS <n> OF <m>` (native decode steps / single-token calls), `NATIVE_GRAPH <g>` (of
+//! those, steps replayed from the captured CUDA graph) and `NATIVE_PREFILL <r> OF <R>` (rows the native
+//! prefill served / rows fed in multi-token calls) last. Logits are taken on the host
+//! (`forward_cached_host`), the way a generate loop takes them. A gate must check
 //! them — a WGSL fallback produces the same kind of rows. `FERRIC_CUDA_NO_PREFILL=1` keeps the
 //! multi-token calls on WGSL, which is what makes the K/V hand-over between the two paths happen.
 use ferric_gguf::GgufFile;
@@ -71,12 +73,12 @@ async fn run() {
         println!("ROW {t} {best} {sum:.4} {ssq:.4} {}", s.join(" "));
     };
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    let (steps0, rows0) = (ferric_tensor::cuda::native_steps(), ferric_tensor::cuda::native_prefill_rows());
+    let (steps0, rows0, graph0) = (ferric_tensor::cuda::native_steps(), ferric_tensor::cuda::native_prefill_rows(), ferric_tensor::cuda::native_graph_steps());
     let (mut t, mut singles, mut multi) = (0usize, 0usize, 0usize);
     let t0 = std::time::Instant::now();
     while t < n {
         let len = if t == 0 { prefill } else if t == chunk_at && chunk > 1 { chunk.min(n - t) } else { 1 };
-        let lg = m.forward_cached(&ids[t..t + len], &mut cache).to_vec().await;
+        let lg = m.forward_cached_host(&ids[t..t + len], &mut cache);
         assert_eq!(lg.len(), len * v, "logits for {len} rows");
         for (j, r) in lg.chunks_exact(v).enumerate() { emit(t + j, r); }
         if len == 1 { singles += 1; } else { multi += len; }
@@ -84,10 +86,12 @@ async fn run() {
     }
     let dt = t0.elapsed();
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    let (native, prows) = (ferric_tensor::cuda::native_steps() - steps0, ferric_tensor::cuda::native_prefill_rows() - rows0);
+    let (native, prows, graph) = (ferric_tensor::cuda::native_steps() - steps0, ferric_tensor::cuda::native_prefill_rows() - rows0,
+                                  ferric_tensor::cuda::native_graph_steps() - graph0);
     #[cfg(not(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32"))))]
-    let (native, prows) = (0u64, 0u64);
+    let (native, prows, graph) = (0u64, 0u64, 0u64);
     eprintln!("{n} positions in {:.1} s ({singles} single-token calls, {multi} rows in multi-token calls)", dt.as_secs_f64());
     println!("NATIVE_STEPS {native} OF {singles}");
+    println!("NATIVE_GRAPH {graph}");
     println!("NATIVE_PREFILL {prows} OF {multi}");
 }

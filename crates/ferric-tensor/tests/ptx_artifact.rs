@@ -20,8 +20,8 @@
 fn tracked_ptx_exports_every_kernel_the_cu_defines() {
     // Both native modules: decode (tier 2) and prefill (tier 3). `load_ptx` treats each the same way —
     // every name resolved, the whole module refused on the first miss.
-    check("cuda_decode", include_str!("../src/cuda_decode.cu"), include_str!("../src/cuda_decode.ptx"), 17);
-    check("cuda_prefill", include_str!("../src/cuda_prefill.cu"), include_str!("../src/cuda_prefill.ptx"), 7);
+    check("cuda_decode", include_str!("../src/cuda_decode.cu"), include_str!("../src/cuda_decode.ptx"), 23);
+    check("cuda_prefill", include_str!("../src/cuda_prefill.cu"), include_str!("../src/cuda_prefill.ptx"), 13);
 }
 
 fn check(stem: &str, cu: &str, ptx: &str, floor: usize) {
@@ -30,6 +30,9 @@ fn check(stem: &str, cu: &str, ptx: &str, floor: usize) {
         .filter_map(|l| {
             let l = l.trim_start();
             let r = l.strip_prefix("extern \"C\" ").unwrap_or(l).strip_prefix("__global__ void ")?;
+            // `__launch_bounds__(...)` sits between the return type and the name on the kernels that
+            // cap their registers; the NAME is what follows it.
+            let r = match r.strip_prefix("__launch_bounds__(") { Some(x) => x.split_once(") ")?.1, None => r };
             let n = r.split(|c: char| !(c.is_alphanumeric() || c == '_')).next()?;
             (!n.is_empty()).then_some(n)
         })
