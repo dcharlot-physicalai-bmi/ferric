@@ -39,7 +39,7 @@ UPDATES = {
     "S03": ("verified", "361cddb + da736c9: encoders (nomic-bert, bge) served beside the chat model; nomic tokenisation EQUAL to the authors', text→vector cos ≥ 0.99999975 over HTTP"),
     "S06": ("implemented", "40d4a54: /api/tags, show, ps, version, chat, generate, embed, embeddings (NDJSON, options, format, tools); serial path only"),
     "S12": ("verified", "3f6089f: logprobs / top_logprobs, raw-distribution log-softmax; unit-tested normalisation"),
-    "S13": ("absent", "3f6089f: n > 1 is now a 400 naming the field, not a silent single choice"),
+    "S13": ("verified", "f8d6360: n 1..16 on chat + completions; choice i = the request with seed + i, so choice 0 IS the n = 1 answer (live: byte-equal, choice 2 = a seed+2 request, streamed = non-streamed per index); out-of-range n, n with tools, streamed completion n > 1 refused"),
     "S14": ("verified", "3f6089f: stop strings cut before the match, streamed tails held back; batched == serial over sockets"),
     "S15": ("verified", "3f6089f: temperature, top_p, top_k, min_p, presence/frequency/repeat penalty, seed; default path pinned token-for-token to the old sampler"),
     "S23": ("implemented", "da736c9: lists every loaded model (chat + embedder)"),
