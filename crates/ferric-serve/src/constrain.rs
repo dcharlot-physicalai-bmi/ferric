@@ -1,13 +1,16 @@
 //! **Constrained decoding: which constraint a request asks for, and the token mask it implies.**
 //!
 //! One reader for every spelling peers accept (parity gap S10, 8.5 of 14 serving peers):
-//! - OpenAI `response_format` — `json_object`, `json_schema` (the existing JSON / schema guides);
+//! - OpenAI `response_format` — `json_object` (the JSON guide), `json_schema`;
 //! - llama-server `grammar` — GBNF;
 //! - vLLM `guided_json` / `guided_regex` / `guided_choice` / `guided_grammar` (GBNF), and its newer
 //!   `structured_outputs: {json | regex | choice | grammar}`; a bare `regex` too.
-//! Regex and choice compile to GBNF (`ferric_agent::regex`), so every grammar-shaped constraint runs on the
-//! one matcher that is checked against llama.cpp's own grammar tests. Two constraints in one request are a
-//! 400 naming both — never one silently ignored.
+//! A JSON Schema compiles to GBNF as llama.cpp compiles it (`ferric_agent::json_schema`, byte-identical to
+//! llama.cpp's converter), and regex and choice compile to GBNF too (`ferric_agent::regex`), so every
+//! constraint but `json_object` runs on the one grammar matcher checked against llama.cpp's own grammar tests,
+//! and gets its mask cache. A schema the converter refuses is a 400 naming the reason, never a fallback to
+//! plain JSON; a pattern it cannot translate is widened to any string, as in llama.cpp, and logged. Two
+//! constraints in one request are a 400 naming both — never one silently ignored.
 //!
 //! **The mask.** A constraint decides, per step, which tokens may come next. The first version trial-stepped
 //! the constraint through every token's bytes, copying its state per token — fine for a JSON state that is a
@@ -31,20 +34,20 @@
 //! the cache lives with the grammar's source, so a repeated grammar starts warm.
 use crate::Engine;
 use ferric_agent::grammar::{Grammar, Matcher, Pos};
-use ferric_agent::guide::{Guide, Item, Json, Schema};
+use ferric_agent::guide::{Guide, Json};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// What a request constrains its output to, owned (a schema guide borrows its compiled program).
-pub(crate) enum Spec { None, Json, Schema(Vec<Item>), Grammar(Arc<Grammar>) }
+/// What a request constrains its output to: nothing, a JSON object (`json_object`), or a grammar (GBNF, or a
+/// JSON Schema / regex / choice list compiled to one).
+pub(crate) enum Spec { None, Json, Grammar(Arc<Grammar>) }
 
 impl Spec {
     pub fn guide(&self) -> Option<Guide<'_>> {
         match self {
             Spec::None => None,
             Spec::Json => Some(Guide::Json(Json::object())),
-            Spec::Schema(p) => Some(Guide::Schema(Schema::new(p))),
             Spec::Grammar(g) => Some(Guide::Grammar(Matcher::new(g.clone()))),
         }
     }
@@ -65,9 +68,14 @@ pub(crate) fn spec_of(req: &Value, compile: &dyn Fn(&str) -> Result<Arc<Grammar>
     let grammar = |src: &str, what: &str| -> Result<Spec, String> {
         compile(src).map(Spec::Grammar).map_err(|e| format!("{what}: {e}"))
     };
+    // A JSON Schema (an object, or its JSON text) → GBNF, as llama.cpp converts it. A missing schema is a 400
+    // (llama-server reads it as {}, any JSON value, which is not what a caller asking for a schema meant).
     let schema = |s: &Value, what: &str| -> Result<Spec, String> {
+        if s.is_null() { return Err(format!("{what} is required")); }
         let s = if let Some(t) = s.as_str() { serde_json::from_str::<Value>(t).map_err(|e| format!("{what}: {e}"))? } else { s.clone() };
-        Ok(ferric_agent::guide::compile(&s).map(Spec::Schema).unwrap_or(Spec::Json))
+        let (src, warnings) = ferric_agent::json_schema::schema_to_gbnf_with_warnings(&s).map_err(|e| format!("{what}: {e}"))?;
+        for w in warnings { eprintln!("ferric-serve: {what}: {w}"); }
+        grammar(&src, what)
     };
     let text = |v: &Value, what: &str| -> Result<String, String> { v.as_str().map(String::from).ok_or_else(|| format!("{what} must be a string")) };
     match req["response_format"]["type"].as_str() {
@@ -539,11 +547,48 @@ mod tests {
         assert!(matches!(spec_of(&json!({"guided_regex": "[0-9]+"}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({"structured_outputs": {"choice": ["a", "b"]}}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({"response_format": {"type": "json_object"}}), &none).unwrap(), Spec::Json));
-        assert!(matches!(spec_of(&json!({"guided_json": {"type": "object", "properties": {"a": {"type": "integer"}}}}), &none).unwrap(), Spec::Schema(_)));
+        assert!(matches!(spec_of(&json!({"guided_json": {"type": "object", "properties": {"a": {"type": "integer"}}}}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({}), &none).unwrap(), Spec::None));
         let e = spec_of(&json!({"grammar": "root ::= \"a\"", "guided_regex": "b"}), &none).err().unwrap();
         assert!(e.contains("grammar") && e.contains("guided_regex"), "{e}");
         assert!(spec_of(&json!({"grammar": "root ::= undefined"}), &none).err().unwrap().contains("Undefined"));
         assert!(spec_of(&json!({"guided_regex": "(a)\\1"}), &none).is_err());
+    }
+
+    /// Every JSON-Schema spelling compiles to the grammar llama.cpp's converter prints, and the grammar takes a
+    /// conforming answer and refuses the rest; a schema the converter refuses is an error naming why (a 400),
+    /// never plain JSON mode.
+    #[test]
+    fn a_json_schema_is_a_grammar_and_a_refused_schema_is_an_error() {
+        let src = std::cell::RefCell::new(Vec::<String>::new());
+        let keep = |s: &str| { src.borrow_mut().push(s.to_string()); Grammar::parse(s, "root", &|_| None).map(Arc::new) };
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer", "minimum": 0}}, "required": ["name"]});
+        let text = serde_json::to_string(&schema).unwrap();
+        for req in [json!({"response_format": {"type": "json_schema", "json_schema": {"name": "p", "schema": schema}}}),
+                    json!({"guided_json": schema}), json!({"guided_json": text}), json!({"structured_outputs": {"json": schema}})] {
+            let Spec::Grammar(g) = spec_of(&req, &keep).unwrap() else { panic!("{req}: not a grammar") };
+            assert_eq!(src.borrow().last().unwrap(), &ferric_agent::json_schema::schema_to_gbnf(&schema).unwrap());
+            let takes = |s: &str| { let mut m = Matcher::new(g.clone()); s.bytes().all(|b| m.step(b)) && m.can_stop() };
+            assert!(takes(r#"{"name": "Ada", "age": 36}"#) && takes(r#"{"name": "Ada"}"#), "{req}");
+            assert!(!takes(r#"{"age": 36}"#) && !takes(r#"{"name": "Ada", "age": -1}"#) && !takes("{}"), "{req}");
+        }
+        let err = |req: Value| spec_of(&req, &keep).err().unwrap_or_else(|| panic!("{req}: accepted"));
+        let e = err(json!({"response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "kaboom"}}}}));
+        assert!(e.contains("response_format.json_schema.schema") && e.contains("unrecognized type kaboom"), "{e}");
+        let e = err(json!({"guided_json": {"$ref": "https://example.com/s.json"}}));
+        assert!(e.contains("only references into the same document"), "{e}");
+        let e = err(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}}));
+        assert!(e.contains("response_format.json_schema.schema is required"), "{e}");
+        let e = err(json!({"guided_json": {"type": "string", "minLength": 5, "maxLength": 2}}));
+        assert!(e.contains("{5,2}"), "the grammar parser refuses a maximum below the minimum: {e}");
+        // (minItems 3 > maxItems 1 is no error in llama.cpp: its repetition of the separated rest comes out
+        // empty, so the grammar takes exactly one item; the port prints the same grammar)
+        let Spec::Grammar(g) = spec_of(&json!({"guided_json": {"type": "array", "minItems": 3, "maxItems": 1}}), &keep).unwrap() else { panic!() };
+        let takes = |s: &str| { let mut m = Matcher::new(g.clone()); s.bytes().all(|b| m.step(b)) && m.can_stop() };
+        assert!(takes("[1]") && !takes("[1, 2, 3]") && !takes("[]"));
+        let e = err(json!({"guided_json": "{not json"}));
+        assert!(e.starts_with("guided_json: "), "{e}");
+        // a pattern llama.cpp cannot translate widens to any string (logged), as there: not an error
+        assert!(matches!(spec_of(&json!({"guided_json": {"type": "string", "pattern": "^\\d+$"}}), &keep).unwrap(), Spec::Grammar(_)));
     }
 }
