@@ -111,8 +111,9 @@ struct GraphApi {
 /// The prefill kernel table, resolved by name from `cuda_prefill.ptx`.
 #[derive(Clone, Copy)]
 pub(crate) struct PrefillK {
-    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format.
-    gemm: [CUfunction; 5],
+    /// Indexed by `QFmt as usize`: the tensor-core GEMM for each weight format — v1 (64x64 tile, one
+    /// shared stage) and v2 (64x128, two stages, ldmatrix; cuda_prefill.cu GEMM v2).
+    gemm: [CUfunction; 5], gemm2: [CUfunction; 5],
     swiglu_rows: CUfunction, attn_prefill: CUfunction,
 }
 unsafe impl Send for PrefillK {}
@@ -323,10 +324,12 @@ impl Driver {
 
     fn prefill_kernels(&self) -> Option<&PrefillK> {
         self.prefill.get_or_init(|| {
-            const N: [&[u8]; 7] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
-                                   b"swiglu_rows\0", b"attn_prefill\0"];
+            const N: [&[u8]; 12] = [b"q4k_gemm\0", b"q5k_gemm\0", b"q6k_gemm\0", b"q8_0_gemm\0", b"q5_0_gemm\0",
+                                    b"swiglu_rows\0", b"attn_prefill\0",
+                                    b"q4k_gemm2\0", b"q5k_gemm2\0", b"q6k_gemm2\0", b"q8_0_gemm2\0", b"q5_0_gemm2\0"];
             let v = self.load_ptx("cuda_prefill.ptx", &N)?;
-            Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6] })
+            Some(PrefillK { gemm: [v[0], v[1], v[2], v[3], v[4]], swiglu_rows: v[5], attn_prefill: v[6],
+                            gemm2: [v[7], v[8], v[9], v[10], v[11]] })
         }).as_ref()
     }
     /// 2-D grid launch, same contract as [`Driver::launch`].
@@ -518,14 +521,21 @@ unsafe fn launch_swiglu(d: &Driver, st: CUstream, k: &DecodeK, x: CUdeviceptr, w
 
 /// `C[m, w.rows] = A[m, w.cols] · Wᵀ` on the tensor cores (f16 in, f32 accumulate; see cuda_prefill.cu).
 /// `ldc` lets several weights write side by side into one wider C (the q|k|v parts). An A value past
-/// f16 range raises `*ovf`.
+/// f16 range raises `*ovf`. The v2 kernel unless `FERRIC_CUDA_GEMM_V1` (the A/B, and a fallback).
 #[allow(clippy::too_many_arguments)]
 unsafe fn launch_gemm(d: &Driver, pk: &PrefillK, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
                       m: usize, ovf: CUdeviceptr) -> bool {
+    static V1: OnceLock<bool> = OnceLock::new();
+    unsafe { launch_gemm_v(d, pk, *V1.get_or_init(|| std::env::var("FERRIC_CUDA_GEMM_V1").is_ok()), a, lda, w, c, ldc, m, ovf) }
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_gemm_v(d: &Driver, pk: &PrefillK, v1: bool, a: CUdeviceptr, lda: usize, w: DW, c: CUdeviceptr, ldc: usize,
+                        m: usize, ovf: CUdeviceptr) -> bool {
     let (mut ap, mut la, mut cp, mut xp, mut cc, mut lc) = (a, lda as u32, w.codes, w.aux, c, ldc as u32);
     let (mut mm, mut nn, mut kk, mut of) = (m as u32, w.rows as u32, w.cols as u32, ovf);
-    unsafe { d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128,
-                       &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of)) }
+    let prm = &mut p!(ap, la, cp, xp, cc, lc, mm, nn, kk, of);
+    if v1 { unsafe { d.launch2(pk.gemm[w.fmt as usize], (w.rows as u32).div_ceil(64), (m as u32).div_ceil(64), 128, prm) } }
+    else { unsafe { d.launch2(pk.gemm2[w.fmt as usize], (w.rows as u32).div_ceil(128), (m as u32).div_ceil(64), 256, prm) } }
 }
 
 /// **The K/V cache on the device — one per SEQUENCE, owned by the caller's cache, not by the graph.**
@@ -1831,7 +1841,9 @@ mod tests {
         let drv = driver().unwrap(); let pk = *drv.prefill_kernels().expect("prefill ptx");
         let h16 = |v: f32| half::f16::from_f32(v).to_f32() as f64;
         for (ci, &(f, k)) in [(QFmt::Q4K, 512usize), (QFmt::Q5K, 512), (QFmt::Q6K, 512), (QFmt::Q8_0, 896), (QFmt::Q5_0, 896), (QFmt::Q8_0, 96), (QFmt::Q5_0, 96)].iter().enumerate() {
-            let (m, n) = (70usize, 100usize);
+            // 70 x 100: part-empty tiles in both kernels; 150 x 260: several blocks along M and N (v2's
+            // 64 x 128 tile three times along N, the last one ragged).
+            let (m, n) = if ci % 2 == 0 { (70usize, 100usize) } else { (150, 260) };
             let bytes = q_fixture(f, n, k, 0xF00D + ci as u64);
             let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).expect("qmatrix");
             let w = qm.native_weight().expect("mirror");
@@ -1845,26 +1857,31 @@ mod tests {
                     s += av as f64 * wv as f64; x += av as f64 * h16(wv); g += (av as f64 * wv as f64).abs(); }
                 want[i * n + o] = s; exact[i * n + o] = x; mag = mag.max(g);
             } }
-            let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
-            assert!(unsafe { launch_gemm(drv, &pk, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
-            let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
-            let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
-            unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
-            let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
-            let tol = 2e-6 * mag;
-            eprintln!("{f:?} gemm {m}x{n}x{k}: max|Δ| vs f64 {dr:.3e} (tol {tol:.3e})   [vs f64 on f16-rounded weights {dx:.3e}]   Σ|a·w| {mag:.3e}");
-            assert!(flag[0].to_bits() == 0, "{f:?}: overflow flag raised on in-range inputs");
-            assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?}: tensor-core GEMM diverges from the f64 host GEMM");
+            for v1 in [true, false] {
+                let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+                assert!(unsafe { launch_gemm_v(drv, &pk, v1, ad, k, w.dw(), cd, n, m, ovf) } && drv.sync(), "gemm launch");
+                let mut got = vec![0f32; m * n]; assert!(drv.dtoh(&mut got, cd));
+                let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
+                unsafe { for p in [ad, cd, ovf] { (drv.cu_mem_free)(p); } }
+                let (dr, dx) = (max_abs_diff(&got, &want), max_abs_diff(&got, &exact));
+                let tol = 2e-6 * mag;
+                let vn = if v1 { "v1" } else { "v2" };
+                eprintln!("{f:?} gemm {vn} {m}x{n}x{k}: max|Δ| vs f64 {dr:.3e} (tol {tol:.3e})   [vs f64 on f16-rounded weights {dx:.3e}]   Σ|a·w| {mag:.3e}");
+                assert!(flag[0].to_bits() == 0, "{f:?} {vn}: overflow flag raised on in-range inputs");
+                assert!(got.iter().all(|v| v.is_finite()) && dr <= tol, "{f:?} {vn}: tensor-core GEMM diverges from the f64 host GEMM");
+            }
         }
         // The f16-range guard: one activation past 65504 must raise the flag (the host then runs WGSL).
         let (f, k, m, n) = (QFmt::Q8_0, 96usize, 3usize, 8usize);
         let bytes = q_fixture(f, n, k, 5);
         let qm = crate::dtype::QMatrix::from_bytes(&ctx, &bytes, f.ggml_type(), n, k).unwrap();
         let mut a = rnd(m * k, 9); a[k + 17] = 7.0e4;
-        let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
-        assert!(unsafe { launch_gemm(drv, &pk, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
-        let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
-        assert!(flag[0].to_bits() != 0, "an activation of 7e4 did NOT raise the f16 overflow flag");
+        for v1 in [true, false] {
+            let (ad, cd, ovf) = (drv.upload_f32(&a).unwrap(), drv.alloc(m * n * 4).unwrap(), drv.upload_f32(&[0.0]).unwrap());
+            assert!(unsafe { launch_gemm_v(drv, &pk, v1, ad, k, qm.native_weight().unwrap().dw(), cd, n, m, ovf) } && drv.sync());
+            let mut flag = [0f32]; assert!(drv.dtoh(&mut flag, ovf));
+            assert!(flag[0].to_bits() != 0, "an activation of 7e4 did NOT raise the f16 overflow flag (v1 = {v1})");
+        }
     }
 
     /// Causal prefill attention with a cache offset (`pos` earlier rows), GQA, row counts that leave

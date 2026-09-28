@@ -19,8 +19,12 @@
 # Engagement is checked from `lm_logits`' NATIVE line (a WGSL fallback prints the same rows).
 #
 # ⛔ NEGATIVE CONTROL: FERRIC_CUDA_ROPE_DEVICE=1 gives ONLY the native tier its old device formula
-# (`expf(-2c/dh · logf(base))`); it must land >= 20x further from the WGSL path than the clean run, in both
-# FULL and DECODE — else this input cannot see where the native angles come from.
+# (`expf(-2c/dh · logf(base))`). At the fixture's 30,000 it moves the logits only 8-31x the clean band on
+# these files (measured: the clean band is ~1/2-2x the authors' own float32 floor, and the old angles sat
+# 18-109x that floor) — reported, not gated. So the same ids ALSO run at 10x the fixture's position
+# (300,000; f32 still holds every integer position there): the angle error is linear in the position,
+# the clean native-vs-WGSL distance must stay in the band, and the control must land >= 20x further out,
+# in FULL and in DECODE — else this gate cannot see where the native angles come from.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-}"; FX="${2:-}"
@@ -36,15 +40,18 @@ off, ids = ref.get("position_offset", 0), ref["ids"]
 T, PRE = len(ids), 8
 if off + T <= 4096:
     print(f"⛔ the fixture reaches only position {off + T - 1}: rope-angle precision needs a large position"); sys.exit(2)
-tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-json.dump({"ids": ids, "sample_ids": ref["sample_ids"], "position_offset": off}, tmp); tmp.close()
+def fixture(p):
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump({"ids": ids, "sample_ids": ref["sample_ids"], "position_offset": p}, f); f.close()
+    return f.name
+FIX = {off: fixture(off), 10 * off: fixture(10 * off)}
 KNOBS = ("FERRIC_CUDA", "FERRIC_CUDA_", "FERRIC_ROPE", "FERRIC_NEOX", "FERRIC_LONGROPE", "FERRIC_LM_DECODE_FROM", "FERRIC_KVQ")
 
-def run(cuda, extra=None):
+def run(cuda, extra=None, at=off):
     env = {k: v for k, v in os.environ.items() if not k.startswith(KNOBS) or k == "FERRIC_CUDA_PTX_DIR"}
     if cuda: env["FERRIC_CUDA"] = "1"
     env.update(extra or {})
-    r = subprocess.run([BIN, M, tmp.name], capture_output=True, text=True, env=env)
+    r = subprocess.run([BIN, M, FIX[at]], capture_output=True, text=True, env=env)
     if r.returncode: print(r.stderr[-1500:]); sys.exit(1)
     rows, nat = {}, (0, 0, 0)
     for l in r.stdout.splitlines():
@@ -75,7 +82,7 @@ SCHED = [("FULL", {}, w_full, (0, T, 0)),
          ("DECODE", DEC, w_dec, (T - PRE, PRE, T - PRE)),
          ("HANDOVER", {**DEC, "FERRIC_CUDA_NO_PREFILL": "1"}, w_dec, (T - PRE, 0, T - PRE))]
 # ⭐ The band, MEASURED on the RTX 4050 (sampled logits print at 1e-5): see the commit that added this gate.
-TOL = 2e-3
+TOL = 1e-3
 ok, clean = True, {}
 for name, env, twin, want in SCHED:
     rows, nat, dev = run(True, env)
@@ -91,10 +98,20 @@ print(f"  for scale — max |Δ| from the authors' float64 over the sample (quan
 for name, env, twin, _ in SCHED[:2]:
     rows, nat, _ = run(True, {**env, "FERRIC_CUDA_ROPE_DEVICE": "1"})
     d, dt, arg = diff(rows, twin)
-    x = d / max(clean[name][0], 1e-5)
-    print(f"  control: native angles from the device formula (FERRIC_CUDA_ROPE_DEVICE) [{name}]   native vs WGSL {d:.3e} = "
-          f"{x:,.0f}x the clean run   argmax {arg}/{T}   ran natively: {nat[0] + nat[1] > 0}")
-    if x < 20 or nat[0] + nat[1] == 0: print("  ⛔ this input cannot see where the native angles come from"); ok = False
+    print(f"  (at {off}) native angles from the device formula [{name}]: native vs WGSL {d:.3e} = {d / max(clean[name][0], 1e-5):,.0f}x the clean run   argmax {arg}/{T}")
+P10 = 10 * off
+for name, env, _, want in SCHED[:2]:
+    twin, _, _ = run(False, env, at=P10)
+    rows, nat, _ = run(True, env, at=P10)
+    d, dt, arg = diff(rows, twin)
+    print(f"  [{name:<8}] at positions {P10}..{P10 + T - 1}: native vs WGSL max |Δ| {d:.3e}   argmax {arg}/{T}   native served {nat}   (tol {TOL:g})")
+    if d > TOL or nat != want: print("  ⛔ native and WGSL disagree at 10x the fixture's position"); ok = False
+    xrows, xnat, _ = run(True, {**env, "FERRIC_CUDA_ROPE_DEVICE": "1"}, at=P10)
+    xd, _, xarg = diff(xrows, twin)
+    x = xd / max(d, 1e-5)
+    print(f"  control: native angles from the device formula (FERRIC_CUDA_ROPE_DEVICE) [{name}] at {P10}: native vs WGSL {xd:.3e} = "
+          f"{x:,.0f}x the clean run   argmax {xarg}/{T}   ran natively: {xnat == want}")
+    if x < 20 or xnat != want: print("  ⛔ this input cannot see where the native angles come from"); ok = False
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
 PY
