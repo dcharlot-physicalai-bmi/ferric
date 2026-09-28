@@ -5,9 +5,11 @@
 //! `common/json-schema-to-grammar.cpp` (that subset, printed as GBNF), ggml-org/llama.cpp @ 4da6337767f9 —
 //! the commit [`crate::grammar`] is ported from. Same rule names, same rule text, same order (rules sorted by
 //! name, as its `std::map` prints them), so a schema gives byte for byte the grammar llama.cpp gives. Checked
-//! against llama.cpp's own `tests/test-json-schema-to-grammar.cpp` (every expected grammar, every expected
-//! failure) and the schema cases of `tests/test-grammar-integration.cpp` (tests/json_schema.rs, fixtures in
-//! tests/fixtures/json_schema/).
+//! (tests/json_schema.rs, fixtures and their generators in tests/fixtures/json_schema/) against llama.cpp's own
+//! `tests/test-json-schema-to-grammar.cpp` (all 78 expected grammars byte for byte, all 3 expected failures)
+//! and the 33 schema cases of `tests/test-grammar-integration.cpp`; against llama.cpp's converter itself,
+//! built from its source, on 1469 schemas (same grammar or same error message on every one); and against the
+//! `jsonschema` package on 8316 instances, where every disagreement is one of the behaviours listed below.
 //!
 //! **What it covers** (as llama.cpp does): `$ref` into the same document (`#/$defs/…`, `#/definitions/…`, any
 //! JSON pointer), `anyOf` / `oneOf`, `allOf` (object properties merged, enums intersected), `const`, `enum`,
@@ -29,17 +31,27 @@
 //! **What it ignores** (as llama.cpp does, so the grammar accepts more than the schema): number bounds and
 //! `multipleOf`, `uniqueItems`, `contains`, `minProperties` / `maxProperties`, `patternProperties`,
 //! `propertyNames`, `dependent*`, `if` / `then` / `else`, `not`, `unevaluated*`, other `format`s, and a
-//! `required` name with no property; `oneOf` is `anyOf` (no exclusivity); `allOf` keeps only object properties
-//! and enum values; beside `$ref`, `anyOf` or `oneOf` every other keyword.
+//! `required` name with no property; `oneOf` is `anyOf` (no exclusivity); beside `$ref`, `anyOf`, `oneOf`,
+//! `const` or `enum` every other keyword; beside a `pattern`, the lengths and `format`; beside a `format`, the
+//! lengths. `minItems` > `maxItems` is no error: the grammar then takes exactly one item.
 //!
-//! **Where the grammar is stricter than the schema** (llama.cpp's choices, for generation): properties come in
-//! schema order, required ones first, then optional ones, then additional ones; `additionalProperties` defaults
-//! to false once `properties` is given; whitespace is the `space` rule (nothing, one space, or one or two
-//! newlines and up to 20 blanks); numbers have at most 16 integral and 16 fractional digits and an exponent
-//! without leading zeros; `const` / `enum` values match their compact serialization exactly; a key that
-//! additional properties may use must not start like a declared one and stop short (llama.cpp's trie encoding).
-//! Repetition limits come from the grammar parser: more than 2000 required items or characters is refused, a
-//! maximum above 2000 is not enforced.
+//! **Where the grammar is stricter or reads differently** (llama.cpp's choices, for generation): properties come
+//! in schema order, required ones first, then optional ones, then additional ones; `additionalProperties`
+//! defaults to false once `properties` is given; without `type`, the keywords decide it (`properties` means an
+//! object, `items` an array, `pattern` / lengths / `format` a string) where JSON Schema would accept any other
+//! value; `allOf` merges its object components into one closed object, every property of a component outside
+//! `anyOf` required; a tuple takes exactly its listed items; whitespace is the `space` rule (nothing, one space,
+//! or one or two newlines and up to 20 blanks); numbers have at most 16 integral and 16 fractional digits and an
+//! exponent without leading zeros; `const` / `enum` values match their compact serialization exactly; a key
+//! that additional properties may use must not be a proper prefix of a declared name (llama.cpp's trie
+//! encoding); a top-level property named `""` takes the rule name `root`, so the grammar's start is that
+//! property's schema. A pattern `^…$` matches the whole string (JSON Schema searches, so `^A|B$` differs), its
+//! `.` excludes `\n` and `\r`, and it is matched against the raw text between the quotes, so a character JSON
+//! escapes (`"`, `\`, a control character) cannot match as the pattern says. `format`s are llama.cpp's own
+//! rules: any day 01–31 in any month, fractional seconds of exactly 3 digits, upper-case `T` and `Z`. Lengths
+//! count the grammar's characters, so a `\u`-escaped surrogate pair is two. Repetition limits come from the
+//! grammar parser: more than 2000 required items or characters is refused, and a maximum above 2000 is not
+//! enforced.
 //!
 //! **Where this port differs from llama.cpp**, each for a reason:
 //! - a regex pattern is read per code point, not per byte (llama.cpp splits a multi-byte character in front of a
@@ -49,8 +61,11 @@
 //!   parentheses deep is refused (llama.cpp would exhaust the stack; a property name nests one level per
 //!   character in the additional-properties key rule);
 //! - the key rule and the optional-property chains are built without recursion (same text);
-//! - a float in `const` / `enum` prints with the shortest round-trip digits (nlohmann's Grisu2 is shortest in
-//!   all but rare cases); serde_json reads `-0` as the float -0.0 where nlohmann reads the integer 0.
+//! - serde_json reads `-0` as the float -0.0 where nlohmann reads the integer 0. Floats print as nlohmann prints
+//!   them (its Grisu2 is ported), provided serde_json parsed them to the nearest double, which needs its
+//!   `float_roundtrip` feature (on in this crate's Cargo.toml);
+//! - and in [`crate::grammar`]: `{m,n}` with n < m is refused, where llama.cpp's parser wraps `n - m` and loops
+//!   about 2^64 times. `minLength` > `maxLength` converts to exactly that.
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
