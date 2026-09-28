@@ -310,6 +310,36 @@ fn attention(q: &[f32], seq: &[usize], pos: &[usize], ks: &[&[f32]], vs: &[&[f32
     cpu_q::pool().for_each(t * nh, |i| SCORES.with(|sc| one(i / nh, i % nh, &mut sc.borrow_mut())));
 }
 
+/// `FERRIC_CPU_PROFILE=1`: wall time per phase of the CPU forward, summed over calls and printed every
+/// 64 calls — to attribute a step between the matmuls, attention and the serial host work between
+/// dispatches. One env read per forward when off.
+struct Prof { on: bool, t: std::time::Instant, acc: [f64; 8] }
+const PHASES: [&str; 8] = ["norm+host", "qkv", "rope+kv", "attention", "wo", "gate|up", "act+down", "head"];
+static PROF_ACC: std::sync::Mutex<([f64; 8], usize)> = std::sync::Mutex::new(([0.0; 8], 0));
+impl Prof {
+    fn new() -> Prof { Prof { on: std::env::var("FERRIC_CPU_PROFILE").is_ok(), t: std::time::Instant::now(), acc: [0.0; 8] } }
+    #[inline]
+    fn mark(&mut self, phase: usize) {
+        if !self.on { return; }
+        let now = std::time::Instant::now();
+        self.acc[phase] += now.duration_since(self.t).as_secs_f64();
+        self.t = now;
+    }
+    /// Add this span's times; `forward_done` counts one forward (the head's span does not).
+    fn flush(self, forward_done: bool) {
+        if !self.on { return; }
+        let mut g = PROF_ACC.lock().unwrap();
+        for i in 0..8 { g.0[i] += self.acc[i]; }
+        if !forward_done { return; }
+        g.1 += 1;
+        if g.1 % 64 == 0 {
+            let tot: f64 = g.0.iter().sum();
+            let parts: Vec<String> = (0..8).map(|i| format!("{} {:.0}us ({:.0}%)", PHASES[i], g.0[i] / g.1 as f64 * 1e6, 100.0 * g.0[i] / tot)).collect();
+            eprintln!("cpu profile, per forward over {} forwards: {:.0}us = {}", g.1, tot / g.1 as f64 * 1e6, parts.join(", "));
+        }
+    }
+}
+
 #[inline]
 fn silu(v: f32) -> f32 { v / (1.0 + (-v).exp()) }
 #[inline]
@@ -389,10 +419,13 @@ impl Qwen3 {
         let (mut h, mut ao, mut f) = (vec![0f32; t * d], vec![0f32; t * d], vec![0f32; t * d]);
         let (mut q, mut k, mut v, mut o) = (vec![0f32; t * q_out], vec![0f32; t * kv_out], vec![0f32; t * kv_out], vec![0f32; t * q_out]);
         let (mut gb, mut ub) = (vec![0f32; t * n_ff], vec![0f32; t * n_ff]);
+        let mut pf = Prof::new();
         for (il, l) in cm.layers.iter().enumerate() {
             // ---- attention ----
             rmsnorm_rows(&x, &l.attn_norm, c.eps, d, &mut h);
+            pf.mark(0);
             cpu_q::matmul_many(&mut [(&l.wq, &mut q), (&l.wk, &mut k), (&l.wv, &mut v)], &h, t);
+            pf.mark(1);
             if let Some((bq, bk, bv)) = &l.bias {
                 for r in 0..t {
                     for (a, b) in q[r * q_out..(r + 1) * q_out].iter_mut().zip(bq) { *a += b; }
@@ -416,6 +449,7 @@ impl Qwen3 {
                 rotate_rows(&mut q, t, q_out, nh, hd, cs, sn, norm_pairs);
                 rotate_rows(&mut k, t, kv_out, nkv, hd, cs, sn, norm_pairs);
             }
+            pf.mark(2);
             // Append each row's K/V to ITS sequence, at ITS row.
             for r in 0..t {
                 let kv = &mut kvs[seq[r]];
@@ -427,7 +461,9 @@ impl Qwen3 {
                 let ks: Vec<&[f32]> = kvs.iter().map(|kv| &kv.k[il][..]).collect();
                 let vs: Vec<&[f32]> = kvs.iter().map(|kv| &kv.v[il][..]).collect();
                 let win = if nowindow { 0 } else { l.window };
+                pf.mark(2);
                 attention(&q, seq, row, &ks, &vs, nh, nkv, hd, win, c.attn_softcap, &mut o);
+                pf.mark(3);
             }
             // Gated GQA (Muse Glimmer): sigmoid of a projection of the layer's NORMED INPUT.
             if let (Some(wg), false) = (&l.attn_gate, nogate) {
@@ -435,29 +471,35 @@ impl Qwen3 {
                 cpu_q::matmul(wg, &h, t, &mut gt);
                 for (a, g) in o.iter_mut().zip(&gt) { *a *= 1.0 / (1.0 + (-g).exp()); }
             }
+            pf.mark(0);
             cpu_q::matmul(&l.wo, &o, t, &mut ao);
+            pf.mark(4);
             // ---- residual + FFN ----
-            if let (Some(pa), Some(pf)) = (&l.post_attn_norm, &l.post_ffn_norm) {
+            if let (Some(pa), Some(pfn)) = (&l.post_attn_norm, &l.post_ffn_norm) {
                 // Gemma / Glimmer: x = x + post_attn_norm(attn); x = x + post_ffn_norm(ffn(ffn_norm(x))).
                 let pe = c.post_norm_eps;
                 rmsnorm_rows(&ao.clone(), pa, pe, d, &mut ao);
                 for (a, b) in x.iter_mut().zip(&ao) { *a += b; }
-                self.cpu_ffn(l, &x, t, &mut h, &mut gb, &mut ub, &mut f);
-                rmsnorm_rows(&f.clone(), pf, pe, d, &mut f);
+                self.cpu_ffn(l, &x, t, &mut h, &mut gb, &mut ub, &mut f, &mut pf);
+                rmsnorm_rows(&f.clone(), pfn, pe, d, &mut f);
             } else {
                 for (a, b) in x.iter_mut().zip(&ao) { *a += b; }
-                self.cpu_ffn(l, &x, t, &mut h, &mut gb, &mut ub, &mut f);
+                self.cpu_ffn(l, &x, t, &mut h, &mut gb, &mut ub, &mut f, &mut pf);
             }
             for (a, b) in x.iter_mut().zip(&f) { *a += b; }
+            pf.mark(0);
         }
+        pf.flush(true);
         x
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cpu_ffn(&self, l: &CpuLayer, x: &[f32], t: usize, h: &mut [f32], gb: &mut [f32], ub: &mut [f32], f: &mut [f32]) {
+    fn cpu_ffn(&self, l: &CpuLayer, x: &[f32], t: usize, h: &mut [f32], gb: &mut [f32], ub: &mut [f32], f: &mut [f32], pf: &mut Prof) {
         let c = &self.cfg;
         rmsnorm_rows(x, &l.ffn_norm, c.eps, c.n_embd, h);
+        pf.mark(0);
         cpu_q::matmul_many(&mut [(&l.gate, &mut *gb), (&l.up, &mut *ub)], h, t);
+        pf.mark(5);
         let gemma = c.is_gemma;
         let gp = SyncPtr(gb.as_mut_ptr());
         let n = l.gate.rows;
@@ -468,10 +510,12 @@ impl Qwen3 {
             else { for (a, &b) in g.iter_mut().zip(u) { *a = silu(*a) * b; } }
         });
         cpu_q::matmul(&l.down, gb, t, f);
+        pf.mark(6);
     }
 
     /// Final norm + LM head (+ logit scale, + final softcap) over `rows` rows of `x`.
     fn cpu_head(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let mut pf = Prof::new();
         let cm = self.cpu.as_ref().unwrap();
         let c = &self.cfg;
         let mut n = vec![0f32; rows * c.n_embd];
@@ -485,6 +529,8 @@ impl Qwen3 {
             let cap = c.final_softcap;
             for v in lg.iter_mut() { *v = cap * (*v / cap).clamp(-15.0, 15.0).tanh(); }
         }
+        pf.mark(7);
+        pf.flush(false);
         lg
     }
 

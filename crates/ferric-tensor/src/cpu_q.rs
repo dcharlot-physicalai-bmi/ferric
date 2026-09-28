@@ -52,23 +52,42 @@ pub const SPIN_US: u64 = 1000;
 
 type JobFn<'a> = dyn Fn(usize) + Sync + 'a;
 
+/// One atomic per 128-byte line — Apple silicon's cache line. Every field below is written by one
+/// party and polled by others; sharing a line turns each item's `fetch_add` into an invalidation of
+/// the line every spinning worker is reading (and on the M3 Ultra, a trip across the die-to-die link).
+#[repr(align(128))]
+#[derive(Default)]
+struct Line<T>(T);
+impl<T> std::ops::Deref for Line<T> { type Target = T; fn deref(&self) -> &T { &self.0 } }
+
+/// Per-thread state, each on its own line.
+#[derive(Default)]
+struct Lane {
+    /// Inside a job (joined and not yet left). The submitter waits for every lane to clear after
+    /// closing, so a job's closure outlives every worker that saw it.
+    active: AtomicBool,
+    /// Items this lane finished in the current job, written ONCE when it runs out of work — the
+    /// submitter sums the lanes to know the job is complete.
+    done: AtomicUsize,
+    parked: AtomicBool,
+    /// This lane's segment of the job's items: `next` is taken by the owner with an uncontended
+    /// `fetch_add`, and by other lanes only once they have drained their own (stealing). A single
+    /// shared counter made every item a contended read-modify-write — ~100 per decode matmul, each a
+    /// cache-line trip across 24 cores (and the M3 Ultra's two dies): 8-15 us of every dispatch.
+    next: AtomicUsize,
+    end: AtomicUsize,
+}
+
 struct Shared {
     /// Bumped once per job; a worker that sees it change tries to join that job.
-    epoch: AtomicUsize,
+    epoch: Line<AtomicUsize>,
     /// The epoch of the last job whose items are all DONE. A worker that arrives for a closed job
     /// backs off without touching it — its closure may no longer exist.
-    closed: AtomicUsize,
-    /// Workers currently inside a job (between joining and leaving). The submitter waits for this to
-    /// reach zero after closing, so a job's closure outlives every worker that saw it.
-    active: AtomicUsize,
+    closed: Line<AtomicUsize>,
     /// The job in flight: a pointer to a `&JobFn` on the submitting thread's stack.
-    job: AtomicPtr<&'static JobFn<'static>>,
-    /// Next item to hand out, items in the job, items finished.
-    next: AtomicUsize,
-    total: AtomicUsize,
-    done: AtomicUsize,
-    quit: AtomicBool,
-    parked: Vec<AtomicBool>,
+    job: Line<AtomicPtr<&'static JobFn<'static>>>,
+    quit: Line<AtomicBool>,
+    lanes: Vec<Line<Lane>>,
     spin_us: u64,
 }
 
@@ -161,15 +180,11 @@ impl Pool {
         let n = if cfg!(target_arch = "wasm32") { 1 } else { n.max(1) };
         let spin_us = std::env::var("FERRIC_CPU_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(SPIN_US);
         let shared = Arc::new(Shared {
-            epoch: AtomicUsize::new(0),
-            closed: AtomicUsize::new(0),
-            active: AtomicUsize::new(0),
-            job: AtomicPtr::new(std::ptr::null_mut()),
-            next: AtomicUsize::new(0),
-            total: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
-            quit: AtomicBool::new(false),
-            parked: (0..n).map(|_| AtomicBool::new(false)).collect(),
+            epoch: Line(AtomicUsize::new(0)),
+            closed: Line(AtomicUsize::new(0)),
+            job: Line(AtomicPtr::new(std::ptr::null_mut())),
+            quit: Line(AtomicBool::new(false)),
+            lanes: (0..n).map(|_| Line(Lane::default())).collect(),
             spin_us,
         });
         let mut threads = Vec::with_capacity(n.saturating_sub(1));
@@ -206,23 +221,34 @@ impl Pool {
         let dynf: &'static JobFn<'static> = unsafe { std::mem::transmute(dynf) };
         let slot: &&'static JobFn<'static> = &dynf;
         sh.job.store(slot as *const _ as *mut _, Ordering::SeqCst);
-        sh.next.store(0, Ordering::SeqCst);
-        sh.done.store(0, Ordering::SeqCst);
-        sh.total.store(n_items, Ordering::SeqCst);
+        // Contiguous segments, one per lane. ⛔ Zero EVERY lane's count before publishing: a lane that
+        // never joins this job would otherwise contribute its count from the last one, and the sum
+        // below would close the job while items are still running. Safe to write: every lane left the
+        // previous job before it was closed.
+        let nl = sh.lanes.len();
+        for (i, l) in sh.lanes.iter().enumerate() {
+            l.done.store(0, Ordering::Relaxed);
+            l.next.store(i * n_items / nl, Ordering::Relaxed);
+            l.end.store((i + 1) * n_items / nl, Ordering::Relaxed);
+        }
         let e = sh.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         for (i, t) in self.threads.iter().enumerate() {
-            if sh.parked[i + 1].load(Ordering::SeqCst) { t.unpark(); }
+            if sh.lanes[i + 1].parked.load(Ordering::SeqCst) { t.unpark(); }
         }
         IN_POOL.with(|c| c.set(true));
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_items(sh, &f)));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_items(sh, 0, &f)));
         IN_POOL.with(|c| c.set(false));
+        // Done when the lanes' counts add up to the items (each lane writes its count once, when the
+        // whole job — its segment and anything it could steal — has run dry).
         let mut spins = 0u32;
-        while sh.done.load(Ordering::Acquire) < n_items {
+        loop {
+            let done: usize = sh.lanes.iter().map(|l| l.done.load(Ordering::Acquire)).sum();
+            if done >= n_items { break; }
             spins = spins.wrapping_add(1);
             if spins % 4096 == 0 { std::thread::yield_now(); } else { std::hint::spin_loop(); }
         }
         sh.closed.store(e, Ordering::SeqCst);
-        while sh.active.load(Ordering::SeqCst) != 0 { std::hint::spin_loop(); }
+        for l in sh.lanes.iter().skip(1) { while l.active.load(Ordering::SeqCst) { std::hint::spin_loop(); } }
         if let Err(p) = r { std::panic::resume_unwind(p); }
     }
 
@@ -235,17 +261,26 @@ impl Pool {
     }
 }
 
-/// Take and run items until none are left; count each one done (even if it panicked, so the
-/// submitter cannot wait forever — the panic is reported, and the submitter's own is re-raised).
-fn run_items(sh: &Shared, f: &JobFn<'_>) {
-    let total = sh.total.load(Ordering::Acquire);
-    loop {
-        let i = sh.next.fetch_add(1, Ordering::AcqRel);
-        if i >= total { break; }
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(i)));
-        sh.done.fetch_add(1, Ordering::AcqRel);
-        if let Err(p) = r { std::panic::resume_unwind(p); }
+/// Drain this lane's segment, then steal from the others in turn; then publish how many items this
+/// lane ran. Every item is counted even if it panicked (so the submitter cannot wait forever — the
+/// panic is reported, and the submitter's own re-raised).
+fn run_items(sh: &Shared, lane: usize, f: &JobFn<'_>) {
+    let nl = sh.lanes.len();
+    let mut n = 0usize;
+    let mut failed = None;
+    for k in 0..nl {
+        let l = &sh.lanes[(lane + k) % nl];
+        let end = l.end.load(Ordering::Acquire);
+        // Cheap look before the read-modify-write: an exhausted segment costs a load, not a write.
+        while l.next.load(Ordering::Relaxed) < end {
+            let i = l.next.fetch_add(1, Ordering::AcqRel);
+            if i >= end { break; }
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(i))) { failed = Some(p); }
+            n += 1;
+        }
     }
+    sh.lanes[lane].done.store(n, Ordering::Release);
+    if let Some(p) = failed { std::panic::resume_unwind(p); }
 }
 
 impl Drop for Pool {
@@ -273,30 +308,31 @@ fn worker(sh: Arc<Shared>, ith: usize) {
             spins = spins.wrapping_add(1);
             if spins % 256 != 0 { std::hint::spin_loop(); continue; }
             if since.elapsed().as_micros() as u64 >= sh.spin_us {
-                sh.parked[ith].store(true, Ordering::SeqCst);
+                sh.lanes[ith].parked.store(true, Ordering::SeqCst);
                 // Re-check after announcing: the submitter bumps the epoch THEN reads `parked`, both
                 // SeqCst, so either it sees this flag and unparks, or this load sees its bump.
                 if sh.epoch.load(Ordering::SeqCst) == seen && !sh.quit.load(Ordering::SeqCst) {
                     std::thread::park();
                 }
-                sh.parked[ith].store(false, Ordering::SeqCst);
+                sh.lanes[ith].parked.store(false, Ordering::SeqCst);
                 since = std::time::Instant::now();
             }
         };
         seen = e;
         if sh.quit.load(Ordering::Acquire) { return; }
-        // Join: announce, THEN check the job is still open. The submitter closes, THEN waits for
-        // `active == 0`, all SeqCst — so either it sees us and waits, or we see it closed and leave.
-        sh.active.fetch_add(1, Ordering::SeqCst);
+        // Join: announce, THEN check the job is still open. The submitter closes, THEN waits for every
+        // lane's `active` to clear, all SeqCst — so either it sees us and waits, or we see it closed.
+        let lane = &sh.lanes[ith];
+        lane.active.store(true, Ordering::SeqCst);
         if sh.closed.load(Ordering::SeqCst) < e && sh.epoch.load(Ordering::SeqCst) == e {
             let job = sh.job.load(Ordering::SeqCst);
-            // SAFETY: the job is open and we are counted in `active`; it outlives our decrement.
+            // SAFETY: the job is open and this lane is marked active; the job outlives our clear.
             let f: &JobFn<'_> = unsafe { *job };
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_items(&sh, f))).is_err() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_items(&sh, ith, f))).is_err() {
                 eprintln!("ferric-cpu worker {ith}: a job item panicked");
             }
         }
-        sh.active.fetch_sub(1, Ordering::SeqCst);
+        lane.active.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1056,19 +1092,24 @@ pub fn matmul_opts(jobs: &mut [(&QWeight, &mut [f32])], x: &[f32], m: usize, opt
     let nth = pool().threads();
     // Tiles: RC weight rows x AC activation rows per work item. Decode (m = 1) splits rows only, into
     // ~4 items per thread so a slow core does not hold the step; prefill keeps both in L1-sized chunks.
-    let (rc_base, ac) = if m == 1 { (0, 1) } else { (16, 16) };
+    // Items are numbered weight by weight and decoded arithmetically — no per-dispatch allocation.
+    let ac = if m == 1 { 1 } else { 16 };
+    let n_ac = m.div_ceil(ac);
+    let rcs: Vec<usize> = jobs.iter().map(|(w, _)| {
+        if m == 1 { (w.rows / (nth * 4).max(1)).clamp(4, 512).next_multiple_of(4) } else { 16 }
+    }).collect();
+    let mut first = Vec::with_capacity(jobs.len() + 1);
+    first.push(0usize);
+    for (j, (w, _)) in jobs.iter().enumerate() { first.push(first[j] + w.rows.div_ceil(rcs[j]) * n_ac); }
     struct Item { j: usize, r0: usize, r1: usize, a0: usize, a1: usize }
-    let mut items = Vec::new();
-    for (j, (w, _)) in jobs.iter().enumerate() {
-        let rc = if rc_base == 0 { (w.rows / (nth * 4).max(1)).clamp(4, 512).next_multiple_of(4) } else { rc_base };
-        let mut r0 = 0;
-        while r0 < w.rows {
-            let r1 = (r0 + rc).min(w.rows);
-            let mut a0 = 0;
-            while a0 < m { let a1 = (a0 + ac).min(m); items.push(Item { j, r0, r1, a0, a1 }); a0 = a1; }
-            r0 = r1;
-        }
-    }
+    let rows_of: Vec<usize> = jobs.iter().map(|(w, _)| w.rows).collect();
+    let item = |i: usize| -> Item {
+        let j = first.partition_point(|&f| f <= i) - 1;
+        let (rows, rc) = (rows_of[j], rcs[j]);
+        let (ri, ai) = ((i - first[j]) / n_ac, (i - first[j]) % n_ac);
+        Item { j, r0: ri * rc, r1: ((ri + 1) * rc).min(rows), a0: ai * ac, a1: ((ai + 1) * ac).min(m) }
+    };
+    let n_items = *first.last().unwrap();
     let outs: Vec<(&QWeight, SyncPtr<f32>)> = jobs.iter_mut().map(|(w, y)| (*w, SyncPtr(y.as_mut_ptr()))).collect();
     let run_item = |it: &Item| {
         let (w, yp) = (outs[it.j].0, outs[it.j].1);
@@ -1129,7 +1170,7 @@ pub fn matmul_opts(jobs: &mut [(&QWeight, &mut [f32])], x: &[f32], m: usize, opt
             }
         }
     };
-    pool().for_each(items.len(), |i| run_item(&items[i]));
+    pool().for_each(n_items, |i| run_item(&item(i)));
 }
 
 /// The dot product of weight row `r` with activation row `x`, through the kernel family in force —
