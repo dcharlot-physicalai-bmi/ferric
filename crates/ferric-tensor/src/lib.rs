@@ -43,7 +43,10 @@ pub mod sched; // L7 heterogeneous scheduler (GPU + CPU as one fabric)
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ws; // WebSocket bridge so a browser tab is a scheduler device
 pub mod sciml; // physics-informed / scientific-ML building blocks (SIREN PINN net + differentiable deriv)
-pub mod sample; // token selection on the device: exact greedy, reduced rows for exact host sampling
+// Token selection on the device: exact greedy, reduced rows for exact host sampling. Native only — its
+// readback BLOCKS on the map (a browser tab must await it; ferric-serve, its caller, is native).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sample;
 pub use autograd::{grad, Var};
 pub use sciml::{deriv, flatten, mse, rar_select, scalar, unflatten, Act, Causal, FourierNet, Lbfgs, LbfgsResult, LbfgsStop, LossBalancer, Mlp, NtkBalancer, Rba, Siren};
 pub mod image; // PPM in, preprocessed tensor out — no image-codec dependency
