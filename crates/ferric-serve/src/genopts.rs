@@ -95,6 +95,22 @@ pub(crate) struct GenOpts {
     pub logit_bias_text: Vec<(String, f32)>,
     /// Internal: the LoRA adapters this request runs with (`Engine::gen_opts`); empty = the base model.
     pub lora: Lora,
+    /// Choices to return for this one prompt (OpenAI `n`); see `choice_request`.
+    pub n: usize,
+}
+
+/// Most choices one request may ask for.
+pub(crate) const MAX_N: usize = 16;
+
+/// The request for choice `i` of an `n > 1` request: `n` removed, and for i >= 1 the seed moved to
+/// (seed or 0) + i, so every choice is reproducible and distinct while choice 0 is exactly the n = 1 answer.
+pub(crate) fn choice_request(req: &Value, i: usize) -> Value {
+    let mut r = req.clone();
+    if let Some(o) = r.as_object_mut() {
+        o.remove("n");
+        if i > 0 { o.insert("seed".into(), serde_json::json!(req["seed"].as_i64().unwrap_or(0).wrapping_add(i as i64))); }
+    }
+    r
 }
 
 /// A request's adapter selection: each adapter uploaded once, and its multiplier.
@@ -111,7 +127,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default(), logit_bias_text: Vec::new() }
+                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default(), logit_bias_text: Vec::new(), n: 1 }
     }
 }
 
@@ -152,8 +168,10 @@ impl GenOpts {
         }
         match &req["n"] {
             Value::Null => {}
-            v if v.as_u64() == Some(1) => {}
-            v => return Err(format!("`n` = {v}: this server returns one choice per request; send n requests")),
+            v => match v.as_u64() {
+                Some(n) if (1..=MAX_N as u64).contains(&n) => o.n = n as usize,
+                _ => return Err(format!("`n` must be an integer from 1 to {MAX_N}, got {v}")),
+            },
         }
         let s = &mut o.sampling;
         if let Some(t) = f32_in(req, "temperature", 0.0, 5.0)? { s.temperature = t; }
@@ -805,9 +823,34 @@ mod tests {
         assert!(content_text(&img).unwrap_err().contains("image_url"));
     }
 
+    /// Choice 0 of an n > 1 request IS the n = 1 request; every later choice differs only in its seed,
+    /// and no two choices share a random stream (with or without a request seed).
+    #[test]
+    fn each_choice_is_the_request_with_its_own_seed() {
+        for base in [json!({"prompt": "x", "n": 4, "temperature": 1.0}), json!({"prompt": "x", "n": 4, "temperature": 1.0, "seed": 42})] {
+            let mut one = base.clone();
+            one.as_object_mut().unwrap().remove("n");
+            assert_eq!(choice_request(&base, 0), one, "choice 0 must be the n = 1 request");
+            let rngs: Vec<u64> = (0..4).map(|i| GenOpts::from_req(&choice_request(&base, i), false).unwrap().rng).collect();
+            for i in 0..4 { for j in 0..i { assert_ne!(rngs[i], rngs[j], "choices {j} and {i} share a random stream: {base}"); } }
+            for i in 1..4 {
+                let mut c = choice_request(&base, i);
+                assert!(c.get("n").is_none());
+                c.as_object_mut().unwrap().remove("seed");
+                let mut b = one.clone();
+                b.as_object_mut().unwrap().remove("seed");
+                assert_eq!(c, b, "choice {i} differs from the request in more than its seed");
+            }
+        }
+    }
+
     #[test]
     fn unsupported_or_malformed_parameters_are_refused_not_ignored() {
-        assert!(GenOpts::from_req(&json!({"n": 2}), true).unwrap_err().contains("`n`"));
+        assert_eq!(GenOpts::from_req(&json!({"n": 2}), true).unwrap().n, 2);
+        assert_eq!(GenOpts::from_req(&json!({}), true).unwrap().n, 1);
+        for n in [json!(0), json!(17), json!(2.5), json!("2")] {
+            assert!(GenOpts::from_req(&json!({"n": n}), true).unwrap_err().contains("`n`"), "n={n}");
+        }
         assert!(GenOpts::from_req(&json!({"top_p": 0}), true).is_err());
         assert!(GenOpts::from_req(&json!({"temperature": -1}), true).is_err());
         assert!(GenOpts::from_req(&json!({"stop": [1, 2]}), true).is_err());

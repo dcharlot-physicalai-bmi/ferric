@@ -2011,8 +2011,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     let opts = match eng.gen_opts(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let empty = vec![];
     if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
-    let id = "chatcmpl-ferric";
     let has_tools = req["tools"].as_array().is_some_and(|t| !t.is_empty()) || !mcps.borrow().openai_tools().is_empty();
+    if opts.n > 1 { return chat_n(eng, mcps, stream, &req, opts.n, has_tools, opts.logprobs); }
+    let id = "chatcmpl-ferric";
     let streaming = req["stream"].as_bool().unwrap_or(false);
     let usage = |r: &ChatResult| json!({"prompt_tokens": r.prompt_tokens, "completion_tokens": r.gen_tokens, "total_tokens": r.prompt_tokens + r.gen_tokens});
     if streaming && has_tools {
@@ -2079,6 +2080,62 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     }
 }
 
+/// **n > 1 choices** of one chat prompt (parity gap S13): each choice is the request for that index
+/// (`genopts::choice_request`), generated one after another; after the first, the prompt cache holds the
+/// prompt, so a later choice prefills almost nothing. Streaming sends each choice's chunks under its own
+/// `index`, which OpenAI's protocol allows. Usage counts the prompt once and every choice's tokens.
+fn chat_n(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpStream, req: &Value, n: usize, has_tools: bool, logprobs: bool) {
+    if has_tools { return bad_request(stream, "`n` > 1 with tools is not served: a tool round-trip is one conversation"); }
+    let id = "chatcmpl-ferric";
+    let streaming = req["stream"].as_bool().unwrap_or(false);
+    let chunk = |i: usize, delta: Value, finish: Value| json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(),
+        "model": eng.name, "choices": [{"index": i, "delta": delta, "finish_reason": finish}]});
+    if streaming { write_sse_headers(stream); }
+    let (mut choices, mut energies, mut ptok, mut gtok) = (Vec::new(), Vec::new(), 0usize, 0usize);
+    for i in 0..n {
+        let r_i = genopts::choice_request(req, i);
+        if streaming { send_sse(stream, &chunk(i, json!({"role": "assistant"}), Value::Null)); }
+        let r = run_chat(eng, mcps, &r_i, |delta, lps, reasoning| {
+            if !streaming { return; }
+            let mut ch = json!({"index": i, "delta": {(if reasoning { "reasoning_content" } else { "content" }): delta}, "finish_reason": Value::Null});
+            if logprobs && !reasoning { ch["logprobs"] = json!({"content": lps}); }
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [ch]}));
+        });
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                if streaming { send_sse(stream, &json!({"error": {"message": e, "type": "server_error"}})); let _ = stream.write_all(b"data: [DONE]\n\n"); }
+                else { bad_request(stream, &e); }
+                return;
+            }
+        };
+        ptok = r.prompt_tokens;
+        gtok += r.gen_tokens;
+        energies.push(r.energy.clone());
+        if streaming {
+            send_sse(stream, &chunk(i, json!({}), json!(r.finish)));
+        } else {
+            let mut message = json!({"role": "assistant", "content": r.text});
+            if !r.reasoning.is_empty() { message["reasoning_content"] = json!(r.reasoning); }
+            let mut choice = json!({"index": i, "message": message, "finish_reason": r.finish});
+            if logprobs { choice["logprobs"] = logprobs_field(true, &r.logprobs); }
+            choices.push(choice);
+        }
+        if peer_gone() { return; }
+    }
+    let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
+    let energy = sum_energy(&energies);
+    if streaming {
+        if req["stream_options"]["include_usage"].as_bool() == Some(true) {
+            send_sse(stream, &json!({"id": id, "object": "chat.completion.chunk", "created": now_unix(), "model": eng.name, "choices": [], "usage": usage, "energy": energy}));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+    } else {
+        write_json(stream, 200, &json!({"id": id, "object": "chat.completion", "created": now_unix(), "model": eng.name,
+            "choices": choices, "usage": usage, "energy": energy}));
+    }
+}
+
 fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let req: Value = match serde_json::from_slice(body) { Ok(v) => v, Err(e) => return bad_request(stream, &format!("bad json: {e}")) };
     let Some(prompt_text) = req["prompt"].as_str() else {
@@ -2092,6 +2149,9 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     ids.extend(eng.enc(prompt_text, true));
     let max = match eng.budget(ids.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
     let cid = format!("cmpl-ferric-{}", ids.len());
+    if req["stream"].as_bool() == Some(true) && opts.n > 1 {
+        return bad_request(stream, "`n` > 1 with a streamed completion is not served; stream n = 1 or ask without `stream`");
+    }
     if req["stream"].as_bool() == Some(true) {
         write_sse_headers(stream);
         let out = eng.generate(&ids, max, &opts, spec.guide(), |delta, lps| {
@@ -2108,14 +2168,27 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         let _ = stream.write_all(b"data: [DONE]\n\n");
         return;
     }
-    let out = eng.generate(&ids, max, &opts, spec.guide(), |_, _| {});
-    let mut choice = json!({"index": 0, "text": out.text, "finish_reason": out.finish});
-    if opts.logprobs { choice["logprobs"] = logprobs_field(false, &out.logprobs); }
+    // n > 1: each choice with its own request (`genopts::choice_request`); the prompt cache makes every
+    // choice after the first nearly prefill-free.
+    let (mut choices, mut energies, mut gtok, mut ptok) = (Vec::new(), Vec::new(), 0usize, 0usize);
+    for i in 0..opts.n {
+        let o_i = if i == 0 { opts.clone() } else {
+            match eng.gen_opts(&genopts::choice_request(&req, i), false) { Ok(o) => o, Err(e) => return bad_request(stream, &e) }
+        };
+        let out = eng.generate(&ids, max, &o_i, spec.guide(), |_, _| {});
+        let mut choice = json!({"index": i, "text": out.text, "finish_reason": out.finish});
+        if opts.logprobs { choice["logprobs"] = logprobs_field(false, &out.logprobs); }
+        choices.push(choice);
+        energies.push(out.energy);
+        ptok = out.prompt_tokens;
+        gtok += out.gen_tokens;
+        if peer_gone() { return; }
+    }
     write_json(stream, 200, &json!({
         "id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name,
-        "choices": [choice],
-        "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.gen_tokens, "total_tokens": out.prompt_tokens + out.gen_tokens},
-        "energy": out.energy
+        "choices": choices,
+        "usage": {"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok},
+        "energy": if energies.len() == 1 { energies.pop().unwrap() } else { sum_energy(&energies) }
     }));
 }
 

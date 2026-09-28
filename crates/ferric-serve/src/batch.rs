@@ -275,6 +275,9 @@ fn authorized(headers: &[(String, String)], key: &str) -> bool {
 
 /// Requests the batch loop declines, and hands to the untouched serial path. See the module docs.
 fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
+    // n > 1 choices are generated one after another on the serial path, each reusing the prompt's cache.
+    // n > 1 is one request per choice on the serial path; an out-of-range n stays here to be refused.
+    if req["n"].as_u64().is_some_and(|n| n > 1 && n <= crate::genopts::MAX_N as u64) { return true; }
     // A constraint masks every step (`constrain`); the batched step has no mask.
     if crate::constrain::asks_for_constraint(req) { return true; }
     // Streaming completions is served by the serial path's SSE writer only for chat; completions
@@ -1225,8 +1228,13 @@ mod tests {
             assert!(must_run_serial(&json!({"messages": [m.clone()]}), true, &o), "batched: {m}");
         }
         assert!(!must_run_serial(&json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}), true, &o));
-        let (c, b) = request(&addr, "POST", "/v1/completions", &json!({"prompt": "x", "n": 3}).to_string());
-        assert_eq!(c, 400, "n=3 must be refused, not answered with one choice: {b}");
+        // n > 1 is served serially, one request per choice; an n outside 1..=16 is refused, never clamped.
+        assert!(must_run_serial(&json!({"prompt": "x", "n": 3}), false, &o));
+        assert!(!must_run_serial(&json!({"prompt": "x", "n": 1}), false, &o));
+        for n in [0, 17] {
+            let (c, b) = request(&addr, "POST", "/v1/completions", &json!({"prompt": "x", "n": n}).to_string());
+            assert_eq!(c, 400, "n={n} must be refused, not answered with some other number of choices: {b}");
+        }
     }
 
     /// A client that disconnects mid-stream frees its batch slot. With ONE slot and a 5000-token request
