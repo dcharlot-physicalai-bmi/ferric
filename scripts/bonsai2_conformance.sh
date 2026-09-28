@@ -23,6 +23,12 @@
 # Tolerance: the fixture's `noise_floor` — how far the fork's own two attention kernels (flash on vs off,
 # same decode path) disagree over the same rows. Ferric must agree with the authors at least that well.
 #
+# Measured 2026-09-28 (M5 Max), worst max|Δ| over 170 rows / tolerance, greedy 32/32 on all 3 prompts:
+#   PQ2_0   8.02e-5 / 4.46e-3   controls 185,858-206,034x
+#   PTQ1_0  7.19e-5 / 4.03e-3   controls 207,258-229,757x
+#   Q2_0    8.02e-5 / 4.46e-3   (group-64 dev file; identical to PQ2_0 — same weights, lossless carrier)
+# Code mutation: deleting the embedding inverse (qwen35.rs `embed`) → france 18.8, argmax 0/36.
+#
 #   scripts/bonsai2_conformance.sh <Ternary-Bonsai-2-27B-{PQ2_0,PTQ1_0,Q2_0...}.gguf> [fixture.json]
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
