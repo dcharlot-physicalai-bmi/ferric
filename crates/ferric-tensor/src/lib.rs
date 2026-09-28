@@ -31,6 +31,9 @@ pub mod optim; // optimizers (Adam)
 pub mod metal4;
 #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
 pub mod native_qgemm;
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+pub mod native_attn; // prefill attention on the M5 matrix units (opt-in with FERRIC_QGEMM)
+pub mod flash_tiled; // tiled (FlashAttention-2 schedule) prefill attention, portable WGSL
 /// NVIDIA native tier (driver API over dlopen; linux/windows only). See `cuda.rs`.
 pub mod cuda;
 /// Tenstorrent native tier, host side (tt-kmd ioctl UAPI; linux only). See `tenstorrent.rs`.
@@ -901,9 +904,27 @@ impl Tensor {
     /// queries at positions `off..off+T`, `k`/`v` all `off + T` keys, and query `i` attends keys
     /// `0..=off+i`. That is a prefix-cache hit's suffix and each chunk of a chunked prefill; before it they
     /// fell to the composed `chunked_attention`, and a 6,587-token prompt fed in 512-token chunks took 2.4x
-    /// as long as the same prompt prefilled whole. `off = 0` is the full-prefill kernel instruction for
-    /// instruction (plus one add), so full prefill is unchanged bit for bit.
+    /// as long as the same prompt prefilled whole. On the per-query kernel `off = 0` is the full-prefill
+    /// kernel instruction for instruction (plus one add).
+    ///
+    /// Routed by [`flash_tiled::route`]: the tiled kernel (a block of query rows per workgroup, K/V tiles
+    /// in workgroup memory — `flash_tiled.rs`) or, opt-in with `FERRIC_QGEMM`, the matrix-unit kernel
+    /// (`native_attn.rs`); this per-query kernel otherwise. `FERRIC_FLASH=rows|tiled|native` forces one.
     pub fn flash_attention_prefill_at(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize, off: usize) -> Tensor {
+        flash_tiled::route(self, k, v, nh, nkv, dh, off, flash_tiled::Kernel::Auto)
+            .unwrap_or_else(|| self.flash_prefill_rows(k, v, nh, nkv, dh, off))
+    }
+
+    /// [`Self::flash_attention_prefill_at`] with the kernel chosen by the caller — the A/B and test seam.
+    /// None when that kernel cannot serve the shape on this device (`Rows` always can, within its asserts).
+    pub fn flash_attention_prefill_with(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize, off: usize,
+                                        kernel: flash_tiled::Kernel) -> Option<Tensor> {
+        if kernel == flash_tiled::Kernel::Rows { return Some(self.flash_prefill_rows(k, v, nh, nkv, dh, off)); }
+        flash_tiled::route(self, k, v, nh, nkv, dh, off, kernel)
+    }
+
+    /// The per-query kernel: one workgroup per (head, query), keys streamed in 2048-key chunks.
+    fn flash_prefill_rows(&self, k: &Tensor, v: &Tensor, nh: usize, nkv: usize, dh: usize, off: usize) -> Tensor {
         let (q, k, v) = (self.contiguous(), k.contiguous(), v.contiguous());
         let t = q.shape[0];
         assert!(dh <= 128 && t <= 65535, "flash prefill: head_dim ≤ 128, T ≤ 65535");

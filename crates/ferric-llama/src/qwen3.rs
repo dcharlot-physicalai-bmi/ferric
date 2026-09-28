@@ -1677,10 +1677,16 @@ impl Qwen3 {
         // FERRIC_NOWINDOW disables the sliding window (attends to all keys) — for A/B-ing its effect.
         let win = if std::env::var("FERRIC_NOWINDOW").is_ok() { 0 } else { l.window };
         let sc = self.cfg.attn_softcap; // Gemma-2 attention-score softcap (0 elsewhere)
+        // Gemma's prefill (sliding window, softcap, head_dim 256) takes the fused tiled kernel when it can
+        // serve the shape — `flash_attention_prefill_opts`, None otherwise and under FERRIC_FLASH=rows — and
+        // the composed path, which materialises the [nh, T, S] scores, only as the fallback.
         let o = if win > 0 {
             // Sliding-window (Gemma local layer): the query attends only to the last `window` keys.
             if t == 1 { nn::decode_attention_win(&q, &kc, &vc, nh, nkv, win, sc) }
-            else { nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win, sc) }
+            else {
+                q.flash_attention_prefill_opts(&kc, &vc, nh, nkv, hd, s.saturating_sub(t), win, sc)
+                    .unwrap_or_else(|| nn::causal_attention_win(&q, &kc, &vc, nh, nkv, win, sc))
+            }
         } else if t == 1 {
             nn::decode_attention(&q, &kc, &vc, nh, nkv, sc)
         } else if t <= s && t <= 65535 && hd <= 128 && sc == 0.0 {
@@ -1690,7 +1696,8 @@ impl Qwen3 {
         } else {
             // chunked_attention delegates to causal_attention when q covers the whole history, so
             // this one call serves full prefill, prefix-cached suffixes and chunked prefill alike.
-            nn::chunked_attention(&q, &kc, &vc, nh, nkv, sc)
+            q.flash_attention_prefill_opts(&kc, &vc, nh, nkv, hd, s.saturating_sub(t), 0, sc)
+                .unwrap_or_else(|| nn::chunked_attention(&q, &kc, &vc, nh, nkv, sc))
         };
         // Gated GQA: the gate is a projection of the layer's NORMED INPUT `h`, not of the attention
         // output, so it cannot be folded into `wo`. Sigmoid, then elementwise into the attention result
