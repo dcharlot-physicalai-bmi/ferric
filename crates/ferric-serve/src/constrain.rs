@@ -154,27 +154,34 @@ impl Trie {
     /// One walk from the stack suffix `suf` alone: which tokens match whatever lies below it, and which run
     /// past its bottom (so depend on what does), with the offsets where they did. A token is recorded as
     /// depending only when no path matched all its bytes — a path that did is a path the full stack has too.
-    fn suffix_mask(&self, g: &Arc<Grammar>, suf: &[Pos], n_vocab: usize) -> SuffixMask {
+    fn suffix_mask(&self, g: &Arc<Grammar>, suf: &[Pos], n_vocab: usize, dfa: &mut Dfa) -> SuffixMask {
         let mut accept = vec![0u64; n_vocab.div_ceil(64)];
         let (mut depends, mut offs) = (Vec::new(), Vec::new());
         // (trie node, state from the suffix alone, byte depth, offsets on this path where the bottom was reached)
-        let mut todo = vec![(0u32, Matcher::from_stacks(g.clone(), vec![suf.to_vec()]), 0u16, Vec::<u16>::new())];
+        let start = dfa.intern(Matcher::from_stacks(g.clone(), vec![suf.to_vec()]));
+        // The offsets where a path reached the bottom, as a linked list in an arena (index, 0 = none): a
+        // child shares its parent's list, so descending costs no copy.
+        let mut arena: Vec<(u16, u32)> = vec![(0, 0)];
+        let mut todo = vec![(0u32, start, 0u16, 0u32)];
         while let Some((node, st, depth, bottoms)) = todo.pop() {
             for &(b, child) in &self.children[node as usize] {
-                let mut s2 = st.clone();
-                let ok = s2.step(b);
-                let mut bottoms = bottoms.clone();
-                if ok && !s2.mid_char() && s2.reached_bottom() { bottoms.push(depth + 1); }
+                let s2 = dfa.step(st, b);
+                let ok = s2 != DEAD;
+                let mut bottoms = bottoms;
+                if ok && dfa.bottom_between_chars(s2) { arena.push((depth + 1, bottoms)); bottoms = arena.len() as u32 - 1; }
                 for &t in &self.ends[child as usize] {
                     if (t as usize) >= n_vocab { continue; }
                     if ok { accept[t as usize / 64] |= 1 << (t % 64); }
-                    else if !bottoms.is_empty() {
+                    else if bottoms != 0 {
                         depends.push(t);
-                        offs.extend(bottoms.iter().map(|&o| o as u32));
+                        let start = offs.len();
+                        let mut k = bottoms;
+                        while k != 0 { offs.push(arena[k as usize].0 as u32); k = arena[k as usize].1; }
+                        offs[start..].reverse();
                         offs.push(u32::MAX);
                     }
                 }
-                if !self.children[child as usize].is_empty() && (ok || !bottoms.is_empty()) { todo.push((child, s2, depth + 1, bottoms)); }
+                if !self.children[child as usize].is_empty() && (ok || bottoms != 0) { todo.push((child, s2, depth + 1, bottoms)); }
             }
         }
         SuffixMask { accept, depends, offs }
@@ -193,16 +200,15 @@ impl Trie {
         // The whole stack as the suffix: running past its bottom is the end of the grammar, so every
         // depending token is refused (the full walk refuses it the same way).
         if k == st.len() { return w; }
-        let below = Matcher::resume(g.clone(), st[..st.len() - k].to_vec());
-        let first: Vec<bool> = (0..=255u8).map(|b| below.clone().step(b)).collect();
+        // The remainders run on the grammar's DFA from the state below the suffix: a remainder's steps are
+        // table lookups once any request has taken them.
+        let mut dfa = x.dfa.lock().unwrap();
+        let below = dfa.intern(Matcher::resume(g.clone(), st[..st.len() - k].to_vec()));
         let mut o = sm.offs.split(|&v| v == u32::MAX);
         for &t in &sm.depends {
             let at = o.next().unwrap_or(&[]);
             let Some(b) = token_bytes.get(t as usize).and_then(|b| b.as_deref()) else { continue };
-            let takes = at.iter().any(|&i| {
-                let rest = &b[i as usize..];
-                rest.first().is_none_or(|&c| first[c as usize]) && { let mut s = below.clone(); rest.iter().all(|&c| s.step(c)) }
-            });
+            let takes = at.iter().any(|&i| b[i as usize..].iter().try_fold(below, |s, &c| Some(dfa.step(s, c)).filter(|&n| n != DEAD)).is_some());
             if takes { w[t as usize / 64] |= 1 << (t % 64); }
         }
         w
@@ -262,15 +268,61 @@ pub(crate) struct Masks {
     limit: usize,
     /// Whole-stack masks served from the cache.
     hits: std::sync::atomic::AtomicUsize,
+    /// The grammar's states met so far and their byte transitions (`Dfa`).
+    dfa: Mutex<Dfa>,
+}
+
+/// A dead state: no parse survives the byte.
+const DEAD: u32 = u32::MAX;
+/// States kept before the table starts over — between walks only, since a walk holds state ids.
+const KEPT_STATES: usize = 1 << 14;
+
+/// **A lazily built DFA over the grammar's parse states.** A mask walk steps a state through every byte
+/// of the vocabulary trie; stepping clones and re-advances parse stacks, but the same few states recur
+/// across thousands of trie nodes (inside a string, every character leads back to the same state). So
+/// states are interned by what they are (`Matcher::state_key`) and each (state, byte) step is computed
+/// once. Same answers as stepping the matcher — it is the matcher's own step, memoized.
+pub(crate) struct Dfa { states: Vec<(Matcher, bool)>, ids: HashMap<(Vec<Vec<Pos>>, (u32, i8)), u32>, next: Vec<Box<[u32; 256]>> }
+
+/// A transition not computed yet.
+const UNKNOWN: u32 = u32::MAX - 1;
+
+impl Dfa {
+    fn new() -> Dfa { Dfa { states: Vec::new(), ids: HashMap::new(), next: Vec::new() } }
+    fn intern(&mut self, m: Matcher) -> u32 {
+        let key = m.state_key();
+        if let Some(&i) = self.ids.get(&key) { return i; }
+        let i = self.states.len() as u32;
+        let bottom = !m.mid_char() && m.reached_bottom();
+        self.states.push((m, bottom));
+        self.next.push(Box::new([UNKNOWN; 256]));
+        self.ids.insert(key, i);
+        i
+    }
+    fn step(&mut self, s: u32, b: u8) -> u32 {
+        if s == DEAD { return DEAD; }
+        let n = self.next[s as usize][b as usize];
+        if n != UNKNOWN { return n; }
+        let mut m = self.states[s as usize].0.clone();
+        let n = if m.step(b) { self.intern(m) } else { DEAD };
+        self.next[s as usize][b as usize] = n;
+        n
+    }
+    /// A parse reached the bottom with no character half-written.
+    fn bottom_between_chars(&self, s: u32) -> bool { self.states[s as usize].1 }
 }
 
 impl Masks {
     pub fn new(g: Arc<Grammar>, n_vocab: usize) -> Masks {
-        Masks { g, suffixes: Mutex::new(HashMap::new()), stacks: Mutex::new(HashMap::new()), limit: (n_vocab / 64).max(256), hits: Default::default() }
+        Masks { g, suffixes: Mutex::new(HashMap::new()), stacks: Mutex::new(HashMap::new()), limit: (n_vocab / 64).max(256), hits: Default::default(),
+                dfa: Mutex::new(Dfa::new()) }
     }
     fn suffix(&self, t: &Trie, suf: &[Pos], n_vocab: usize) -> Arc<SuffixMask> {
         if let Some(x) = self.suffixes.lock().unwrap().get(suf) { return x.clone(); }
-        let x = Arc::new(t.suffix_mask(&self.g, suf, n_vocab));
+        let mut dfa = self.dfa.lock().unwrap();
+        if dfa.states.len() >= KEPT_STATES { *dfa = Dfa::new(); }
+        let x = Arc::new(t.suffix_mask(&self.g, suf, n_vocab, &mut dfa));
+        drop(dfa);
         self.suffixes.lock().unwrap().insert(suf.to_vec(), x.clone());
         x
     }

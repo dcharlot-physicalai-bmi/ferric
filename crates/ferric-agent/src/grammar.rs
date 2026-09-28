@@ -401,6 +401,13 @@ impl Matcher {
         Matcher { g, stacks, partial: (0, 0) }
     }
     pub fn grammar(&self) -> &Arc<Grammar> { &self.g }
+    /// What the state IS, independent of how it was reached: the set of stacks (sorted — stepping treats
+    /// them as a set) and the half-written character. Equal keys accept exactly the same continuations.
+    pub fn state_key(&self) -> (Vec<Stack>, (u32, i8)) {
+        let mut s = self.stacks.clone();
+        s.sort();
+        (s, self.partial)
+    }
     pub fn stacks(&self) -> &[Stack] { &self.stacks }
     /// A code point is begun and not finished.
     pub fn mid_char(&self) -> bool { self.partial.1 != 0 }
