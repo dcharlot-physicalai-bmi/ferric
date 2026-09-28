@@ -85,6 +85,8 @@ pub struct Driver {
     /// Stream capture + graph replay (CUDA 11.4+ drivers). `None` on an older driver: the step then
     /// runs its launches eagerly on the same stream — same kernels, same numbers, more host time.
     graph: Option<GraphApi>,
+    /// Streaming multiprocessors on device 0 — sizes the split attention's fixed grid.
+    pub sm_count: u32,
     /// `cuDeviceGetName` of device 0, so the native tier can be NAMED in every harness header — the
     /// wgpu adapter line says nothing about which GPU libcuda opened.
     pub name: String,
@@ -131,6 +133,8 @@ pub(crate) struct DecodeK {
     /// The decode step's rope and attention: row, position and K/V addresses read from the step block,
     /// so one captured graph serves every token of every sequence (cuda_decode.cu, THE STEP BLOCK).
     qk_norm_rope_step: CUfunction, attn_decode_step: CUfunction,
+    /// Split-K decode attention over a fixed (G, n_kv) grid and its chunk merge (cuda_decode.cu).
+    attn_split: CUfunction, attn_split_step: CUfunction, attn_combine: CUfunction,
     quant_x_q8: CUfunction, q5k_gemv_q8: CUfunction, q5k_swiglu_gemv_q8: CUfunction,
     /// Indexed by `QFmt as usize`: the GEMV and the fused gate|up + SwiGLU for each weight format.
     gemv: [CUfunction; 5], swiglu: [CUfunction; 5],
@@ -193,6 +197,7 @@ impl Driver {
             }))(),
             _ctx: std::ptr::null_mut(),
             name: String::new(),
+            sm_count: 0,
             gemv_q5k: OnceLock::new(),
             decode: OnceLock::new(),
             prefill: OnceLock::new(),
@@ -212,7 +217,11 @@ impl Driver {
             let name = if get_name(buf.as_mut_ptr() as *mut c_char, 128, dev) == 0 {
                 CStr::from_ptr(buf.as_ptr() as *const c_char).to_string_lossy().into_owned()
             } else { String::from("?") };
-            Some(Driver { _ctx: ctx, name, ..d })
+            let get_attr = sym!(d._lib, "cuDeviceGetAttribute", unsafe extern "C" fn(*mut i32, i32, CUdevice) -> CUresult);
+            const MULTIPROCESSOR_COUNT: i32 = 16;
+            let mut sms = 0i32;
+            let sm_count = if get_attr(&mut sms, MULTIPROCESSOR_COUNT, dev) == 0 && sms > 0 { sms as u32 } else { 16 };
+            Some(Driver { _ctx: ctx, name, sm_count, ..d })
         }
     }
 
@@ -297,17 +306,18 @@ impl Driver {
     }
     fn decode_kernels(&self) -> Option<&DecodeK> {
         self.decode.get_or_init(|| {
-            const N: [&[u8]; 19] = [b"rmsnorm\0", b"add_rmsnorm\0", b"qk_norm_rope\0", b"attn_decode\0",
+            const N: [&[u8]; 22] = [b"rmsnorm\0", b"add_rmsnorm\0", b"qk_norm_rope\0", b"attn_decode\0",
                 b"quant_x_q8\0", b"q5k_gemv_q8\0", b"q5k_swiglu_gemv_q8\0",
                 // gemv, in QFmt order: Q4_K, Q5_K (the coalesced one, not tier 1's), Q6_K, Q8_0, Q5_0
                 b"q4k_gemv\0", b"q5k_gemv\0", b"q6k_gemv\0", b"q8_0_gemv\0", b"q5_0_gemv\0",
                 b"q4k_swiglu_gemv\0", b"q5k_swiglu_gemv\0", b"q6k_swiglu_gemv\0", b"q8_0_swiglu_gemv\0", b"q5_0_swiglu_gemv\0",
-                b"qk_norm_rope_step\0", b"attn_decode_step\0"];
+                b"qk_norm_rope_step\0", b"attn_decode_step\0", b"attn_split\0", b"attn_split_step\0", b"attn_combine\0"];
             let v = self.load_ptx("cuda_decode.ptx", &N)?;
             Some(DecodeK { rmsnorm: v[0], add_rmsnorm: v[1], qk_norm_rope: v[2], attn_decode: v[3],
                            quant_x_q8: v[4], q5k_gemv_q8: v[5], q5k_swiglu_gemv_q8: v[6],
                            gemv: [v[7], v[8], v[9], v[10], v[11]], swiglu: [v[12], v[13], v[14], v[15], v[16]],
-                           qk_norm_rope_step: v[17], attn_decode_step: v[18] })
+                           qk_norm_rope_step: v[17], attn_decode_step: v[18],
+                           attn_split: v[19], attn_split_step: v[20], attn_combine: v[21] })
         }).as_ref()
     }
 
@@ -321,9 +331,11 @@ impl Driver {
     }
     /// 2-D grid launch, same contract as [`Driver::launch`].
     unsafe fn launch2(&self, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
+        unsafe { self.launch2_on(std::ptr::null_mut(), f, gx, gy, block, params) }
+    }
+    unsafe fn launch2_on(&self, s: CUstream, f: CUfunction, gx: u32, gy: u32, block: u32, params: &mut [*mut c_void]) -> bool {
         self.bind();
-        let r = unsafe { (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(),
-                                                 params.as_mut_ptr(), std::ptr::null_mut()) };
+        let r = unsafe { (self.cu_launch_kernel)(f, gx, gy, 1, block, 1, 1, 0, s, params.as_mut_ptr(), std::ptr::null_mut()) };
         if r != 0 { eprintln!("{}", self.err("cuLaunchKernel", r)); return false; }
         true
     }
@@ -692,6 +704,11 @@ impl StepLayout {
     }
 }
 
+/// Chunks per kv head for the split attention: enough blocks for ~4 per SM across the kv heads — the
+/// grid is FIXED (the graph captures it), and a chunk past the context's end exits at once, so a short
+/// context pays only the launch. 2..=128.
+fn split_chunks(sm_count: u32, nkv: usize) -> u32 { (4 * sm_count).div_ceil(nkv as u32).clamp(2, 128) }
+
 /// Decode steps replayed from the captured graph (not launched one kernel at a time) — so a harness
 /// can prove which way the step ran, as [`native_steps`] does for the tier itself.
 static GRAPH_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -738,6 +755,10 @@ pub struct DecodeGraph {
     exec: Option<CUgraphExec>,
     /// Replay the graph: `FERRIC_CUDA_NO_GRAPH` unset, the driver has the API, capture has not failed.
     graph_on: bool,
+    /// Split-K attention: `Some(G)` chunks per kv head (cuda_decode.cu SPLIT-K DECODE ATTENTION) with its
+    /// partials buffer; `None` = the one-block-per-head `attn_decode` (FERRIC_CUDA_ATTN_SERIAL, or a head
+    /// group wider than the split kernel holds).
+    split: Option<(u32, CUdeviceptr)>,
     /// `FERRIC_CUDA_STEPTIME=1`: GPU time of each whole step (two events on the decode stream, no extra
     /// sync) against the wall time of `step` — the split that says whether a step is waiting on the GPU
     /// or the GPU is waiting on the host.
@@ -817,6 +838,11 @@ impl DecodeGraph {
         // Q6_K, which is the only reason it never fired.
         let (xq, xs) = (al(widest)?, al(widest / 32 * 4 + 4)?);
         let sb = al(lay.bytes)?;
+        let g = nh / nkv;
+        let split = if std::env::var("FERRIC_CUDA_ATTN_SERIAL").is_err() && g <= 16 && g * dh <= 2048 {
+            let chunks = split_chunks(drv.sm_count, nkv);
+            Some((chunks, al(nh * chunks as usize * (dh + 2) * 4)?))
+        } else { None };
         drv.bind();
         let mut stream: CUstream = std::ptr::null_mut();
         let (mut hb, mut hl): (*mut c_void, *mut c_void) = (std::ptr::null_mut(), std::ptr::null_mut());
@@ -844,7 +870,7 @@ impl DecodeGraph {
             q8x: std::env::var("FERRIC_CUDA_Q8X").is_ok(),
             xq, xs,
             owned, pf: None,
-            stream, sb, hb: hb as *mut u8, lay, hl: hl as *mut f32, exec: None, graph_on, steptime,
+            stream, sb, hb: hb as *mut u8, lay, hl: hl as *mut f32, exec: None, graph_on, steptime, split,
             drv,
         })
     }
@@ -945,7 +971,14 @@ impl DecodeGraph {
                 timed!(2, drv.launch_on(st, k.qk_norm_rope_step, (self.nh + self.nkv) as u32, 128,
                                         &mut p!(qkv, qw, kw, qo, ko, nh, nkv, dh, base, eps, qoff, koff, hn, voff, bias, ff, np, tb, sp, li32, nl32)));
                 let (mut q, mut ao, mut scale) = (self.q, self.attn, 1.0f32 / (self.dh as f32).sqrt());
-                timed!(4, drv.launch_on(st, k.attn_decode_step, self.nh as u32, 128, &mut p!(q, ao, nh, nkv, dh, scale, sp, li32, nl32)));
+                match self.split {
+                    Some((chunks, part)) => {
+                        let (mut pp, mut gg) = (part, chunks);
+                        timed!(4, drv.launch2_on(st, k.attn_split_step, chunks, self.nkv as u32, 128, &mut p!(q, pp, nh, nkv, dh, scale, sp, li32, nl32))
+                                  && drv.launch_on(st, k.attn_combine, self.nh as u32, (self.dh as u32).next_multiple_of(32), &mut p!(pp, ao, dh, gg)));
+                    }
+                    None => timed!(4, drv.launch_on(st, k.attn_decode_step, self.nh as u32, 128, &mut p!(q, ao, nh, nkv, dh, scale, sp, li32, nl32))),
+                }
                 timed!(5, launch_gemv(drv, st, k, self.attn, l.wo, self.y, q8));
                 let (mut x2, mut y2, mut fw, mut xy, mut xn) = (x, self.y, l.ffn_norm, self.xy, self.xn);
                 timed!(6, drv.launch_on(st, k.add_rmsnorm, 1, 256, &mut p!(x2, y2, fw, xy, xn, d32, eps)));
@@ -1631,9 +1664,20 @@ mod tests {
                 assert!(drv.launch(k.attn_decode, nh as u32, 128, &mut p!(q2, kk, vv, o2, nh32, nkv32, dh32, s32, sc)));
                 assert!(drv.sync());
                 assert!(same(&get(ao_s, q_out), &get(ao_a, q_out)), "attn_decode_step != attn_decode over the same {} keys (tab={use_tab})", row + 1);
+                // the split kernel's step twin: same partials, bit for bit
+                let chunks = 5u32;
+                let pn = nh * chunks as usize * (dh + 2);
+                let (ps_s, ps_a) = (outs(pn), outs(pn));
+                let (mut q3, mut pp3, mut q4, mut pp4) = (qs, ps_s, qa, ps_a);
+                assert!(drv.launch2(k.attn_split_step, chunks, nkv as u32, 128, &mut p!(q3, pp3, nh32, nkv32, dh32, sc, spp, li32, nl32)));
+                let (mut kk2, mut vv2) = (ca[li], ca[nl + li]);
+                assert!(drv.launch2(k.attn_split, chunks, nkv as u32, 128, &mut p!(q4, kk2, vv2, pp4, nh32, nkv32, dh32, s32, sc)));
+                assert!(drv.sync());
+                assert!(same(&get(ps_s, pn), &get(ps_a, pn)), "attn_split_step != attn_split (tab={use_tab})");
+                (drv.cu_mem_free)(ps_s); (drv.cu_mem_free)(ps_a);
                 for p in [sb, sd, qwd, kwd, bd, qs, ks, qa, ka, ao_s, ao_a, tb2_owned] { if p != 0 { (drv.cu_mem_free)(p); } }
             }
-            eprintln!("step kernels (tab={use_tab}): qk_norm_rope_step == qk_norm_rope and attn_decode_step == attn_decode, bit for bit, at row {row} of layer {li}");
+            eprintln!("step kernels (tab={use_tab}): qk_norm_rope_step == qk_norm_rope, attn_decode_step == attn_decode and attn_split_step == attn_split, bit for bit, at row {row} of layer {li}");
         }
         unsafe { for &p in cs.iter().chain(&ca) { (drv.cu_mem_free)(p); } }
     }
@@ -1747,8 +1791,19 @@ mod tests {
                 let z: f64 = sc.iter().map(|v| (v - m).exp()).sum();
                 for j in 0..s { let p = (sc[j] - m).exp() / z; for e in 0..dh { host[h * dh + e] += p * vv[j * kvo + kvh * dh + e] as f64; } }
             }
-            unsafe { for p in [qd, kd, vd, ad] { (drv.cu_mem_free)(p); } }
             gate(&format!("attn_decode nh={nh} nkv={nkv} dh={dh} S={s}"), &got, &want, &host);
+            // The split-K kernel + merge on the same inputs: the step's own chunk count for this card,
+            // a count that does not divide S (a ragged last chunk), and more chunks than keys (empty ones).
+            for chunks in [split_chunks(drv.sm_count, nkv), 3, (s as u32 + 5).min(128)] {
+                let (mut pd, mut od) = (drv.alloc(nh * chunks as usize * (dh + 2) * 4).unwrap(), drv.alloc(qo * 4).unwrap());
+                let (mut gg, mut kd2, mut vd2, mut qd2) = (chunks, kd, vd, qd);
+                assert!(unsafe { drv.launch2(k.attn_split, chunks, nkv as u32, 128, &mut p!(qd2, kd2, vd2, pd, a, b, c, s32, sc))
+                                 && drv.launch(k.attn_combine, nh as u32, (dh as u32).next_multiple_of(32), &mut p!(pd, od, c, gg)) } && drv.sync());
+                let mut gs = vec![0f32; qo]; assert!(drv.dtoh(&mut gs, od));
+                unsafe { (drv.cu_mem_free)(pd); (drv.cu_mem_free)(od); }
+                gate(&format!("attn_split+combine G={chunks} nh={nh} nkv={nkv} dh={dh} S={s}"), &gs, &want, &host);
+            }
+            unsafe { for p in [qd, kd, vd, ad] { (drv.cu_mem_free)(p); } }
         };
         attn(nh, nkv, dh, s_len, 6);
         // The real head geometry (dh=128 -> 4 elements per lane) and a key count that leaves a
@@ -1757,6 +1812,11 @@ mod tests {
         // Past one 2048-key chunk: 2049 (one key into the second chunk) and 4500 (three chunks).
         attn(14, 2, 64, 2049, 26);
         attn(32, 8, 64, 4500, 36);
+        // Qwen2.5-0.5B's group (7 q-heads per kv head) at the context the split kernel was built for,
+        // a one-key context (all but one chunk empty), and a whole group on one kv head at dh 128.
+        attn(14, 2, 64, 576, 46);
+        attn(14, 2, 64, 1, 56);
+        attn(7, 1, 128, 300, 66);
     }
 
     /// **The tensor-core GEMM, every format**, against the f64 product of the host-dequantised weights
