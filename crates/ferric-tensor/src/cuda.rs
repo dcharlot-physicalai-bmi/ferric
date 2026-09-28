@@ -1644,6 +1644,47 @@ mod tests {
         }
     }
 
+    /// **Prefill rows take THEIR row of the rope table.** Three rows at positions 29998, 29999 and 30000 in
+    /// one launch (`blockIdx.y` = row), each against the f64 rotation by its own position's float32 angles:
+    /// a kernel that read row 0's angles for every row, or rows in the wrong order, is 1e-2-scale off.
+    #[test]
+    fn rope_table_rows_follow_their_positions() {
+        if driver().is_none() { eprintln!("SKIPPED rope_table_rows_follow_their_positions: no CUDA driver / FERRIC_CUDA unset."); return; }
+        let drv = driver().unwrap(); let k = *drv.decode_kernels().expect("decode ptx");
+        let (nh, nkv, dh, base, rows, pos0) = (4usize, 2usize, 64usize, 1e6f32, 3usize, 29998usize);
+        let (q_out, kv_out) = (nh * dh, nkv * dh); let width = q_out + 2 * kv_out;
+        let inv = authors_inv(base, dh, None);
+        let qkv = rndx(rows * width, 77);
+        let tab: Vec<f32> = (0..rows).flat_map(|r| host_tab(&inv, pos0 + r)).collect();
+        let (mut sd, mut tb) = (drv.upload_f32(&qkv).unwrap(), drv.upload_f32(&tab).unwrap());
+        let (mut qo, mut ko) = (drv.alloc(rows * q_out * 4).unwrap(), drv.alloc(rows * kv_out * 4).unwrap());
+        let (mut z0, mut z1, mut z2, mut z3, mut z4, mut z5) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut nh32, mut nkv32, mut dh32, mut b, mut p32, mut e2) = (nh as u32, nkv as u32, dh as u32, base, pos0 as u32, 1e-6f32);
+        let (mut qoff, mut koff, mut hn, mut voff, mut np, mut rw) = (0u32, q_out as u32, 0u32, (q_out + kv_out) as u32, 0u32, width as u32);
+        assert!(unsafe { drv.launch2(k.qk_norm_rope, (nh + nkv) as u32, rows as u32, 128,
+            &mut p!(sd, z0, z1, qo, ko, nh32, nkv32, dh32, b, p32, e2, qoff, koff, hn, z2, z3, voff, z4, z5, np, rw, tb)) } && drv.sync());
+        let (mut qg, mut kg) = (vec![0f32; rows * q_out], vec![0f32; rows * kv_out]);
+        assert!(drv.dtoh(&mut qg, qo) && drv.dtoh(&mut kg, ko));
+        unsafe { for p in [sd, tb, qo, ko] { (drv.cu_mem_free)(p); } }
+        for r in 0..rows {
+            let pos = pos0 + r;
+            let rot = |x: &[f32], heads: usize| -> Vec<f64> {
+                let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                for h in 0..heads { for c in 0..dh / 2 {
+                    let (s, co) = ((pos as f32 * inv[c]) as f64).sin_cos();
+                    let (x1, x2) = (x[h * dh + c] as f64, x[h * dh + c + dh / 2] as f64);
+                    out[h * dh + c] = x1 * co - x2 * s; out[h * dh + c + dh / 2] = x2 * co + x1 * s;
+                } }
+                out
+            };
+            let row = &qkv[r * width..(r + 1) * width];
+            let d = max_abs_diff(&qg[r * q_out..(r + 1) * q_out], &rot(&row[..q_out], nh))
+                .max(max_abs_diff(&kg[r * kv_out..(r + 1) * kv_out], &rot(&row[q_out..q_out + kv_out], nkv)));
+            eprintln!("rope table row {r} (position {pos}): max|Δ| vs f64 at its own float32 angles {d:.3e}");
+            assert!(d <= 1e-6, "row {r} was not rotated by its own table row ({d:.3e})");
+        }
+    }
+
     /// **The step-block kernels are their argument twins, bit for bit.** `qk_norm_rope_step` and
     /// `attn_decode_step` read row, position and the K/V addresses from the step block instead of their
     /// arguments; they call the same bodies, so any difference is an indexing bug in the indirection
