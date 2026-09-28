@@ -505,15 +505,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane = idx / (t * nk);              // 0 = q, 1 = k
     let r = (idx % (t * nk)) / nk; let h = idx % nk;
     let base = r * cd + plane * (nk * dk) + h * dk;
+    // Eight loads in flight before the first is consumed (one-at-a-time was a memory latency per element,
+    // 84 us per step on the M3 Ultra); the adds keep their order, so the same bits.
     var ss = 0.0;
-    for (var j: u32 = 0u; j < dk; j = j + 1u) { let x = conv[base + j]; ss = ss + x * x; }
+    var j = 0u;
+    loop {
+        if (j + 8u > dk) { break; }
+        let x0 = conv[base + j]; let x1 = conv[base + j + 1u]; let x2 = conv[base + j + 2u]; let x3 = conv[base + j + 3u];
+        let x4 = conv[base + j + 4u]; let x5 = conv[base + j + 5u]; let x6 = conv[base + j + 6u]; let x7 = conv[base + j + 7u];
+        ss = ss + x0 * x0; ss = ss + x1 * x1; ss = ss + x2 * x2; ss = ss + x3 * x3;
+        ss = ss + x4 * x4; ss = ss + x5 * x5; ss = ss + x6 * x6; ss = ss + x7 * x7;
+        j = j + 8u;
+    }
+    for (; j < dk; j = j + 1u) { let x = conv[base + j]; ss = ss + x * x; }
     let inv = 1.0 / max(sqrt(ss), eps);      // same clamp as the l2norm kernel
     let s = select(1.0, scale, plane == 0u); // 1/√dv folded into q only
     let orow = r * (rep * nk * dk);
-    for (var ri: u32 = 0u; ri < rep; ri = ri + 1u) {
-        let ob = orow + (ri * nk + h) * dk;  // tiled: v-head = ri·nk + h  (head % nk broadcast)
-        for (var j: u32 = 0u; j < dk; j = j + 1u) {
-            let val = conv[base + j] * inv * s;
+    j = 0u;
+    loop {
+        if (j + 8u > dk) { break; }
+        let x0 = conv[base + j]; let x1 = conv[base + j + 1u]; let x2 = conv[base + j + 2u]; let x3 = conv[base + j + 3u];
+        let x4 = conv[base + j + 4u]; let x5 = conv[base + j + 5u]; let x6 = conv[base + j + 6u]; let x7 = conv[base + j + 7u];
+        let v0 = x0 * inv * s; let v1 = x1 * inv * s; let v2 = x2 * inv * s; let v3 = x3 * inv * s;
+        let v4 = x4 * inv * s; let v5 = x5 * inv * s; let v6 = x6 * inv * s; let v7 = x7 * inv * s;
+        for (var ri: u32 = 0u; ri < rep; ri = ri + 1u) {
+            let ob = orow + (ri * nk + h) * dk + j;  // tiled: v-head = ri·nk + h  (head % nk broadcast)
+            if (plane == 0u) { q[ob] = v0; q[ob + 1u] = v1; q[ob + 2u] = v2; q[ob + 3u] = v3; q[ob + 4u] = v4; q[ob + 5u] = v5; q[ob + 6u] = v6; q[ob + 7u] = v7; }
+            else { kk[ob] = v0; kk[ob + 1u] = v1; kk[ob + 2u] = v2; kk[ob + 3u] = v3; kk[ob + 4u] = v4; kk[ob + 5u] = v5; kk[ob + 6u] = v6; kk[ob + 7u] = v7; }
+        }
+        j = j + 8u;
+    }
+    for (; j < dk; j = j + 1u) {
+        let val = conv[base + j] * inv * s;
+        for (var ri: u32 = 0u; ri < rep; ri = ri + 1u) {
+            let ob = orow + (ri * nk + h) * dk;
             if (plane == 0u) { q[ob + j] = val; } else { kk[ob + j] = val; }
         }
     }
@@ -574,11 +599,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (r >= t * nv) { return; }
     let zo = info[0].w; let pw = info[1].x; let eps = bitcast<f32>(info[1].y);
     let base = r * dv;
+    // Eight loads in flight (see GDN_QK_WGSL); same order, same bits.
     var ms = 0.0;
-    for (var j: u32 = 0u; j < dv; j = j + 1u) { let v = o[base + j]; ms = ms + v * v; }
+    var j = 0u;
+    loop {
+        if (j + 8u > dv) { break; }
+        let v0 = o[base + j]; let v1 = o[base + j + 1u]; let v2 = o[base + j + 2u]; let v3 = o[base + j + 3u];
+        let v4 = o[base + j + 4u]; let v5 = o[base + j + 5u]; let v6 = o[base + j + 6u]; let v7 = o[base + j + 7u];
+        ms = ms + v0 * v0; ms = ms + v1 * v1; ms = ms + v2 * v2; ms = ms + v3 * v3;
+        ms = ms + v4 * v4; ms = ms + v5 * v5; ms = ms + v6 * v6; ms = ms + v7 * v7;
+        j = j + 8u;
+    }
+    for (; j < dv; j = j + 1u) { let v = o[base + j]; ms = ms + v * v; }
     let inv = 1.0 / sqrt(ms / f32(dv) + eps);       // same mean+eps clamp as the rmsnorm kernel
     let zb = (r / nv) * pw + zo + (r % nv) * dv;
-    for (var j: u32 = 0u; j < dv; j = j + 1u) {
+    j = 0u;
+    loop {
+        if (j + 4u > dv) { break; }
+        let z0 = proj[zb + j]; let z1 = proj[zb + j + 1u]; let z2 = proj[zb + j + 2u]; let z3 = proj[zb + j + 3u];
+        let o0 = o[base + j]; let o1 = o[base + j + 1u]; let o2 = o[base + j + 2u]; let o3 = o[base + j + 3u];
+        let n0 = norm[j]; let n1 = norm[j + 1u]; let n2 = norm[j + 2u]; let n3 = norm[j + 3u];
+        outp[base + j] = o0 * inv * n0 * (z0 / (1.0 + exp(-z0)));
+        outp[base + j + 1u] = o1 * inv * n1 * (z1 / (1.0 + exp(-z1)));
+        outp[base + j + 2u] = o2 * inv * n2 * (z2 / (1.0 + exp(-z2)));
+        outp[base + j + 3u] = o3 * inv * n3 * (z3 / (1.0 + exp(-z3)));
+        j = j + 4u;
+    }
+    for (; j < dv; j = j + 1u) {
         let z = proj[zb + j];
         outp[base + j] = o[base + j] * inv * norm[j] * (z / (1.0 + exp(-z)));
     }
@@ -921,5 +968,97 @@ mod swa_rule_tests {
         }
         assert_eq!(0usize, (0..10).filter(|&kj| symmetric_band_masked(5, kj, 0)).count(),
                    "n_swa = 0 means no windowing at all");
+    }
+}
+
+
+#[cfg(test)]
+mod gdn_kernel_tests {
+    use super::*;
+    use std::sync::Arc;
+    // The kernels as they were before the loads-in-flight rewrite: the reference the rewrite must equal.
+    const OLD_GDN_QK_WGSL: &str = r#"
+    @group(0) @binding(0) var<storage,read>        conv: array<f32>;   // [T, cd]
+    @group(0) @binding(1) var<storage,read_write>  q:    array<f32>;   // [T, nv·dk] l2normed·scale, tiled
+    @group(0) @binding(2) var<storage,read_write>  kk:   array<f32>;   // [T, nv·dk] l2normed, tiled
+    @group(0) @binding(3) var<uniform>             info: array<vec4<u32>, 2>; // t,nk,dk,rep | cd,scale,eps,_
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let idx = gid.x;
+        let t = info[0].x; let nk = info[0].y; let dk = info[0].z; let rep = info[0].w;
+        let cd = info[1].x; let scale = bitcast<f32>(info[1].y); let eps = bitcast<f32>(info[1].z);
+        if (idx >= t * nk * 2u) { return; }
+        let plane = idx / (t * nk);              // 0 = q, 1 = k
+        let r = (idx % (t * nk)) / nk; let h = idx % nk;
+        let base = r * cd + plane * (nk * dk) + h * dk;
+        var ss = 0.0;
+        for (var j: u32 = 0u; j < dk; j = j + 1u) { let x = conv[base + j]; ss = ss + x * x; }
+        let inv = 1.0 / max(sqrt(ss), eps);      // same clamp as the l2norm kernel
+        let s = select(1.0, scale, plane == 0u); // 1/√dv folded into q only
+        let orow = r * (rep * nk * dk);
+        for (var ri: u32 = 0u; ri < rep; ri = ri + 1u) {
+            let ob = orow + (ri * nk + h) * dk;  // tiled: v-head = ri·nk + h  (head % nk broadcast)
+            for (var j: u32 = 0u; j < dk; j = j + 1u) {
+                let val = conv[base + j] * inv * s;
+                if (plane == 0u) { q[ob + j] = val; } else { kk[ob + j] = val; }
+            }
+        }
+    }
+    "#;
+    const OLD_GDN_POST_WGSL: &str = r#"
+    @group(0) @binding(0) var<storage,read>        o:    array<f32>;   // [T, nv, dv] delta-rule output
+    @group(0) @binding(1) var<storage,read>        proj: array<f32>;   // z gate read in place from the in_proj
+    @group(0) @binding(2) var<storage,read>        norm: array<f32>;   // [dv]
+    @group(0) @binding(3) var<storage,read_write>  outp: array<f32>;   // [T, nv·dv]
+    @group(0) @binding(4) var<uniform>             info: array<vec4<u32>, 2>; // t,nv,dv,z_off | pw,eps,_,_
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let r = gid.x; let t = info[0].x; let nv = info[0].y; let dv = info[0].z;
+        if (r >= t * nv) { return; }
+        let zo = info[0].w; let pw = info[1].x; let eps = bitcast<f32>(info[1].y);
+        let base = r * dv;
+        var ms = 0.0;
+        for (var j: u32 = 0u; j < dv; j = j + 1u) { let v = o[base + j]; ms = ms + v * v; }
+        let inv = 1.0 / sqrt(ms / f32(dv) + eps);       // same mean+eps clamp as the rmsnorm kernel
+        let zb = (r / nv) * pw + zo + (r % nv) * dv;
+        for (var j: u32 = 0u; j < dv; j = j + 1u) {
+            let z = proj[zb + j];
+            outp[base + j] = o[base + j] * inv * norm[j] * (z / (1.0 + exp(-z)));
+        }
+    }
+    "#;
+
+    fn rnd(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.713 + s).sin()) * 1.7).collect() }
+
+    /// gdn_qk and gdn_post issue several loads before consuming one and must change nothing else: every
+    /// output bit equal to the one-load loops', at Bonsai 2's geometry (16 key / 48 value heads, 128) and
+    /// at widths that exercise the tails (dk 100, 7), one and three rows.
+    #[test]
+    fn unrolled_gdn_qk_and_post_are_bit_identical() {
+        let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else { return };
+        let ctx = Arc::new(ctx);
+        for &(t, nk, dk, rep) in &[(1usize, 16usize, 128usize, 3usize), (3, 4, 100, 2), (1, 2, 7, 1)] {
+            let nv = nk * rep; let cd = 2 * nk * dk + nv * dk;
+            let conv = Tensor::from_vec(&ctx, &rnd(t * cd, 0.3), &[t, cd]);
+            let (q, k) = gdn_qk(&conv, nk, dk, rep, cd, 0.088, 1e-6);
+            let (oq, ok) = (crate::empty(&ctx, t * nv * dk), crate::empty(&ctx, t * nv * dk));
+            crate::run(&ctx, OLD_GDN_QK_WGSL, "old_gdn_qk", &[conv.buf.as_ref(), &oq, &ok,
+                &crate::unibuf(&ctx, &[t as u32, nk as u32, dk as u32, rep as u32, cd as u32, 0.088f32.to_bits(), 1e-6f32.to_bits(), 0])],
+                crate::groups(t * nk * 2));
+            let bits = |b: &wgpu::Buffer| pollster::block_on(crate::readback(&ctx, b, t * nv * dk));
+            assert_eq!(bits(&oq).iter().map(|x| x.to_bits()).collect::<Vec<_>>(), pollster::block_on(q.to_vec()).iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "gdn_qk q t={t} dk={dk}");
+            assert_eq!(bits(&ok).iter().map(|x| x.to_bits()).collect::<Vec<_>>(), pollster::block_on(k.to_vec()).iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "gdn_qk k t={t} dk={dk}");
+            // gdn_post over [t, nv, dv] with dv = dk and z read from a proj of width pw at offset zo
+            let dv = dk; let zo = 5usize; let pw = zo + nv * dv + 3;
+            let o = Tensor::from_vec(&ctx, &rnd(t * nv * dv, 0.9), &[t, nv, dv]);
+            let proj = Tensor::from_vec(&ctx, &rnd(t * pw, 1.3), &[t, pw]);
+            let norm = Tensor::from_vec(&ctx, &rnd(dv, 2.1).iter().map(|x| 1.0 + 0.2 * x).collect::<Vec<_>>(), &[dv]);
+            let got = pollster::block_on(gdn_post(&o, &proj, &norm, zo, 1e-6).to_vec());
+            let want = crate::empty(&ctx, t * nv * dv);
+            crate::run(&ctx, OLD_GDN_POST_WGSL, "old_gdn_post", &[o.buf.as_ref(), proj.buf.as_ref(), norm.buf.as_ref(), &want,
+                &crate::unibuf(&ctx, &[t as u32, nv as u32, dv as u32, zo as u32, pw as u32, 1e-6f32.to_bits(), 0, 0])], crate::groups(t * nv));
+            let want = pollster::block_on(crate::readback(&ctx, &want, t * nv * dv));
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "gdn_post t={t} dv={dv}: not bit-identical");
+        }
     }
 }
