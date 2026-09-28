@@ -22,6 +22,9 @@ pub mod autograd; // reverse-mode autodiff (training)
 pub mod cpu; // strided CPU reference (validation source of truth)
 pub mod cpu_simd; // CPU vector-unit kernels + worker pool: the fabric's second compute unit
 pub mod iq_grids;
+pub mod iq_grids2; // IQ2_XS / IQ2_S / IQ3_S / IQ1_S grids for the raw-block kernels
+pub mod iq_raw; // IQ1_S / IQ1_M / IQ2_XS / IQ2_S / IQ3_S packed matmul
+pub mod gq; // grouped-int / FP8 / FP4 packed matmul for GPTQ, AWQ, compressed-tensors, FP8, ModelOpt
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)
 pub mod kvquant; // block-quantized KV cache: q8_0/q4_0/q4_1 blocks that grow one row at a time
