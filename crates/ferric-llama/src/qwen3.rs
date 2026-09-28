@@ -234,6 +234,39 @@ pub(crate) fn rope_inv_freq(base: f32, head_dim: usize, scale: &RopeScale) -> Ve
 /// the precision gates' can-fail demonstration, not a mode.
 pub(crate) fn rope_on_device() -> bool { std::env::var("FERRIC_ROPE_DEVICE").is_ok() }
 
+/// The NVIDIA tier derives its angles on the device (its formula before host tables) — under
+/// `FERRIC_ROPE_DEVICE`, like every path, or under `FERRIC_CUDA_ROPE_DEVICE`, which moves ONLY the native
+/// tier: `scripts/cuda_rope_conformance.sh`'s negative control, native-with-old-angles against a WGSL
+/// path that keeps the exact ones.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+fn native_rope_on_device() -> bool { rope_on_device() || std::env::var("FERRIC_CUDA_ROPE_DEVICE").is_ok() }
+
+/// **One position's rope cos and sin, the authors' way** — angle = the float32 product
+/// `f32(position) · inv` (their `inv_freq[None, :] * position_ids[:, :, None]` in float32), its cos and
+/// sin taken in f64 and rounded, then times `af` (LongRoPE's attention factor; 1 elsewhere). The ONE
+/// place the angles are made: the WGSL rope table and the NVIDIA tier's rope rows both call it, so the
+/// two paths rotate by the same float32 numbers and differ only in their kernels' arithmetic.
+pub(crate) fn rope_cos_sin(inv: &[f32], position: f32, af: f32, cv: &mut Vec<f32>, sv: &mut Vec<f32>) {
+    for &f in inv {
+        let a = (position * f) as f64;
+        cv.push(a.cos() as f32 * af);
+        sv.push(a.sin() as f32 * af);
+    }
+}
+
+/// The NVIDIA tier's rope rows for positions `first..first + t`: per row `[cos half | sin half]`.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+fn native_rope_rows(inv: &[f32], first: usize, t: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(t * 2 * inv.len());
+    let (mut c, mut s) = (Vec::with_capacity(inv.len()), Vec::with_capacity(inv.len()));
+    for r in 0..t {
+        c.clear(); s.clear();
+        rope_cos_sin(inv, (first + r) as f32, 1.0, &mut c, &mut s);
+        out.extend_from_slice(&c); out.extend_from_slice(&s);
+    }
+    out
+}
+
 /// Which rows a rope table covers: a run `start..start+t` (one sequence), or explicit per-row positions
 /// (batched decode, one row per sequence).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -652,7 +685,7 @@ impl Cache {
     /// Rows the NVIDIA tier holds that the WGSL store does not yet — `0` off-tier.
     pub fn native_ahead(&self) -> usize {
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(n) = &self.native { return n.kv.len.min(self.pos).saturating_sub(self.kv.first().map_or(0, |p| p.0.len())); }
+        if let Some(n) = &self.native { return n.kv.len.min(self.pos.saturating_sub(n.kv.base)).saturating_sub(self.kv.first().map_or(0, |p| p.0.len())); }
         0
     }
     /// Bring every row that exists only on the NVIDIA device into the WGSL store, so the cache can be
@@ -665,7 +698,8 @@ impl Cache {
             // ⚠ Rows past `pos` are DEAD — a caller that rewinds (a speculative step dropping rejected
             // drafts, `pos` set back by hand) leaves them on the device. Pulling them would hand the WGSL
             // path history the sequence never kept.
-            if n.kv.len > self.pos { n.kv.len = self.pos; }
+            let rows = self.pos.saturating_sub(n.kv.base);
+            if n.kv.len > rows { n.kv.len = rows; }
             let n = &*n;
             if self.fmt.is_some() { return; }
             let have = self.kv.first().map_or(0, |p| p.0.len());
@@ -974,7 +1008,7 @@ pub struct Qwen3 {
 /// every token.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 #[derive(Default)]
-enum NativeSlot { #[default] Untried, Refused, Ready(ferric_tensor::cuda::DecodeGraph) }
+enum NativeSlot { #[default] Untried, Refused, Ready(ferric_tensor::cuda::DecodeGraph, Option<Vec<f32>>) }
 /// Build one transformer layer from a weight source.
 ///
 /// Extracted from `Qwen3::load` unchanged, so a layer can also be built **on demand** from bytes a tier
@@ -1322,11 +1356,7 @@ impl Qwen3 {
         let (mut cv, mut sv) = (Vec::with_capacity(t * half), Vec::with_capacity(t * half));
         for r in 0..t {
             let p = match rows { RopeRows::Run(s, _) => (s + r) as f32, RopeRows::At(ps) => ps[r] as f32 };
-            for &f in &inv {
-                let a = (p * f) as f64;
-                cv.push(a.cos() as f32 * af);
-                sv.push(a.sin() as f32 * af);
-            }
+            rope_cos_sin(&inv, p, af, &mut cv, &mut sv);
         }
         let (c, sn) = (Tensor::from_vec(&self.ctx, &cv, &[t, half]), Tensor::from_vec(&self.ctx, &sv, &[t, half]));
         cache.push((key, c.clone(), sn.clone()));
@@ -2176,7 +2206,7 @@ impl Qwen3 {
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
         {
             let native = if tokens.len() == 1 { self.native_step(tokens[0], cache) } else { self.native_prefill(tokens, cache, true) };
-            if let Some(lg) = native { return lg; }
+            if let Some(lg) = native { return Tensor::from_vec(&self.ctx, &lg, &[tokens.len(), self.cfg.n_vocab]); }
         }
         if let Some(all) = self.longrope_refill(tokens, cache) {
             let x = self.run_layers(&all, cache);
@@ -2200,7 +2230,7 @@ impl Qwen3 {
         let refill;
         let tokens = match self.longrope_refill(tokens, cache) { Some(all) => { refill = all; &refill[..] } None => tokens };
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(lg) = self.native_prefill(tokens, cache, false) { return lg; }
+        if let Some(lg) = self.native_prefill(tokens, cache, false) { return Tensor::from_vec(&self.ctx, &lg, &[1, self.cfg.n_vocab]); }
         let x = self.run_layers(tokens, cache);
         let last = x.narrow(0, tokens.len() - 1, 1).contiguous();
         let out = batch(&self.ctx, || self.head(&last));
@@ -2208,10 +2238,39 @@ impl Qwen3 {
         out
     }
 
+    /// **[`Qwen3::forward_cached`] with the logits delivered to the HOST** — `[tokens.len(), n_vocab]`,
+    /// what a sampler reads. On the NVIDIA tier the device's logits land in host memory directly; on
+    /// the portable path this is `forward_cached(..).to_vec()`.
+    ///
+    /// ⛔ Every generate loop used to call `forward_cached(..).to_vec()`, and on the native tier that
+    /// meant: logits copied device → host, uploaded into a FRESH wgpu buffer (`Tensor::from_vec`), then
+    /// read straight back through a wgpu staging buffer and a map — two extra 0.5-0.6 MB transfers and a
+    /// queue round trip per token, for a row that was already on the host. Measured on the RTX 4050 in
+    /// the commit that added this.
+    pub fn forward_cached_host(&self, tokens: &[u32], cache: &mut Cache) -> Vec<f32> {
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        {
+            let native = if tokens.len() == 1 { self.native_step(tokens[0], cache) } else { self.native_prefill(tokens, cache, true) };
+            if let Some(lg) = native { return lg; }
+        }
+        pollster::block_on(self.forward_cached(tokens, cache).to_vec())
+    }
+
+    /// [`Qwen3::forward_cached_last`] with the logits on the HOST (`[n_vocab]`) — see
+    /// [`Qwen3::forward_cached_host`].
+    pub fn forward_cached_last_host(&self, tokens: &[u32], cache: &mut Cache) -> Vec<f32> {
+        if tokens.len() == 1 { return self.forward_cached_host(tokens, cache); }
+        // (A LongRoPE model is refused by `native_run`; `forward_cached_last` does its refill first.)
+        #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+        if let Some(lg) = self.native_prefill(tokens, cache, false) { return lg; }
+        let v = pollster::block_on(self.forward_cached_last(tokens, cache).to_vec());
+        v[v.len() - self.cfg.n_vocab..].to_vec()
+    }
+
     /// **Tier 2 decode step on the NVIDIA native path.** Builds the resident graph on first use from
     /// the WGSL-side weights (their CUDA mirrors were uploaded at load), brings this sequence's device
     /// K/V up to `cache.pos` (pushing only the rows the WGSL path wrote since), then runs the whole step
-    /// on the device: one `[d]` row in, one `[n_vocab]` row out.
+    /// on the device: one step block in, one `[n_vocab]` row out — returned as it landed, on the host.
     ///
     /// `None` = not eligible or not available; the caller falls back to WGSL, which is always correct —
     /// and is now always SAFE: a failed step leaves the device K/V untouched, and the WGSL path pulls
@@ -2224,38 +2283,48 @@ impl Qwen3 {
     /// single-shard Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 weights, head_dim a multiple of 32 up to 128.
     /// Everything else (YaRN's attention factor, softcaps, windows, logit scale, Gemma's norms,
     /// multimodal rope) stays on the portable path rather than being approximated.
+    ///
+    /// ⭐ The rope angles are the WGSL path's own: this step's cos|sin row is built on the host by
+    /// [`rope_cos_sin`] from [`rope_inv_freq`] — the device formula the tier used before sat, on the
+    /// WGSL path that had the same one, 18-109x the authors' float32 floor at position 30,000.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    fn native_step(&self, token: u32, cache: &mut Cache) -> Option<Tensor> {
+    fn native_step(&self, token: u32, cache: &mut Cache) -> Option<Vec<f32>> {
         ferric_tensor::cuda::driver()?;
         let row = self.embed_rows(&[token], true);
-        let logits = self.native_run(cache, |g, kv| g.step(kv, &row))?;
+        let logits = self.native_run(cache, |g, kv, inv| {
+            let rope = inv.map(|inv| native_rope_rows(inv, kv.base + kv.len, 1));
+            g.step(kv, &row, rope.as_deref())
+        })?;
         cache.pos += 1;
-        Some(Tensor::from_vec(&self.ctx, &logits, &[1, self.cfg.n_vocab]))
+        Some(logits)
     }
 
     /// **A multi-token forward on the NVIDIA tier** — the prompt's matmuls on the tensor cores
-    /// (`DecodeGraph::prefill`). `all` = logits for every row (`forward_cached`), else the last row only
-    /// (`forward_cached_last`). `FERRIC_CUDA_NO_PREFILL` keeps prefill on WGSL (native decode only) —
-    /// the A/B switch, since this path rounds activations to f16 on their way into the tensor cores.
+    /// (`DecodeGraph::prefill`). `all` = logits for every row (`[T, n_vocab]`), else the last row only.
+    /// `FERRIC_CUDA_NO_PREFILL` keeps prefill on WGSL (native decode only) — the A/B switch.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    fn native_prefill(&self, tokens: &[u32], cache: &mut Cache, all: bool) -> Option<Tensor> {
+    fn native_prefill(&self, tokens: &[u32], cache: &mut Cache, all: bool) -> Option<Vec<f32>> {
         ferric_tensor::cuda::driver()?;
         if std::env::var("FERRIC_CUDA_NO_PREFILL").is_ok() { return None; }
         let rows = self.embed_rows(tokens, true);
-        let logits = self.native_run(cache, |g, kv| g.prefill(kv, &rows, all))?;
+        let logits = self.native_run(cache, |g, kv, inv| {
+            let rope = inv.map(|inv| native_rope_rows(inv, kv.base + kv.len, tokens.len()));
+            g.prefill(kv, &rows, rope.as_deref(), all)
+        })?;
         cache.pos += tokens.len();
-        Some(Tensor::from_vec(&self.ctx, &logits, &[if all { tokens.len() } else { 1 }, self.cfg.n_vocab]))
+        Some(logits)
     }
 
     /// Build (or refuse, once) the graph, attach this cache's device K/V, bring it up to `cache.pos`,
-    /// then run `f`. The caller advances `cache.pos` on `Some`.
+    /// then run `f` with the graph, the K/V and the host inverse frequencies (`None` = device angles).
+    /// The caller advances `cache.pos` on `Some`.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
     fn native_run<R>(&self, cache: &mut Cache,
-                     f: impl FnOnce(&mut ferric_tensor::cuda::DecodeGraph, &mut ferric_tensor::cuda::DevKv) -> Option<R>) -> Option<R> {
+                     f: impl FnOnce(&mut ferric_tensor::cuda::DecodeGraph, &mut ferric_tensor::cuda::DevKv, Option<&[f32]>) -> Option<R>) -> Option<R> {
         use ferric_tensor::cuda::DecodeGraph;
         // The resident graph has no LoRA: an adapted sequence stays on the portable path (decode AND prefill).
         // Nor LongRoPE: its table switch at original_max_position_embeddings recomputes the cache on the
-        // portable path (`longrope_refill`), and the graph's angles are the base table's.
+        // portable path (`longrope_refill`), and the native rope rows are the base table's.
         if cache.fmt.is_some() || !cache.lora.is_empty() || self.longrope.is_some() { return None; }
         let mut slot = self.native.borrow_mut();
         if let NativeSlot::Untried = *slot {
@@ -2265,34 +2334,46 @@ impl Qwen3 {
                     None => { eprintln!("cuda: native decode graph could not be built (a shape the kernels do not cover, \
                                          or no PTX/memory) — WGSL runs"); NativeSlot::Refused }
                     Some(g) => {
-                        eprintln!("cuda: tier-2 resident decode graph built on {} ({} layers, KV grows on demand)",
-                                  ferric_tensor::cuda::device_name().unwrap_or_default(), self.layers.len());
-                        NativeSlot::Ready(g)
+                        eprintln!("cuda: tier-2 resident decode graph built on {} ({} layers, KV grows on demand, rope angles {})",
+                                  ferric_tensor::cuda::device_name().unwrap_or_default(), self.layers.len(),
+                                  if g.rope_host() { "from the host table" } else { "derived on the device (FERRIC_ROPE_DEVICE / FERRIC_CUDA_ROPE_DEVICE)" });
+                        // The same inverse frequencies `rope_table` uses; LongRoPE was refused above.
+                        let inv = g.rope_host().then(|| rope_inv_freq(self.cfg.rope_base, self.cfg.head_dim, &self.rope_scale));
+                        NativeSlot::Ready(g, inv)
                     }
                 },
             };
         }
-        let NativeSlot::Ready(g) = &mut *slot else { return None };
+        let NativeSlot::Ready(g, inv) = &mut *slot else { return None };
         if cache.native.is_none() {
             cache.native = Some(NativeKv { kv: g.new_kv()?, ctx: self.ctx.clone() });
         }
         let n = cache.native.as_mut().unwrap();
         let pos = cache.pos;
-        if n.kv.len > pos { n.kv.len = pos; }          // the caller rewound `pos`: rows past it are dead
-        if n.kv.len < pos {
+        // Rows the WGSL store holds. With no rows on the device, re-derive where row 0 sits: a cache that
+        // starts at position P with no history (`lm_logits`' position offset — the floor fixtures) has
+        // pos − have = P; every conversation has 0.
+        let have = cache.kv.first().map_or(0, |p| p.0.len());
+        if n.kv.len == 0 {
+            if have > pos { return None; }
+            n.kv.base = pos - have;
+        }
+        if pos < n.kv.base { return None; }            // rewound past the device cache's first row
+        let rows = pos - n.kv.base;
+        if n.kv.len > rows { n.kv.len = rows; }        // the caller rewound `pos`: rows past it are dead
+        if n.kv.len < rows {
             // Rows the WGSL path wrote since the device last saw this sequence (a WGSL prefill, a
             // prefix-cache seed, a batched step). They must ALL be there, or the push has nothing to copy.
-            let have = cache.kv.first().map_or(0, |p| p.0.len());
-            if have < pos || !n.kv.reserve(pos + 1) { return None; }
-            let (from, cnt) = (n.kv.len, pos - n.kv.len);
+            if have < rows || !n.kv.reserve(rows + 1) { return None; }
+            let (from, cnt) = (n.kv.len, rows - n.kv.len);
             for il in 0..self.cfg.n_layer {
                 let (kb, vb) = &cache.kv[il];
                 let rows = |b: &KvBuf| pollster::block_on(b.view(&self.ctx).narrow(0, from, cnt).contiguous().to_vec());
                 if !n.kv.write_rows(il, from, &rows(kb), &rows(vb)) { return None; }
             }
-            n.kv.len = pos;
+            n.kv.len = rows;
         }
-        f(g, &mut n.kv)
+        f(g, &mut n.kv, inv.as_deref())
     }
 
     /// The host-side description of this model for [`ferric_tensor::cuda::DecodeGraph::build`], or the
@@ -2337,7 +2418,7 @@ impl Qwen3 {
         Ok(GraphSpec {
             d: c.n_embd, nh: c.n_head, nkv: c.n_head_kv, dh: c.head_dim, n_ff: c.n_ff, n_vocab: c.n_vocab,
             eps: c.eps, rope_base: c.rope_base, has_qk_norm: qk_norm,
-            rope_ff: self.rope_freqs.as_ref().map(tv), norm_pairs,
+            rope_ff: self.rope_freqs.as_ref().map(tv), norm_pairs, rope_host: !native_rope_on_device(),
             layers, out_norm: tv(&self.out_norm), lm_head: nw(&self.lm_head, "the LM head")?,
         })
     }

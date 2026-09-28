@@ -2,8 +2,10 @@
 //!
 //!   phase_bench <model.gguf> [prompt 512] [decode 128] [reps 5]
 //!
-//! Each rep: a fresh cache, one prefill of `prompt` tokens (`forward_cached_last`, as a server does),
-//! then `decode` greedy steps reading the logits back each step. Prints per-rep times, the median
+//! Each rep: a fresh cache, one prefill of `prompt` tokens (`forward_cached_last_host`, as a server
+//! does), then `decode` greedy steps reading the logits on the host each step (`forward_cached_host`).
+//! `PHASE_TENSOR_LOGITS=1` takes the logits the old way instead — `forward_cached(..).to_vec()`, a wgpu
+//! Tensor round trip per token — so the host-logits path can be measured against it in one binary. Prints per-rep times, the median
 //! tok/s of each phase (llama-bench's pp512 / tg128 shape by default), and `MARK <phase> <begin|end>
 //! <unix_ns>` lines on stderr so `scripts/cuda_phase_joules.py` can integrate board power over exactly
 //! those windows. Run it with and without FERRIC_CUDA to compare the native tier with WGSL on one box.
@@ -32,15 +34,18 @@ async fn run() {
     // A fixed pseudo-prompt: throughput does not depend on WHICH ids, and this needs no tokenizer.
     let prompt: Vec<u32> = (0..n as u32).map(|i| 100 + (i * 7919) % 20000).collect();
     let am = |v: &[f32]| (0..nv).max_by(|&x, &y| v[v.len() - nv + x].partial_cmp(&v[v.len() - nv + y]).unwrap()).unwrap() as u32;
+    let tensor_logits = std::env::var("PHASE_TENSOR_LOGITS").is_ok();
+    let last = |c: &mut Cache| if tensor_logits { pollster::block_on(m.forward_cached_last(&prompt, c).to_vec()) } else { m.forward_cached_last_host(&prompt, c) };
+    let step = |t: u32, c: &mut Cache| if tensor_logits { pollster::block_on(m.forward_cached(&[t], c).to_vec()) } else { m.forward_cached_host(&[t], c) };
+    println!("logits    : {}", if tensor_logits { "forward_cached(..).to_vec() — a wgpu Tensor round trip (PHASE_TENSOR_LOGITS)" } else { "host (forward_cached_host)" });
     // Warm-up: compile every pipeline / JIT every kernel both phases use.
-    { let mut c = Cache::new(&m.cfg); let v = m.forward_cached_last(&prompt, &mut c).to_vec().await;
-      let _ = m.forward_cached(&[am(&v)], &mut c).to_vec().await; }
+    { let mut c = Cache::new(&m.cfg); let v = last(&mut c); let _ = step(am(&v), &mut c); }
     let (mut tp, mut td, mut ids) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..reps {
         let mut c = Cache::new(&m.cfg);
         mark("prefill", "begin");
         let t0 = Instant::now();
-        let v = m.forward_cached_last(&prompt, &mut c).to_vec().await;
+        let v = last(&mut c);
         tp.push(t0.elapsed().as_secs_f64());
         mark("prefill", "end");
         let mut tok = am(&v);
@@ -48,7 +53,7 @@ async fn run() {
         mark("decode", "begin");
         let t1 = Instant::now();
         for _ in 0..d {
-            let v = m.forward_cached(&[tok], &mut c).to_vec().await;
+            let v = step(tok, &mut c);
             tok = am(&v); generated.push(tok);
         }
         td.push(t1.elapsed().as_secs_f64());
@@ -62,5 +67,6 @@ async fn run() {
     println!("  DECODE_TOKS_PER_S {:.1}  (median of {reps})", d as f64 / median(td));
     println!("  last rep's greedy ids (first 24): {:?}", &ids[..ids.len().min(24)]);
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-    println!("  native steps {}  native prefill rows {}", ferric_tensor::cuda::native_steps(), ferric_tensor::cuda::native_prefill_rows());
+    println!("  native steps {}  native prefill rows {}  graph replays {}", ferric_tensor::cuda::native_steps(),
+             ferric_tensor::cuda::native_prefill_rows(), ferric_tensor::cuda::native_graph_steps());
 }

@@ -407,21 +407,26 @@ extern "C" __global__ void q5_0_swiglu_gemv(GEMV_ARGS) { swiglu_t<4>(x, codes, a
 //                 0 = NEOX split-half, partners (c, c + dh/2). The frequency index is c in both.
 //                 ⛔ The wrong pairing is the classic silent RoPE failure: finite logits, fluent text.
 //    ROWS: blockIdx.y is the row (prefill); row i sits at position pos + i, reads qkv row i (width
-//    row_w) and writes q/k row i and cache row i. Decode launches gridDim.y = 1 (row 0, same math). ──
-extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
-                                        const float* __restrict__ kw, float* __restrict__ qo,
-                                        float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
-                                        float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
-                                        unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
-                                        unsigned v_off, const float* __restrict__ bias,
-                                        const float* __restrict__ ff, unsigned norm_pairs, unsigned row_w) {
-    __shared__ float red[4]; __shared__ float s_inv;
-    const unsigned id = blockIdx.x, t = threadIdx.x, row = blockIdx.y;
+//    row_w) and writes q/k row i and cache row i. Decode launches gridDim.y = 1 (row 0, same math).
+//
+//    ⭐ THE ANGLES. `tab` [rows, dh] = cos of each pair's angle in [0, dh/2), sin in [dh/2, dh), built on
+//    the HOST exactly as the WGSL path builds its rope table (qwen3.rs `rope_table`: the authors' float32
+//    inverse frequencies from `rope_inv_freq`, angle = f32(position) · inv, cos/sin in f64 then rounded).
+//    ⛔ The device formula below (`tab` null) is what this kernel did before: `expf(-2c/dh · logf(base))`
+//    misses the authors' float32 inverse frequency by a few ulp, and the position multiplies that — at
+//    position 30,000 the WGSL path's copy of it sat 18-109x the authors' float32-vs-float64 distance.
+//    It stays reachable (FERRIC_CUDA_ROPE_DEVICE / FERRIC_ROPE_DEVICE) as the gates' negative control. ──
+__device__ __forceinline__ void qk_norm_rope_row(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                                 const float* __restrict__ kw, float* __restrict__ qo,
+                                                 float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                                 float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
+                                                 unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
+                                                 unsigned v_off, const float* __restrict__ bias,
+                                                 const float* __restrict__ ff, unsigned norm_pairs,
+                                                 const float* __restrict__ tab, float* red, float& s_inv) {
+    const unsigned id = blockIdx.x, t = threadIdx.x;
     const bool is_k = id >= nh;
     const unsigned head = is_k ? id - nh : id;
-    qkv += (size_t)row * row_w; qo += (size_t)row * nh * dh; ko += (size_t)row * nkv * dh; pos += row;
-    if (kc_row != 0) kc_row += (size_t)row * nkv * dh;
-    if (vc_row != 0) vc_row += (size_t)row * nkv * dh;
     const unsigned so = (is_k ? k_off : q_off) + head * dh;
     const float* src = qkv + so;
     const float* bsrc = bias != 0 ? bias + so : 0;
@@ -442,9 +447,14 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
     if (t < half) {
         const unsigned c = t;
         const unsigned p0 = norm_pairs ? 2u * c : c, p1 = norm_pairs ? 2u * c + 1u : c + half;
-        float fr = expf(-2.f * (float)c / (float)dh * logf(base));
-        if (ff != 0) fr = fr * ff[c];
-        const float ang = (float)pos * fr, cs = cosf(ang), sn = sinf(ang);
+        float cs, sn;
+        if (tab != 0) { cs = tab[c]; sn = tab[half + c]; }
+        else {
+            float fr = expf(-2.f * (float)c / (float)dh * logf(base));
+            if (ff != 0) fr = fr * ff[c];
+            const float ang = (float)pos * fr;
+            cs = cosf(ang); sn = sinf(ang);
+        }
         const float w1 = has_norm ? w[p0] : 1.f, w2 = has_norm ? w[p1] : 1.f;
         const float a = bsrc != 0 ? src[p0] + bsrc[p0] : src[p0];
         const float b = bsrc != 0 ? src[p1] + bsrc[p1] : src[p1];
@@ -458,6 +468,47 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
         vc_row[head * dh + t] = bias != 0 ? qkv[vi] + bias[vi] : qkv[vi];
     }
 }
+extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                        const float* __restrict__ kw, float* __restrict__ qo,
+                                        float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                        float base, unsigned pos, float eps, unsigned q_off, unsigned k_off,
+                                        unsigned has_norm, float* __restrict__ kc_row, float* __restrict__ vc_row,
+                                        unsigned v_off, const float* __restrict__ bias,
+                                        const float* __restrict__ ff, unsigned norm_pairs, unsigned row_w,
+                                        const float* __restrict__ tab) {
+    __shared__ float red[4]; __shared__ float s_inv;
+    const unsigned row = blockIdx.y;
+    qkv += (size_t)row * row_w; qo += (size_t)row * nh * dh; ko += (size_t)row * nkv * dh; pos += row;
+    if (kc_row != 0) kc_row += (size_t)row * nkv * dh;
+    if (vc_row != 0) vc_row += (size_t)row * nkv * dh;
+    if (tab != 0) tab += (size_t)row * dh;
+    qk_norm_rope_row(qkv, qw, kw, qo, ko, nh, nkv, dh, base, pos, eps, q_off, k_off, has_norm, kc_row, vc_row,
+                     v_off, bias, ff, norm_pairs, tab, red, s_inv);
+}
+
+// ── THE STEP BLOCK: what changes from one decode token to the next, read from DEVICE memory so a
+//    CUDA graph captured once replays every later token unchanged (cuda.rs `DecodeGraph::step`).
+//    u32 words: [0] the row this token writes (= rows already cached), [1] its absolute position,
+//    [2..4) pad, then 2·n_layer u64 K/V base pointers (K of layer l at [l], V at [n_layer + l]) — the
+//    cache is per SEQUENCE and regrows by reallocation, so its addresses cannot be graph constants.
+//    The rope row and the input x row follow; the host fills the whole block and ONE copy moves it. ──
+#define STEP_KVP(step) (reinterpret_cast<const unsigned long long*>((step) + 4))
+extern "C" __global__ void qk_norm_rope_step(const float* __restrict__ qkv, const float* __restrict__ qw,
+                                             const float* __restrict__ kw, float* __restrict__ qo,
+                                             float* __restrict__ ko, unsigned nh, unsigned nkv, unsigned dh,
+                                             float base, float eps, unsigned q_off, unsigned k_off,
+                                             unsigned has_norm, unsigned v_off, const float* __restrict__ bias,
+                                             const float* __restrict__ ff, unsigned norm_pairs,
+                                             const float* __restrict__ tab, const unsigned* __restrict__ step,
+                                             unsigned li, unsigned nl) {
+    __shared__ float red[4]; __shared__ float s_inv;
+    const unsigned row = step[0], pos = step[1];
+    const size_t ro = (size_t)row * nkv * dh;
+    float* kc_row = reinterpret_cast<float*>(STEP_KVP(step)[li]) + ro;
+    float* vc_row = reinterpret_cast<float*>(STEP_KVP(step)[nl + li]) + ro;
+    qk_norm_rope_row(qkv, qw, kw, qo, ko, nh, nkv, dh, base, pos, eps, q_off, k_off, has_norm, kc_row, vc_row,
+                     v_off, bias, ff, norm_pairs, tab, red, s_inv);
+}
 
 // ── Fused single-query attention over an [S, nkv*dh] K/V cache: one block (128 threads = 4 warps)
 //    per q-head, GQA head -> kv head, chunked online softmax. dh <= 128.
@@ -467,9 +518,9 @@ extern "C" __global__ void qk_norm_rope(const float* __restrict__ qkv, const flo
 //    lanes x 4 dh elements, shuffle-reduced), warps reduce max/sum with one shuffle tree each, and V is
 //    accumulated per warp over a strided key subset (lane covers 4 consecutive dh elements: coalesced
 //    128 B per key per warp), then combined across the 4 warps once. Mirrors FUSED_ATTN_WGSL's math. ──
-extern "C" __global__ void attn_decode(const float* __restrict__ q, const float* __restrict__ k,
-                                       const float* __restrict__ v, float* __restrict__ out,
-                                       unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+__device__ __forceinline__ void attn_decode_body(const float* __restrict__ q, const float* __restrict__ k,
+                                                 const float* __restrict__ v, float* __restrict__ out,
+                                                 unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
     __shared__ float sc[2048];
     __shared__ float red[4];
     __shared__ float vacc[4][128];
@@ -521,6 +572,18 @@ extern "C" __global__ void attn_decode(const float* __restrict__ q, const float*
     for (unsigned e = 0u; e < dpl; ++e) vacc[warp][lane * dpl + e] = acc[e];
     __syncthreads();
     if (t < dh) out[head * dh + t] = (vacc[0][t] + vacc[1][t] + vacc[2][t] + vacc[3][t]) / l_run;
+}
+extern "C" __global__ void attn_decode(const float* __restrict__ q, const float* __restrict__ k,
+                                       const float* __restrict__ v, float* __restrict__ out,
+                                       unsigned nh, unsigned nkv, unsigned dh, unsigned s, float scale) {
+    attn_decode_body(q, k, v, out, nh, nkv, dh, s, scale);
+}
+// The graph's attention: this layer's K/V base and the key count come from the step block.
+extern "C" __global__ void attn_decode_step(const float* __restrict__ q, float* __restrict__ out,
+                                            unsigned nh, unsigned nkv, unsigned dh, float scale,
+                                            const unsigned* __restrict__ step, unsigned li, unsigned nl) {
+    attn_decode_body(q, reinterpret_cast<const float*>(STEP_KVP(step)[li]),
+                     reinterpret_cast<const float*>(STEP_KVP(step)[nl + li]), out, nh, nkv, dh, step[0] + 1u, scale);
 }
 
 

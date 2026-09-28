@@ -53,18 +53,24 @@ async fn run() {
     // LongRoPE's switch, and the rows from N on must equal the authors' full prefill of the whole text
     // (causal attention, one table): the cache recomputed at the crossing, not extended stale.
     let decode_from: Option<usize> = std::env::var("FERRIC_LM_DECODE_FROM").ok().map(|v| v.parse().expect("FERRIC_LM_DECODE_FROM"));
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    let (steps0, rows0, graph0) = (ferric_tensor::cuda::native_steps(), ferric_tensor::cuda::native_prefill_rows(), ferric_tensor::cuda::native_graph_steps());
     let lg = if let Some(n) = decode_from {
-        assert!(offset == 0 && n > 0 && n < ids.len(), "FERRIC_LM_DECODE_FROM={n} needs 0 < N < {} tokens, offset 0", ids.len());
+        // With a position offset too (dense runtime): the cache starts at P, the first N ids are one
+        // forward and the rest are decode steps at P+N.. — how `scripts/cuda_rope_conformance.sh` puts
+        // the NVIDIA tier's DECODE step at position 30,000 without a 30k-token prefill.
+        assert!(n > 0 && n < ids.len(), "FERRIC_LM_DECODE_FROM={n} needs 0 < N < {} tokens", ids.len());
         let m = Qwen3::load(&ctx, &g).expect("load");
         let mut cache = ferric_llama::qwen3::Cache::new(&m.cfg);
-        let mut lg = m.forward_cached(&ids[..n], &mut cache).to_vec().await;
-        for &t in &ids[n..] { lg.extend(m.forward_cached(&[t], &mut cache).to_vec().await); }
+        cache.pos = offset;
+        let mut lg = m.forward_cached_host(&ids[..n], &mut cache);
+        for &t in &ids[n..] { lg.extend(m.forward_cached_host(&[t], &mut cache)); }
         lg
     } else if offset > 0 {
         let m = Qwen3::load(&ctx, &g).expect("load");
         let mut cache = ferric_llama::qwen3::Cache::new(&m.cfg);
         cache.pos = offset;
-        m.forward_cached(&ids, &mut cache).to_vec().await
+        m.forward_cached_host(&ids, &mut cache)
     } else if arch.starts_with("qwen35") {
         Qwen35::load(&ctx, &g).expect("load qwen35").forward(&ids).to_vec().await
     } else if arch == "nemotron_h" {
@@ -101,4 +107,9 @@ async fn run() {
         let s: Vec<String> = sample.iter().map(|&i| format!("{:.5}", r[i as usize])).collect();
         println!("ROW {t} {best} {sum:.4} {ssq:.4} {}", s.join(" "));
     }
+    // What the NVIDIA tier served (all zero without FERRIC_CUDA) — a gate must check it, since a WGSL
+    // fallback prints the same kind of rows.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    println!("NATIVE {} {} {}", ferric_tensor::cuda::native_steps() - steps0, ferric_tensor::cuda::native_prefill_rows() - rows0,
+             ferric_tensor::cuda::native_graph_steps() - graph0);
 }

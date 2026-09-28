@@ -51,7 +51,7 @@ async fn run() {
     println!("prompt    : {}", ids.iter().map(|&t| name(t)).collect::<Vec<_>>().join("|"));
 
     let mut c = Cache::new(&m.cfg);
-    let logits = m.forward_cached(&ids, &mut c).to_vec().await;
+    let logits = m.forward_cached_host(&ids, &mut c);
     let last = &logits[logits.len() - vn..];
 
     // Finiteness first: a NaN anywhere means a kernel produced garbage, and every "the model is
@@ -81,7 +81,7 @@ async fn run() {
     let t_dec = std::time::Instant::now();
     for _ in 0..n {
         out.push(next);
-        let l = m.forward_cached(&[next], &mut c).to_vec().await;
+        let l = m.forward_cached_host(&[next], &mut c);
         next = am(&l);
     }
     let dt = t_dec.elapsed();
