@@ -2082,6 +2082,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     let opts = match eng.gen_opts(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let empty = vec![];
     if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
+    // The constraint too (a schema the converter refuses, a GBNF that does not parse): a stream's headers go
+    // out before generation resolves it. The compiled grammar is kept, so generation finds it again.
+    if constrain::asks_for_constraint(&req) && let Err(e) = eng.constraint(&req) { return bad_request(stream, &e); }
     let has_tools = req["tools"].as_array().is_some_and(|t| !t.is_empty()) || !mcps.borrow().openai_tools().is_empty();
     if opts.n > 1 { return chat_n(eng, mcps, stream, &req, opts.n, has_tools, opts.logprobs); }
     let id = "chatcmpl-ferric";
