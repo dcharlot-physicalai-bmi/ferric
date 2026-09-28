@@ -12,7 +12,7 @@ Every feature Ferric lacks or has only in part, most widely shipped first. Preva
 |---|---|---|---|---|
 | E13 | Multi-host / RPC distributed inference | 6/6 | partial | Remote devices execute single ops (bmm, linear_relu) shipped as host buffers, not model shards. No LLM inference has run across hosts. Same gap as E12. |
 | O06 | Install via package manager (brew / pip / cargo / winget) | 13/14 | partial | `cargo install ferric-serve` works but installs a 6-week-old build: 2 of today's 7 runtimes, no continuous batching, no /v1/rerank. On PyPI the name 'ferric' belongs to an unrelated project (0.1.0rc5, 'a Rust-native quan |
-| B01 | NVIDIA CUDA | 16.5/18 | partial | 9190710 (merged): dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 (whole Q4_K_M/Q5_K_M/Q8_0 files), q/k/v bias,  |
+| B01 | NVIDIA CUDA | 16.5/18 | partial | 59906e7 (merged feat/cuda2 d910414): native NVIDIA decode as ONE CUDA graph replayed per token + host logits, split-K (flash-decoding) attention, int8 tensor-core prefill GEMM v3 (activations as three int8 digits of a 22 |
 | E19 | Rope scaling for long context (YaRN, linear, NTK, LongRoPE) | 16/18 | partial | 87c1f6b linear + 210382c: Phi-3 LongRoPE (short/long tables switched at the authors' rule, attn_factor, cache recomputed across the switch) = the authors within 1.5-2.3x their f32 floor; decoder angles built on the host, |
 | E21 | Attention sinks | 14.5/18 | partial | Only the MLA path (hyv4) carries sinks; the dense/hybrid runtimes do not, and gpt-oss (the common sink model) is not a registered architecture. StreamingLLM-style sink-token retention during context shift is absent. |
 | E29 | Sampling on GPU | 14/18 | absent | Logits are read back (~608 KB/token, measured 0.45 ms, docs/RUNTIME-PARITY-2026.md) and sampled on the host: crates/ferric-serve/src/lib.rs:891 sample_top_p. The only GPU top-k kernel is MoE routing (crates/ferric-tensor |
@@ -156,7 +156,7 @@ Not on the feature list, and measured by the audit: **none of the 14 serving pee
 | E19 | Rope scaling for long context (YaRN, linear, NTK, LongRoPE) | 16/18 | partial | 87c1f6b linear + 210382c: Phi-3 LongRoPE (short/long tables switched at the authors' rule, attn_factor, cache recomputed across the switch) = the authors within |
 | E20 | Sliding-window attention | 16.5/18 | verified | gemma2 and gemma4 rows are Loads, not reference-verified. |
 | E21 | Attention sinks | 14.5/18 | partial | Only the MLA path (hyv4) carries sinks; the dense/hybrid runtimes do not, and gpt-oss (the common sink model) is not a registered architecture. StreamingLLM-sty |
-| E22 | Kernel fusion / CUDA-graph-style launch reduction | 17.5/18 | verified | No graph capture (CUDA graphs measured at ~0.2 ms of a 9.3 ms step on the RTX 4050 and not pursued, docs/sota-2026-09-10.md:295-305). Cutting 29% of dispatches  |
+| E22 | Kernel fusion / CUDA-graph-style launch reduction | 17.5/18 | verified | 59906e7: CUDA graphs now used — the native decode step is one captured graph replayed for every token of every sequence (all per-token inputs in one pinned step |
 | E23 | Disaggregated prefill / decode | 6/18 | absent | Listed as still open in docs/RUNTIME-PARITY-2026.md ('matters at multi-GPU scale, which is not Ferric's near-term shape'). |
 | E24 | Hybrid SSM / linear-attention state caching (Mamba2, GatedDeltaNet) | 16/18 | verified | nemotron_h state is 85.4 MB and does not grow with the conversation (arch.rs:168-170). State survives across requests only through ferric-serve's one-slot prefi |
 | E25 | Multi-LoRA batched serving | 8/18 | verified | 8a42c8b: forward_batch applies EACH ROW's LoRA selection; rows a/b/none match PEFT's adapter_names mixed batch at 0.77x its float32 floor (scripts/lora_conforma |
@@ -191,7 +191,7 @@ Not on the feature list, and measured by the audit: **none of the 14 serving pee
 
 | id | feature | peers with it | Ferric | note |
 |---|---|---|---|---|
-| B01 | NVIDIA CUDA | 16.5/18 | partial | 9190710 (merged): dense runtime natively on NVIDIA end to end — decode AND prefill (tensor-core GEMM, integer weight codes + split f16 activations), Q4_K/Q5_K/Q |
+| B01 | NVIDIA CUDA | 16.5/18 | partial | 59906e7 (merged feat/cuda2 d910414): native NVIDIA decode as ONE CUDA graph replayed per token + host logits, split-K (flash-decoding) attention, int8 tensor-co |
 | B02 | AMD ROCm / HIP | 8.5/18 | absent | docs/sota-feature-matrix.md §B: 'ROCm native ❌ / AMD via Vulkan; AITER/CK unused'. |
 | B03 | Apple Metal | 13/18 | verified | 5a1f7a6: + quantized prefill on the M5 matrix units (FERRIC_QGEMM, opt-in: Q8_0/Q5_0/Q4_K/Q6_K tiles → fp16 → mpp matmul2d), prefill 10-20x (0.5B Q8_0 ~500 → 5, |
 | B04 | Vulkan | 6.5/18 | verified | The f32 8x8 coop kernel returns all zeros on NVIDIA Vulkan and is gated off there (lib.rs:69-80). |
