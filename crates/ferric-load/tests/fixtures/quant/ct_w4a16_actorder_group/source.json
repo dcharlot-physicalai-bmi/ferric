@@ -1,0 +1,7 @@
+{
+ "source": "RedHatAI/Qwen2.5-0.5B-quantized.w4a16",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "compressed-tensors 0.11.0 pack-quantized decompress (scale float32)",
+ "revision": "81996352fa5c5b2154927b2fc0b3f58cbe59ddcc"
+}

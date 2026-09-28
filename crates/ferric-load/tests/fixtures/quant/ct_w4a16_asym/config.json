@@ -1,0 +1,33 @@
+{
+ "quantization_config": {
+  "config_groups": {
+   "group_0": {
+    "input_activations": null,
+    "output_activations": null,
+    "targets": [
+     "Linear"
+    ],
+    "weights": {
+     "actorder": "weight",
+     "block_structure": null,
+     "dynamic": false,
+     "group_size": 64,
+     "num_bits": 4,
+     "observer": "mse",
+     "observer_kwargs": {},
+     "strategy": "group",
+     "symmetric": false,
+     "type": "int"
+    }
+   }
+  },
+  "format": "pack-quantized",
+  "global_compression_ratio": null,
+  "ignore": [
+   "lm_head"
+  ],
+  "kv_cache_scheme": null,
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed"
+ }
+}

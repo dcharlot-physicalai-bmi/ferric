@@ -1,0 +1,7 @@
+{
+ "source": "RedHatAI/Qwen3-0.6B-FP8-BLOCK",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 128,
+ "dequantizer": "compressed-tensors 0.19.0 float-quantized decompress (scale float32)",
+ "revision": "5def00c475640c0527e3a7067b1a26b94decefb5"
+}

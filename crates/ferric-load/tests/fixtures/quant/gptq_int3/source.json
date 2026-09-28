@@ -1,0 +1,7 @@
+{
+ "source": "PepitaxX/qwen3-0.6b-gptq",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "gptqmodel 7.5.0 convert_gptq_file (float32)",
+ "revision": "41d83798ec83cea273c641cc206d9df958abf847"
+}

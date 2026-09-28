@@ -1,0 +1,23 @@
+{
+ "quantization_config": {
+  "bits": 4,
+  "checkpoint_format": "gptq",
+  "desc_act": true,
+  "group_size": 128,
+  "lm_head": false,
+  "meta": {
+   "damp_auto_increment": 0.0025,
+   "damp_percent": 0.01,
+   "mse": 0.0,
+   "quantizer": [
+    "gptqmodel:2.1.1-dev"
+   ],
+   "static_groups": false,
+   "true_sequential": true,
+   "uri": "https://github.com/modelcloud/gptqmodel"
+  },
+  "pack_dtype": "int32",
+  "quant_method": "gptq",
+  "sym": true
+ }
+}

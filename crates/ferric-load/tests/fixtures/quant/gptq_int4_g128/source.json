@@ -1,0 +1,7 @@
+{
+ "source": "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "gptqmodel 7.5.0 convert_gptq_file (float32)",
+ "revision": "c34a4a91629f09f73a285f32dbd26106b033c654"
+}

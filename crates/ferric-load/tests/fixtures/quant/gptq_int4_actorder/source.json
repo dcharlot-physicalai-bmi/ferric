@@ -1,0 +1,7 @@
+{
+ "source": "viveksil/Qwen2.5-0.5B-Instruct-gptqmodel-4bit",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "gptqmodel 7.5.0 convert_gptq_file (float32)",
+ "revision": "cefb6d4f66629bb73b1f2a2b0838200009ac4fb5"
+}

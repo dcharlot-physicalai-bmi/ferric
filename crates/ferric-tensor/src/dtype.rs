@@ -1067,6 +1067,11 @@ pub enum QShard {
     Iq4Nl(Iq4NlWeights),
     Mxfp4(Mxfp4Weights),
     Nvfp4(Nvfp4Weights),
+    /// IQ1_S / IQ1_M / IQ2_XS / IQ2_S / IQ3_S, block bytes resident unchanged — see [`crate::iq_raw`].
+    IqRaw(crate::iq_raw::IqRawWeights),
+    /// Grouped-integer / FP8 / FP4 weights from GPTQ, AWQ, compressed-tensors, FP8 and ModelOpt
+    /// checkpoints — see [`crate::gq`].
+    Gq(crate::gq::GqWeights),
     /// 16-bit weights (F16 / BF16) kept 16-bit on the device — see [`HalfWeights`].
     Half(HalfWeights),
     /// Fallback for any GGUF quant with no native packed kernel yet (e.g. IQ4_NL): the weight
@@ -1095,8 +1100,8 @@ impl DenseWeight {
 }
 
 impl QShard {
-    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::Half(w) => w.rows, QShard::Dense(w) => w.rows } }
-    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::Half(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
+    fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::IqRaw(w) => w.rows, QShard::Gq(w) => w.rows, QShard::Half(w) => w.rows, QShard::Dense(w) => w.rows } }
+    fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::IqRaw(w) => w.nbytes(), QShard::Gq(w) => w.nbytes(), QShard::Half(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
         Ok(match ggml_type {
             2 => QShard::Q4_0(Q4_0Weights::from_bytes(ctx, bytes, rows, cols)),
@@ -1113,6 +1118,8 @@ impl QShard {
             23 => QShard::Iq4Xs(Iq4XsWeights::from_bytes(ctx, bytes, rows, cols)),
             39 => QShard::Mxfp4(Mxfp4Weights::from_bytes(ctx, bytes, rows, cols)),
             40 => QShard::Nvfp4(Nvfp4Weights::from_bytes(ctx, bytes, rows, cols)),
+            17 | 19 | 21 | 22 | 29 => QShard::IqRaw(crate::iq_raw::IqRawWeights::from_bytes(ctx, bytes, ggml_type, rows, cols)),
+            t if crate::gq::is_gq(t) => QShard::Gq(crate::gq::GqWeights::from_bytes(ctx, bytes, t, rows, cols)?),
             42 => QShard::Q2_0(Q2_0Weights::from_bytes(ctx, bytes, rows, cols)),
             43 => QShard::Stq1_0(Stq1_0Weights::from_bytes(ctx, bytes, rows, cols)),
             16 => QShard::Iq2Xxs(Iq2XxsWeights::from_bytes(ctx, bytes, rows, cols)),
@@ -1207,6 +1214,10 @@ impl QMatrix {
             43 => Some((256, 42)), // STQ1_0
             16 => Some((256, 66)), // IQ2_XXS
             18 => Some((256, 98)), // IQ3_XXS
+            // IQ2_XS / IQ2_S / IQ3_S / IQ1_S / IQ1_M: raw-block kernels (`iq_raw`)
+            t if crate::iq_raw::iq_raw_block_bytes(t).is_some() => Some((256, crate::iq_raw::iq_raw_block_bytes(t).unwrap())),
+            // Ferric's grouped format for safetensors quant checkpoints — the id encodes bits and group
+            t if crate::gq::is_gq(t) => crate::gq::block_bytes(t),
             _ => None,
         }
     }
@@ -1346,6 +1357,8 @@ impl Tensor {
             QShard::Iq4Nl(w) => self.matmul_iq4_nl(w),
             QShard::Mxfp4(w) => self.matmul_mxfp4(w),
             QShard::Nvfp4(w) => self.matmul_nvfp4(w),
+            QShard::IqRaw(w) => self.matmul_iq_raw(w),
+            QShard::Gq(w) => self.matmul_gq(w),
             QShard::Half(w) => self.matmul_half(w),
             QShard::Dense(w) => self.matmul(&w.wt),
         }
@@ -4789,6 +4802,10 @@ impl Tensor {
             .replace("__L__", &lanes.to_string())
             .replace("__OPW__", &opw.to_string())
             .replace("__LH__", &(lanes / 2).to_string());
+        // Negative control for scripts/quant_formats_conformance.sh: the E8M0 scale one binade high —
+        // 2^(e-127) where the doubled table needs 2^(e-128), the off-by-one this kernel's docs name.
+        let src = if std::env::var("FERRIC_IQ_CONTROL").as_deref() == Ok("mxfp4_bias") {
+            src.replace("let d = e8m0h(mxsc(bi));", "let d = e8m0h(mxsc(bi)) * vec2<f32>(2.0, 1.0);") } else { src };
         run(&self.ctx, &src, "matmul_mxfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
@@ -4823,6 +4840,10 @@ impl Tensor {
             .replace("__L__", &lanes.to_string())
             .replace("__OPW__", &opw.to_string())
             .replace("__LH__", &(lanes / 2).to_string());
+        // Negative control for scripts/quant_formats_conformance.sh: the UE4M3 scale without ggml's
+        // `* 0.5` — the named trap above. Must move a real NVFP4 model >= 20x the clean distance.
+        let src = if std::env::var("FERRIC_IQ_CONTROL").as_deref() == Ok("nvfp4_half") {
+            src.replace("return raw * 0.5;", "return raw;") } else { src };
         run(&self.ctx, &src, "matmul_nvfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
