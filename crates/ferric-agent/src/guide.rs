@@ -671,12 +671,36 @@ fn step_elem(item: &Item, ev: &mut ArrElem, b: u8) -> EO {
     }
 }
 
-/// A guided-decoding constraint: free-form-but-valid JSON, or schema-conformant JSON.
-#[derive(Clone, Copy)]
-pub enum Guide<'a> { Json(Json), Schema(Schema<'a>) }
+/// A guided-decoding constraint: free-form-but-valid JSON, schema-conformant JSON, or a GBNF grammar
+/// (which regex and choice constraints compile to — see `grammar`, `regex`).
+///
+/// `Clone`, not `Copy`: a grammar's state is a set of parse stacks. JSON and schema states still clone as
+/// a plain copy.
+#[derive(Clone)]
+pub enum Guide<'a> { Json(Json), Schema(Schema<'a>), Grammar(crate::grammar::Matcher) }
 impl<'a> Guide<'a> {
-    pub fn step(&mut self, b: u8) -> bool { match self { Guide::Json(j) => j.step(b), Guide::Schema(s) => s.step(b) } }
-    pub fn can_stop(&self) -> bool { match self { Guide::Json(j) => j.can_stop(), Guide::Schema(s) => s.can_stop() } }
+    /// Feed one byte of token TEXT. A grammar stack waiting for a whole token (`<[id]>`, `!<[id]>`) does
+    /// not survive a byte — see `commit` / `token_allowed` for tokens.
+    pub fn step(&mut self, b: u8) -> bool {
+        match self { Guide::Json(j) => j.step(b), Guide::Schema(s) => s.step(b), Guide::Grammar(m) => m.step(b) }
+    }
+    pub fn can_stop(&self) -> bool {
+        match self { Guide::Json(j) => j.can_stop(), Guide::Schema(s) => s.can_stop(), Guide::Grammar(m) => m.can_stop() }
+    }
+    /// Advance past a sampled token: its text bytes (`None` for a special token), and for a grammar its
+    /// id too, which a token element matches.
+    pub fn commit(&mut self, id: u32, bytes: Option<&[u8]>) {
+        match self {
+            Guide::Grammar(m) => { m.step_token(id, bytes.unwrap_or(&[])); }
+            g => if let Some(b) = bytes { for &c in b { g.step(c); } },
+        }
+    }
+    /// Whether a grammar stack waiting for a whole token accepts token `id` (always `false` otherwise):
+    /// the token path of the mask, unioned with the text path.
+    pub fn token_allowed(&self, id: u32) -> bool {
+        match self { Guide::Grammar(m) => m.token_allows(id), _ => false }
+    }
+    pub fn wants_token(&self) -> bool { matches!(self, Guide::Grammar(m) if m.wants_token()) }
 }
 
 #[cfg(test)]

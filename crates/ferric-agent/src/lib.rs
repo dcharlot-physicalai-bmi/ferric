@@ -8,4 +8,6 @@
 //! Nothing here touches the GPU, the tokenizer, or the network, so it compiles to wasm32 unchanged —
 //! the same guided decoding runs in a browser tab as on the server.
 pub mod guide;
+pub mod grammar;
+pub mod regex;
 pub mod tools;

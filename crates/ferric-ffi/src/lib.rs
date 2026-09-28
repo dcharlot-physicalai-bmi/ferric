@@ -80,7 +80,7 @@ impl FerricHandle {
                 let can_stop = g.can_stop();
                 let (mut best, mut bl) = (None, f32::NEG_INFINITY);
                 for i in 0..c.n_vocab {
-                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&ch| a.step(ch)) } _ => false } };
+                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = g.clone(); b.iter().all(|&ch| a.step(ch)) } _ => false } };
                     if ok && row[i] > bl { bl = row[i]; best = Some(i as u32); }
                 }
                 match best { Some(t) => t, None => break }

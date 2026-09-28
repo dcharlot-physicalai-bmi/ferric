@@ -59,6 +59,7 @@ mod ollama;
 mod models;
 mod images;
 mod vision;
+mod constrain;
 pub mod template;
 mod specgate;
 use genopts::{GenOpts, Emitter};
@@ -432,6 +433,8 @@ pub(crate) struct Engine {
     vision: Option<vision::Vision>,
     /// LoRA adapters named on the command line (`--lora name=path`), uploaded once: (name, adapter, card).
     adapters: Vec<(String, Arc<ferric_llama::lora::DeviceLora>, ollama::Card)>,
+    /// The vocabulary as a byte trie, built on the first constrained request (`constrain`).
+    trie: std::cell::OnceCell<constrain::Trie>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -678,7 +681,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx, vision: None, adapters: Vec::new() }
+                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default() }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -1084,7 +1087,7 @@ impl Engine {
             let row = &v[v.len() - n_vocab..];
             let Some(next) = self.select_token(row, &guide, &opts.sampling, prompt, &r#gen, &mut rng) else { finish = "stop"; break };
             if self.eos.contains(&next) { finish = "stop"; break; }
-            if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[next as usize].as_ref()) { for &c in b { g.step(c); } }
+            if let Some(g) = guide.as_mut() { g.commit(next, self.token_bytes[next as usize].as_deref()); }
             if opts.logprobs { lps.push(self.lp_entry(row, next, opts)); }
             r#gen.push(next);
             // Re-detok the whole generation and release only what is safe (multi-byte UTF-8, stop strings).
@@ -1179,14 +1182,10 @@ impl Engine {
     fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, s: &genopts::Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
         let n_vocab = row.len();
         if let Some(g) = guide.as_ref() {
-            let can_stop = g.can_stop();
+            let ok = self.allowed(g);
             let mut masked = vec![f32::NEG_INFINITY; n_vocab];
             let mut any = false;
-            for i in 0..n_vocab {
-                let ok = if self.eos.contains(&(i as u32)) { can_stop }
-                    else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&c| a.step(c)) } _ => false } };
-                if ok { masked[i] = row[i]; any = true; }
-            }
+            for i in 0..n_vocab { if ok[i] { masked[i] = row[i]; any = true; } }
             if !any { return None; } // no legal continuation (shouldn't happen for a valid schema)
             let tail = &prompt[prompt.len().saturating_sub(s.repeat_last_n)..];
             Some(genopts::sample(&masked, s, tail, generated, rng))
@@ -1234,7 +1233,7 @@ impl Engine {
         // would on a stop token, rolling back any cache entry this step's verify left unconfirmed.
         macro_rules! commit {
             ($tok:expr_2021, $row:expr_2021) => {{
-                if let (Some(g), Some(b)) = (guide.as_mut(), self.token_bytes[$tok as usize].as_ref()) { for &c in b { g.step(c); } }
+                if let Some(g) = guide.as_mut() { g.commit($tok, self.token_bytes[$tok as usize].as_deref()); }
                 if opts.logprobs { lps.push(self.lp_entry($row, $tok, opts)); }
                 r#gen.push($tok);
                 let full = if opts.with_specials { self.detok_all(&r#gen) } else { self.detok(&r#gen) };
@@ -1964,12 +1963,9 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         return Err("the tool loop did not settle in 4 rounds".into());
     }
 
-    // No tools → optional guided decoding.
-    let rf = req["response_format"]["type"].as_str().unwrap_or("");
-    let sch_prog = if rf == "json_schema" { ferric_agent::guide::compile(&req["response_format"]["json_schema"]["schema"]) } else { None };
-    let guide = if let Some(prog) = &sch_prog { Some(ferric_agent::guide::Guide::Schema(ferric_agent::guide::Schema::new(prog))) }
-        else if rf == "json_object" || rf == "json_schema" { Some(ferric_agent::guide::Guide::Json(ferric_agent::guide::Json::object())) }
-        else { None };
+    // No tools → optional constrained decoding (JSON, schema, GBNF, regex, choice — see `constrain`).
+    let spec = eng.constraint(req)?;
+    let guide = spec.guide();
     let (prompt, image) = eng.chat_prompt(&messages, None, &kwargs)?;
     opts.image = image;
     let max = eng.budget(prompt.len(), opts.max_tokens)?;
@@ -2075,6 +2071,8 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         return bad_request(stream, "`prompt` must be a string (arrays of prompts and token arrays are not accepted here)")
     };
     let opts = match eng.gen_opts(&req, false) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
+    // llama-server's `/completion` takes `grammar`; vLLM's completions take `guided_*` — both here.
+    let spec = match eng.constraint(&req) { Ok(s) => s, Err(e) => return bad_request(stream, &e) };
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.enc(prompt_text, true));
@@ -2082,7 +2080,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let cid = format!("cmpl-ferric-{}", ids.len());
     if req["stream"].as_bool() == Some(true) {
         write_sse_headers(stream);
-        let out = eng.generate(&ids, max, &opts, None, |delta, lps| {
+        let out = eng.generate(&ids, max, &opts, spec.guide(), |delta, lps| {
             let mut ch = json!({"index": 0, "text": delta, "finish_reason": Value::Null});
             if opts.logprobs { ch["logprobs"] = logprobs_field(false, lps); }
             send_sse(stream, &json!({"id": cid, "object": "text_completion", "created": now_unix(), "model": eng.name, "choices": [ch]}));
@@ -2096,7 +2094,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
         let _ = stream.write_all(b"data: [DONE]\n\n");
         return;
     }
-    let out = eng.generate(&ids, max, &opts, None, |_, _| {});
+    let out = eng.generate(&ids, max, &opts, spec.guide(), |_, _| {});
     let mut choice = json!({"index": 0, "text": out.text, "finish_reason": out.finish});
     if opts.logprobs { choice["logprobs"] = logprobs_field(false, &out.logprobs); }
     write_json(stream, 200, &json!({

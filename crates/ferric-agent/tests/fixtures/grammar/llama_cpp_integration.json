@@ -1,0 +1,1168 @@
+{
+ "source": "llama.cpp tests/test-grammar-integration.cpp @ 4da6337767f9",
+ "cases": [
+  {
+   "desc": "simple grammar",
+   "grammar": "\n            root ::= expr\n            expr ::= term (\"+\" term)*\n            term ::= number\n            number ::= [0-9]+",
+   "pass": [
+    [
+     {
+      "text": "42"
+     }
+    ],
+    [
+     {
+      "text": "1+2+3+4+5"
+     }
+    ],
+    [
+     {
+      "text": "123+456"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "+"
+     }
+    ],
+    [
+     {
+      "text": "/ 3"
+     }
+    ],
+    [
+     {
+      "text": "1+2+3+4+5+"
+     }
+    ],
+    [
+     {
+      "text": "12a45"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "simple grammar with tokens",
+   "grammar": "\n            root ::= <[10]> content <[11]>\n            content ::= (!<[11]>)*",
+   "pass": [
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "hello world"
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "text with "
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": " other tokens "
+     },
+     {
+      "token": 13
+     },
+     {
+      "text": " mixed in"
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 12
+     },
+     {
+      "token": 13
+     },
+     {
+      "token": 14
+     },
+     {
+      "token": 15
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "a"
+     },
+     {
+      "token": 11
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "missing end token"
+     }
+    ],
+    [
+     {
+      "token": 10
+     }
+    ],
+    [
+     {
+      "text": "missing start token"
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 11
+     }
+    ],
+    [
+     {
+      "token": 11
+     },
+     {
+      "text": "wrong order"
+     },
+     {
+      "token": 10
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "medium complexity grammar",
+   "grammar": "\n            root ::= expression\n            expression ::= term ws ((\"+\"|\"-\") ws term)*\n            term ::= factor ws ((\"*\"|\"/\") ws factor)*\n            factor ::= number | variable | \"(\" expression \")\" | function-call\n            number ::= [0-9]+\n            variable ::= [a-zA-Z_][a-zA-Z0-9_]*\n            function-call ::= variable ws \"(\" (expression (\",\" ws expression)*)? \")\"\n            ws ::= [ \\t\\n\\r]?",
+   "pass": [
+    [
+     {
+      "text": "42"
+     }
+    ],
+    [
+     {
+      "text": "1*2*3*4*5"
+     }
+    ],
+    [
+     {
+      "text": "x"
+     }
+    ],
+    [
+     {
+      "text": "x+10"
+     }
+    ],
+    [
+     {
+      "text": "x1+y2"
+     }
+    ],
+    [
+     {
+      "text": "(a+b)*(c-d)"
+     }
+    ],
+    [
+     {
+      "text": "func()"
+     }
+    ],
+    [
+     {
+      "text": "func(x,y+2)"
+     }
+    ],
+    [
+     {
+      "text": "a*(b+c)-d/e"
+     }
+    ],
+    [
+     {
+      "text": "f(g(x),h(y,z))"
+     }
+    ],
+    [
+     {
+      "text": "x + 10"
+     }
+    ],
+    [
+     {
+      "text": "x1 + y2"
+     }
+    ],
+    [
+     {
+      "text": "(a + b) * (c - d)"
+     }
+    ],
+    [
+     {
+      "text": "func()"
+     }
+    ],
+    [
+     {
+      "text": "func(x, y + 2)"
+     }
+    ],
+    [
+     {
+      "text": "a * (b + c) - d / e"
+     }
+    ],
+    [
+     {
+      "text": "f(g(x), h(y, z))"
+     }
+    ],
+    [
+     {
+      "text": "123+456"
+     }
+    ],
+    [
+     {
+      "text": "123*456*789-123/456+789*123"
+     }
+    ],
+    [
+     {
+      "text": "123+456*789-123/456+789*123-456/789+123*456-789/123+456*789-123/456+789*123-456"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "+"
+     }
+    ],
+    [
+     {
+      "text": "/ 3x"
+     }
+    ],
+    [
+     {
+      "text": "x + + y"
+     }
+    ],
+    [
+     {
+      "text": "a * / b"
+     }
+    ],
+    [
+     {
+      "text": "func(,)"
+     }
+    ],
+    [
+     {
+      "text": "func(x y)"
+     }
+    ],
+    [
+     {
+      "text": "(a + b"
+     }
+    ],
+    [
+     {
+      "text": "x + y)"
+     }
+    ],
+    [
+     {
+      "text": "a + b * (c - d"
+     }
+    ],
+    [
+     {
+      "text": "42 +"
+     }
+    ],
+    [
+     {
+      "text": "x +"
+     }
+    ],
+    [
+     {
+      "text": "x + 10 +"
+     }
+    ],
+    [
+     {
+      "text": "(a + b) * (c - d"
+     }
+    ],
+    [
+     {
+      "text": "func("
+     }
+    ],
+    [
+     {
+      "text": "func(x, y + 2"
+     }
+    ],
+    [
+     {
+      "text": "a * (b + c) - d /"
+     }
+    ],
+    [
+     {
+      "text": "f(g(x), h(y, z)"
+     }
+    ],
+    [
+     {
+      "text": "123+456*789-123/456+789*123-456/789+123*456-789/123+456*789-123/456+789*123-456/"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "complex grammar with tokens",
+   "grammar": "\n            root ::= reasoning+ content tool-call*\n            reasoning ::= <[10]> (!<[11]>)* <[11]>\n            content ::= <[20]> (!<[21]>)* <[21]>\n            tool-call ::= <[12]> name <[13]> args <[14]>\n            name ::= (!<[13]>)+\n            args ::= (!<[14]>)*",
+   "pass": [
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "I am thinking"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "text": "hello world!"
+     },
+     {
+      "token": 21
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "search"
+     },
+     {
+      "token": 13
+     },
+     {
+      "text": "query=test"
+     },
+     {
+      "token": 14
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "reasoning 1"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 10
+     },
+     {
+      "text": "reasoning 2"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "token": 21
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "tool"
+     },
+     {
+      "token": 13
+     },
+     {
+      "token": 14
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "text": "content"
+     },
+     {
+      "token": 21
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "think"
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": " nested"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "token": 10
+     },
+     {
+      "text": "more content"
+     },
+     {
+      "token": 21
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "fn"
+     },
+     {
+      "token": 13
+     },
+     {
+      "text": "x=1,y=2"
+     },
+     {
+      "token": 14
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "fn2"
+     },
+     {
+      "token": 13
+     },
+     {
+      "token": 14
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "reasoning"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 10
+     },
+     {
+      "text": "more"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 10
+     },
+     {
+      "text": "even more"
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "text": "text"
+     },
+     {
+      "token": 21
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "a"
+     },
+     {
+      "token": 13
+     },
+     {
+      "text": "b"
+     },
+     {
+      "token": 14
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "c"
+     },
+     {
+      "token": 13
+     },
+     {
+      "text": "d"
+     },
+     {
+      "token": 14
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "token": 20
+     },
+     {
+      "text": "content only"
+     },
+     {
+      "token": 21
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "text": "no closing reasoning"
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "text": "no closing content"
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "token": 21
+     },
+     {
+      "token": 12
+     },
+     {
+      "text": "incomplete tool"
+     }
+    ],
+    [
+     {
+      "token": 10
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 11
+     },
+     {
+      "token": 20
+     },
+     {
+      "token": 21
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "special characters",
+   "grammar": "\n            root ::= ... \"abc\" ...\n            ",
+   "pass": [
+    [
+     {
+      "text": "abcabcabc"
+     }
+    ],
+    [
+     {
+      "text": "aaaabcccc"
+     }
+    ],
+    [
+     {
+      "text": "🔵🟠✅abc❌🟠🔵"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "aaabcccc"
+     }
+    ],
+    [
+     {
+      "text": "aaaaabcccc"
+     }
+    ],
+    [
+     {
+      "text": "aaaabccc"
+     }
+    ],
+    [
+     {
+      "text": "aaaabccccc"
+     }
+    ],
+    [
+     {
+      "text": "🔵🟠✅❌abc❌✅🟠🔵"
+     }
+    ],
+    [
+     {
+      "text": "🔵🟠abc🟠🔵"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "* quantifier",
+   "grammar": "root ::= \"a\"*",
+   "pass": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "a"
+     }
+    ],
+    [
+     {
+      "text": "aaaaa"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "b"
+     }
+    ],
+    [
+     {
+      "text": "ab"
+     }
+    ],
+    [
+     {
+      "text": "aab"
+     }
+    ],
+    [
+     {
+      "text": "ba"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "+ quantifier",
+   "grammar": "root ::= \"a\"+",
+   "pass": [
+    [
+     {
+      "text": "a"
+     }
+    ],
+    [
+     {
+      "text": "aaaaa"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "b"
+     }
+    ],
+    [
+     {
+      "text": "ab"
+     }
+    ],
+    [
+     {
+      "text": "aab"
+     }
+    ],
+    [
+     {
+      "text": "ba"
+     }
+    ],
+    [
+     {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "? quantifier",
+   "grammar": "root ::= \"a\"?",
+   "pass": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "a"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "b"
+     }
+    ],
+    [
+     {
+      "text": "ab"
+     }
+    ],
+    [
+     {
+      "text": "aa"
+     }
+    ],
+    [
+     {
+      "text": "ba"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "mixed quantifiers",
+   "grammar": "\n            root ::= cons+ vowel* cons? (vowel cons)*\n            vowel ::= [aeiouy]\n            cons ::= [bcdfghjklmnpqrstvwxyz]\n            ",
+   "pass": [
+    [
+     {
+      "text": "yes"
+     }
+    ],
+    [
+     {
+      "text": "no"
+     }
+    ],
+    [
+     {
+      "text": "noyes"
+     }
+    ],
+    [
+     {
+      "text": "crwth"
+     }
+    ],
+    [
+     {
+      "text": "four"
+     }
+    ],
+    [
+     {
+      "text": "bryyyy"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "yess"
+     }
+    ],
+    [
+     {
+      "text": "yesno"
+     }
+    ],
+    [
+     {
+      "text": "forty"
+     }
+    ],
+    [
+     {
+      "text": "catyyy"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "simple exact repetition",
+   "grammar": "\n            root ::= [ab]{4}\n        ",
+   "pass": [
+    [
+     {
+      "text": "aaaa"
+     }
+    ],
+    [
+     {
+      "text": "bbbb"
+     }
+    ],
+    [
+     {
+      "text": "abab"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "a"
+     }
+    ],
+    [
+     {
+      "text": "b"
+     }
+    ],
+    [
+     {
+      "text": "aaaaa"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "simple min repetition",
+   "grammar": "\n            root ::= [ab]{4,}\n        ",
+   "pass": [
+    [
+     {
+      "text": "aaaa"
+     }
+    ],
+    [
+     {
+      "text": "aaaaab"
+     }
+    ],
+    [
+     {
+      "text": "bbbb"
+     }
+    ],
+    [
+     {
+      "text": "ababab"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "aba"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "simple max repetition",
+   "grammar": "\n            root ::= [ab]{0,4}\n        ",
+   "pass": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "a"
+     }
+    ],
+    [
+     {
+      "text": "aa"
+     }
+    ],
+    [
+     {
+      "text": "aaa"
+     }
+    ],
+    [
+     {
+      "text": "aaab"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "aaaaa"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "min / max repetition",
+   "grammar": "\n            root ::= (\"0x\" [A-F0-9]{2} \" \"?){3,5}\n        ",
+   "pass": [
+    [
+     {
+      "text": "0xFF 0x12 0xAB"
+     }
+    ],
+    [
+     {
+      "text": "0xFF 0x12 0xAB 0x00 0x00"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "0xFF"
+     }
+    ],
+    [
+     {
+      "text": "0xFF 0x12"
+     }
+    ],
+    [
+     {
+      "text": "0xFF 0x12 0xAB 0x00 0x00 0x00"
+     }
+    ]
+   ]
+  },
+  {
+   "desc": "segfault",
+   "grammar": "\n            root ::= ( [x]* )*\n        ",
+   "pass": [
+    [
+     {
+      "text": ""
+     }
+    ],
+    [
+     {
+      "text": "x"
+     }
+    ],
+    [
+     {
+      "text": "xx"
+     }
+    ]
+   ],
+   "fail": [
+    [
+     {
+      "text": "y"
+     }
+    ],
+    [
+     {
+      "text": "yy"
+     }
+    ]
+   ]
+  }
+ ],
+ "build_fails": [
+  {
+   "test": "test_failure_missing_root/grammar_str",
+   "grammar": "\n        rot ::= expr\n        expr ::= term (\"+\" term)*\n        term ::= number\n        number ::= [0-9]+",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_missing_reference/grammar_str",
+   "grammar": "root ::= expr\n        expr ::= term (\"+\" term)*\n        term ::= numero\n        number ::= [0-9]+",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_left_recursion/simple_str",
+   "grammar": "root ::= \"a\" | root \"a\"",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_left_recursion/medium_str",
+   "grammar": "\n        root ::= asdf\n        asdf ::= \"a\" | asdf \"a\"\n        ",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_left_recursion/hard_str",
+   "grammar": "\n        root ::= asdf\n        asdf ::= \"a\" | foo \"b\"\n        foo ::= \"c\" | asdf \"d\" | \"e\"",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_left_recursion/hardest_str",
+   "grammar": "\n        root ::= asdf\n        asdf ::= \"a\" | foo \"b\"\n        foo ::= \"c\" | empty asdf \"d\" | \"e\"\n        empty ::= \"blah\" | ",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_failure_missing_root_symbol/grammar_str",
+   "grammar": "\n        root ::= \"foobar\"\n    ",
+   "root": "nonexistent",
+   "builds": false
+  },
+  {
+   "test": "test_custom_root_symbol_check/custom_root_grammar_str",
+   "grammar": "\n        foobar ::= \"foobar\"\n    ",
+   "root": "root",
+   "builds": false
+  },
+  {
+   "test": "test_custom_root_symbol_check/custom_root_grammar_str",
+   "grammar": "\n        foobar ::= \"foobar\"\n    ",
+   "root": "foobar",
+   "builds": true
+  }
+ ]
+}

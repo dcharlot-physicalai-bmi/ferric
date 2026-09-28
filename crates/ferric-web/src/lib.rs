@@ -376,7 +376,7 @@ pub async fn bonsai_generate_json(model: Vec<u8>, prompt: String, steps: usize, 
         let (mut best, mut best_l) = (None, f32::NEG_INFINITY);
         for i in 0..c.n_vocab {
             let ok = if eos(i as u32) { can_stop }
-                else { match &token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = guide; b.iter().all(|&ch| a.step(ch)) } _ => false } };
+                else { match &token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = guide.clone(); b.iter().all(|&ch| a.step(ch)) } _ => false } };
             if ok && row[i] > best_l { best_l = row[i]; best = Some(i as u32); }
         }
         let next = match best { Some(t) => t, None => break };
@@ -1035,7 +1035,7 @@ impl FerricModel {
                 let can_stop = g.can_stop();
                 let (mut best, mut bl) = (None, f32::NEG_INFINITY);
                 for i in 0..n_vocab {
-                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = *g; b.iter().all(|&ch| a.step(ch)) } _ => false } };
+                    let ok = if eos(i as u32) { can_stop } else { match &self.token_bytes[i] { Some(b) if !b.is_empty() => { let mut a = g.clone(); b.iter().all(|&ch| a.step(ch)) } _ => false } };
                     if ok && row[i] > bl { bl = row[i]; best = Some(i as u32); }
                 }
                 match best { Some(t) => t, None => break }

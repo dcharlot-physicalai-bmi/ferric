@@ -275,7 +275,8 @@ fn authorized(headers: &[(String, String)], key: &str) -> bool {
 
 /// Requests the batch loop declines, and hands to the untouched serial path. See the module docs.
 fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
-    if !req["response_format"]["type"].is_null() { return true; }
+    // A constraint masks every step (`constrain`); the batched step has no mask.
+    if crate::constrain::asks_for_constraint(req) { return true; }
     // Streaming completions is served by the serial path's SSE writer only for chat; completions
     // here are non-streaming, so a streaming completions request is declined rather than answered as
     // one JSON blob it did not ask for.
