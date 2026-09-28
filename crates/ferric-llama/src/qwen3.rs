@@ -1895,6 +1895,13 @@ impl Qwen3 {
         let (q, k) = if fuse {
             let qk = rope_rows(qkv.narrow(1, 0, l.q_out + l.kv_out).contiguous(), nh + nkv);
             (qk.narrow(1, 0, l.q_out), qk.narrow(1, l.q_out, l.kv_out))
+        } else if let (Some((c, sn)), true) = (&tab, self.qk_rope_fusable(l)) {
+            // ⛔ BATCH INVARIANCE. Solo decode takes the FUSED QK-norm+RoPE kernel here (`attn`); this path
+            // used to take the composed rmsnorm + rope, whose rounding differs — so every batched Qwen3 row
+            // left solo decode's logits from the first step (Qwen3-0.6B Q8_0, n=2: 143,865 of 151,936 logits
+            // differed; tokens held). The fused kernel reads per-row angles, so it takes the batch as is.
+            Tensor::qk_norm_rope_table(&qkv, 0, l.q_out, l.q_norm.as_ref().unwrap(), l.k_norm.as_ref().unwrap(),
+                                       n, nh, nkv, hd, c, sn, self.cfg.eps)
         } else {
             let q = qn(qkv.narrow(1, 0, l.q_out), nh, &l.q_norm);
             let k = qn(qkv.narrow(1, l.q_out, l.kv_out), nkv, &l.k_norm);
