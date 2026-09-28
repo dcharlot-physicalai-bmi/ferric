@@ -21,7 +21,7 @@ fn tracked_ptx_exports_every_kernel_the_cu_defines() {
     // Both native modules: decode (tier 2) and prefill (tier 3). `load_ptx` treats each the same way —
     // every name resolved, the whole module refused on the first miss.
     check("cuda_decode", include_str!("../src/cuda_decode.cu"), include_str!("../src/cuda_decode.ptx"), 23);
-    check("cuda_prefill", include_str!("../src/cuda_prefill.cu"), include_str!("../src/cuda_prefill.ptx"), 12);
+    check("cuda_prefill", include_str!("../src/cuda_prefill.cu"), include_str!("../src/cuda_prefill.ptx"), 17);
 }
 
 fn check(stem: &str, cu: &str, ptx: &str, floor: usize) {

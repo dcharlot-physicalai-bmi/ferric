@@ -571,6 +571,256 @@ extern "C" __global__ void q8_0_gemm2(GEMM_ARGS) { gemm2_t<3>(A, lda, codes, aux
 extern "C" __global__ void q5_0_gemm2(GEMM_ARGS) { gemm2_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
 #undef GEMM_ARGS
 
+// ═══════════ GEMM v3: INTEGER tensor cores — fixed-point activations in three int8 digits ═══════════
+// Measured on the RTX 4050 (a 20-line mma loop): f16 x f16 -> f32 `mma` peaks at 16.4 TFLOPS, s8 x s8 -> s32
+// at 65.7 TOPS — 4x — and the sm_75 `mma.m8n8k16.s8` reaches it (65.5), so this stays compute_75 PTX.
+// v1/v2 spend TWO f16 mma per product (the hi and lo halves) and already run the tensor pipe at 60-85%
+// of that 16.4 (examples/cuda_gemm_bench.rs), so no feeding change can buy much; the instruction must.
+//
+// ⚠ NUMERICS (what differs from v2): each row's 32 activations of a K tile become ONE 22-bit signed
+// integer each, q = round(a · 2^e), with e the power of two that puts the row-tile's largest |a| in
+// [2^21, 2^22): an absolute error <= 2^-22 of that largest value — the same order as the f32 rounding
+// of the sum it is about to join, and 2^-22 RELATIVE for values near the maximum (v2's hi+lo: 2^-22
+// relative for every value). q is split EXACTLY into three balanced digits q = 2^16 q2 + 2^8 q1 + q0,
+// each in [-128, 127]; the weights enter as their exact integer codes (every format's fit int8). Every
+// product and every sum inside a K tile is then an INTEGER — exact, no rounding, no tensor-core
+// truncation — and the tile folds into f32 once: acc += scale_n · 2^-e_m · (2^16 P2 + (2^8 P1 + P0))
+// (− min_n · Σa for Q4_K/Q5_K, the row sum taken in f32 as before). An f16 overflow cannot happen
+// (the exponent absorbs any magnitude); the flag catches inf/NaN only.
+// Cost per product: 3 int8 MACs at 4x the rate = 3/8 of v2's two f16 MACs.
+#define LDB 48u        // bytes per shared row: 32 codes + 16 pad — ldmatrix rows land on 8 distinct bank quads
+struct __align__(16) Stage3 {
+    unsigned char Aq[3][B2M * LDB], Wq[B2N * LDB];
+    float Sc[2][B2N], Mn[B2N], Rs[B2M], Ri[B2M];
+};
+__device__ __forceinline__ void mma8816(int (&c)[2], unsigned a, unsigned b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a), "r"(b));
+}
+// Four small integers (each in [-128, 127]) as the four bytes of a word.
+__device__ __forceinline__ unsigned pack4s8(int a, int b, int c, int d) {
+    return (unsigned)(a & 0xff) | ((unsigned)(b & 0xff) << 8u) | ((unsigned)(c & 0xff) << 16u) | ((unsigned)(d & 0xff) << 24u);
+}
+template <int F>
+__device__ __forceinline__ void decode16_s8(const Raw16& r, unsigned n, unsigned K, unsigned kc, unsigned h,
+                                            unsigned (&o)[4], float& scale, float& mn) {
+    // The codes decode16 makes as f16, here as bytes. ⚠ Q5_K's high bit and Q6_K's sign are the same
+    // expressions; only the packing differs.
+    int v[16];
+    mn = 0.f;
+    const unsigned qw[4] = {r.q.x, r.q.y, r.q.z, r.q.w}, hw[4] = {r.qh.x, r.qh.y, r.qh.z, r.qh.w};
+    if (F == 0 || F == 1) {
+        const unsigned s = kc & 7u, sh = 4u * (s & 1u);
+        const unsigned axw[4] = {r.ax.x, r.ax.y, r.ax.z, r.ax.w};
+        #define SCB(i) ((axw[1u + ((i) >> 2u)] >> (8u * ((i) & 3u))) & 0xffu)
+        unsigned sc, m6;
+        if (s < 4u) { sc = SCB(s) & 63u; m6 = SCB(s + 4u) & 63u; }
+        else { const unsigned a = SCB(s + 4u), lo = SCB(s - 4u), hi = SCB(s);
+               sc = (a & 0x0Fu) | ((lo >> 6u) << 4u); m6 = (a >> 4u) | ((hi >> 6u) << 4u); }
+        #undef SCB
+        scale = f16_to_f32(axw[0] & 0xffffu) * (float)sc; mn = f16_to_f32(axw[0] >> 16u) * (float)m6;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) {
+                unsigned qq = (qw[w] >> (8u * k + sh)) & 0xfu;
+                if (F == 1) qq |= ((hw[w] >> (8u * k + s)) & 1u) << 4u;
+                v[4u * w + k] = (int)qq;
+            }
+    } else if (F == 2) {
+        const unsigned j = kc & 7u, hf = j >> 2u, qq = j & 3u, si = 8u * hf + 2u * qq + h;
+        scale = f16_to_f32(r.ax.x & 0xffffu) * (float)((int)(((r.ax.y >> (8u * (si & 3u))) & 0xffu) << 24u) >> 24);
+        const unsigned nsh = 4u * (qq >> 1u), hsh = 2u * qq;
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k)
+                v[4u * w + k] = (int)(((qw[w] >> (8u * k + nsh)) & 0xfu) | (((hw[w] >> (8u * k + hsh)) & 3u) << 4u)) - 32;
+    } else if (F == 3) {
+        const unsigned bi = n * (K / 32u) + kc;
+        scale = f16_to_f32((bi & 1u) ? (r.ax.x >> 16u) : (r.ax.x & 0xffffu));
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) v[4u * w + k] = (int)(qw[w] << (24u - 8u * k)) >> 24;
+    } else {
+        const unsigned qh = r.ax.x;
+        scale = f16_to_f32(r.ax.y & 0xffffu);
+        #pragma unroll
+        for (unsigned w = 0u; w < 4u; ++w)
+            #pragma unroll
+            for (unsigned k = 0u; k < 4u; ++k) {
+                const unsigned e = 4u * w + k;
+                v[e] = (int)(((qw[w] >> (8u * k + 4u * h)) & 0xfu) | (((qh >> (e + 16u * h)) & 1u) << 4u)) - 16;
+            }
+    }
+    #pragma unroll
+    for (unsigned i = 0u; i < 4u; ++i) o[i] = pack4s8(v[4u * i], v[4u * i + 1u], v[4u * i + 2u], v[4u * i + 3u]);
+}
+template <int F>
+__device__ __forceinline__ void gemm3_t(const float* __restrict__ A, unsigned lda,
+                                        const unsigned* __restrict__ codes, const unsigned* __restrict__ aux,
+                                        float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, unsigned K,
+                                        int* __restrict__ ovf) {
+    constexpr bool TWO = F == 2;
+    constexpr bool MIN = F == 0 || F == 1;
+    __shared__ Stage3 st[2];
+    const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned wm = warp >> 2u, wn = warp & 3u;                  // 2 x 4 warps of 32 x 32
+    const unsigned m0 = blockIdx.y * B2M, n0 = blockIdx.x * B2N;
+    const unsigned g = lane >> 2u, t4 = lane & 3u;
+    const unsigned ar = tid >> 2u, aq = tid & 3u, wr = tid >> 1u, wh = tid & 1u;
+    float acc[4][4][2];                                              // [m8 tile][n8 tile][2]
+    #pragma unroll
+    for (unsigned i = 0u; i < 4u; ++i)
+        #pragma unroll
+        for (unsigned j = 0u; j < 4u; ++j) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; }
+    bool bad = false;
+    float4 ra0, ra1; Raw16 rw;
+    auto fetch = [&](unsigned k0) {
+        if (m0 + ar < M) {
+            const float* src = A + (size_t)(m0 + ar) * lda + k0 + 8u * aq;
+            ra0 = *reinterpret_cast<const float4*>(src); ra1 = *reinterpret_cast<const float4*>(src + 4u);
+        } else { ra0 = make_float4(0.f, 0.f, 0.f, 0.f); ra1 = ra0; }
+        if (n0 + wr < N) fetch16<F>(codes, aux, n0 + wr, K, k0 / 32u, wh, rw);
+    };
+    auto store = [&](Stage3& s, unsigned k0) {
+        const float x[8] = {ra0.x, ra0.y, ra0.z, ra0.w, ra1.x, ra1.y, ra1.z, ra1.w};
+        float amax = 0.f;
+        #pragma unroll
+        for (unsigned j = 0u; j < 8u; ++j) amax = fmaxf(amax, fabsf(x[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        bad |= !(amax <= 3.0e38f);                                          // inf / NaN
+        // e: largest |a| · 2^e in [2^21, 2^22)
+        int e = amax > 0.f ? 21 - ((int)((__float_as_uint(amax) >> 23u) & 0xffu) - 127) : 0;
+        e = max(-100, min(100, e));
+        const float up = __uint_as_float((unsigned)(127 + e) << 23u), dn = __uint_as_float((unsigned)(127 - e) << 23u);
+        int d0[8], d1[8], d2[8];
+        #pragma unroll
+        for (unsigned j = 0u; j < 8u; ++j) {
+            const int q = __float2int_rn(x[j] * up);                       // |q| <= 2^22; the scaling is exact
+            const int q0 = ((q + 128) & 255) - 128, r1 = (q - q0) >> 8;      // balanced base-256 digits:
+            const int q1 = ((r1 + 128) & 255) - 128, q2 = (r1 - q1) >> 8;    // q = 65536 q2 + 256 q1 + q0
+            d0[j] = q0; d1[j] = q1; d2[j] = q2;
+        }
+        *reinterpret_cast<uint2*>(s.Aq[0] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d0[0], d0[1], d0[2], d0[3]), pack4s8(d0[4], d0[5], d0[6], d0[7]));
+        *reinterpret_cast<uint2*>(s.Aq[1] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d1[0], d1[1], d1[2], d1[3]), pack4s8(d1[4], d1[5], d1[6], d1[7]));
+        *reinterpret_cast<uint2*>(s.Aq[2] + ar * LDB + 8u * aq) = make_uint2(pack4s8(d2[0], d2[1], d2[2], d2[3]), pack4s8(d2[4], d2[5], d2[6], d2[7]));
+        float rsum = 0.f;
+        if (MIN) {
+            rsum = ((x[0] + x[1]) + (x[2] + x[3])) + ((x[4] + x[5]) + (x[6] + x[7]));
+            rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
+            rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
+        }
+        if (aq == 0u) { s.Rs[ar] = rsum; s.Ri[ar] = dn; }
+        unsigned w[4]; float sc = 0.f, mn = 0.f;
+        if (n0 + wr < N) decode16_s8<F>(rw, n0 + wr, K, k0 / 32u, wh, w, sc, mn);
+        else { w[0] = w[1] = w[2] = w[3] = 0u; }
+        *reinterpret_cast<uint4*>(s.Wq + wr * LDB + 16u * wh) = make_uint4(w[0], w[1], w[2], w[3]);
+        s.Sc[wh][wr] = sc;
+        if (wh == 0u) s.Mn[wr] = mn;
+    };
+    fetch(0u); store(st[0], 0u);
+    __syncthreads();
+    const unsigned nk = K / BK;
+    // ldmatrix row addresses: A — matrix mi = lane>>3 is rows [wm·32 + 8·mi, +8); B — matrix ni is rows [wn·32 + 8·ni, +8)
+    const unsigned arow = wm * 32u + (lane >> 3u) * 8u + (lane & 7u), brow = wn * 32u + (lane >> 3u) * 8u + (lane & 7u);
+    for (unsigned kt = 0u; kt < nk; ++kt) {
+        const Stage3& s = st[kt & 1u];
+        if (kt + 1u < nk) fetch((kt + 1u) * BK);
+        float2 sc[2][4], mnv[4]; float rs[4], ri[4];
+        #pragma unroll
+        for (unsigned ni = 0u; ni < 4u; ++ni) {
+            const unsigned col = wn * 32u + ni * 8u + 2u * t4;
+            sc[0][ni] = *reinterpret_cast<const float2*>(&s.Sc[0][col]);
+            sc[1][ni] = TWO ? *reinterpret_cast<const float2*>(&s.Sc[1][col]) : sc[0][ni];
+            if (MIN) mnv[ni] = *reinterpret_cast<const float2*>(&s.Mn[col]);
+        }
+        #pragma unroll
+        for (unsigned mi = 0u; mi < 4u; ++mi) { const unsigned row = wm * 32u + mi * 8u + g; rs[mi] = MIN ? s.Rs[row] : 0.f; ri[mi] = s.Ri[row]; }
+        int chi[4][4][2], clo[4][4][2];                              // 2^16 digit / (2^8 digit, 1 digit)
+        auto zero = [&]() {
+            #pragma unroll
+            for (unsigned i = 0u; i < 4u; ++i)
+                #pragma unroll
+                for (unsigned j = 0u; j < 4u; ++j) { chi[i][j][0] = chi[i][j][1] = 0; clo[i][j][0] = clo[i][j][1] = 0; }
+        };
+        auto fold = [&](unsigned half, bool with_min) {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni)
+                    #pragma unroll
+                    for (unsigned c = 0u; c < 2u; ++c) {
+                        const float pv = (float)chi[mi][ni][c] * 65536.f + (float)clo[mi][ni][c];
+                        float v = (c ? sc[half][ni].y : sc[half][ni].x) * pv * ri[mi];
+                        if (MIN && with_min) v -= (c ? mnv[ni].y : mnv[ni].x) * rs[mi];
+                        acc[mi][ni][c] += v;
+                    }
+        };
+        auto mma_all = [&](int (&cc)[4][4][2], const unsigned (&a)[4], const unsigned (&bf)[4]) {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni) mma8816(cc[mi][ni], a[mi], bf[ni]);
+        };
+        auto times256 = [&]() {
+            #pragma unroll
+            for (unsigned mi = 0u; mi < 4u; ++mi)
+                #pragma unroll
+                for (unsigned ni = 0u; ni < 4u; ++ni) { clo[mi][ni][0] *= 256; clo[mi][ni][1] *= 256; }
+        };
+        zero();
+        if (TWO) {
+            // Q6_K: each 16-wide half has its own scale — fold per half.
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) {
+                unsigned bf[4], ad[4];
+                ldsm_x4(bf, s.Wq + brow * LDB + 16u * kh);
+                ldsm_x4(ad, s.Aq[2] + arow * LDB + 16u * kh); mma_all(chi, ad, bf);
+                ldsm_x4(ad, s.Aq[1] + arow * LDB + 16u * kh); mma_all(clo, ad, bf);
+                times256();                                             // clo = 256·Σq1·w, exact (|.| < 2^27)
+                ldsm_x4(ad, s.Aq[0] + arow * LDB + 16u * kh); mma_all(clo, ad, bf);
+                fold(kh, false); zero();
+            }
+        } else {
+            // One scale per 32: the 2^16 digit into chi, the 2^8 digit into clo over BOTH halves, then
+            // clo·256 and the unit digit — every sum an exact integer (|chi| < 2^19, |clo| < 2^28).
+            unsigned bf[2][4], ad[4];
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) {
+                ldsm_x4(bf[kh], s.Wq + brow * LDB + 16u * kh);
+                ldsm_x4(ad, s.Aq[2] + arow * LDB + 16u * kh); mma_all(chi, ad, bf[kh]);
+                ldsm_x4(ad, s.Aq[1] + arow * LDB + 16u * kh); mma_all(clo, ad, bf[kh]);
+            }
+            times256();
+            #pragma unroll
+            for (unsigned kh = 0u; kh < 2u; ++kh) { ldsm_x4(ad, s.Aq[0] + arow * LDB + 16u * kh); mma_all(clo, ad, bf[kh]); }
+            fold(0u, true);
+        }
+        if (kt + 1u < nk) store(st[(kt + 1u) & 1u], (kt + 1u) * BK);
+        __syncthreads();
+    }
+    if (bad) atomicOr(ovf, 1);
+    #pragma unroll
+    for (unsigned mi = 0u; mi < 4u; ++mi)
+        #pragma unroll
+        for (unsigned ni = 0u; ni < 4u; ++ni) {
+            const unsigned r = m0 + wm * 32u + mi * 8u + g, c = n0 + wn * 32u + ni * 8u + 2u * t4;
+            if (r < M) { if (c < N) C[(size_t)r * ldc + c] = acc[mi][ni][0]; if (c + 1u < N) C[(size_t)r * ldc + c + 1u] = acc[mi][ni][1]; }
+        }
+}
+#define GEMM_ARGS const float* __restrict__ A, unsigned lda, const unsigned* __restrict__ codes, \
+                  const unsigned* __restrict__ aux, float* __restrict__ C, unsigned ldc, unsigned M, unsigned N, \
+                  unsigned K, int* __restrict__ ovf
+extern "C" __global__ void q4k_gemm3(GEMM_ARGS)  { gemm3_t<0>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void q5k_gemm3(GEMM_ARGS)  { gemm3_t<1>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void q6k_gemm3(GEMM_ARGS)  { gemm3_t<2>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void q8_0_gemm3(GEMM_ARGS) { gemm3_t<3>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+extern "C" __global__ void q5_0_gemm3(GEMM_ARGS) { gemm3_t<4>(A, lda, codes, aux, C, ldc, M, N, K, ovf); }
+#undef GEMM_ARGS
+
 // ── h[t, i] = silu(gu[t, i]) · gu[t, n_ff + i] — the same expression the fused decode kernels use. ──
 extern "C" __global__ void swiglu_rows(const float* __restrict__ gu, float* __restrict__ h, unsigned n_ff, unsigned rows) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
