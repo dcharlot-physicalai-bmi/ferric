@@ -77,7 +77,7 @@ CONTROLS = {
     "gguf_IQ2_XS":      ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
     "gguf_IQ2_S":       ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
     "gguf_IQ3_S":       ("FERRIC_IQ_CONTROL",    "iq_signs",    "sign bits ignored"),
-    "gguf_NVFP4":       (None, None, None),
+    "gguf_NVFP4":       ("FERRIC_IQ_CONTROL",    "nvfp4_half",  "UE4M3 scale without ggml's * 0.5"),
 }
 
 def locate(fx, name):

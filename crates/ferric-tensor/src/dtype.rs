@@ -4836,6 +4836,10 @@ impl Tensor {
             .replace("__L__", &lanes.to_string())
             .replace("__OPW__", &opw.to_string())
             .replace("__LH__", &(lanes / 2).to_string());
+        // Negative control for scripts/quant_formats_conformance.sh: the UE4M3 scale without ggml's
+        // `* 0.5` — the named trap above. Must move a real NVFP4 model >= 20x the clean distance.
+        let src = if std::env::var("FERRIC_IQ_CONTROL").as_deref() == Ok("nvfp4_half") {
+            src.replace("return raw * 0.5;", "return raw;") } else { src };
         run(&self.ctx, &src, "matmul_nvfp4",
             &[x.buf.as_ref(), w.codes.as_ref(), w.aux.as_ref(), &out,
               &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, rs])], grid);
