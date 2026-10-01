@@ -411,22 +411,41 @@ impl Gemma4 {
     /// Logits for `tokens`, carrying KV in `cache`.
     pub fn forward(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
         let h = self.forward_hidden_cached(tokens, cache);
+        self.logits(h)
+    }
+
+    /// The head and the final softcap, on normed hidden rows.
+    pub fn logits(&self, h: Tensor) -> Tensor {
         let logits = h.matmul_q(&self.head);
         if self.cfg.final_softcap > 0.0 { logits.softcap(self.cfg.final_softcap) } else { logits }
     }
 
+    /// Token embeddings as the forward pass starts from them: gathered, then scaled by sqrt(d) BEFORE
+    /// anything else, including the per-layer projection, which reads this scaled value.
+    pub fn embed(&self, tokens: &[u32]) -> Tensor {
+        let x = self.gather(&self.embd_raw, self.embd_ty, self.cfg.d, tokens);
+        x.mul(&x.scalar((self.cfg.d as f32).sqrt()))
+    }
+
     /// Final normed hidden state, before the head.
     pub fn forward_hidden_cached(&self, tokens: &[u32], cache: &mut Cache) -> Tensor {
+        let x = self.embed(tokens);
+        self.forward_hidden_embeds(tokens, x, cache)
+    }
+
+    /// [`Self::forward_hidden_cached`] from given input rows — the multimodal entry point.
+    ///
+    /// `x` is `[t, d]`: [`Self::embed`] rows with an image's or an audio clip's soft tokens spliced over
+    /// their placeholders (NOT scaled by sqrt(d) — the authors' towers project straight into this space).
+    /// `ple_tokens` index the per-layer table, and at a placeholder they must be the PAD id: the authors'
+    /// `Gemma4Model.forward` replaces every multimodal token id with `pad_token_id` before the per-layer
+    /// lookup, while the per-layer PROJECTION reads the spliced `x` (`gemma4_mm_stages`' `ple_mm_id` control).
+    pub fn forward_hidden_embeds(&self, ple_tokens: &[u32], x: Tensor, cache: &mut Cache) -> Tensor {
         let cfg = &self.cfg;
-        let (d, eps, t, pos) = (cfg.d, cfg.eps, tokens.len(), cache.pos);
-
-        // Token embeddings are scaled by sqrt(d) BEFORE anything else, including the per-layer
-        // projection, which reads this scaled value.
-        let mut x = self
-            .gather(&self.embd_raw, self.embd_ty, d, tokens);
-        let mut x = x.mul(&x.scalar((d as f32).sqrt()));
-
-        let per_layer = (cfg.ple > 0).then(|| self.per_layer_inputs(tokens, &x));
+        let (d, eps, t, pos) = (cfg.d, cfg.eps, ple_tokens.len(), cache.pos);
+        assert_eq!(x.shape, [t, d], "forward_hidden_embeds: {t} per-layer ids for rows {:?}", x.shape);
+        let per_layer = (cfg.ple > 0).then(|| self.per_layer_inputs(ple_tokens, &x));
+        let mut x = x;
 
         for (il, blk) in self.blocks.iter().enumerate() {
             let hd = cfg.head_dim_at(il);
@@ -510,13 +529,13 @@ impl Gemma4 {
 
             // GELU-gated FFN, and a post-norm INSIDE the residual.
             let f = attn_out.rmsnorm(&blk.ffn_norm, eps);
-            let ffn = f.matmul_q(&blk.gate).gelu().mul(&f.matmul_q(&blk.up)).matmul_q(&blk.down);
+            let ffn = f.matmul_q(&blk.gate).gelu_tanh().mul(&f.matmul_q(&blk.up)).matmul_q(&blk.down);
             x = attn_out.add(&ffn.rmsnorm(&blk.ffn_post_norm, eps));
 
             // Per-layer embedding, gated by this block's slice and added back.
             if let Some(pl) = &per_layer {
                 let slice = pl.narrow(1, il, 1).contiguous().reshape(&[t, cfg.ple]);
-                let gated = x.matmul_q(&blk.inp_gate).gelu().mul(&slice);
+                let gated = x.matmul_q(&blk.inp_gate).gelu_tanh().mul(&slice);
                 x = x.add(&gated.matmul_q(&blk.proj).rmsnorm(&blk.ple_post_norm, eps));
             }
 
@@ -674,12 +693,12 @@ impl Gemma4 {
             let attn_out = x.add(&att.matmul_q(&blk.o).rmsnorm(&blk.attn_post_norm, eps));
 
             let f = attn_out.rmsnorm(&blk.ffn_norm, eps);
-            let ffn = f.matmul_q(&blk.gate).gelu().mul(&f.matmul_q(&blk.up)).matmul_q(&blk.down);
+            let ffn = f.matmul_q(&blk.gate).gelu_tanh().mul(&f.matmul_q(&blk.up)).matmul_q(&blk.down);
             x = attn_out.add(&ffn.rmsnorm(&blk.ffn_post_norm, eps));
 
             if let Some(pl) = &per_layer {
                 let slice = pl.narrow(1, il, 1).contiguous().reshape(&[n, cfg.ple]);
-                let gated = x.matmul_q(&blk.inp_gate).gelu().mul(&slice);
+                let gated = x.matmul_q(&blk.inp_gate).gelu_tanh().mul(&slice);
                 x = x.add(&gated.matmul_q(&blk.proj).rmsnorm(&blk.ple_post_norm, eps));
             }
 
