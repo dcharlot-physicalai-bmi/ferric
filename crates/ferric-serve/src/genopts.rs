@@ -100,6 +100,8 @@ pub(crate) struct GenOpts {
     pub lora: Lora,
     /// Choices to return for this one prompt (OpenAI `n`); see `choice_request`.
     pub n: usize,
+    /// The request's own context window (Ollama's `options.num_ctx`): it can narrow the model's, not widen it.
+    pub num_ctx: Option<usize>,
 }
 
 /// Most choices one request may ask for.
@@ -291,7 +293,7 @@ pub(crate) const DEFAULT_RNG: u64 = 0x2545_F491_4F6C_DD1D;
 impl Default for GenOpts {
     fn default() -> Self {
         GenOpts { max_tokens: None, sampling: Sampling::default(), rng: DEFAULT_RNG, stop: Vec::new(),
-                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default(), logit_bias_text: Vec::new(), n: 1 }
+                  logprobs: false, top_logprobs: 0, with_specials: false, image: None, lora: Lora::default(), logit_bias_text: Vec::new(), n: 1, num_ctx: None }
     }
 }
 
@@ -329,6 +331,10 @@ impl GenOpts {
                     _ => return Err(format!("`{k}` must be a positive integer, got {v}")),
                 },
             }
+        }
+        match &req["num_ctx"] {
+            Value::Null => {}
+            v => o.num_ctx = Some(v.as_u64().filter(|&n| n > 0).ok_or_else(|| format!("`num_ctx` must be a positive integer, got {v}"))? as usize),
         }
         match &req["n"] {
             Value::Null => {}
@@ -1081,6 +1087,14 @@ mod tests {
                 assert_eq!(c, b, "choice {i} differs from the request in more than its seed");
             }
         }
+    }
+
+    /// Ollama's `num_ctx` is read (it was silently dropped) and refused when not a positive count.
+    #[test]
+    fn num_ctx_is_read_not_dropped() {
+        assert_eq!(GenOpts::from_req(&json!({"num_ctx": 2048}), true).unwrap().num_ctx, Some(2048));
+        assert_eq!(GenOpts::from_req(&json!({}), true).unwrap().num_ctx, None);
+        for bad in [json!(0), json!(-5), json!("4k")] { assert!(GenOpts::from_req(&json!({"num_ctx": bad}), true).is_err()); }
     }
 
     #[test]

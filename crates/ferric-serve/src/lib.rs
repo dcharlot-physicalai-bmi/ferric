@@ -676,7 +676,8 @@ impl Engine {
         let spec_gate = std::sync::Mutex::new(specgate::SpecGate::new(model.n_layer()));
         // Absent is not "unlimited": 4096 is a conservative bound for a file that does not say, and the
         // error it produces names the number so a caller can see why.
-        let n_ctx = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
+        let trained = match g.metadata.get(&format!("{arch}.context_length")) { Some(Meta::U(v)) => *v as usize, _ => 4096 };
+        let n_ctx = ctx_cap(trained);
         // Phi-3 / 3.5: microsoft/Phi-3.5-mini-instruct's tokenizer.json marks every `<|…|>` added token
         // rstrip=True except `<|endoftext|>`, so "<|user|>\nHi" tokenises as "<|user|>Hi". Without this a
         // two-turn prompt was 36 tokens where the authors' tokenizer gives 26 (checked against HF
@@ -942,12 +943,13 @@ impl Engine {
 
     /// How many tokens this request may generate: its own limit, capped by what is left of the context.
     /// A prompt that does not fit is an error naming both numbers, never a silent truncation.
-    pub(crate) fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String> {
-        if prompt_len >= self.n_ctx {
-            return Err(format!("the prompt is {prompt_len} tokens and this model's context is {} — \
-                                shorten the conversation", self.n_ctx));
+    pub(crate) fn budget(&self, prompt_len: usize, o: &GenOpts) -> Result<usize, String> {
+        // The request's own window (Ollama's `num_ctx`) can only narrow the server's.
+        let (ctx, whose) = match o.num_ctx { Some(c) if c < self.n_ctx => (c, "this request's num_ctx"), _ => (self.n_ctx, "this model's context") };
+        if prompt_len >= ctx {
+            return Err(format!("the prompt is {prompt_len} tokens and {whose} is {ctx} — shorten the conversation"));
         }
-        Ok(want.unwrap_or(usize::MAX).min(self.n_ctx - prompt_len))
+        Ok(o.max_tokens.unwrap_or(usize::MAX).min(ctx - prompt_len))
     }
 
     /// Every loaded model's card: the chat model, its LoRA adapters, then the embedder.
@@ -1573,6 +1575,17 @@ fn physical_memory() -> Option<u64> {
     Some(kb * 1024)
 }
 
+/// The context the server gives a model: its trained length, or less when `--ctx-size` / FERRIC_CTX_SIZE
+/// asks (llama.cpp's `-c`). Never more: past its trained length a model needs a rope scaling it was not
+/// given, so a larger value is capped, said once at load.
+pub(crate) fn ctx_cap(trained: usize) -> usize {
+    match std::env::var("FERRIC_CTX_SIZE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&c| c > 0) {
+        Some(c) if c <= trained => c,
+        Some(c) => { eprintln!("ferric-serve: --ctx-size {c} is past this model's trained context {trained}; using {trained}"); trained }
+        None => trained,
+    }
+}
+
 /// CLI entry point. Lives in the library so the binary is a two-line shim and everything the
 /// server does stays reachable from tests — see the crate docs.
 pub fn run() {
@@ -1619,6 +1632,9 @@ pub fn run() {
             // `--reasoning-budget N` (-1 unlimited, 0 = end thinking at once) and the message forced before the
             // end marker when it runs out — llama-server's flags; a request's `thinking_budget_tokens` overrides.
             // FIXME: Audit that the environment access only happens in single-threaded code.
+            // `--ctx-size N` (llama.cpp's -c): every model's context, at most its trained length.
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            "--ctx-size" | "-c" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_CTX_SIZE", v) }; } i += 2; }
             "--reasoning-budget" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET", v) }; } i += 2; }
             "--reasoning-budget-message" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET_MESSAGE", v) }; } i += 2; }
             // `--otlp http://collector:4318`: OpenTelemetry traces (else the OTEL_EXPORTER_OTLP_* variables).
@@ -2041,7 +2057,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
         for _round in 0..4 {
             let (prompt, image) = eng.chat_prompt(&messages, tools_arg, &kwargs)?;
             opts.image = image;
-            let max = eng.budget(prompt.len(), opts.max_tokens)?;
+            let max = eng.budget(prompt.len(), &opts)?;
             let out = eng.generate(&prompt, max, &opts, None, |_, _| {});
             ptok += out.prompt_tokens; gtok += out.gen_tokens;
             energies.push(out.energy.clone());
@@ -2083,7 +2099,7 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let guide = spec.guide();
     let (prompt, image) = eng.chat_prompt(&messages, None, &kwargs)?;
     opts.image = image;
-    let max = eng.budget(prompt.len(), opts.max_tokens)?;
+    let max = eng.budget(prompt.len(), &opts)?;
     let mut sp = splitter(&prompt);
     let out = eng.generate(&prompt, max, &opts, guide, |d, l| match sp.as_mut() {
         Some(sp) => {
@@ -2251,7 +2267,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     let mut ids = Vec::new();
     if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
     ids.extend(eng.enc(prompt_text, true));
-    let max = match eng.budget(ids.len(), opts.max_tokens) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
+    let max = match eng.budget(ids.len(), &opts) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
     let cid = format!("cmpl-ferric-{}", ids.len());
     if req["stream"].as_bool() == Some(true) && opts.n > 1 {
         return bad_request(stream, "`n` > 1 with a streamed completion is not served; stream n = 1 or ask without `stream`");

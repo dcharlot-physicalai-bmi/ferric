@@ -168,7 +168,7 @@ fn to_openai(req: &Value) -> Result<Value, String> {
         Some(n) if n > 0 => { r["max_tokens"] = json!(n); }
         Some(n) => return Err(format!("options.num_predict {n}: use a positive count, or -1 for unlimited")),
     }
-    for k in ["temperature", "top_p", "top_k", "min_p", "seed", "stop", "repeat_penalty", "repeat_last_n",
+    for k in ["temperature", "top_p", "top_k", "min_p", "seed", "stop", "repeat_penalty", "repeat_last_n", "num_ctx",
               "presence_penalty", "frequency_penalty", "typical_p", "mirostat", "mirostat_tau", "mirostat_eta"] {
         if !o[k].is_null() { r[k] = o[k].clone(); }
     }
@@ -344,7 +344,7 @@ fn generate(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, body: &[u8], s
             let r = to_openai(&req)?;
             let opts = eng.gen_opts(&r, false)?;
             let ids = eng.encode_prompt(prompt);
-            let max = eng.budget(ids.len(), opts.max_tokens)?;
+            let max = eng.budget(ids.len(), &opts)?;
             let out = eng.generate(&ids, max, &opts, None, |d, _| on_delta(d));
             Ok(ChatResult { text: out.text, reasoning: String::new(), tool_calls: vec![], prompt_tokens: out.prompt_tokens, gen_tokens: out.gen_tokens,
                             finish: out.finish, logprobs: vec![], energy: out.energy, stop_seq: out.stop_seq })

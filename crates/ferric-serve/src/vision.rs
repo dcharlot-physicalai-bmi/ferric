@@ -319,7 +319,7 @@ impl Engine {
         let card = card(&name, d).ok_or("config.json unreadable")?;
         let reasoning_markers = template.contains("<think>").then(|| ("<think>".to_string(), "</think>".to_string()));
         let spec_gate = std::sync::Mutex::new(crate::specgate::SpecGate::new(model.cfg.n_layer));
-        let n_ctx = card.context;
+        let n_ctx = crate::ctx_cap(card.context);
         let (im_start, im_end) = (id_of("<|im_start|>"), id_of("<|im_end|>"));
         Ok(Engine {
             ctx, model: Model::Dense(model), aux: shared.aux.clone(), card, chat_template, reasoning_markers,

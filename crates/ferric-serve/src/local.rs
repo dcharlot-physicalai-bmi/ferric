@@ -55,7 +55,7 @@ impl LocalModel {
         let mut ids = Vec::new();
         if self.eng.add_bos { if let Some(b) = self.eng.bos_id { ids.push(b); } }
         ids.extend(self.eng.enc(prompt, true));
-        let max = self.eng.budget(ids.len(), opts.max_tokens)?;
+        let max = self.eng.budget(ids.len(), &opts)?;
         let spec = self.eng.constraint(req)?;
         let out = self.eng.generate(&ids, max, &opts, spec.guide(), |d, _| on_delta(d));
         let mut choice = json!({"index": 0, "text": out.text, "finish_reason": out.finish});

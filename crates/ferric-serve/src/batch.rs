@@ -109,7 +109,7 @@ pub(crate) trait ServeModel {
     /// A token's text and bytes, for `logprobs`.
     fn piece(&self, tok: u32) -> (String, Vec<u8>);
     /// Tokens this request may generate given its prompt: its own `max_tokens`, capped by the context.
-    fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String>;
+    fn budget(&self, prompt_len: usize, o: &GenOpts) -> Result<usize, String>;
     /// This model generates better on its own serial loop than in the scheduler — a hybrid with an MTP
     /// draft block, whose `generate_spec` (and one-slot prefix cache) the batched step cannot run.
     fn serial_generation(&self) -> bool { false }
@@ -426,7 +426,7 @@ fn route<M: ServeModel>(
         };
         // Same debug hook as the serial path: the ids the model will actually see, replayable elsewhere.
         if std::env::var("FERRIC_DUMP_IDS").is_ok() { eprintln!("prompt ids ({}): {:?}", prompt.len(), prompt); }
-        let max_tokens = match m.budget(prompt.len(), gopts.max_tokens) { Ok(n) => n, Err(e) => return bad(&mut j.stream, &e) };
+        let max_tokens = match m.budget(prompt.len(), &gopts) { Ok(n) => n, Err(e) => return bad(&mut j.stream, &e) };
         let streaming = chat && req["stream"].as_bool().unwrap_or(false);
         if streaming {
             write_sse_headers(&mut j.stream);
@@ -990,7 +990,7 @@ impl ServeModel for Engine {
     fn is_stop(&self, tok: u32) -> bool { self.eos.contains(&tok) }
     fn text_of(&self, ids: &[u32], specials: bool) -> String { if specials { self.detok_all(ids) } else { self.detok(ids) } }
     fn piece(&self, tok: u32) -> (String, Vec<u8>) { Engine::piece(self, tok) }
-    fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String> { Engine::budget(self, prompt_len, want) }
+    fn budget(&self, prompt_len: usize, o: &GenOpts) -> Result<usize, String> { Engine::budget(self, prompt_len, o) }
     /// ⛔ Wiring batching sent plain requests on an MTP hybrid through the scheduler, which cannot
     /// draft — so speculative decoding, its energy gate and the one-slot prefix cache ran only for
     /// `response_format` and tool requests. Such a model keeps its own serial loop.
@@ -1111,7 +1111,7 @@ mod tests {
             ids.iter().map(|i| format!("{i},")).collect()
         }
         fn piece(&self, tok: u32) -> (String, Vec<u8>) { let t = format!("{tok},"); (t.clone(), t.into_bytes()) }
-        fn budget(&self, _p: usize, want: Option<usize>) -> Result<usize, String> { Ok(want.unwrap_or(256)) }
+        fn budget(&self, _p: usize, o: &GenOpts) -> Result<usize, String> { Ok(o.max_tokens.unwrap_or(256)) }
     }
 
     fn onehot(i: u32, n: usize) -> Vec<f32> {
