@@ -79,7 +79,11 @@ pub struct LayerBytes<'a> {
     bytes: &'a [u8],
 }
 
-impl LayerBytes<'_> {
+impl<'a> LayerBytes<'a> {
+    /// Serve the tensors inside `[run_start, run_start + bytes.len())` from `bytes`, everything else
+    /// from `inner`.
+    pub fn new(inner: &'a GgufBacked, run_start: u64, bytes: &'a [u8]) -> Self { LayerBytes { inner, run_start, bytes } }
+
     /// Byte range of `name` inside the fetched run, if it belongs to this layer.
     fn local(&self, name: &str) -> Option<(usize, usize)> {
         let t = self.inner.tensor(name)?;
@@ -94,15 +98,20 @@ impl LayerBytes<'_> {
 impl GgufSource for LayerBytes<'_> {
     fn metadata(&self) -> &HashMap<String, Meta> { self.inner.metadata() }
     fn tensor(&self, n: &str) -> Option<&TensorInfo> { self.inner.tensor(n) }
+    // ⛔ A LOCAL read must ask the reader's PrismML lock itself: it never reaches `inner.raw`, so before
+    // this check a streamed loader read Hadamard-rotated tensors without ever declaring that it applies
+    // the transform — the one bypass of the guard every other reader enforces.
     fn raw(&self, n: &str) -> Result<Vec<u8>, String> {
         match self.local(n) {
-            Some((o, sz)) => Ok(self.bytes[o..o + sz].to_vec()),
+            Some((o, sz)) => { self.inner.prism_check(n)?; Ok(self.bytes[o..o + sz].to_vec()) }
             None => self.inner.raw(n), // not part of this run (embeddings, head, norms outside the layer)
         }
     }
+    fn unlock_prism_hadamard(&self) -> bool { self.inner.unlock_prism_hadamard() }
     fn dequant(&self, n: &str) -> Result<Vec<f32>, String> {
         match self.local(n) {
             Some((o, sz)) => {
+                self.inner.prism_check(n)?;
                 let t = self.tensor(n).ok_or("missing tensor")?;
                 let count: usize = t.dims.iter().product::<u64>() as usize;
                 deq_raw(&self.bytes[o..o + sz], count, t.ggml_type)
@@ -429,6 +438,36 @@ mod run_tests {
         let ts = vec![t("blk.0.a.weight", 0, 2), t("blk.1.x.weight", 16, 2), t("blk.0.b.weight", 32, 8)];
         let e = layer_runs_of(&ts, 0).expect_err("a foreign tensor in the span must be refused");
         assert!(e.contains("blk.1.x.weight"), "the error must name the tensor that overlaps: {e}");
+    }
+
+    /// ⛔ A streamed layer's tensors are served from bytes the tier fetched, never through the reader's
+    /// `raw` — so the PrismML read lock has to be asked explicitly, or a streaming loader reads rotated
+    /// weights without declaring that it transforms their activations. Locked until unlocked; a tensor
+    /// the contract does not name is never locked.
+    #[test]
+    fn a_streamed_layer_read_honours_the_prism_lock() {
+        use super::LayerBytes;
+        use ferric_gguf::{backed::GgufBacked, write::GgufWriter, GgufSource};
+        let mut w = GgufWriter::new("qwen35");
+        w.kv_u32("prism.hadamard.version", 1)
+            .kv_u32("prism.hadamard.block_size", 4)
+            .kv_str("prism.hadamard.transform", "normalized-sylvester-walsh-hadamard")
+            .kv_str("prism.hadamard.axis", "input-last-dimension")
+            .kv_str("prism.hadamard.sign_mode", "explicit")
+            .kv_arr_i32("prism.hadamard.sign_widths", &[8])
+            .kv_arr_i32("prism.hadamard.sign_values", &[1, -1, 1, 1, -1, 1, 1, 1])
+            .kv_arr_str("prism.hadamard.weight_names", &["blk.0.ffn_up.weight".into()])
+            .tensor_f32("blk.0.ffn_up.weight", &[8, 2], &[0.5; 16])
+            .tensor_f32("blk.0.attn_norm.weight", &[8], &[1.0; 8]);
+        let bytes = w.finish().unwrap();
+        let src = GgufBacked::new(bytes.clone(), std::sync::Arc::new(ferric_tier::SliceBacking::new(bytes.clone()))).unwrap();
+        let run = layer_runs_of(&src.tensors, src.data_start()).unwrap()[0];
+        let lb = LayerBytes::new(&src, run.offset, &bytes[run.offset as usize..(run.offset + run.bytes) as usize]);
+        assert!(lb.raw("blk.0.ffn_up.weight").is_err(), "a rotated tensor read from the fetched run before unlock");
+        assert!(lb.dequant("blk.0.ffn_up.weight").is_err(), "a rotated tensor dequantized before unlock");
+        assert_eq!(lb.dequant("blk.0.attn_norm.weight").unwrap(), vec![1.0; 8], "an unrotated tensor must stay readable");
+        assert!(lb.unlock_prism_hadamard(), "the unlock must reach the reader's lock");
+        assert_eq!(lb.dequant("blk.0.ffn_up.weight").unwrap(), vec![0.5; 16]);
     }
 
     /// An unpadded layer is unchanged by the fix — span and sum agree, so nothing moved for the

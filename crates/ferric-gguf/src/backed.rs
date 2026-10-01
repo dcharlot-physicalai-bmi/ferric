@@ -56,6 +56,11 @@ impl GgufBacked {
     pub fn data_start(&self) -> u64 { self.data_start }
     pub fn backing(&self) -> &Arc<dyn Backing + Send + Sync> { &self.backing }
 
+    /// The Hadamard read guard, for a wrapper that serves this reader's tensors from bytes it fetched
+    /// itself (`ferric_llama::stream::LayerBytes`). Such a wrapper never calls [`GgufSource::raw`] on
+    /// this reader for those tensors, so without asking here it would bypass the lock entirely.
+    pub fn prism_check(&self, name: &str) -> Result<(), String> { self.prism_lock.check(name) }
+
     /// Absolute byte range of `name` in the checkpoint.
     pub fn extent(&self, name: &str) -> Option<(u64, usize)> {
         let t = self.tensor(name)?;

@@ -546,6 +546,56 @@ pub struct Qwen35 {
     pub mtp: Option<Mtp>,
     /// PrismML's Hadamard contract (Bonsai 2), or `None` for an ordinary file.
     pub rot: Option<Arc<Rotations>>,
+    /// Layers `layers.len()..n_layer` streamed from a backing (see [`Qwen35::load_streaming`]), or
+    /// `None` when every layer is resident.
+    pub stream: Option<Qwen35Stream>,
+}
+
+/// One block's weights for one visit: borrowed when resident (or pinned), built when streamed. The
+/// drop of a `Built` at the end of its step is the eviction.
+pub enum LayerRef<'a> { Resident(&'a Layer), Built(Layer) }
+
+impl std::ops::Deref for LayerRef<'_> {
+    type Target = Layer;
+    fn deref(&self) -> &Layer { match self { LayerRef::Resident(l) => l, LayerRef::Built(l) => l } }
+}
+
+enum Qwen35Tier {
+    Sync(ferric_tier::LayerCache),
+    /// The next streamed layer is read on a worker thread while this one computes. Native only.
+    #[cfg(not(target_arch = "wasm32"))]
+    Overlapped(ferric_tier::PrefetchCache),
+}
+
+/// **Layer streaming for the hybrid**: a prefix of blocks resident on the device, the rest re-read
+/// from a [`ferric_tier::Backing`] and rebuilt on every visit — how a 7 GB Bonsai 2 runs on a GPU with
+/// 6 GB of memory.
+///
+/// The split is decided in DEVICE bytes ([`Qwen35::layer_device_bytes`]), because that is the memory
+/// that runs out: a PTQ1_0 file is 1.75 bpw on disk and 2.125 bpw on the device after the lossless
+/// group-128 transcode, so a plan priced in file bytes would overcommit the GPU by 21%.
+///
+/// The tier here holds ONLY the streamed layers (its own plan pins nothing): the pinned prefix is built
+/// once at load straight from the file and lives on the device, so no host copy of it is kept — the
+/// qwen3 stream's tier holds the pinned prefix's bytes in host RAM as well, which on a 15 GB host
+/// next to a 6 GB GPU is memory the page cache wants.
+///
+/// Placement never changes results: a streamed layer is built by the same `load_layer` from the same
+/// bytes as a resident one. `scripts/bonsai2_conformance.sh` runs with `FERRIC_STREAM_GIB` set to check
+/// exactly that against the authors' fixture.
+pub struct Qwen35Stream {
+    src: ferric_gguf::backed::GgufBacked,
+    tier: std::cell::RefCell<Qwen35Tier>,
+    backing: Arc<dyn ferric_tier::Backing + Send + Sync>,
+    /// Streamed layers only: `runs[k]` is layer `npin + k`.
+    runs: Vec<ferric_tier::LayerDesc>,
+    /// Layers `0..npin` are resident.
+    pub npin: usize,
+    /// Layers built from streamed bytes so far (excluding the validation pass at load).
+    pub rebuilds: std::cell::Cell<u64>,
+    /// Device bytes of the resident prefix, and file bytes re-read per full pass of the streamed layers.
+    pub pinned_device_bytes: u64,
+    pub streamed_bytes_per_pass: u64,
 }
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
@@ -908,6 +958,131 @@ pub mod route_trace {
 
 impl Qwen35 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
+        let m = Self::load_prefix(ctx, g, usize::MAX)?;
+        // The fork's graph check, at load: every folded weight went through a transform-applying site.
+        if let Some(r) = &m.rot { r.verify_all_claimed()?; }
+        Ok(m)
+    }
+
+    /// Device bytes of each block (`blk.N.*`), as this runtime will hold them: the ternary packings
+    /// that ride the group-128 Q2_0 kernels through a lossless transcode (PTQ1_0, group-64 Q2_0) are
+    /// priced at 34 B per 128 weights, everything else at its file size.
+    pub fn layer_device_bytes(g: &impl GgufSource, tensors: &[ferric_gguf::TensorInfo], n_layer: usize) -> Result<Vec<u64>, String> {
+        let _ = g;
+        let mut v = vec![0u64; n_layer];
+        for t in tensors {
+            let Some(rest) = t.name.strip_prefix("blk.") else { continue };
+            let Some(il) = rest.split('.').next().and_then(|s| s.parse::<usize>().ok()) else { continue };
+            if il >= n_layer { continue; }
+            let n: usize = t.dims.iter().product::<u64>() as usize;
+            v[il] += match t.ggml_type {
+                ferric_gguf::prism::PTQ1_0 | ferric_gguf::prism::Q2_0_G64 => (n / 128 * 34) as u64,
+                ty => ferric_gguf::type_size(ty, n)? as u64,
+            };
+        }
+        Ok(v)
+    }
+
+    /// **Run with layer weights streamed from `path`**, keeping as many leading blocks resident as fit
+    /// in `budget_bytes` of DEVICE memory for layer weights. Everything outside the blocks — the LM
+    /// head on the device, the token-embedding table in host RAM — stays loaded regardless. See
+    /// [`Qwen35Stream`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_streaming(ctx: &Arc<Context>, path: &str, budget_bytes: u64) -> Result<Qwen35, String> {
+        let file = GgufFile::open(path)?;
+        if file.shard_count() > 1 {
+            return Err(format!("this checkpoint is {} shards and the streaming reader addresses one file \
+                                positionally; merge it (llama-gguf-split --merge)", file.shard_count()));
+        }
+        let backing: Arc<dyn ferric_tier::Backing + Send + Sync> =
+            Arc::new(ferric_tier::FileBacking::open(path).map_err(|e| e.to_string())?);
+        // `total` is the FILE SIZE — see `stream::open_with` for what passing a sentinel here costs.
+        let total = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("{path}: {e}"))?;
+        let (header, _) = ferric_gguf::backed::header_probe(&*backing, total, 1 << 20, 64 << 20)?;
+        let src = ferric_gguf::backed::GgufBacked::new(header, Arc::clone(&backing))?;
+        let overlap = std::env::var("FERRIC_STREAM_SYNC").is_err();
+        Self::with_stream(ctx, &file, src, backing, budget_bytes, overlap)
+    }
+
+    /// The embodiment-independent half of [`Self::load_streaming`]: `g` serves the resident parts
+    /// (the pinned prefix, head, embeddings), `src` + `backing` the streamed blocks. A browser passes
+    /// a `GgufBacked` over a `StagedBacking` for both.
+    pub fn with_stream(ctx: &Arc<Context>, g: &impl GgufSource, src: ferric_gguf::backed::GgufBacked,
+                       backing: Arc<dyn ferric_tier::Backing + Send + Sync>, budget_bytes: u64,
+                       overlap: bool) -> Result<Qwen35, String> {
+        let mut cfg = Cfg::from_gguf(g)?;
+        if let Ok(n) = std::env::var("FERRIC_MAX_LAYERS") { if let Ok(n) = n.parse::<usize>() { cfg.n_layer = cfg.n_layer.min(n); } }
+        let runs = crate::stream::layer_runs_of(&src.tensors, src.data_start())?;
+        if runs.len() < cfg.n_layer { return Err(format!("{} block runs for {} layers", runs.len(), cfg.n_layer)); }
+        let dev = Self::layer_device_bytes(g, &src.tensors, cfg.n_layer)?;
+        let (mut npin, mut used) = (0usize, 0u64);
+        while npin < cfg.n_layer && used + dev[npin] <= budget_bytes { used += dev[npin]; npin += 1; }
+        let mut m = Self::load_prefix(ctx, g, npin)?;
+        if npin < m.cfg.n_layer {
+            if m.rot.is_some() && !src.unlock_prism_hadamard() {
+                return Err("the streaming reader cannot unlock PrismML Hadamard-folded tensors".into());
+            }
+            let srun: Vec<ferric_tier::LayerDesc> = runs[npin..m.cfg.n_layer].to_vec();
+            let slot = ferric_tier::align_up(srun.iter().map(|r| r.bytes).max().unwrap_or(0), 4096);
+            let plan = ferric_tier::LayerPlan { npin: 0, ring_slot: slot, spent: 2 * slot, n_layers: srun.len() };
+            #[cfg(not(target_arch = "wasm32"))]
+            let tier = if overlap {
+                Qwen35Tier::Overlapped(ferric_tier::PrefetchCache::new(plan, srun.clone(), Arc::clone(&backing))
+                    .map_err(|e| e.to_string())?)
+            } else { Qwen35Tier::Sync(ferric_tier::LayerCache::new(plan, srun.clone())) };
+            #[cfg(target_arch = "wasm32")]
+            let tier = { let _ = overlap; Qwen35Tier::Sync(ferric_tier::LayerCache::new(plan, srun.clone())) };
+            m.stream = Some(Qwen35Stream {
+                src, tier: std::cell::RefCell::new(tier), backing, npin,
+                streamed_bytes_per_pass: srun.iter().map(|r| r.bytes).sum(),
+                runs: srun, rebuilds: std::cell::Cell::new(0), pinned_device_bytes: used,
+            });
+            // Build every streamed block ONCE now and drop it: a missing or malformed tensor fails at
+            // open rather than on the first token that reaches its block, and every folded weight gets
+            // claimed by a transform-applying load site before the check below.
+            for il in npin..m.cfg.n_layer {
+                drop(m.build_streamed(il)?);
+                ctx.flush();
+            }
+            if let Some(s) = &m.stream { s.rebuilds.set(0); }
+        }
+        if let Some(r) = &m.rot { r.verify_all_claimed()?; }
+        Ok(m)
+    }
+
+    /// Rebuild streamed block `il` from bytes the tier delivers — the same `load_layer` as a resident
+    /// block, so placement cannot change what is computed.
+    fn build_streamed(&self, il: usize) -> Result<Layer, String> {
+        let s = self.stream.as_ref().ok_or("model is not streaming")?;
+        let k = il.checked_sub(s.npin).ok_or("a resident layer has no stream slot")?;
+        let mut tier = s.tier.borrow_mut();
+        let bytes = match &mut *tier {
+            Qwen35Tier::Sync(c) => c.bind(k as u32, &*s.backing).map(|(b, _)| b),
+            #[cfg(not(target_arch = "wasm32"))]
+            Qwen35Tier::Overlapped(c) => c.bind(k as u32).map(|(b, _)| b),
+        }.map_err(|e| format!("tier bind for layer {il}: {e}"))?;
+        let lb = crate::stream::LayerBytes::new(&s.src, s.runs[k].offset, bytes);
+        s.rebuilds.set(s.rebuilds.get() + 1);
+        let conv_dim = self.cfg.key_dim() * 2 + self.cfg.d_inner;
+        Self::load_layer(&self.ctx, &lb, il, &self.cfg, conv_dim, self.rot.as_deref())
+    }
+
+    /// Block `il` for one visit.
+    ///
+    /// A streamed block is built here and then the device is drained of the previous step's work
+    /// before it is used: that frees the previous streamed block's buffers (dropped at the end of its
+    /// step) and bounds the transient device footprint to about two blocks. Without the drain, wgpu
+    /// frees nothing until the next readback and a forward pass would hold every streamed block at once.
+    pub fn layer(&self, il: usize) -> LayerRef<'_> {
+        if il < self.layers.len() { return LayerRef::Resident(&self.layers[il]); }
+        let l = self.build_streamed(il).unwrap_or_else(|e| panic!("streaming block {il}: {e}"));
+        self.ctx.flush();
+        LayerRef::Built(l)
+    }
+
+    /// Everything except blocks `npin..` (and the MTP draft block, unless every block is resident).
+    /// Does NOT run the Hadamard claim check — the caller does, once every block has been built.
+    fn load_prefix(ctx: &Arc<Context>, g: &impl GgufSource, npin: usize) -> Result<Qwen35, String> {
         let mut cfg = Cfg::from_gguf(g)?;
         // Debug aid: FERRIC_MAX_LAYERS=N truncates the model (e.g. to isolate GPU-resource-limit issues).
         if let Ok(n) = std::env::var("FERRIC_MAX_LAYERS") { if let Ok(n) = n.parse::<usize>() { cfg.n_layer = cfg.n_layer.min(n); } }
@@ -930,8 +1105,8 @@ impl Qwen35 {
         }
         let rref = rot.as_ref();
 
-        let mut layers = Vec::with_capacity(cfg.n_layer);
-        for il in 0..cfg.n_layer {
+        let mut layers = Vec::with_capacity(cfg.n_layer.min(npin));
+        for il in 0..cfg.n_layer.min(npin) {
             layers.push(Self::load_layer(ctx, g, il, &cfg, conv_dim, rref)?);
             // MoE layers allocate ~500 buffers (~300 MB) each; flush per layer so pending buffer
             // initializations commit — past ~10 GB un-flushed, Metal silently zeroes later buffers.
@@ -941,7 +1116,7 @@ impl Qwen35 {
         // The MTP ("nextn") draft block: a standard attn+FFN layer stored after the main layers, plus
         // the eh_proj/enorm/hnorm glue and its own pre-head norm. Loaded for speculative decoding;
         // it shares the main embedding and LM head.
-        let mtp = if cfg.n_nextn > 0 {
+        let mtp = if cfg.n_nextn > 0 && npin >= cfg.n_layer {
             let il = cfg.n_layer + cfg.n_nextn - 1; // draft block index (40 for qwen35moe)
             let b = |s: &str| format!("blk.{il}.{s}");
             if g.tensor(&b("nextn.eh_proj.weight")).is_some() {
@@ -964,13 +1139,11 @@ impl Qwen35 {
         let tok_embd = g.raw("token_embd.weight")?;
         let emb_row_bytes = tok_embd.len() / cfg.n_vocab;
         let lm_head = rq(ctx, g, rref, head, None)?;
-        // The fork's graph check, at load: every folded weight went through a transform-applying site.
-        if let Some(r) = &rot { r.verify_all_claimed()?; }
         Ok(Qwen35 {
             tok_embd, emb_type, emb_row_bytes,
             out_norm: f32t(ctx, g, "output_norm.weight", &[cfg.n_embd])?,
             lm_head,
-            cfg, ctx: ctx.clone(), layers, mtp, rot: rot.map(Arc::new),
+            cfg, ctx: ctx.clone(), layers, mtp, rot: rot.map(Arc::new), stream: None,
         })
     }
 
@@ -1343,7 +1516,9 @@ impl Qwen35 {
         // FERRIC_PROFILE splits each layer into per-category submissions so the sync'd timer can
         // attribute time (mixer vs ffn); otherwise the whole layer is one batch (fewer submits).
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
-        for (il, l) in self.layers.iter().enumerate().take(n) {
+        for il in 0..n.min(self.cfg.n_layer) {
+            let lref = self.layer(il);
+            let l: &Layer = &lref;
             // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
             let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
@@ -1399,7 +1574,9 @@ impl Qwen35 {
         use ferric_tensor::batch;
         let mut x = self.embed(tokens);
         let pos = cache.pos;
-        for (il, l) in self.layers.iter().enumerate().take(n) {
+        for il in 0..n.min(self.cfg.n_layer) {
+            let lref = self.layer(il);
+            let l: &Layer = &lref;
             // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
             let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
@@ -1435,7 +1612,9 @@ impl Qwen35 {
         prof(&self.ctx, "embed");
         let pos = cache.pos;
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
-        for (il, l) in self.layers.iter().enumerate().take(n) {
+        for il in 0..n.min(self.cfg.n_layer) {
+            let lref = self.layer(il);
+            let l: &Layer = &lref;
             // Read the format BEFORE borrowing the layer slot mutably: `fmt` is Copy, `lc` is not.
             let fmt = cache.fmt;
             let lc = &mut cache.layers[il];
@@ -1480,7 +1659,8 @@ impl Qwen35 {
     /// Debug: time one layer's FFN at batch size `t` (median of `iters`, synced) — isolates the
     /// slab MoE path's t-scaling from everything else in a forward.
     pub fn bench_ffn(&self, il: usize, t: usize, iters: usize) -> f64 {
-        let l = &self.layers[il];
+        let lref = self.layer(il);
+        let l: &Layer = &lref;
         let h = Tensor::from_vec(&self.ctx, &vec![0.01f32; t * self.cfg.n_embd], &[t, self.cfg.n_embd]);
         let mut times = Vec::with_capacity(iters);
         for _ in 0..iters {
@@ -1848,8 +2028,9 @@ impl Qwen35 {
         assert_eq!(tokens.len(), caches.len(), "one token per sequence");
         assert!(!tokens.is_empty(), "forward_batch needs at least one sequence");
         let mut x = self.embed(tokens);
-        for (il, l) in self.layers.iter().enumerate() {
-            x = self.apply_layer_batch(&x, l, caches, il);
+        for il in 0..self.cfg.n_layer {
+            let l = self.layer(il);
+            x = self.apply_layer_batch(&x, &l, caches, il);
         }
         // AFTER the layers: `attn_batch`/`lag_attn_batch` read `c.pos` as this token's own absolute
         // position. Bumping first would rope every row one step into the future.

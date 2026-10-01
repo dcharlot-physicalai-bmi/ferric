@@ -11,6 +11,7 @@
 //!       [--out logits.bin] [--gen N] [--time]
 //!
 //! Prints `gen=<ids>` and, with `--time`, per-token decode wall time (the prefill excluded).
+//! `FERRIC_STREAM_GIB=<GiB>` streams the blocks that do not fit that device budget (`Qwen35::load_streaming`).
 use ferric_core::Context;
 use ferric_gguf::GgufFile;
 use ferric_llama::qwen35::{Cache, Qwen35};
@@ -34,10 +35,22 @@ async fn run() {
     let mut out = flag("--out").map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create --out")));
 
     let ctx = Arc::new(Context::new().await.expect("GPU context"));
-    let g = GgufFile::open(path).expect("open gguf");
+    // Say which device ran it: on a hybrid-GPU box wgpu has silently picked the iGPU before.
+    eprintln!("adapter: {} ({:?})", ctx.adapter_name, ctx.backend);
     let t0 = std::time::Instant::now();
-    let m = Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load: {e}"));
+    // FERRIC_STREAM_GIB=<device GiB for layer weights>: keep that many leading blocks resident and
+    // stream the rest from the file (`Qwen35::load_streaming`) — how the model runs on a GPU smaller
+    // than it. Unset: everything resident.
+    let m = match std::env::var("FERRIC_STREAM_GIB").ok().and_then(|v| v.parse::<f64>().ok()) {
+        Some(gib) => Qwen35::load_streaming(&ctx, path, (gib * (1u64 << 30) as f64) as u64),
+        None => Qwen35::load(&ctx, &GgufFile::open(path).expect("open gguf")),
+    }.unwrap_or_else(|e| panic!("load: {e}"));
     eprintln!("loaded in {:.2?} (prism.hadamard: {})", t0.elapsed(), if m.rot.is_some() { "applied" } else { "absent" });
+    if let Some(s) = &m.stream {
+        eprintln!("streaming: {}/{} blocks resident ({:.2} GiB device), {:.2} GiB re-read per pass",
+                  s.npin, m.cfg.n_layer, s.pinned_device_bytes as f64 / (1u64 << 30) as f64,
+                  s.streamed_bytes_per_pass as f64 / (1u64 << 30) as f64);
+    }
     let nv = m.cfg.n_vocab;
 
     let mut cache = Cache::new(&m.cfg);
@@ -63,6 +76,7 @@ async fn run() {
     if let Some(w) = out.as_mut() { w.flush().unwrap(); }
     println!("n_vocab={nv} n={}", ids.len());
     if n_gen > 0 { println!("gen={}", gen_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
+    if let Some(s) = &m.stream { println!("stream: npin={} rebuilds={}", s.npin, s.rebuilds.get()); }
     if time && !step_ms.is_empty() {
         let mut s = step_ms.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
