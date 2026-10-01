@@ -76,7 +76,10 @@ async fn run() {
     if let Some(w) = out.as_mut() { w.flush().unwrap(); }
     println!("n_vocab={nv} n={}", ids.len());
     if n_gen > 0 { println!("gen={}", gen_ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")); }
-    if let Some(s) = &m.stream { println!("stream: npin={} rebuilds={}", s.npin, s.rebuilds.get()); }
+    if let Some(s) = &m.stream {
+        println!("stream: npin={} rebuilds={}  bind {:.0} ms  build {:.0} ms  drain {:.0} ms", s.npin, s.rebuilds.get(),
+                 s.bind_ns.get() as f64 / 1e6, s.build_ns.get() as f64 / 1e6, s.drain_ns.get() as f64 / 1e6);
+    }
     if time && !step_ms.is_empty() {
         let mut s = step_ms.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());

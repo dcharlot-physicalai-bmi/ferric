@@ -596,6 +596,12 @@ pub struct Qwen35Stream {
     /// Device bytes of the resident prefix, and file bytes re-read per full pass of the streamed layers.
     pub pinned_device_bytes: u64,
     pub streamed_bytes_per_pass: u64,
+    /// Wall time spent getting streamed blocks' bytes from the tier, building their device tensors,
+    /// and draining the device before each one — so a slow streamed step can be attributed rather
+    /// than guessed at. Nanoseconds; excludes the validation pass at load.
+    pub bind_ns: std::cell::Cell<u64>,
+    pub build_ns: std::cell::Cell<u64>,
+    pub drain_ns: std::cell::Cell<u64>,
 }
 
 /// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
@@ -1036,6 +1042,7 @@ impl Qwen35 {
                 src, tier: std::cell::RefCell::new(tier), backing, npin,
                 streamed_bytes_per_pass: srun.iter().map(|r| r.bytes).sum(),
                 runs: srun, rebuilds: std::cell::Cell::new(0), pinned_device_bytes: used,
+                bind_ns: Default::default(), build_ns: Default::default(), drain_ns: Default::default(),
             });
             // Build every streamed block ONCE now and drop it: a missing or malformed tensor fails at
             // open rather than on the first token that reaches its block, and every folded weight gets
@@ -1044,7 +1051,7 @@ impl Qwen35 {
                 drop(m.build_streamed(il)?);
                 ctx.flush();
             }
-            if let Some(s) = &m.stream { s.rebuilds.set(0); }
+            if let Some(s) = &m.stream { s.rebuilds.set(0); s.bind_ns.set(0); s.build_ns.set(0); s.drain_ns.set(0); }
         }
         if let Some(r) = &m.rot { r.verify_all_claimed()?; }
         Ok(m)
@@ -1055,16 +1062,21 @@ impl Qwen35 {
     fn build_streamed(&self, il: usize) -> Result<Layer, String> {
         let s = self.stream.as_ref().ok_or("model is not streaming")?;
         let k = il.checked_sub(s.npin).ok_or("a resident layer has no stream slot")?;
+        let t0 = std::time::Instant::now();
         let mut tier = s.tier.borrow_mut();
         let bytes = match &mut *tier {
             Qwen35Tier::Sync(c) => c.bind(k as u32, &*s.backing).map(|(b, _)| b),
             #[cfg(not(target_arch = "wasm32"))]
             Qwen35Tier::Overlapped(c) => c.bind(k as u32).map(|(b, _)| b),
         }.map_err(|e| format!("tier bind for layer {il}: {e}"))?;
+        let t1 = std::time::Instant::now();
         let lb = crate::stream::LayerBytes::new(&s.src, s.runs[k].offset, bytes);
         s.rebuilds.set(s.rebuilds.get() + 1);
         let conv_dim = self.cfg.key_dim() * 2 + self.cfg.d_inner;
-        Self::load_layer(&self.ctx, &lb, il, &self.cfg, conv_dim, self.rot.as_deref())
+        let l = Self::load_layer(&self.ctx, &lb, il, &self.cfg, conv_dim, self.rot.as_deref());
+        s.bind_ns.set(s.bind_ns.get() + (t1 - t0).as_nanos() as u64);
+        s.build_ns.set(s.build_ns.get() + t1.elapsed().as_nanos() as u64);
+        l
     }
 
     /// Block `il` for one visit.
@@ -1076,7 +1088,9 @@ impl Qwen35 {
     pub fn layer(&self, il: usize) -> LayerRef<'_> {
         if il < self.layers.len() { return LayerRef::Resident(&self.layers[il]); }
         let l = self.build_streamed(il).unwrap_or_else(|e| panic!("streaming block {il}: {e}"));
+        let t = std::time::Instant::now();
         self.ctx.flush();
+        if let Some(s) = &self.stream { s.drain_ns.set(s.drain_ns.get() + t.elapsed().as_nanos() as u64); }
         LayerRef::Built(l)
     }
 
@@ -1108,9 +1122,13 @@ impl Qwen35 {
         let mut layers = Vec::with_capacity(cfg.n_layer.min(npin));
         for il in 0..cfg.n_layer.min(npin) {
             layers.push(Self::load_layer(ctx, g, il, &cfg, conv_dim, rref)?);
-            // MoE layers allocate ~500 buffers (~300 MB) each; flush per layer so pending buffer
-            // initializations commit — past ~10 GB un-flushed, Metal silently zeroes later buffers.
-            if cfg.is_moe() { ctx.flush(); }
+            // Flush per layer so pending buffer initializations commit and their STAGING copies are
+            // freed. MoE layers allocate ~500 buffers (~300 MB) each — past ~10 GB un-flushed, Metal
+            // silently zeroes later buffers. And on a discrete GPU every `create_buffer_init` holds a
+            // second, host-visible copy until the next poll, which can sit in VRAM itself (resizable
+            // BAR): on the 6 GB RTX 4050 a 3.5 GiB prefix ran out of memory at 5.6 GB used, mid-load,
+            // with half its staging never released.
+            ctx.flush();
         }
 
         // The MTP ("nextn") draft block: a standard attn+FFN layer stored after the main layers, plus
