@@ -103,7 +103,24 @@ async fn run() {
         for (name, t) in &taps { stage_out(name, t, &t.to_vec().await); }
         (soft, fx["image_token_id"].as_u64().expect("image_token_id") as u32)
     } else {
-        panic!("audio fixtures: not wired yet");
+        let fe = match &src { Src::Hf { .. } => ferric_llama::gemma4_audio::FeCfg::load(tower_path).expect("processor_config.json"),
+                              Src::Gguf(_) => Default::default() };
+        let (pcm, rate) = ferric_llama::gemma4_audio::read_wav(&std::fs::read(file).expect("wav")).expect("wav");
+        assert_eq!(rate, fe.sample_rate, "the fixture's clip is {} Hz", fe.sample_rate);
+        let feats = ferric_llama::gemma4_audio::log_mel(&pcm, &fe);
+        println!("FRAMES {} {}", feats.frames, feats.valid);
+        if let Some(rec) = fx.get("features") {
+            print_rows("FEAT", &feats.mel, fe.n_mels, &u32s(&rec["rows"]), &u32s(&rec["cols"]));
+        }
+        let tower = ferric_llama::gemma4_audio::AudioTower::load(&ctx, &src).expect("audio tower");
+        if tower.neg != ferric_llama::gemma4_audio::Neg::None { eprintln!("⚠ audio control: {:?}", tower.neg); }
+        let mut taps = Vec::new();
+        let t0 = std::time::Instant::now();
+        let soft = tower.encode(&feats, Some(&mut taps)).expect("encode");
+        let _ = soft.to_vec().await;
+        eprintln!("audio tower: {} frames -> {} soft tokens in {:.1} ms", feats.valid, soft.shape[0], t0.elapsed().as_secs_f64() * 1e3);
+        for (name, t) in &taps { stage_out(name, t, &t.to_vec().await); }
+        (soft, fx["audio_token_id"].as_u64().expect("audio_token_id") as u32)
     };
     if std::env::var("FERRIC_G4_TOWER_ONLY").is_ok() { return; }
 

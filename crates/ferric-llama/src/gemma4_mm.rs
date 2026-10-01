@@ -108,6 +108,10 @@ impl Src {
                     v = w;
                     shape = vec![o, 3 * p * p];
                 }
+                // The depthwise conv kernel drops its singleton group axis: [1024, 5] for [1024, 1, 5].
+                if hf.ends_with("lconv1d.depthwise_conv1d.weight") && shape.len() == 2 {
+                    shape = vec![shape[0], 1, shape[1]];
+                }
                 // A scalar is stored as a 1-element vector.
                 if shape == [1] && ["input_min", "input_max", "output_min", "output_max"].iter().any(|b| hf.ends_with(b)) {
                     shape = vec![];
@@ -139,16 +143,47 @@ impl Src {
             }
         };
         if hf.ends_with("patch_embedder.input_proj.weight") && self.is_gguf() {
+            // The conv-layout kernel permuted back (see `f32s`). A 16-bit file is permuted AS 16-BIT
+            // ELEMENTS and kept in its type, so the matmul is the same kernel on the same bits as the
+            // authors' BF16 tensor — the two weight sources then give identical activations, not merely
+            // close ones (`gemma4_mm_stages` run on both).
+            if matches!(ty, 1 | 30) && dims.len() == 4 && dims[1] == 3 && dims[2] == dims[3] {
+                let (o, p) = (dims[0], dims[2]);
+                if o != out || 3 * p * p != inp { return Err(format!("{hf}: {dims:?} vs [{out}, {inp}]")); }
+                let mut b = vec![0u8; raw.len()];
+                for oi in 0..o { for c in 0..3 { for y in 0..p { for x in 0..p {
+                    let (src, dst) = (((oi * 3 + c) * p + y) * p + x, oi * 3 * p * p + (y * p + x) * 3 + c);
+                    b[2 * dst..2 * dst + 2].copy_from_slice(&raw[2 * src..2 * src + 2]);
+                } } } }
+                return QMatrix::from_bytes(ctx, &b, ty, out, inp);
+            }
             let (v, s) = self.f32s(hf)?;
             if s != [out, inp] { return Err(format!("{hf}: {s:?}, expected [{out}, {inp}]")); }
-            return Ok(QMatrix::from_dense(ctx, &v, out, inp));
+            return Ok(as_bf16_if_exact(ctx, &v, out, inp));
         }
         if dims != [out, inp] { return Err(format!("{hf}: {dims:?}, expected [{out}, {inp}]")); }
         if ty != 0 && QMatrix::block_bytes(ty).is_some() {
             QMatrix::from_bytes(ctx, &raw, ty, out, inp)
         } else {
-            Ok(QMatrix::from_dense(ctx, &self.f32s(hf)?.0, out, inp))
+            Ok(as_bf16_if_exact(ctx, &self.f32s(hf)?.0, out, inp))
         }
+    }
+
+    /// The audio attention's `softplus(per_dim_scale)`, `[head_dim]` — what the model multiplies q by.
+    ///
+    /// ⚠ The two files store DIFFERENT quantities under one role: the authors keep the raw parameter and
+    /// apply `F.softplus` in `forward`; the converter applies it once and stores the result (raw -2.0625,
+    /// mmproj 0.1196797). Reading the mmproj value as raw would softplus it twice.
+    pub fn softplus_per_dim_scale(&self, hf: &str) -> Result<Vec<f32>, String> {
+        let (v, _) = self.f32s(hf)?;
+        Ok(match self {
+            Src::Gguf(_) => v,
+            // softplus (beta 1, threshold 20) in f64, rounded once. torch evaluates it in float32 with its own
+            // vectorised exp/log1p, and the converter stored THAT: each of the 12 layers has some entry 1 ulp
+            // (6e-8 relative) from this one — and from a plain float32 `exp().ln_1p()` too, which was tried.
+            // Measured by `gemma4_mm_weights`; three orders below the floor any stage is judged at.
+            Src::Hf { .. } => v.iter().map(|&x| { let x = x as f64; (if x > 20.0 { x } else { x.exp().ln_1p() }) as f32 }).collect(),
+        })
     }
 
     /// One scalar buffer (a clipping bound).
@@ -159,10 +194,24 @@ impl Src {
     }
 }
 
+/// An F32 weight whose every value is a bfloat16 is presented AS bfloat16: the converter widened some of the
+/// authors' BF16 tensors to F32 (the patch embedding, the audio input projection), and the BF16 and F32 matmul
+/// kernels accumulate in different orders. Same bits through the same kernel is what makes the mmproj and the
+/// checkpoint give IDENTICAL activations rather than merely close ones.
+fn as_bf16_if_exact(ctx: &Arc<Context>, v: &[f32], out: usize, inp: usize) -> QMatrix {
+    let exact = std::env::var("FERRIC_HALF_DENSE").is_err() && v.iter().all(|x| x.to_bits() & 0xffff == 0);
+    if exact {
+        let b: Vec<u8> = v.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        if let Ok(q) = QMatrix::from_bytes(ctx, &b, 30, out, inp) { return q; }
+    }
+    QMatrix::from_dense(ctx, v, out, inp)
+}
+
 /// The authors' tensor name → ggml-org's mmproj name. `None` = this tensor has no mmproj counterpart.
 ///
 /// Read from a real mmproj (`mmproj-gemma-4-E2B-it-*.gguf`) and CHECKED BY VALUE against the authors' file,
-/// tensor by tensor (`examples/gemma4_mm_weights.rs`). Two traps it encodes:
+/// tensor by tensor (`examples/gemma4_mm_weights.rs`) — which is how the crossed LightConv norms below were
+/// found: the first version of this table had them straight. Traps it encodes:
 ///   * the audio tower's `output_proj` is `a.pre_encode.out` — the name says "pre", the tensor is the LAST
 ///     projection (1024 -> 1536, with bias);
 ///   * the conformer's two feed-forwards are `ffn_*` and `ffn_*_1`, and its final norm is `ln2` — while the
@@ -220,7 +269,10 @@ pub fn gguf_name(hf: &str) -> Option<String> {
             ("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"), ("self_attn.v_proj", "attn_v"),
             ("self_attn.post", "attn_out"), ("self_attn.relative_k_proj", "attn_k_rel"),
             ("norm_pre_attn", "attn_pre_norm"), ("norm_post_attn", "attn_post_norm"), ("norm_out", "ln2"),
-            ("lconv1d.pre_layer_norm", "norm_conv"), ("lconv1d.conv_norm", "conv_norm"),
+            // ⛔ CROSSED: the converter writes the LightConv's PRE norm as `conv_norm` and the norm AFTER the
+            // depthwise conv as `norm_conv`. Found by value (both are [1024] RMS weights; the first table
+            // had them straight, and every shape check passed).
+            ("lconv1d.pre_layer_norm", "conv_norm"), ("lconv1d.conv_norm", "norm_conv"),
             ("lconv1d.linear_start", "conv_pw1"), ("lconv1d.linear_end", "conv_pw2"),
             ("lconv1d.depthwise_conv1d", "conv_dw"),
         ]).map(|s| format!("a.blk.{i}.{s}"));

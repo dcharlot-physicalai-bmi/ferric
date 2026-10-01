@@ -61,12 +61,33 @@ def cfg_at(snap, dtype):
     return cfg
 
 
+# ⛔⛔ THE AUDIO TOWER MUST NOT RUN UNDER `attn_implementation="eager"`. Its attention is hand-written (it never
+# calls the attention interface), so the setting changes only the MASK the tower is handed — and under eager
+# `create_bidirectional_mask` returns a FLOAT additive mask (0 / -3.4e38) where the tower expects BOOL: its
+# `masked_fill(attention_mask.logical_not(), -1e9)` then masks every ALLOWED position and lets every masked
+# one through. Measured: 47.3 apart at the tower's output, eager vs the default sdpa, same weights and input.
+# The first audio fixture was generated that way and Ferric "missed" it by 6e-2 at block 0. So the audio
+# tower runs at its default ("sdpa": the mask is bool), and every run asserts the mask it received is bool.
+AUDIO_ATTN = "sdpa"
+
+
+def guard_audio_mask(m):
+    seen = []
+    def pre(_mod, args, kwargs):
+        mk = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
+        seen.append(None if mk is None else mk.dtype)
+    h = m.model.audio_tower.layers[0].self_attn.register_forward_pre_hook(pre, with_kwargs=True)
+    return h, seen
+
+
 def load(snap, dtype):
     """The authors' class at `dtype`, every parameter and persistent buffer checked against the FILE."""
     from safetensors import safe_open
     cfg = cfg_at(snap, dtype)
     m = M.Gemma4ForConditionalGeneration.from_pretrained(snap, config=cfg, dtype=dtype, attn_implementation="eager")
     m.eval()
+    if getattr(m.model, "audio_tower", None) is not None:
+        m.model.audio_tower.config._attn_implementation = AUDIO_ATTN
     bad = sorted({str(p.dtype) for p in m.parameters() if p.dtype != dtype})
     if bad:
         raise SystemExit(f"loaded as {bad}, not {dtype} — refusing to emit a fixture")
@@ -103,6 +124,31 @@ def load(snap, dtype):
     if clip_bufs and finite == 0:
         raise SystemExit("every clipping bound is infinite — the clipped linears were re-initialised, refusing")
     return m, rep
+
+
+F64_PATCHES = []
+
+
+def audio_attention_at_run_dtype():
+    """⚠ THE ONE CHANGE to the authors' code, and only for the float64 run: `Gemma4AudioAttention.forward`
+    casts q, k and v to float32 with `.float()`, then multiplies q by `softplus(per_dim_scale)` — a float64
+    parameter in a float64 model — so q is promoted to float64 while k stays float32, and the next matmul
+    raises `expected m1 and m2 to have the same dtype`. Their audio tower cannot run at float64 as written.
+    The three `.float()` casts become `.to(hidden_states.dtype)` (a no-op at float32), so the noise-floor run
+    computes the attention at float64. Applied by rewriting the method's source, recorded in the fixture."""
+    import inspect, textwrap
+    src = textwrap.dedent(inspect.getsource(M.Gemma4AudioAttention.forward))
+    n = src.count(").float().view(hidden_shape)")
+    if n != 3:
+        raise SystemExit(f"Gemma4AudioAttention.forward has {n} q/k/v .float() casts, expected 3 — refusing to patch blind")
+    src = src.replace(").float().view(hidden_shape)", ").to(hidden_states.dtype).view(hidden_shape)")
+    ns = {}
+    exec(compile(src, "<gemma4_audio_attention_f64>", "exec"), M.__dict__, ns)
+    orig = M.Gemma4AudioAttention.forward
+    M.Gemma4AudioAttention.forward = ns["forward"]
+    F64_PATCHES.append("Gemma4AudioAttention.forward: q/k/v `.float()` -> `.to(hidden_states.dtype)` (float64 run only; "
+                       "unpatched it raises a dtype error at float64)")
+    return orig
 
 
 def g(v, d):
@@ -214,10 +260,16 @@ def run(kind, m, enc, dtype, taps_on=True):
     for k in ("pixel_values", "input_features"):
         if k in kw:
             kw[k] = kw[k].to(dtype)
+    guard = guard_audio_mask(m) if kind == "audio" else None
     with torch.no_grad():
         out = m(**kw, use_cache=False)
     for h in hooks:
         h.remove()
+    if guard is not None:
+        guard[0].remove()
+        if not guard[1] or any(d != torch.bool for d in guard[1]):
+            raise SystemExit(f"the audio attention received mask dtypes {guard[1]}, not bool — its masked_fill would "
+                             f"invert a float mask; refusing to emit a fixture")
     return out.logits[0].detach(), taps
 
 
@@ -279,6 +331,8 @@ def main():
     cfg = cfg_at(snap, torch.float32)
     fx = {**meta, "kind": kind, "snapshot": os.path.basename(snap.rstrip("/")), "model_type": cfg.model_type,
           "question": question, "file": os.path.basename(path), **info, "ids": ids,
+          "attn_implementation": {"text": "eager", "vision": "eager", "audio": AUDIO_ATTN + " (its attention is hand-written; "
+                                  "this selects a BOOL mask — eager hands it a float mask its masked_fill inverts)"},
           "image_token_id": cfg.image_token_id, "audio_token_id": cfg.audio_token_id}
     if kind == "image":
         pv, pos = enc["pixel_values"][0], enc["image_position_ids"][0]
@@ -331,7 +385,10 @@ def main():
     del m
     gc.collect()
     m64, rep64 = load(snap, torch.float64)
+    restore = audio_attention_at_run_dtype() if kind == "audio" else None
     lg64, taps64 = run(kind, m64, enc, torch.float64)
+    if restore is not None:
+        M.Gemma4AudioAttention.forward = restore
     text_lg64 = None
     if kind == "image":
         with torch.no_grad():
@@ -341,8 +398,8 @@ def main():
 
     stages, stages64 = stage_records(taps, taps64, n_real, kind)
     fx.update({"load": rep, "stages": stages, "vocab": int(lg.shape[1]), "rows": logit_rows(lg, sample),
-               "float64": {"note": "the same code at float64 (its explicit float32 casts kept): the noise floor",
-                           "load": rep64, "stages": stages64, "rows": logit_rows(lg64, sample)}})
+               "float64": {"note": "the same code at float64 (its explicit float32 casts kept, except as patched): the noise floor",
+                           "patches": F64_PATCHES, "load": rep64, "stages": stages64, "rows": logit_rows(lg64, sample)}})
     if text_lg is not None:
         fx["text_rows"] = logit_rows(text_lg, sample)
         fx["float64"]["text_rows"] = logit_rows(text_lg64, sample)
