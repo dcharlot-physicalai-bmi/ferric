@@ -118,6 +118,8 @@ pub mod pooling;      // <arch>.pooling_type -> one vector; ONE copy, because it
 pub mod nemotron_h; // general.architecture registry: what runs, and the refusal for what does not
 
 pub mod gemma4; // Google Gemma 4 (E2B/E4B): per-layer embeddings, shared KV, two head widths
+pub mod gemma4_mm; // Gemma 4 towers: weight source (authors' safetensors | mmproj GGUF), clipped linear, embedder
+pub mod gemma4_vision; // Gemma 4 vision tower + the authors' image preprocessing (torchvision uint8 resize, bit-exact)
 
 pub mod deepseek2; // DeepSeek-V2/V3/Coder-V2: MLA + DeepSeekMoE
 
