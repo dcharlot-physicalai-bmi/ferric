@@ -5,6 +5,9 @@
 //   clang++ -std=c++17 -O2 bonsai2_decode_joules.cpp -I<fork>/include -I<fork>/ggml/include \
 //       -L<release dir> -lllama -lggml -lggml-base -Wl,-rpath,<release dir> -o bonsai2_decode_joules
 // usage: bonsai2_decode_joules <model.gguf> <id,id,...> [chunks 5] [k 128] [idle_s 4] [--noflash]
+//        env BONSAI2_NGL=<gpu layers> BONSAI2_THREADS=<cpu threads> for partial offload
+// Linux/CUDA: g++ -std=c++17 -O2 bonsai2_decode_joules.cpp -I<fork>/include -I<fork>/ggml/include \
+//       -L<fork>/build/bin -lllama -lggml -lggml-base -Wl,-rpath,<fork>/build/bin -o bonsai2_decode_joules
 #include "llama.h"
 #include <chrono>
 #include <cstdio>
@@ -21,11 +24,14 @@ int main(int argc, char ** argv) {
     int chunks = argc > 3 ? atoi(argv[3]) : 5, k = argc > 4 ? atoi(argv[4]) : 128; double idle = argc > 5 ? atof(argv[5]) : 4.0;
     bool noflash = argc > 6 && !strcmp(argv[6], "--noflash");
     llama_backend_init();
-    auto mp = llama_model_default_params(); mp.n_gpu_layers = 99;
+    // BONSAI2_NGL: layers on the GPU (default all) — partial offload for a GPU smaller than the model;
+    // BONSAI2_THREADS: CPU threads for the layers left on the host (llama.cpp's -t).
+    auto mp = llama_model_default_params(); mp.n_gpu_layers = getenv("BONSAI2_NGL") ? atoi(getenv("BONSAI2_NGL")) : 99;
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
     auto cp = llama_context_default_params(); cp.n_ctx = 4096; cp.n_batch = cp.n_ubatch = 512; cp.n_seq_max = 1;
     if (noflash) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if (getenv("BONSAI2_THREADS")) cp.n_threads = cp.n_threads_batch = atoi(getenv("BONSAI2_THREADS"));
     llama_context * ctx = llama_init_from_model(model, cp);
     auto run = [&](int kk) {
         llama_memory_clear(llama_get_memory(ctx), true);

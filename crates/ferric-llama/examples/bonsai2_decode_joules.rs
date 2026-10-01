@@ -9,6 +9,8 @@
 //!
 //!   cargo run --release -p ferric-llama --example bonsai2_decode_joules -- <model.gguf> <id,id,...> \
 //!       [chunks 5] [k 128] [idle_s 4]
+//!
+//! `FERRIC_STREAM_GIB=<GiB>` runs it with layer streaming (`Qwen35::load_streaming`).
 use ferric_core::Context;
 use ferric_gguf::GgufFile;
 use ferric_llama::qwen35::{Cache, Qwen35};
@@ -24,8 +26,16 @@ async fn run() {
     let arg = |i: usize, d: f64| a.get(i).map(|s| s.parse().unwrap()).unwrap_or(d);
     let (chunks, k, idle) = (arg(3, 5.0) as usize, arg(4, 128.0) as usize, arg(5, 4.0));
     let ctx = Arc::new(Context::new().await.expect("GPU"));
-    let g = GgufFile::open(&a[1]).expect("open");
-    let m = Qwen35::load(&ctx, &g).unwrap_or_else(|e| panic!("load: {e}"));
+    eprintln!("adapter: {} ({:?})", ctx.adapter_name, ctx.backend);
+    // FERRIC_STREAM_GIB=<device GiB for layer weights>: stream the blocks beyond that budget.
+    let m = match std::env::var("FERRIC_STREAM_GIB").ok().and_then(|v| v.parse::<f64>().ok()) {
+        Some(gib) => Qwen35::load_streaming(&ctx, &a[1], (gib * (1u64 << 30) as f64) as u64),
+        None => Qwen35::load(&ctx, &GgufFile::open(&a[1]).expect("open")),
+    }.unwrap_or_else(|e| panic!("load: {e}"));
+    if let Some(s) = &m.stream {
+        eprintln!("streaming: {}/{} blocks resident, {:.2} GiB re-read per pass", s.npin, m.cfg.n_layer,
+                  s.streamed_bytes_per_pass as f64 / (1u64 << 30) as f64);
+    }
     let nl = m.cfg.n_layer;
     // One decode run: prefill (untimed by the caller), then `k` greedy steps with readback.
     let decode = |cache: &mut Cache, first: u32, k: usize| -> Vec<u32> {

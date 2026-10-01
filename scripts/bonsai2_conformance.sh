@@ -20,6 +20,11 @@
 #      (the decode control in crates/ferric-gguf/tests/bonsai2_dequant.rs) — at the model level a stride
 #      mismatch is refused by the reader before any matmul runs.
 #
+# PLACEMENT (layer streaming, `Qwen35::load_streaming`): with FERRIC_STREAM_GIB=<GiB> set, every run above
+# keeps only the leading blocks that fit that device budget resident and re-reads the rest from the file
+# each pass — how the 7 GB model runs on a 6 GB GPU, gated against the same fixture. With
+# BONSAI2_PLACEMENT_GIB=<GiB>, step 4 also requires streamed logits BIT-IDENTICAL to an all-resident run.
+#
 # Tolerance: the fixture's `noise_floor` — how far the fork's own two attention kernels (flash on vs off,
 # same decode path) disagree over the same rows. Ferric must agree with the authors at least that well.
 #
@@ -117,6 +122,29 @@ for c, what in [("hadamard", "no Hadamard transform"), ("signs", "no sign flips"
     ratio = w / max(worst_all, 1e-9)
     print(f"  {what:44s} max|Δ| {w:.3e} = {ratio:,.0f}x the real run's worst  argmax {am}/{n}")
     if ratio < 20: print("  ⛔ not ≥20x worse — the gate cannot see this mechanism"); ok = False
+PG = os.environ.get("BONSAI2_PLACEMENT_GIB")
+if PG:
+    # Placement must change WHERE bytes live, never what is computed: the same kernels on the same device
+    # over the same bytes, so streamed logits must equal resident ones BIT FOR BIT, not within a tolerance.
+    print(f"── 4. placement: blocks beyond {PG} GiB streamed vs all resident (france + chat, 8 greedy steps)")
+    for p in ref["prompts"][:2]:
+        outs = []
+        for gib in (None, PG):
+            env = dict(os.environ); env.pop("FERRIC_PRISM_OFF", None); env.pop("FERRIC_STREAM_GIB", None)
+            if gib: env["FERRIC_STREAM_GIB"] = gib
+            with tempfile.TemporaryDirectory() as td:
+                o = os.path.join(td, "l.bin")
+                r = subprocess.run([BIN, M, ",".join(map(str, p["ids"])), "--out", o, "--gen", "8"],
+                                   capture_output=True, text=True, env=env)
+                if r.returncode: print(r.stderr[-1500:]); sys.exit(1)
+                st = [l for l in r.stderr.splitlines() if l.startswith("streaming:")]
+                outs.append((open(o, "rb").read(), st[0] if st else "all resident"))
+        (a, _), (b, st) = outs
+        same = a == b and len(a) > 0
+        nd = sum(x != y for x, y in zip(array.array("f", a), array.array("f", b))) if len(a) == len(b) else -1
+        print(f"  {p['name']:7s} {len(a) // 4 // nv:3d} rows  {st}:  {'BIT-IDENTICAL' if same else f'{nd} values differ'}")
+        if not same: ok = False
+        if "streaming:" not in st: print("  ⛔ the streamed run did not stream — budget too large to test placement"); ok = False
 print("✅ Bonsai 2 agrees with PrismML's fork at every recorded position" if ok else "⛔ Bonsai 2 conformance FAILED")
 sys.exit(0 if ok else 1)
 PY
