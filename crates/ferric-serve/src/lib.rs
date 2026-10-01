@@ -62,6 +62,8 @@ mod vision;
 mod constrain;
 mod trace;
 mod batchapi;
+mod local;
+pub use local::LocalModel;
 pub mod template;
 mod specgate;
 mod gpu_sample;
@@ -451,6 +453,8 @@ pub(crate) struct Engine {
     grammars: std::cell::RefCell<Vec<(String, std::sync::Arc<constrain::Masks>)>>,
     /// JSON-object guide masks by guide state (`constrain`).
     json_masks: std::cell::RefCell<HashMap<ferric_agent::guide::Json, Vec<u64>>>,
+    /// The model's own recommended sampling (`general.sampling.*` in the GGUF), as request fields.
+    sampling_defaults: serde_json::Map<String, Value>,
 }
 
 /// What `/metrics` exposes, in Prometheus text format.
@@ -685,6 +689,12 @@ impl Engine {
             specials.iter().filter(|(t, _)| t.starts_with("<|") && t.ends_with("|>") && t != "<|endoftext|>").map(|(_, i)| *i).collect()
         } else { Default::default() };
         let card = ollama::Card::from_gguf(&name, path, &g, false, model.n_embd(), n_ctx, &template);
+        let sampling_defaults = genopts::model_sampling_defaults(&g.metadata);
+        if !sampling_defaults.is_empty() {
+            eprintln!("ferric-serve: sampling defaults from the GGUF (general.sampling.*), used where a request sets none: {}{}",
+                serde_json::Value::Object(sampling_defaults.clone()),
+                if std::env::var("FERRIC_MODEL_SAMPLING").as_deref() == Ok("0") { " — OFF (FERRIC_MODEL_SAMPLING=0)" } else { "" });
+        }
         let tok_str = |id: Option<u32>| id.and_then(|i| tokens.get(i as usize).cloned()).unwrap_or_default();
         let chat_template = if template.is_empty() { None } else {
             match template::ChatTemplate::compile(&template, &tok_str(bos_id), &tok_str(eos_id)) {
@@ -697,7 +707,7 @@ impl Engine {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
                  },
-                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default() }
+                 rstrip_after, n_ctx, vision: None, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default(), sampling_defaults }
     }
 
     /// Tokenize a raw-text fragment through whichever tokenizer this model uses. `at_start` = this is
@@ -905,6 +915,25 @@ impl Engine {
 
     /// The prompt, and the image it carries if any — what a generating caller needs (a validating one
     /// needs only `chat_ids_with`).
+    /// The prompt a tool-free chat request renders to — the same rules as `run_chat` (`developer` is the
+    /// system role; `template_kwargs`), for the batched path.
+    pub(crate) fn chat_request_ids(&self, req: &Value) -> Result<Vec<u32>, String> {
+        let empty = vec![];
+        let mut messages: Vec<Value> = req["messages"].as_array().unwrap_or(&empty).clone();
+        for m in messages.iter_mut() { if m["role"] == "developer" { m["role"] = json!("system"); } }
+        self.chat_prompt(&messages, None, &template_kwargs(req)).map(|(p, _)| p)
+    }
+
+    /// A thinking model's reasoning/answer splitter for a reply to `prompt` (the block may already be open
+    /// in the prompt's tail), or None for a model without reasoning markers.
+    pub(crate) fn reasoning_split(&self, prompt: &[u32]) -> Option<genopts::ReasoningSplit> {
+        self.reasoning_markers.as_ref().map(|(o, c)| {
+            let tail = self.detok_all(&prompt[prompt.len().saturating_sub(24)..]);
+            let started = tail.rfind(o.as_str()).is_some_and(|a| tail.rfind(c.as_str()).is_none_or(|b| a > b));
+            genopts::ReasoningSplit::new(o, c, started)
+        })
+    }
+
     pub(crate) fn chat_prompt(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &serde_json::Map<String, Value>)
         -> Result<(Vec<u32>, Option<Arc<vision::MmInput>>), String>
     {
@@ -961,7 +990,29 @@ impl Engine {
     /// - `lora: [{"id": i | "name": n, "scale": s}]` (llama-server's; `id` is the adapter's place among
     ///   the `--lora` flags). Several SUM, as PEFT does; scale 0 drops one; an unknown one is refused.
     pub(crate) fn gen_opts(&self, req: &Value, chat: bool) -> Result<GenOpts, String> {
+        let merged;
+        let req = if self.sampling_defaults.is_empty() || std::env::var("FERRIC_MODEL_SAMPLING").as_deref() == Ok("0") { req } else {
+            merged = genopts::with_defaults(req, &self.sampling_defaults);
+            &merged
+        };
         let mut o = GenOpts::from_req(req, chat)?;
+        // The reasoning budget (llama.cpp's semantics): the request's `thinking_budget_tokens`, else the
+        // server's `--reasoning-budget`; -1 = unlimited. Only a model with reasoning markers has one.
+        let budget = match &req["thinking_budget_tokens"] {
+            Value::Null => std::env::var("FERRIC_REASONING_BUDGET").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(-1),
+            v => v.as_i64().filter(|&n| n >= -1).ok_or_else(|| format!("`thinking_budget_tokens` must be -1 (unlimited) or a count, got {v}"))?,
+        };
+        if budget >= 0 {
+            let Some((open, close)) = &self.reasoning_markers else {
+                return Err("`thinking_budget_tokens`: this model has no reasoning markers, so there is no thinking to budget".into());
+            };
+            let marker = |s: &str| self.specials.iter().find(|(t, _)| t == s).map(|(_, i)| vec![*i]).unwrap_or_else(|| self.enc(s, false));
+            let message = req["reasoning_budget_message"].as_str().map(String::from)
+                .or_else(|| std::env::var("FERRIC_REASONING_BUDGET_MESSAGE").ok()).unwrap_or_default();
+            let mut forced = if message.is_empty() { Vec::new() } else { self.enc(&message, false) };
+            forced.extend(marker(close));
+            o.sampling.reasoning_budget = Some(Arc::new(genopts::BudgetCfg { start: marker(open), end: marker(close), forced, budget: budget as i32 }));
+        }
         // The tokenizer-dependent sampler inputs, resolved as their reference implementation resolves them:
         // DRY's breakers are the LAST id of "a" + breaker (so a breaker is tokenized as text-final); XTC's
         // specials are the last id of "\n" and EOS; a text logit_bias applies to every token of its text.
@@ -1242,6 +1293,12 @@ impl Engine {
     /// legal continuation (stop cleanly). Most tokens reject on their first byte, so the scan is cheap.
     fn select_token(&self, row: &[f32], guide: &Option<ferric_agent::guide::Guide>, s: &genopts::Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32> {
         let n_vocab = row.len();
+        // A spent reasoning budget forces its message and end marker, one token per step (every other logit
+        // is -inf in llama.cpp's sampler, so sampling can only pick it).
+        if let Some(b) = &s.reasoning_budget {
+            let complete = |t: u32| self.token_bytes.get(t as usize).and_then(|b| b.as_deref()).is_none_or(genopts::utf8_is_complete);
+            if let Some(t) = b.forced(&prompt[prompt.len().saturating_sub(24)..], generated, complete) { return Some(t); }
+        }
         if let Some(g) = guide.as_ref() {
             let ok = self.allowed(g);
             let mut masked = vec![f32::NEG_INFINITY; n_vocab];
@@ -1583,6 +1640,11 @@ pub fn run() {
             "--name" => { name = args.get(i + 1).cloned().unwrap_or(name); i += 2; }
             "--max-models" => { max_models = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(max_models); i += 2; }
             "--keep-alive" => { keep_alive = args.get(i + 1).cloned().unwrap_or(keep_alive); i += 2; }
+            // `--reasoning-budget N` (-1 unlimited, 0 = end thinking at once) and the message forced before the
+            // end marker when it runs out — llama-server's flags; a request's `thinking_budget_tokens` overrides.
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            "--reasoning-budget" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET", v) }; } i += 2; }
+            "--reasoning-budget-message" => { if let Some(v) = args.get(i + 1) { unsafe { std::env::set_var("FERRIC_REASONING_BUDGET_MESSAGE", v) }; } i += 2; }
             // `--otlp http://collector:4318`: OpenTelemetry traces (else the OTEL_EXPORTER_OTLP_* variables).
             "--otlp" => { otlp = args.get(i + 1).cloned(); i += 2; }
             // `--lora name=path` (repeatable): a PEFT adapter directory or a llama.cpp GGUF adapter for the
@@ -1960,6 +2022,19 @@ fn sum_energy(parts: &[Value]) -> Value {
     v
 }
 
+/// What the chat template is rendered with besides the messages: `chat_template_kwargs`, plus OpenAI's
+/// `reasoning_effort` (passed to templates that read it — Bonsai 2, gpt-oss — and, when the request did
+/// not set `enable_thinking`, "none"/"minimal" turn thinking off in templates that read that instead).
+/// One reader for the serial and batched paths, so the same request renders the same prompt on both.
+pub(crate) fn template_kwargs(req: &Value) -> serde_json::Map<String, Value> {
+    let mut k = req["chat_template_kwargs"].as_object().cloned().unwrap_or_default();
+    if let Some(e) = req["reasoning_effort"].as_str() {
+        k.entry("reasoning_effort").or_insert_with(|| json!(e));
+        k.entry("enable_thinking").or_insert_with(|| json!(e != "none" && e != "minimal"));
+    }
+    k
+}
+
 /// **The chat core both API dialects share** (OpenAI `/v1/chat/completions`, Ollama `/api/chat`), so they
 /// cannot disagree about what a conversation means. `req` is OpenAI-shaped. `on_delta` receives the
 /// streamed text and its logprob entries; it is not called on the tool path, whose answer is only known
@@ -1973,16 +2048,12 @@ pub(crate) fn run_chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, req
     let mut opts = eng.gen_opts(req, true)?;
     opts.with_specials = eng.reasoning_markers.is_some();
     // A thinking model's reasoning is split from its answer; the block may already be open in the prompt.
-    let splitter = |prompt: &[u32]| eng.reasoning_markers.as_ref().map(|(o, c)| {
-        let tail = eng.detok_all(&prompt[prompt.len().saturating_sub(24)..]);
-        let started = tail.rfind(o.as_str()).is_some_and(|a| tail.rfind(c.as_str()).is_none_or(|b| a > b));
-        genopts::ReasoningSplit::new(o, c, started)
-    });
+    let splitter = |prompt: &[u32]| eng.reasoning_split(prompt);
     // Advertised tools = caller's + every connected MCP server's.
     let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
     tools.extend(mcps.borrow().openai_tools());
 
-    let kwargs = req["chat_template_kwargs"].as_object().cloned().unwrap_or_default();
+    let kwargs = template_kwargs(req);
     let via_template = eng.template_handles_tools();
     let tools_arg = (via_template && !tools.is_empty()).then_some(tools.as_slice());
     if !tools.is_empty() {
@@ -2065,6 +2136,9 @@ fn chat(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, stream: &mut TcpSt
     let opts = match eng.gen_opts(&req, true) { Ok(o) => o, Err(e) => return bad_request(stream, &e) };
     let empty = vec![];
     if let Err(e) = eng.chat_ids(req["messages"].as_array().unwrap_or(&empty)) { return bad_request(stream, &e); }
+    // The constraint too (a schema the converter refuses, a GBNF that does not parse): a stream's headers go
+    // out before generation resolves it. The compiled grammar is kept, so generation finds it again.
+    if constrain::asks_for_constraint(&req) && let Err(e) = eng.constraint(&req) { return bad_request(stream, &e); }
     let has_tools = req["tools"].as_array().is_some_and(|t| !t.is_empty()) || !mcps.borrow().openai_tools().is_empty();
     if opts.n > 1 { return chat_n(eng, mcps, stream, &req, opts.n, has_tools, opts.logprobs); }
     let id = "chatcmpl-ferric";

@@ -1,0 +1,7 @@
+{
+ "source": "RedHatAI/Qwen2.5-0.5B-Instruct-FP8-dynamic",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "compressed-tensors 0.19.0 float-quantized decompress (scale float32)",
+ "revision": "67c5c3a4f39629d3653b715527f363d86929841e"
+}

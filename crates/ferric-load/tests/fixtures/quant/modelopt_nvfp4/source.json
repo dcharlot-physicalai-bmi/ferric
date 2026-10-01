@@ -1,0 +1,7 @@
+{
+ "source": "NVFP4/Qwen3-0.6B-FP4",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "nvidia-modelopt 0.47.0 NVFP4QTensor.dequantize(fast=False)",
+ "revision": "c035dfb93aaac621bc73a473d10d773526a031e8"
+}

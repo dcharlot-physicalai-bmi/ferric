@@ -1,0 +1,26 @@
+{
+ "quantization_config": {
+  "batch_size": 1,
+  "bits": 8,
+  "block_name_to_quantize": null,
+  "cache_block_outputs": true,
+  "damp_percent": 0.01,
+  "dataset": null,
+  "desc_act": false,
+  "exllama_config": {
+   "version": 1
+  },
+  "group_size": 128,
+  "max_input_length": null,
+  "model_seqlen": null,
+  "module_name_preceding_first_block": null,
+  "modules_in_block_to_quantize": null,
+  "pad_token_id": null,
+  "quant_method": "gptq",
+  "sym": true,
+  "tokenizer": null,
+  "true_sequential": true,
+  "use_cuda_fp16": false,
+  "use_exllama": true
+ }
+}

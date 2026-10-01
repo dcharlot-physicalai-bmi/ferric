@@ -1,7 +1,8 @@
 //! Pure-Rust reader for the llama.cpp **GGUF** container + dequantizers for the common block-quant
 //! formats: F32, F16, Q8_0, the legacy Q4_0/Q4_1/Q5_0/Q5_1, the k-quants **Q4_K/Q5_K/Q6_K**, the
-//! non-linear codebook quants **IQ4_NL/IQ4_XS**, OCP microscaling **MXFP4** (GPT-OSS's release
-//! format), and BitNet-style ternary (TQ2_0 + PrismML Q1_0/Q2_0).
+//! non-linear codebook quants **IQ4_NL/IQ4_XS**, the grid i-quants **IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/
+//! IQ3_XXS/IQ3_S**, OCP microscaling **MXFP4** (GPT-OSS's release format), NVIDIA's **NVFP4**, and
+//! BitNet-style ternary (TQ2_0 + PrismML Q1_0/Q2_0).
 //! GGUF is how the entire llama.cpp / HF
 //! quantized-model corpus ships — including Liquid AI's LFM2 and BitNet — so this is the ingest path
 //! that lets Ferric run those models. Dequant here is CPU-side (I/O layer); a fused on-GPU dequant
@@ -16,7 +17,11 @@ pub mod imatrix;
 mod iq_grids;
 pub mod prism;
 use prism::{PQ2_0, PTQ1_0, Q2_0_G64};
+mod iq_grids2;
 pub use iq_grids::{IQ2XXS_GRID, IQ3XXS_GRID};
+pub use iq_grids2::{IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ3S_GRID};
+pub mod more_quants;
+pub mod gq;
 pub mod quantize;
 pub mod quantplan;
 pub mod write;
@@ -35,7 +40,13 @@ const Q4_K: u32 = 12;
 const Q5_K: u32 = 13;
 const Q6_K: u32 = 14;
 const IQ2_XXS: u32 = 16; // 2.0625 bpw: 8-element grid codebook + 7-bit sign index, 4-bit sub-scale
+const IQ2_XS: u32 = 17; // 2.3125 bpw: 512-entry grid (9-bit index) + 7-bit parity-coded signs, 2 sub-scales / 32
 const IQ3_XXS: u32 = 18; // 3.0625 bpw: two 4-element grid lookups per 8, same sign/scale word
+const IQ1_S: u32 = 19; // 1.5625 bpw: 2048-entry {-1,0,1} grid shifted by ±1/8, 3-bit scale / 32
+const IQ3_S: u32 = 21; // 3.4375 bpw: 512-entry 4-element grid, plain sign bytes, 4-bit odd scales
+const IQ2_S: u32 = 22; // 2.5625 bpw: 1024-entry grid (10-bit index), plain sign bytes
+const IQ1_M: u32 = 29; // 1.75 bpw: IQ1_S's grid, no f16 field — the scale is spread over four nibbles
+const NVFP4: u32 = 40; // NVIDIA FP4: 64 values = 4 × (UE4M3 scale + 16 E2M1), 4.5 bpw
 const IQ4_NL: u32 = 20; // 4-bit non-linear codebook, group-32 (kvalues_iq4nl)
 const IQ4_XS: u32 = 23; // 4-bit non-linear codebook, 256-super-block w/ 6-bit sub-scales
 const TQ2_0: u32 = 35; // llama.cpp ternary (BitNet) quant: 2 bits/weight, {−1,0,+1}·scale
@@ -582,7 +593,13 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q5_K => n / 256 * 176,
         Q6_K => n / 256 * 210,
         IQ2_XXS => n / 256 * 66,
+        IQ2_XS => n / 256 * more_quants::IQ2_XS_BYTES,
+        IQ2_S => n / 256 * more_quants::IQ2_S_BYTES,
         IQ3_XXS => n / 256 * 98,
+        IQ3_S => n / 256 * more_quants::IQ3_S_BYTES,
+        IQ1_S => n / 256 * more_quants::IQ1_S_BYTES,
+        IQ1_M => n / 256 * more_quants::IQ1_M_BYTES,
+        NVFP4 => n / 64 * more_quants::NVFP4_BYTES,
         IQ4_NL => n / 32 * 18,
         IQ4_XS => n / 256 * 136,
         TQ2_0 => n / 256 * 66,
@@ -595,6 +612,8 @@ pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
         Q2_0_G64 => n / 64 * 18,
         // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
         F8_E4M3_B128 => n / 128 * F8_E4M3_B128_BYTES,
+        // Ferric's in-memory form for safetensors quant checkpoints: never in a file, see [`gq`].
+        t if gq::is_gq(t) => n / blk * gq::GqSpec::from_id(t).unwrap().block_bytes(),
         other => return Err(format!("unsupported ggml type {other}")),
     })
 }
@@ -633,8 +652,9 @@ pub fn block_elems(ty: u32) -> usize {
     match ty {
         F32 | F16T | BF16T => 1,
         Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | IQ4_NL | MXFP4 => 32,
-        Q2_0_G64 => 64,
+        Q2_0_G64 | NVFP4 => 64,
         Q1_0 | Q2_0 | F8_E4M3_B128 | PQ2_0 | PTQ1_0 => 128,
+        t if gq::is_gq(t) => gq::GqSpec::from_id(t).unwrap().group as usize,
         _ => 256,
     }
 }
@@ -656,7 +676,13 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q5_K => deq_q5_k(raw, n),
         Q6_K => deq_q6_k(raw, n),
         IQ2_XXS => deq_iq2_xxs(raw, n),
+        IQ2_XS => more_quants::deq_iq2_xs(raw, n),
+        IQ2_S => more_quants::deq_iq2_s(raw, n),
         IQ3_XXS => deq_iq3_xxs(raw, n),
+        IQ3_S => more_quants::deq_iq3_s(raw, n),
+        IQ1_S => more_quants::deq_iq1_s(raw, n),
+        IQ1_M => more_quants::deq_iq1_m(raw, n),
+        NVFP4 => more_quants::deq_nvfp4(raw, n),
         IQ4_NL => deq_iq4_nl(raw, n),
         IQ4_XS => deq_iq4_xs(raw, n),
         TQ2_0 => deq_tq2_0(raw, n),
@@ -668,6 +694,7 @@ pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
         Q2_0_G64 => prism::deq_q2_0_g64(raw, n),
         // Internal id only — the FILE says 42, [`resolve_type_42`] maps it here by stride.
         F8_E4M3_B128 => deq_f8_e4m3_b128(raw, n)?,
+        t if gq::is_gq(t) => gq::deq_gq_blocks(raw, n, &gq::GqSpec::from_id(t).unwrap())?,
         other => return Err(format!("unsupported ggml type {other}")),
     })
 }

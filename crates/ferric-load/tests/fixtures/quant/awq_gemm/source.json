@@ -1,0 +1,7 @@
+{
+ "source": "Qwen/Qwen2.5-0.5B-Instruct-AWQ",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 32,
+ "dequantizer": "gptqmodel 7.5.0 vendored AutoAWQ dequantize_gemm (scales float32); offline: convert_awq_file",
+ "revision": "db09cd27ead7fee40cdee309693cf83601b9c899"
+}

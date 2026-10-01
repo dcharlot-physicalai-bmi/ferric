@@ -41,6 +41,9 @@ pub struct HfCheckpoint {
     pub arch: String,
     /// Every F32 tensor is presented as BF16, rounded as `torch.Tensor.to(torch.bfloat16)` rounds.
     narrow_bf16: bool,
+    /// GPTQ / AWQ / compressed-tensors / FP8 / ModelOpt — see [`crate::quant`]. Quantized weights are
+    /// presented under a GQ type id and decoded by the format's own reader, never as stored tensors.
+    pub quant: Option<crate::quant::Quant>,
 }
 
 /// How to present a checkpoint. The default is the file exactly as stored.
@@ -96,13 +99,19 @@ impl HfCheckpoint {
         let cfg: serde_json::Value = serde_json::from_str(&cfg_txt).map_err(|e| format!("config.json: {e}"))?;
         let model_type = cfg["model_type"].as_str()
             .ok_or("config.json has no model_type, so there is nothing to key the mapping on")?.to_string();
-        let st = SafeTensors::open(dir)?;
+        let mut st = SafeTensors::open(dir)?;
+        // A quantized checkpoint's linears have no `.weight` of their own (GPTQ: qweight/qzeros/scales)
+        // or one that is not the weight (FP8 codes, packed FP4 bytes). The reader presents each as
+        // `<prefix>.weight` so the maps below find it — and refuses a quantization it cannot decode.
+        let quant = crate::quant::Quant::detect(dir, &cfg, &st)?;
+        if let Some(q) = &quant { q.register_virtual(&mut st); }
 
         let (meta, name_map) = match model_type.as_str() {
             "lfm2" => lfm2_map(&cfg, &st)?,
             "qwen3_vl" => qwen3vl_map(&cfg, &st)?,
             "qwen2_5_vl" => qwen25vl_map(&cfg, &st)?,
             "qwen2" => qwen2_map(&cfg, &st)?,
+            "qwen3" => qwen3_map(&cfg, &st)?,
             "nomic_bert" => nomic_bert_map(&cfg, &st)?,
             other => return Err(format!(
                 "no HF mapping for model_type '{other}'. Adding one is a table of metadata keys and \
@@ -134,6 +143,15 @@ impl HfCheckpoint {
         for (gguf_name, hf_name) in name_map {
             let e = st.info(&hf_name).ok_or_else(|| format!(
                 "{gguf_name} maps to {hf_name}, which this checkpoint does not contain"))?;
+            // A quantized weight takes its geometry from the quant reader: its stored tensor (if it has
+            // one at all) can be packed — ModelOpt FP4 is [out, in/2] bytes.
+            if let Some(m) = quant.as_ref().and_then(|q| q.module(&hf_name)) {
+                infos.insert(gguf_name.clone(), TensorInfo {
+                    name: gguf_name.clone(), dims: vec![m.inp as u64, m.out as u64], ggml_type: m.spec.id(), offset: 0,
+                });
+                src.insert(gguf_name, hf_name);
+                continue;
+            }
             let mut dims: Vec<u64> = e.shape.iter().rev().map(|&d| d as u64).collect();
             // A PyTorch depthwise conv is [C, 1, L] — reversed, [L, 1, C] — and the singleton
             // carries no information; GGUF stores [L, C]. Dropping it keeps the runtime's
@@ -147,7 +165,7 @@ impl HfCheckpoint {
             });
             src.insert(gguf_name, hf_name);
         }
-        Ok(HfCheckpoint { st, meta, infos, src, arch: model_type, narrow_bf16: opts.narrow_f32_to_bf16 })
+        Ok(HfCheckpoint { st, meta, infos, src, arch: model_type, narrow_bf16: opts.narrow_f32_to_bf16, quant })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &String> { self.infos.keys() }
@@ -158,6 +176,7 @@ impl GgufSource for HfCheckpoint {
     fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.infos.get(name) }
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
         let hf = self.src.get(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        if let Some(q) = self.quant.as_ref().filter(|q| q.module(hf).is_some()) { return q.gq_bytes(&self.st, hf); }
         let bytes = self.st.raw(hf)?;
         if self.narrow_bf16 && self.st.info(hf).is_some_and(|e| e.dtype == "F32") {
             return Ok(bytes.chunks_exact(4)
@@ -168,6 +187,7 @@ impl GgufSource for HfCheckpoint {
     }
     fn dequant(&self, name: &str) -> Result<Vec<f32>, String> {
         let hf = self.src.get(name).ok_or_else(|| format!("no tensor '{name}'"))?;
+        if let Some(q) = self.quant.as_ref().filter(|q| q.module(hf).is_some()) { return q.dequant(&self.st, hf); }
         let mut v = self.st.get(hf)?.data;
         if self.narrow_bf16 && self.st.info(hf).is_some_and(|e| e.dtype == "F32") {
             for x in &mut v { *x = f32::from_bits((f32_to_bf16_bits(*x) as u32) << 16); }
@@ -427,6 +447,78 @@ fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
                           ("attn_v.bias", format!("{p}.self_attn.v_proj.bias"))]);
         }
         n.extend(pairs.into_iter().map(|(g, hf)| (format!("blk.{il}.{g}"), hf)));
+    }
+    if let Some((g, hf)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
+        return Err(format!("mapping points {g} at {hf}, which the checkpoint does not contain"));
+    }
+    Ok((m, n))
+}
+
+/// **Qwen3, text model** — `model_type: qwen3`: Qwen2's layout without q/k/v biases, plus per-head
+/// RMS QK-norm (`q_norm` / `k_norm`), and an explicit `head_dim` that is NOT `hidden / heads`
+/// (Qwen3-0.6B: 1024 / 16 = 64, head_dim 128). The quantized Qwen3 releases (`-FP8`, `-GPTQ-*`, the
+/// RedHatAI / NVFP4 ports) are this architecture, which is why it is mapped here.
+///
+/// ⛔ Refused rather than half-mapped: `rope_scaling` (YaRN et al.), sliding window, and MoE (`qwen3_moe`
+/// is a different model_type and never reaches this).
+fn qwen3_map(cfg: &serde_json::Value, st: &SafeTensors)
+    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+{
+    let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
+    if cfg["use_sliding_window"].as_bool() == Some(true) {
+        return Err("use_sliding_window is true: the windowed layers are not mapped here".into());
+    }
+    let rp = &cfg["rope_parameters"];
+    let rope_type = rp["rope_type"].as_str().unwrap_or("default");
+    if !cfg["rope_scaling"].is_null() || rope_type != "default" {
+        return Err(format!("rope scaling ({} / {rope_type}) is not mapped — refusing rather than run unscaled", cfg["rope_scaling"]));
+    }
+    let theta = cfg_f(cfg, "rope_theta").or_else(|| rp["rope_theta"].as_f64())
+        .ok_or("config.json: missing rope_theta")?;
+    let n_layer = need_u("num_hidden_layers")? as usize;
+    let (h, nh) = (need_u("hidden_size")?, need_u("num_attention_heads")?);
+    let head_dim = cfg_u(cfg, "head_dim").unwrap_or(h / nh);
+    let mut m = HashMap::new();
+    m.insert("general.architecture".into(), Meta::Str("qwen3".into()));
+    m.insert("qwen3.block_count".into(), Meta::U(n_layer as u64));
+    m.insert("qwen3.embedding_length".into(), Meta::U(h));
+    m.insert("qwen3.feed_forward_length".into(), Meta::U(need_u("intermediate_size")?));
+    m.insert("qwen3.attention.head_count".into(), Meta::U(nh));
+    m.insert("qwen3.attention.head_count_kv".into(), Meta::U(need_u("num_key_value_heads")?));
+    m.insert("qwen3.attention.key_length".into(), Meta::U(head_dim));
+    m.insert("qwen3.attention.value_length".into(), Meta::U(head_dim));
+    m.insert("qwen3.attention.layer_norm_rms_epsilon".into(), Meta::F(need_f("rms_norm_eps")?));
+    m.insert("qwen3.rope.freq_base".into(), Meta::F(theta));
+    // Only the COUNT is load-bearing: this path is fed token ids, never text. See qwen3vl_map.
+    m.insert("tokenizer.ggml.tokens".into(),
+             Meta::Arr(vec![Meta::Str(String::new()); need_u("vocab_size")? as usize]));
+    let mut n: Vec<(String, String)> = vec![
+        ("token_embd.weight".into(), "model.embed_tokens.weight".into()),
+        ("output_norm.weight".into(), "model.norm.weight".into()),
+    ];
+    if st.info("lm_head.weight").is_some() {
+        n.push(("output.weight".into(), "lm_head.weight".into()));
+    } else if cfg["tie_word_embeddings"].as_bool() != Some(true) {
+        return Err("no lm_head.weight and tie_word_embeddings is not set — refusing to tie silently".into());
+    }
+    for il in 0..n_layer {
+        let p = format!("model.layers.{il}");
+        for (g, hf) in [
+            ("attn_norm.weight", format!("{p}.input_layernorm.weight")),
+            ("attn_q.weight", format!("{p}.self_attn.q_proj.weight")),
+            ("attn_k.weight", format!("{p}.self_attn.k_proj.weight")),
+            ("attn_v.weight", format!("{p}.self_attn.v_proj.weight")),
+            ("attn_output.weight", format!("{p}.self_attn.o_proj.weight")),
+            ("attn_q_norm.weight", format!("{p}.self_attn.q_norm.weight")),
+            ("attn_k_norm.weight", format!("{p}.self_attn.k_norm.weight")),
+            ("ffn_norm.weight", format!("{p}.post_attention_layernorm.weight")),
+            ("ffn_gate.weight", format!("{p}.mlp.gate_proj.weight")),
+            ("ffn_up.weight", format!("{p}.mlp.up_proj.weight")),
+            ("ffn_down.weight", format!("{p}.mlp.down_proj.weight")),
+        ] {
+            n.push((format!("blk.{il}.{g}"), hf));
+        }
     }
     if let Some((g, hf)) = n.iter().find(|(_, hf)| st.info(hf).is_none()) {
         return Err(format!("mapping points {g} at {hf}, which the checkpoint does not contain"));

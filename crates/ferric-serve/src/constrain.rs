@@ -1,13 +1,16 @@
 //! **Constrained decoding: which constraint a request asks for, and the token mask it implies.**
 //!
 //! One reader for every spelling peers accept (parity gap S10, 8.5 of 14 serving peers):
-//! - OpenAI `response_format` — `json_object`, `json_schema` (the existing JSON / schema guides);
+//! - OpenAI `response_format` — `json_object` (the JSON guide), `json_schema`;
 //! - llama-server `grammar` — GBNF;
 //! - vLLM `guided_json` / `guided_regex` / `guided_choice` / `guided_grammar` (GBNF), and its newer
 //!   `structured_outputs: {json | regex | choice | grammar}`; a bare `regex` too.
-//! Regex and choice compile to GBNF (`ferric_agent::regex`), so every grammar-shaped constraint runs on the
-//! one matcher that is checked against llama.cpp's own grammar tests. Two constraints in one request are a
-//! 400 naming both — never one silently ignored.
+//! A JSON Schema compiles to GBNF as llama.cpp compiles it (`ferric_agent::json_schema`, byte-identical to
+//! llama.cpp's converter), and regex and choice compile to GBNF too (`ferric_agent::regex`), so every
+//! constraint but `json_object` runs on the one grammar matcher checked against llama.cpp's own grammar tests,
+//! and gets its mask cache. A schema the converter refuses is a 400 naming the reason, never a fallback to
+//! plain JSON; a pattern it cannot translate is widened to any string, as in llama.cpp, and logged. Two
+//! constraints in one request are a 400 naming both — never one silently ignored.
 //!
 //! **The mask.** A constraint decides, per step, which tokens may come next. The first version trial-stepped
 //! the constraint through every token's bytes, copying its state per token — fine for a JSON state that is a
@@ -31,20 +34,20 @@
 //! the cache lives with the grammar's source, so a repeated grammar starts warm.
 use crate::Engine;
 use ferric_agent::grammar::{Grammar, Matcher, Pos};
-use ferric_agent::guide::{Guide, Item, Json, Schema};
+use ferric_agent::guide::{Guide, Json};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// What a request constrains its output to, owned (a schema guide borrows its compiled program).
-pub(crate) enum Spec { None, Json, Schema(Vec<Item>), Grammar(Arc<Grammar>) }
+/// What a request constrains its output to: nothing, a JSON object (`json_object`), or a grammar (GBNF, or a
+/// JSON Schema / regex / choice list compiled to one).
+pub(crate) enum Spec { None, Json, Grammar(Arc<Grammar>) }
 
 impl Spec {
     pub fn guide(&self) -> Option<Guide<'_>> {
         match self {
             Spec::None => None,
             Spec::Json => Some(Guide::Json(Json::object())),
-            Spec::Schema(p) => Some(Guide::Schema(Schema::new(p))),
             Spec::Grammar(g) => Some(Guide::Grammar(Matcher::new(g.clone()))),
         }
     }
@@ -65,9 +68,14 @@ pub(crate) fn spec_of(req: &Value, compile: &dyn Fn(&str) -> Result<Arc<Grammar>
     let grammar = |src: &str, what: &str| -> Result<Spec, String> {
         compile(src).map(Spec::Grammar).map_err(|e| format!("{what}: {e}"))
     };
+    // A JSON Schema (an object, or its JSON text) → GBNF, as llama.cpp converts it. A missing schema is a 400
+    // (llama-server reads it as {}, any JSON value, which is not what a caller asking for a schema meant).
     let schema = |s: &Value, what: &str| -> Result<Spec, String> {
+        if s.is_null() { return Err(format!("{what} is required")); }
         let s = if let Some(t) = s.as_str() { serde_json::from_str::<Value>(t).map_err(|e| format!("{what}: {e}"))? } else { s.clone() };
-        Ok(ferric_agent::guide::compile(&s).map(Spec::Schema).unwrap_or(Spec::Json))
+        let (src, warnings) = ferric_agent::json_schema::schema_to_gbnf_with_warnings(&s).map_err(|e| format!("{what}: {e}"))?;
+        for w in warnings { eprintln!("ferric-serve: {what}: {w}"); }
+        grammar(&src, what)
     };
     let text = |v: &Value, what: &str| -> Result<String, String> { v.as_str().map(String::from).ok_or_else(|| format!("{what} must be a string")) };
     match req["response_format"]["type"].as_str() {
@@ -146,27 +154,34 @@ impl Trie {
     /// One walk from the stack suffix `suf` alone: which tokens match whatever lies below it, and which run
     /// past its bottom (so depend on what does), with the offsets where they did. A token is recorded as
     /// depending only when no path matched all its bytes — a path that did is a path the full stack has too.
-    fn suffix_mask(&self, g: &Arc<Grammar>, suf: &[Pos], n_vocab: usize) -> SuffixMask {
+    fn suffix_mask(&self, g: &Arc<Grammar>, suf: &[Pos], n_vocab: usize, dfa: &mut Dfa) -> SuffixMask {
         let mut accept = vec![0u64; n_vocab.div_ceil(64)];
         let (mut depends, mut offs) = (Vec::new(), Vec::new());
         // (trie node, state from the suffix alone, byte depth, offsets on this path where the bottom was reached)
-        let mut todo = vec![(0u32, Matcher::from_stacks(g.clone(), vec![suf.to_vec()]), 0u16, Vec::<u16>::new())];
+        let start = dfa.intern(Matcher::from_stacks(g.clone(), vec![suf.to_vec()]));
+        // The offsets where a path reached the bottom, as a linked list in an arena (index, 0 = none): a
+        // child shares its parent's list, so descending costs no copy.
+        let mut arena: Vec<(u16, u32)> = vec![(0, 0)];
+        let mut todo = vec![(0u32, start, 0u16, 0u32)];
         while let Some((node, st, depth, bottoms)) = todo.pop() {
             for &(b, child) in &self.children[node as usize] {
-                let mut s2 = st.clone();
-                let ok = s2.step(b);
-                let mut bottoms = bottoms.clone();
-                if ok && !s2.mid_char() && s2.reached_bottom() { bottoms.push(depth + 1); }
+                let s2 = dfa.step(st, b);
+                let ok = s2 != DEAD;
+                let mut bottoms = bottoms;
+                if ok && dfa.bottom_between_chars(s2) { arena.push((depth + 1, bottoms)); bottoms = arena.len() as u32 - 1; }
                 for &t in &self.ends[child as usize] {
                     if (t as usize) >= n_vocab { continue; }
                     if ok { accept[t as usize / 64] |= 1 << (t % 64); }
-                    else if !bottoms.is_empty() {
+                    else if bottoms != 0 {
                         depends.push(t);
-                        offs.extend(bottoms.iter().map(|&o| o as u32));
+                        let start = offs.len();
+                        let mut k = bottoms;
+                        while k != 0 { offs.push(arena[k as usize].0 as u32); k = arena[k as usize].1; }
+                        offs[start..].reverse();
                         offs.push(u32::MAX);
                     }
                 }
-                if !self.children[child as usize].is_empty() && (ok || !bottoms.is_empty()) { todo.push((child, s2, depth + 1, bottoms)); }
+                if !self.children[child as usize].is_empty() && (ok || bottoms != 0) { todo.push((child, s2, depth + 1, bottoms)); }
             }
         }
         SuffixMask { accept, depends, offs }
@@ -185,16 +200,15 @@ impl Trie {
         // The whole stack as the suffix: running past its bottom is the end of the grammar, so every
         // depending token is refused (the full walk refuses it the same way).
         if k == st.len() { return w; }
-        let below = Matcher::resume(g.clone(), st[..st.len() - k].to_vec());
-        let first: Vec<bool> = (0..=255u8).map(|b| below.clone().step(b)).collect();
+        // The remainders run on the grammar's DFA from the state below the suffix: a remainder's steps are
+        // table lookups once any request has taken them.
+        let mut dfa = x.dfa.lock().unwrap();
+        let below = dfa.intern(Matcher::resume(g.clone(), st[..st.len() - k].to_vec()));
         let mut o = sm.offs.split(|&v| v == u32::MAX);
         for &t in &sm.depends {
             let at = o.next().unwrap_or(&[]);
             let Some(b) = token_bytes.get(t as usize).and_then(|b| b.as_deref()) else { continue };
-            let takes = at.iter().any(|&i| {
-                let rest = &b[i as usize..];
-                rest.first().is_none_or(|&c| first[c as usize]) && { let mut s = below.clone(); rest.iter().all(|&c| s.step(c)) }
-            });
+            let takes = at.iter().any(|&i| b[i as usize..].iter().try_fold(below, |s, &c| Some(dfa.step(s, c)).filter(|&n| n != DEAD)).is_some());
             if takes { w[t as usize / 64] |= 1 << (t % 64); }
         }
         w
@@ -254,15 +268,61 @@ pub(crate) struct Masks {
     limit: usize,
     /// Whole-stack masks served from the cache.
     hits: std::sync::atomic::AtomicUsize,
+    /// The grammar's states met so far and their byte transitions (`Dfa`).
+    dfa: Mutex<Dfa>,
+}
+
+/// A dead state: no parse survives the byte.
+const DEAD: u32 = u32::MAX;
+/// States kept before the table starts over — between walks only, since a walk holds state ids.
+const KEPT_STATES: usize = 1 << 14;
+
+/// **A lazily built DFA over the grammar's parse states.** A mask walk steps a state through every byte
+/// of the vocabulary trie; stepping clones and re-advances parse stacks, but the same few states recur
+/// across thousands of trie nodes (inside a string, every character leads back to the same state). So
+/// states are interned by what they are (`Matcher::state_key`) and each (state, byte) step is computed
+/// once. Same answers as stepping the matcher — it is the matcher's own step, memoized.
+pub(crate) struct Dfa { states: Vec<(Matcher, bool)>, ids: HashMap<(Vec<Vec<Pos>>, (u32, i8)), u32>, next: Vec<Box<[u32; 256]>> }
+
+/// A transition not computed yet.
+const UNKNOWN: u32 = u32::MAX - 1;
+
+impl Dfa {
+    fn new() -> Dfa { Dfa { states: Vec::new(), ids: HashMap::new(), next: Vec::new() } }
+    fn intern(&mut self, m: Matcher) -> u32 {
+        let key = m.state_key();
+        if let Some(&i) = self.ids.get(&key) { return i; }
+        let i = self.states.len() as u32;
+        let bottom = !m.mid_char() && m.reached_bottom();
+        self.states.push((m, bottom));
+        self.next.push(Box::new([UNKNOWN; 256]));
+        self.ids.insert(key, i);
+        i
+    }
+    fn step(&mut self, s: u32, b: u8) -> u32 {
+        if s == DEAD { return DEAD; }
+        let n = self.next[s as usize][b as usize];
+        if n != UNKNOWN { return n; }
+        let mut m = self.states[s as usize].0.clone();
+        let n = if m.step(b) { self.intern(m) } else { DEAD };
+        self.next[s as usize][b as usize] = n;
+        n
+    }
+    /// A parse reached the bottom with no character half-written.
+    fn bottom_between_chars(&self, s: u32) -> bool { self.states[s as usize].1 }
 }
 
 impl Masks {
     pub fn new(g: Arc<Grammar>, n_vocab: usize) -> Masks {
-        Masks { g, suffixes: Mutex::new(HashMap::new()), stacks: Mutex::new(HashMap::new()), limit: (n_vocab / 64).max(256), hits: Default::default() }
+        Masks { g, suffixes: Mutex::new(HashMap::new()), stacks: Mutex::new(HashMap::new()), limit: (n_vocab / 64).max(256), hits: Default::default(),
+                dfa: Mutex::new(Dfa::new()) }
     }
     fn suffix(&self, t: &Trie, suf: &[Pos], n_vocab: usize) -> Arc<SuffixMask> {
         if let Some(x) = self.suffixes.lock().unwrap().get(suf) { return x.clone(); }
-        let x = Arc::new(t.suffix_mask(&self.g, suf, n_vocab));
+        let mut dfa = self.dfa.lock().unwrap();
+        if dfa.states.len() >= KEPT_STATES { *dfa = Dfa::new(); }
+        let x = Arc::new(t.suffix_mask(&self.g, suf, n_vocab, &mut dfa));
+        drop(dfa);
         self.suffixes.lock().unwrap().insert(suf.to_vec(), x.clone());
         x
     }
@@ -539,11 +599,48 @@ mod tests {
         assert!(matches!(spec_of(&json!({"guided_regex": "[0-9]+"}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({"structured_outputs": {"choice": ["a", "b"]}}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({"response_format": {"type": "json_object"}}), &none).unwrap(), Spec::Json));
-        assert!(matches!(spec_of(&json!({"guided_json": {"type": "object", "properties": {"a": {"type": "integer"}}}}), &none).unwrap(), Spec::Schema(_)));
+        assert!(matches!(spec_of(&json!({"guided_json": {"type": "object", "properties": {"a": {"type": "integer"}}}}), &none).unwrap(), Spec::Grammar(_)));
         assert!(matches!(spec_of(&json!({}), &none).unwrap(), Spec::None));
         let e = spec_of(&json!({"grammar": "root ::= \"a\"", "guided_regex": "b"}), &none).err().unwrap();
         assert!(e.contains("grammar") && e.contains("guided_regex"), "{e}");
         assert!(spec_of(&json!({"grammar": "root ::= undefined"}), &none).err().unwrap().contains("Undefined"));
         assert!(spec_of(&json!({"guided_regex": "(a)\\1"}), &none).is_err());
+    }
+
+    /// Every JSON-Schema spelling compiles to the grammar llama.cpp's converter prints, and the grammar takes a
+    /// conforming answer and refuses the rest; a schema the converter refuses is an error naming why (a 400),
+    /// never plain JSON mode.
+    #[test]
+    fn a_json_schema_is_a_grammar_and_a_refused_schema_is_an_error() {
+        let src = std::cell::RefCell::new(Vec::<String>::new());
+        let keep = |s: &str| { src.borrow_mut().push(s.to_string()); Grammar::parse(s, "root", &|_| None).map(Arc::new) };
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer", "minimum": 0}}, "required": ["name"]});
+        let text = serde_json::to_string(&schema).unwrap();
+        for req in [json!({"response_format": {"type": "json_schema", "json_schema": {"name": "p", "schema": schema}}}),
+                    json!({"guided_json": schema}), json!({"guided_json": text}), json!({"structured_outputs": {"json": schema}})] {
+            let Spec::Grammar(g) = spec_of(&req, &keep).unwrap() else { panic!("{req}: not a grammar") };
+            assert_eq!(src.borrow().last().unwrap(), &ferric_agent::json_schema::schema_to_gbnf(&schema).unwrap());
+            let takes = |s: &str| { let mut m = Matcher::new(g.clone()); s.bytes().all(|b| m.step(b)) && m.can_stop() };
+            assert!(takes(r#"{"name": "Ada", "age": 36}"#) && takes(r#"{"name": "Ada"}"#), "{req}");
+            assert!(!takes(r#"{"age": 36}"#) && !takes(r#"{"name": "Ada", "age": -1}"#) && !takes("{}"), "{req}");
+        }
+        let err = |req: Value| spec_of(&req, &keep).err().unwrap_or_else(|| panic!("{req}: accepted"));
+        let e = err(json!({"response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "kaboom"}}}}));
+        assert!(e.contains("response_format.json_schema.schema") && e.contains("unrecognized type kaboom"), "{e}");
+        let e = err(json!({"guided_json": {"$ref": "https://example.com/s.json"}}));
+        assert!(e.contains("only references into the same document"), "{e}");
+        let e = err(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}}));
+        assert!(e.contains("response_format.json_schema.schema is required"), "{e}");
+        let e = err(json!({"guided_json": {"type": "string", "minLength": 5, "maxLength": 2}}));
+        assert!(e.contains("{5,2}"), "the grammar parser refuses a maximum below the minimum: {e}");
+        // (minItems 3 > maxItems 1 is no error in llama.cpp: its repetition of the separated rest comes out
+        // empty, so the grammar takes exactly one item; the port prints the same grammar)
+        let Spec::Grammar(g) = spec_of(&json!({"guided_json": {"type": "array", "minItems": 3, "maxItems": 1}}), &keep).unwrap() else { panic!() };
+        let takes = |s: &str| { let mut m = Matcher::new(g.clone()); s.bytes().all(|b| m.step(b)) && m.can_stop() };
+        assert!(takes("[1]") && !takes("[1, 2, 3]") && !takes("[]"));
+        let e = err(json!({"guided_json": "{not json"}));
+        assert!(e.starts_with("guided_json: "), "{e}");
+        // a pattern llama.cpp cannot translate widens to any string (logged), as there: not an error
+        assert!(matches!(spec_of(&json!({"guided_json": {"type": "string", "pattern": "^\\d+$"}}), &keep).unwrap(), Spec::Grammar(_)));
     }
 }

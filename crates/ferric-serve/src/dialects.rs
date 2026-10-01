@@ -91,7 +91,11 @@ fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
             "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}})).collect::<Vec<_>>());
     }
     match req["thinking"]["type"].as_str() {
-        Some("enabled") => { r["chat_template_kwargs"] = json!({"enable_thinking": true}); }
+        Some("enabled") => {
+            r["chat_template_kwargs"] = json!({"enable_thinking": true});
+            // Anthropic's `thinking.budget_tokens` is the reasoning budget.
+            if let Some(n) = req["thinking"]["budget_tokens"].as_i64() { r["thinking_budget_tokens"] = json!(n); }
+        }
         Some("disabled") => { r["chat_template_kwargs"] = json!({"enable_thinking": false}); }
         _ => {}
     }
@@ -309,9 +313,8 @@ pub(crate) fn responses(eng: &Engine, mcps: &std::cell::RefCell<mcp::McpSet>, st
     } else if req["text"]["format"]["type"] == "json_object" {
         r["response_format"] = json!({"type": "json_object"});
     }
-    if let Some(e) = req["reasoning"]["effort"].as_str() {
-        r["chat_template_kwargs"] = json!({"enable_thinking": e != "minimal" && e != "none"});
-    }
+    // `reasoning.effort` is Chat Completions' `reasoning_effort` (see `template_kwargs`).
+    if let Some(e) = req["reasoning"]["effort"].as_str() { r["reasoning_effort"] = json!(e); }
     let empty = vec![];
     if let Err(e) = eng.gen_opts(&r, true).and_then(|_| eng.chat_ids(r["messages"].as_array().unwrap_or(&empty)).map(|_| ())) {
         return bad(stream, false, &e);

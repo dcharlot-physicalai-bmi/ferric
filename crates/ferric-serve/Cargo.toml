@@ -28,7 +28,9 @@ ferric-joule = { path = "../ferric-joule", version = "0.3" }
 ferric-tokenizer = { path = "../ferric-tokenizer", version = "0.3" }
 ferric-agent = { path = "../ferric-agent", version = "0.3" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip: a request's numbers parse to the nearest double (a json_schema's const/enum literals become
+# grammar text; see ferric-agent's Cargo.toml).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 pollster = "0.4"
 # The model's own chat template (Jinja), rendered as Hugging Face's apply_chat_template renders it. Vendored
 # like every other dependency. `pycompat` adds the Python str/dict methods HF templates call (.strip(),

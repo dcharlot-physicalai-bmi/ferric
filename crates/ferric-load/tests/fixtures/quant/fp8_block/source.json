@@ -1,0 +1,7 @@
+{
+ "source": "Qwen/Qwen3-0.6B-FP8",
+ "module": "model.layers.0.self_attn.q_proj",
+ "keep": 128,
+ "dequantizer": "transformers 5.17.0 Fp8Dequantize._dequantize_one (float32 output)",
+ "revision": "e5be08033360965ceca7b0ffd72d521a51331ce0"
+}

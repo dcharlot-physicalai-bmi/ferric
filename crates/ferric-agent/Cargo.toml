@@ -11,4 +11,12 @@ keywords = ["llm", "guided-decoding", "json-schema", "tool-calling", "agent"]
 categories = ["science", "wasm"]
 
 [dependencies]
-serde_json = { version = "1", features = ["preserve_order"] }
+# preserve_order: a schema's properties keep document order (the grammar emits them in that order).
+# float_roundtrip: a number is parsed to the nearest double, as nlohmann and Python parse it; the default
+# parser rounds twice past 1e22 (9.5e24 read as 9.499999999999999e24), and a const/enum literal would then
+# constrain the model to a different number than the schema names.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[dev-dependencies]
+# Reads the gzipped differential fixture in tests/fixtures/json_schema (vendored; ferric-serve's tests use it).
+flate2 = "1"

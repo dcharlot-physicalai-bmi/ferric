@@ -74,7 +74,10 @@ pub(crate) trait ServeModel {
     fn can_batch(&self) -> bool;
 
     /// Tokenize a chat request's `messages`. `Err` = a message this path cannot feed (a 400).
-    fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String>;
+    /// A chat request's prompt, rendered by the same rules as the serial path (template kwargs included).
+    fn encode_chat(&self, req: &Value) -> Result<Vec<u32>, String>;
+    /// A thinking model's reasoning/answer splitter for a reply to `prompt` (None: no reasoning markers).
+    fn reasoning(&self, _prompt: &[u32]) -> Option<crate::genopts::ReasoningSplit> { None }
     /// Tokenize a `/v1/completions` prompt string.
     fn encode_text(&self, text: &str) -> Vec<u32>;
 
@@ -105,7 +108,8 @@ pub(crate) trait ServeModel {
     /// Sample one token from one row. `None` = stop with nothing further emitted.
     fn pick(&self, row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32], rng: &mut u64) -> Option<u32>;
     fn is_stop(&self, tok: u32) -> bool;
-    fn text_of(&self, ids: &[u32]) -> String;
+    /// Generated text; `specials` keeps special tokens (a reasoning model's markers may be specials).
+    fn text_of(&self, ids: &[u32], specials: bool) -> String;
     /// A token's text and bytes, for `logprobs`.
     fn piece(&self, tok: u32) -> (String, Vec<u8>);
     /// Tokens this request may generate given its prompt: its own `max_tokens`, capped by the context.
@@ -226,6 +230,8 @@ struct Gen<S> {
     next: u32,
     /// The request's trace span, exported when the sequence retires.
     span: Option<crate::trace::Span>,
+    /// A thinking model's reasoning/answer splitter (chat only), as the serial path's.
+    split: Option<crate::genopts::ReasoningSplit>,
 }
 
 impl<S> Gen<S> {
@@ -238,13 +244,30 @@ impl<S> Gen<S> {
             self.logprobs.push(crate::genopts::logprob_entry(&|t| m.piece(t), tok, lp, &alts));
         }
         self.r#gen.push(tok);
-        if let Some(d) = self.em.update(&m.text_of(&self.r#gen)) { self.send_delta(m, &d); }
+        if let Some(d) = self.em.update(&m.text_of(&self.r#gen, self.split.is_some())) { self.deliver(m, &d); }
         self.em.hit_stop
     }
 
-    fn send_delta<M: ServeModel<State = S>>(&mut self, m: &M, delta: &str) {
+    /// Released text → the client, through the reasoning splitter when there is one (as `run_chat`).
+    fn deliver<M: ServeModel<State = S>>(&mut self, m: &M, d: &str) {
+        match self.split.as_mut() {
+            Some(sp) => {
+                let (r, c) = sp.push(d);
+                if !r.is_empty() { self.send_delta(m, &r, true); }
+                if !c.is_empty() { self.send_delta(m, &c, false); }
+            }
+            None => self.send_delta(m, d, false),
+        }
+    }
+
+    fn send_delta<M: ServeModel<State = S>>(&mut self, m: &M, delta: &str, reasoning: bool) {
         if self.streaming {
-            let mut ch = json!({"index": 0, "delta": {"content": delta}, "finish_reason": Value::Null});
+            let mut ch = json!({"index": 0, "delta": {(if reasoning { "reasoning_content" } else { "content" }): delta}, "finish_reason": Value::Null});
+            if reasoning {
+                if !send_sse(&mut self.stream, &json!({"id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
+                    "model": m.name(), "choices": [ch]})) { self.gone = true; }
+                return;
+            }
             if self.opts.logprobs { ch["logprobs"] = json!({"content": &self.logprobs[self.lp_sent..]}); }
             if !send_sse(&mut self.stream, &json!({
                 "id": "chatcmpl-ferric", "object": "chat.completion.chunk", "created": now_unix(),
@@ -293,7 +316,6 @@ fn authorized(headers: &[(String, String)], key: &str) -> bool {
 
 /// Requests the batch loop declines, and hands to the untouched serial path. See the module docs.
 fn must_run_serial(req: &Value, chat: bool, opts: &ServeOpts) -> bool {
-    // n > 1 choices are generated one after another on the serial path, each reusing the prompt's cache.
     // n > 1 is one request per choice on the serial path; an out-of-range n stays here to be refused.
     if req["n"].as_u64().is_some_and(|n| n > 1 && n <= crate::genopts::MAX_N as u64) { return true; }
     // A constraint masks every step (`constrain`); the batched step has no mask.
@@ -399,8 +421,7 @@ fn route<M: ServeModel>(
         }
         let gopts = match m.gen_opts(&req, chat) { Ok(o) => o, Err(e) => return bad(&mut j.stream, &e) };
         let prompt = if chat {
-            let empty = vec![];
-            match m.encode_chat(req["messages"].as_array().unwrap_or(&empty)) { Ok(p) => p, Err(e) => return bad(&mut j.stream, &e) }
+            match m.encode_chat(&req) { Ok(p) => p, Err(e) => return bad(&mut j.stream, &e) }
         } else {
             match req["prompt"].as_str() {
                 Some(p) => m.encode_text(p),
@@ -419,6 +440,7 @@ fn route<M: ServeModel>(
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}]}));
         }
         let id = sched.submit(prompt.clone(), max_tokens);
+        let split = if chat { m.reasoning(&prompt) } else { None };
         gens.push(Gen {
             id, stream: j.stream, streaming, chat,
             // Same seed as `Engine::generate` (the fixed default, or the request's `seed`), per sequence.
@@ -428,6 +450,7 @@ fn route<M: ServeModel>(
             opts: gopts,
             prompt, r#gen: Vec::new(), logprobs: Vec::new(), lp_sent: 0, ticket: None, gone: false, state: None, fed: 0, ready: false, next: 0,
             span: crate::trace::leave(),
+            split,
         });
         return;
     }
@@ -894,7 +917,17 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
         return;
     }
     let reason = if g.em.hit_stop || !matches!(why, Done::Length) { "stop" } else { "length" };
-    if let Some(d) = g.em.flush() { g.send_delta(m, &d); }
+    if let Some(d) = g.em.flush() { g.deliver(m, &d); }
+    // A reasoning model's answer and reasoning, as `run_chat` returns them (the tails flushed, ends trimmed).
+    let (text, reasoning) = match g.split.take() {
+        Some(mut sp) => {
+            let (r, c) = sp.finish();
+            if !r.is_empty() { g.send_delta(m, &r, true); }
+            if !c.is_empty() { g.send_delta(m, &c, false); }
+            (sp.content.trim_end().to_string(), sp.reasoning.trim_end().to_string())
+        }
+        None => (g.em.text.clone(), String::new()),
+    };
     let (ptok, gtok) = (g.prompt.len(), g.r#gen.len());
     let usage = json!({"prompt_tokens": ptok, "completion_tokens": gtok, "total_tokens": ptok + gtok});
     let energy = m.energy_end(g.ticket.take(), gtok);
@@ -915,9 +948,11 @@ fn finish<M: ServeModel>(m: &M, mut g: Gen<M::State>, why: Done) {
         return;
     }
     let mut choice = if g.chat {
-        json!({"index": 0, "message": {"role": "assistant", "content": g.em.text}, "finish_reason": reason})
+        let mut message = json!({"role": "assistant", "content": text});
+        if !reasoning.is_empty() { message["reasoning_content"] = json!(reasoning); }
+        json!({"index": 0, "message": message, "finish_reason": reason})
     } else {
-        json!({"index": 0, "text": g.em.text, "finish_reason": reason})
+        json!({"index": 0, "text": text, "finish_reason": reason})
     };
     if g.opts.logprobs { choice["logprobs"] = crate::logprobs_field(g.chat, &g.logprobs); }
     let body = if g.chat {
@@ -940,7 +975,8 @@ impl ServeModel for Engine {
     fn name(&self) -> &str { &self.name }
     fn n_vocab(&self) -> usize { self.model.n_vocab() }
     fn can_batch(&self) -> bool { self.batchable() }
-    fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String> { self.chat_ids(messages) }
+    fn encode_chat(&self, req: &Value) -> Result<Vec<u32>, String> { self.chat_request_ids(req) }
+    fn reasoning(&self, prompt: &[u32]) -> Option<crate::genopts::ReasoningSplit> { self.reasoning_split(prompt) }
 
     fn encode_text(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
@@ -983,14 +1019,18 @@ impl ServeModel for Engine {
     }
 
     fn is_stop(&self, tok: u32) -> bool { self.eos.contains(&tok) }
-    fn text_of(&self, ids: &[u32]) -> String { self.detok(ids) }
+    fn text_of(&self, ids: &[u32], specials: bool) -> String { if specials { self.detok_all(ids) } else { self.detok(ids) } }
     fn piece(&self, tok: u32) -> (String, Vec<u8>) { Engine::piece(self, tok) }
     fn budget(&self, prompt_len: usize, want: Option<usize>) -> Result<usize, String> { Engine::budget(self, prompt_len, want) }
     /// ⛔ Wiring batching sent plain requests on an MTP hybrid through the scheduler, which cannot
     /// draft — so speculative decoding, its energy gate and the one-slot prefix cache ran only for
     /// `response_format` and tool requests. Such a model keeps its own serial loop.
     fn serial_generation(&self) -> bool {
-        (matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err())
+        // `--no-batch` (FERRIC_NOBATCH): every request on the serial handler (`run_chat` / `generate`), the
+        // reference the batched path is checked against (scripts/batch_serial_check.py) — not the scheduler
+        // at one row, which shares the batched path's own rendering and emission.
+        std::env::var("FERRIC_NOBATCH").is_ok()
+        || (matches!(&self.model, crate::Model::Hybrid(m) if m.mtp.is_some()) && std::env::var("FERRIC_NOSPEC").is_err())
             // Prompt lookup (FERRIC_LOOKUP) speculates on the serial loop; a dense model that asked for it
             // takes that loop for every request, trading batching for tokens per forward.
             || (matches!(&self.model, crate::Model::Dense(_)) && crate::lookup_k().is_some() && crate::qwen3_cache_is_f32())
@@ -1069,9 +1109,9 @@ mod tests {
         fn name(&self) -> &str { &self.name }
         fn n_vocab(&self) -> usize { 8192 }
         fn can_batch(&self) -> bool { self.batchable }
-        fn encode_chat(&self, messages: &[Value]) -> Result<Vec<u32>, String> {
+        fn encode_chat(&self, req: &Value) -> Result<Vec<u32>, String> {
             let mut out = Vec::new();
-            for v in messages { out.extend(self.encode_text(&crate::genopts::content_text(&v["content"])?)); }
+            for v in req["messages"].as_array().into_iter().flatten() { out.extend(self.encode_text(&crate::genopts::content_text(&v["content"])?)); }
             Ok(out)
         }
         fn encode_text(&self, text: &str) -> Vec<u32> { text.bytes().map(|b| b as u32).collect() }
@@ -1098,7 +1138,7 @@ mod tests {
             Some(row.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0 as u32)
         }
         fn is_stop(&self, tok: u32) -> bool { self.stop != 0 && tok == self.stop }
-        fn text_of(&self, ids: &[u32]) -> String {
+        fn text_of(&self, ids: &[u32], _specials: bool) -> String {
             ids.iter().map(|i| format!("{i},")).collect()
         }
         fn piece(&self, tok: u32) -> (String, Vec<u8>) { let t = format!("{tok},"); (t.clone(), t.into_bytes()) }
