@@ -52,7 +52,7 @@ async fn run() {
     let mut gen_ids = Vec::new();
     let mut step_ms = Vec::new();
     // Dispatch accounting over the decode steps only: FERRIC_CENSUS=1 names the kernels behind the count.
-    ferric_tensor::reset_op_counters(); ferric_tensor::reset_op_census();
+    ferric_tensor::reset_op_counters(); ferric_tensor::reset_op_census(); ferric_tensor::kprof::reset();
     for s in 0..n_gen {
         gen_ids.push(next);
         if s + 1 == n_gen { break; }
@@ -74,6 +74,16 @@ async fn run() {
         let mut c = ferric_tensor::op_census();
         c.sort_by(|a, b| b.1.cmp(&a.1));
         for (k, v) in c.iter().take(40) { println!("  {:>8.1}/token  {k}", *v as f64 / s.len() as f64); }
+        // FERRIC_KPROF=1 FERRIC_GPUPROF=1: GPU time per kernel label, per decode token.
+        let kp = ferric_tensor::kprof::report();
+        if !kp.is_empty() {
+            let tot: f64 = kp.iter().map(|k| k.1).sum::<f64>() / s.len() as f64 / 1e6;
+            println!("GPU time per decode token (timestamps): {tot:.2} ms");
+            for (k, ns, c) in kp.iter().take(40) {
+                println!("  {:>7.3} ms {:>5.1}%  {:>6.1} calls  {:>7.1} us/call  {k}", ns / s.len() as f64 / 1e6,
+                         100.0 * ns / s.len() as f64 / 1e6 / tot, *c as f64 / s.len() as f64, ns / *c as f64 / 1e3);
+            }
+        }
         ferric_tensor::prof_report();
     }
 }

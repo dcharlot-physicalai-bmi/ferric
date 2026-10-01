@@ -27,6 +27,7 @@ pub mod iq_raw; // IQ1_S / IQ1_M / IQ2_XS / IQ2_S / IQ3_S packed matmul
 pub mod gq; // grouped-int / FP8 / FP4 packed matmul for GPTQ, AWQ, compressed-tensors, FP8, ModelOpt
 pub mod dtype; // f16/bf16 half-precision storage + on-device dequant
 pub mod fuse; // kernel fusion via runtime WGSL codegen (the optimizing-compiler seed)
+pub mod kprof; // GPU time per kernel from timestamp queries (FERRIC_KPROF=1 FERRIC_GPUPROF=1)
 pub mod fwht; // blockwise Walsh–Hadamard transform (PrismML Bonsai 2 rotated-basis activations)
 pub mod kvquant; // block-quantized KV cache: q8_0/q4_0/q4_1 blocks that grow one row at a time
 pub mod nn; // transformer blocks expressed on the general runtime
@@ -2084,9 +2085,21 @@ pub(crate) fn record_dispatch(ctx: &Context, label: &str, pipe: &wgpu::ComputePi
     // Record into an ALREADY-OPEN pass when batching, opening one only if the segment has none.
     // Pipeline and bind group are set per dispatch because consecutive ops differ in both; only the
     // pass boundary is amortised.
+    // FERRIC_KPROF: this dispatch alone in a pass stamped at both ends (kprof.rs).
+    let stamp = if kprof::on(ctx) { kprof::slot(ctx, label) } else { None };
+    let tsw = stamp.as_ref().map(|(q, i)| wgpu::ComputePassTimestampWrites {
+        query_set: q, beginning_of_pass_write_index: Some(*i), end_of_pass_write_index: Some(*i + 1) });
     let record_into = |slot: &mut Option<wgpu::ComputePass<'static>>,
                        enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let _t = profclock::now();
+        if let Some(tsw) = tsw.clone() {
+            drop(slot.take());
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: Some(tsw) });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(g.0, g.1, g.2);
+            return;
+        }
         if slot.is_none() {
             *slot = Some(enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("batch"), timestamp_writes: None }).forget_lifetime());
@@ -2111,7 +2124,7 @@ pub(crate) fn record_dispatch(ctx: &Context, label: &str, pipe: &wgpu::ComputePi
     // Unbatched: one pass for the single dispatch, as before.
     let record = |enc: &mut wgpu::CommandEncoder, bg: &wgpu::BindGroup| {
         let _t = profclock::now();
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: tsw.clone() });
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(g.0, g.1, g.2);
@@ -2139,6 +2152,7 @@ pub(crate) fn record_dispatch(ctx: &Context, label: &str, pipe: &wgpu::ComputePi
         record(&mut enc, &bg);
         ctx.queue.submit([enc.finish()]);
         SUBMITS.with(|c| c.set(c.get() + 1));
+        if stamp.is_some() { kprof::resolve(ctx); }
     }
 }
 
@@ -2160,6 +2174,7 @@ pub(crate) fn flush_batch(ctx: &Context) {
                 drop(pass);
                 ctx.queue.submit([enc.finish()]);
                 SUBMITS.with(|c| c.set(c.get() + 1));
+                if kprof::on(ctx) { kprof::resolve(ctx); }
             }
             #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
             Seg::External(ops) => {
