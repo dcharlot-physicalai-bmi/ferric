@@ -1,0 +1,17 @@
+[package]
+name = "ferric-accept"
+description = "Machine-checkable acceptance receipts for Ferric. Separates a measured result from a target and from a historical author claim, and rejects a pass that does not carry its protocol, provenance, and preregistered tolerance."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["verification", "provenance", "receipt", "evidence"]
+categories = ["development-tools", "science"]
+
+# serde_json is already the repo's JSON library (ferric-serve, ferric-llama, ferric-agent).
+# No other dependency: a receipt checker that pulled the tensor stack would stop being
+# something you can run while those crates are the thing under test.
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }

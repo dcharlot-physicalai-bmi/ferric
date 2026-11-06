@@ -1,0 +1,147 @@
+{
+  "schema_version": "1",
+  "evidence_class": "target",
+  "note": "Required cells. None is passed. implementation describes the tree on 2026-11-06, which is a code-inspection label, not a measured run.",
+  "cells": [
+    {
+      "cell_id": "gpu.wgpu.metal",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": false,
+      "code": "Device::Gpu via wgpu Metal. crates/ferric-tensor/src/sched.rs",
+      "note": "WGSL contract. Not closed by metal4.tensor-units."
+    },
+    {
+      "cell_id": "gpu.wgpu.vulkan.hardware",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": false,
+      "does_not_satisfy": ["gpu.wgpu.vulkan.lavapipe"],
+      "code": "Device::Gpu via wgpu Vulkan on a hardware adapter",
+      "note": "lavapipe does not satisfy this cell."
+    },
+    {
+      "cell_id": "gpu.wgpu.dx12",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": false,
+      "code": "wgpu DX12 backend, same WGSL kernels",
+      "note": "No in-tree receipt names a DX12 adapter."
+    },
+    {
+      "cell_id": "gpu.wgpu.webgpu.browser",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": true,
+      "code": "crates/ferric-web and web/. Device::BrowserWorker is the host-side socket, not this cell by itself.",
+      "note": "Requires a real browser. Headless Chrome counts only when the page's adapter is the browser's WebGPU device, not lavapipe."
+    },
+    {
+      "cell_id": "gpu.wgpu.vulkan.lavapipe",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": false,
+      "does_not_satisfy": ["gpu.wgpu.vulkan.hardware", "gpu.wgpu.webgpu.browser"],
+      "code": ".github/workflows/ci.yml installs mesa-vulkan-drivers for lavapipe. This cell is the software stand-in only.",
+      "note": "CI runs this. It does not close hardware Vulkan or the browser."
+    },
+    {
+      "cell_id": "cpu.host",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": false,
+      "code": "Device::Cpu in crates/ferric-tensor/src/sched.rs"
+    },
+    {
+      "cell_id": "remote.tcp",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": false,
+      "code": "Device::Remote. docs/parity/MATRIX.md E13: single ops, no LLM across hosts.",
+      "note": "The parity sentence is historical_author. The cell stays required."
+    },
+    {
+      "cell_id": "browser.worker",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": true,
+      "code": "Device::BrowserWorker(WsConn) in crates/ferric-tensor/src/sched.rs"
+    },
+    {
+      "cell_id": "npu.execution-provider",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": false,
+      "requires_compute_plan_receipt": true,
+      "code": "Device::Npu and docs/FABRIC.md MLComputePlan gate",
+      "note": "No receipt, no claim. docs/parity/MATRIX.md B10: no LLM token reaches the ANE. That sentence is historical."
+    },
+    {
+      "cell_id": "metal4.tensor-units",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "present",
+      "real_browser_required": false,
+      "does_not_satisfy": ["gpu.wgpu.metal"],
+      "code": "Device::Metal4, macOS only. crates/ferric-core/examples/metal4_tensor_gemm.rs asserts err < 5e-2 against the fp16 oracle.",
+      "note": "fp16-input contract. Does not satisfy the f32 WGSL metal cell."
+    },
+    {
+      "cell_id": "cuda.native",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": false,
+      "code": "crates/ferric-tensor/src/cuda.rs. docs/parity/MATRIX.md B01 calls the path partial.",
+      "note": "Partial is a code-inspection label from that audit, not a new measurement."
+    },
+    {
+      "cell_id": "rocm.native",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "absent_in_tree",
+      "real_browser_required": false,
+      "code": "docs/parity/MATRIX.md B02: ROCm native absent. AMD via Vulkan is the hardware Vulkan cell, not this one."
+    },
+    {
+      "cell_id": "webnn.browser",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": true,
+      "code": "crates/ferric-web/examples/npu.rs launches Chrome with WebNN. docs/NPU.md records WebNN absent in the local Chrome of that note.",
+      "note": "Absence of the API is a withhold, not a pass."
+    },
+    {
+      "cell_id": "tenstorrent.host",
+      "evidence_class": "target",
+      "status": "required",
+      "outcome": "not_applicable",
+      "implementation": "partial",
+      "real_browser_required": false,
+      "code": "docs/parity/MATRIX.md B13: host plumbing, no compute kernel exercised."
+    }
+  ]
+}

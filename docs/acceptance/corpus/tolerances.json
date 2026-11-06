@@ -1,0 +1,59 @@
+{
+  "schema_version": "1",
+  "evidence_class": "target",
+  "note": "Predicates are the bars a future run is graded against. They are not errors observed by this workstream.",
+  "tolerances": [
+    {
+      "id": "A.full-model.v1",
+      "track": "A",
+      "comparison": "registered architecture against the authors' implementation and against named refusal paths",
+      "predicate": "Tokenizer ids byte-identical to llama-tokenize on scripts/tokenizer_conformance.sh. Import of the same GGUF. Logit rows on an EXACT-class file (lm_conformance.sh: F32, or F16/BF16 when the checkpoint dtype is that width) within max abs 1e-3 and sum-of-squares tolerance 1e-4 of the authors' f32 eager fixture. Generation recorded as its own stage and not used as the logit proof. Malformed magic, truncated header, and truncated tensor extent refused with the reader's named error. A prompt that does not fit is refused naming both lengths. A tier budget smaller than one layer is BudgetTooSmall before any read. KV-cache versus full recompute remains max abs 0, which is stricter than the in-tree assert worst < 2e-3. A quantized file is not this proof.",
+      "evidence_class": "target",
+      "not_a_measurement": true,
+      "in_tree_gate_note": "scripts/lm_conformance.sh already exits on the 1e-3/1e-4 EXACT band and uses 5e-2/5e-3 only for files that rounded the authors' weights. crates/ferric-core/examples/generate.rs asserts worst < 2e-3 while its println says EXACT. The mission bar for that comparison is 0."
+    },
+    {
+      "id": "B.fabric-cell.v1",
+      "track": "B",
+      "comparison": "one kernel configuration on one fabric cell against the CPU reference or the fp16 oracle that cell's contract names",
+      "predicate": "The receipt names profile, kernel, dtype, shape, and driver, and satisfies only its own cell_id. WGSL f32 cells that the README treats as cross-fabric bit-identical are bitwise equal to each other on the compared outputs. The in-tree matmul assert diff < 1e-4 and the kernel assert d < 1e-4 are historical gates, not a replacement for that bitwise cell. gpu.wgpu.webgpu.browser, browser.worker, and webnn.browser run in a real browser. gpu.wgpu.vulkan.lavapipe does not satisfy the hardware Vulkan cell or any browser cell. npu.execution-provider requires a compute-plan receipt. metal4.tensor-units is graded against the fp16 oracle at the in-tree assert err < 5e-2 and is not an f32 WGSL result.",
+      "evidence_class": "target",
+      "not_a_measurement": true
+    },
+    {
+      "id": "C.matched-energy.v1",
+      "track": "C",
+      "comparison": "Ferric versus a named baseline on the same prefill, decode, or training task",
+      "predicate": "Both arms passed the track A quality gate at the same git revision and the same weight digest. Each arm reports gross joules and above-idle joules. energy.class is measured or derived. class estimated is not a pass. above-idle joules below zero is not a pass. A saving exists only when both readings exist. ferrotherm calibration readings A1 and A2 agree before B is attributable. Prefill, decode, and training each have their own receipt.",
+      "evidence_class": "target",
+      "not_a_measurement": true,
+      "in_tree_gate_note": "crates/ferric-serve/src/energy.rs labels the server figure class derived and returns null joules when the window is unresolved. crates/ferric-joule Class::claimable is false for Estimated."
+    },
+    {
+      "id": "D.hermetic.v1",
+      "track": "D",
+      "comparison": "two offline rebuilds and a bounds-then-recovery read",
+      "predicate": "Both machines build with cargo --offline from the same manifest. The manifest includes a Cargo.lock sha256 and the same rustc commit. The named release artifact sha256 matches. A layer budget smaller than one layer returns BudgetTooSmall. The same logical reads at a budget that fits match the bytes from a larger budget.",
+      "evidence_class": "target",
+      "not_a_measurement": true,
+      "in_tree_gate_note": "Cargo.lock is not in the tree as of 2026-11-06. README says vendor/ is not committed. Those facts block a pass; they are not a softer hermetic bar."
+    },
+    {
+      "id": "E.leadership-matrix.v1",
+      "track": "E",
+      "comparison": "Ferric versus pinned peers on each leadership cell",
+      "predicate": "The matrix has a date and an owner email on the physicalai-bmi attribution. Every leadership cell names a peer revision, a Ferric revision, and a measured receipt id. leadership_cells_open is 0. A cell whose only support is docs/parity/MATRIX.md stays historical_author.",
+      "evidence_class": "target",
+      "not_a_measurement": true
+    },
+    {
+      "id": "F.closed-loop.v1",
+      "track": "F",
+      "comparison": "task f.closed-loop.ferromotion-sin3x.v1 against an independent CPU reference, with synchronized energy",
+      "predicate": "Init, data, and Adam match crates/ferric-tensor/examples/ferromotion_mlp.rs and crates/ferric-tensor/src/optim.rs: MLP [1,32,32,1], ReLU, 48 points x=-1+2i/47, y=sin(3x), Adam lr 0.01, b1 0.9, b2 0.999, eps 1e-8, 3000 full-batch MSE steps. Both arms satisfy final MSE < 5e-3 and max abs versus sin(3x) < 0.15 on the 40 probes x=-1+2k/39. max abs between the two arms' probe outputs <= 1e-3. Gross and above-idle joules cover that window. ferrotherm A1 and A2 agree. Interface revisions for ferrotherm metrology, ferromorphic event-NIR, and ferromotion dynamics control are non-empty and not unpinned. The event stream is not a ferric-signal synthetic fixture.",
+      "evidence_class": "target",
+      "not_a_measurement": true,
+      "in_tree_gate_note": "The example asserts last < 5e-3 and max_err < 0.15 against sin(3x) only. It does not compare a second implementation and it does not record joules. The 1e-3 cross-implementation bar is preregistered here, stricter than 0.15, and is not an observed error."
+    }
+  ]
+}

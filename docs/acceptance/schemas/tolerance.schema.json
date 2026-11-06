@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://physicalai-bmi.org/ferric/acceptance/tolerance/v1",
+  "title": "Ferric preregistered tolerance",
+  "description": "A bar registered before a run. Corpus entries are targets. They are not the error a run happened to produce.",
+  "type": "object",
+  "required": ["id", "track", "comparison", "predicate", "evidence_class", "not_a_measurement"],
+  "properties": {
+    "id": { "type": "string" },
+    "track": { "enum": ["A", "B", "C", "D", "E", "F"] },
+    "comparison": { "type": "string", "minLength": 1 },
+    "predicate": { "type": "string", "minLength": 1 },
+    "evidence_class": { "const": "target" },
+    "not_a_measurement": { "const": true },
+    "in_tree_gate_note": { "type": "string" }
+  }
+}

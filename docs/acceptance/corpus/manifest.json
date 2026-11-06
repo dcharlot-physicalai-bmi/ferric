@@ -1,0 +1,99 @@
+{
+  "schema_version": "1",
+  "evidence_class": "target",
+  "note": "Sha256 of acceptance documents. These hashes are integrity of the text, not measurements of a model, a fabric, or a joule figure.",
+  "documents": [
+    {
+      "path": "docs/acceptance/ACTOR.md",
+      "sha256": "374f0c048ccfff5fd6c168202502a256c6eb2f2333d4b787fc618db4d611c758"
+    },
+    {
+      "path": "docs/acceptance/EVIDENCE.md",
+      "sha256": "093e2bd9d077ba10fe126fcc8587b17fdecf824d5fd087212fc0f704fea984f7"
+    },
+    {
+      "path": "docs/acceptance/README.md",
+      "sha256": "382afbd4e9cfe759d53a69207bb8c4951bc0367713380f14384a1deef2798360"
+    },
+    {
+      "path": "docs/acceptance/corpus/fabric-cells.json",
+      "sha256": "b9cda0633581dba18ece37f39e054c5971e7a000df0118610f1b6aff8af11cc7"
+    },
+    {
+      "path": "docs/acceptance/corpus/historical.json",
+      "sha256": "6edcff59d587fbd4dc877280fa78438c20d706beaa26c12458b19e0cf923cf3f"
+    },
+    {
+      "path": "docs/acceptance/corpus/measured.json",
+      "sha256": "e4cc6a87154bc2dc2d809a62f76dee26f9b41a1e5201e2d7900ebe172a0549e2"
+    },
+    {
+      "path": "docs/acceptance/corpus/targets.json",
+      "sha256": "b9403ecc0fded987eeb7234bae7f90f3710dd3258cb481e4923b4179c48de909"
+    },
+    {
+      "path": "docs/acceptance/corpus/tolerances.json",
+      "sha256": "0f4fd61c279887d7675a717459bb980e0e9d771eea87308912b26c99b66a1a11"
+    },
+    {
+      "path": "docs/acceptance/issues/A-full-model-correctness.md",
+      "sha256": "09514771d7cf0237839c230f0b634735ba2098cec4d5fcd43b813330eaa53c21"
+    },
+    {
+      "path": "docs/acceptance/issues/B-fabric-contracts.md",
+      "sha256": "3df9452eb9b70d47dd8fd07ce921eee87c3c96db101d4cc57853ccdf1b886a00"
+    },
+    {
+      "path": "docs/acceptance/issues/C-energy-leadership.md",
+      "sha256": "139ae77f1d8d4c0b8938dc20c8f033e7ceae5157fbab3caa0d5796984940d3ba"
+    },
+    {
+      "path": "docs/acceptance/issues/D-hermetic-production.md",
+      "sha256": "3816a5a3a2b7ac758310c9c62da95af118cfcdb7f7edd817951ab2848c41e9b2"
+    },
+    {
+      "path": "docs/acceptance/issues/E-prior-art-matrix.md",
+      "sha256": "7c43249f6c8a57f67120ab86a925c0f413f55d611c8d9c38e6f0018fbdfa8d16"
+    },
+    {
+      "path": "docs/acceptance/issues/F-closed-loop.md",
+      "sha256": "7af7cd3c56d099882893d269d190e11d0242a4b173bc638eeb47d36ef8b66146"
+    },
+    {
+      "path": "docs/acceptance/protocols/A-full-model-correctness.md",
+      "sha256": "cd5e4940b18a91c400d916eb79f3acb6ec88a973432f23b22b0603898ac59a72"
+    },
+    {
+      "path": "docs/acceptance/protocols/B-fabric-contracts.md",
+      "sha256": "d73154ad3c631457dc34fa0f191f0a21c2e7a102f9f450b673a7cc4ed28d9f46"
+    },
+    {
+      "path": "docs/acceptance/protocols/C-energy-leadership.md",
+      "sha256": "69f66458a375004634d6758ce4ddd482b227720658726e15414130033162f059"
+    },
+    {
+      "path": "docs/acceptance/protocols/D-hermetic-production.md",
+      "sha256": "8733f8365004d9f272e8f4db0757d70100fe0b8b0a4433c6080de5ab7a1aef77"
+    },
+    {
+      "path": "docs/acceptance/protocols/E-prior-art-matrix.md",
+      "sha256": "357cf5dcb0bc1078d763fb0c381b84cfc803b3b4e57e43de197fd3ee4bbbd3d5"
+    },
+    {
+      "path": "docs/acceptance/protocols/F-closed-loop.md",
+      "sha256": "2c14d6440a5f8de1024d7d71c0e4596a01af6fa36c20cdc5196152c2c3a5caf7"
+    },
+    {
+      "path": "docs/acceptance/schemas/fabric-cell.schema.json",
+      "sha256": "0df56593edfb685a465cf7d14c78731729035fe893365e5702882feefae7ea85"
+    },
+    {
+      "path": "docs/acceptance/schemas/receipt.schema.json",
+      "sha256": "788ffc52fb90862e3017dd9aa627d0e676ab72f815ee04385ffdc2d2c4de698b"
+    },
+    {
+      "path": "docs/acceptance/schemas/tolerance.schema.json",
+      "sha256": "c1566055e5f925225609ccad16a8c1249d6f694afec20ddf80df287a1fc1d2cf"
+    }
+  ]
+}
