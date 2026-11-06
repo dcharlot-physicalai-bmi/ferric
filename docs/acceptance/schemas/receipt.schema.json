@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://physicalai-bmi.org/ferric/acceptance/receipt/v1",
+  "title": "Ferric acceptance receipt",
+  "description": "One statement about one track. evidence_class is measured, target, or historical_author. outcome pass is only valid when evidence_class is measured and the track rules in ferric-accept hold. This schema names the fields; crates/ferric-accept enforces the cross-field rules.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "receipt_id",
+    "track",
+    "evidence_class",
+    "status",
+    "outcome",
+    "protocol_id",
+    "claim",
+    "recorded_on"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "receipt_id": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{2,95}$" },
+    "track": { "enum": ["A", "B", "C", "D", "E", "F"] },
+    "evidence_class": { "enum": ["measured", "target", "historical_author"] },
+    "status": { "enum": ["registered", "executed", "recorded", "withheld"] },
+    "outcome": { "enum": ["pass", "fail", "inconclusive", "not_applicable"] },
+    "protocol_id": { "type": "string" },
+    "claim": { "type": "string", "minLength": 1 },
+    "recorded_on": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "not_a_measurement": { "type": "boolean" },
+    "not_a_new_measurement": { "type": "boolean" },
+    "git": {
+      "type": "object",
+      "required": ["repository", "revision", "dirty"],
+      "properties": {
+        "repository": { "const": "https://github.com/dcharlot-physicalai-bmi/ferric" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "const": false }
+      }
+    },
+    "command": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "machine": {
+      "type": "object",
+      "required": ["os", "adapter"],
+      "properties": {
+        "os": { "type": "string" },
+        "adapter": { "type": "string" }
+      }
+    },
+    "comparator": {
+      "type": "object",
+      "required": ["name", "independent"],
+      "properties": {
+        "name": { "type": "string" },
+        "independent": { "const": true }
+      }
+    },
+    "tolerance": {
+      "type": "object",
+      "required": ["id", "preregistered", "predicate"],
+      "properties": {
+        "id": { "type": "string" },
+        "preregistered": { "const": true },
+        "predicate": { "type": "string", "minLength": 1 }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "sha256"],
+        "properties": {
+          "name": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "source": { "type": "object" },
+    "energy": { "type": "object" },
+    "fabric": { "type": "object" },
+    "stages": { "type": "array" },
+    "interfaces": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "evidence_class": { "const": "target" } }, "required": ["evidence_class"] },
+      "then": {
+        "properties": {
+          "status": { "const": "registered" },
+          "outcome": { "const": "not_applicable" },
+          "not_a_measurement": { "const": true }
+        },
+        "not": { "required": ["joules"] }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "pass" } }, "required": ["outcome"] },
+      "then": {
+        "properties": { "evidence_class": { "const": "measured" }, "status": { "const": "executed" } }
+      }
+    }
+  ]
+}

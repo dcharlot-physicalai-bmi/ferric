@@ -1,0 +1,7 @@
+{
+  "schema_version": "1",
+  "evidence_class": "measured",
+  "recorded_on": "2026-11-06",
+  "statement": "This workstream ran the ferric-accept checker and nothing else. No model, fabric, browser, power meter, offline rebuild, or closed-loop task was executed for a receipt. The array is empty so that an empty measured set cannot be mistaken for a pass.",
+  "receipts": []
+}

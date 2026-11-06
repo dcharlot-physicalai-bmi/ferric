@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://physicalai-bmi.org/ferric/acceptance/fabric-cell/v1",
+  "title": "Ferric fabric cell",
+  "description": "One required behavioral-contract cell. In this foundation every cell is a target with status required. A measured pass for the cell is a receipt, not a mutation of this object into outcome pass.",
+  "type": "object",
+  "required": [
+    "cell_id",
+    "evidence_class",
+    "status",
+    "outcome",
+    "implementation",
+    "real_browser_required",
+    "code"
+  ],
+  "properties": {
+    "cell_id": { "type": "string" },
+    "evidence_class": { "const": "target" },
+    "status": { "const": "required" },
+    "outcome": { "const": "not_applicable" },
+    "implementation": { "enum": ["present", "partial", "absent_in_tree"] },
+    "real_browser_required": { "type": "boolean" },
+    "requires_compute_plan_receipt": { "type": "boolean" },
+    "does_not_satisfy": { "type": "array", "items": { "type": "string" } },
+    "code": { "type": "string", "minLength": 1 },
+    "note": { "type": "string" }
+  }
+}

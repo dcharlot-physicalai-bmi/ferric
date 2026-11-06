@@ -1,0 +1,74 @@
+[
+  {
+    "schema_version": "1",
+    "receipt_id": "target.a.full-model",
+    "track": "A",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "A.full-model-correctness.v1",
+    "claim": "Every registered architecture agrees with an independent reference on tokenization, import, full-row logits inside the preregistered EXACT band, and generation recorded separately; malformed inputs and resource overruns are refused by name. The KV-cache mission bar stays max abs 0 against full recompute.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  },
+  {
+    "schema_version": "1",
+    "receipt_id": "target.b.fabric-cells",
+    "track": "B",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "B.fabric-contracts.v1",
+    "claim": "Each required fabric cell has its own behavioral receipt naming profile, kernel, dtype, shape, and driver. Real-browser cells run in a real browser. A software rasterizer does not close them. Absent cells stay open.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  },
+  {
+    "schema_version": "1",
+    "receipt_id": "target.c.energy-leadership",
+    "track": "C",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "C.energy-leadership.v1",
+    "claim": "Matched-quality leadership on prefill, decode, and training, each with gross joules and above-idle joules, class measured or derived, compared as a both-arm saving against a baseline that passed the same quality gate, with ferrotherm A/B/A calibration.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  },
+  {
+    "schema_version": "1",
+    "receipt_id": "target.d.hermetic",
+    "track": "D",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "D.hermetic-production.v1",
+    "claim": "Two independent offline rebuilds from one immutable manifest, including a Cargo.lock digest and one rustc commit, produce the same artifact digest. Bounds are refused up front. Recovery reads the same bytes.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  },
+  {
+    "schema_version": "1",
+    "receipt_id": "target.e.leadership-matrix",
+    "track": "E",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "E.prior-art-matrix.v1",
+    "claim": "A dated, owner-attributed matrix in which every leadership cell cites a pinned peer, a pinned Ferric revision, and a measured receipt. The September 2026 parity audit is an input, not that proof.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  },
+  {
+    "schema_version": "1",
+    "receipt_id": "target.f.closed-loop",
+    "track": "F",
+    "evidence_class": "target",
+    "status": "registered",
+    "outcome": "not_applicable",
+    "protocol_id": "F.closed-loop.v1",
+    "claim": "One revision-pinned task, f.closed-loop.ferromotion-sin3x.v1, with reference agreement, synchronized gross and above-idle energy, and pinned revisions of ferrotherm metrology, ferromorphic event-NIR, and ferromotion dynamics control.",
+    "recorded_on": "2026-11-06",
+    "not_a_measurement": true
+  }
+]
