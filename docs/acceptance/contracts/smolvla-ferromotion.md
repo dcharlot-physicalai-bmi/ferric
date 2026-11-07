@@ -22,10 +22,9 @@ Pin: LeRobot commit `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a` (2026-07-23). Fil
 - Network noise / pre-slice tensor: `(batch, chunk_size, max_action_dim)` = `(batch, 50, 32)` by default, f32. `sample_actions` allocates that shape. Its docstring says `num_steps`; `num_steps` is the Euler count, default **10**, and is not the horizon.
 - After unpad: `(batch, chunk_size, action_dim)` with `action_dim = action_feature.shape[0]`, the dataset width, not 32 unless the dataset is 32.
 - Queue for `select_action` keeps `n_action_steps` (default 50). `n_action_steps > chunk_size` is a `ValueError`.
-- Canonical bytes for one robot: time-major f32, row `t` then action dimension. Codec version 1. Domain `ferric.smolvla.action-chunk`.
-- Unit after unnormalize: dataset-native. Not degrees, not radians. A Hub comment that the range is [-100, 100] is not this formula.
-- Frame: embodiment name supplied by the caller (`so100_follower` or otherwise). The model does not convert frames.
-- Time: action index `k` is chunk step `k`. `observation_delta_indices` is `[0]` (current frame). Dataset fps is not in `SmolVLAConfig`. The codec tag for time is step, not seconds.
+- Canonical bytes, codec version **2**, domain `ferric.smolvla.action-chunk`. Version 1 in commit `831d729` is withdrawn: it allowed empty noise and had no joint metadata.
+- Unit strings and frame strings are caller labels stored in the digest. This crate does not parse them and does not convert degrees, radians, or meters.
+- Time is an integer clock the caller supplies. Action index `k` is at `t0_ns + k * step_duration_ns`. `step_duration_ns` of 0 is refused. There is no fps field and no conversion from a rate. `observation_delta_indices` in the pinned config is `[0]`.
 
 ## Preprocess, in code order
 
@@ -53,9 +52,37 @@ Postprocess: unnormalize, then CPU. Unnormalize is `y * std + mean`. Forward is 
 
 If `noise` is omitted, `sample_actions` draws it. That profile is stochastic and cannot be a reference-agreement receipt. A deterministic receipt carries the noise sha256, the weight sha256, and the stats sha256. Flow count stays 10 unless the pinned config on the receipt says otherwise. `load_vlm_weights` defaults false on the dataclass; that is not a statement about `from_pretrained`.
 
-## Digest
+## Digest, version 2
 
-Version 1 covers: magic, codec version, LeRobot commit, model id, weight sha256, stats sha256, noise sha256 (empty if stochastic), embodiment name, horizon, action dim, dtype/layout/unit/frame/time tags, and the f32 values. It does not cover wall time, GPU name, or energy.
+Little-endian. A string is a `u32` byte length then UTF-8, with no trailing NUL. The three provenance fields are fixed 64 ASCII bytes, lowercase hex. The digest is SHA-256 of these bytes and is not appended to them.
+
+| Order | Field |
+|---|---|
+| 21 | magic `FERRIC-SMOLVLA-CHUNK` and a NUL |
+| u32 | version `2` |
+| string | LeRobot commit |
+| string | model id |
+| 64 | weight sha256 |
+| 64 | stats sha256 |
+| 64 | noise sha256 |
+| string | embodiment name |
+| u64 | `t0_ns` |
+| u64 | `step_duration_ns` |
+| u32 | `n_action_steps` |
+| u32 | `action_dim` |
+| u32 | joint count, equal to `action_dim` |
+| repeat | joint name, unit, frame, then f32 min, f32 max |
+| u8 | `1` for f32 |
+| u8 | `1` for time-major, joint order |
+| f32… | values, row `t` then joint `0..action_dim` |
+
+Empty or non-hex weight, stats, or noise refuses the digest. Empty embodiment, a joint count that is not the action width, an empty joint name, unit, or frame, or `min >= max` refuses it. A value outside that joint's `[min, max]` refuses it. `authorize_rollout` uses the same checks, then refuses again because the entry is proposed. A complete golden digest does not authorize a rollout.
+
+Protocol fixture, not a model, rollout, or energy result: `docs/acceptance/contracts/fixtures/smolvla-chunk-v2.json`.
+
+Golden digest: `6d668d7e25c89249c890d895ef15b8fdcbb97dab7a1339a0a97605c6e1172d86`
+
+Refusal: the same input with `noise_sha256` empty. Error `MissingNoiseProvenance`. `rollout_authorized` is false.
 
 ## Bounds
 
@@ -67,5 +94,11 @@ Version 1 covers: magic, codec version, LeRobot commit, model id, weight sha256,
 | tokens | ≤ 48 | refuse when a length is presented |
 | pixels before the SigLIP map | `[0, 1]` | refuse |
 | Aloha joint deltas | false | refuse |
+| weight, stats, and noise sha256 | 64 lowercase hex each | refuse, and block `authorize_rollout` |
+| embodiment, joint name, unit, frame | non-empty | refuse |
+| joint count | equal to `action_dim`, in that order | refuse |
+| each joint `min` < `max`, finite | caller limits, not converted | refuse |
+| each value | inside that joint's limits | refuse |
+| `step_duration_ns` | non-zero integer the caller supplies | refuse; no fps is read |
 
-No SmolVLA forward was run to produce a fixture. The tests construct chunks and stats in process.
+No SmolVLA forward was run to produce a fixture. The golden numbers are a protocol test.

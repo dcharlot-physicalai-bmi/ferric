@@ -16,8 +16,12 @@
       "sha256": "46e1892cdcd0f4076ffb6a09bfe6098d3992f44d52d306ede0d439be754a8b9b"
     },
     {
+      "path": "docs/acceptance/contracts/fixtures/smolvla-chunk-v2.json",
+      "sha256": "7dc00166a35e81b82aae254294a8deb1d9da321d09d6e2bfef9a760bd85b822b"
+    },
+    {
       "path": "docs/acceptance/contracts/smolvla-ferromotion.md",
-      "sha256": "d1cf0db7ccd353940d9bb747a75d6b07735b2b6ebcb44bd7a08609bcc84f6ee9"
+      "sha256": "1cdf59f8df7fa877e09e550ff901ebb22ca9fe2e692529b28357017cc628bdce"
     },
     {
       "path": "docs/acceptance/corpus/fabric-cells.json",
