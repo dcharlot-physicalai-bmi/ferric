@@ -116,11 +116,13 @@ thread_local! {
     static PIPES: std::cell::RefCell<Pipes> = std::cell::RefCell::new(Default::default());
 }
 
+thread_local! {
+    /// Diagnostic from the most recent `compile_msl` decline on this thread. The numeric tests
+    /// surface it: a `None` kernel with no text would hide the compiler error the CI failure was.
+    static LAST_DECLINE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn build(ctx: &Context, fmt: QFmt, swiglu: bool) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
-    let dev = &ctx.device;
-    // A compile failure (no MetalPerformancePrimitives, an older GPU family) must DECLINE the route,
-    // not panic the process — wgpu's default uncaptured-error handler panics, so scope it.
-    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
     // FERRIC_QGEMM_FAULT plants a known decoding error (see qgemm.metal) — the negative control of
     // scripts/qgemm_conformance.sh, which must see the model get worse or it proves nothing.
     let src = if std::env::var_os("FERRIC_QGEMM_FAULT").is_some() {
@@ -128,14 +130,30 @@ fn build(ctx: &Context, fmt: QFmt, swiglu: bool) -> Option<(wgpu::ComputePipelin
     } else {
         Cow::Borrowed(SRC)
     };
+    compile_msl(ctx, &src, fmt.entry(swiglu))
+}
+
+/// Compile one passthrough MSL compute entry, or `None` when the driver rejects it.
+///
+/// A compile failure (no MetalPerformancePrimitives, a paravirtualized GPU that rejects the
+/// shader, an older GPU family) must DECLINE the route, not panic the process. wgpu's default
+/// uncaptured-error handler panics. Metal reports a failed `new_compute_pipeline_state` as
+/// `CreateComputePipelineError::Internal` (`hal::PipelineError::Linkage`), and that variant's
+/// WebGPU class is `ErrorType::Internal`. A Validation-only scope does not match it, so the
+/// handler panics — the failure of `qmm_q8_0` on CI run 36869740122. Both classes are scoped,
+/// innermost first on the way out.
+fn compile_msl(ctx: &Context, src: &str, entry: &str) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+    let dev = &ctx.device;
+    let validation = dev.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = dev.push_error_scope(wgpu::ErrorFilter::Internal);
     let module = unsafe {
         dev.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
             label: Some("qgemm"),
             entry_points: Cow::Owned(vec![wgpu::PassthroughShaderEntryPoint {
-                name: fmt.entry(swiglu).into(),
+                name: entry.into(),
                 workgroup_size: (THREADS, 1, 1),
             }]),
-            msl: Some(src),
+            msl: Some(Cow::Borrowed(src)),
             ..Default::default()
         })
     };
@@ -162,17 +180,23 @@ fn build(ctx: &Context, fmt: QFmt, swiglu: bool) -> Option<(wgpu::ComputePipelin
         immediate_size: 0,
     });
     let pipe = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(fmt.entry(swiglu)),
+        label: Some(entry),
         layout: Some(&layout),
         module: &module,
-        entry_point: Some(fmt.entry(swiglu)),
+        entry_point: Some(entry),
         compilation_options: Default::default(),
         cache: None,
     });
-    if let Some(e) = pollster::block_on(scope.pop()) {
-        eprintln!("ferric: FERRIC_QGEMM requested but the Metal-4 tensor-op kernel did not build ({e}); using the portable path");
+    // Innermost scope first. Popping out of order panics.
+    let internal_err = pollster::block_on(internal.pop());
+    let validation_err = pollster::block_on(validation.pop());
+    if let Some(e) = internal_err.or(validation_err) {
+        let text = e.to_string();
+        eprintln!("ferric: MSL pipeline '{entry}' did not build ({text}); declining the tensor-unit route");
+        LAST_DECLINE.with(|s| *s.borrow_mut() = Some(text));
         return None;
     }
+    LAST_DECLINE.with(|s| *s.borrow_mut() = None);
     Some((pipe, bgl))
 }
 
@@ -390,6 +414,31 @@ mod tests {
         Some(Arc::new(c))
     }
 
+    /// `None` from the tensor-unit route is a failed build. Say what the compiler said — a bare
+    /// `expect("kernel")` would replace the diagnostic CI needs with the word "kernel".
+    fn built(y: Option<Tensor>) -> Tensor {
+        y.unwrap_or_else(|| {
+            let why = super::LAST_DECLINE.with(|s| s.borrow().clone()).unwrap_or_else(|| "no diagnostic captured".into());
+            panic!("tensor-unit kernel did not build: {why}");
+        })
+    }
+
+    /// The panic on CI was wgpu's default handler, not an assertion. A shader the compiler must
+    /// reject has to come back as `None` from the same scope the real kernel uses.
+    #[test]
+    fn compiler_rejection_declines_instead_of_panicking() {
+        let Some(ctx) = ctx() else { return };
+        let bad = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void bad(device float* o [[buffer(0)]]) { o[0] = not_declared; }
+"#;
+        assert!(super::compile_msl(&ctx, bad, "bad").is_none(),
+                "a shader the Metal compiler rejects must decline the route");
+        let why = super::LAST_DECLINE.with(|s| s.borrow().clone()).unwrap_or_default();
+        assert!(!why.is_empty(), "the decline carried no compiler diagnostic");
+    }
+
     /// The kernel against the format's own definition, for all three formats, at ragged M and N
     /// (neither a tile multiple) and K spanning several blocks. The pass bar is the fp16-INPUT
     /// reference to fp32-accumulation noise (1e-6 of Σ|x·w|); the exact-f64 distance is reported and
@@ -410,7 +459,7 @@ mod tests {
             let (got, w, wrong) = match fmt {
                 "q8_0" => {
                     let wq = Q8_0Weights::from_bytes(&ctx, &raw, n, k);
-                    let g = xt.native_qmm_q8_0(&wq).expect("kernel");
+                    let g = built(xt.native_qmm_q8_0(&wq));
                     // wrong: each block scaled by its NEIGHBOUR's d
                     let mut raw2 = raw.clone();
                     let nb = n * k / 32;
@@ -419,15 +468,15 @@ mod tests {
                 }
                 "q5_0" => {
                     let wq = Q5_0Weights::from_bytes(&ctx, &raw, n, k);
-                    (xt.native_qmm_q5_0(&wq).expect("kernel"), deq_q5_0(&raw, n, k, false), deq_q5_0(&raw, n, k, true))
+                    (built(xt.native_qmm_q5_0(&wq)), deq_q5_0(&raw, n, k, false), deq_q5_0(&raw, n, k, true))
                 }
                 "q4_k" => {
                     let wq = Q4_KWeights::from_bytes(&ctx, &raw, n, k);
-                    (xt.native_qmm_q4_k(&wq).expect("kernel"), deq_q4_k(&raw, n, k, false), deq_q4_k(&raw, n, k, true))
+                    (built(xt.native_qmm_q4_k(&wq)), deq_q4_k(&raw, n, k, false), deq_q4_k(&raw, n, k, true))
                 }
                 _ => {
                     let wq = Q6_KWeights::from_bytes(&ctx, &raw, n, k);
-                    (xt.native_qmm_q6_k(&wq).expect("kernel"), deq_q6_k(&raw, n, k, false), deq_q6_k(&raw, n, k, true))
+                    (built(xt.native_qmm_q6_k(&wq)), deq_q6_k(&raw, n, k, false), deq_q6_k(&raw, n, k, true))
                 }
             };
             let got = pollster::block_on(got.to_vec());
@@ -463,7 +512,7 @@ mod tests {
                 "q4_k" => (xt.native_qmm_swiglu_q4_k(&Q4_KWeights::from_bytes(&ctx, &raw, n, k)), deq_q4_k(&raw, n, k, false)),
                 _ => (xt.native_qmm_swiglu_q6_k(&Q6_KWeights::from_bytes(&ctx, &raw, n, k)), deq_q6_k(&raw, n, k, false)),
             };
-            let got = pollster::block_on(got.expect("kernel").to_vec());
+            let got = pollster::block_on(built(got).to_vec());
             assert_eq!(got.len(), m * n_ff);
             let silu = |v: f64| v / (1.0 + (-v).exp());
             let (mut e, mut e_swap, mut scale) = (0f64, 0f64, 0f64);
@@ -513,7 +562,7 @@ mod tests {
                     "q4_k" => xt.native_qmm_q4_k(&Q4_KWeights::from_bytes(&ctx, &raw, n, k)),
                     _ => xt.native_qmm_q6_k(&Q6_KWeights::from_bytes(&ctx, &raw, n, k)),
                 };
-                pollster::block_on(y.expect("kernel").to_vec())
+                pollster::block_on(built(y).to_vec())
             };
             let full = run(&x);
             for (start, len) in [(0usize, 37usize), (50, 37), (63, 37), (99, 1), (5, 1)] {

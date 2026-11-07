@@ -5648,11 +5648,20 @@ mod format_reachability {
         (10, "Q2_K"), (11, "Q3_K"), (12, "Q4_K"), (13, "Q5_K"), (14, "Q6_K"),
         (20, "IQ4_NL"), (23, "IQ4_XS"),
         (39, "MXFP4"),
+        (40, "NVFP4"),
         (42, "Q2_0"),
         (1, "F16"), (30, "BF16"),
         (43, "STQ1_0"),
         (16, "IQ2_XXS"),
         (18, "IQ3_XXS"),
+        // Raw-block kernels (`iq_raw`). These were already in `block_bytes` and `QShard::build`;
+        // leaving them out of this table is what failed `every_readable_format_is_classified`
+        // (ggml types 17, 19, 21, 22, 29) on both CI fabrics.
+        (17, "IQ2_XS"),
+        (19, "IQ1_S"),
+        (21, "IQ3_S"),
+        (22, "IQ2_S"),
+        (29, "IQ1_M"),
     ];
 
     /// Types the loader decodes to f32 and runs dense, each with the reason. Must NOT be in
@@ -5683,6 +5692,24 @@ mod format_reachability {
              nor deliberately dense. Add each to PACKED (and to QMatrix::block_bytes) if it has a kernel, \
              or to DENSE_BY_DESIGN with the reason. Leaving it unclassified is how IQ4_XS shipped with a \
              correct, tested, unreachable kernel.");
+    }
+
+    /// The six types that failed CI run 36869740122. Each already had a packed kernel and a
+    /// `block_bytes` entry; the classification table had not been told. A move into
+    /// `DENSE_BY_DESIGN` would not silence this — `block_bytes` is `Some` for all six, and the
+    /// dense-by-design check forbids that.
+    #[test]
+    fn iq_raw_and_nvfp4_stay_packed() {
+        for &(ty, name) in &[(17u32, "IQ2_XS"), (19, "IQ1_S"), (21, "IQ3_S"), (22, "IQ2_S"), (29, "IQ1_M"), (40, "NVFP4")] {
+            assert!(PACKED.iter().any(|&(t, n)| t == ty && n == name), "{name} (ggml type {ty}) left PACKED");
+            let Some((elems, block)) = QMatrix::block_bytes(ty) else {
+                panic!("{name} dropped out of block_bytes");
+            };
+            // One block, not a fixed 256 — NVFP4's block is 64 values (36 bytes), so type_size(256)
+            // is four blocks and must not be compared to a single block.
+            let nbytes = ferric_gguf::type_size(ty, elems).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(nbytes, block, "{name}: type_size for one block is {nbytes}, block_bytes says {block}");
+        }
     }
 
     #[test]

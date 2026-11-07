@@ -148,12 +148,22 @@ kernel void NAME(device const float* x     [[buffer(0)]],                       
     threadgroup float sc[SWI ? MT * NT : 1]; /* the SwiGLU epilogue's gate|up tile (unused if !SWI) */  \
     const uint m0 = tg.y * MT;                                                                         \
     const uint n0 = SWI ? tg.x * (NT / 2) : tg.x * NT;                                                 \
-    auto tX = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sx, dextents<int32_t, 2>(KT, MT)); \
-    auto tW = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sw, dextents<int32_t, 2>(KT, NT)); \
+    /* Static extents. The tiles are constexpr (KT, MT, NT) and the threadgroup buffers are exactly    \
+       that size — out-of-range rows are zero-filled below, not expressed as a smaller runtime extent. \
+       `dextents` made the destination cooperative_tensor `extents<int, dynamic, dynamic>`. The Metal   \
+       compiler on a paravirtualized GPU then rejects the pipeline with                                \
+       "unsupported deferred-static-alloca-size function body" inside that type's MTL_SIZEAS           \
+       (CI run 36869740122, label qmm_q8_0). The same runner compiles and runs the device-tensor       \
+       matmul2d kernels, which never build this dynamic cooperative_tensor. Static extents are also    \
+       what Apple's MPP guide requires for an aligned tile. `remove_addrspace_t` keeps the destination \
+       call well-formed when the header rejects an address-space-qualified decltype. */                \
+    auto tX = tensor<threadgroup half, extents<int32_t, KT, MT>, tensor_inline>(sx, extents<int32_t, KT, MT>{}); \
+    auto tW = tensor<threadgroup half, extents<int32_t, KT, NT>, tensor_inline>(sw, extents<int32_t, KT, NT>{}); \
     constexpr auto desc = matmul2d_descriptor(MT, NT, KT, false, true, false,                         \
                                               matmul2d_descriptor::mode::multiply_accumulate);          \
     matmul2d<desc, execution_simdgroups<4>> mm;                                                        \
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();             \
+    auto cT = mm.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tX)>,           \
+                                                    metal::remove_addrspace_t<decltype(tW)>, float>(); \
     for (uint16_t i = 0; i < cT.get_capacity(); ++i) { if (cT.is_valid_element(i)) cT[i] = 0; }        \
     for (uint k0 = 0; k0 < d.K; k0 += KT) {                                                            \
         for (uint e = t; e < MT * KT / 4; e += NTHR) {                                                 \
@@ -177,7 +187,7 @@ kernel void NAME(device const float* x     [[buffer(0)]],                       
         auto tOs = tO.slice(n0, m0);                                                                   \
         cT.store(tOs);                                                                                 \
     } else {                                                                                           \
-        auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(NT, MT)); \
+        auto tC = tensor<threadgroup float, extents<int32_t, NT, MT>, tensor_inline>(sc, extents<int32_t, NT, MT>{}); \
         cT.store(tC);                                                                                  \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                               \
         for (uint e = t; e < MT * (NT / 2); e += NTHR) {                                               \
