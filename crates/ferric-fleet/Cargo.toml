@@ -1,0 +1,16 @@
+[package]
+name = "ferric-fleet"
+description = "Fleet measurement harness for a later SmolVLA run. Pins artifacts, rejects software GPU adapters, and refuses energy claims the meters cannot support. It does not execute the model."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[[bin]]
+name = "ferric-fleet"
+path = "src/bin/ferric-fleet.rs"
