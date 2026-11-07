@@ -84,6 +84,8 @@ Golden digest: `6d668d7e25c89249c890d895ef15b8fdcbb97dab7a1339a0a97605c6e1172d86
 
 Refusal: the same input with `noise_sha256` empty. Error `MissingNoiseProvenance`. `rollout_authorized` is false.
 
+The same identity with `n_action_steps` 0 and an empty value list is also a v2 protocol vector, not a behavior change: `docs/acceptance/contracts/fixtures/smolvla-empty-chunk-v2.json`. Its digest is `6295818fa11b85b37ad8054c75e0a1935b0c0cbb5d7e419090c2520a17b1744e`. Encode accepts it. `authorize_rollout` still returns `ProposedEntryInvoked`. There is no `EmptyHorizon` gate.
+
 ## Bounds
 
 | Bound | Value | On violation |
