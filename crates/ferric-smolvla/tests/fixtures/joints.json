@@ -1,0 +1,44 @@
+[
+  {
+    "name": "action_0",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  },
+  {
+    "name": "action_1",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  },
+  {
+    "name": "action_2",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  },
+  {
+    "name": "action_3",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  },
+  {
+    "name": "action_4",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  },
+  {
+    "name": "action_5",
+    "unit": "dataset_native",
+    "frame": "model_action_index",
+    "min": -1000000.0,
+    "max": 1000000.0
+  }
+]

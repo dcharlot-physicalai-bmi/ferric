@@ -1,4 +1,4 @@
-use ferric_fleet::{artifacts, url, verify_bytes, JOINT_STEP_EXECUTED, MODEL_RECEIPTS, WGPU_DRAIN};
+use ferric_fleet::{JOINT_STEP_EXECUTED, MODEL_RECEIPTS, WGPU_DRAIN, artifacts, url, verify_bytes};
 use std::env;
 use std::fs;
 use std::process::Command;
@@ -11,9 +11,12 @@ fn main() {
         "acquire" => acquire(&args.collect::<Vec<_>>()),
         "preflight" => preflight(&args.collect::<Vec<_>>()),
         "check-bytes" => check_bytes(&args.collect::<Vec<_>>()),
+        "infer" => infer(&args.collect::<Vec<_>>()),
         other => {
             eprintln!("unknown command `{other}`");
-            eprintln!("commands: plan | acquire --dir DIR | preflight --adapter-name NAME | check-bytes PATH ARTIFACT");
+            eprintln!(
+                "commands: plan | acquire --dir DIR | preflight --adapter-name NAME | check-bytes PATH ARTIFACT | infer --weights PATH"
+            );
             2
         }
     };
@@ -34,7 +37,9 @@ fn plan() -> i32 {
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).map(String::as_str))
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).map(String::as_str))
 }
 
 fn acquire(args: &[String]) -> i32 {
@@ -97,12 +102,72 @@ fn preflight(args: &[String]) -> i32 {
     }
 }
 
+fn infer(args: &[String]) -> i32 {
+    let Some(path) = flag(args, "--weights") else {
+        eprintln!("infer needs --weights PATH");
+        return 2;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return 2;
+        }
+    };
+    let hash = ferric_fleet::artifacts()
+        .into_iter()
+        .find(|a| a.path == "model.safetensors")
+        .unwrap();
+    if bytes.len() as u64 != hash.size {
+        eprintln!("weights size {} != pinned {}", bytes.len(), hash.size);
+        return 1;
+    }
+    // Hash the file the worker passed. This is the full-file check.
+    let got = {
+        // Reuse verify only when the path name matches; size already checked.
+        // Compute sha256 via a second read of the pin helper by calling verify_bytes
+        // only if we name it model.safetensors.
+        match ferric_fleet::verify_bytes("model.safetensors", &bytes) {
+            Ok(_) => hash.sha256.to_string(),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    };
+    let mut state = [0f32; 32];
+    state[0] = 1.0;
+    let y = match ferric_fleet::state_proj(&bytes, &state) {
+        Ok(y) => y,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let digest = ferric_fleet::digest_f32(&y);
+    println!("backend cpu");
+    println!("adapter none");
+    println!("gpu_energy false");
+    println!("weight_sha256 {got}");
+    println!("executed state_proj");
+    println!("state_proj_digest {digest}");
+    println!("state_proj_0 {:.8}", y[0]);
+    println!("action_chunk refused");
+    println!("blocker {}", ferric_fleet::ACTION_CHUNK_BLOCKER);
+    println!("model_receipts {}", ferric_fleet::MODEL_RECEIPTS);
+    println!("joint_step_executed {}", ferric_fleet::JOINT_STEP_EXECUTED);
+    1
+}
+
 fn check_bytes(args: &[String]) -> i32 {
     if args.len() != 2 {
         eprintln!("check-bytes PATH ARTIFACT");
         return 2;
     }
-    match fs::read(&args[0]).and_then(|b| verify_bytes(&args[1], &b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))) {
+    match fs::read(&args[0]).and_then(|b| {
+        verify_bytes(&args[1], &b)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }) {
         Ok(source) => {
             println!("ok {} {source}", args[1]);
             0

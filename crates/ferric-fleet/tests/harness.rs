@@ -76,6 +76,26 @@ fn clock_bind_matches_the_forward_product_every_call() {
 }
 
 #[test]
+fn real_state_proj_column_matches_the_weight_file() {
+    let bytes = include_bytes!("fixtures/state_proj.safetensors");
+    let mut x = [0f32; 32];
+    x[0] = 1.0;
+    let y = ferric_fleet::state_proj(bytes, &x).unwrap();
+    assert_eq!(y.len(), 960);
+    assert!((y[0] - (-0.13992482)).abs() < 1e-6, "{}", y[0]);
+    assert!((y[1] - (-0.08349697)).abs() < 1e-6, "{}", y[1]);
+    assert!((y[2] - (-0.13289170)).abs() < 1e-6, "{}", y[2]);
+    assert!((y[3] - 0.04185394).abs() < 1e-6, "{}", y[3]);
+    let full = std::path::Path::new("/tmp/smolvla/model.safetensors");
+    if full.exists() {
+        let file = std::fs::read(full).unwrap();
+        assert!(ferric_fleet::verify_bytes("model.safetensors", &file).is_ok());
+        let y2 = ferric_fleet::state_proj(&file, &x).unwrap();
+        assert_eq!(y, y2);
+    }
+}
+
+#[test]
 fn pinned_small_artifacts_match_their_bytes() {
     let config = include_bytes!("fixtures/config.json");
     assert!(verify_bytes("config.json", config).is_ok());

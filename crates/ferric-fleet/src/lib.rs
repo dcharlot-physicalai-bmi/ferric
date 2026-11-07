@@ -7,13 +7,17 @@
 
 mod acquire;
 mod bind;
+mod infer;
 mod meter;
 mod window;
 
-pub use acquire::{artifacts, url, verify_bytes, Artifact};
-pub use bind::{bind_clock, ClockSnapshot};
-pub use meter::{delta_uj, dram_joules, evaluate_domains, Domain, Sample};
-pub use window::{attributable, duration_is_explicit, gpu_receipt_allowed, require_drains, Drain, Phase};
+pub use acquire::{Artifact, artifacts, url, verify_bytes};
+pub use bind::{ClockSnapshot, bind_clock};
+pub use infer::{ACTION_CHUNK_BLOCKER, digest_f32, load_tensor, state_proj};
+pub use meter::{Domain, Sample, delta_uj, dram_joules, evaluate_domains};
+pub use window::{
+    Drain, Phase, attributable, duration_is_explicit, gpu_receipt_allowed, require_drains,
+};
 
 /// No model forward has been attached to this crate.
 pub const MODEL_RECEIPTS: usize = 0;
@@ -22,10 +26,7 @@ pub const MODEL_RECEIPTS: usize = 0;
 pub const JOINT_STEP_EXECUTED: bool = false;
 
 /// wgpu drain used by Ferric, matching `Context::flush` in `crates/ferric-core/src/lib.rs`.
-pub const WGPU_DRAIN: &[&str] = &[
-    "queue.submit(empty)",
-    "device.poll(wait_indefinitely)",
-];
+pub const WGPU_DRAIN: &[&str] = &["queue.submit(empty)", "device.poll(wait_indefinitely)"];
 
 pub const METHODOLOGY: &[&str] = &[
     "https://ml.energy/zeus/measure/",
