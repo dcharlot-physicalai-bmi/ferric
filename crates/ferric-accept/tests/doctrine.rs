@@ -209,6 +209,100 @@ https://github.com/dcharlot-physicalai-bmi/ferric/issues/1
     assert!(e.iter().any(|m| m.contains("did not open")), "{e:?}");
 }
 
+#[test]
+fn a_hardware_counter_cannot_claim_a_wall_outlet() {
+    let mut v = fabric_energy_pass();
+    v["energy"]["boundary_gross"] = serde_json::json!("wall outlet");
+    let e = check_receipt(&v);
+    assert!(e.iter().any(|m| m.contains("wall outlet")), "{e:?}");
+}
+
+#[test]
+fn a_leaderboard_row_is_not_a_ferric_measurement() {
+    let mut v = fabric_energy_pass();
+    v["fabric_energy"]["copied_leaderboard_joules_as_own"] = serde_json::json!(true);
+    let e = check_receipt(&v);
+    assert!(e.iter().any(|m| m.contains("leaderboard")), "{e:?}");
+}
+
+#[test]
+fn an_apple_energy_model_cannot_pass() {
+    let mut v = fabric_energy_pass();
+    v["fabric_energy"]["cell_id"] = serde_json::json!("gpu.wgpu.metal");
+    v["fabric_energy"]["instrument"] = serde_json::json!("model_estimate");
+    v["fabric_energy"]["counter_or_meter"] = serde_json::json!("IOReport Energy Model");
+    let e = check_receipt(&v);
+    assert!(e.iter().any(|m| m.contains("model_estimate") || m.contains("IOReport")), "{e:?}");
+}
+
+#[test]
+fn lavapipe_cannot_report_gpu_board_energy() {
+    let mut v = fabric_energy_pass();
+    v["fabric_energy"]["cell_id"] = serde_json::json!("gpu.wgpu.vulkan.lavapipe");
+    v["fabric_energy"]["claims_gpu_energy"] = serde_json::json!(true);
+    let e = check_receipt(&v);
+    assert!(e.iter().any(|m| m.contains("lavapipe")), "{e:?}");
+}
+
+#[test]
+fn a_single_cell_does_not_close_track_c() {
+    let mut v = fabric_energy_pass();
+    v["fabric_energy"]["closes_track_c"] = serde_json::json!(true);
+    let e = check_receipt(&v);
+    assert!(e.iter().any(|m| m.contains("closes_track_c") || m.contains("pareto")), "{e:?}");
+}
+
+#[test]
+fn a_shaped_per_fabric_fixture_is_accepted_and_is_not_a_corpus_result() {
+    // Built inside the test. Not written under docs/acceptance/corpus/measured.json.
+    let e = check_receipt(&fabric_energy_pass());
+    assert!(e.is_empty(), "{e:?}");
+}
+
+fn fabric_energy_pass() -> serde_json::Value {
+    let mut v = measured_shell("C");
+    v["energy"] = serde_json::json!({
+        "class": "measured",
+        "gross_joules": 10.0,
+        "above_idle_joules": 8.0,
+        "boundary_gross": "gpu board counter delta",
+        "boundary_above_idle": "gpu board counter minus idle"
+    });
+    v["quality_gate_receipt_id"] = serde_json::json!("quality.fixture");
+    v["fabric_energy"] = serde_json::json!({
+        "cell_id": "cuda.native",
+        "workload": "prefill",
+        "instrument": "hardware_counter",
+        "domain": "gpu_board",
+        "counter_or_meter": "nvmlDeviceGetTotalEnergyConsumption",
+        "stack_version": "driver-fixture",
+        "vendor_counter_is_not_wall": true,
+        "counter_delta_joules": 10.0,
+        "accounting": "steady_state_service",
+        "sync_before_read": true,
+        "sync_method": "stream synchronize before the second counter read",
+        "warmup_outside_window": true,
+        "idle_joules": 2.0,
+        "subtraction_recorded": true,
+        "copied_leaderboard_joules_as_own": false,
+        "zeus_is_production_dependency": false,
+        "closes_track_c": false,
+        "steady_state_excludes_ramp": true,
+        "batch_saturated": true,
+        "output_tokens": 100.0,
+        "energy_per_output_token_joules": 0.1,
+        "is_stable": true,
+        "stability_rule": "fixture rule, not a published ML.ENERGY threshold",
+        "workload_parity": {
+            "checkpoint_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "prompt_set_id": "fixture-prompts",
+            "batch_or_concurrency": "max_batch=1",
+            "token_accounting": "prefill_tokens"
+        }
+    });
+    v
+}
+
 fn measured_shell(track: &str) -> serde_json::Value {
     let tol = match track {
         "A" => "A.full-model.v1",

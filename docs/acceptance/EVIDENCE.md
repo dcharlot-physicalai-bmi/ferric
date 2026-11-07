@@ -39,4 +39,4 @@ Quoting the audit's "verified" label does not make a new measurement. The label 
 
 ## What this workstream measured
 
-The checker tests in `crates/ferric-accept` were run in order to see whether the corpus matches the rules. That is a check of documents. It is not a logit error, a joule figure, a browser transcript, or a rebuild digest. No such numbers were produced here, and none are invented in the corpus.
+The checker tests in `crates/ferric-accept` were run in order to see whether the corpus matches the rules. That is a check of documents. It is not a logit error, a joule figure, a browser transcript, or a rebuild digest. No such numbers were produced here, and none are invented in the corpus. Published ML.ENERGY leaderboard rows are that project's measurements on their hardware. They are not rows in `corpus/measured.json`.

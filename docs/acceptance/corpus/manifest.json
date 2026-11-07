@@ -9,11 +9,15 @@
     },
     {
       "path": "docs/acceptance/EVIDENCE.md",
-      "sha256": "093e2bd9d077ba10fe126fcc8587b17fdecf824d5fd087212fc0f704fea984f7"
+      "sha256": "ed042b656a92aa00bc2f7fde32bb130d5fd98e370c7b62982c3e797db2c6c8c8"
     },
     {
       "path": "docs/acceptance/README.md",
-      "sha256": "382afbd4e9cfe759d53a69207bb8c4951bc0367713380f14384a1deef2798360"
+      "sha256": "46e1892cdcd0f4076ffb6a09bfe6098d3992f44d52d306ede0d439be754a8b9b"
+    },
+    {
+      "path": "docs/acceptance/contracts/smolvla-ferromotion.md",
+      "sha256": "d1cf0db7ccd353940d9bb747a75d6b07735b2b6ebcb44bd7a08609bcc84f6ee9"
     },
     {
       "path": "docs/acceptance/corpus/fabric-cells.json",
@@ -33,7 +37,7 @@
     },
     {
       "path": "docs/acceptance/corpus/tolerances.json",
-      "sha256": "0f4fd61c279887d7675a717459bb980e0e9d771eea87308912b26c99b66a1a11"
+      "sha256": "6e04c9f8c39c4f9ac788750df5588337e1998eea5a0fafcbdbae3fe4bdba1f64"
     },
     {
       "path": "docs/acceptance/issues/A-full-model-correctness.md",
@@ -45,7 +49,7 @@
     },
     {
       "path": "docs/acceptance/issues/C-energy-leadership.md",
-      "sha256": "139ae77f1d8d4c0b8938dc20c8f033e7ceae5157fbab3caa0d5796984940d3ba"
+      "sha256": "db07955180e312007e29ac71aaaeaa9335f726d4242aeb37f4a93eae8837a59a"
     },
     {
       "path": "docs/acceptance/issues/D-hermetic-production.md",
@@ -69,7 +73,7 @@
     },
     {
       "path": "docs/acceptance/protocols/C-energy-leadership.md",
-      "sha256": "69f66458a375004634d6758ce4ddd482b227720658726e15414130033162f059"
+      "sha256": "7608fcdb470e3bc5a19033a4dcb1c74803b9ad81b8580052dc3300e426785e30"
     },
     {
       "path": "docs/acceptance/protocols/D-hermetic-production.md",
@@ -86,6 +90,10 @@
     {
       "path": "docs/acceptance/schemas/fabric-cell.schema.json",
       "sha256": "0df56593edfb685a465cf7d14c78731729035fe893365e5702882feefae7ea85"
+    },
+    {
+      "path": "docs/acceptance/schemas/fabric-energy.schema.json",
+      "sha256": "da28c6b5dc4fc325f9faad7f88014d605443375c6e90a3ead2f3b37fff48d43d"
     },
     {
       "path": "docs/acceptance/schemas/receipt.schema.json",
