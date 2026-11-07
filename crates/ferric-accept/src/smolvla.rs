@@ -20,8 +20,11 @@ pub const LEROBOT_COMMIT_DATE: &str = "2026-07-23";
 pub const MODEL_ID: &str = "lerobot/smolvla_base";
 /// Proposed stable name. Nothing in this repository implements it.
 pub const INFERENCE_ENTRY_POINT: &str = "ferric.smolvla.predict_action_chunk.v1";
-/// Bytes this codec writes. Version 1.
-pub const CHUNK_CODEC_VERSION: u32 = 1;
+/// Bytes this codec writes. Version 2.
+///
+/// Version 1, in commit `831d729`, allowed an empty noise field and carried no
+/// joint order, frame, unit, limit, or step duration. It is not the handoff codec.
+pub const CHUNK_CODEC_VERSION: u32 = 2;
 pub const CHUNK_DOMAIN: &str = "ferric.smolvla.action-chunk";
 
 pub const N_OBS_STEPS: u32 = 1;
@@ -63,6 +66,17 @@ pub enum ContractError {
     ActionStepsExceedChunk { n_action_steps: u32, chunk_size: u32 },
     DeltaAlohaNotPorted,
     MissingNormStats,
+    MissingWeightProvenance,
+    MissingStatsProvenance,
+    MissingNoiseProvenance,
+    MissingEmbodiment,
+    MissingJointMetadata,
+    /// `step_duration_ns` was 0. This crate does not derive a duration from fps.
+    StepDurationAbsent,
+    JointCount { joints: u32, action_dim: u32 },
+    JointLimitOrder { index: u32 },
+    ValueOutsideLimit { index: u32 },
+    TimestampIndex { index: u32, steps: u32 },
     /// LeRobot's `pad_vector` leaves a longer vector unchanged. The state projection is
     /// `Linear(max_state_dim, ...)`. This contract refuses the longer vector so the
     /// width stays the projection width.
@@ -277,7 +291,20 @@ pub const MODEL_PREPARE_ORDER: &[&str] = &[
 
 pub const POSTPROCESS_CODE_ORDER: &[&str] = &["unnormalize_action", "to_cpu"];
 
-/// One robot, one chunk, f32, time-major then action dimension.
+/// One joint, in the order of the action vector. Strings are stored, not interpreted.
+///
+/// `unit` and `frame` are the embodiment's own labels. This crate does not convert
+/// radians, degrees, or meters, and it does not infer them from the label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JointMeta {
+    pub name: String,
+    pub unit: String,
+    pub frame: String,
+    pub min: f32,
+    pub max: f32,
+}
+
+/// One robot, one chunk, f32, time-major then joint order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActionChunk {
     pub n_action_steps: u32,
@@ -313,51 +340,129 @@ impl ActionChunk {
     }
 }
 
-/// Fields the digest covers. Wall-clock, adapter name, and energy are outside it.
+/// Fields the digest covers. Adapter name and energy are outside it.
+///
+/// `t0_ns` is the timestamp of action index 0. `step_duration_ns` is the duration
+/// of one chunk step, supplied by the caller. Action index `k` is at
+/// `t0_ns + k * step_duration_ns`. There is no fps field and no conversion.
 #[derive(Debug, Clone)]
 pub struct ChunkIdentity {
     pub model_id: String,
-    /// 64 lowercase hex characters, or empty when the weight file was not hashed.
+    /// 64 lowercase hex characters of the weight file. Empty refuses the digest.
     pub weight_sha256: String,
-    /// 64 lowercase hex of the dataset mean/std tensors the unnormalize used.
+    /// 64 lowercase hex of the dataset mean/std bytes the unnormalize used.
     pub stats_sha256: String,
-    /// 64 lowercase hex of the caller noise. Empty means [`Determinism::Stochastic`].
+    /// 64 lowercase hex of the caller noise. Empty refuses the digest and the rollout.
     pub noise_sha256: String,
+    /// Embodiment name. Empty refuses. It does not select a joint map.
     pub embodiment: String,
+    pub t0_ns: u64,
+    pub step_duration_ns: u64,
+    /// Joint `i` is action dimension `i`, in this order.
+    pub joints: Vec<JointMeta>,
 }
 
-/// Canonical bytes, then their sha256.
+/// Timestamp of action index `k` in the same integer clock as `t0_ns`.
+pub fn action_timestamp_ns(t0_ns: u64, step_duration_ns: u64, index: u32, steps: u32) -> Result<u64, ContractError> {
+    if step_duration_ns == 0 {
+        return Err(ContractError::StepDurationAbsent);
+    }
+    if index >= steps {
+        return Err(ContractError::TimestampIndex { index, steps });
+    }
+    t0_ns
+        .checked_add(
+            step_duration_ns
+                .checked_mul(u64::from(index))
+                .ok_or(ContractError::StepDurationAbsent)?,
+        )
+        .ok_or(ContractError::StepDurationAbsent)
+}
+
+/// Canonical bytes, then their sha256. The digest is not appended to the bytes.
+///
+/// Layout, little-endian, version 2. Strings are a `u32` byte length then UTF-8,
+/// with no trailing NUL. The three provenance fields are fixed 64 ASCII bytes.
 pub fn encode_action_chunk(chunk: &ActionChunk, id: &ChunkIdentity) -> Result<(Vec<u8>, String), ContractError> {
-    if id.weight_sha256.is_empty() || id.stats_sha256.is_empty() {
-        return Err(ContractError::MissingNormStats);
-    }
-    if !id.noise_sha256.is_empty() && !is_sha256(&id.noise_sha256) {
-        return Err(ContractError::NoiseShape);
-    }
-    if !is_sha256(&id.weight_sha256) || !is_sha256(&id.stats_sha256) {
-        return Err(ContractError::MissingNormStats);
-    }
+    check_identity(chunk, id)?;
     let mut buf = Vec::new();
     buf.extend_from_slice(b"FERRIC-SMOLVLA-CHUNK\0");
     buf.extend_from_slice(&CHUNK_CODEC_VERSION.to_le_bytes());
     push_str(&mut buf, LEROBOT_COMMIT);
     push_str(&mut buf, &id.model_id);
-    push_str(&mut buf, &id.weight_sha256);
-    push_str(&mut buf, &id.stats_sha256);
-    push_str(&mut buf, &id.noise_sha256);
+    buf.extend_from_slice(id.weight_sha256.as_bytes());
+    buf.extend_from_slice(id.stats_sha256.as_bytes());
+    buf.extend_from_slice(id.noise_sha256.as_bytes());
     push_str(&mut buf, &id.embodiment);
+    buf.extend_from_slice(&id.t0_ns.to_le_bytes());
+    buf.extend_from_slice(&id.step_duration_ns.to_le_bytes());
     buf.extend_from_slice(&chunk.n_action_steps.to_le_bytes());
     buf.extend_from_slice(&chunk.action_dim.to_le_bytes());
+    buf.extend_from_slice(&(id.joints.len() as u32).to_le_bytes());
+    for joint in &id.joints {
+        push_str(&mut buf, &joint.name);
+        push_str(&mut buf, &joint.unit);
+        push_str(&mut buf, &joint.frame);
+        buf.extend_from_slice(&joint.min.to_le_bytes());
+        buf.extend_from_slice(&joint.max.to_le_bytes());
+    }
     buf.push(1); // f32
-    buf.push(1); // time-major
-    buf.push(0); // dataset-native unit
-    buf.push(0); // embodiment frame
-    buf.push(0); // chunk step, not seconds
+    buf.push(1); // time-major, joint order
     for v in &chunk.values {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     let digest = hex(&sha256(&buf));
     Ok((buf, digest))
+}
+
+fn check_identity(chunk: &ActionChunk, id: &ChunkIdentity) -> Result<(), ContractError> {
+    if id.weight_sha256.is_empty() || !is_sha256(&id.weight_sha256) {
+        return Err(ContractError::MissingWeightProvenance);
+    }
+    if id.stats_sha256.is_empty() || !is_sha256(&id.stats_sha256) {
+        return Err(ContractError::MissingStatsProvenance);
+    }
+    if id.noise_sha256.is_empty() || !is_sha256(&id.noise_sha256) {
+        return Err(ContractError::MissingNoiseProvenance);
+    }
+    if id.embodiment.is_empty() {
+        return Err(ContractError::MissingEmbodiment);
+    }
+    if id.step_duration_ns == 0 {
+        return Err(ContractError::StepDurationAbsent);
+    }
+    if id.joints.len() != chunk.action_dim as usize {
+        return Err(ContractError::JointCount {
+            joints: id.joints.len() as u32,
+            action_dim: chunk.action_dim,
+        });
+    }
+    for (i, joint) in id.joints.iter().enumerate() {
+        if joint.name.is_empty() || joint.unit.is_empty() || joint.frame.is_empty() {
+            return Err(ContractError::MissingJointMetadata);
+        }
+        if !joint.min.is_finite() || !joint.max.is_finite() || joint.min >= joint.max {
+            return Err(ContractError::JointLimitOrder { index: i as u32 });
+        }
+    }
+    for t in 0..chunk.n_action_steps {
+        for d in 0..chunk.action_dim {
+            let v = chunk.values[(t * chunk.action_dim + d) as usize];
+            let joint = &id.joints[d as usize];
+            if !v.is_finite() || v < joint.min || v > joint.max {
+                return Err(ContractError::ValueOutsideLimit { index: d });
+            }
+        }
+        action_timestamp_ns(id.t0_ns, id.step_duration_ns, t, chunk.n_action_steps)?;
+    }
+    Ok(())
+}
+
+/// A real rollout needs provenance and an executing model. This entry is proposed,
+/// so the function refuses even when the digest would succeed.
+pub fn authorize_rollout(chunk: &ActionChunk, id: &ChunkIdentity) -> Result<(), ContractError> {
+    check_identity(chunk, id)?;
+    Err(ContractError::ProposedEntryInvoked)
 }
 
 pub fn determinism_of(id: &ChunkIdentity) -> Determinism {
@@ -451,39 +556,64 @@ mod tests {
         assert_eq!(ensure_task_newline("pick\n"), "pick\n");
     }
 
-    #[test]
-    fn digest_covers_the_chunk_and_ignores_nothing_inside_it() {
-        let chunk = ActionChunk::try_new(2, 1, vec![0.25, -0.5]).unwrap();
-        let id = ChunkIdentity {
+    fn joints() -> Vec<JointMeta> {
+        vec![JointMeta {
+            name: "j0".into(),
+            unit: "dataset_label".into(),
+            frame: "embodiment_joint".into(),
+            min: -1.0,
+            max: 1.0,
+        }]
+    }
+
+    fn identity(noise: &str) -> ChunkIdentity {
+        ChunkIdentity {
             model_id: MODEL_ID.into(),
             weight_sha256: sha(),
             stats_sha256: sha(),
-            noise_sha256: sha(),
-            embodiment: "so100_follower".into(),
-        };
+            noise_sha256: noise.into(),
+            embodiment: "protocol-test-embodiment".into(),
+            t0_ns: 1_000_000_000,
+            step_duration_ns: 20_000_000,
+            joints: joints(),
+        }
+    }
+
+    #[test]
+    fn digest_covers_the_chunk_and_the_joint_clock() {
+        let chunk = ActionChunk::try_new(2, 1, vec![0.25, -0.5]).unwrap();
+        let id = identity(&sha());
         let (bytes, digest) = encode_action_chunk(&chunk, &id).unwrap();
         let again = encode_action_chunk(&chunk, &id).unwrap();
         assert_eq!(bytes, again.0);
         assert_eq!(digest, again.1);
+        assert_eq!(action_timestamp_ns(id.t0_ns, id.step_duration_ns, 0, 2).unwrap(), 1_000_000_000);
+        assert_eq!(action_timestamp_ns(id.t0_ns, id.step_duration_ns, 1, 2).unwrap(), 1_020_000_000);
         let mut other = chunk.clone();
         other.values[0] = 0.26;
         let (_, d2) = encode_action_chunk(&other, &id).unwrap();
         assert_ne!(digest, d2);
         assert_eq!(determinism_of(&id), Determinism::PinnedNoise);
         assert!(require_reference_agreement(&id).is_ok());
+        assert_eq!(authorize_rollout(&chunk, &id), Err(ContractError::ProposedEntryInvoked));
     }
 
     #[test]
-    fn a_missing_noise_pin_cannot_be_reference_agreement() {
-        let id = ChunkIdentity {
-            model_id: MODEL_ID.into(),
-            weight_sha256: sha(),
-            stats_sha256: sha(),
-            noise_sha256: String::new(),
-            embodiment: "so100_follower".into(),
-        };
+    fn missing_noise_refuses_the_digest_and_the_rollout() {
+        let chunk = ActionChunk::try_new(2, 1, vec![0.25, -0.5]).unwrap();
+        let id = identity("");
         assert_eq!(determinism_of(&id), Determinism::Stochastic);
         assert_eq!(require_reference_agreement(&id), Err(ContractError::StochasticAgreement));
+        assert_eq!(encode_action_chunk(&chunk, &id).unwrap_err(), ContractError::MissingNoiseProvenance);
+        assert_eq!(authorize_rollout(&chunk, &id), Err(ContractError::MissingNoiseProvenance));
+    }
+
+    #[test]
+    fn a_zero_step_duration_is_not_filled_from_a_rate() {
+        let chunk = ActionChunk::try_new(1, 1, vec![0.0]).unwrap();
+        let mut id = identity(&sha());
+        id.step_duration_ns = 0;
+        assert_eq!(encode_action_chunk(&chunk, &id).unwrap_err(), ContractError::StepDurationAbsent);
     }
 
     #[test]
