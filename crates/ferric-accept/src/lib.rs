@@ -13,11 +13,14 @@
 //!
 //! The rules live in [`check`]. They are the same rules named by
 //! `docs/acceptance/schemas/`. This crate does not run a model, a browser, or a power meter.
+//! [`smolvla`] is the Ferromotion action-chunk contract. It checks pins and bytes.
+//! It does not execute SmolVLA.
 
 #![forbid(unsafe_code)]
 
 mod check;
 mod sha256;
+pub mod smolvla;
 
 pub use check::{
     check_corpus, check_fabric_cell, check_issue, check_protocol, check_receipt, check_tolerance,
