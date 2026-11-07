@@ -34,7 +34,7 @@ cargo run -p ferric-accept --example check
 
 The crate has no dependency on the tensor stack. `cargo test --workspace` already runs it, because the workspace members include `crates/*`. No CI workflow file is involved.
 
-Schemas for anything that is not Rust: `schemas/receipt.schema.json`, `schemas/fabric-cell.schema.json`, `schemas/tolerance.schema.json`. The Rust checker is normative for the cross-field rules (a target cannot carry joules, a pass must use the mission tolerance id, lavapipe cannot close a browser cell).
+Schemas for anything that is not Rust: `schemas/receipt.schema.json`, `schemas/fabric-cell.schema.json`, `schemas/tolerance.schema.json`, and `schemas/fabric-energy.schema.json`. The last one is the per-fabric energy methodology (Zeus v0.16.0 and the ML.ENERGY Benchmark). A schema-valid energy object is not a measurement. The Rust checker is normative for the cross-field rules (a target cannot carry joules, a pass must use the mission tolerance id, a hardware counter cannot claim a wall outlet, lavapipe cannot close a browser cell). `corpus/measured.json` stays empty until a run exists.
 
 ## What a later pass looks like
 

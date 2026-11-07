@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://physicalai-bmi.org/ferric/acceptance/fabric-energy/v1",
+  "title": "Ferric per-fabric energy receipt",
+  "description": "Methodology fields for one fabric cell and one workload. Adapted from Zeus v0.16.0 (published 2026-07-07) and the ML.ENERGY Benchmark (NeurIPS 2025 Datasets and Benchmarks; leaderboard v3, December 2025). A valid object is not evidence that the cell was run. Vendor counters are not wall-outlet measurements. Leaderboard rows are not Ferric measurements.",
+  "type": "object",
+  "required": [
+    "cell_id",
+    "workload",
+    "instrument",
+    "domain",
+    "counter_or_meter",
+    "accounting",
+    "sync_before_read",
+    "sync_method",
+    "warmup_outside_window",
+    "idle_joules",
+    "subtraction_recorded",
+    "copied_leaderboard_joules_as_own",
+    "zeus_is_production_dependency",
+    "closes_track_c",
+    "is_stable",
+    "stability_rule",
+    "workload_parity"
+  ],
+  "properties": {
+    "cell_id": { "type": "string" },
+    "workload": { "enum": ["prefill", "decode", "training"] },
+    "instrument": { "enum": ["hardware_counter", "sampled_rail", "wall_meter", "model_estimate"] },
+    "domain": {
+      "enum": ["gpu_board", "host_package", "dram", "soc_subsystem", "host_rail", "wall"]
+    },
+    "counter_or_meter": { "type": "string", "minLength": 1 },
+    "accounting": { "enum": ["steady_state_service", "repeated_window", "whole_batch"] },
+    "sync_before_read": { "const": true },
+    "sync_method": { "type": "string", "minLength": 1 },
+    "warmup_outside_window": { "const": true },
+    "idle_joules": { "type": "number" },
+    "counter_delta_joules": { "type": "number" },
+    "window_joules": { "type": "number" },
+    "subtraction_recorded": { "const": true },
+    "copied_leaderboard_joules_as_own": { "const": false },
+    "zeus_is_production_dependency": { "const": false },
+    "closes_track_c": { "type": "boolean" },
+    "vendor_counter_is_not_wall": { "type": "boolean" },
+    "sample_period_s": { "type": "number", "exclusiveMinimum": 0 },
+    "sample_count": { "type": "integer", "minimum": 8 },
+    "n_trials": { "type": "integer", "minimum": 1 },
+    "measurement_duration_s": { "type": "number", "exclusiveMinimum": 0 },
+    "cooldown_duration_s": { "type": "number", "minimum": 0 },
+    "is_stable": { "type": "boolean" },
+    "stability_rule": { "type": "string", "minLength": 1 },
+    "steady_state_excludes_ramp": { "type": "boolean" },
+    "batch_saturated": { "type": "boolean" },
+    "output_tokens": { "type": "number", "exclusiveMinimum": 0 },
+    "energy_per_output_token_joules": { "type": "number" },
+    "batch_size": { "type": "integer", "minimum": 1 },
+    "energy_per_request_joules": { "type": "number" },
+    "claims_gpu_energy": { "type": "boolean" },
+    "rocm_ge_6_3": { "type": "boolean" },
+    "stack_version": { "type": "string" },
+    "zeus_has_no_device_binding": { "type": "boolean" },
+    "cell_was_the_load": { "type": "boolean" },
+    "workload_parity": {
+      "type": "object",
+      "required": ["checkpoint_sha256", "prompt_set_id", "batch_or_concurrency", "token_accounting"],
+      "properties": {
+        "checkpoint_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "prompt_set_id": { "type": "string", "minLength": 1 },
+        "batch_or_concurrency": { "type": "string", "minLength": 1 },
+        "token_accounting": { "enum": ["output_tokens", "prefill_tokens", "train_steps"] }
+      }
+    },
+    "pareto": {
+      "type": "object",
+      "required": ["latency_target", "min_energy_meets_latency", "single_best_case_only"],
+      "properties": {
+        "latency_target": { "type": "string", "minLength": 1 },
+        "min_energy_meets_latency": { "type": "boolean" },
+        "single_best_case_only": { "type": "boolean" }
+      }
+    },
+    "external_meter": {
+      "type": "object",
+      "required": ["name"],
+      "properties": { "name": { "type": "string", "minLength": 1 } }
+    }
+  }
+}
