@@ -53,12 +53,35 @@ pub struct Sample {
     pub state_std: Option<Vec<f32>>,
     pub action_mean: Option<Vec<f32>>,
     pub action_std: Option<Vec<f32>>,
+    /// The schema is MEAN_STD. This flag is the only way to run the tensor
+    /// path when those stats are absent, and the result is not executable.
+    pub allow_unnormalized_network: bool,
+    pub capture: bool,
+}
+
+pub struct VisionSnap {
+    pub patch_plus_pos_token0: Vec<f32>,
+    pub vision_layer0_token0: Vec<f32>,
+    pub vision_post_token0: Vec<f32>,
+    pub connector_token0: Vec<f32>,
+}
+
+pub struct ActivationTrace {
+    pub prepared_image0: Vec<f32>,
+    pub vision: VisionSnap,
+    pub state_token: Vec<f32>,
+    pub text_layer0_k_token0: Vec<f32>,
+    pub velocity0: Vec<f32>,
+    pub raw_actions: Vec<f32>,
 }
 
 pub struct Forward {
     pub actions: Vec<f32>,
+    pub raw_actions: Vec<f32>,
     pub state_norm: &'static str,
     pub action_norm: &'static str,
+    pub executable: bool,
+    pub trace: Option<ActivationTrace>,
 }
 
 pub fn forward(store: &Store, sample: &Sample) -> Result<Forward, String> {
@@ -88,15 +111,24 @@ pub fn forward(store: &Store, sample: &Sample) -> Result<Forward, String> {
         &sample.state,
         sample.state_mean.as_deref(),
         sample.state_std.as_deref(),
+        sample.allow_unnormalized_network,
     )?;
     let mut prefix = Vec::new();
     let mut pad = Vec::new();
     let mut att = Vec::new();
+    let mut prepared_image0 = Vec::new();
+    let mut vision = None;
     for image in 0..3 {
         eprintln!("vision camera {image}");
         let (h, w) = sample.image_hw[image];
         let pixels = prepare_image(&sample.images[image], h, w)?;
-        let tokens = embed_image(store, &pixels)?;
+        if image == 0 && sample.capture {
+            prepared_image0 = pixels.clone();
+        }
+        let (tokens, snap) = embed_image(store, &pixels, image == 0 && sample.capture)?;
+        if image == 0 {
+            vision = snap;
+        }
         let n = tokens.len() / TEXT_DIM;
         if n != IMG_TOKENS {
             return Err(format!("image tokens {n}, expected {IMG_TOKENS}"));
@@ -123,26 +155,53 @@ pub fn forward(store: &Store, sample: &Sample) -> Result<Forward, String> {
     let seq = pad.len();
     let mask = att_2d(&pad, &att);
     let pos = positions(&pad);
-    let cache = text_prefix(store, &prefix, seq, &mask, &pos)?;
+    let (cache, text_k0) = text_prefix(store, &prefix, seq, &mask, &pos, sample.capture)?;
     let mut x = sample.noise.clone();
     let dt = -1.0 / STEPS as f32;
+    let mut velocity0 = Vec::new();
     for step in 0..STEPS {
         eprintln!("euler step {step}");
         let time = 1.0 + step as f32 * dt;
         let v = denoise(store, &cache, &pad, &x, time)?;
+        if step == 0 && sample.capture {
+            velocity0 = v[..MAX_ACTION].to_vec();
+        }
         for (dst, vel) in x.iter_mut().zip(&v) {
             *dst += dt * vel;
         }
     }
+    let raw_actions = x.clone();
     let (actions, action_norm) = unpad_and_unnormalize(
         &x,
         sample.action_mean.as_deref(),
         sample.action_std.as_deref(),
+        sample.allow_unnormalized_network,
     )?;
+    let executable = state_norm == "mean_std" && action_norm == "mean_std_inverse";
+    let trace = if sample.capture {
+        Some(ActivationTrace {
+            prepared_image0,
+            vision: vision.unwrap_or(VisionSnap {
+                patch_plus_pos_token0: Vec::new(),
+                vision_layer0_token0: Vec::new(),
+                vision_post_token0: Vec::new(),
+                connector_token0: Vec::new(),
+            }),
+            state_token: state.clone(),
+            text_layer0_k_token0: text_k0,
+            velocity0,
+            raw_actions: raw_actions.clone(),
+        })
+    } else {
+        None
+    };
     Ok(Forward {
         actions,
+        raw_actions,
         state_norm,
         action_norm,
+        executable,
+        trace,
     })
 }
 
@@ -150,6 +209,7 @@ fn normalize_state(
     state: &[f32],
     mean: Option<&[f32]>,
     std: Option<&[f32]>,
+    allow_unnormalized_network: bool,
 ) -> Result<(Vec<f32>, &'static str), String> {
     let mut out = vec![0.0f32; MAX_STATE];
     let mode = match (mean, std) {
@@ -162,9 +222,12 @@ fn normalize_state(
             }
             "mean_std"
         }
-        (None, None) => {
+        (None, None) if allow_unnormalized_network => {
             out[..state.len()].copy_from_slice(state);
-            "identity_key_absent"
+            "unnormalized_network_forward"
+        }
+        (None, None) => {
+            return Err("MEAN_STD requires observation.state mean and std. The schema is not IDENTITY, and a missing key does not become an execution.".into());
         }
         _ => return Err("state mean and std must both be present".into()),
     };
@@ -175,6 +238,7 @@ fn unpad_and_unnormalize(
     x: &[f32],
     mean: Option<&[f32]>,
     std: Option<&[f32]>,
+    allow_unnormalized_network: bool,
 ) -> Result<(Vec<f32>, &'static str), String> {
     let mut actions = Vec::with_capacity(CHUNK * ACTION_DIM);
     for t in 0..CHUNK {
@@ -193,13 +257,16 @@ fn unpad_and_unnormalize(
             }
             "mean_std_inverse"
         }
-        (None, None) => "identity_key_absent",
+        (None, None) if allow_unnormalized_network => "not_unnormalized",
+        (None, None) => {
+            return Err("MEAN_STD requires action mean and std from the pinned embodiment map. A missing key does not become an execution.".into());
+        }
         _ => return Err("action mean and std must both be present".into()),
     };
     Ok((actions, mode))
 }
 
-fn prepare_image(nchw: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn prepare_image(nchw: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
     if nchw.len() != 3 * h * w {
         return Err(format!(
             "image bytes are {}, shape is 3x{h}x{w}",
@@ -288,7 +355,7 @@ fn source_index(
     (i0, i1, 1.0 - lambda1, lambda1)
 }
 
-fn embed_image(store: &Store, pixels: &[f32]) -> Result<Vec<f32>, String> {
+fn embed_image(store: &Store, pixels: &[f32], capture: bool) -> Result<(Vec<f32>, Option<VisionSnap>), String> {
     let weight = store
         .tensor("model.vlm_with_expert.vlm.model.vision_model.embeddings.patch_embedding.weight")?;
     let bias = store
@@ -303,17 +370,34 @@ fn embed_image(store: &Store, pixels: &[f32]) -> Result<Vec<f32>, String> {
     for (h, p) in hidden.iter_mut().zip(&pos) {
         *h += p;
     }
+    let patch_plus_pos_token0 = if capture { hidden[..VISION_DIM].to_vec() } else { Vec::new() };
+    let mut vision_layer0_token0 = Vec::new();
     for layer in 0..VISION_LAYERS {
         hidden = vision_layer(store, layer, &hidden)?;
+        if capture && layer == 0 {
+            vision_layer0_token0 = hidden[..VISION_DIM].to_vec();
+        }
     }
     let nw = store.tensor("model.vlm_with_expert.vlm.model.vision_model.post_layernorm.weight")?;
     let nb = store.tensor("model.vlm_with_expert.vlm.model.vision_model.post_layernorm.bias")?;
     hidden = layernorm(&hidden, &nw, &nb, PATCHES, VISION_DIM, LN_EPS);
+    let vision_post_token0 = if capture { hidden[..VISION_DIM].to_vec() } else { Vec::new() };
     let shuffled = pixel_shuffle(&hidden, PATCHES, VISION_DIM, CONNECTOR_SCALE)?;
     let proj = store
         .tensor("model.vlm_with_expert.vlm.model.connector.modality_projection.proj.weight")?;
     let inn = VISION_DIM * CONNECTOR_SCALE * CONNECTOR_SCALE;
-    Ok(linear(&shuffled, &proj, None, IMG_TOKENS, inn, TEXT_DIM))
+    let tokens = linear(&shuffled, &proj, None, IMG_TOKENS, inn, TEXT_DIM);
+    let snap = if capture {
+        Some(VisionSnap {
+            patch_plus_pos_token0,
+            vision_layer0_token0,
+            vision_post_token0,
+            connector_token0: tokens[..TEXT_DIM].to_vec(),
+        })
+    } else {
+        None
+    };
+    Ok((tokens, snap))
 }
 
 fn patch_embed(pixels: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
@@ -488,9 +572,11 @@ fn text_prefix(
     seq: usize,
     mask: &[bool],
     pos: &[u32],
-) -> Result<Vec<LayerCache>, String> {
+    capture: bool,
+) -> Result<(Vec<LayerCache>, Vec<f32>), String> {
     let mut hidden = hidden0.to_vec();
     let mut cache = Vec::with_capacity(TEXT_LAYERS);
+    let mut k0 = Vec::new();
     for layer in 0..TEXT_LAYERS {
         let p = format!("model.vlm_with_expert.vlm.model.text_model.layers.{layer}");
         let normed = rmsnorm(
@@ -524,6 +610,9 @@ fn text_prefix(
             KV_HEADS * HEAD_DIM,
         );
         let (q, k) = (rope(&q, pos, HEADS), rope(&k, pos, KV_HEADS));
+        if capture && layer == 0 {
+            k0 = k[..KV_HEADS * HEAD_DIM].to_vec();
+        }
         cache.push(LayerCache {
             k: k.clone(),
             v: v.clone(),
@@ -555,7 +644,7 @@ fn text_prefix(
     }
     let norm = store.tensor("model.vlm_with_expert.vlm.model.text_model.norm.weight")?;
     let _ = rmsnorm(&norm, &hidden, seq, TEXT_DIM);
-    Ok(cache)
+    Ok((cache, k0))
 }
 
 fn denoise(
@@ -865,7 +954,7 @@ fn attention(
     out
 }
 
-fn att_2d(pad: &[bool], att: &[u8]) -> Vec<bool> {
+pub(crate) fn att_2d(pad: &[bool], att: &[u8]) -> Vec<bool> {
     let n = pad.len();
     let mut cum = vec![0i32; n];
     let mut acc = 0i32;
@@ -882,7 +971,7 @@ fn att_2d(pad: &[bool], att: &[u8]) -> Vec<bool> {
     m
 }
 
-fn positions(pad: &[bool]) -> Vec<u32> {
+pub(crate) fn positions(pad: &[bool]) -> Vec<u32> {
     let mut c = 0u32;
     pad.iter()
         .map(|p| {
@@ -894,7 +983,7 @@ fn positions(pad: &[bool]) -> Vec<u32> {
         .collect()
 }
 
-fn self_mask(prefix_pad: &[bool], suffix: usize) -> Vec<bool> {
+pub(crate) fn self_mask(prefix_pad: &[bool], suffix: usize) -> Vec<bool> {
     let prefix = prefix_pad.len();
     let cols = prefix + suffix;
     let mut m = vec![false; suffix * cols];
@@ -909,7 +998,7 @@ fn self_mask(prefix_pad: &[bool], suffix: usize) -> Vec<bool> {
     m
 }
 
-fn cross_mask(prefix_pad: &[bool]) -> Vec<bool> {
+pub(crate) fn cross_mask(prefix_pad: &[bool]) -> Vec<bool> {
     let prefix = prefix_pad.len();
     let mut m = vec![false; CHUNK * prefix];
     for i in 0..CHUNK {

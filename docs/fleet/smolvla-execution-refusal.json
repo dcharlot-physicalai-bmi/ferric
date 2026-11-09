@@ -1,0 +1,15 @@
+{
+  "command": "ferric-smolvla infer",
+  "executable": false,
+  "forward_backend": "not_run",
+  "input_class": "synthetic_protocol",
+  "reason": "MEAN_STD execution refused. Missing feature keys: observation.state. Stats prefixes present: so100-blue.buffer.action, so100-red.buffer.action, so100.buffer.action. The normalization schema is MEAN_STD, not IDENTITY.",
+  "embodiment_map": "/tmp/embodiment-map.json",
+  "state_key": "observation.state",
+  "action_key": "so100.buffer.action",
+  "weight_sha256": "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb",
+  "stats_sha256": "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8",
+  "gpu_energy": false,
+  "robot_actuated": false,
+  "authorized_rollout": false
+}

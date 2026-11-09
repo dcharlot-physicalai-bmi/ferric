@@ -61,6 +61,34 @@ impl Context {
     pub fn sigmoid_t(&self, x: &Tensor) -> Tensor { self.unary(x, SIGMOID_WGSL, "sigmoid") }
     pub fn sqrt_t(&self, x: &Tensor) -> Tensor { self.unary(x, SQRT_WGSL, "sqrt") }
     pub fn gelu_t(&self, x: &Tensor) -> Tensor { self.unary(x, GELU_WGSL, "gelu") }
+    /// PyTorch `gelu_pytorch_tanh`. SmolVLM vision uses this. It is not [`Self::gelu_t`].
+    pub fn gelu_tanh_t(&self, x: &Tensor) -> Tensor { self.unary(x, GELU_TANH_WGSL, "gelu_tanh") }
+    /// RoPE with an explicit position id per row.
+    pub fn rope_positions_t(&self, x: &Tensor, positions: &[u32], heads: u32, dh: u32, base: f32) -> Tensor {
+        let seq = positions.len() as u32;
+        let out = self.empty(&x.shape);
+        let pos = self.storage_u32("pos", positions);
+        let dims = self.uniform_u32("d", &[seq, heads, dh, base.to_bits()]);
+        let pipe = self.pipeline("rope_pos", ROPE_POS_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &pos, &out.buf, &dims], (seq * heads / 64 + 1, 1, 1));
+        out
+    }
+    /// Read one head from `[seq, heads, dh]` row-major data.
+    pub fn head_read_t(&self, x: &Tensor, seq: u32, heads: u32, dh: u32, head: u32) -> Tensor {
+        let out = self.empty(&[seq as usize, dh as usize]);
+        let dims = self.uniform_u32("d", &[seq, heads, dh, head]);
+        let pipe = self.pipeline("head_read", HEAD_READ_WGSL);
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((seq * dh) / 64 + 1, 1, 1));
+        out
+    }
+    /// Copy `full` and replace one head with `src` (`[seq, dh]`).
+    pub fn head_write_t(&self, full: &Tensor, src: &Tensor, seq: u32, heads: u32, dh: u32, head: u32) -> Tensor {
+        let out = self.empty(&full.shape);
+        let dims = self.uniform_u32("d", &[seq, heads, dh, head]);
+        let pipe = self.pipeline("head_write", HEAD_WRITE_WGSL);
+        self.dispatch(&pipe, &[&full.buf, &src.buf, &out.buf, &dims], ((seq * heads * dh) / 64 + 1, 1, 1));
+        out
+    }
     pub fn sub_t(&self, a: &Tensor, b: &Tensor) -> Tensor { self.binary(a, b, SUB_WGSL, "sub") }
     pub fn div_t(&self, a: &Tensor, b: &Tensor) -> Tensor { self.binary(a, b, DIV_WGSL, "div") }
     fn unary(&self, x: &Tensor, wgsl: &str, name: &str) -> Tensor {
@@ -570,6 +598,74 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = x[i];
     let h = det_bar(0.5 * v, dims.y);
     out[i] = h * (1.0 + erf(v * 0.7071067811865476, dims.y));
+}
+"#;
+
+const GELU_TANH_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform>             dims: vec4<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= dims.x) { return; }
+    let v = x[i];
+    let c = 0.7978845834732056;
+    let cube = v * v * v;
+    out[i] = 0.5 * v * (1.0 + tanh(c * (v + 0.044715 * cube)));
+}
+"#;
+
+const ROPE_POS_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       positions: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // seq, heads, dh, bitcast(base)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let seq = dims.x; let heads = dims.y; let dh = dims.z; let base = bitcast<f32>(dims.w);
+    let id = gid.x; if (id >= seq * heads) { return; }
+    let i = id / heads; let head = id % heads;
+    let half = dh / 2u;
+    let o = (i * heads + head) * dh;
+    let pos = f32(positions[i]);
+    for (var c: u32 = 0u; c < half; c = c + 1u) {
+        let timescale = pow(base, (2.0 * f32(c)) / f32(dh));
+        let ang = pos / timescale;
+        let cs = cos(ang); let sn = sin(ang);
+        let x1 = x[o + c]; let x2 = x[o + c + half];
+        out[o + c] = x1 * cs - x2 * sn;
+        out[o + c + half] = x2 * cs + x1 * sn;
+    }
+}
+"#;
+
+const HEAD_READ_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@group(0) @binding(2) var<uniform>             dims: vec4<u32>; // seq, heads, dh, head
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let seq = dims.x; let heads = dims.y; let dh = dims.z; let head = dims.w;
+    let i = gid.x; if (i >= seq * dh) { return; }
+    let s = i / dh; let c = i % dh;
+    out[i] = x[(s * heads + head) * dh + c];
+}
+"#;
+
+const HEAD_WRITE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read>       full: array<f32>;
+@group(0) @binding(1) var<storage, read>       src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform>             dims: vec4<u32>; // seq, heads, dh, head
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let seq = dims.x; let heads = dims.y; let dh = dims.z; let head = dims.w;
+    let i = gid.x; if (i >= seq * heads * dh) { return; }
+    let s = i / (heads * dh);
+    let rem = i % (heads * dh);
+    let h = rem / dh;
+    let c = rem % dh;
+    if (h == head) { out[i] = src[s * dh + c]; } else { out[i] = full[i]; }
 }
 "#;
 

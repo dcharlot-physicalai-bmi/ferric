@@ -55,6 +55,12 @@ impl Store {
         })
     }
 
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.index.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub fn shape(&self, name: &str) -> Result<&[usize], String> {
         self.index
             .get(name)

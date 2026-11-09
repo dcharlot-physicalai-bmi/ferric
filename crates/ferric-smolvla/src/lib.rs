@@ -10,8 +10,11 @@
 //! command read from that chunk is not a robot actuation.
 
 mod gemm;
+mod gpu;
 mod model;
 pub mod weights;
+
+pub use gpu::{forward_gpu, GpuForward};
 
 pub use model::{Forward, Sample, forward, resize_with_pad, sinusoidal};
 
@@ -74,6 +77,47 @@ mod tests {
         assert!((y[0] - -0.13992482).abs() < 1e-6, "{}", y[0]);
         assert!((y[1] - -0.08349697).abs() < 1e-6, "{}", y[1]);
     }
+
+    #[test]
+    fn mean_std_refuses_a_stats_file_without_observation_state() {
+        let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/policy_preprocessor_step_5_normalizer_processor.safetensors");
+        let err = require_mean_std(bytes, "observation.state", "action").unwrap_err();
+        assert!(err.contains("MEAN_STD"));
+        assert!(err.contains("observation.state"));
+        assert!(!err.contains("IDENTITY is applied"));
+        let mapped = require_mean_std(bytes, "observation.state", "so100.buffer.action").unwrap_err();
+        assert!(mapped.contains("observation.state"));
+    }
+
+    #[test]
+    fn simulation_gate_keeps_the_rollout_refused() {
+        use ferric_accept::smolvla::{ChunkIdentity, JointMeta};
+        let id = ChunkIdentity {
+            model_id: "lerobot/smolvla_base".into(),
+            weight_sha256: "ab".repeat(32),
+            stats_sha256: "cd".repeat(32),
+            noise_sha256: "ef".repeat(32),
+            embodiment: "simulation-embodiment".into(),
+            t0_ns: 1_000_000_000,
+            step_duration_ns: 20_000_000,
+            joints: vec![JointMeta {
+                name: "action_0".into(),
+                unit: "dataset_native".into(),
+                frame: "model_action_index".into(),
+                min: -10.0,
+                max: 10.0,
+            }],
+        };
+        let report = simulation_validation(&[0.25, -0.5], id, 1_000_000_000).unwrap();
+        assert_eq!(report.gate, "simulation-validation");
+        assert!(!report.authorized_rollout);
+        assert_eq!(report.authorize_error, "ProposedEntryInvoked");
+        assert!(!report.robot_actuated);
+        assert_eq!(report.steps.len(), 2);
+        assert_eq!(report.steps[0].1, 1_000_000_000);
+        assert_eq!(report.steps[1].1, 1_020_000_000);
+        assert_eq!(report.steps[1].2, vec![-0.5]);
+    }
 }
 
 fn next_unit(state: &mut u64) -> f64 {
@@ -133,6 +177,47 @@ pub fn tokenize(tokenizer_path: &str, task: &str) -> Result<(Vec<u32>, Vec<bool>
     Ok((ids, mask))
 }
 
+pub struct EmbodimentMap {
+    pub embodiment: String,
+    pub state_key: String,
+    pub action_key: String,
+}
+
+pub fn parse_embodiment_map(bytes: &[u8]) -> Result<EmbodimentMap, String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    Ok(EmbodimentMap {
+        embodiment: v["embodiment"].as_str().unwrap_or("").to_string(),
+        state_key: v["observation.state"].as_str().unwrap_or("").to_string(),
+        action_key: v["action"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// MEAN_STD execution. A missing feature key is a refusal. It is not IDENTITY.
+pub fn require_mean_std(stats: &[u8], state_key: &str, action_key: &str) -> Result<(), String> {
+    if state_key.is_empty() || action_key.is_empty() {
+        return Err("MEAN_STD execution requires a pinned embodiment map with observation.state and action keys".into());
+    }
+    let store = weights::Store::open_bytes(stats)?;
+    let names = store.names();
+    let mut missing = Vec::new();
+    for key in [state_key, action_key] {
+        let has_mean = names.iter().any(|n| n == &format!("{key}.mean"));
+        let has_std = names.iter().any(|n| n == &format!("{key}.std"));
+        if !has_mean || !has_std {
+            missing.push(key.to_string());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let prefixes: Vec<&str> = names.iter().filter_map(|n| n.strip_suffix(".mean")).collect();
+    Err(format!(
+        "MEAN_STD execution refused. Missing feature keys: {}. Stats prefixes present: {}. The normalization schema is MEAN_STD, not IDENTITY.",
+        missing.join(", "),
+        prefixes.join(", ")
+    ))
+}
+
 pub fn load_stats(path: &str, key: &str) -> Result<(Vec<f32>, Vec<f32>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let store = weights::Store::open_bytes(&bytes)?;
@@ -147,6 +232,53 @@ pub struct EncodedChunk {
     pub command: Vec<f32>,
     pub timestamp_ns: u64,
     pub robot_actuated: bool,
+}
+
+pub struct SimulationReport {
+    pub gate: &'static str,
+    pub authorized_rollout: bool,
+    pub authorize_error: String,
+    pub robot_actuated: bool,
+    pub steps: Vec<(u32, u64, Vec<f32>)>,
+}
+
+/// Clock-step a codec-valid chunk in simulation. `authorize_rollout` must
+/// return `ProposedEntryInvoked`. This function does not turn that refusal
+/// into an authorized rollout or a robot write.
+pub fn simulation_validation(actions: &[f32], identity: ChunkIdentity, origin_ns: u64) -> Result<SimulationReport, String> {
+    let action_dim = identity.joints.len() as u32;
+    if action_dim == 0 || actions.len() % action_dim as usize != 0 {
+        return Err("simulation actions are not a multiple of the joint count".into());
+    }
+    let n = (actions.len() / action_dim as usize) as u32;
+    let chunk = ActionChunk::try_new(n, action_dim, actions.to_vec()).map_err(|e| format!("{e:?}"))?;
+    let authorize_error = match ferric_accept::smolvla::authorize_rollout(&chunk, &identity) {
+        Err(ferric_accept::smolvla::ContractError::ProposedEntryInvoked) => "ProposedEntryInvoked".to_string(),
+        Err(e) => return Err(format!("chunk is not simulation-eligible: {e:?}")),
+        Ok(()) => return Err("authorize_rollout returned Ok".into()),
+    };
+    let period = identity.step_duration_ns;
+    let mut steps = Vec::new();
+    for k in 0..n {
+        let snapshot = ClockSnapshot {
+            origin_ns,
+            period_ns: period,
+            t0_ns: identity.t0_ns,
+            step_duration_ns: period,
+            dt_bits: ((period as f64) * 1e-9).to_bits(),
+        };
+        bind_clock(&snapshot).map_err(|e| format!("joint clock: {e}"))?;
+        let timestamp_ns = ferric_accept::smolvla::action_timestamp_ns(identity.t0_ns, period, k, n).map_err(|e| format!("{e:?}"))?;
+        let start = k as usize * action_dim as usize;
+        steps.push((k, timestamp_ns, actions[start..start + action_dim as usize].to_vec()));
+    }
+    Ok(SimulationReport {
+        gate: "simulation-validation",
+        authorized_rollout: false,
+        authorize_error,
+        robot_actuated: false,
+        steps,
+    })
 }
 
 pub fn encode_and_read_command(

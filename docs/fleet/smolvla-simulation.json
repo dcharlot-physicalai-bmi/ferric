@@ -1,0 +1,36 @@
+{
+  "command": "ferric-smolvla simulate",
+  "gate": "simulation-validation",
+  "authorized_rollout": false,
+  "authorize_error": "ProposedEntryInvoked",
+  "robot_actuated": false,
+  "steps": [
+    {
+      "index": 0,
+      "timestamp_ns": 1000000000,
+      "command": [
+        -1.1936671733856201,
+        0.4419126510620117,
+        -0.17924930155277252,
+        0.025902125984430313,
+        0.16193053126335144,
+        -0.400928795337677
+      ]
+    },
+    {
+      "index": 1,
+      "timestamp_ns": 1020000000,
+      "command": [
+        -1.1459286212921143,
+        0.42647668719291687,
+        -0.1906575709581375,
+        0.2709476053714752,
+        0.18264888226985931,
+        -0.44501858949661255
+      ]
+    }
+  ],
+  "gpu_energy": false,
+  "n_steps_total": 50,
+  "note": "first two of 50 simulation steps; authorized_rollout stays false"
+}

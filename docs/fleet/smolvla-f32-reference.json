@@ -1,0 +1,52 @@
+{
+  "dtype": "f32",
+  "weight_cast": "bf16 expanded to f32, f32 tensors left as f32",
+  "input_class": "synthetic_protocol",
+  "executable": false,
+  "token_ids_match_tokenizer_json": true,
+  "prepared_image0": {
+    "max_abs": 2.384185791015625e-07,
+    "rmse": 6.102035854382848e-08,
+    "n": 786432
+  },
+  "patch_token0": {
+    "max_abs": 7.152557373046875e-07,
+    "rmse": 7.016252112634902e-08,
+    "n": 768
+  },
+  "vision_l0_token0": {
+    "max_abs": 3.814697265625e-06,
+    "rmse": 4.6999670644254365e-07,
+    "n": 768
+  },
+  "vision_post_token0": {
+    "max_abs": 1.5735626220703125e-05,
+    "rmse": 3.841048510366818e-06,
+    "n": 768
+  },
+  "connector_token0": {
+    "max_abs": 6.866455078125e-05,
+    "rmse": 1.2788995263690595e-05,
+    "n": 960
+  },
+  "state_token": {
+    "max_abs": 0.0,
+    "rmse": 0.0,
+    "n": 960
+  },
+  "text_l0_k_token0": {
+    "max_abs": 4.291534423828125e-06,
+    "rmse": 9.6998098797485e-07,
+    "n": 320
+  },
+  "velocity0": {
+    "max_abs": 2.86102294921875e-06,
+    "rmse": 8.624640486232238e-07,
+    "n": 32
+  },
+  "raw_actions": {
+    "max_abs": 3.6954879760742188e-06,
+    "rmse": 3.9042464550220757e-07,
+    "n": 1600
+  }
+}

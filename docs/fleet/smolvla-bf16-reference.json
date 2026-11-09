@@ -1,0 +1,52 @@
+{
+  "dtype": "bf16",
+  "weight_cast": "bf16 matmul kept in torch.bfloat16; f32 projection weights stay f32; compared after cast to f32",
+  "input_class": "synthetic_protocol",
+  "executable": false,
+  "token_ids_match_tokenizer_json": true,
+  "prepared_image0": {
+    "max_abs": 2.384185791015625e-07,
+    "rmse": 6.102035854382848e-08,
+    "n": 786432
+  },
+  "patch_token0": {
+    "max_abs": 0.0033648014068603516,
+    "rmse": 0.00035525549901649356,
+    "n": 768
+  },
+  "vision_l0_token0": {
+    "max_abs": 0.015265941619873047,
+    "rmse": 0.0018317673821002245,
+    "n": 768
+  },
+  "vision_post_token0": {
+    "max_abs": 0.0878443717956543,
+    "rmse": 0.020429590716958046,
+    "n": 768
+  },
+  "connector_token0": {
+    "max_abs": 0.24053335189819336,
+    "rmse": 0.07512945681810379,
+    "n": 960
+  },
+  "state_token": {
+    "max_abs": 0.0,
+    "rmse": 0.0,
+    "n": 960
+  },
+  "text_l0_k_token0": {
+    "max_abs": 0.025644302368164062,
+    "rmse": 0.005863653961569071,
+    "n": 320
+  },
+  "velocity0": {
+    "max_abs": 0.004586160182952881,
+    "rmse": 0.0017574606463313103,
+    "n": 32
+  },
+  "raw_actions": {
+    "max_abs": 0.008876025676727295,
+    "rmse": 0.0014558694092556834,
+    "n": 1600
+  }
+}
