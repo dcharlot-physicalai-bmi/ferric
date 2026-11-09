@@ -266,6 +266,19 @@ fn unpad_and_unnormalize(
     Ok((actions, mode))
 }
 
+/// v0.7.0 PR #4292 path. `forward` does not call this.
+/// uint8 pixels are divided by 255 before the existing `[0, 1]` resize.
+pub fn prepare_uint8_v070(nchw: &[u8], h: usize, w: usize) -> Result<Vec<f32>, String> {
+    if nchw.len() != 3 * h * w {
+        return Err(format!(
+            "uint8 image bytes are {}, shape is 3x{h}x{w}",
+            nchw.len()
+        ));
+    }
+    let unit: Vec<f32> = nchw.iter().map(|p| f32::from(*p) / 255.0).collect();
+    prepare_image(&unit, h, w)
+}
+
 pub(crate) fn prepare_image(nchw: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
     if nchw.len() != 3 * h * w {
         return Err(format!(
@@ -535,7 +548,7 @@ fn vision_layer(store: &Store, layer: usize, hidden: &[f32]) -> Result<Vec<f32>,
     Ok(residual)
 }
 
-fn gelu_tanh(x: &[f32]) -> Vec<f32> {
+pub(crate) fn gelu_tanh(x: &[f32]) -> Vec<f32> {
     let c = (2.0f32 / std::f32::consts::PI).sqrt();
     x.iter()
         .map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh()))
@@ -880,7 +893,7 @@ fn rmsnorm_cpu(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f
     ferric_core::cpu::rmsnorm(x, w, rows, dim, eps)
 }
 
-fn rope(x: &[f32], pos: &[u32], heads: usize) -> Vec<f32> {
+pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Vec<f32> {
     let seq = pos.len();
     let mut o = x.to_vec();
     let half = HEAD_DIM / 2;
@@ -902,7 +915,7 @@ fn rope(x: &[f32], pos: &[u32], heads: usize) -> Vec<f32> {
     o
 }
 
-fn attention(
+pub(crate) fn attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],

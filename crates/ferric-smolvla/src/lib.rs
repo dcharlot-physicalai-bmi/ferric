@@ -9,6 +9,7 @@
 //! This crate does not call it. Encoding a chunk is the v2 codec. A joint
 //! command read from that chunk is not a robot actuation.
 
+mod faults;
 mod gemm;
 mod gpu;
 mod model;
@@ -19,7 +20,10 @@ pub use tolerance::{bounds_json, max_abs_bound, within_bound, F32_U};
 
 pub use gpu::{forward_gpu, GpuForward, GpuSession};
 
-pub use model::{ActivationTrace, Forward, Sample, forward, resize_with_pad, sinusoidal};
+pub use faults::{cpu_fault_report, gemm_abft_residual, stage_digest, FAULT_SEED};
+pub use model::{
+    ActivationTrace, Forward, Sample, forward, prepare_uint8_v070, resize_with_pad, sinusoidal,
+};
 
 use ferric_accept::smolvla::{ActionChunk, ChunkIdentity, JointMeta, encode_action_chunk};
 use ferric_accept::{hex, sha256};

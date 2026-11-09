@@ -15,3 +15,7 @@ Recorded max-abs, not used to choose the bound:
 | raw actions | 3.70e-6 | 4.29e-6 | 9.36e-6 | 1.95e-4 | all three pass |
 
 The full per-stage table is produced by the tolerance unit test. RADV does not fail this bound. It does exceed the smaller CPU-achieved envelope on `vision_post_token0`, `text_l0_k_token0`, and `raw_actions`. That envelope is not the tolerance.
+
+## Fault injection
+
+`docs/fleet/smolvla-fault-injection.json` injects a fixed catalogue, seed `0x5a17`, into the CPU kernels and scores each output against this raw-action bound and against the mapped per-stage bound. A low-mantissa flip stays under both. That is the same limit arXiv:2609.00363 measured for a one-spacing tolerance: the check does not fire on a one-spacing fault. That paper is not about SmolVLA. The added checks are a per-stage FNV digest of the f32 bits, which sees those flips, and a matmul row/column checksum, which sees a dropped product term. There is no quantized GEMM on this path.

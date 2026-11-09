@@ -1,4 +1,6 @@
 {
+  "lerobot_repository": "huggingface/lerobot",
+  "lerobot_commit": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
   "dtype": "bf16",
   "weight_cast": "bf16 matmul kept in torch.bfloat16; f32 projection weights stay f32; compared after cast to f32",
   "input_class": "synthetic_protocol",

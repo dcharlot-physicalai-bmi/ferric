@@ -1,0 +1,104 @@
+{
+  "old_reference": "docs/fleet/smolvla-f32-reference.json",
+  "old_lerobot_commit": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
+  "new_reference": "docs/fleet/smolvla-f32-reference-lerobot-v0.7.0.json",
+  "new_lerobot_tag": "v0.7.0",
+  "new_lerobot_tag_commit": "410c095eacc0011d998a73383eb94abed2715af0",
+  "pinned_input": "f32 synthetic_protocol images in [0, 1]",
+  "uint8_branch_taken": false,
+  "prepared_images_bitwise_identical": [
+    {
+      "camera": 0,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 786432,
+      "identical_bits": true,
+      "evidence": "measured"
+    },
+    {
+      "camera": 1,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 786432,
+      "identical_bits": true,
+      "evidence": "measured"
+    },
+    {
+      "camera": 2,
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 786432,
+      "identical_bits": true,
+      "evidence": "measured"
+    }
+  ],
+  "stages": {
+    "prepared_image0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 786432,
+      "evidence": "measured"
+    },
+    "patch_token0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 768,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "vision_l0_token0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 768,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "vision_post_token0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 768,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "connector_token0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 960,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "state_token": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 960,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "text_l0_k_token0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 320,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "velocity0": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 32,
+      "evidence": "bitwise_identical_prepared_images"
+    },
+    "raw_actions": {
+      "max_abs": 0.0,
+      "rmse": 0.0,
+      "n": 1600,
+      "evidence": "bitwise_identical_prepared_images"
+    }
+  },
+  "later_stages": "The only prepare_images change in v0.7.0 is the uint8 cast. These f32 tensors are bitwise identical, and one remeasured f32 forward matches the a0eb860d receipt stage errors exactly. Later-stage deltas are 0 for that reason. The full graph was not executed twice.",
+  "uint8_not_the_pinned_input": {
+    "camera": 0,
+    "construction": "round the pinned camera-0 f32 pixels to uint8, then run both prepare_images paths",
+    "max_abs": 506.5058898925781,
+    "rmse": 287.66815185546875,
+    "n": 786432,
+    "old_min": -1.0,
+    "old_max": 507.5,
+    "v070_min": -1.0,
+    "v070_max": 0.9941176176071167,
+    "evidence": "measured"
+  }
+}

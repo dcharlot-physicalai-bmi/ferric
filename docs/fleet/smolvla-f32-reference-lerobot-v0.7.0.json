@@ -1,0 +1,71 @@
+{
+  "dtype": "f32",
+  "weight_cast": "bf16 expanded to f32, f32 tensors left as f32",
+  "input_class": "synthetic_protocol",
+  "executable": false,
+  "token_ids_match_tokenizer_json": true,
+  "lerobot_repository": "huggingface/lerobot",
+  "lerobot_release": "v0.7.0",
+  "lerobot_tag_commit": "410c095eacc0011d998a73383eb94abed2715af0",
+  "lerobot_release_published": "2026-11-05T17:13:20Z",
+  "preprocess_pr": "https://github.com/huggingface/lerobot/pull/4292",
+  "preprocess_pr_title": "fix(smolvla): normalize uint8 images before resizing",
+  "preprocess_merge_commit": "c1789b1306ca451cdc61c4576c3eba691bd9b974",
+  "preprocess_merged_at": "2026-10-21T10:14:13Z",
+  "model_id": "lerobot/smolvla_base",
+  "model_revision": "5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6",
+  "model_revision_is_hub_head_on_2026_11_09": true,
+  "hub_last_modified": "2026-10-06T13:57:08.000Z",
+  "v070_does_not_pin_a_weight_revision": true,
+  "model_safetensors_bytes": 906712520,
+  "model_safetensors_sha256": "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb",
+  "model_safetensors_sha256_matches_expected": true,
+  "uint8_branch_taken_on_pinned_inputs": false,
+  "pinned_inputs": "f32 pixels in [0, 1] from the synthetic_protocol trace used by the f32 receipt",
+  "compared_to": "ferric cpu trace. Stage errors match docs/fleet/smolvla-f32-reference.json.",
+  "prepared_image0": {
+    "max_abs": 2.384185791015625e-07,
+    "rmse": 6.102035854382848e-08,
+    "n": 786432
+  },
+  "patch_token0": {
+    "max_abs": 7.152557373046875e-07,
+    "rmse": 7.016252112634902e-08,
+    "n": 768
+  },
+  "vision_l0_token0": {
+    "max_abs": 3.814697265625e-06,
+    "rmse": 4.6999670644254365e-07,
+    "n": 768
+  },
+  "vision_post_token0": {
+    "max_abs": 1.5735626220703125e-05,
+    "rmse": 3.841048510366818e-06,
+    "n": 768
+  },
+  "connector_token0": {
+    "max_abs": 6.866455078125e-05,
+    "rmse": 1.2788995263690595e-05,
+    "n": 960
+  },
+  "state_token": {
+    "max_abs": 0.0,
+    "rmse": 0.0,
+    "n": 960
+  },
+  "text_l0_k_token0": {
+    "max_abs": 4.291534423828125e-06,
+    "rmse": 9.6998098797485e-07,
+    "n": 320
+  },
+  "velocity0": {
+    "max_abs": 2.86102294921875e-06,
+    "rmse": 8.624640486232238e-07,
+    "n": 32
+  },
+  "raw_actions": {
+    "max_abs": 3.6954879760742188e-06,
+    "rmse": 3.9042464550220757e-07,
+    "n": 1600
+  }
+}

@@ -1,4 +1,6 @@
 {
+  "lerobot_repository": "huggingface/lerobot",
+  "lerobot_commit": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
   "dtype": "f32",
   "weight_cast": "bf16 expanded to f32, f32 tensors left as f32",
   "input_class": "synthetic_protocol",
