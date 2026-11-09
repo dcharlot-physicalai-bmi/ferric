@@ -71,6 +71,19 @@ pub struct EnergySeries {
     pub range_uj: u64,
     pub cpu_tctl_c: Option<f64>,
     pub gpu_edge_c: Option<f64>,
+    /// Busy fraction of non-pinned cores on each settle interval.
+    pub settle_busy: Vec<f64>,
+    /// Busy fraction of non-pinned cores on each workload sample.
+    pub workload_busy: Vec<f64>,
+    pub tctl_pre: Option<f64>,
+    pub tctl_workload: Option<f64>,
+    pub tctl_post: Option<f64>,
+    pub edge_pre: Option<f64>,
+    pub edge_workload: Option<f64>,
+    pub edge_post: Option<f64>,
+    pub workload_reached: bool,
+    pub post_reached: bool,
+    pub pre_reached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +109,8 @@ pub struct DriveReceipt {
     pub rapl_package_j: Option<f64>,
     pub rapl_core_j: Option<f64>,
     pub amdgpu_ppt_j: Option<f64>,
+    /// Samples collected up to the point the attempt stopped.
+    pub series: EnergySeries,
 }
 
 #[derive(Debug, Clone)]
@@ -190,27 +205,112 @@ pub fn load_is_quiet(samples: &[f64], load1_max: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Gate used after the settle and before the workload is spawned.
+/// A failing sample must not be followed by the trial load.
+pub fn pre_idle_gate(load1: &[f64], settle_busy: &[f64], load1_max: f64, busy_max: f64) -> Result<(), String> {
+    load_is_quiet(load1, load1_max)?;
+    if let Some(v) = settle_busy.iter().copied().find(|v| *v > busy_max) {
+        return Err(format!("settle busy fraction {v} exceeds {busy_max}"));
+    }
+    Ok(())
+}
+
+/// SMT siblings that were left outside the pin set. `siblings_of(cpu)` includes `cpu`.
+pub fn unpinned_siblings(pinned: &[usize], siblings_of: impl Fn(usize) -> Vec<usize>) -> Vec<(usize, usize)> {
+    let mut missing = Vec::new();
+    for &cpu in pinned {
+        for sib in siblings_of(cpu) {
+            if sib != cpu && !pinned.contains(&sib) && !missing.contains(&(cpu, sib)) {
+                missing.push((cpu, sib));
+            }
+        }
+    }
+    missing
+}
+
+pub fn parse_cpu_list(text: &str) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let start: usize = a.parse().map_err(|e| format!("{part}: {e}"))?;
+            let end: usize = b.parse().map_err(|e| format!("{part}: {e}"))?;
+            if end < start {
+                return Err(format!("{part} is reversed"));
+            }
+            out.extend(start..=end);
+        } else {
+            out.push(part.parse().map_err(|e| format!("{part}: {e}"))?);
+        }
+    }
+    if out.is_empty() {
+        return Err("cpu list is empty".into());
+    }
+    Ok(out)
+}
+
+pub fn thread_siblings_list(cpu: usize) -> Result<Vec<usize>, String> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    parse_cpu_list(text.trim())
+}
+
+pub fn require_smt_siblings(pinned: &[usize]) -> Result<(), String> {
+    let mut known = Vec::new();
+    for &cpu in pinned {
+        let sibs = thread_siblings_list(cpu)?;
+        known.push((cpu, sibs));
+    }
+    let missing = unpinned_siblings(pinned, |cpu| {
+        known.iter().find(|(c, _)| *c == cpu).map(|(_, s)| s.clone()).unwrap_or_else(|| vec![cpu])
+    });
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        let pairs: Vec<String> = missing.iter().map(|(c, s)| format!("{c}->{s}")).collect();
+        Err(format!("pinned core leaves its SMT sibling unpinned: {}", pairs.join(", ")))
+    }
+}
+
+fn phase_temp(vals: &[Option<f64>]) -> Option<f64> {
+    vals.iter().copied().flatten().reduce(f64::max)
+}
+
+fn refusal_grades(series: &EnergySeries, busy: Option<f64>) -> Grades {
+    let pre_ok = series.pre_reached
+        && pre_idle_gate(&series.load1_pre, &series.settle_busy, series.load1_max, series.busy_fraction_max).is_ok();
+    let workload_over = busy.is_some_and(|b| b > series.busy_fraction_max)
+        || series.workload_busy.iter().any(|v| *v > series.busy_fraction_max);
+    let workload_ok = series.workload_reached && !workload_over;
+    let post_ok = series.post_reached && load_is_quiet(&series.load1_post, series.load1_max).is_ok();
+    let refused = Grade::Refused;
+    Grades {
+        pre_idle: if pre_ok { Grade::Quiet } else { refused },
+        workload: if workload_ok { Grade::Quiet } else { refused },
+        post_idle: if post_ok { Grade::Quiet } else { refused },
+        rapl_package: refused,
+        rapl_core: refused,
+        amdgpu_ppt: refused,
+    }
+}
+
 fn refused(reason: String, lock: LockHold, series: &EnergySeries, busy: Option<f64>) -> DriveReceipt {
-    let g = Grade::Refused;
     DriveReceipt {
         attributable: false,
         reason,
-        grades: Grades {
-            pre_idle: g,
-            workload: g,
-            post_idle: g,
-            rapl_package: g,
-            rapl_core: g,
-            amdgpu_ppt: g,
-        },
+        grades: refusal_grades(series, busy),
         lock,
         busy_fraction_max: series.busy_fraction_max,
         busy_fraction: busy,
-        cpu_tctl_c: series.cpu_tctl_c,
-        gpu_edge_c: series.gpu_edge_c,
+        cpu_tctl_c: phase_temp(&[series.tctl_pre, series.tctl_workload, series.tctl_post]),
+        gpu_edge_c: phase_temp(&[series.edge_pre, series.edge_workload, series.edge_post]),
         rapl_package_j: None,
         rapl_core_j: None,
         amdgpu_ppt_j: None,
+        series: series.clone(),
     }
 }
 
@@ -270,15 +370,83 @@ pub fn judge(series: &EnergySeries, lock: LockHold) -> DriveReceipt {
         lock,
         busy_fraction_max: series.busy_fraction_max,
         busy_fraction: Some(busy),
-        cpu_tctl_c: series.cpu_tctl_c,
-        gpu_edge_c: series.gpu_edge_c,
+        cpu_tctl_c: phase_temp(&[series.tctl_pre, series.tctl_workload, series.tctl_post]).or(series.cpu_tctl_c),
+        gpu_edge_c: phase_temp(&[series.edge_pre, series.edge_workload, series.edge_post]).or(series.gpu_edge_c),
         rapl_package_j: Some(pkg_du as f64 * 1e-6),
         rapl_core_j: Some(core_du as f64 * 1e-6),
         amdgpu_ppt_j: series.trial_ppt_j,
+        series: series.clone(),
     }
 }
 
+fn finite_max(v: &[f64]) -> Option<f64> {
+    v.iter().copied().filter(|x| x.is_finite()).reduce(f64::max)
+}
+
+fn drift_json(series: &EnergySeries) -> serde_json::Value {
+    if !series.pre_reached {
+        return serde_json::json!({"status": "not_reached", "phase": "pre_idle"});
+    }
+    if !series.workload_reached {
+        return serde_json::json!({"status": "not_reached", "phase": "workload"});
+    }
+    if !series.post_reached {
+        return serde_json::json!({"status": "not_reached", "phase": "post_idle"});
+    }
+    let pre = powers_from_counter(&series.pre_package, series.range_uj).ok();
+    let post = powers_from_counter(&series.post_package, series.range_uj).ok();
+    match (pre, post) {
+        (Some(pre), Some(post)) => match drift_within_3_sigma(&pre, &post) {
+            Ok(()) => {
+                let delta = (mean(&pre) - mean(&post)).abs();
+                let sigma = {
+                    let v1 = sample_var(&pre).unwrap_or(0.0);
+                    let v2 = sample_var(&post).unwrap_or(0.0);
+                    let n1 = pre.len();
+                    let n2 = post.len();
+                    let pooled = ((n1 - 1) as f64 * v1 + (n2 - 1) as f64 * v2) / (n1 + n2 - 2) as f64;
+                    pooled.sqrt()
+                };
+                serde_json::json!({"status": "computed", "delta_w": delta, "sigma_w": sigma, "within_3_sigma": true})
+            }
+            Err(reason) => serde_json::json!({"status": "computed", "within_3_sigma": false, "reason": reason}),
+        },
+        _ => serde_json::json!({"status": "not_reached", "phase": "post_idle"}),
+    }
+}
+
+fn phase_json(reached: bool, grade: Grade, load1: &[f64], busy: &[f64], package_w: &[f64], core_w: &[f64], ppt_w: &[f64], tctl: Option<f64>, edge: Option<f64>) -> serde_json::Value {
+    serde_json::json!({
+        "reached": reached,
+        "grade": grade.as_str(),
+        "load1": load1,
+        "load1_max": finite_max(load1),
+        "busy_fraction": busy,
+        "baseline_power_w": {
+            "rapl_package": package_w,
+            "rapl_core": core_w,
+            "amdgpu_ppt": ppt_w,
+        },
+        "cpu_tctl_max_c": tctl,
+        "gpu_edge_max_c": edge,
+    })
+}
+
 pub fn receipt_json(r: &DriveReceipt) -> serde_json::Value {
+    let series = &r.series;
+    let pre_pkg = powers_from_counter(&series.pre_package, series.range_uj).unwrap_or_default();
+    let post_pkg = if series.post_reached { powers_from_counter(&series.post_package, series.range_uj).unwrap_or_default() } else { Vec::new() };
+    let pre_core = powers_from_counter(&series.pre_core, series.range_uj).unwrap_or_default();
+    let post_core = if series.post_reached { powers_from_counter(&series.post_core, series.range_uj).unwrap_or_default() } else { Vec::new() };
+    let joules = if r.attributable {
+        serde_json::json!({
+            "rapl_package": r.rapl_package_j,
+            "rapl_core": r.rapl_core_j,
+            "amdgpu_ppt": r.amdgpu_ppt_j,
+        })
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::json!({
         "attributable": r.attributable,
         "reason": r.reason,
@@ -291,6 +459,12 @@ pub fn receipt_json(r: &DriveReceipt) -> serde_json::Value {
             "amdgpu_ppt": r.grades.amdgpu_ppt.as_str(),
             "meters_pooled": false,
         },
+        "phases": {
+            "pre_idle": phase_json(series.pre_reached, r.grades.pre_idle, &series.load1_pre, &series.settle_busy, &pre_pkg, &pre_core, &series.pre_ppt_w, series.tctl_pre, series.edge_pre),
+            "workload": phase_json(series.workload_reached, r.grades.workload, &[], &series.workload_busy, &[], &[], &[], series.tctl_workload, series.edge_workload),
+            "post_idle": phase_json(series.post_reached, r.grades.post_idle, &series.load1_post, &[], &post_pkg, &post_core, &series.post_ppt_w, series.tctl_post, series.edge_post),
+        },
+        "drift": drift_json(series),
         "lock": {
             "path": r.lock.path,
             "pid": r.lock.pid,
@@ -303,6 +477,7 @@ pub fn receipt_json(r: &DriveReceipt) -> serde_json::Value {
         "busy_fraction": r.busy_fraction,
         "cpu_tctl_c": r.cpu_tctl_c,
         "gpu_edge_c": r.gpu_edge_c,
+        "joules": joules,
         "rapl_package_j": r.rapl_package_j,
         "rapl_core_j": r.rapl_core_j,
         "amdgpu_ppt_j": r.amdgpu_ppt_j,
@@ -467,6 +642,17 @@ fn empty_series() -> EnergySeries {
         range_uj: FRAMEWORK_RANGE_UJ,
         cpu_tctl_c: None,
         gpu_edge_c: None,
+        settle_busy: vec![],
+        workload_busy: vec![],
+        tctl_pre: None,
+        tctl_workload: None,
+        tctl_post: None,
+        edge_pre: None,
+        edge_workload: None,
+        edge_post: None,
+        workload_reached: false,
+        post_reached: false,
+        pre_reached: false,
     }
 }
 
@@ -554,32 +740,96 @@ struct Bracket {
     ppt_w: Vec<f64>,
     cpu_tctl_c: Option<f64>,
     gpu_edge_c: Option<f64>,
+    busy: Vec<f64>,
+    blocked: Option<String>,
+}
+
+fn note_temp(slot: &mut Option<f64>, sample: Option<f64>) {
+    if let Some(c) = sample {
+        *slot = Some(slot.map(|m| m.max(c)).unwrap_or(c));
+    }
 }
 
 fn take_bracket(cfg: &LiveConfig, origin: std::time::Instant) -> Result<Bracket, String> {
     let steps = cfg.settle_s.round().max(1.0) as u32;
-    let mut bracket = Bracket { load1: vec![], package: vec![], core: vec![], ppt_w: vec![], cpu_tctl_c: None, gpu_edge_c: None };
+    let mut bracket = Bracket {
+        load1: vec![],
+        package: vec![],
+        core: vec![],
+        ppt_w: vec![],
+        cpu_tctl_c: None,
+        gpu_edge_c: None,
+        busy: vec![],
+        blocked: None,
+    };
+    let mut prev_ticks: Option<Vec<CpuTicks>> = None;
     for i in 0..steps {
-        bracket.load1.push(read_load1()?);
+        match read_load1() {
+            Ok(v) => bracket.load1.push(v),
+            Err(e) if bracket.load1.is_empty() => return Err(e),
+            Err(e) => {
+                bracket.blocked = Some(e);
+                return Ok(bracket);
+            }
+        }
         let t_ns = origin.elapsed().as_nanos() as u64;
-        bracket.package.push((t_ns, read_uj(&cfg.rapl_package)?));
-        bracket.core.push((t_ns, read_uj(&cfg.rapl_core)?));
+        match (read_uj(&cfg.rapl_package), read_uj(&cfg.rapl_core)) {
+            (Ok(pkg), Ok(core)) => {
+                bracket.package.push((t_ns, pkg));
+                bracket.core.push((t_ns, core));
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                bracket.blocked = Some(e);
+                return Ok(bracket);
+            }
+        }
         if let Some(path) = &cfg.ppt {
             if let Ok(uw) = read_uj(path) {
                 bracket.ppt_w.push(uw as f64 * 1e-6);
             }
         }
-        if let Some(c) = millic_to_c(&cfg.cpu_tctl) {
-            bracket.cpu_tctl_c = Some(bracket.cpu_tctl_c.map(|m| m.max(c)).unwrap_or(c));
+        note_temp(&mut bracket.cpu_tctl_c, millic_to_c(&cfg.cpu_tctl));
+        note_temp(&mut bracket.gpu_edge_c, millic_to_c(&cfg.gpu_edge));
+        if let Ok(now) = read_cpu_ticks() {
+            if let Some(prev) = &prev_ticks {
+                if let Ok(b) = busy_fraction(prev, &now, &cfg.pin_cores) {
+                    bracket.busy.push(b.fraction);
+                }
+            }
+            prev_ticks = Some(now);
         }
-        if let Some(c) = millic_to_c(&cfg.gpu_edge) {
-            bracket.gpu_edge_c = Some(bracket.gpu_edge_c.map(|m| m.max(c)).unwrap_or(c));
+        let load_bad = bracket.load1.iter().any(|v| *v > cfg.load1_max);
+        let busy_bad = bracket.busy.iter().any(|v| *v > cfg.busy_fraction_max);
+        if load_bad || busy_bad {
+            bracket.blocked = pre_idle_gate(&bracket.load1, &bracket.busy, cfg.load1_max, cfg.busy_fraction_max).err();
+            return Ok(bracket);
         }
         if i + 1 < steps {
             sleep(Duration::from_secs(1));
         }
     }
     Ok(bracket)
+}
+
+fn series_from_pre(cfg: &LiveConfig, range: u64, pre: &Bracket) -> EnergySeries {
+    let mut series = empty_series();
+    series.load1_pre = pre.load1.clone();
+    series.pre_package = pre.package.clone();
+    series.pre_core = pre.core.clone();
+    series.pre_ppt_w = pre.ppt_w.clone();
+    series.settle_busy = pre.busy.clone();
+    series.tctl_pre = pre.cpu_tctl_c;
+    series.edge_pre = pre.gpu_edge_c;
+    series.pre_reached = true;
+    series.busy_fraction_max = cfg.busy_fraction_max;
+    series.load1_max = cfg.load1_max;
+    series.pinned = cfg.pin_cores.clone();
+    series.range_uj = range;
+    series
+}
+
+fn refuse_pre(lock: &LockGuard, cfg: &LiveConfig, range: u64, pre: &Bracket, reason: String) -> DriveReceipt {
+    refused(reason, lock.hold(), &series_from_pre(cfg, range, pre), None)
 }
 
 /// One locked attempt: preflight, both idle brackets, and the pinned workload.
@@ -592,123 +842,136 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
         }
         (Err(e), _) | (_, Err(e)) => return refusal_now(lock, cfg, e),
     };
+    if let Err(e) = require_smt_siblings(&cfg.pin_cores) {
+        return refusal_now(lock, cfg, e);
+    }
     let origin = std::time::Instant::now();
     let pre = match take_bracket(cfg, origin) {
         Ok(b) => b,
         Err(e) => return refusal_now(lock, cfg, e),
     };
+    if let Some(reason) = pre.blocked.clone() {
+        return refuse_pre(lock, cfg, range, &pre, format!("pre-trial idle: {reason}"));
+    }
+    if let Err(e) = pre_idle_gate(&pre.load1, &pre.busy, cfg.load1_max, cfg.busy_fraction_max) {
+        return refuse_pre(lock, cfg, range, &pre, format!("pre-trial idle: {e}"));
+    }
     let ticks0 = match read_cpu_ticks() {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return refuse_pre(lock, cfg, range, &pre, e),
     };
     let pkg0 = match read_uj(&cfg.rapl_package) {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return refuse_pre(lock, cfg, range, &pre, e),
     };
     let core0 = match read_uj(&cfg.rapl_core) {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return refuse_pre(lock, cfg, range, &pre, e),
     };
     let mut child = match spawn_pinned(&cfg.pin_cores, &cfg.workload) {
         Ok(c) => c,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return refuse_pre(lock, cfg, range, &pre, e),
     };
     let mut ppt_series: Vec<(u64, f64)> = Vec::new();
+    let mut workload_busy = Vec::new();
+    let mut tctl_workload = None;
+    let mut edge_workload = None;
+    let mut prev_ticks = ticks0.clone();
+    let abort_workload = |reason: String, busy: Option<f64>, workload_busy: Vec<f64>, tctl_workload: Option<f64>, edge_workload: Option<f64>| {
+        let mut series = series_from_pre(cfg, range, &pre);
+        series.workload_reached = true;
+        series.workload_busy = workload_busy;
+        series.tctl_workload = tctl_workload;
+        series.edge_workload = edge_workload;
+        refused(reason, lock.hold(), &series, busy)
+    };
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return refusal_now(lock, cfg, format!("workload exit {status}"));
+                    return abort_workload(format!("workload exit {status}"), None, workload_busy, tctl_workload, edge_workload);
                 }
                 break;
             }
             Ok(None) => {
                 sleep(Duration::from_secs(1));
                 let t_ns = origin.elapsed().as_nanos() as u64;
+                note_temp(&mut tctl_workload, millic_to_c(&cfg.cpu_tctl));
+                note_temp(&mut edge_workload, millic_to_c(&cfg.gpu_edge));
                 if let Some(path) = &cfg.ppt {
                     if let Ok(uw) = read_uj(path) {
                         ppt_series.push((t_ns, uw as f64 * 1e-6));
                     }
                 }
                 if let Ok(now_ticks) = read_cpu_ticks() {
+                    if let Ok(interval) = busy_fraction(&prev_ticks, &now_ticks, &cfg.pin_cores) {
+                        workload_busy.push(interval.fraction);
+                    }
                     if let Ok(busy) = busy_fraction(&ticks0, &now_ticks, &cfg.pin_cores) {
-                        if busy.fraction > cfg.busy_fraction_max {
+                        let interval_over = workload_busy.last().copied().is_some_and(|v| v > cfg.busy_fraction_max);
+                        if busy.fraction > cfg.busy_fraction_max || interval_over {
                             let _ = child.kill();
                             let _ = child.wait();
-                            let mut series = empty_series();
-                            series.busy_fraction_max = cfg.busy_fraction_max;
-                            series.load1_max = cfg.load1_max;
-                            series.cpu_tctl_c = millic_to_c(&cfg.cpu_tctl);
-                            series.gpu_edge_c = millic_to_c(&cfg.gpu_edge);
-                            series.pinned = cfg.pin_cores.clone();
-                            return refused(
+                            return abort_workload(
                                 format!("non-pinned busy fraction {} exceeds the predeclared {}", busy.fraction, cfg.busy_fraction_max),
-                                lock.hold(),
-                                &series,
                                 Some(busy.fraction),
+                                workload_busy,
+                                tctl_workload,
+                                edge_workload,
                             );
                         }
                     }
+                    prev_ticks = now_ticks;
                 }
             }
-            Err(e) => return refusal_now(lock, cfg, e.to_string()),
+            Err(e) => return abort_workload(e.to_string(), None, workload_busy, tctl_workload, edge_workload),
         }
     }
     let pkg1 = match read_uj(&cfg.rapl_package) {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
     };
     let core1 = match read_uj(&cfg.rapl_core) {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
     };
     let ticks1 = match read_cpu_ticks() {
         Ok(v) => v,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
     };
     let post = match take_bracket(cfg, origin) {
         Ok(b) => b,
-        Err(e) => return refusal_now(lock, cfg, e),
+        Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
     };
-    let series = EnergySeries {
-        load1_pre: pre.load1,
-        load1_post: post.load1,
-        pre_package: pre.package,
-        post_package: post.package,
-        pre_core: pre.core,
-        post_core: post.core,
-        pre_ppt_w: pre.ppt_w,
-        post_ppt_w: post.ppt_w,
-        trial_package: (pkg0, pkg1),
-        trial_core: (core0, core1),
-        trial_ppt_j: crate::trapezoid_joules(&ppt_series),
-        cpu_before: ticks0,
-        cpu_after: ticks1,
-        pinned: cfg.pin_cores.clone(),
-        busy_fraction_max: cfg.busy_fraction_max,
-        load1_max: cfg.load1_max,
-        range_uj: range,
-        cpu_tctl_c: max_temp(pre.cpu_tctl_c, post.cpu_tctl_c),
-        gpu_edge_c: max_temp(pre.gpu_edge_c, post.gpu_edge_c),
-    };
-    judge(&series, lock.hold())
-}
-
-fn max_temp(a: Option<f64>, b: Option<f64>) -> Option<f64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.max(y)),
-        (Some(x), None) => Some(x),
-        (None, Some(y)) => Some(y),
-        (None, None) => None,
+    let mut series = series_from_pre(cfg, range, &pre);
+    series.load1_post = post.load1;
+    series.post_package = post.package;
+    series.post_core = post.core;
+    series.post_ppt_w = post.ppt_w;
+    series.tctl_post = post.cpu_tctl_c;
+    series.edge_post = post.gpu_edge_c;
+    series.trial_package = (pkg0, pkg1);
+    series.trial_core = (core0, core1);
+    series.trial_ppt_j = crate::trapezoid_joules(&ppt_series);
+    series.cpu_before = ticks0;
+    series.cpu_after = ticks1;
+    series.workload_busy = workload_busy;
+    series.tctl_workload = tctl_workload;
+    series.edge_workload = edge_workload;
+    series.workload_reached = true;
+    series.post_reached = true;
+    series.cpu_tctl_c = phase_temp(&[series.tctl_pre, series.tctl_workload, series.tctl_post]);
+    series.gpu_edge_c = phase_temp(&[series.edge_pre, series.edge_workload, series.edge_post]);
+    if let Some(reason) = post.blocked {
+        return refused(format!("post-trial idle: {reason}"), lock.hold(), &series, None);
     }
+    judge(&series, lock.hold())
 }
 
 fn refusal_now(lock: &LockGuard, cfg: &LiveConfig, reason: String) -> DriveReceipt {
     let mut series = empty_series();
     series.busy_fraction_max = cfg.busy_fraction_max;
     series.load1_max = cfg.load1_max;
-    series.cpu_tctl_c = millic_to_c(&cfg.cpu_tctl);
-    series.gpu_edge_c = millic_to_c(&cfg.gpu_edge);
     series.pinned = cfg.pin_cores.clone();
     refused(reason, lock.hold(), &series, None)
 }
@@ -746,6 +1009,17 @@ mod tests {
             range_uj: FRAMEWORK_RANGE_UJ,
             cpu_tctl_c: Some(70.0),
             gpu_edge_c: Some(55.0),
+            settle_busy: vec![0.01, 0.02],
+            workload_busy: vec![0.01],
+            tctl_pre: Some(68.0),
+            tctl_workload: Some(70.0),
+            tctl_post: Some(69.0),
+            edge_pre: Some(50.0),
+            edge_workload: Some(55.0),
+            edge_post: Some(52.0),
+            workload_reached: true,
+            post_reached: true,
+            pre_reached: true,
         }
     }
 
@@ -881,5 +1155,102 @@ mod tests {
         assert!(edge.ends_with("temp2_input"));
         assert!(crate::hwmon_input(&root, "amdgpu", "temp", "temp1").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settle_above_the_limit_blocks_the_workload() {
+        assert!(pre_idle_gate(&[0.4, 2.5], &[0.01], 2.0, 0.10).unwrap_err().contains("load1"));
+        assert!(pre_idle_gate(&[0.4, 1.0], &[0.01, 0.40], 2.0, 0.10).unwrap_err().contains("busy fraction"));
+        assert!(pre_idle_gate(&[0.4, 1.0], &[0.01, 0.05], 2.0, 0.10).is_ok());
+    }
+
+    #[test]
+    fn a_workload_abort_keeps_settle_evidence_and_nulls_joules() {
+        let mut s = quiet_series();
+        s.post_reached = false;
+        s.load1_post.clear();
+        s.post_package.clear();
+        s.post_core.clear();
+        s.post_ppt_w.clear();
+        s.tctl_post = None;
+        s.edge_post = None;
+        s.workload_reached = true;
+        s.workload_busy = vec![0.02, 0.40];
+        s.tctl_workload = Some(72.5);
+        s.edge_workload = Some(61.0);
+        s.trial_ppt_j = None;
+        let r = refused(
+            "non-pinned busy fraction 0.4 exceeds the predeclared 0.1".into(),
+            held(),
+            &s,
+            Some(0.4),
+        );
+        assert!(!r.attributable);
+        assert!(r.rapl_package_j.is_none());
+        assert!(r.rapl_core_j.is_none());
+        assert!(r.amdgpu_ppt_j.is_none());
+        let j = receipt_json(&r);
+        assert!(j["joules"].is_null());
+        assert_eq!(j["phases"]["pre_idle"]["reached"], true);
+        assert_eq!(j["phases"]["pre_idle"]["load1"], serde_json::json!([0.5, 1.0, 1.5]));
+        assert_eq!(j["phases"]["pre_idle"]["load1_max"], serde_json::json!(1.5));
+        assert_eq!(j["phases"]["pre_idle"]["busy_fraction"], serde_json::json!([0.01, 0.02]));
+        assert_eq!(j["phases"]["pre_idle"]["cpu_tctl_max_c"], serde_json::json!(68.0));
+        assert_eq!(j["phases"]["pre_idle"]["gpu_edge_max_c"], serde_json::json!(50.0));
+        let pkg = j["phases"]["pre_idle"]["baseline_power_w"]["rapl_package"].as_array().unwrap();
+        assert!(!pkg.is_empty());
+        assert_eq!(j["phases"]["workload"]["reached"], true);
+        assert_eq!(j["phases"]["workload"]["busy_fraction"], serde_json::json!([0.02, 0.40]));
+        assert_eq!(j["phases"]["workload"]["cpu_tctl_max_c"], serde_json::json!(72.5));
+        assert_eq!(j["phases"]["workload"]["gpu_edge_max_c"], serde_json::json!(61.0));
+        assert_eq!(j["phases"]["post_idle"]["reached"], false);
+        assert_eq!(j["phases"]["post_idle"]["cpu_tctl_max_c"], serde_json::Value::Null);
+        assert_eq!(j["drift"]["status"], "not_reached");
+        assert_eq!(j["drift"]["phase"], "post_idle");
+    }
+
+    #[test]
+    fn a_settle_refusal_names_the_phase_that_was_not_reached() {
+        let mut s = quiet_series();
+        s.load1_pre = vec![0.2, 3.0];
+        s.settle_busy = vec![0.04];
+        s.workload_reached = false;
+        s.post_reached = false;
+        s.workload_busy.clear();
+        s.tctl_workload = None;
+        s.edge_workload = None;
+        s.tctl_post = None;
+        s.edge_post = None;
+        let r = refused("pre-trial idle: load1 3 exceeds 2".into(), held(), &s, None);
+        let j = receipt_json(&r);
+        assert!(j["joules"].is_null());
+        assert_eq!(j["phases"]["pre_idle"]["load1_max"], serde_json::json!(3.0));
+        assert_eq!(j["phases"]["workload"]["reached"], false);
+        assert_eq!(j["drift"]["status"], "not_reached");
+        assert_eq!(j["drift"]["phase"], "workload");
+        assert_eq!(r.grades.pre_idle, Grade::Refused);
+    }
+
+    #[test]
+    fn both_brackets_compute_drift_on_a_refusal() {
+        let mut s = quiet_series();
+        s.load1_post = vec![4.0];
+        let r = judge(&s, held());
+        assert!(!r.attributable);
+        assert!(r.rapl_package_j.is_none());
+        let j = receipt_json(&r);
+        assert_eq!(j["drift"]["status"], "computed");
+        assert!(j["joules"].is_null());
+    }
+
+    #[test]
+    fn an_unpinned_smt_sibling_is_refused() {
+        let siblings = |cpu: usize| {
+            if cpu < 16 { vec![cpu, cpu + 16] } else { vec![cpu - 16, cpu] }
+        };
+        let missing = unpinned_siblings(&[0, 1, 2, 3], siblings);
+        assert_eq!(missing, vec![(0, 16), (1, 17), (2, 18), (3, 19)]);
+        assert!(unpinned_siblings(&[0, 1, 2, 3, 16, 17, 18, 19], siblings).is_empty());
+        assert_eq!(parse_cpu_list("0-3,16-19").unwrap(), vec![0, 1, 2, 3, 16, 17, 18, 19]);
     }
 }

@@ -2,9 +2,11 @@
 
 `ferric-fleet energy-drive` holds an exclusive non-blocking `flock` on `/tmp/bmi-energy.lock` from preflight through the post-trial idle bracket. bmi-1's ferrotherm harness uses the same path. If the lock is taken, the driver writes a refusal receipt and retries later. It does not block while counters are running, does not use sudo, and does not signal any process except the workload it spawned.
 
-A refusal receipt has no joule fields. RAPL package, RAPL core, and amdgpu PPT are graded separately and are never added. CPU Tctl and GPU edge temperature are read from the hwmon channel whose label is `Tctl` or `edge`, not from a fixed `hwmonN` index. PPT is the amdgpu channel labeled `PPT`.
+A refusal receipt keeps every phase collected up to the abort and sets `joules` to null. `rapl_package_j`, `rapl_core_j`, and `amdgpu_ppt_j` stay null with it. Those three meters are graded separately and are never added. CPU Tctl and GPU edge temperature are the maximum of the samples in each phase (`phases.<phase>.cpu_tctl_max_c` and `gpu_edge_max_c`), read from the hwmon channel whose label is `Tctl` or `edge`, not from a fixed `hwmonN` index and not from a single reading taken at the refusal. PPT is the amdgpu channel labeled `PPT`.
 
-The idle bracket is 60 s and every load1 sample in it must be ≤ 2. During the workload the busy fraction on cores outside `--pin-cores` must stay at or below `--busy-fraction-max`, which is written into the receipt before the workload starts. The before and after package-power baselines must agree within 3σ of their pooled sample deviation. The RAPL modulus on framework-128gb-0000 is 65532610987 µJ.
+The idle bracket is 60 s. After it, and before the workload is spawned, every settle load1 sample must be ≤ `--load1-max` and every settle busy-fraction sample on cores outside `--pin-cores` must be ≤ `--busy-fraction-max`. A sample over either limit refuses the attempt, so a busy host does not also receive the trial load. The same busy-fraction cap is checked again while the workload runs. The before and after package-power baselines must agree within 3σ of their pooled sample deviation. `drift` is `{"status":"computed",...}` when both brackets were collected, and `{"status":"not_reached","phase":"<pre_idle|workload|post_idle>"}` otherwise. The RAPL modulus on framework-128gb-0000 is 65532610987 µJ.
+
+`--pin-cores` must include each pinned thread's SMT sibling. On framework-128gb-0000 the siblings of 0–3 are 16–19; a pin of `0,1,2,3` leaves those siblings in the non-pinned set, so the workload's own sibling threads count toward the busy fraction. The driver reads `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list` and refuses before the settle when any sibling is missing. The cpu list accepts commas and ranges.
 
 On that machine, as the user who can read the counters:
 
@@ -17,7 +19,7 @@ nohup /path/to/ferric-fleet energy-drive \
   --settle-s 60 \
   --load1-max 2 \
   --busy-fraction-max 0.10 \
-  --pin-cores 0,1,2,3 \
+  --pin-cores 0-3,16-19 \
   --rapl-package /sys/class/powercap/intel-rapl:0/energy_uj \
   --rapl-core /sys/class/powercap/intel-rapl:0:0/energy_uj \
   -- \

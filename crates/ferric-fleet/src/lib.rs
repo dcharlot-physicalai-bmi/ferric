@@ -16,8 +16,9 @@ pub use acquire::{Artifact, artifacts, url, verify_bytes};
 pub use bind::{ClockSnapshot, bind_clock};
 pub use infer::{ACTION_CHUNK_BLOCKER, digest_f32, load_tensor, state_proj};
 pub use energy_drive::{
-    judge, pinned_argv, receipt_json, run_locked_attempt, run_until_quiet, try_lock_exclusive, BusyFraction,
-    CpuTicks, DriveReceipt, EnergySeries, Grade, LiveConfig, LockHold, LOAD1_MAX, LOCK_PATH, SETTLE_S,
+    judge, parse_cpu_list, pinned_argv, receipt_json, run_locked_attempt, run_until_quiet, try_lock_exclusive,
+    BusyFraction, CpuTicks, DriveReceipt, EnergySeries, Grade, LiveConfig, LockHold, LOAD1_MAX, LOCK_PATH,
+    SETTLE_S,
 };
 pub use meter::{
     hwmon_input, trapezoid_joules, Domain, Sample, delta_uj, dram_joules, evaluate_domains,

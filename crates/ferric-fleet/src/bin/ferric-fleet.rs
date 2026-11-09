@@ -192,8 +192,14 @@ fn energy_drive(args: &[String]) -> i32 {
         eprintln!("energy-drive needs a workload after --");
         return 2;
     }
-    let pin = flag("--pin-cores").unwrap_or("0,1,2,3");
-    let cores: Vec<usize> = pin.split(',').filter_map(|s| s.parse().ok()).collect();
+    let pin = flag("--pin-cores").unwrap_or("0,1,2,3,16,17,18,19");
+    let cores = match ferric_fleet::parse_cpu_list(pin) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("--pin-cores: {e}");
+            return 2;
+        }
+    };
     let deadline_s: f64 = flag("--deadline-s").and_then(|s| s.parse().ok()).unwrap_or(6.0 * 60.0 * 60.0);
     let retry_s: f64 = flag("--retry-wait-s").and_then(|s| s.parse().ok()).unwrap_or(120.0);
     let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
