@@ -17,10 +17,16 @@ Protocol `docs/acceptance/protocols/D-hermetic-production.md`, tolerance `D.herm
 
 Forks under `forks/` and the README's vendor instructions are historical description. `ferric-tier` tests are the bounds procedure, not a completed two-machine rebuild. Target: `target.d.hermetic`. Measured set: empty.
 
+## Status on 2026-11-09
+
+Issue number 5 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. `Cargo.lock` is still gitignored. No two-machine offline rebuild was run, and no release artifact digests were compared. This issue still does not ask for a lockfile to be added on this branch.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No existing hermetic-build issue.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 5 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE address david@openie.dev is not an acceptable actor. This body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.

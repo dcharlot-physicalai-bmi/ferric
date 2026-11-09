@@ -19,10 +19,16 @@ The methodology pin is Zeus `zeus-v0.16.0` (2026-07-07) and the ML.ENERGY Benchm
 
 `crates/ferric-serve/src/energy.rs` labeling the server figure derived, and `ferric-joule` refusing estimates, are historical contracts of the code. They are not a joule measurement of a model. `scripts/speech_joules_browser.sh` points at a developer-machine tree this workstream does not touch. The ML.ENERGY leaderboard and the Hugging Face dataset `ml-energy/benchmark-v3` are external published results. They are not Ferric receipts. Targets: `target.c.energy-leadership`. Measured set: empty. No fabric cell was metered for this change.
 
+## Status on 2026-11-09
+
+Issue number 4 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. No prefill, decode, or training joule was measured. `gpu_energy` is not claimed for the SmolVLA forward on `cursor/fleet-energy-harness-65da`. The fleet harness refusing to add RAPL package and core, or PPT and package, is a code contract, not a watt measurement. Zeus and the ML.ENERGY leaderboard stay external cross-checks.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No existing energy-leadership issue.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 4 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. david@openie.dev is the OpenIE run owner and is not an acceptable actor for opening this issue. The body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.

@@ -17,10 +17,16 @@ Protocol `docs/acceptance/protocols/F-closed-loop.md`, tolerance `F.closed-loop.
 
 The MLP assert in `crates/ferric-tensor/examples/ferromotion_mlp.rs` is an in-tree gate and a historical record. It does not include a second implementation or a joule figure. The 1e-3 agreement bar is a preregistered target, not an observed error. ferrotherm and ferromorphic are not crates in this repository. Target: `target.f.closed-loop`. Measured set: empty.
 
+## Status on 2026-11-09
+
+Issue number 7 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. A simulation clock step on `cursor/fleet-energy-harness-65da`, when present, keeps `authorize_rollout` at `ProposedEntryInvoked` and `robot_actuated` false. That gate is not `f.closed-loop.ferromotion-sin3x.v1`. It is not event-NIR, not a ferrotherm window, and not a joule measurement. Synthetic images do not count as a sensor.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No existing closed-loop issue.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 7 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. david@openie.dev is an OpenIE identity and is not an acceptable actor. This body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.

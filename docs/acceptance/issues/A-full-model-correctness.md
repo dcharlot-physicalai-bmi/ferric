@@ -19,10 +19,16 @@ A closing receipt is `evidence_class: measured`, `tolerance.id` `A.full-model.v1
 
 Targets live in `docs/acceptance/corpus/targets.json` (`target.a.full-model`). Historical author claims, including the 1e-3/1e-4 band and the generate.rs assert, live in `docs/acceptance/corpus/historical.json`. Measured receipts for this track are empty as of 2026-11-06 (`docs/acceptance/corpus/measured.json`). Do not close this issue on a historical sentence.
 
+## Status on 2026-11-09
+
+Issue number 2 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. That is the measured set. A SmolVLA f32 network forward on `cursor/fleet-energy-harness-65da` is not a closing receipt for `A.full-model.v1`. The pinned stats file has no `observation.state` mean or std, so MEAN_STD execution is refused instead of being treated as IDENTITY. Images used on that branch are synthetic protocol inputs. The six closing stages remain tokenization, import, logits, generation, malformed, and resource_bounds. Do not close issue 2 on the fleet forward.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No open or closed issue exists to deduplicate. Open one issue for this track, not a second one later for the same protocol.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 2 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. `gh api user` returned 403. The Cursor run owner email is david@openie.dev, and that OpenIE account is not an acceptable actor for a remote write. This body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.

@@ -49,27 +49,27 @@
     },
     {
       "path": "docs/acceptance/issues/A-full-model-correctness.md",
-      "sha256": "09514771d7cf0237839c230f0b634735ba2098cec4d5fcd43b813330eaa53c21"
+      "sha256": "43c074fff2156e35763fe058ea35cdd3f4aa533e6271f1118061973b64a53de0"
     },
     {
       "path": "docs/acceptance/issues/B-fabric-contracts.md",
-      "sha256": "3df9452eb9b70d47dd8fd07ce921eee87c3c96db101d4cc57853ccdf1b886a00"
+      "sha256": "0a7630bec8a61ca2a63a5b0579ace858c582d6b1c8ce75d4a847e4f18b4c0f24"
     },
     {
       "path": "docs/acceptance/issues/C-energy-leadership.md",
-      "sha256": "db07955180e312007e29ac71aaaeaa9335f726d4242aeb37f4a93eae8837a59a"
+      "sha256": "5a84ffa466c29c7db547586a17e63f3280e287a0c3cefd5c056dbd22bc1000da"
     },
     {
       "path": "docs/acceptance/issues/D-hermetic-production.md",
-      "sha256": "3816a5a3a2b7ac758310c9c62da95af118cfcdb7f7edd817951ab2848c41e9b2"
+      "sha256": "85b54dab42d9d4c463cc78f8c344e7867ec3d6705539186a2105fe8d3a98b52f"
     },
     {
       "path": "docs/acceptance/issues/E-prior-art-matrix.md",
-      "sha256": "7c43249f6c8a57f67120ab86a925c0f413f55d611c8d9c38e6f0018fbdfa8d16"
+      "sha256": "653a6f984e084bc53b74714340d5db073295251c562941a6892c46f4a483f053"
     },
     {
       "path": "docs/acceptance/issues/F-closed-loop.md",
-      "sha256": "7af7cd3c56d099882893d269d190e11d0242a4b173bc638eeb47d36ef8b66146"
+      "sha256": "aa4c76de15895a0f0620f935e4763399853a85c55dc246ef21215384a7b5a64e"
     },
     {
       "path": "docs/acceptance/protocols/A-full-model-correctness.md",

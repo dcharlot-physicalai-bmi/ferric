@@ -17,10 +17,16 @@ Protocol `docs/acceptance/protocols/E-prior-art-matrix.md`, tolerance `E.leaders
 
 `docs/parity/MATRIX.md` is historical_author, owner David Jean Charlot, commit `d36f756`. Sentences in that file are not re-measurements. Target: `target.e.leadership-matrix`. Measured set: empty.
 
+## Status on 2026-11-09
+
+Issue number 6 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. No leadership cell has a new measured receipt. `docs/parity/MATRIX.md` stays `historical_author`. `matrix.leadership_cells_open` is not zero.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No existing prior-art issue.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 6 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. An OpenIE account, including david@openie.dev, is not an acceptable owner or opener. This body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.

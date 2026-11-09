@@ -17,10 +17,16 @@ Protocol `docs/acceptance/protocols/B-fabric-contracts.md`, tolerance `B.fabric-
 
 The README's 7.15e-7 cross-fabric number, the M5 Max roster, the browser Paris sentence, and the 1e-4 / 5e-2 in-tree asserts are historical author records. They are not new measurements. Targets are `target.b.fabric-cells`. The measured set is empty.
 
+## Status on 2026-11-09
+
+Issue number 3 is open with this title. This file is the body for `dcharlot-physicalai-bmi` to apply if that issue is edited or reopened. This workstream does not call the issues API and does not open a pull request.
+
+`docs/acceptance/corpus/measured.json` still has `receipts: []`. No required fabric cell has a measured pass. A lavapipe or llvmpipe dispatch, including one recorded on `cursor/fleet-energy-harness-65da`, does not close hardware Vulkan, Metal, DX12, or a real-browser WebGPU cell. Cells with no kernel stay required.
+
 ## Dedup
 
-On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. No existing issue covers this track.
+On 2026-11-06, `gh issue list --repo dcharlot-physicalai-bmi/ferric --state all --limit 100` returned []. On 2026-11-09 that list shows issues 2 through 7 open, one per track. Issue 3 is this file. Do not open a second issue for the same protocol.
 
 ## Identity
 
-GitHub actor available to this workstream is cursor[bot], not dcharlot-physicalai-bmi. The Cursor run owner email david@openie.dev is an OpenIE identity and is not an acceptable actor. This body was prepared in-tree and the issue was not opened.
+The actor that prepared this body is cursor[bot], not dcharlot-physicalai-bmi. The OpenIE account is not an acceptable actor. This body stays in the tree for dcharlot-physicalai-bmi to apply. It does not link an issue URL.
