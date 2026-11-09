@@ -1,0 +1,64 @@
+{
+  "unit_roundoff": 1.1920928955078125e-07,
+  "per_matmul_element": "2 * u * sqrt(K)",
+  "within_layer": "root-sum-square",
+  "across_layers": "root-sum-square, jacobian 1",
+  "euler": "ten steps of dt=0.1, root-sum-square",
+  "max_abs_factor": "sqrt(2 * ln(N))",
+  "stages": {
+    "prepared_image0": {
+      "element_bound": 9.5367431640625e-07,
+      "vector_length": 786432,
+      "extreme_factor": 5.210616381724359,
+      "max_abs_bound": 4.969231015896186e-06
+    },
+    "patch_token0": {
+      "element_bound": 6.607249479556569e-06,
+      "vector_length": 768,
+      "extreme_factor": 3.645213226451279,
+      "max_abs_bound": 2.4084833193342935e-05
+    },
+    "vision_l0_token0": {
+      "element_bound": 2.538010288652661e-05,
+      "vector_length": 768,
+      "extreme_factor": 3.645213226451279,
+      "max_abs_bound": 9.251588673066108e-05
+    },
+    "vision_post_token0": {
+      "element_bound": 8.540045675239161e-05,
+      "vector_length": 768,
+      "extreme_factor": 3.645213226451279,
+      "max_abs_bound": 0.00031130287449879836
+    },
+    "connector_token0": {
+      "element_bound": 8.93964761300954e-05,
+      "vector_length": 960,
+      "extreme_factor": 3.705923173640242,
+      "max_abs_bound": 0.0003312964725322973
+    },
+    "state_token": {
+      "element_bound": 1.3486991523486091e-06,
+      "vector_length": 960,
+      "extreme_factor": 3.705923173640242,
+      "max_abs_bound": 4.998175442957662e-06
+    },
+    "text_l0_k_token0": {
+      "element_bound": 1.0446978712180445e-05,
+      "vector_length": 320,
+      "extreme_factor": 3.396563261826216,
+      "max_abs_bound": 3.548382409087265e-05
+    },
+    "velocity0": {
+      "element_bound": 0.00016033928631191847,
+      "vector_length": 32,
+      "extreme_factor": 2.6327688477341593,
+      "max_abs_bound": 0.00042213627806994704
+    },
+    "raw_actions": {
+      "element_bound": 5.070373431515214e-05,
+      "vector_length": 1600,
+      "extreme_factor": 3.841291165279683,
+      "max_abs_bound": 0.0001947678066714822
+    }
+  }
+}

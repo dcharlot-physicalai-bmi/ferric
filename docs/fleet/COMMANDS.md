@@ -41,6 +41,8 @@ cargo run -p ferric-smolvla --release -- simulate \
 
 `docs/fleet/smolvla-cpu-infer.json` is an earlier run that unnormalized with the unpinned key `so100.buffer.action` and padded state without mean/std. It is not an execution receipt.
 
+The quiet driver and the f32 bound are `docs/fleet/ENERGY-DRIVE.md` and `docs/fleet/TOLERANCE.md`. The RADV gfx1151 file `docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json` stays `attributable: false`.
+
 `preflight` refuses an adapter name containing `llvmpipe`, `lavapipe`, or `swiftshader`. It does not open a device. The worker passes the name wgpu reports. RADV on the Framework is eligible. llvmpipe on that same machine is not.
 
 Measurement windows stay separate: `load`, `compile`, `warmup`, `steady-infer`, `joint-step`. Around each window the worker drains wgpu the way `Context::flush` does: `queue.submit` of an empty batch, then `device.poll(wait_indefinitely)`. Steady inference and the joint step also read results back after the second drain.

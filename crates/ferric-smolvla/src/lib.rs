@@ -12,11 +12,14 @@
 mod gemm;
 mod gpu;
 mod model;
+mod tolerance;
 pub mod weights;
 
-pub use gpu::{forward_gpu, GpuForward};
+pub use tolerance::{bounds_json, max_abs_bound, within_bound, F32_U};
 
-pub use model::{Forward, Sample, forward, resize_with_pad, sinusoidal};
+pub use gpu::{forward_gpu, GpuForward, GpuSession};
+
+pub use model::{ActivationTrace, Forward, Sample, forward, resize_with_pad, sinusoidal};
 
 use ferric_accept::smolvla::{ActionChunk, ChunkIdentity, JointMeta, encode_action_chunk};
 use ferric_accept::{hex, sha256};

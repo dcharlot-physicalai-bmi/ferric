@@ -12,10 +12,11 @@ fn main() {
         "preflight" => preflight(&args.collect::<Vec<_>>()),
         "check-bytes" => check_bytes(&args.collect::<Vec<_>>()),
         "infer" => infer(&args.collect::<Vec<_>>()),
+        "energy-drive" => energy_drive(&args.collect::<Vec<_>>()),
         other => {
             eprintln!("unknown command `{other}`");
             eprintln!(
-                "commands: plan | acquire --dir DIR | preflight --adapter-name NAME | check-bytes PATH ARTIFACT | infer --weights PATH"
+                "commands: plan | acquire --dir DIR | preflight --adapter-name NAME | check-bytes PATH ARTIFACT | infer --weights PATH | energy-drive [flags] -- WORKLOAD"
             );
             2
         }
@@ -157,6 +158,78 @@ fn infer(args: &[String]) -> i32 {
     println!("model_receipts {}", ferric_fleet::MODEL_RECEIPTS);
     println!("joint_step_executed {}", ferric_fleet::JOINT_STEP_EXECUTED);
     1
+}
+
+fn energy_drive(args: &[String]) -> i32 {
+    let mut flags = Vec::new();
+    let mut workload = Vec::new();
+    let mut after = false;
+    for arg in args {
+        if after {
+            workload.push(arg.clone());
+        } else if arg == "--" {
+            after = true;
+        } else {
+            flags.push(arg.clone());
+        }
+    }
+    let flag = |name: &str| {
+        flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).map(String::as_str)
+    };
+    let Some(out) = flag("--out-dir") else {
+        eprintln!("energy-drive needs --out-dir and -- WORKLOAD");
+        return 2;
+    };
+    let Some(pkg) = flag("--rapl-package") else {
+        eprintln!("energy-drive needs --rapl-package");
+        return 2;
+    };
+    let Some(core) = flag("--rapl-core") else {
+        eprintln!("energy-drive needs --rapl-core");
+        return 2;
+    };
+    if workload.is_empty() {
+        eprintln!("energy-drive needs a workload after --");
+        return 2;
+    }
+    let pin = flag("--pin-cores").unwrap_or("0,1,2,3");
+    let cores: Vec<usize> = pin.split(',').filter_map(|s| s.parse().ok()).collect();
+    let deadline_s: f64 = flag("--deadline-s").and_then(|s| s.parse().ok()).unwrap_or(6.0 * 60.0 * 60.0);
+    let retry_s: f64 = flag("--retry-wait-s").and_then(|s| s.parse().ok()).unwrap_or(120.0);
+    let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
+    let load1_max: f64 = flag("--load1-max").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::LOAD1_MAX);
+    let busy_max: f64 = flag("--busy-fraction-max").and_then(|s| s.parse().ok()).unwrap_or(0.10);
+    let lock = flag("--lock").unwrap_or(ferric_fleet::LOCK_PATH);
+    let hwmon = std::path::Path::new("/sys/class/hwmon");
+    let cfg = ferric_fleet::LiveConfig {
+        rapl_package: pkg.into(),
+        rapl_core: core.into(),
+        ppt: ferric_fleet::hwmon_input(hwmon, "amdgpu", "power", "PPT"),
+        cpu_tctl: ferric_fleet::hwmon_input(hwmon, "k10temp", "temp", "Tctl"),
+        gpu_edge: ferric_fleet::hwmon_input(hwmon, "amdgpu", "temp", "edge"),
+        settle_s,
+        load1_max,
+        busy_fraction_max: busy_max,
+        pin_cores: cores,
+        workload,
+    };
+    let out_dir = std::path::PathBuf::from(out);
+    match ferric_fleet::run_until_quiet(
+        std::path::Path::new(lock),
+        &out_dir,
+        std::time::Duration::from_secs_f64(deadline_s),
+        std::time::Duration::from_secs_f64(retry_s),
+        |guard| ferric_fleet::run_locked_attempt(&cfg, guard),
+    ) {
+        Ok(receipt) => {
+            println!("{}", serde_json::to_string_pretty(&ferric_fleet::receipt_json(&receipt)).unwrap());
+            if receipt.attributable { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 fn check_bytes(args: &[String]) -> i32 {

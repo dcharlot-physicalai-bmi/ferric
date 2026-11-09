@@ -224,29 +224,90 @@ fn unfold_patches(pixels: &[f32]) -> Vec<f32> {
     cols
 }
 
-pub async fn forward_gpu(store: &Store, sample: &Sample) -> Result<GpuForward, String> {
-    if !sample.allow_unnormalized_network {
-        return Err("the wgpu graph runs only the declared non-executable network forward".into());
+/// Device-resident weights and the context they live on. A second `forward`
+/// reuses the uploaded weights, so a measured steady window does not include
+/// weight upload. The first `forward` uploads and compiles.
+pub struct GpuSession {
+    pub ctx: Context,
+    pub software: bool,
+    pub listed: Vec<String>,
+    mats: HashMap<String, Tensor>,
+    vecs: HashMap<String, Tensor>,
+    embed0: Option<Tensor>,
+    embed1: Option<Tensor>,
+    embed_mid: u32,
+}
+
+impl GpuSession {
+    pub async fn open() -> Result<Self, String> {
+        let listed = Context::enumerate().await;
+        let ctx = Context::new().await?;
+        let name_l = ctx.adapter_name.to_lowercase();
+        let software = name_l.contains("llvmpipe")
+            || name_l.contains("lavapipe")
+            || name_l.contains("swiftshader")
+            || listed.iter().any(|(n, _, t)| n == &ctx.adapter_name && format!("{t:?}").contains("Cpu"));
+        Ok(Self {
+            ctx,
+            software,
+            listed: listed.iter().map(|(n, b, t)| format!("{n} | {b:?} | {t:?}")).collect(),
+            mats: HashMap::new(),
+            vecs: HashMap::new(),
+            embed0: None,
+            embed1: None,
+            embed_mid: 0,
+        })
     }
-    let listed = Context::enumerate().await;
-    let ctx = Context::new().await?;
-    let name_l = ctx.adapter_name.to_lowercase();
-    let software = name_l.contains("llvmpipe")
-        || name_l.contains("lavapipe")
-        || name_l.contains("swiftshader")
-        || listed.iter().any(|(n, _, t)| n == &ctx.adapter_name && format!("{t:?}").contains("Cpu"));
-    let mut dev = Dev {
-        ctx: &ctx,
-        store,
-        mats: HashMap::new(),
-        vecs: HashMap::new(),
-        embed0: None,
-        embed1: None,
-        embed_mid: 0,
-        dispatches: 0,
-        completions: 0,
-        readbacks: 0,
-    };
+
+    /// Submit an empty batch, then `device.poll(wait_indefinitely)`.
+    pub fn drain(&self) {
+        self.ctx.flush();
+    }
+
+    pub async fn forward(&mut self, store: &Store, sample: &Sample) -> Result<GpuForward, String> {
+        if !sample.allow_unnormalized_network {
+            return Err("the wgpu graph runs only the declared non-executable network forward".into());
+        }
+        let mut dev = Dev {
+            ctx: &self.ctx,
+            store,
+            mats: std::mem::take(&mut self.mats),
+            vecs: std::mem::take(&mut self.vecs),
+            embed0: self.embed0.take(),
+            embed1: self.embed1.take(),
+            embed_mid: self.embed_mid,
+            dispatches: 0,
+            completions: 0,
+            readbacks: 0,
+        };
+        let out = run_graph(&mut dev, sample).await;
+        self.mats = std::mem::take(&mut dev.mats);
+        self.vecs = std::mem::take(&mut dev.vecs);
+        self.embed0 = dev.embed0.take();
+        self.embed1 = dev.embed1.take();
+        self.embed_mid = dev.embed_mid;
+        let (raw, trace) = out?;
+        Ok(GpuForward {
+            raw_actions: raw,
+            adapter: self.ctx.adapter_name.clone(),
+            backend: format!("{:?}", self.ctx.backend),
+            software: self.software,
+            dispatches: dev.dispatches,
+            completions: dev.completions,
+            readbacks: dev.readbacks,
+            trace,
+            host_index_moves: &["patch_unfold", "pixel_shuffle"],
+        })
+    }
+}
+
+pub async fn forward_gpu(store: &Store, sample: &Sample) -> Result<GpuForward, String> {
+    let mut session = GpuSession::open().await?;
+    session.forward(store, sample).await
+}
+
+async fn run_graph(dev: &mut Dev<'_>, sample: &Sample) -> Result<(Vec<f32>, ActivationTrace), String> {
+    let mut dev = dev;
     let mut prefix_host = Vec::new();
     let mut pad = Vec::new();
     let mut att = Vec::new();
@@ -318,29 +379,20 @@ pub async fn forward_gpu(store: &Store, sample: &Sample) -> Result<GpuForward, S
         }
         dev.flush();
     }
-    Ok(GpuForward {
+    let trace = ActivationTrace {
+        prepared_image0,
+        vision: vision.unwrap_or(VisionSnap {
+            patch_plus_pos_token0: Vec::new(),
+            vision_layer0_token0: Vec::new(),
+            vision_post_token0: Vec::new(),
+            connector_token0: Vec::new(),
+        }),
+        state_token: state_host,
+        text_layer0_k_token0: k0,
+        velocity0,
         raw_actions: x.clone(),
-        adapter: ctx.adapter_name.clone(),
-        backend: format!("{:?}", ctx.backend),
-        software,
-        dispatches: dev.dispatches,
-        completions: dev.completions,
-        readbacks: dev.readbacks,
-        trace: ActivationTrace {
-            prepared_image0,
-            vision: vision.unwrap_or(VisionSnap {
-                patch_plus_pos_token0: Vec::new(),
-                vision_layer0_token0: Vec::new(),
-                vision_post_token0: Vec::new(),
-                connector_token0: Vec::new(),
-            }),
-            state_token: state_host,
-            text_layer0_k_token0: k0,
-            velocity0,
-            raw_actions: x,
-        },
-        host_index_moves: &["patch_unfold", "pixel_shuffle"],
-    })
+    };
+    Ok((x, trace))
 }
 
 async fn vision_image(dev: &mut Dev<'_>, pixels: &[f32], capture: bool) -> Result<(Vec<f32>, Option<VisionSnap>), String> {

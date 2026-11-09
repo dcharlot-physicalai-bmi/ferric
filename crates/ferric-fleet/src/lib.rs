@@ -7,6 +7,7 @@
 
 mod acquire;
 mod bind;
+mod energy_drive;
 mod infer;
 mod meter;
 mod window;
@@ -14,7 +15,13 @@ mod window;
 pub use acquire::{Artifact, artifacts, url, verify_bytes};
 pub use bind::{ClockSnapshot, bind_clock};
 pub use infer::{ACTION_CHUNK_BLOCKER, digest_f32, load_tensor, state_proj};
-pub use meter::{Domain, Sample, delta_uj, dram_joules, evaluate_domains};
+pub use energy_drive::{
+    judge, pinned_argv, receipt_json, run_locked_attempt, run_until_quiet, try_lock_exclusive, BusyFraction,
+    CpuTicks, DriveReceipt, EnergySeries, Grade, LiveConfig, LockHold, LOAD1_MAX, LOCK_PATH, SETTLE_S,
+};
+pub use meter::{
+    hwmon_input, trapezoid_joules, Domain, Sample, delta_uj, dram_joules, evaluate_domains,
+};
 pub use window::{
     Drain, Phase, attributable, duration_is_explicit, gpu_receipt_allowed, require_drains,
 };

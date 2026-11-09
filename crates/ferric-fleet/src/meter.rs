@@ -45,6 +45,57 @@ pub struct Sample {
     pub watts: Option<f64>,
 }
 
+/// Trapezoid integral of a power series `(t_ns, watts)` in joules.
+/// Fewer than two samples is not an integral.
+pub fn trapezoid_joules(series: &[(u64, f64)]) -> Option<f64> {
+    if series.len() < 2 {
+        return None;
+    }
+    Some(series.windows(2).map(|p| (p[1].0 - p[0].0) as f64 * 1e-9 * (p[0].1 + p[1].1) / 2.0).sum())
+}
+
+/// Find `{prefix}{n}_input` whose `{prefix}{n}_label` equals `label`, under a hwmon
+/// chip whose `name` file equals `chip`. The channel index is never assumed.
+pub fn hwmon_input(sys_class_hwmon: &std::path::Path, chip: &str, prefix: &str, label: &str) -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<_> = std::fs::read_dir(sys_class_hwmon).ok()?.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let Ok(name) = std::fs::read_to_string(dir.join("name")) else { continue };
+        if name.trim() != chip {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Some(file) = path.file_name().map(|s| s.to_string_lossy().into_owned()) else { continue };
+            if !file.starts_with(prefix) || !file.ends_with("_label") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if text.trim() != label {
+                continue;
+            }
+            let input = dir.join(file.replace("_label", "_input"));
+            if input.is_file() {
+                return Some(input);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trapezoid_matches_a_two_point_rectangle() {
+        let j = trapezoid_joules(&[(0, 10.0), (1_000_000_000, 10.0)]).unwrap();
+        assert!((j - 10.0).abs() < 1e-9, "{j}");
+        assert!(trapezoid_joules(&[(0, 1.0)]).is_none());
+    }
+}
+
 /// `(delta_uj, wrapped)`.
 pub fn delta_uj(start: u64, end: u64, range_uj: u64) -> Result<(u64, bool), String> {
     if end >= start {
