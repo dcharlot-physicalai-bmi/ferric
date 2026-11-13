@@ -224,7 +224,7 @@ fn energy_drive(args: &[String]) -> i32 {
         workload,
     };
     let out_dir = std::path::PathBuf::from(out);
-    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(3600.0);
     match ferric_fleet::run_until_quiet(
         std::path::Path::new(lock),
         &out_dir,
@@ -256,8 +256,12 @@ fn energy_drive_macmon(flags: &[String], workload: &[String], out: &str) -> i32 
     let retry_s: f64 = flag("--retry-wait-s").and_then(|s| s.parse().ok()).unwrap_or(120.0);
     let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
     let load1_max: f64 = flag("--load1-max").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::LOAD1_MAX);
-    let sample_ms: u64 = flag("--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let sample_ms: u64 = flag("--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(200);
+    if !(100..=250).contains(&sample_ms) {
+        eprintln!("macmon power samples must be between 100 and 250 ms; the quiet gate stays at 1 Hz");
+        return 2;
+    }
+    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(3600.0);
     let lock = flag("--lock").unwrap_or(ferric_fleet::LOCK_PATH);
     let cfg = ferric_fleet::MacmonConfig {
         settle_s,

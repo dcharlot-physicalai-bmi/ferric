@@ -654,6 +654,12 @@ pub struct MacmonSample {
     pub ecpu_mhz: f64,
     pub gpu_mhz: f64,
     pub cpu_active: f64,
+    pub gpu_active: f64,
+    /// `gpu_ram_power`. `NaN` when the key is absent.
+    pub gpu_ram: f64,
+    /// True when `ram_power` and `gpu_ram_power` are absent or exactly 0.
+    /// An exact zero is a missing counter, not a measured zero.
+    pub dram_unavailable: bool,
 }
 
 impl MacmonSample {
@@ -665,6 +671,17 @@ impl MacmonSample {
     /// compute-bound, so DRAM is a first-order term for exactly this workload.
     pub fn soc(&self) -> f64 {
         self.cpu + self.gpu + self.ane + self.ram
+    }
+
+    /// SoC watts only when DRAM was actually reported. Otherwise `None`: adding a zero
+    /// `ram_power` would publish a total that silently excludes DRAM.
+    pub fn soc_if_dram_reported(&self) -> Option<f64> {
+        if self.dram_unavailable { None } else { Some(self.soc()) }
+    }
+
+    /// `gpu + ram`, or `None` when DRAM is unavailable for the same reason.
+    pub fn accelerator_if_dram_reported(&self) -> Option<f64> {
+        if self.dram_unavailable { None } else { Some(self.gpu + self.ram) }
     }
 }
 
@@ -678,6 +695,9 @@ struct MacmonState {
     /// Keep only the samples of the last this-many seconds (0 = keep everything). A benchmark wants the
     /// whole trace; a server running for days must not grow a sample per 100 ms forever.
     keep_secs: f64,
+    /// Set when a SoC or accelerator sample had DRAM at exactly 0. The running total then
+    /// excludes DRAM, so [`Meter::read_joules`] refuses it.
+    dram_excluded: bool,
 }
 
 impl Macmon {
@@ -702,35 +722,36 @@ impl Macmon {
             use std::io::BufRead;
             for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                 let Some(mut sample) = parse_sample(&line) else { continue };
-                let w = match scope {
-                    MacmonScope::Soc => sample.soc(),
-                    MacmonScope::Accelerator => sample.gpu + sample.ram,
-                    MacmonScope::System => sample.sys,
+                let watts = |s: &MacmonSample| match scope {
+                    MacmonScope::Soc => s.soc_if_dram_reported(),
+                    MacmonScope::Accelerator => s.accelerator_if_dram_reported(),
+                    MacmonScope::System => s.sys.is_finite().then_some(s.sys),
                 };
+                let w = watts(&sample);
                 let now = Instant::now();
                 let Ok(mut st) = worker.lock() else { return };
+                if w.is_none() && !matches!(scope, MacmonScope::System) {
+                    st.dram_excluded = true;
+                }
                 // TRAPEZOID over the ACTUAL interval between samples, not the nominal one. The
                 // requested `-i` is not the delivered interval — a loaded machine runs late, and
                 // multiplying by the flag would count time at a power never observed. Trapezoid
                 // rather than a left sum because a rectangle systematically misses the ramp on
                 // every edge, and every edge biases the same direction so it never averages out.
-                if let Some(prev) = st.last {
+                if let (Some(prev), Some(w)) = (st.last, w) {
                     let dt = now.duration_since(prev).as_secs_f64();
-                    let prev_w = st.all.last().map(|s| match scope {
-                        MacmonScope::Soc => s.soc(),
-            MacmonScope::Accelerator => s.gpu + s.ram,
-                        MacmonScope::System => s.sys,
-                    });
-                    st.joules += match prev_w {
-                        Some(p) => 0.5 * (p + w) * dt,
-                        None => w * dt,
-                    };
-                } else {
+                    if let Some(p) = st.all.last().and_then(watts) {
+                        st.joules += 0.5 * (p + w) * dt;
+                        st.watt_sum += w;
+                    }
+                } else if st.first.is_none() {
+                    st.first = Some(now);
+                }
+                if st.first.is_none() {
                     st.first = Some(now);
                 }
                 sample.t = st.first.map(|f| now.duration_since(f).as_secs_f64()).unwrap_or(0.0);
                 st.last = Some(now);
-                st.watt_sum += w;
                 st.all.push(sample);
                 if st.keep_secs > 0.0 {
                     let cut = sample.t - st.keep_secs;
@@ -778,6 +799,11 @@ impl Macmon {
             return None;
         }
         let all = self.trace();
+        if matches!(self.scope, MacmonScope::Soc | MacmonScope::Accelerator)
+            && all.iter().any(|s| s.dram_unavailable)
+        {
+            return None;
+        }
         let w = |s: &MacmonSample| match self.scope {
             MacmonScope::Soc => s.soc(),
             MacmonScope::Accelerator => s.gpu + s.ram,
@@ -857,6 +883,10 @@ impl Macmon {
 /// **Each lookup includes the opening quote** — `"ram_power":` — which is what keeps it from
 /// matching inside `"gpu_ram_power":`, a collision that would silently add the wrong term and that
 /// nothing downstream would report.
+pub fn parse_macmon_line(line: &str) -> Option<MacmonSample> {
+    parse_sample(line)
+}
+
 fn parse_sample(line: &str) -> Option<MacmonSample> {
     let field = |k: &str| -> Option<f64> {
         let pat = format!("\"{k}\":");
@@ -865,12 +895,15 @@ fn parse_sample(line: &str) -> Option<MacmonSample> {
         let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
         rest[..end].trim().parse().ok()
     };
+    let ram = field("ram_power");
+    let gpu_ram = field("gpu_ram_power");
+    let dram_unavailable = ram.unwrap_or(0.0) == 0.0 && gpu_ram.unwrap_or(0.0) == 0.0;
     Some(MacmonSample {
         t: 0.0,
         cpu: field("cpu_power")?,
         gpu: field("gpu_power")?,
         ane: field("ane_power").unwrap_or(0.0),
-        ram: field("ram_power").unwrap_or(0.0),
+        ram: ram.unwrap_or(0.0),
         sys: field("sys_power").unwrap_or(f64::NAN),
         cpu_temp: field("cpu_temp_avg").unwrap_or(f64::NAN),
         gpu_temp: field("gpu_temp_avg").unwrap_or(f64::NAN),
@@ -878,13 +911,37 @@ fn parse_sample(line: &str) -> Option<MacmonSample> {
         ecpu_mhz: field("ecpu_freq_mhz").unwrap_or(f64::NAN),
         gpu_mhz: field("gpu_freq_mhz").unwrap_or(f64::NAN),
         cpu_active: field("cpu_active_ratio").unwrap_or(f64::NAN),
+        gpu_active: field("gpu_active_ratio").unwrap_or(f64::NAN),
+        gpu_ram: gpu_ram.unwrap_or(f64::NAN),
+        dram_unavailable,
     })
+}
+
+/// 1-minute load average from `getloadavg(3)`. `None` off macOS or when the call fails.
+pub fn macos_load1() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+        }
+        let mut v = [0.0f64; 3];
+        let n = unsafe { getloadavg(v.as_mut_ptr(), 3) };
+        if n >= 1 { Some(v[0]) } else { None }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 impl Meter for Macmon {
     fn read_joules(&self) -> Option<f64> {
         let s = self.state.lock().ok()?;
-        (!s.all.is_empty()).then_some(s.joules)
+        if s.all.is_empty() || s.dram_excluded {
+            None
+        } else {
+            Some(s.joules)
+        }
     }
     fn class(&self) -> Class {
         Class::Derived
@@ -1655,6 +1712,23 @@ mod meter_registry_tests {
         for (name, _, _) in METERS {
             assert!(capability_report().contains(name), "{name} is in METERS but not in the report");
         }
+    }
+
+    #[test]
+    fn exact_zero_dram_withholds_soc_and_accelerator() {
+        let line = r#"{"cpu_power":12.0,"gpu_power":30.0,"ane_power":0.5,"ram_power":0.0,"gpu_ram_power":0.0,"sys_power":65.99,"all_power":65.99}"#;
+        let s = parse_macmon_line(line).unwrap();
+        assert!(s.dram_unavailable);
+        assert!(s.soc_if_dram_reported().is_none());
+        assert!(s.accelerator_if_dram_reported().is_none());
+        assert!((s.sys - 65.99).abs() < 1e-9);
+        let reported = parse_macmon_line(
+            r#"{"cpu_power":1.0,"gpu_power":2.0,"ane_power":0.0,"ram_power":0.5,"gpu_ram_power":0.1,"sys_power":8.0}"#,
+        )
+        .unwrap();
+        assert!(!reported.dram_unavailable);
+        assert!((reported.soc() - 3.5).abs() < 1e-9);
+        assert!((reported.gpu_ram - 0.1).abs() < 1e-12);
     }
 
     /// ⚠ `Macmon` before `MacBattery`, because on a desk machine battery discharge is not a fallback

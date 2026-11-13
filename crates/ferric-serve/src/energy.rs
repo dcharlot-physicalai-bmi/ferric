@@ -92,6 +92,10 @@ pub(crate) fn attribute(samples: &[ferric_joule::MacmonSample], windows: &[(f64,
                       "why": format!("{secs:.3} s spans {} meter samples — too short to resolve at 100 ms", inside.len())});
     }
     let span: Vec<&ferric_joule::MacmonSample> = before.into_iter().chain(inside.iter().copied()).chain(after).collect();
+    if span.iter().any(|s| s.dram_unavailable) {
+        return json!({"joules": null, "soc_joules": null,
+                      "why": "DRAM fields read exactly 0; an accelerator or SoC total would exclude DRAM"});
+    }
     if let Some(bad) = span.iter().find(|s| s.cpu.max(s.gpu).max(s.ram).max(s.sys) > CEILING_W) {
         return json!({"joules": null, "why": format!("meter glitch: a sample read {:.0} W, above any machine this runs on", bad.cpu.max(bad.gpu).max(bad.ram).max(bad.sys))});
     }
@@ -174,7 +178,8 @@ mod tests {
     use super::*;
     fn s(t: f64, gpu: f64) -> ferric_joule::MacmonSample {
         ferric_joule::MacmonSample { t, cpu: 5.0, gpu, ane: 0.0, ram: 1.0, sys: 20.0, cpu_temp: 0.0, gpu_temp: 0.0,
-                                     pcpu_mhz: 0.0, ecpu_mhz: 0.0, gpu_mhz: 0.0, cpu_active: 0.0 }
+                                     pcpu_mhz: 0.0, ecpu_mhz: 0.0, gpu_mhz: 0.0, cpu_active: 0.0,
+                                     gpu_active: 0.0, gpu_ram: 0.0, dram_unavailable: false }
     }
 
     /// 2 W idle, 12 W while working for 2 s: 20 J above idle — all of it to a lone request, half each to

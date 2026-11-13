@@ -713,14 +713,7 @@ pub fn read_load1() -> Result<f64, String> {
     if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
         return crate::macmon::parse_proc_load1(&text);
     }
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .map_err(|e| format!("sysctl vm.loadavg: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("sysctl vm.loadavg: {}", String::from_utf8_lossy(&out.stderr)));
-    }
-    crate::macmon::parse_sysctl_loadavg(&String::from_utf8_lossy(&out.stdout))
+    ferric_joule::macos_load1().ok_or_else(|| "getloadavg returned no load1".into())
 }
 
 pub fn read_cpu_ticks() -> Result<Vec<CpuTicks>, String> {
@@ -1153,14 +1146,28 @@ pub fn macmon_receipt(attempt: &MacmonAttempt, lock: &LockHold) -> serde_json::V
         "attributable": ok,
         "reason": reason,
         "joules": joules.map(|j| serde_json::json!({
-            "sys": j.sys,
-            "cpu": j.cpu,
-            "gpu": j.gpu,
-            "ane": j.ane,
+            "gpu_power": j.gpu,
+            "cpu_power": j.cpu,
+            "ane_power": j.ane,
+            "ram_power": j.ram,
+            "gpu_ram_power": j.gpu_ram,
+            "sys_power": j.sys,
+            "soc": j.soc,
+            "soc_label": j.soc_label,
+            "accelerator": j.accelerator,
+            "accelerator_label": j.accelerator_label,
+            "dram_scope": j.dram_scope,
         })),
+        "context": {
+            "pre_idle": crate::macmon::context_means(&attempt.pre),
+            "workload": crate::macmon::context_means(&attempt.trial),
+            "post_idle": crate::macmon::context_means(&attempt.post),
+        },
+        "power_sample": "macmon pipe -i <ms> -s 0, 100-250 ms, trapezoid over the actual gap between samples",
+        "gate_sample_hz": 1,
         "summed": false,
         "soc_telemetry": crate::fleet_gate::SOC_TELEMETRY_LIMIT,
-        "macmon_version_note": "ferrotherm c82c1e96 does not name a macmon release. macmon PR 125, in the release named v0.11.0 (2026-11-06), drops ram_power when it exceeds system power. This driver does not integrate ram_power.",
+        "macmon_version_note": "ferrotherm c82c1e96 does not name a macmon release. macmon 0.11.0 can report ram_power and gpu_ram_power as exactly 0 while sys_power is nonzero. An exact 0 is unavailable, not a measured zero, and SoC and accelerator totals are refused rather than published without DRAM.",
         "overlaps": crate::macmon::overlaps(),
         "trial_window_rule": {
             "enforce": true,
@@ -1755,17 +1762,21 @@ mod tests {
         }, &held());
         assert_eq!(quiet["attributable"], true);
         assert_eq!(quiet["summed"], false);
-        assert_eq!(quiet["pinning"], "unavailable");
+        assert_eq!(quiet["pinning"], "no core pinning was applied");
+        assert!(quiet["joules"]["ram_power"].is_null());
+        assert!(quiet["joules"]["soc"].is_null());
+        assert_eq!(quiet["joules"]["dram_scope"], "unavailable");
+        assert_eq!(quiet["gate_sample_hz"], 1);
         assert_eq!(quiet["busy_fraction_status"], "unavailable");
         assert!(quiet["busy_fraction"].is_null());
         assert!(quiet["declared_before_run"] == true);
-        assert!((quiet["joules"]["sys"].as_f64().unwrap() - 5.876533).abs() < 1e-6);
-        assert!((quiet["joules"]["cpu"].as_f64().unwrap() - 0.20486385).abs() < 1e-6);
-        let summed = quiet["joules"]["sys"].as_f64().unwrap()
-            + quiet["joules"]["cpu"].as_f64().unwrap()
-            + quiet["joules"]["gpu"].as_f64().unwrap()
-            + quiet["joules"]["ane"].as_f64().unwrap();
-        assert!(summed > quiet["joules"]["sys"].as_f64().unwrap());
+        assert!((quiet["joules"]["sys_power"].as_f64().unwrap() - 5.876533).abs() < 1e-6);
+        assert!((quiet["joules"]["cpu_power"].as_f64().unwrap() - 0.20486385).abs() < 1e-6);
+        let summed = quiet["joules"]["sys_power"].as_f64().unwrap()
+            + quiet["joules"]["cpu_power"].as_f64().unwrap()
+            + quiet["joules"]["gpu_power"].as_f64().unwrap()
+            + quiet["joules"]["ane_power"].as_f64().unwrap();
+        assert!(summed > quiet["joules"]["sys_power"].as_f64().unwrap());
         let mut busy = quiet.clone();
         busy["load1_pre"] = serde_json::json!([3.0]);
         let refused = macmon_receipt(&MacmonAttempt {
@@ -1783,7 +1794,7 @@ mod tests {
         assert_eq!(refused["attributable"], false);
         assert!(refused["joules"].is_null());
         assert_eq!(refused["phases"]["pre_idle"]["load1"], serde_json::json!([0.2, 3.0]));
-        assert_eq!(refused["pinning"], "unavailable");
+        assert_eq!(refused["pinning"], "no core pinning was applied");
         assert_eq!(refused["busy_fraction_status"], "unavailable");
         assert_eq!(refused["drift"]["phase"], "workload");
     }

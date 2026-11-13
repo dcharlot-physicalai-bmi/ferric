@@ -545,9 +545,9 @@ fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
     let trials: usize = flag(args, "--trials").ok_or("--trials")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     let warmup: usize = flag(args, "--warmup").ok_or("--warmup")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     let baseline_s: f64 = ferric_fleet::duration_is_explicit(flag(args, "--baseline-s").and_then(|s| s.parse().ok()))?;
-    let period_ms: u64 = flag(args, "--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(1000);
-    if trials < 2 || warmup < 1 || period_ms == 0 {
-        return Err("need --trials >= 2, --warmup >= 1, --sample-ms > 0".into());
+    let period_ms: u64 = flag(args, "--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(200);
+    if trials < 2 || warmup < 1 || !(100..=250).contains(&period_ms) {
+        return Err("need --trials >= 2, --warmup >= 1, and --sample-ms between 100 and 250".into());
     }
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let case = load_case(args)?;
@@ -580,7 +580,7 @@ fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
             "t_start_monotonic_ns": t0,
             "t_end_monotonic_ns": t1,
             "wall_s": (t1.saturating_sub(t0)) as f64 * 1e-9,
-            "macmon_j": {"sys": joules.sys, "cpu": joules.cpu, "gpu": joules.gpu, "ane": joules.ane},
+            "macmon_j": {"gpu_power": joules.gpu, "cpu_power": joules.cpu, "ane_power": joules.ane, "ram_power": joules.ram, "gpu_ram_power": joules.gpu_ram, "sys_power": joules.sys, "soc": joules.soc, "accelerator": joules.accelerator, "dram_scope": joules.dram_scope, "soc_label": joules.soc_label, "accelerator_label": joules.accelerator_label},
             "summed": false,
             "raw_action_sha256": ferric_fleet::digest_f32(&g.raw_actions),
             "dispatches": g.dispatches,
@@ -606,7 +606,7 @@ fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
             "t_start_monotonic_ns": t0,
             "t_end_monotonic_ns": t1,
             "wall_s": (t1.saturating_sub(t0)) as f64 * 1e-9,
-            "macmon_j": {"sys": joules.sys, "cpu": joules.cpu, "gpu": joules.gpu, "ane": joules.ane},
+            "macmon_j": {"gpu_power": joules.gpu, "cpu_power": joules.cpu, "ane_power": joules.ane, "ram_power": joules.ram, "gpu_ram_power": joules.gpu_ram, "sys_power": joules.sys, "soc": joules.soc, "accelerator": joules.accelerator, "dram_scope": joules.dram_scope, "soc_label": joules.soc_label, "accelerator_label": joules.accelerator_label},
             "summed": false,
         }))
     };
@@ -621,7 +621,7 @@ fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
     let a1 = windows.iter().find(|w| w["label"] == "baseline_A1");
     let a2 = windows.iter().find(|w| w["label"] == "baseline_A2");
     if let (Some(a1), Some(a2)) = (a1, a2) {
-        for key in ["sys", "cpu", "gpu", "ane"] {
+        for key in ["sys_power", "cpu_power", "gpu_power", "ane_power", "ram_power", "gpu_ram_power"] {
             let joule = |w: &serde_json::Value| w["macmon_j"][key].as_f64();
             let wall = |w: &serde_json::Value| w["wall_s"].as_f64().unwrap_or(0.0);
             let (Some(j1), Some(j2)) = (joule(a1), joule(a2)) else { continue };

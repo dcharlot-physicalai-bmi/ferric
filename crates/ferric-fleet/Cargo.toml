@@ -10,6 +10,7 @@ homepage.workspace = true
 
 [dependencies]
 fs4 = "0.12"
+ferric-joule = { path = "../ferric-joule" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [[bin]]

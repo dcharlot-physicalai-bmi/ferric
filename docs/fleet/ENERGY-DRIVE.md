@@ -2,7 +2,7 @@
 
 The gates below are the ferrotherm harness at `c82c1e96c24d6f6c292af1196cd72199b0838257` (`bench/thrml-tsp-fleet`). Citations are `bench/thrml-tsp/METHODOLOGY.md` and `bench/thrml-tsp/src/energy.rs` in that tree.
 
-- The host lock is `flock` `LOCK_EX` on `/tmp/bmi-energy.lock`. If it is not acquired, the energy grade is refused with reason `host lock not held` (`METHODOLOGY.md` lines 69–85; `energy.rs` lines 887–896). The receipt records `host_lock.held` and `holder_pid`. `--lock-wait-s` polls the non-blocking acquire for that many seconds (`energy.rs` lines 944–1037, default there 3600). Omitting it keeps a single non-blocking try, then the existing retry. A process id attributes or refuses; it is not subtracted from joules (`METHODOLOGY.md` lines 3–4).
+- The host lock is `flock` `LOCK_EX` on `/tmp/bmi-energy.lock`. If it is not acquired, the energy grade is refused with reason `host lock not held` (`METHODOLOGY.md` lines 69–85; `energy.rs` lines 887–896). The receipt records `host_lock.path`, `acquired_utc`, `released_utc`, `wait_s`, `holder_pid`, `held`, and `reason`. `--lock-wait-s` polls `LOCK_EX|LOCK_NB` for that many seconds and defaults to 3600 (`energy.rs` lines 944–1037). Pass `0` for a single non-blocking try. A process id attributes or refuses; it is not subtracted from joules (`METHODOLOGY.md` lines 3–4).
 - Before each idle bracket the driver waits for 60 consecutive 1 Hz `load1` samples at or under 2, and gives up after 600 samples (`METHODOLOGY.md` lines 28–32; `energy.rs` lines 738–794). Every 1 Hz sample through the bracket must also be finite and at or under 2, and an empty series is a refusal (`METHODOLOGY.md` lines 34–36; `energy.rs` lines 796–811).
 - Linux trial windows refuse when the mean busy fraction of cores outside the pin is above 0.05 or any 1 Hz sample is above 0.15 (`METHODOLOGY.md` lines 49–54; `energy.rs` lines 822–858). `load1` is not a trial-window criterion (`METHODOLOGY.md` lines 40–43).
 - macOS trial windows use the non-harness CPU fraction, mean at most 0.15 and no sample above 0.50, and the idle brackets must agree within 3σ (`METHODOLOGY.md` lines 57–62; `energy.rs` lines 827–870 and 1092–1133). That fraction is not subtracted from joules.
@@ -49,9 +49,13 @@ nohup /path/to/ferric-fleet energy-drive \
 
 ## macOS, macmon
 
-`--meter macmon` samples `macmon pipe -i <sample-ms> -s 0`. The fields are `cpu_power`, `gpu_power`, `ane_power`, and `sys_power` from current macmon `Metrics`, in watts, integrated with the same trapezoid as PPT. `sys_power` is at least `chip_power`, and `chip_power` is at least CPU + GPU + ANE + DRAM, so those meters overlap and are not added. Temperatures are `temp.cpu_temp_avg` and `temp.gpu_temp_avg`.
+`--meter macmon` drops the RAPL, hwmon, `/proc`, and `taskset` requirements. It samples with the ferric-joule meter, `macmon pipe -i <ms> -s 0`, through `parse_macmon_line`. Power samples are 100–250 ms (default 200) and each scope is a trapezoid over the actual gap between samples. The quiet gate stays at 1 Hz.
 
-There is no per-core pin. The receipt says `pinning: unavailable` instead of failing. Per-core busy fraction via `host_processor_info` is not collected; the quiet gate, declared before the run, is load1 (`sysctl -n vm.loadavg` on macOS, `/proc/loadavg` when that file exists) and the idle `sys_power` baseline. The same `/tmp/bmi-energy.lock` is held from preflight through the post bracket. No sudo and no `powermetrics`.
+Each of `gpu_power`, `cpu_power`, `ane_power`, `ram_power`, `gpu_ram_power`, and `sys_power` is its own scope. They overlap, and the receipt does not add them. `sys_power` is SoC telemetry, not wall power. The receipt also keeps the mean `pcpu_freq_mhz`, `ecpu_freq_mhz`, `gpu_freq_mhz`, `cpu_active_ratio`, `gpu_active_ratio`, and the cpu and gpu temperature averages.
+
+If `ram_power` and `gpu_ram_power` read exactly 0, that scope is `unavailable`. A missing counter is not a measured zero. The SoC total (`cpu+gpu+ane+ram`) and the accelerator total (`gpu+ram`) are refused in that case, with a label, so they cannot be published as if DRAM were absent from the sum. One M5 Max probe of macmon 0.11.0 saw both DRAM fields at 0.0 while `sys_power` was nonzero. That probe is not a measurement.
+
+On macOS the receipt records `pinning: no core pinning was applied`. Per-core busy fraction is not collected. The quiet gate, declared before the run, is load1 from `getloadavg` (and `/proc/loadavg` when that file exists) plus the idle `sys_power` baseline. The same `/tmp/bmi-energy.lock` is held from preflight through the post bracket. No sudo and no `powermetrics`.
 
 On the M5 Max, as the user who can run `macmon`:
 
@@ -65,12 +69,12 @@ nohup /path/to/ferric-fleet energy-drive \
   --retry-wait-s 120 \
   --settle-s 60 \
   --load1-max 2 \
-  --sample-ms 1000 \
+  --sample-ms 200 \
   -- \
   /path/to/ferric-smolvla gpu-energy \
     --meter macmon \
     --macmon-bin macmon \
-    --sample-ms 1000 \
+    --sample-ms 200 \
     --weights "$HOME/art/model.safetensors" \
     --tokenizer /path/to/ferric/crates/ferric-smolvla/tests/fixtures/tokenizer.json \
     --stats "$HOME/art/policy_preprocessor_step_5_normalizer_processor.safetensors" \

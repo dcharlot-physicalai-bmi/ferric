@@ -21,9 +21,8 @@ use crate::meter::trapezoid_joules;
 
 pub const PIPE_SAMPLES_FOREVER: &str = "0";
 
-pub const PINNING: &str = "unavailable";
-pub const PINNING_REASON: &str =
-    "macOS does not provide taskset or a rootless per-core pin; the workload is started unpinned";
+pub const PINNING: &str = "no core pinning was applied";
+pub const PINNING_REASON: &str = "no core pinning was applied";
 
 pub const BUSY_FRACTION_STATUS: &str = "unavailable";
 pub const BUSY_FRACTION_REASON: &str = "per-core busy fraction via host_processor_info is not collected; this build does not call mach APIs. The quiet gate is load1, from sysctl vm.loadavg or /proc/loadavg, plus the idle sys_power baseline. This is fixed before the run.";
@@ -36,8 +35,15 @@ pub struct Reading {
     pub sys_w: Option<f64>,
     pub chip_w: Option<f64>,
     pub ram_w: Option<f64>,
+    pub gpu_ram_w: Option<f64>,
+    pub dram_unavailable: bool,
     pub cpu_temp_c: Option<f64>,
     pub gpu_temp_c: Option<f64>,
+    pub pcpu_mhz: Option<f64>,
+    pub ecpu_mhz: Option<f64>,
+    pub gpu_mhz: Option<f64>,
+    pub cpu_active: Option<f64>,
+    pub gpu_active: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,6 +52,13 @@ pub struct Joules {
     pub gpu: Option<f64>,
     pub ane: Option<f64>,
     pub sys: Option<f64>,
+    pub ram: Option<f64>,
+    pub gpu_ram: Option<f64>,
+    pub soc: Option<f64>,
+    pub accelerator: Option<f64>,
+    pub dram_scope: &'static str,
+    pub soc_label: &'static str,
+    pub accelerator_label: &'static str,
 }
 
 pub fn pipe_args(interval_ms: u64) -> Vec<String> {
@@ -58,40 +71,34 @@ pub fn pipe_args(interval_ms: u64) -> Vec<String> {
     ]
 }
 
-fn num(v: &serde_json::Value, key: &str) -> Option<f64> {
-    v.get(key).and_then(|x| x.as_f64()).filter(|x| x.is_finite())
+fn finite(v: f64) -> Option<f64> {
+    v.is_finite().then_some(v)
 }
 
-fn grouped(v: &serde_json::Value, key: &str) -> Option<f64> {
-    v.get("power").and_then(|p| num(p, key))
-}
-
-fn watts(v: &serde_json::Value, flat: &str, group: &str) -> Option<f64> {
-    num(v, flat).or_else(|| grouped(v, group))
-}
-
-/// One JSON object from `macmon pipe`.
+/// One `macmon pipe` line, parsed by [`ferric_joule::parse_macmon_line`].
 pub fn parse_line(line: &str) -> Result<Reading, String> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Err("empty macmon line".into());
-    }
-    let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("macmon json: {e}"))?;
-    let cpu_w = watts(&v, "cpu_power", "cpu").ok_or("macmon line has no cpu_power")?;
-    let gpu_w = watts(&v, "gpu_power", "gpu").ok_or("macmon line has no gpu_power")?;
-    let ane_w = watts(&v, "ane_power", "ane").ok_or("macmon line has no ane_power")?;
-    let temp = v.get("temp");
-    let temp_of = |key: &str| temp.and_then(|t| num(t, key));
+    let s = ferric_joule::parse_macmon_line(line).ok_or("macmon line has no cpu_power/gpu_power")?;
     Ok(Reading {
-        cpu_w,
-        gpu_w,
-        ane_w,
-        sys_w: watts(&v, "sys_power", "board"),
-        chip_w: watts(&v, "chip_power", "package").or_else(|| num(&v, "all_power")),
-        ram_w: watts(&v, "ram_power", "ram"),
-        cpu_temp_c: temp_of("cpu_temp_avg"),
-        gpu_temp_c: temp_of("gpu_temp_avg"),
+        cpu_w: s.cpu,
+        gpu_w: s.gpu,
+        ane_w: s.ane,
+        sys_w: finite(s.sys),
+        chip_w: None,
+        ram_w: (s.ram != 0.0).then_some(s.ram),
+        gpu_ram_w: (s.gpu_ram.is_finite() && s.gpu_ram != 0.0).then_some(s.gpu_ram),
+        dram_unavailable: s.dram_unavailable,
+        cpu_temp_c: finite(s.cpu_temp),
+        gpu_temp_c: finite(s.gpu_temp),
+        pcpu_mhz: finite(s.pcpu_mhz),
+        ecpu_mhz: finite(s.ecpu_mhz),
+        gpu_mhz: finite(s.gpu_mhz),
+        cpu_active: finite(s.cpu_active),
+        gpu_active: finite(s.gpu_active),
     })
+}
+
+fn all_zero(samples: &[(u64, Reading)], f: fn(&Reading) -> Option<f64>) -> bool {
+    samples.iter().all(|(_, r)| f(r).unwrap_or(0.0) == 0.0)
 }
 
 pub fn integrate(samples: &[(u64, Reading)]) -> Joules {
@@ -99,12 +106,51 @@ pub fn integrate(samples: &[(u64, Reading)]) -> Joules {
         let pts: Vec<(u64, f64)> = samples.iter().filter_map(|(t, r)| f(r).map(|w| (*t, w))).collect();
         trapezoid_joules(&pts)
     };
+    let ram_missing = all_zero(samples, |r| r.ram_w);
+    let gpu_ram_missing = all_zero(samples, |r| r.gpu_ram_w);
+    let cpu = series(|r| Some(r.cpu_w));
+    let gpu = series(|r| Some(r.gpu_w));
+    let ane = series(|r| Some(r.ane_w));
+    let ram = if ram_missing { None } else { series(|r| r.ram_w) };
+    let (soc, soc_label) = if ram_missing {
+        (None, "refused: DRAM read exactly 0, so a SoC total would exclude DRAM")
+    } else {
+        (Some(cpu.unwrap_or(0.0) + gpu.unwrap_or(0.0) + ane.unwrap_or(0.0) + ram.unwrap_or(0.0)), "cpu+gpu+ane+ram")
+    };
+    let (accelerator, accelerator_label) = if ram_missing {
+        (None, "refused: DRAM read exactly 0, so an accelerator total would exclude DRAM")
+    } else {
+        (Some(gpu.unwrap_or(0.0) + ram.unwrap_or(0.0)), "gpu+ram")
+    };
     Joules {
-        cpu: series(|r| Some(r.cpu_w)),
-        gpu: series(|r| Some(r.gpu_w)),
-        ane: series(|r| Some(r.ane_w)),
+        cpu,
+        gpu,
+        ane,
         sys: series(|r| r.sys_w),
+        ram,
+        gpu_ram: if gpu_ram_missing { None } else { series(|r| r.gpu_ram_w) },
+        soc,
+        accelerator,
+        dram_scope: if ram_missing && gpu_ram_missing { "unavailable" } else { "reported" },
+        soc_label,
+        accelerator_label,
     }
+}
+
+pub fn context_means(samples: &[(u64, Reading)]) -> serde_json::Value {
+    let mean = |f: fn(&Reading) -> Option<f64>| {
+        let v: Vec<f64> = samples.iter().filter_map(|(_, r)| f(r)).collect();
+        if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) }
+    };
+    serde_json::json!({
+        "cpu_temp_avg_c": mean(|r| r.cpu_temp_c),
+        "gpu_temp_avg_c": mean(|r| r.gpu_temp_c),
+        "pcpu_freq_mhz": mean(|r| r.pcpu_mhz),
+        "ecpu_freq_mhz": mean(|r| r.ecpu_mhz),
+        "gpu_freq_mhz": mean(|r| r.gpu_mhz),
+        "cpu_active_ratio": mean(|r| r.cpu_active),
+        "gpu_active_ratio": mean(|r| r.gpu_active),
+    })
 }
 
 pub fn mean_power(joules: Option<f64>, wall_s: f64) -> Option<f64> {
@@ -239,16 +285,29 @@ mod tests {
     }
 
     #[test]
-    fn the_pr59_line_and_the_grouped_shape_parse() {
+    fn the_pr59_line_parses_and_a_grouped_object_is_not_a_second_parser() {
         let r = parse_line(PR59_LINE).unwrap();
         assert!((r.cpu_w - 0.8916881680488586).abs() < 1e-12);
         assert!((r.sys_w.unwrap() - 16.489110946655273).abs() < 1e-12);
-        assert!((r.cpu_temp_c.unwrap() - 48.95563888549805).abs() < 1e-9);
-        let g = parse_line(GROUPED_LINE).unwrap();
-        assert!((g.cpu_w - 0.7379913).abs() < 1e-7);
-        assert!((g.gpu_w - 0.37346822).abs() < 1e-7);
-        assert_eq!(g.ane_w, 0.0);
-        assert!((g.sys_w.unwrap() - 10.063049).abs() < 1e-6);
+        assert!((r.ram_w.unwrap() - 0.25657692551612854).abs() < 1e-12);
+        assert!(r.gpu_ram_w.is_none(), "an exact 0 gpu_ram_power is unavailable");
+        assert!(parse_line(GROUPED_LINE).is_err());
+    }
+
+    #[test]
+    fn exact_zero_dram_is_unavailable_and_soc_is_refused() {
+        let line = r#"{"cpu_power":12.0,"gpu_power":30.0,"ane_power":0.5,"ram_power":0.0,"gpu_ram_power":0.0,"sys_power":65.99,"all_power":65.99,"pcpu_freq_mhz":4000.0,"ecpu_freq_mhz":1100.0,"gpu_freq_mhz":900.0,"cpu_active_ratio":0.4,"gpu_active_ratio":0.8,"temp":{"cpu_temp_avg":70.0,"gpu_temp_avg":68.0}}"#;
+        let r = parse_line(line).unwrap();
+        assert!(r.dram_unavailable);
+        assert!(r.ram_w.is_none());
+        assert!((r.pcpu_mhz.unwrap() - 4000.0).abs() < 1e-9);
+        let j = integrate(&[(0, r.clone()), (200_000_000, r)]);
+        assert!(j.ram.is_none());
+        assert!(j.gpu_ram.is_none());
+        assert!(j.soc.is_none());
+        assert!(j.accelerator.is_none());
+        assert_eq!(j.dram_scope, "unavailable");
+        assert!((j.sys.unwrap() - 65.99 * 0.2).abs() < 1e-6);
     }
 
     #[test]

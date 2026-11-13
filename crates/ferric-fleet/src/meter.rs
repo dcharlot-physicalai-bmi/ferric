@@ -8,6 +8,9 @@ pub enum Domain {
     MacmonGpu,
     MacmonDram,
     MacmonSys,
+    MacmonCpu,
+    MacmonAne,
+    MacmonGpuRam,
 }
 
 impl Domain {
@@ -19,6 +22,9 @@ impl Domain {
             Domain::MacmonGpu => "macmon-gpu",
             Domain::MacmonDram => "macmon-dram",
             Domain::MacmonSys => "macmon-sys",
+            Domain::MacmonCpu => "macmon-cpu",
+            Domain::MacmonAne => "macmon-ane",
+            Domain::MacmonGpuRam => "macmon-gpu-ram",
         }
     }
     pub fn boundary(self) -> &'static str {
@@ -26,8 +32,12 @@ impl Domain {
             Domain::RaplPackage => "RAPL package energy_uj, not the GPU and not the core domain",
             Domain::RaplCore => "RAPL core energy_uj, kept separate from package",
             Domain::RocmPpt => "ROCm-SMI PPT socket figure; overlap with the APU package is not ruled out",
-            Domain::MacmonGpu | Domain::MacmonSys => "macmon subsystem telemetry, not wall energy",
-            Domain::MacmonDram => "macmon DRAM field",
+            Domain::MacmonGpu => "macmon gpu_power",
+            Domain::MacmonSys => "macmon sys_power, SoC telemetry, not wall power",
+            Domain::MacmonDram => "macmon ram_power; an exact 0 is unavailable, not a measured zero",
+            Domain::MacmonCpu => "macmon cpu_power",
+            Domain::MacmonAne => "macmon ane_power",
+            Domain::MacmonGpuRam => "macmon gpu_ram_power; an exact 0 is unavailable, not a measured zero",
         }
     }
 }
@@ -115,7 +125,8 @@ pub fn dram_joules(samples: &[Sample]) -> Result<Option<f64>, String> {
     if rows.iter().all(|s| s.watts.unwrap_or(0.0) == 0.0 && s.counter_uj.unwrap_or(0) == 0) {
         return Ok(None);
     }
-    Err("a non-zero DRAM series is not integrated here; this build does not claim DRAM joules".into())
+    let series: Vec<(u64, f64)> = rows.iter().filter_map(|s| s.watts.map(|w| (s.t_monotonic_ns, w))).collect();
+    Ok(trapezoid_joules(&series))
 }
 
 /// Refuse the combinations the fleet notes forbid. Does not invent a system total.
