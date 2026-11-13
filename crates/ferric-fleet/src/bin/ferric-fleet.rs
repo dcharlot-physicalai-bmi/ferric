@@ -208,7 +208,7 @@ fn energy_drive(args: &[String]) -> i32 {
     let retry_s: f64 = flag("--retry-wait-s").and_then(|s| s.parse().ok()).unwrap_or(120.0);
     let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
     let load1_max: f64 = flag("--load1-max").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::LOAD1_MAX);
-    let busy_max: f64 = flag("--busy-fraction-max").and_then(|s| s.parse().ok()).unwrap_or(0.10);
+    let busy_max: f64 = flag("--other-core-mean").or_else(|| flag("--busy-fraction-max")).and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::OTHER_CORE_MEAN_MAX);
     let lock = flag("--lock").unwrap_or(ferric_fleet::LOCK_PATH);
     let hwmon = std::path::Path::new("/sys/class/hwmon");
     let cfg = ferric_fleet::LiveConfig {
@@ -224,11 +224,13 @@ fn energy_drive(args: &[String]) -> i32 {
         workload,
     };
     let out_dir = std::path::PathBuf::from(out);
+    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     match ferric_fleet::run_until_quiet(
         std::path::Path::new(lock),
         &out_dir,
         std::time::Duration::from_secs_f64(deadline_s),
         std::time::Duration::from_secs_f64(retry_s),
+        lock_wait_s,
         |guard| ferric_fleet::run_locked_attempt(&cfg, guard),
     ) {
         Ok(receipt) => {
@@ -255,6 +257,7 @@ fn energy_drive_macmon(flags: &[String], workload: &[String], out: &str) -> i32 
     let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
     let load1_max: f64 = flag("--load1-max").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::LOAD1_MAX);
     let sample_ms: u64 = flag("--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let lock_wait_s: f64 = flag("--lock-wait-s").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let lock = flag("--lock").unwrap_or(ferric_fleet::LOCK_PATH);
     let cfg = ferric_fleet::MacmonConfig {
         settle_s,
@@ -268,6 +271,7 @@ fn energy_drive_macmon(flags: &[String], workload: &[String], out: &str) -> i32 
         std::path::Path::new(out),
         std::time::Duration::from_secs_f64(deadline_s),
         std::time::Duration::from_secs_f64(retry_s),
+        lock_wait_s,
         &cfg,
     ) {
         Ok(body) => {

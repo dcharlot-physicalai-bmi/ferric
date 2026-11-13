@@ -84,6 +84,8 @@ pub struct EnergySeries {
     pub workload_reached: bool,
     pub post_reached: bool,
     pub pre_reached: bool,
+    pub settle_load1_pre: Vec<f64>,
+    pub settle_load1_post: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,7 @@ pub struct LockHold {
     pub release_unix_ns: Option<u64>,
     pub first_attempt_contended: bool,
     pub contended: bool,
+    pub wait_s: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -317,7 +320,7 @@ fn refused(reason: String, lock: LockHold, series: &EnergySeries, busy: Option<f
 /// Grade one captured attempt. Joules are present only when every gate passes.
 pub fn judge(series: &EnergySeries, lock: LockHold) -> DriveReceipt {
     if lock.contended || lock.acquire_unix_ns.is_none() {
-        return refused("lock contended; counters were not read".into(), lock, series, None);
+                return refused(crate::fleet_gate::HOST_LOCK_REFUSAL.into(), lock, series, None);
     }
     if let Err(e) = load_is_quiet(&series.load1_pre, series.load1_max) {
         return refused(format!("pre-trial idle: {e}"), lock, series, None);
@@ -478,6 +481,29 @@ pub fn receipt_json(r: &DriveReceipt) -> serde_json::Value {
         "cpu_tctl_c": r.cpu_tctl_c,
         "gpu_edge_c": r.gpu_edge_c,
         "joules": joules,
+        "evidence_grade": if !r.lock.acquire_unix_ns.is_some() || r.lock.contended {
+            crate::fleet_gate::HOST_LOCK_REFUSAL
+        } else if r.attributable {
+            "quiet"
+        } else {
+            "load_gated"
+        },
+        "host_lock": {
+            "path": r.lock.path,
+            "acquired_utc": r.lock.acquire_unix_ns.map(|ns| crate::fleet_gate::format_unix_utc(ns as f64 / 1e9)),
+            "released_utc": r.lock.release_unix_ns.map(|ns| crate::fleet_gate::format_unix_utc(ns as f64 / 1e9)),
+            "wait_s": r.lock.wait_s,
+            "holder_pid": r.lock.pid,
+            "held": r.lock.acquire_unix_ns.is_some() && !r.lock.contended,
+            "reason": if r.lock.acquire_unix_ns.is_some() && !r.lock.contended { serde_json::Value::Null } else { serde_json::json!(crate::fleet_gate::HOST_LOCK_REFUSAL) },
+        },
+        "trial_window_rule": {
+            "enforce": true,
+            "other_core_mean_max": r.busy_fraction_max,
+            "other_core_sample_max": crate::fleet_gate::OTHER_CORE_SAMPLE_MAX,
+            "why_load1_is_not_a_trial_criterion": "load1 counts runnable threads, so the workload under test raises it. Brackets use load1. Trial windows do not.",
+        },
+        "baseline_settle_load1": r.series.settle_load1_pre,
         "rapl_package_j": r.rapl_package_j,
         "rapl_core_j": r.rapl_core_j,
         "amdgpu_ppt_j": r.amdgpu_ppt_j,
@@ -508,6 +534,7 @@ impl LockGuard {
             release_unix_ns: None,
             first_attempt_contended: self.first_attempt_contended,
             contended: false,
+            wait_s: 0.0,
         }
     }
     pub fn release_stamp(&self) -> LockHold {
@@ -531,8 +558,14 @@ pub fn try_lock_exclusive(path: &Path) -> Result<Option<LockGuard>, String> {
     }
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(LockGuard {
-            file,
+        Ok(()) =>         Ok(Some(LockGuard {
+            file: {
+                use std::io::Write;
+                let mut owned = file;
+                let _ = owned.write_all(format!("{}\n", std::process::id()).as_bytes());
+                let _ = owned.flush();
+                owned
+            },
             path: path.display().to_string(),
             pid: std::process::id(),
             acquire_unix_ns: unix_ns(),
@@ -558,11 +591,27 @@ pub fn write_receipt(path: &Path, receipt: &DriveReceipt) -> Result<(), String> 
 }
 
 /// Retry schedule. Sleeps only between attempts, never while a counter window is open.
+pub fn poll_host_lock(path: &Path, wait_s: f64) -> Result<Option<LockGuard>, String> {
+    let started = std::time::Instant::now();
+    let wait = if wait_s.is_finite() && wait_s > 0.0 { wait_s } else { 0.0 };
+    loop {
+        if let Some(guard) = try_lock_exclusive(path)? {
+            return Ok(Some(guard));
+        }
+        let waited = started.elapsed().as_secs_f64();
+        if waited >= wait {
+            return Ok(None);
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn run_until_quiet<F>(
     lock_path: &Path,
     out_dir: &Path,
     deadline: Duration,
     retry_wait: Duration,
+    lock_wait_s: f64,
     mut attempt: F,
 ) -> Result<DriveReceipt, String>
 where
@@ -581,12 +630,13 @@ where
                 release_unix_ns: None,
                 first_attempt_contended: first_contended,
                 contended: false,
+                wait_s: 0.0,
             };
             let receipt = refused("deadline reached before a quiet attributable run".into(), lock, &series, None);
             write_receipt(&out_dir.join(format!("refusal-deadline.json")), &receipt)?;
             return Ok(receipt);
         }
-        match try_lock_exclusive(lock_path)? {
+        match poll_host_lock(lock_path, lock_wait_s)? {
             None => {
                 first_contended = true;
                 let series = empty_series();
@@ -597,8 +647,9 @@ where
                     release_unix_ns: None,
                     first_attempt_contended: true,
                     contended: true,
+                    wait_s: 0.0,
                 };
-                let receipt = refused("lock contended; counters were not read".into(), lock, &series, None);
+                let receipt = refused(crate::fleet_gate::HOST_LOCK_REFUSAL.into(), lock, &series, None);
                 write_receipt(&out_dir.join(format!("refusal-lock-{n}.json")), &receipt)?;
                 n += 1;
                 sleep(retry_wait);
@@ -653,6 +704,8 @@ fn empty_series() -> EnergySeries {
         workload_reached: false,
         post_reached: false,
         pre_reached: false,
+        settle_load1_pre: vec![],
+        settle_load1_post: vec![],
     }
 }
 
@@ -807,10 +860,8 @@ fn take_bracket(cfg: &LiveConfig, origin: std::time::Instant) -> Result<Bracket,
             }
             prev_ticks = Some(now);
         }
-        let load_bad = bracket.load1.iter().any(|v| *v > cfg.load1_max);
-        let busy_bad = bracket.busy.iter().any(|v| *v > cfg.busy_fraction_max);
-        if load_bad || busy_bad {
-            bracket.blocked = pre_idle_gate(&bracket.load1, &bracket.busy, cfg.load1_max, cfg.busy_fraction_max).err();
+        if crate::fleet_gate::bracket_load_offender(&bracket.load1.iter().copied().map(Some).collect::<Vec<_>>()).is_some() {
+            bracket.blocked = load_is_quiet(&bracket.load1, cfg.load1_max).err();
             return Ok(bracket);
         }
         if i + 1 < steps {
@@ -854,6 +905,9 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
     if let Err(e) = require_smt_siblings(&cfg.pin_cores) {
         return refusal_now(lock, cfg, e);
     }
+    if let Err(e) = wait_for_load_streak() {
+        return refusal_now(lock, cfg, format!("baseline settle: {e}"));
+    }
     let origin = std::time::Instant::now();
     let pre = match take_bracket(cfg, origin) {
         Ok(b) => b,
@@ -862,7 +916,7 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
     if let Some(reason) = pre.blocked.clone() {
         return refuse_pre(lock, cfg, range, &pre, format!("pre-trial idle: {reason}"));
     }
-    if let Err(e) = pre_idle_gate(&pre.load1, &pre.busy, cfg.load1_max, cfg.busy_fraction_max) {
+    if let Err(e) = load_is_quiet(&pre.load1, cfg.load1_max) {
         return refuse_pre(lock, cfg, range, &pre, format!("pre-trial idle: {e}"));
     }
     let ticks0 = match read_cpu_ticks() {
@@ -917,8 +971,10 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
                         workload_busy.push(interval.fraction);
                     }
                     if let Ok(busy) = busy_fraction(&ticks0, &now_ticks, &cfg.pin_cores) {
-                        let interval_over = workload_busy.last().copied().is_some_and(|v| v > cfg.busy_fraction_max);
-                        if busy.fraction > cfg.busy_fraction_max || interval_over {
+                        let interval_over = workload_busy.last().copied().is_some_and(|v| v > crate::fleet_gate::OTHER_CORE_SAMPLE_MAX);
+                        let mean_over = crate::fleet_gate::fraction_refusal(&workload_busy, cfg.busy_fraction_max, crate::fleet_gate::OTHER_CORE_SAMPLE_MAX)
+                            == Some("the mean exceeded the maximum");
+                        if busy.fraction > cfg.busy_fraction_max || interval_over || mean_over {
                             let _ = child.kill();
                             let _ = child.wait();
                             return abort_workload(
@@ -948,6 +1004,9 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
         Ok(v) => v,
         Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
     };
+    if let Err(e) = wait_for_load_streak() {
+        return abort_workload(format!("post-trial settle: {e}"), None, workload_busy, tctl_workload, edge_workload);
+    }
     let post = match take_bracket(cfg, origin) {
         Ok(b) => b,
         Err(e) => return abort_workload(e, None, workload_busy, tctl_workload, edge_workload),
@@ -975,6 +1034,22 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
         return refused(format!("post-trial idle: {reason}"), lock.hold(), &series, None);
     }
     judge(&series, lock.hold())
+}
+
+fn wait_for_load_streak() -> Result<(), String> {
+    let mut raw = Vec::new();
+    while raw.len() < crate::fleet_gate::SETTLE_BOUND {
+        raw.push(Some(read_load1()?));
+        let outcome = crate::fleet_gate::settle_outcome(&raw);
+        if outcome.settled {
+            return Ok(());
+        }
+        if raw.len() == crate::fleet_gate::SETTLE_BOUND {
+            return Err(outcome.reason.into());
+        }
+        sleep(Duration::from_secs(1));
+    }
+    Err("settle bound exhausted".into())
 }
 
 fn refusal_now(lock: &LockGuard, cfg: &LiveConfig, reason: String) -> DriveReceipt {
@@ -1084,7 +1159,15 @@ pub fn macmon_receipt(attempt: &MacmonAttempt, lock: &LockHold) -> serde_json::V
             "ane": j.ane,
         })),
         "summed": false,
+        "soc_telemetry": crate::fleet_gate::SOC_TELEMETRY_LIMIT,
+        "macmon_version_note": "ferrotherm c82c1e96 does not name a macmon release. macmon PR 125, in the release named v0.11.0 (2026-11-06), drops ram_power when it exceeds system power. This driver does not integrate ram_power.",
         "overlaps": crate::macmon::overlaps(),
+        "trial_window_rule": {
+            "enforce": true,
+            "foreign_cpu_mean_max": crate::fleet_gate::FOREIGN_CPU_MEAN_MAX,
+            "foreign_cpu_sample_max": crate::fleet_gate::FOREIGN_CPU_SAMPLE_MAX,
+            "why_load1_is_not_a_trial_criterion": "load1 counts runnable threads, so the workload under test raises it. Brackets use load1. Trial windows do not.",
+        },
         "pinning": crate::macmon::PINNING,
         "pinning_reason": crate::macmon::PINNING_REASON,
         "busy_fraction": null,
@@ -1097,13 +1180,21 @@ pub fn macmon_receipt(attempt: &MacmonAttempt, lock: &LockHold) -> serde_json::V
             "post_idle": phase(attempt.post_reached, &attempt.load1_post, &attempt.post),
         },
         "drift": drift,
-        "lock": {
+        "evidence_grade": if lock.acquire_unix_ns.is_none() || lock.contended {
+            crate::fleet_gate::HOST_LOCK_REFUSAL
+        } else if ok {
+            "quiet"
+        } else {
+            "load_gated"
+        },
+        "host_lock": {
             "path": lock.path,
-            "pid": lock.pid,
-            "acquire_unix_ns": lock.acquire_unix_ns,
-            "release_unix_ns": lock.release_unix_ns,
-            "first_attempt_contended": lock.first_attempt_contended,
-            "contended": lock.contended,
+            "acquired_utc": lock.acquire_unix_ns.map(|ns| crate::fleet_gate::format_unix_utc(ns as f64 / 1e9)),
+            "released_utc": lock.release_unix_ns.map(|ns| crate::fleet_gate::format_unix_utc(ns as f64 / 1e9)),
+            "wait_s": lock.wait_s,
+            "holder_pid": lock.pid,
+            "held": lock.acquire_unix_ns.is_some() && !lock.contended,
+            "reason": if lock.acquire_unix_ns.is_some() && !lock.contended { serde_json::Value::Null } else { serde_json::json!(crate::fleet_gate::HOST_LOCK_REFUSAL) },
         },
     })
 }
@@ -1147,22 +1238,22 @@ pub fn run_locked_macmon(cfg: &MacmonConfig, lock: &LockGuard) -> serde_json::Va
         }
     };
     let settle = || -> Result<Vec<f64>, (Vec<f64>, String)> {
-        let steps = cfg.settle_s.round().max(1.0) as u32;
-        let mut load1 = Vec::new();
-        for i in 0..steps {
-            let v = match read_load1() {
-                Ok(v) => v,
-                Err(e) => return Err((load1, e)),
-            };
-            load1.push(v);
-            if v > cfg.load1_max {
-                return Err((load1, format!("load1 {v} exceeds {}", cfg.load1_max)));
+        let mut raw: Vec<Option<f64>> = Vec::new();
+        while raw.len() < crate::fleet_gate::SETTLE_BOUND {
+            match read_load1() {
+                Ok(v) => raw.push(Some(v)),
+                Err(e) => return Err((raw.into_iter().flatten().collect(), e)),
             }
-            if i + 1 < steps {
-                sleep(Duration::from_secs(1));
+            let outcome = crate::fleet_gate::settle_outcome(&raw);
+            if outcome.settled {
+                return Ok(outcome.samples);
             }
+            if raw.len() == crate::fleet_gate::SETTLE_BOUND {
+                return Err((outcome.samples, outcome.reason.into()));
+            }
+            sleep(Duration::from_secs(1));
         }
-        Ok(load1)
+        Err((raw.into_iter().flatten().collect(), "settle bound exhausted".into()))
     };
     let load1_pre = match settle() {
         Ok(v) => v,
@@ -1195,6 +1286,8 @@ pub fn run_locked_macmon(cfg: &MacmonConfig, lock: &LockGuard) -> serde_json::Va
             return macmon_fail(format!("spawn workload: {e}"), load1_pre, pre, false, &hold);
         }
     };
+    let mut foreign = Vec::new();
+    let mut prev_ps = crate::fleet_gate::read_ps_cpu().ok();
     let workload_end = loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break sampler.snapshot(),
@@ -1202,13 +1295,27 @@ pub fn run_locked_macmon(cfg: &MacmonConfig, lock: &LockGuard) -> serde_json::Va
                 sampler.stop();
                 return macmon_fail(format!("workload exit {status}"), load1_pre, pre, true, &hold);
             }
-            Ok(None) => sleep(Duration::from_secs(1)),
+            Ok(None) => {
+                sleep(Duration::from_secs(1));
+                if let Ok(now) = crate::fleet_gate::read_ps_cpu() {
+                    if let Some(prev) = &prev_ps {
+                        if let Some(frac) = crate::fleet_gate::foreign_cpu_fraction(prev, &now, std::process::id(), 1.0) {
+                            foreign.push(frac);
+                        }
+                    }
+                    prev_ps = Some(now);
+                }
+            }
             Err(e) => {
                 sampler.stop();
                 return macmon_fail(e.to_string(), load1_pre, pre, true, &hold);
             }
         }
     };
+    if let Some(why) = crate::fleet_gate::fraction_refusal(&foreign, crate::fleet_gate::FOREIGN_CPU_MEAN_MAX, crate::fleet_gate::FOREIGN_CPU_SAMPLE_MAX) {
+        sampler.stop();
+        return macmon_fail(format!("non-harness CPU: {why}"), load1_pre, pre, true, &hold);
+    }
     let trial = slice_new(&pre, &workload_end);
     let load1_post = match settle() {
         Ok(v) => v,
@@ -1250,6 +1357,7 @@ pub fn run_until_quiet_macmon(
     out_dir: &Path,
     deadline: Duration,
     retry_wait: Duration,
+    lock_wait_s: f64,
     cfg: &MacmonConfig,
 ) -> Result<serde_json::Value, String> {
     let started = std::time::Instant::now();
@@ -1278,11 +1386,12 @@ pub fn run_until_quiet_macmon(
                 release_unix_ns: None,
                 first_attempt_contended: first_contended,
                 contended: false,
+                wait_s: 0.0,
             });
             write("refusal-deadline.json", &body)?;
             return Ok(body);
         }
-        match try_lock_exclusive(lock_path)? {
+        match poll_host_lock(lock_path, lock_wait_s)? {
             None => {
                 first_contended = true;
                 let body = macmon_receipt(&MacmonAttempt {
@@ -1295,7 +1404,7 @@ pub fn run_until_quiet_macmon(
                     pre_reached: false,
                     workload_reached: false,
                     post_reached: false,
-                    failure: Some("lock contended; counters were not read".into()),
+                    failure: Some(crate::fleet_gate::HOST_LOCK_REFUSAL.into()),
                 }, &LockHold {
                     path: lock_path.display().to_string(),
                     pid: std::process::id(),
@@ -1303,6 +1412,7 @@ pub fn run_until_quiet_macmon(
                     release_unix_ns: None,
                     first_attempt_contended: true,
                     contended: true,
+                    wait_s: 0.0,
                 });
                 write(&format!("refusal-lock-{n}.json"), &body)?;
                 n += 1;
@@ -1380,6 +1490,8 @@ mod tests {
             workload_reached: true,
             post_reached: true,
             pre_reached: true,
+            settle_load1_pre: vec![],
+            settle_load1_post: vec![],
         }
     }
 
@@ -1391,6 +1503,7 @@ mod tests {
             release_unix_ns: Some(20),
             first_attempt_contended: false,
             contended: false,
+            wait_s: 0.0,
         }
     }
 
@@ -1471,6 +1584,7 @@ mod tests {
                 release_unix_ns: None,
                 first_attempt_contended: true,
                 contended: true,
+                wait_s: 0.0,
             },
         );
         assert!(!r.attributable);

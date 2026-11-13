@@ -8,6 +8,7 @@
 mod acquire;
 mod bind;
 mod energy_drive;
+mod fleet_gate;
 mod infer;
 mod macmon;
 mod meter;
@@ -27,6 +28,13 @@ pub use macmon::{
 };
 pub use meter::{
     hwmon_input, trapezoid_joules, Domain, Sample, delta_uj, dram_joules, evaluate_domains,
+};
+pub use fleet_gate::{
+    bracket_load_offender, combine_uncertainty, counter_cadence_edge_j, counter_quantization_j,
+    counter_quantum_j, foreign_cpu_fraction, fraction_refusal, settle_outcome, student_t_half,
+    format_unix_utc, uncertainty_json, FOREIGN_CPU_MEAN_MAX, FOREIGN_CPU_SAMPLE_MAX,
+    HOST_LOCK_REFUSAL, HOST_LOCK_WAIT_S, OTHER_CORE_MEAN_MAX, OTHER_CORE_SAMPLE_MAX, QUIET_LOAD,
+    SETTLE_BOUND, SETTLE_STREAK, SOC_TELEMETRY_LIMIT,
 };
 pub use window::{
     Drain, Phase, attributable, duration_is_explicit, gpu_receipt_allowed, require_drains,
