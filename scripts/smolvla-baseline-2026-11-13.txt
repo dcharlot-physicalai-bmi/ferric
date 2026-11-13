@@ -1,0 +1,19 @@
+# Separately named SmolVLA reference baseline, 2026-11-13.
+# This does not replace the frozen reference environment.
+#
+# Frozen, unchanged:
+#   PyTorch 2.15.0+cpu, as recorded in
+#   docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json
+#   LeRobot a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a
+#   LeRobot v0.7.0 = 410c095eacc0011d998a73383eb94abed2715af0
+#   lerobot/smolvla_base rev 5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6
+#   model.safetensors sha256 7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb
+#
+# This baseline is the current PyPI resolution of the same script.
+# torch 2.15.0 is still the latest release; the wheel PyPI serves by
+# default is 2.15.0+cu132, not the frozen 2.15.0+cpu build.
+# huggingface/lerobot releases on this date still end at v0.7.0.
+torch==2.15.0
+numpy==2.5.4
+safetensors==0.8.0
+tokenizers==0.23.3
