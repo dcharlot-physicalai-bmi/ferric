@@ -93,8 +93,9 @@ pub fn rope_index(types: &[u8], grids: &[(usize, usize, usize)], merge: usize)
 mod tests {
     use super::*;
 
+    type RopeWant = (Vec<i64>, Vec<i64>, Vec<i64>, i64);
     struct Case { name: String, types: Vec<u8>, grids: Vec<(usize, usize, usize)>,
-                  want: Option<(Vec<i64>, Vec<i64>, Vec<i64>, i64)> }
+                  want: Option<RopeWant> }
 
     /// Parse the fixture emitted by `examples/refgen/qwen3vl_rope_index.py`, which runs the
     /// PUBLISHED function bodies under a numpy shim rather than a reimplementation of them.
@@ -160,7 +161,7 @@ mod tests {
         // one text token, then the image, then one text token
         let probe = |gh: usize, gw: usize| -> i64 {
             let ntok = (gh / 2) * (gw / 2);
-            let mut types = vec![0u8]; types.extend(std::iter::repeat(1).take(ntok)); types.push(0);
+            let mut types = vec![0u8]; types.extend(std::iter::repeat_n(1, ntok)); types.push(0);
             let r = rope_index(&types, &[(1, gh, gw)], 2).unwrap();
             *r.t.last().unwrap()   // the trailing text token's position
         };
@@ -178,7 +179,7 @@ mod tests {
     /// — a port that filled all three with the same ramp would pass a text-only fixture.
     #[test]
     fn image_tokens_carry_grid_coordinates_not_a_ramp() {
-        let types: Vec<u8> = std::iter::repeat(1).take(6).collect();
+        let types: Vec<u8> = std::iter::repeat_n(1, 6).collect();
         let r = rope_index(&types, &[(1, 4, 6)], 2).unwrap();   // merged 2 x 3
         assert_eq!(r.t, vec![0, 0, 0, 0, 0, 0], "one frame: temporal is constant");
         assert_eq!(r.h, vec![0, 0, 0, 1, 1, 1], "height is the slow axis");

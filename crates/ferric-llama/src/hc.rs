@@ -232,7 +232,7 @@ mod tests {
     /// negative-only inputs without anything noticing. A fixture needs a guard like any other claim.
     #[test]
     fn the_fixture_generator_is_two_signed() {
-        let ctx = ctx_or_skip!();
+        let _ctx = ctx_or_skip!();
         let v = { let mut s = 777u64; (0..1024).map(|_| lcg(&mut s)).collect::<Vec<f32>>() };
         let (mx, mn) = v.iter().fold((f32::MIN, f32::MAX), |(a, b), x| (a.max(*x), b.min(*x)));
         assert!(mx > 0.5 && mn < -0.5, "generator does not span both signs: max {mx}, min {mn}");
@@ -402,7 +402,7 @@ mod tests {
         // A zero projection with a large negative bias sends both sigmoids to 0 for every token.
         let g = HcGate {
             fn_w: Tensor::from_vec(&ctx, &vec![0.0; 2 * HC * HC * D], &[2 * HC, HC * D]),
-            base: Tensor::from_vec(&ctx, &vec![-40.0; 2 * HC], &[2 * HC]),
+            base: Tensor::from_vec(&ctx, &[-40.0; 2 * HC], &[2 * HC]),
             scale: [1.0, 1.0],
         };
         let (p, q) = hcm.gates(&h, &g);
@@ -427,7 +427,7 @@ mod tests {
         let h = hcm.replicate(&emb_t);
         let g = HcGate {
             fn_w: Tensor::from_vec(&ctx, &vec![0.0; 2 * HC * HC * D], &[2 * HC, HC * D]),
-            base: Tensor::from_vec(&ctx, &vec![40.0; 2 * HC], &[2 * HC]),
+            base: Tensor::from_vec(&ctx, &[40.0; 2 * HC], &[2 * HC]),
             scale: [1.0, 1.0],
         };
         let (p, q) = hcm.gates(&h, &g);

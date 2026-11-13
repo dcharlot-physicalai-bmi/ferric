@@ -19,7 +19,7 @@ const HE: usize = 128; // energy hidden
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn valid(seq: &[usize]) -> bool { seq.iter().sum::<usize>() == T }
 fn gen_valid(m: usize, seed: u32) -> Vec<Vec<usize>> {
     let mut out = Vec::with_capacity(m); let mut s = seed;
@@ -27,7 +27,8 @@ fn gen_valid(m: usize, seed: u32) -> Vec<Vec<usize>> {
     out
 }
 // AR input row for position t with previous token `prev` (prev==V means BOS): [onehot(prev)_V, onehot(t)_L]
-fn ar_input(prev: usize, t: usize, row: &mut [f32]) { for x in row.iter_mut() { *x = 0.0; } if prev < V { row[prev] = 1.0; } row[V + t] = 1.0; }
+fn ar_input(prev: usize, t: usize, row: &mut [f32]) { for x in row.iter_mut() { *x = 0.0; }
+            if prev < V { row[prev] = 1.0; } row[V + t] = 1.0; }
 // autoregressively sample m sequences from the (frozen) AR proposal
 async fn ar_sample(ctx: &Arc<ferric_core::Context>, ap: &[Tensor], m: usize, seed: u32) -> Vec<Vec<usize>> {
     let mut seqs = vec![vec![0usize; L]; m]; let mut prev = vec![V; m];
@@ -50,7 +51,7 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
     println!("  EFA energy-first — residual-energy verifier on an AR model (EDLM): seqs of len {L} over {{0..{}}} summing to {T}", V - 1);
-    let one = Tensor::from_vec(&ctx, &[1.0], &[1]); let eps = Tensor::from_vec(&ctx, &[1e-6], &[1]);
+    let _one = Tensor::from_vec(&ctx, &[1.0], &[1]); let eps = Tensor::from_vec(&ctx, &[1e-6], &[1]);
     let bs = 512usize;
 
     // ---- train the LOCAL AR proposal p(x_t | x_{t-1}, t): MLP [V+L → HA → V], teacher-forced CE on valid seqs
@@ -107,8 +108,11 @@ async fn run() {
         let (mut bon, mut orc, mut rnd) = (0usize, 0usize, 0usize);
         for tr in 0..trials {
             let (mut bi, mut be) = (tr * nn, f32::MAX); let mut any = false;
-            for j in 0..nn { let idx = tr * nn + j; if e[idx] < be { be = e[idx]; bi = idx; } if valid(&seqs[idx]) { any = true; } }
-            if valid(&seqs[bi]) { bon += 1; } if any { orc += 1; } if valid(&seqs[tr * nn]) { rnd += 1; }
+            for j in 0..nn { let idx = tr * nn + j; if e[idx] < be { be = e[idx]; bi = idx; }
+            if valid(&seqs[idx]) { any = true; } }
+            if valid(&seqs[bi]) { bon += 1; }
+            if any { orc += 1; }
+            if valid(&seqs[tr * nn]) { rnd += 1; }
         }
         println!("     {:>6}  {:>9.0}%  {:>11.0}%  {:>9.0}%", nn, bon as f32 / trials as f32 * 100.0, orc as f32 / trials as f32 * 100.0, rnd as f32 / trials as f32 * 100.0);
     }

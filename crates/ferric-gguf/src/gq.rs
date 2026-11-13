@@ -72,7 +72,7 @@ impl GqSpec {
     pub fn valid(&self) -> Result<(), String> {
         let ok_bits = match self.kind { GqKind::Int => matches!(self.bits, 2 | 3 | 4 | 8), GqKind::Fp8E4m3 => self.bits == 8, GqKind::Fp4E2m1 => self.bits == 4 };
         if !ok_bits { return Err(format!("GQ {:?} cannot have {} bits", self.kind, self.bits)) }
-        if self.group == 0 || self.group >= 4096 || (self.group * self.bits) % 32 != 0 {
+        if self.group == 0 || self.group >= 4096 || !(self.group * self.bits).is_multiple_of(32) {
             return Err(format!("GQ group {} x {} bits is not a whole number of 32-bit words (or >= 4096)", self.group, self.bits));
         }
         Ok(())
@@ -142,7 +142,7 @@ pub fn deq_gq_blocks(raw: &[u8], n: usize, spec: &GqSpec) -> Result<Vec<f32>, St
 /// Decode a whole `[rows, cols]` GQ tensor, act-order or not.
 pub fn deq_gq_rows(raw: &[u8], rows: usize, cols: usize, spec: &GqSpec) -> Result<Vec<f32>, String> {
     let (g, bb) = (spec.group as usize, spec.block_bytes());
-    if cols % g != 0 { return Err(format!("GQ: {cols} columns is not a whole number of {g}-value groups")) }
+    if !cols.is_multiple_of(g) { return Err(format!("GQ: {cols} columns is not a whole number of {g}-value groups")) }
     let nb = cols / g;
     if raw.len() != rows * nb * bb { return Err(format!("GQ: {} bytes for [{rows}, {cols}] ({} expected)", raw.len(), rows * nb * bb)) }
     if !spec.act { return deq_gq_blocks(raw, rows * cols, spec) }

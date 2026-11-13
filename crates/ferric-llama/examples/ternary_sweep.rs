@@ -15,7 +15,7 @@ const Q8_0: u32 = 8;
 fn ternarize(w: &[f32], planes: usize) -> Vec<f32> {
     let mut resid = w.to_vec(); let mut recon = vec![0f32; w.len()];
     for _ in 0..planes {
-        for g in 0..(w.len() + GS - 1) / GS {
+        for g in 0..w.len().div_ceil(GS) {
             let (lo, hi) = (g * GS, ((g + 1) * GS).min(w.len()));
             let grp = &resid[lo..hi];
             let d = 0.7 * grp.iter().map(|x| x.abs()).sum::<f32>() / grp.len() as f32;
@@ -46,7 +46,7 @@ impl GgufSource for TGguf<'_> {
     }
 }
 
-async fn ppl(ctx: &Arc<Context>, m: &Qwen3, ids: &[u32]) -> f64 {
+async fn ppl(_ctx: &Arc<Context>, m: &Qwen3, ids: &[u32]) -> f64 {
     let c = &m.cfg;
     let v = m.forward_cached(ids, &mut Cache::new(c)).to_vec().await;
     let (mut nll, mut cnt) = (0f64, 0usize);
@@ -88,8 +88,8 @@ predictions without being explicitly programmed to do so.";
     let configs: Vec<(&str, Box<dyn Fn(&str) -> bool>)> = vec![
         ("attention only (all layers)", Box::new(|n: &str| is_attn(n))),
         ("FFN only (all layers)", Box::new(|n: &str| is_ffn(n))),
-        ("FFN, middle layers 6..18", Box::new(|n: &str| is_ffn(n) && layer_of(n).map_or(false, |l| (6..18).contains(&l)))),
-        ("all proj, keep first/last 2 layers fp", Box::new(|n: &str| is_proj(n) && layer_of(n).map_or(false, |l| (2..nl - 2).contains(&l)))),
+        ("FFN, middle layers 6..18", Box::new(|n: &str| is_ffn(n) && layer_of(n).is_some_and(|l| (6..18).contains(&l)))),
+        ("all proj, keep first/last 2 layers fp", Box::new(|n: &str| is_proj(n) && layer_of(n).is_some_and(|l| (2..nl - 2).contains(&l)))),
         ("all projections (baseline)", Box::new(|n: &str| is_proj(n))),
     ];
     for (label, tgt) in &configs {

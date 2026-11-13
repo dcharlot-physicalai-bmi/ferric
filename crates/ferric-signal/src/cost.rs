@@ -364,7 +364,6 @@ pub fn embed_cost(seq_len: usize, rows: u32, d_model: usize) -> EmbedCost {
 }
 #[cfg(test)]
 mod traffic_tests {
-    use super::*;
     use crate::EncoderConfig;
 
     fn cfg() -> EncoderConfig {

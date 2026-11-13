@@ -15,8 +15,8 @@ const GS: usize = 128; // group size (shared FP16 scale per GS weights)
 // group-wise ternarize: threshold Δ=0.7·mean|w| (TWN near-optimal), scale = mean|w| over the kept weights.
 // pack 5 trits/byte. returns (packed_trits, fp16-ish scales as f32).
 fn ternary_encode(w: &[f32], gs: usize) -> (Vec<u8>, Vec<f32>) {
-    let ng = (w.len() + gs - 1) / gs;
-    let bpg = (gs + 4) / 5; // bytes per group for the trits
+    let ng = w.len().div_ceil(gs);
+    let bpg = gs.div_ceil(5); // bytes per group for the trits
     let mut packed = vec![0u8; ng * bpg];
     let mut scales = vec![0f32; ng];
     for g in 0..ng {
@@ -40,7 +40,7 @@ fn ternary_encode(w: &[f32], gs: usize) -> (Vec<u8>, Vec<f32>) {
     (packed, scales)
 }
 fn ternary_decode(packed: &[u8], scales: &[f32], n: usize, gs: usize) -> Vec<f32> {
-    let bpg = (gs + 4) / 5;
+    let bpg = gs.div_ceil(5);
     let mut out = vec![0f32; n];
     for g in 0..scales.len() {
         let s = scales[g]; let base = g * gs;
@@ -92,7 +92,7 @@ async fn run() {
     let err = rel_err(weight, &recon);
 
     // 3) achieved bits-per-weight
-    let bpg = (GS + 4) / 5;
+    let bpg = GS.div_ceil(5);
     let trit_bpw = bpg as f32 * 8.0 / GS as f32;
     let total_bpw = (bpg as f32 * 8.0 + 16.0) / GS as f32; // + one f16 scale per group
     let nonzero = recon.iter().filter(|&&x| x != 0.0).count();
@@ -126,7 +126,7 @@ async fn run() {
     let mut recon2 = ternary_decode(&pk2, &sc2, n, GS);
     for i in 0..n { if weight[i].abs() >= thresh { recon2[i] = weight[i]; } } // salient kept exact (fp16)
     let err2 = rel_err(weight, &recon2);
-    let salient_bpw = total_bpw + keep_frac as f32 * (16.0 + 32.0); // +fp16 value +~int32 index per kept weight
+    let salient_bpw = total_bpw + keep_frac * (16.0 + 32.0); // +fp16 value +~int32 index per kept weight
     println!("\nSTEP-2 PREVIEW — salient-weight preservation (top {:.0}% kept fp16):", keep_frac * 100.0);
     println!("  reconstruction rel error {err:.3e} → {err2:.3e}  ({:.0}% lower)  at {salient_bpw:.2} bpw",
              100.0 * (1.0 - err2 / err));

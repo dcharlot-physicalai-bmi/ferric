@@ -38,11 +38,12 @@ use std::sync::Arc;
 pub(crate) const VL_TYPES: &[&str] = &["qwen2_5_vl", "qwen3_vl"];
 
 pub(crate) enum Tower {
-    Qwen25(ferric_llama::qwen25vl_vision::VisionTower),
-    Qwen3(ferric_llama::qwen3vl_vision::VisionTower),
+    Qwen25(Box<ferric_llama::qwen25vl_vision::VisionTower>),
+    Qwen3(Box<ferric_llama::qwen3vl_vision::VisionTower>),
 }
 
 /// A vision tower and what feeding it needs.
+type VisionPrompt = Option<(Vec<u32>, Arc<MmInput>)>;
 pub(crate) struct Vision {
     tower: Tower,
     pcfg: PreprocCfg,
@@ -141,7 +142,7 @@ impl Engine {
     /// token becomes the run of `n` the tower's output fills. `Ok(None)` = the conversation has no image
     /// (then it takes the text path unchanged).
     pub(crate) fn vision_prompt(&self, messages: &[Value], tools: Option<&[Value]>, kwargs: &serde_json::Map<String, Value>)
-        -> Result<Option<(Vec<u32>, Arc<MmInput>)>, String>
+        -> Result<VisionPrompt, String>
     {
         let (msgs, imgs) = split_images(messages)?;
         if imgs.is_empty() { return Ok(None); }
@@ -252,9 +253,8 @@ pub(crate) fn card(name: &str, dir: &Path) -> Option<ollama::Card> {
 /// The authors' chat template: `chat_template.json`, else `chat_template.jinja`, else `tokenizer_config.json`.
 fn chat_template_of(dir: &Path) -> Option<String> {
     let rd = |f: &str| std::fs::read(dir.join(f)).ok();
-    if let Some(v) = rd("chat_template.json").and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-        if let Some(s) = v["chat_template"].as_str() { return Some(s.to_string()); }
-    }
+    if let Some(v) = rd("chat_template.json").and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        && let Some(s) = v["chat_template"].as_str() { return Some(s.to_string()); }
     if let Some(b) = rd("chat_template.jinja") { return String::from_utf8(b).ok(); }
     let tc: Value = serde_json::from_slice(&rd("tokenizer_config.json")?).ok()?;
     match &tc["chat_template"] {
@@ -300,7 +300,7 @@ impl Engine {
             Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
             _ => Vec::new(),
         };
-        for t in ["<|im_end|>", "<|endoftext|>"] { if let Some(e) = id_of(t) { if !eos.contains(&e) { eos.push(e); } } }
+        for t in ["<|im_end|>", "<|endoftext|>"] { if let Some(e) = id_of(t) && !eos.contains(&e) { eos.push(e); } }
         let template = chat_template_of(d).ok_or("no chat template in the checkpoint")?;
         let tc: Value = std::fs::read(d.join("tokenizer_config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
         let tok_s = |k: &str| tc[k].as_str().or_else(|| tc[k]["content"].as_str()).unwrap_or("").to_string();
@@ -312,22 +312,21 @@ impl Engine {
             Some(b)
         }).collect();
         let tower = match mt.as_str() {
-            "qwen2_5_vl" => Tower::Qwen25(ferric_llama::qwen25vl_vision::VisionTower::load(&ctx, dir)?),
-            _ => Tower::Qwen3(ferric_llama::qwen3vl_vision::VisionTower::load(&ctx, dir)?),
+            "qwen2_5_vl" => Tower::Qwen25(Box::new(ferric_llama::qwen25vl_vision::VisionTower::load(&ctx, dir)?)),
+            _ => Tower::Qwen3(Box::new(ferric_llama::qwen3vl_vision::VisionTower::load(&ctx, dir)?)),
         };
         let vision = Some(Vision { tower, pcfg: PreprocCfg::load(dir)?, img_tok });
         let card = card(&name, d).ok_or("config.json unreadable")?;
         let reasoning_markers = template.contains("<think>").then(|| ("<think>".to_string(), "</think>".to_string()));
         let spec_gate = std::sync::Mutex::new(crate::specgate::SpecGate::new(model.cfg.n_layer));
         let n_ctx = crate::ctx_cap(card.context);
-        let (im_start, im_end) = (id_of("<|im_start|>"), id_of("<|im_end|>"));
         Ok(Engine {
             ctx, model: Model::Dense(model), aux: shared.aux.clone(), card, chat_template, reasoning_markers,
             energy: shared.energy.clone(), responses: shared.responses.clone(), metrics: shared.metrics.clone(),
             // Image prompts never use it (see the module docs); a text turn on this model may.
-            prefix_cache: None, spec_gate, bpe, spm: None, add_space_prefix: false, tokens, u2b, im_start, im_end,
+            prefix_cache: None, spec_gate, bpe, spm: None, add_space_prefix: false, tokens, u2b,
             bos_id: None, add_bos: false, eos_id: eos.first().copied(), add_eos: false, pooling: None, eos, name,
-            token_bytes, specials, rstrip_after: Default::default(), template, prefix: std::cell::RefCell::new(None),
+            token_bytes, specials, rstrip_after: Default::default(), prefix: std::cell::RefCell::new(None),
             n_ctx, vision, adapters: Vec::new(), trie: Default::default(), grammars: Default::default(), json_masks: Default::default(), sampling_defaults: Default::default(),
         })
     }

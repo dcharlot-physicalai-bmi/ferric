@@ -359,8 +359,8 @@ fn hex(b: &[u8; 20]) -> String {
 fn unhex(s: &str) -> Option<[u8; 20]> {
     if s.len() != 40 { return None; }
     let mut o = [0u8; 20];
-    for i in 0..20 {
-        o[i] = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    for (i, byte) in o.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
     Some(o)
 }
@@ -375,7 +375,7 @@ fn sha1(msg: &[u8]) -> [u8; 20] {
     while data.len() % 64 != 56 { data.push(0); }
     data.extend_from_slice(&bitlen.to_be_bytes());
 
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());

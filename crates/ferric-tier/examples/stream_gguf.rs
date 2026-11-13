@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Read volume is the metric that matters here. Wall clock barely moves because this file fits");
     println!("  the OS page cache and the per-rung time is dominated by checksumming every delivered byte —");
     println!("  reporting it as a speedup would be measuring the harness, not the tier.\n");
-    println!("  {:>10}  {:>6}  {:>9}  {:>8}  {:>7}   {}", "budget", "pinned", "hit rate", "read", "wall", "checksum");
+    println!("  {:>10}  {:>6}  {:>9}  {:>8}  {:>7}   checksum", "budget", "pinned", "hit rate", "read", "wall");
     println!("  {:-<72}", "");
 
     let mut reference: Option<u64> = None;

@@ -38,7 +38,7 @@ fn det_sqrt_cpu(y: f32) -> f32 {
         let t = x * x;
         let u = hy * t;
         let w = 1.5 - u;
-        x = x * w;
+        x *= w;
     }
     y * x
 }

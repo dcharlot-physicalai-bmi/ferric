@@ -31,9 +31,8 @@ async fn run() {
     let vocab: HashMap<String, u32> = toks.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
     let bpe = Bpe::new_with_pre(vocab, &merges, Pre::from_gguf(pre));
     let mut ids = bpe.encode(text);
-    if matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) {
-        if let Some(Meta::U(b)) = g.metadata.get("tokenizer.ggml.bos_token_id") { ids.insert(0, *b as u32); }
-    }
+    if matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true)))
+        && let Some(Meta::U(b)) = g.metadata.get("tokenizer.ggml.bos_token_id") { ids.insert(0, *b as u32); }
     println!("  {} tokens: {ids:?}", ids.len());
 
     let m = NemotronH::load(&ctx, &g).expect("load");
@@ -85,7 +84,7 @@ async fn run() {
         seq.push(best as u32);
         if matches!(g.metadata.get("tokenizer.ggml.eos_token_id"), Some(Meta::U(e)) if *e as usize == best) { break; }
     }
-    println!("  generated: {:?}", out.replace('\u{2581}', " ").replace('Ġ', " "));
+    println!("  generated: {:?}", out.replace(['\u{2581}', 'Ġ'], " "));
 
     // ---- the state check: incremental must equal stateless, token for token ----
     //
@@ -108,7 +107,7 @@ async fn run() {
         cseq.push(best as u32);
         if matches!(g.metadata.get("tokenizer.ggml.eos_token_id"), Some(Meta::U(e)) if *e as usize == best) { break; }
     }
-    println!("  cached:    {:?}", cout.replace('\u{2581}', " ").replace('Ġ', " "));
+    println!("  cached:    {:?}", cout.replace(['\u{2581}', 'Ġ'], " "));
     println!("  state: {:.1} MB, INDEPENDENT of sequence length", cache.bytes() as f64 / 1e6);
     assert_eq!(cout, out,
                "the incremental path diverged from the stateless one. A cache bug drifts rather than \

@@ -13,7 +13,7 @@ use std::sync::Arc;
 const HW: usize = 64; const G: f32 = 9.8; const MC: f32 = 1.0; const MP: f32 = 0.1; const L: f32 = 0.5; const DT: f32 = 0.02;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn nz(seed: u32, sc: f32) -> f32 { let a = u(seed, 1); let b = u(seed, 2); (-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos() * sc }
+fn nz(seed: u32, sc: f32) -> f32 { let a = u(seed, 1); let b = u(seed, 2); (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos() * sc }
 fn accel(th: f32, thd: f32, f: f32) -> (f32, f32) {
     let (s, c) = (th.sin(), th.cos());
     let temp = (f + MP * L * thd * thd * s) / (MC + MP);

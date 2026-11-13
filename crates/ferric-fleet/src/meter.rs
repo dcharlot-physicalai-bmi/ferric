@@ -94,18 +94,6 @@ pub fn hwmon_input(sys_class_hwmon: &std::path::Path, chip: &str, prefix: &str, 
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn trapezoid_matches_a_two_point_rectangle() {
-        let j = trapezoid_joules(&[(0, 10.0), (1_000_000_000, 10.0)]).unwrap();
-        assert!((j - 10.0).abs() < 1e-9, "{j}");
-        assert!(trapezoid_joules(&[(0, 1.0)]).is_none());
-    }
-}
-
 /// `(delta_uj, wrapped)`.
 pub fn delta_uj(start: u64, end: u64, range_uj: u64) -> Result<(u64, bool), String> {
     if end >= start {
@@ -148,4 +136,16 @@ pub fn evaluate_domains(samples: &[Sample], sum_rapl: bool, gpu_only: bool, syst
     }
     let _ = dram_joules(samples)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trapezoid_matches_a_two_point_rectangle() {
+        let j = trapezoid_joules(&[(0, 10.0), (1_000_000_000, 10.0)]).unwrap();
+        assert!((j - 10.0).abs() < 1e-9, "{j}");
+        assert!(trapezoid_joules(&[(0, 1.0)]).is_none());
+    }
 }

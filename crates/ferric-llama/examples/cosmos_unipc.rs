@@ -124,7 +124,7 @@ fn main() {
     let vels: Vec<Vec<f64>> = (0..4).map(|i| (0..d).map(|j| (j as f64 * 0.5 + i as f64 * 0.3).cos() * 0.4).collect()).collect();
     let mut me = UniPc::new(2);
     let mut x = x0.clone();
-    for i in 0..4 { x = me.step(&vels[i], &x); }
+    for item in vels[..4].iter() { x = me.step(item, &x); }
     // reference final state (numpy UniPC, verified == real diffusers scheduler to 1e-7)
     let x4_ref = [-0.2988471145495058, 0.5206147200895057, 1.0673532274036543, 1.130566495975874, 0.7223405617296, 0.06172708638989455];
     let err = x.iter().zip(&x4_ref).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);

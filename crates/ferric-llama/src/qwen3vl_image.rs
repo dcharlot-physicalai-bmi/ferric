@@ -492,7 +492,7 @@ mod tests {
         let b = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
         assert_eq!(b.len(), 4 + n * 4, "{path}: header says {n} floats");
-        b[4..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        b[4..].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
     /// Against **Pillow's own C resampler**, not a reimplementation of it.

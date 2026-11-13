@@ -6,7 +6,7 @@ use ferric_core::Context;
 use ferric_tensor::Tensor;
 use std::sync::Arc;
 
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.37 + s).sin())).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (i as f32 * 0.37 + s).sin()).collect() }
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
 
 fn main() { pollster::block_on(run()); }

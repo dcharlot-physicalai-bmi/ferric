@@ -12,7 +12,7 @@ use std::sync::Arc;
 const GS: usize = 128;
 fn ternarize(w: &[f32]) -> Vec<f32> { // per-group absmean ternary (BitNet b1.58)
     let mut out = vec![0f32; w.len()];
-    for g in 0..(w.len() + GS - 1) / GS {
+    for g in 0..w.len().div_ceil(GS) {
         let (lo, hi) = (g * GS, ((g + 1) * GS).min(w.len()));
         let gamma = (w[lo..hi].iter().map(|x| x.abs()).sum::<f32>() / (hi - lo) as f32).max(1e-8);
         for k in lo..hi { out[k] = (w[k] / gamma).round().clamp(-1.0, 1.0) * gamma; }
@@ -26,7 +26,7 @@ async fn run() {
     let (n, hid) = (256usize, 64usize);
     let mut seed = 0xACE1u64;
     let mut u = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 40) as f32 + 0.5) / (1u32 << 24) as f32 };
-    let mut gs = |u: &mut dyn FnMut() -> f32| (-2.0 * u().max(1e-7).ln()).sqrt() * (std::f32::consts::TAU * u()).cos();
+    let gs = |u: &mut dyn FnMut() -> f32| (-2.0 * u().max(1e-7).ln()).sqrt() * (std::f32::consts::TAU * u()).cos();
     // XOR-ish task: 2D inputs, label sign(x1·x2) ∈ {−1,+1} — nonlinear, needs the hidden layer
     let mut xd = vec![0f32; n * 2]; let mut yd = vec![0f32; n];
     for i in 0..n { let (a, b) = (gs(&mut u), gs(&mut u)); xd[i * 2] = a; xd[i * 2 + 1] = b; yd[i] = if a * b > 0.0 { 1.0 } else { -1.0 }; }

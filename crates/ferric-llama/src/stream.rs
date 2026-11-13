@@ -122,7 +122,7 @@ pub enum LayerRef<'a> {
     Pinned(&'a Layer),
     /// A resident (non-streamed) layer, borrowed from the model.
     Borrowed(&'a Layer),
-    Built(Layer),
+    Built(Box<Layer>),
 }
 
 impl std::ops::Deref for LayerRef<'_> {
@@ -196,7 +196,7 @@ impl LayerStream {
             let _ = self.pinned[il].set(built);
             return Ok(LayerRef::Pinned(self.pinned[il].get().expect("just set")));
         }
-        Ok(LayerRef::Built(self.build(il)?))
+        Ok(LayerRef::Built(Box::new(self.build(il)?)))
     }
 
     fn build(&self, il: usize) -> Result<Layer, String> {

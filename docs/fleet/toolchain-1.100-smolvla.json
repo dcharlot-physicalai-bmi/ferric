@@ -1,0 +1,61 @@
+{
+  "receipt": "toolchain-1.100 SmolVLA f32 forward",
+  "date": "2026-11-13",
+  "rustc_vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5",
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "cargo_lock_sha256": "3addbafb869cbd7511ec5064f7248be1b1990389f55e3b01a88a5b3c2de296c5",
+  "weights": {
+    "model_id": "lerobot/smolvla_base",
+    "revision": "5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6",
+    "model_safetensors_sha256": "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb",
+    "model_safetensors_bytes": 906712520
+  },
+  "python": {
+    "frozen_reference": "PyTorch 2.15.0+cpu, recorded in docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json. That pin was not changed.",
+    "new_baseline": "scripts/smolvla-baseline-2026-11-13.txt",
+    "new_baseline_packages": {
+      "torch": "2.15.0+cu132",
+      "numpy": "2.5.4",
+      "safetensors": "0.8.0",
+      "tokenizers": "0.23.3"
+    },
+    "note": "PyPI's latest torch release is still 2.15.0. The default wheel is 2.15.0+cu132, which is a different build of that release from the frozen 2.15.0+cpu pin. The stage errors below were measured with the new baseline against the same Rust trace."
+  },
+  "lerobot": {
+    "old_reference": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
+    "v0_7_0": "410c095eacc0011d998a73383eb94abed2715af0",
+    "newer_release": "none. GitHub releases on 2026-11-13 still end at v0.7.0. No new named reference was added."
+  },
+  "bound_raw_actions": 0.0001947678066714822,
+  "cpu_vs_pytorch": {
+    "previous_receipt": "docs/fleet/smolvla-f32-reference.json",
+    "stages": {
+      "prepared_image0": {"old_max_abs": 2.384185791015625e-07, "new_max_abs": 2.384185791015625e-07},
+      "patch_token0": {"old_max_abs": 7.152557373046875e-07, "new_max_abs": 7.152557373046875e-07},
+      "vision_l0_token0": {"old_max_abs": 3.814697265625e-06, "new_max_abs": 3.814697265625e-06},
+      "vision_post_token0": {"old_max_abs": 1.5735626220703125e-05, "new_max_abs": 1.5735626220703125e-05},
+      "connector_token0": {"old_max_abs": 6.866455078125e-05, "new_max_abs": 6.866455078125e-05},
+      "state_token": {"old_max_abs": 0.0, "new_max_abs": 0.0},
+      "text_l0_k_token0": {"old_max_abs": 4.291534423828125e-06, "new_max_abs": 4.291534423828125e-06},
+      "velocity0": {"old_max_abs": 2.86102294921875e-06, "new_max_abs": 2.86102294921875e-06},
+      "raw_actions": {"old_max_abs": 3.6954879760742188e-06, "new_max_abs": 3.6954879760742188e-06}
+    },
+    "delta": "none. Every stage max_abs and rmse matches the previous receipt."
+  },
+  "llvmpipe_vs_cpu": {
+    "previous_receipt": "docs/fleet/smolvla-wgpu-llvmpipe.json",
+    "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "mesa": "25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)",
+    "raw_action_max_abs_vs_cpu": {"old": 4.291534423828125e-06, "new": 4.291534423828125e-06},
+    "raw_action_rmse_vs_cpu": {"old": 6.731323196618177e-07, "new": 6.731323196618177e-07},
+    "connector_token0_max_abs_vs_cpu": {"old": 0.0001068115234375, "new": 0.0001068115234375},
+    "velocity0_max_abs_vs_cpu": {"old": 3.337860107421875e-06, "new": 3.337860107421875e-06},
+    "dispatches": 27482,
+    "delta": "none. The new gpu receipt matches docs/fleet/smolvla-wgpu-llvmpipe.json field for field."
+  },
+  "radv": {
+    "status": "pending hardware",
+    "previous": "docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json raw_actions radv_vs_pytorch_f32 max_abs 9.357929229736328e-06, inside the 1.95e-4 bound",
+    "reason": "This VM has lavapipe only. RADV on gfx1151 was not re-run."
+  }
+}

@@ -43,7 +43,7 @@ async fn run() {
     println!("GPU round-trip cost — the sync expert streaming would pay per (token, layer)\n");
 
     // A router selection row: [T, 2k] for T=1, k=8. 64 bytes.
-    let sel = Tensor::from_vec(&ctx, &vec![1.0f32; 16], &[1, 16]);
+    let sel = Tensor::from_vec(&ctx, &[1.0f32; 16], &[1, 16]);
     // Something to make the queue non-empty, so the COLD case is a real drain rather than a no-op.
     let busy = Tensor::from_vec(&ctx, &vec![0.5f32; 1 << 20], &[1024, 1024]);
 

@@ -291,7 +291,7 @@ fn simulate(args: &[String]) -> Result<String, String> {
     let actions_path = flag(args, "--actions").ok_or("--actions")?;
     let joints_path = flag(args, "--joints").ok_or("--joints")?;
     let bytes = fs::read(actions_path).map_err(|e| e.to_string())?;
-    let actions: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let actions: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     let joints = parse_joints(&fs::read(joints_path).map_err(|e| e.to_string())?)?;
     let t0 = parse_u64(flag(args, "--t0-ns").unwrap_or("1000000000"))?;
     let step = parse_u64(flag(args, "--step-ns").unwrap_or("20000000"))?;
@@ -566,7 +566,7 @@ fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
     let clip = |rows: &[(u64, ferric_fleet::Reading)], a: u64, b: u64| -> Vec<(u64, ferric_fleet::Reading)> {
         rows.iter().filter(|(t, _)| *t >= a && *t <= b).cloned().collect()
     };
-    let mut run = |session: &mut ferric_smolvla::GpuSession, label: String, phase: &'static str| -> Result<serde_json::Value, String> {
+    let run = |session: &mut ferric_smolvla::GpuSession, label: String, phase: &'static str| -> Result<serde_json::Value, String> {
         session.drain();
         let t0 = sampler.snapshot().last().map(|(t, _)| *t).unwrap_or(0);
         let g = pollster::block_on(session.forward(&store, &s))?;
@@ -681,6 +681,8 @@ fn gpu_energy(args: &[String]) -> Result<String, String> {
     }
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let counters = find_powercap()?;
+    assert_eq!(counters[0].label, "rapl-package");
+    assert_eq!(counters[1].label, "rapl-core");
     let ppt = hwmon_labeled("amdgpu", "power", "PPT").filter(|p| read_u64(p).is_ok());
     let paths = Arc::new(Paths {
         pkg: counters[0].path.clone(),
@@ -737,7 +739,7 @@ fn gpu_energy(args: &[String]) -> Result<String, String> {
     let mut traces = Vec::new();
 
     // Window: first forward = weight upload + pipeline compile + first inference.
-    let mut run = |session: &mut ferric_smolvla::GpuSession, label: String, phase: &'static str| -> Result<(Window, ferric_smolvla::GpuForward), String> {
+    let run = |session: &mut ferric_smolvla::GpuSession, label: String, phase: &'static str| -> Result<(Window, ferric_smolvla::GpuForward), String> {
         session.drain();
         let a = sample_row(&paths, origin)?;
         let g = pollster::block_on(session.forward(&store, &s))?;

@@ -13,7 +13,6 @@
 //!   cargo run -p ferric-llama --example stream_embodiments --release
 use ferric_core::{max_abs_diff, Context};
 use ferric_gguf::backed::{header_probe, GgufBacked};
-use ferric_gguf::{GgufFile, GgufSource};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_llama::stream::layer_runs_of;
 use ferric_tier::{Backing, FileBacking, SliceBacking, StagedBacking, TierError};
@@ -49,7 +48,7 @@ async fn run() {
     };
 
     let reference = logits_of(Arc::clone(&file_b)).to_vec().await;
-    println!("\n  {:<28} {:>12}  {:>14}   {}", "embodiment", "resident", "max|Δ| vs file", "argmax");
+    println!("\n  {:<28} {:>12}  {:>14}   argmax", "embodiment", "resident", "max|Δ| vs file");
     println!("  {:-<74}", "");
     let arg = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
     let ref_arg = arg(&reference[reference.len() - 151936..]);
@@ -90,7 +89,7 @@ async fn run() {
 
     // ---------- the property the browser path lives or dies on ----------
     let empty = StagedBacking::new();
-    let e = empty.read_at(1 << 20, &mut vec![0u8; 64]).unwrap_err();
+    let e = empty.read_at(1 << 20, &mut [0u8; 64]).unwrap_err();
     let named = matches!(e, TierError::NotStaged { .. });
     println!("\n  un-staged read → {}", e);
     assert!(named, "an un-staged read must be a NAMED error, not zeros and not a stall");
@@ -100,7 +99,7 @@ async fn run() {
     println!("     runs the same code path as native rather than a wasm-only reimplementation of it.");
     println!("\n  The browser's constraint is real and handled rather than hidden: read_at is synchronous");
     println!("  and fetch is not, so bytes must be staged BEFORE the forward pass reads them. A miss is");
-    println!("  `{}`,", "TierError::NotStaged");
+    println!("  `TierError::NotStaged`,");
     println!("  which names the range — because returning zeros would produce a model that runs and lies.");
     println!("\n  Layer weights: {:.1} MB of {:.1} MB.", layer_bytes as f64 / 1e6, total as f64 / 1e6);
 

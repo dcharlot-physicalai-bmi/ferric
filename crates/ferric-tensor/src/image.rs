@@ -39,7 +39,7 @@ pub fn read_ppm(bytes: &[u8]) -> Result<Rgb8, String> {
     // header — including between the dimensions, which is where a naive split breaks. Parsed with a
     // plain cursor rather than nested iterator borrows.
     let mut p = 0usize;
-    let mut field = |p: &mut usize| -> Result<String, String> {
+    let field = |p: &mut usize| -> Result<String, String> {
         let mut tok = String::new();
         while *p < bytes.len() {
             let ch = bytes[*p] as char;

@@ -80,7 +80,7 @@ fn build(top_k: u32) -> Vec<u8> {
         .kv_f32("hyv4.expert_weights_scale", 2.827)
         .kv_bool("hyv4.expert_weights_norm", true)
         .kv_u32("hyv4.expert_gating_func", 2)
-        .kv_arr_f32("hyv4.swiglu_clamp_exp", &vec![10.0f32; L])
+        .kv_arr_f32("hyv4.swiglu_clamp_exp", &[10.0f32; L])
         .kv_u32("hyv4.hyper_connection.count", HC as u32)
         .kv_f32("hyv4.hyper_connection.epsilon", 1e-6)
         .kv_f32("hyv4.hyper_connection.magnitude", 2.0)
@@ -115,7 +115,7 @@ fn build(top_k: u32) -> Vec<u8> {
 
     w.tensor_f32("token_embd.weight", &[D as u64, VOCAB as u64], &rnd(VOCAB * D))
         .tensor_f32("output.weight", &[D as u64, VOCAB as u64], &rnd(VOCAB * D))
-        .tensor_f32("output_norm.weight", &[D as u64], &vec![1.0; D])
+        .tensor_f32("output_norm.weight", &[D as u64], &[1.0; D])
         .tensor_f32("output_hc_fn.weight", &[(HC * D) as u64, HC as u64], &rnd(HC * HC * D))
         .tensor_f32("output_hc_base.weight", &[HC as u64], &rnd(HC))
         .tensor_f32("output_hc_scale.weight", &[1], &[0.8]);
@@ -126,13 +126,13 @@ fn build(top_k: u32) -> Vec<u8> {
         // [in, out]. Writing them the other way round is the transposition class of bug — right
         // element count, wrong arrangement — and it would survive a round trip through this file
         // because the loader reverses whatever is written.
-        w.tensor_f32(&b("attn_norm.weight"), &[D as u64], &vec![1.0; D])
-            .tensor_f32(&b("ffn_norm.weight"), &[D as u64], &vec![1.0; D])
+        w.tensor_f32(&b("attn_norm.weight"), &[D as u64], &[1.0; D])
+            .tensor_f32(&b("ffn_norm.weight"), &[D as u64], &[1.0; D])
             .tensor_f32(&b("attn_q_a.weight"), &[D as u64, QLORA as u64], &rnd(QLORA * D))
-            .tensor_f32(&b("attn_q_a_norm.weight"), &[QLORA as u64], &vec![1.0; QLORA])
+            .tensor_f32(&b("attn_q_a_norm.weight"), &[QLORA as u64], &[1.0; QLORA])
             .tensor_f32(&b("attn_q_b.weight"), &[QLORA as u64, (HEADS * qk_head) as u64], &rnd(HEADS * qk_head * QLORA))
             .tensor_f32(&b("attn_kv_a_mqa.weight"), &[D as u64, (KVL + ROPE) as u64], &rnd((KVL + ROPE) * D))
-            .tensor_f32(&b("attn_kv_a_norm.weight"), &[KVL as u64], &vec![1.0; KVL])
+            .tensor_f32(&b("attn_kv_a_norm.weight"), &[KVL as u64], &[1.0; KVL])
             .tensor_f32(&b("attn_k_b.weight"), &[QK_NOPE as u64, KVL as u64, HEADS as u64], &rnd(HEADS * KVL * QK_NOPE))
             .tensor_f32(&b("attn_v_b.weight"), &[KVL as u64, VH as u64, HEADS as u64], &rnd(HEADS * VH * KVL))
             .tensor_f32(&b("attn_gate.weight"), &[D as u64, (HEADS * VH) as u64], &rnd(HEADS * VH * D))
@@ -148,7 +148,7 @@ fn build(top_k: u32) -> Vec<u8> {
         if il == 0 {
             w.tensor_f32(&b("indexer.attn_q_b.weight"), &[QLORA as u64, (IDX_HEADS * IDX_DK) as u64], &rnd(IDX_HEADS * IDX_DK * QLORA))
                 .tensor_f32(&b("indexer.attn_k.weight"), &[D as u64, IDX_DK as u64], &rnd(IDX_DK * D))
-                .tensor_f32(&b("indexer.k_norm.weight"), &[IDX_DK as u64], &vec![1.0; IDX_DK])
+                .tensor_f32(&b("indexer.k_norm.weight"), &[IDX_DK as u64], &[1.0; IDX_DK])
                 .tensor_f32(&b("indexer.k_norm.bias"), &[IDX_DK as u64], &rnd(IDX_DK))
                 .tensor_f32(&b("indexer.proj.weight"), &[D as u64, IDX_HEADS as u64], &rnd(IDX_HEADS * D));
             // Block 0 is the dense one (leading_dense_block_count = 1).

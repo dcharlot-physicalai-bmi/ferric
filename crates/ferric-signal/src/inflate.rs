@@ -317,7 +317,7 @@ pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, InflateError> {
     let (cmf, flg) = (data[0], data[1]);
     // Compression method 8 is DEFLATE, and the two header bytes read as a big-endian 16-bit
     // number must be a multiple of 31.
-    if cmf & 0x0f != 8 || ((cmf as u16) << 8 | flg as u16) % 31 != 0 {
+    if cmf & 0x0f != 8 || !((cmf as u16) << 8 | flg as u16).is_multiple_of(31) {
         return Err(InflateError::BadZlibHeader { cmf, flg });
     }
     if flg & 0x20 != 0 {

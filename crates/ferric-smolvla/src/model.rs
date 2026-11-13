@@ -435,7 +435,7 @@ fn patch_embed(pixels: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
 
 pub fn pixel_shuffle(x: &[f32], seq: usize, dim: usize, scale: usize) -> Result<Vec<f32>, String> {
     let side = (seq as f32).sqrt() as usize;
-    if side * side != seq || side % scale != 0 {
+    if side * side != seq || !side.is_multiple_of(scale) {
         return Err(format!("pixel shuffle seq {seq} scale {scale}"));
     }
     let w_out = side / scale;
@@ -639,9 +639,9 @@ fn text_prefix(
             TEXT_DIM,
             TEXT_DIM,
         );
-        let mut residual = ferric_core::cpu::add(&hidden, &projected);
+        let residual = ferric_core::cpu::add(&hidden, &projected);
         hidden = mlp(
-            &store,
+            store,
             &format!("{p}.mlp"),
             &format!("{p}.post_attention_layernorm.weight"),
             &residual,
@@ -652,8 +652,6 @@ fn text_prefix(
         for (a, b) in hidden.iter_mut().zip(&residual) {
             *a += b;
         }
-        residual = hidden;
-        hidden = residual;
     }
     let norm = store.tensor("model.vlm_with_expert.vlm.model.text_model.norm.weight")?;
     let _ = rmsnorm(&norm, &hidden, seq, TEXT_DIM);
@@ -673,7 +671,7 @@ fn denoise(
     let offset = prefix_pad.iter().filter(|p| **p).count() as u32;
     let pos: Vec<u32> = (0..CHUNK).map(|i| offset + i as u32).collect();
     let pos0: Vec<u32> = (0..CHUNK as u32).collect();
-    for layer in 0..TEXT_LAYERS {
+    for (layer, cached) in cache.iter().enumerate() {
         let p = format!("model.vlm_with_expert.lm_expert.layers.{layer}");
         let normed = rmsnorm(
             &store.tensor(&format!("{p}.input_layernorm.weight"))?,
@@ -708,7 +706,7 @@ fn denoise(
             );
             let q = rope(&q, &pos, HEADS)?;
             let k = rope(&k, &pos, KV_HEADS)?;
-            let (k, v) = concat_kv(&cache[layer].k, &k, &cache[layer].v, &v, prefix, CHUNK);
+            let (k, v) = concat_kv(&cached.k, &k, &cached.v, &v, prefix, CHUNK);
             let mask = self_mask(prefix_pad, CHUNK);
             attention(
                 &q,
@@ -722,8 +720,8 @@ fn denoise(
                 Some(&mask),
             )
         } else {
-            let flat_k = flatten_heads(&cache[layer].k, prefix, KV_HEADS, HEAD_DIM);
-            let flat_v = flatten_heads(&cache[layer].v, prefix, KV_HEADS, HEAD_DIM);
+            let flat_k = flatten_heads(&cached.k, prefix, KV_HEADS, HEAD_DIM);
+            let flat_v = flatten_heads(&cached.v, prefix, KV_HEADS, HEAD_DIM);
             let k = linear(
                 &flat_k,
                 &store.tensor(&format!("{p}.self_attn.k_proj.weight"))?,
@@ -764,7 +762,7 @@ fn denoise(
         );
         let residual = ferric_core::cpu::add(&hidden, &projected);
         let mut next = mlp(
-            &store,
+            store,
             &format!("{p}.mlp"),
             &format!("{p}.post_attention_layernorm.weight"),
             &residual,
@@ -894,11 +892,10 @@ fn rmsnorm_cpu(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f
 }
 
 pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Result<Vec<f32>, String> {
-    let seq = pos.len();
     let mut o = x.to_vec();
     let half = HEAD_DIM / 2;
-    for t in 0..seq {
-        let p = pos[t] as f32;
+    for (t, &p_u) in pos.iter().enumerate() {
+        let p = p_u as f32;
         for h in 0..heads {
             let off = (t * heads + h) * HEAD_DIM;
             for c in 0..half {
@@ -916,6 +913,7 @@ pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Result<Vec<f32>, Str
     Ok(o)
 }
 
+#[allow(clippy::too_many_arguments)] // query and key lengths, the two head counts, and the mask are independent
 pub(crate) fn attention(
     q: &[f32],
     k: &[f32],
@@ -1052,14 +1050,14 @@ mod tests {
     #[test]
     fn gelu_tanh_matches_the_pytorch_formula() {
         let y = gelu_tanh(&[1.0, -0.5]);
-        assert!((y[0] - 0.8411919906082768).abs() < 1e-6, "{}", y[0]);
-        assert!((y[1] - -0.15428599017485606).abs() < 1e-6, "{}", y[1]);
+        assert!((y[0] - 0.841_192).abs() < 1e-6, "{}", y[0]);
+        assert!((y[1] - -0.154_286).abs() < 1e-6, "{}", y[1]);
     }
 
     #[test]
     fn time_embedding_matches_the_f64_outer_product() {
         let y = sinusoidal(1.0, 720);
-        assert!((y[1] - 0.9958927469604786).abs() < 1e-6, "{}", y[1]);
+        assert!((y[1] - 0.995_892_76).abs() < 1e-6, "{}", y[1]);
         assert!((y[360] - 1.0).abs() < 1e-6, "{}", y[360]);
         assert!(y[0].abs() < 1e-5, "{}", y[0]);
     }

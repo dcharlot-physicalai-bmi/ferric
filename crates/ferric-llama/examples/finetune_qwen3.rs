@@ -8,7 +8,7 @@
 //!
 //! usage: finetune_qwen3 <qwen3-0.6b.gguf>
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::Qwen3;
 use ferric_tensor::{Adam, Tensor, Var};
 use ferric_tokenizer::Bpe;
@@ -29,7 +29,7 @@ fn byte_decoder() -> HashMap<char, u8> {
 
 // Deterministic pseudo-random init (same recipe as train_transformer) — reproducibility is the moat.
 fn seed_vec(n: usize, s: f32, scale: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract() * 2.0 - 1.0) * scale).collect()
+    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43_758.547).fract() * 2.0 - 1.0) * scale).collect()
 }
 
 fn main() { pollster::block_on(run()); }
@@ -56,7 +56,7 @@ async fn run() {
     let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos.is_some() };
     let enc = |s: &str| -> Vec<u32> {
         let mut ids = bpe.encode(s);
-        if add_bos { if let Some(b) = bos { if ids.first() != Some(&b) { ids.insert(0, b); } } }
+        if add_bos && let Some(b) = bos && ids.first() != Some(&b) { ids.insert(0, b); }
         ids
     };
 

@@ -121,7 +121,7 @@ async fn run() {
     println!("  [V2] off-center (below-COM) +x push: Δθ={:+.3}, peak ω={:+.3} — {}", dth, wmax,
         if dth.abs() > 0.05 { "✓ rotates (off-center contact torque spins the cube)" } else { "✗ no rotation" });
     // demonstrator
-    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(k, |w| demo(w)); dd += d; if d < TOL { dok += 1; } }
+    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(k, demo); dd += d; if d < TOL { dok += 1; } }
     println!("\n  scripted demonstrator (push cube center to target): reach {:.0}% · mean final distance {:.3}", dok as f32 / 2.0, dd / 200.0);
     // ── distill the EFA flow ──
     println!("\n  distilling the EFA flow (obs 10 → {H} → {H} → 2 pusher-velocity; CFM to the demonstrator):");
@@ -147,7 +147,7 @@ async fn run() {
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
         if it % 4000 == 3999 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
-    let mut wv = Vec::new(); for c in 0..fin { wv.push(fp[c].to_vec().await); }
+    let mut wv = Vec::new(); for item in fp[..fin].iter() { wv.push(item.to_vec().await); }
     let net = Net { w: wv, b1: fp[fin].to_vec().await, w2: fp[fin + 1].to_vec().await, b2: fp[fin + 2].to_vec().await, w3: fp[fin + 3].to_vec().await, b3: fp[fin + 4].to_vec().await };
     println!("\n  the card — reach (cube center within {:.2}; 200 episodes):", TOL);
     for kk in [1usize, 2, 4] { let (mut ok, mut md) = (0, 0.0f32);

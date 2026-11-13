@@ -21,11 +21,12 @@
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
+type EnergySamples = Vec<(u64, f64, Option<f64>)>;
 pub(crate) struct Energy {
     meter: Option<ferric_joule::Macmon>,
     why_none: String,
     /// (id, t0, t1 or None while in flight)
-    log: Mutex<(u64, Vec<(u64, f64, Option<f64>)>)>,
+    log: Mutex<(u64, EnergySamples)>,
 }
 
 /// A request's claim on the meter: its id and when it began.

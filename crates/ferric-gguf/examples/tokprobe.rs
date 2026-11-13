@@ -18,7 +18,7 @@ fn main() {
     // llama.cpp llama_token_type: 1 NORMAL, 2 UNKNOWN, 3 CONTROL, 4 USER_DEFINED, 5 UNUSED, 6 BYTE
     let name = |x: i64| match x { 1=>"NORMAL",2=>"UNKNOWN",3=>"CONTROL",4=>"USER_DEFINED",5=>"UNUSED",6=>"BYTE",_=>"?" };
     let ty = |i: usize| match t.get(i) {
-        Some(ferric_gguf::Meta::I(x)) => *x as i64, Some(ferric_gguf::Meta::U(x)) => *x as i64, _ => -1 };
+        Some(ferric_gguf::Meta::I(x)) => *x, Some(ferric_gguf::Meta::U(x)) => *x as i64, _ => -1 };
     for id in &ids {
         if let Some(ferric_gguf::Meta::Str(s)) = v.get(*id) {
             println!("  id {id:>7}  {s:?}  type {} ({})", ty(*id), name(ty(*id)));

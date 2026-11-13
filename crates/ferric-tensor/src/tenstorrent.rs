@@ -265,7 +265,7 @@ fn noc_io(x: u16, y: u16, noc: u8, addr: u64, width: u8, value: u64) -> std::io:
     if !matches!(width, 1 | 2 | 4 | 8) {
         return Err(bad("NOC width must be 1, 2, 4 or 8"));
     }
-    if addr % width as u64 != 0 {
+    if !addr.is_multiple_of(width as u64) {
         return Err(bad("NOC addr must be aligned to width"));
     }
     Ok(NocIo {

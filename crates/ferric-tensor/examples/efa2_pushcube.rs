@@ -90,7 +90,7 @@ async fn run() {
     for _ in 0..100 { w.step([PUSH_V, 0.0]); }
     println!("  [0] physics: straight +x push moved puck to ({:+.3},{:+.3}) — {}", w.puck[0], w.puck[1],
         if w.puck[0] > 0.2 && w.puck[1].abs() < 0.05 { "✓ pushes along the push direction" } else { "✗" });
-    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(k, |w| demo(w)); dd += d; if d < TOL { dok += 1; } }
+    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(k, demo); dd += d; if d < TOL { dok += 1; } }
     println!("      scripted demonstrator reach {:.0}% · mean final distance {:.3}", dok as f32 / 2.0, dd / 200.0);
     // ── distill the EFA flow (CFM to the scripted demonstrator) ──
     println!("\n  distilling the EFA flow (obs 8 → {H} → {H} → 2 pusher-velocity; CFM to the demonstrator):");
@@ -118,7 +118,7 @@ async fn run() {
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
         if it % 3500 == 3499 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
-    let ex = async |p: &Vec<Tensor>, no: usize| -> Net { let mut w = Vec::new(); for c in 0..fin { w.push(p[c].to_vec().await); }
+    let ex = async |p: &Vec<Tensor>, no: usize| -> Net { let mut w = Vec::new(); for item in p[..fin].iter() { w.push(item.to_vec().await); }
         Net { w, b1: p[fin].to_vec().await, w2: p[fin + 1].to_vec().await, b2: p[fin + 2].to_vec().await, w3: p[fin + 3].to_vec().await, b3: p[fin + 4].to_vec().await, no } };
     let flow = Flow { net: ex(&fp, 2).await };
     // ── [1] the card ──

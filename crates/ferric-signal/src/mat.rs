@@ -654,7 +654,7 @@ mod tests {
         let mut v = u32b(dtype, le);
         v.extend(u32b(payload.len() as u32, le));
         v.extend(payload);
-        while v.len() % 8 != 0 {
+        while !v.len().is_multiple_of(8) {
             v.push(0);
         }
         v

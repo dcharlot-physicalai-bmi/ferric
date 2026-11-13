@@ -130,7 +130,7 @@ mod tests {
         let mut got = vec![0u8; 128];
         let e = b.read_at(0, &mut got).unwrap_err();
         assert!(matches!(e, TierError::ShortRead { want: 128, got: 64 }), "got {e:?}");
-        let e = b.read_at(60, &mut vec![0u8; 8]).unwrap_err();
+        let e = b.read_at(60, &mut [0u8; 8]).unwrap_err();
         assert!(matches!(e, TierError::ShortRead { .. }), "got {e:?}");
         let _ = std::fs::remove_file(&p);
     }

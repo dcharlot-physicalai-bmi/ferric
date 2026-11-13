@@ -1,5 +1,5 @@
 //! Q5_K tensor-core prefill matmul vs scalar (Q5_K_M models).
-use ferric_core::Context; use ferric_gguf::deq_raw; use ferric_tensor::{Q5_KWeights, Tensor};
+use ferric_core::Context;  use ferric_tensor::{Q5_KWeights, Tensor};
 use std::sync::Arc; use std::time::Instant; use half::f16;
 fn q5k_block(seed:u32)->Vec<u8>{let mut b=vec![0u8;176];
  b[0..2].copy_from_slice(&f16::from_f32(0.05+0.01*((seed%7)as f32)).to_le_bytes());

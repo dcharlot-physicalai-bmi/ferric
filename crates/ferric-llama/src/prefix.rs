@@ -99,7 +99,7 @@ impl PrefixCache {
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
     pub fn hit_rate(&self) -> f64 {
         let n = self.hits + self.misses;
-        if n == 0 { return 0.0 } else { self.hits as f64 / n as f64 }
+        if n == 0 { 0.0 } else { self.hits as f64 / n as f64 }
     }
 
     /// Remember `tokens` and the KV they produced.
@@ -555,17 +555,15 @@ impl PrefixTree {
 
         // Duplicate first, so an exact re-insert never evicts anything to make room for KV that is
         // already there.
-        if let Some((len, node)) = self.walk(tokens) {
-            if len == tokens.len() && self.node(node).depth == len {
-                if let Some(id) = self.node(node).entry {
+        if let Some((len, node)) = self.walk(tokens)
+            && len == tokens.len() && self.node(node).depth == len
+                && let Some(id) = self.node(node).entry {
                     let now = self.tick();
                     let e = self.entries.get_mut(&id).expect("indexed entry is live");
                     e.refs += 1;
                     e.last_used = now;
                     return Some(id)
                 }
-            }
-        }
 
         let need = tokens.len();
         if need > self.capacity_tokens { self.refusals += 1; return None }

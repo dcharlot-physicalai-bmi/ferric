@@ -1,0 +1,43 @@
+{
+  "receipt": "toolchain-1.100 workspace suite",
+  "date": "2026-11-13",
+  "head_base": "a999660dda508751961bddd86718b244f04dc0b6",
+  "rustc": {
+    "release": "1.100.0",
+    "commit_hash": "0ef1bc386059596dada8fb65b50425aab2ea637a",
+    "commit_date": "2026-11-09",
+    "host": "x86_64-unknown-linux-gnu",
+    "llvm": "23.1.5",
+    "vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5"
+  },
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "cargo_lock_sha256": "3addbafb869cbd7511ec5064f7248be1b1990389f55e3b01a88a5b3c2de296c5",
+  "cargo_lock_committed": false,
+  "channel_manifest": {
+    "url": "https://static.rust-lang.org/dist/channel-rust-stable.toml",
+    "date": "2026-11-12",
+    "rustc": "1.100.0 (0ef1bc386 2026-11-09)"
+  },
+  "blog": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/",
+  "previous_toolchain": "no rust-toolchain.toml; CI used dtolnay/rust-toolchain@stable; workspace rust-version 1.98",
+  "suite": "cargo test --workspace",
+  "vulkan": {
+    "driver": "lavapipe",
+    "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "mesa": "25.2.8-0ubuntu0.24.04.4",
+    "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/lvp_icd.json",
+    "GALLIUM_OVERRIDE_CPU_CAPS": "avx2",
+    "LP_NATIVE_VECTOR_WIDTH": "256"
+  },
+  "result": {
+    "passed": 1164,
+    "failed": 0,
+    "ignored": 39,
+    "exit_code": 0
+  },
+  "ignored_note": "The 39 ignored tests are the pre-existing #[ignore] training and timing tests. CI runs cargo test --workspace without --ignored.",
+  "cross_checks": {
+    "aarch64-apple-darwin": "cargo check --workspace --target aarch64-apple-darwin exit 0",
+    "wasm32-unknown-unknown": "cargo check of ferric-core, ferric-kv, ferric-tier, ferric-certify, ferric-dist, ferric-gguf, ferric-tokenizer, ferric-llama, ferric-web exit 0"
+  }
+}

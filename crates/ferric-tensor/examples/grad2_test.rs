@@ -17,7 +17,7 @@ async fn run() {
     // (1) f = Σ x³ ; g = ∂f/∂x = 3x² ; then backward Σg ⇒ ∂/∂x = 6x
     let x = Var::leaf(Tensor::from_vec(&ctx, &xv, &[4]));
     let f = x.mul(&x).mul(&x).sum_all();
-    let g = grad(&f, &[x.clone()], None).remove(0);          // differentiable ∂f/∂x = 3x²
+    let g = grad(&f, std::slice::from_ref(&x), None).remove(0);          // differentiable ∂f/∂x = 3x²
     let g_val = g.value().to_vec().await;
     g.sum_all().backward();                                   // d/dx Σ(3x²) = 6x
     let gg = x.grad().unwrap().to_vec().await;
@@ -28,7 +28,7 @@ async fn run() {
     // (2) f = Σ eˣ ; g = eˣ ; second deriv (of Σg) = eˣ
     let x2 = Var::leaf(Tensor::from_vec(&ctx, &xv, &[4]));
     let f2 = x2.exp().sum_all();
-    let g2 = grad(&f2, &[x2.clone()], None).remove(0);
+    let g2 = grad(&f2, std::slice::from_ref(&x2), None).remove(0);
     g2.sum_all().backward();
     let gg2 = x2.grad().unwrap().to_vec().await;
     let want = xv.iter().map(|v| v.exp()).collect::<Vec<_>>();
@@ -50,7 +50,7 @@ async fn run() {
         let xin = Var::leaf(x3.clone());
         let hh = xin.matmul(&pv[0]).add(&pv[1]).relu();       // H(x) = w2·relu(w1 x + b1) + b2
         let energy = hh.matmul(&pv[2]).add(&pv[3]).sum_all(); // scalar
-        let dhdx = grad(&energy, &[xin.clone()], None).remove(0);   // ∂H/∂x  (differentiable in w)
+        let dhdx = grad(&energy, std::slice::from_ref(&xin), None).remove(0);   // ∂H/∂x  (differentiable in w)
         let diff = dhdx.sub(&Var::leaf(target.clone()));
         let loss = diff.mul(&diff).mean_all();               // ‖∂H/∂x − target‖²
         let lval = loss.value().to_vec().await[0];
@@ -64,5 +64,5 @@ async fn run() {
         if last < first * 0.2 { "✅ 2nd-order training works" } else { "⚠ did not converge" });
 }
 
-fn randn(n: usize, s: u32) -> Vec<f32> { (0..n).map(|i| { let a = (((i as u32).wrapping_mul(2654435761) ^ s) % 9973 + 1) as f32 / 9973.0; let b = ((i as u32 * 40503 ^ s) % 9973 + 1) as f32 / 9973.0; ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * 0.4 }).collect() }
+fn randn(n: usize, s: u32) -> Vec<f32> { (0..n).map(|i| { let a = (((i as u32).wrapping_mul(2654435761) ^ s) % 9973 + 1) as f32 / 9973.0; let b = (((i as u32 * 40503) ^ s) % 9973 + 1) as f32 / 9973.0; ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * 0.4 }).collect() }
 fn rnd(v: &[f32]) -> Vec<f32> { v.iter().map(|x| (x * 100.0).round() / 100.0).collect() }

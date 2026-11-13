@@ -49,6 +49,8 @@ type CUgraphExec = *mut c_void;
 
 macro_rules! sym {
     ($lib:expr, $name:literal, $ty:ty) => {{
+        // Some call sites are already inside `unsafe fn`, so this block is redundant there.
+        #[allow(unused_unsafe)]
         let s: Symbol<$ty> = unsafe { $lib.get(concat!($name, "\0").as_bytes()) }.ok()?;
         *s
     }};
@@ -144,6 +146,7 @@ pub(crate) struct DecodeK {
     /// so one captured graph serves every token of every sequence (cuda_decode.cu, THE STEP BLOCK).
     qk_norm_rope_step: CUfunction, attn_decode_step: CUfunction,
     /// Split-K decode attention over a fixed (G, n_kv) grid and its chunk merge (cuda_decode.cu).
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     attn_split: CUfunction, attn_split_step: CUfunction, attn_combine: CUfunction,
     quant_x_q8: CUfunction, q5k_gemv_q8: CUfunction, q5k_swiglu_gemv_q8: CUfunction,
     /// Indexed by `QFmt as usize`: the GEMV and the fused gate|up + SwiGLU for each weight format.
@@ -168,7 +171,7 @@ unsafe impl Sync for Driver {}
 impl Driver {
     fn open() -> Option<Driver> {
         let names: &[&str] = if cfg!(target_os = "windows") { &["nvcuda.dll"] } else { &["libcuda.so.1", "libcuda.so"] };
-        let lib = names.iter().find_map(|n| unsafe { Library::new(n) }.ok())?;
+        let lib = names.iter().find_map(|n| unsafe { Library::new(*n) }.ok())?;
         let cu_init = sym!(lib, "cuInit", unsafe extern "C" fn(u32) -> CUresult);
         let cu_device_get_count = sym!(lib, "cuDeviceGetCount", unsafe extern "C" fn(*mut i32) -> CUresult);
         let cu_device_get = sym!(lib, "cuDeviceGet", unsafe extern "C" fn(*mut CUdevice, i32) -> CUresult);
@@ -275,7 +278,7 @@ impl Driver {
             let r = unsafe { (self.cu_module_load_data)(&mut m, ptx.as_ptr() as *const c_void) };
             if r != 0 { eprintln!("{}", self.err("cuModuleLoadData", r)); return None; }
             let mut f: CUfunction = std::ptr::null_mut();
-            let r = unsafe { (self.cu_module_get_function)(&mut f, m, b"q5k_gemv\0".as_ptr() as *const c_char) };
+            let r = unsafe { (self.cu_module_get_function)(&mut f, m, c"q5k_gemv".as_ptr()) };
             if r != 0 { eprintln!("{}", self.err("cuModuleGetFunction(q5k_gemv)", r)); return None; }
             Some(f)
         })
@@ -618,7 +621,7 @@ impl DevKv {
     /// Host rows → device rows `[at, at + n)` of layer `il` (`k`/`v` are `[n, width]`). Needs `reserve`.
     pub fn write_rows(&mut self, il: usize, at: usize, k: &[f32], v: &[f32]) -> bool {
         let n = k.len() / self.width.max(1);
-        if k.len() != v.len() || k.len() % self.width.max(1) != 0 || at + n > self.cap { return false; }
+        if k.len() != v.len() || !k.len().is_multiple_of(self.width.max(1)) || at + n > self.cap { return false; }
         let off = (at * self.width * 4) as u64;
         self.drv.htod(self.k[il] + off, k) && self.drv.htod(self.v[il] + off, v)
     }
@@ -706,7 +709,7 @@ impl Prof {
     fn tick(&mut self) {
         if !self.on { return; }
         self.steps += 1;
-        if self.steps % 16 == 0 {
+        if self.steps.is_multiple_of(16) {
             let tot: f64 = self.acc.iter().sum();
             eprintln!("cuda profile: per-token GPU time by kernel class over {} steps (total {:.2} ms/tok):", self.steps, tot / self.steps as f64);
             let mut rows: Vec<(usize, f64)> = self.acc.iter().copied().enumerate().collect();
@@ -832,7 +835,7 @@ impl DecodeGraph {
         // attn_decode gives each lane dh/32 elements and qk_norm_rope runs one 128-thread block per head.
         if dh > 128 || dh % 32 != 0 || nkv == 0 || nh % nkv != 0 { return None; }
         let q_out = nh * dh; let kv_out = nkv * dh;
-        let fits = |w: &NativeWeight<'_>, rows: usize, cols: usize| w.rows == rows && w.cols == cols && cols % w.fmt().block() == 0;
+        let fits = |w: &NativeWeight<'_>, rows: usize, cols: usize| w.rows == rows && w.cols == cols && cols.is_multiple_of(w.fmt().block());
         if !fits(&spec.lm_head, spec.n_vocab, d) { return None; }
         if spec.rope_ff.as_ref().is_some_and(|f| f.len() != dh / 2) { return None; }
         let mut owned: Vec<CUdeviceptr> = Vec::new();
@@ -1099,7 +1102,7 @@ impl DecodeGraph {
     /// `kv.len` unchanged: rows written past it are dead, and the caller's WGSL prefill runs instead.
     pub fn prefill(&mut self, kv: &mut DevKv, x_rows: &[f32], rope: Option<&[f32]>, all_logits: bool) -> Option<Vec<f32>> {
         let d = self.d;
-        if x_rows.is_empty() || x_rows.len() % d != 0 || kv.n_layer() != self.layers.len() || kv.width() != self.kv_out { return None; }
+        if x_rows.is_empty() || !x_rows.len().is_multiple_of(d) || kv.n_layer() != self.layers.len() || kv.width() != self.kv_out { return None; }
         let t = x_rows.len() / d;
         if rope.is_some() != self.rope_host || rope.is_some_and(|r| r.len() != t * self.dh) { return None; }
         let k = *self.drv.decode_kernels()?;
@@ -1289,7 +1292,7 @@ mod tests {
         let mut lcg = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 40) as u8 };
         let mut bytes = vec![0u8; out * (inn / 256) * 176];
         for b in bytes.iter_mut() { *b = lcg(); }
-        for (bi, blk) in bytes.chunks_exact_mut(176).enumerate() {
+        for (bi, blk) in bytes.as_chunks_mut::<176>().0.iter_mut().enumerate() {
             blk[0..2].copy_from_slice(&half::f16::from_f32(0.01 + 0.003 * (bi % 7) as f32).to_le_bytes());
             blk[2..4].copy_from_slice(&half::f16::from_f32(0.002 + 0.0005 * (bi % 5) as f32).to_le_bytes());
         }
@@ -1622,8 +1625,8 @@ mod tests {
                 let (qd, kd, _, _) = run_rope(&qkv, None, None, None, with_ff.then_some(&mult[..]), norm_pairs, nh, nkv, dh, base, pos, eps, None);
                 let rot = |x: &[f32], heads: usize| -> Vec<f64> {
                     let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-                    for h in 0..heads { for c in 0..dh / 2 {
-                        let a = (pos as f32 * inv[c]) as f64;
+                    for h in 0..heads { for (c, &inv_c) in inv.iter().take(dh / 2).enumerate() {
+                        let a = (pos as f32 * inv_c) as f64;
                         let (s, co) = a.sin_cos();
                         let (p0, p1) = if norm_pairs { (2 * c, 2 * c + 1) } else { (c, c + dh / 2) };
                         let (x1, x2) = (x[h * dh + p0] as f64, x[h * dh + p1] as f64);
@@ -1714,7 +1717,7 @@ mod tests {
             blk[0..4].copy_from_slice(&(row as u32).to_le_bytes()); blk[4..8].copy_from_slice(&(pos as u32).to_le_bytes());
             for (i, &p) in cs.iter().enumerate() { blk[lay.kvp + 8 * i..lay.kvp + 8 * i + 8].copy_from_slice(&p.to_le_bytes()); }
             for (i, v) in tab.iter().enumerate() { blk[lay.rope + 4 * i..lay.rope + 4 * i + 4].copy_from_slice(&v.to_le_bytes()); }
-            let words: Vec<u32> = blk.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let words: Vec<u32> = blk.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
             let sb = drv.upload(&words).unwrap();
             let (sd, qwd, kwd, bd) = (drv.upload_f32(&qkv).unwrap(), drv.upload_f32(&qw).unwrap(), drv.upload_f32(&kw).unwrap(), drv.upload_f32(&bias).unwrap());
             let outs = |n: usize| drv.alloc(n * 4).unwrap();

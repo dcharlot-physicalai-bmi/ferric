@@ -52,7 +52,7 @@ impl Imatrix {
     /// Accumulate `Σ x²` for one observation. `act` is `[rows, cols]` row-major; each row is one token's
     /// activation, and `cols` must equal the projection's input width.
     pub fn accumulate(&mut self, name: &str, act: &[f32], cols: usize) {
-        debug_assert!(cols > 0 && act.len() % cols == 0, "activation is not [rows, {cols}]");
+        debug_assert!(cols > 0 && act.len().is_multiple_of(cols), "activation is not [rows, {cols}]");
         let e = self.entries.entry(name.to_string()).or_insert_with(|| (vec![0.0; cols], 0));
         if e.0.len() != cols { return; } // shape changed: ignore rather than corrupt a partial vector
         for row in act.chunks_exact(cols) {
@@ -175,7 +175,7 @@ const THRESHOLDS: [f32; 9] = [0.35, 0.45, 0.55, 0.65, 0.70, 0.75, 0.85, 0.95, 1.
 /// Passing `None` for `imp` gives plain unweighted ternary over the same sweep, which is the correct
 /// control: it isolates the effect of importance rather than confounding it with the sweep itself.
 pub fn quantize_ternary_weighted(w: &[f32], cols: usize, group: usize, imp: Option<&[f32]>) -> Vec<f32> {
-    assert!(cols > 0 && w.len() % cols == 0, "weights are not [rows, {cols}]");
+    assert!(cols > 0 && w.len().is_multiple_of(cols), "weights are not [rows, {cols}]");
     if let Some(v) = imp {
         assert_eq!(v.len(), cols, "importance must have one entry per input channel");
     }
@@ -209,19 +209,19 @@ pub fn quantize_ternary_weighted(w: &[f32], cols: usize, group: usize, imp: Opti
                 let d = tf * mean_abs;
                 // Closed-form optimal scale for this assignment.
                 let (mut num, mut den) = (0f32, 0f32);
-                for i in 0..gw.len() {
-                    if gw[i].abs() > d {
+                for (i, g) in gw.iter().enumerate() {
+                    if g.abs() > d {
                         let k = wt(i);
-                        num += k * gw[i].abs();
+                        num += k * g.abs();
                         den += k;
                     }
                 }
                 if den == 0.0 { continue; } // this threshold zeroes the whole group
                 let a = num / den;
                 let mut err = 0f32;
-                for i in 0..gw.len() {
-                    let q = if gw[i].abs() > d { a * gw[i].signum() } else { 0.0 };
-                    let e = gw[i] - q;
+                for (i, g) in gw.iter().enumerate() {
+                    let q = if g.abs() > d { a * g.signum() } else { 0.0 };
+                    let e = g - q;
                     err += wt(i) * e * e;
                 }
                 if err < best_err {

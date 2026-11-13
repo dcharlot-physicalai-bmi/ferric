@@ -2,6 +2,7 @@
 //! graph on Ferric's on-GPU tensor ops. Starter op set: MatMul, Add, Relu — enough to run real
 //! MLP/linear graphs; the transformer op set (attention decomposition, LayerNorm, etc.) extends this.
 
+#[allow(clippy::doc_overindented_list_items)] // prost writes the ONNX comments; we do not edit the generated file
 pub mod onnx {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
@@ -25,7 +26,7 @@ pub fn load(bytes: &[u8]) -> Result<Model, String> {
 fn tensor_data(t: &onnx::TensorProto) -> (Vec<f32>, Vec<usize>) {
     let shape: Vec<usize> = t.dims.iter().map(|&d| d as usize).collect();
     let data = if !t.raw_data().is_empty() {
-        t.raw_data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        t.raw_data().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
     } else {
         t.float_data.clone()
     };
@@ -36,7 +37,7 @@ fn tensor_data(t: &onnx::TensorProto) -> (Vec<f32>, Vec<usize>) {
 fn int_data(t: &onnx::TensorProto) -> (Vec<i64>, Vec<usize>) {
     let shape: Vec<usize> = t.dims.iter().map(|&d| d as usize).collect();
     let data = if !t.raw_data().is_empty() {
-        t.raw_data().chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect()
+        t.raw_data().as_chunks::<8>().0.iter().map(|b| i64::from_le_bytes(*b)).collect()
     } else {
         t.int64_data.clone()
     };
@@ -93,7 +94,7 @@ impl Model {
                     let (big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
                     if big.len() == small.len() {
                         ctx.add_t(big, small)
-                    } else if small.len() > 0 && big.len() % small.len() == 0 {
+                    } else if !small.is_empty() && big.len().is_multiple_of(small.len()) {
                         ctx.add_bias_t(big, small) // per-row bias broadcast [.,d] + [d]
                     } else {
                         return Err(format!("Add broadcast {:?}+{:?} not yet supported", a.shape, b.shape));

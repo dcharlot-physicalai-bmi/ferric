@@ -16,7 +16,7 @@ const TGP: [(f32, f32); 4] = [(0.8, -0.6), (-0.7, 0.5), (0.5, 0.9), (-0.5, -0.8)
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 // UNDERACTUATED: torque on joints 1,2 only; joint 3 passive (driven by coupling alone)
 fn step(s: [f32; 6], u1: f32, u2: f32) -> [f32; 6] {
@@ -52,7 +52,7 @@ impl Vn {
 }
 struct Fl { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: [f32; 2] }
 impl Fl {
-    fn vel(&self, s: [f32; 6], g: (f32, f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) { let mut f = [0.0f32; 15]; let ff = feat(s, g); for c in 0..NF { f[c] = ff[c]; } f[12] = a1; f[13] = a2; f[14] = t;
+    fn vel(&self, s: [f32; 6], g: (f32, f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) { let mut f = [0.0f32; 15]; let ff = feat(s, g); f[..NF].copy_from_slice(&ff[..NF]); f[12] = a1; f[13] = a2; f[14] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..15 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let (mut o1, mut o2) = (self.b3[0], self.b3[1]); for j in 0..H { o1 += h2[j] * self.w3[j * 2]; o2 += h2[j] * self.w3[j * 2 + 1]; } (o1, o2) }
@@ -89,7 +89,7 @@ async fn run() {
         let e = vnet(&(0..NF).map(|c| l(&fc[c], bs)).collect::<Vec<_>>(), &pv, &ov); let d = e.sub(&Var::leaf(Tensor::from_vec(&ctx, &target, &[bs, 1]))); let loss = d.mul(&d).mean_all(); loss.backward();
         let g: Vec<Tensor> = pv.iter().zip(&p).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adam.step(&mut p, &g); if it % 200 == 0 { tgt = p.clone(); }
     }
-    let mut vw: Vec<Vec<f32>> = Vec::new(); for c in 0..NF { vw.push(p[c].to_vec().await); }
+    let mut vw: Vec<Vec<f32>> = Vec::new(); for item in p[..NF].iter() { vw.push(item.to_vec().await); }
     let vn = Vn { w: vw, b1: p[NF].to_vec().await, w2: p[NF + 1].to_vec().await, b2: p[NF + 2].to_vec().await, w3: p[NF + 3].to_vec().await, b3: p[NF + 4].to_vec().await[0] };
 
     // ---- flow distill (2-output) ----
@@ -115,7 +115,7 @@ async fn run() {
         let g: Vec<Tensor> = pv.iter().zip(&q).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamq.step(&mut q, &g);
     }
     let fb2 = q[19].to_vec().await;
-    let mut fw: Vec<Vec<f32>> = Vec::new(); for c in 0..15 { fw.push(q[c].to_vec().await); }
+    let mut fw: Vec<Vec<f32>> = Vec::new(); for item in q[..15].iter() { fw.push(item.to_vec().await); }
     let fl = Fl { w: fw, b1: q[15].to_vec().await, w2: q[16].to_vec().await, b2: q[17].to_vec().await, w3: q[18].to_vec().await, b3: [fb2[0], fb2[1]] };
 
     // ---- eval: teacher vs flow; overall reach + passive-joint tracking ----
@@ -127,9 +127,11 @@ async fn run() {
     let reached = |s: [f32; 6], g: (f32, f32, f32)| wrap(s[0] - g.0).abs() < 0.35 && wrap(s[1] - g.1).abs() < 0.35 && wrap(s[2] - g.2).abs() < 0.35 && s[3].abs() < 0.7 && s[4].abs() < 0.7 && s[5].abs() < 0.7;
     println!("  goals: (g1,g2) free, g3 = passive equilibrium of the coupling: {}", TGP.iter().map(|&(a, b)| format!("({:.1},{:.1}→{:.2})", a, b, g3_of(b))).collect::<Vec<_>>().join(" "));
     println!("\n     controller                        reach     passive |θ3−g3| (mean)   evals/decision");
-    let (mut rd, mut p3) = (0, 0.0f32); for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let uu = vn.ustar(s, g); s = step(s, uu.0, uu.1); } if reached(s, g) { rd += 1; } p3 += wrap(s[2] - g.2).abs(); }
+    let (mut rd, mut p3) = (0, 0.0f32); for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let uu = vn.ustar(s, g); s = step(s, uu.0, uu.1); }
+            if reached(s, g) { rd += 1; } p3 += wrap(s[2] - g.2).abs(); }
     println!("     discrete two-stage argmin          {:>4.0}%        {:.3} rad                34", rd as f32 / n as f32 * 100.0, p3 / n as f32);
-    for k in [1usize, 2, 4] { let (mut rr, mut pp) = (0, 0.0f32); for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let a = fl.act(s, g, k); s = step(s, a.0, a.1); } if reached(s, g) { rr += 1; } pp += wrap(s[2] - g.2).abs(); }
+    for k in [1usize, 2, 4] { let (mut rr, mut pp) = (0, 0.0f32); for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let a = fl.act(s, g, k); s = step(s, a.0, a.1); }
+            if reached(s, g) { rr += 1; } pp += wrap(s[2] - g.2).abs(); }
         println!("     flow-matching, K={:<2} fwd passes    {:>4.0}%        {:.3} rad                {:>2}", k, rr as f32 / n as f32 * 100.0, pp / n as f32, k); }
     println!("\n  The passive joint has NO torque — it is parked at its equilibrium purely through the coupling. Reach requires all");
     println!("  THREE joints (incl. passive) within 0.35 rad / 0.7 rad·s. HONEST: reachable-by-construction goals; one seed.");

@@ -336,7 +336,7 @@ impl Tensor {
         let rows = p.numel() / d;
         let out = empty(&self.ctx, p.numel());
         run(&self.ctx, SOFTMAX_WGSL, "softmax", &[p.buf.as_ref(), &out, &u32buf(&self.ctx, &[rows as u32, d as u32])],
-            { let gx = (rows as u32).min(32768).max(1); (gx, (rows as u32).div_ceil(gx), 1) });
+            { let gx = (rows as u32).clamp(1, 32768); (gx, (rows as u32).div_ceil(gx), 1) });
         let sm = Tensor::from_parts(&self.ctx, out, p.shape.clone());
         let mut inv = vec![0usize; r];
         for (i, &pp) in perm.iter().enumerate() { inv[pp] = i; }
@@ -376,7 +376,7 @@ impl Tensor {
         run(&self.ctx, LAYERNORM_WGSL, "layernorm",
             &[c.buf.as_ref(), weight.contiguous().buf.as_ref(), bias.contiguous().buf.as_ref(), &out,
               &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])],
-            { let gx = (rows as u32).min(32768).max(1); (gx, (rows as u32).div_ceil(gx), 1) });
+            { let gx = (rows as u32).clamp(1, 32768); (gx, (rows as u32).div_ceil(gx), 1) });
         Tensor::from_parts(&self.ctx, out, c.shape.clone())
     }
 
@@ -396,7 +396,7 @@ impl Tensor {
         run(&self.ctx, ADD_RMSNORM_WGSL, "add_rmsnorm",
             &[a.buf.as_ref(), b.buf.as_ref(), weight.contiguous().buf.as_ref(), &sumo, &normo,
               &u32buf(&self.ctx, &[rows as u32, d as u32, eps.to_bits()])], {
-                let gx = (rows as u32).min(32768).max(1);
+                let gx = (rows as u32).clamp(1, 32768);
                 (gx, (rows as u32).div_ceil(gx), 1)
               });
         (Tensor::from_parts(&self.ctx, sumo, a.shape.clone()), Tensor::from_parts(&self.ctx, normo, a.shape.clone()))
@@ -450,7 +450,7 @@ impl Tensor {
 
     #[allow(clippy::too_many_arguments)]
     fn rope_full(&self, n_heads: usize, head_dim: usize, base: f32, offset: usize, interleaved: bool, n_rot: usize) -> Tensor {
-        assert!(n_rot <= head_dim && n_rot % 2 == 0, "n_rot must be even and <= head_dim");
+        assert!(n_rot <= head_dim && n_rot.is_multiple_of(2), "n_rot must be even and <= head_dim");
         // A rank-2 row-major window is read in place; anything else is packed first. The kernel addresses
         // the input as (src_off + row * src_row_stride + col), which describes exactly that family of
         // views and nothing more — a permuted or higher-rank view must still be materialised, and saying
@@ -745,6 +745,7 @@ impl Tensor {
     /// Gated delta rule that can **resume from a carried state** and returns the evolved one —
     /// what turns generation from re-running the whole prefix per token into a single step.
     /// `state` is `[H, dv, dk]`; `None` starts from zero. Returns `(out [T,H,dv], state)`.
+    #[allow(clippy::too_many_arguments)] // the carried state is optional and the two head widths are not the same axis
     pub fn gated_delta_rule_stateful(&self, k: &Tensor, v: &Tensor, gb: &Tensor, h: usize, dk: usize, dv: usize, state: Option<&Tensor>) -> (Tensor, Tensor) {
         assert!(dk <= 128, "gated_delta_rule: head_k_dim ≤ 128");
         let (q, k, v, gb) = (self.contiguous(), k.contiguous(), v.contiguous(), gb.contiguous());
@@ -1110,10 +1111,6 @@ impl Tensor {
             grid);
         Tensor::from_parts(&self.ctx, out, vec![to, ho, wo, o])
     }
-
-    /// Input gradient of [`Self::conv2d`]: `self` is the output gradient `[n, ho, wo, o]`, `w` the
-    /// forward weights `[kh, kw, c, o]`, `in_hw` the forward input's spatial dims. Returns
-    /// `[n, h, w, c]` — the stride-aware transposed convolution, portable WGSL.
 
     /// Depthwise 2D convolution — `[n,h,w,C]` activations against `[kh,kw,1,C]` weights, output
     /// channel `o` reading input channel `o` only.
@@ -1516,6 +1513,7 @@ pub struct KvBuf {
 }
 impl KvBuf {
     pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
     /// Keep the first `n` rows (the buffer stays; later appends overwrite the rest). How a speculative
     /// step forgets the drafts it rejected.
     pub fn truncate(&mut self, n: usize) { assert!(n <= self.len, "KvBuf::truncate({n}) past {} rows", self.len); self.len = n; }
@@ -1878,9 +1876,8 @@ fn scopeguard_ns(t: profclock::T, slot: usize) -> NsGuard { NsGuard(t, slot) }
 /// wgpu exposes no core count, so these are tuned constants rather than a derived value. `FERRIC_SPLITKV`
 /// overrides for A/B (0 or 1 disables).
 fn decode_splits(s: usize, nh: usize) -> usize {
-    if let Ok(v) = std::env::var("FERRIC_SPLITKV") {
-        if let Ok(n) = v.parse::<usize>() { return n.max(1); }
-    }
+    if let Ok(v) = std::env::var("FERRIC_SPLITKV")
+        && let Ok(n) = v.parse::<usize>() { return n.max(1); }
     // Measured on an M5 Max (Qwen2.5-0.5B Q8_0, 14 query heads, examples/prefill_bench.rs): one
     // workgroup per head leaves a 40-core GPU mostly idle, and 512 keys per split kept it that way until
     // 1024 keys. At ~64 keys per split and up to 512 workgroups, decode ran 112 → 177 tok/s at 384 keys
@@ -1891,7 +1888,7 @@ fn decode_splits(s: usize, nh: usize) -> usize {
     (s / MIN_KEYS_PER_SPLIT).min(MAX_WORKGROUPS / nh.max(1)).max(1)
 }
 
-fn groups(n: usize) -> (u32, u32, u32) { (((n as u32) + 63) / 64, 1, 1) }
+fn groups(n: usize) -> (u32, u32, u32) { ((n as u32).div_ceil(64), 1, 1) }
 /// 2D workgroup grid for large launches: a 1D grid caps at 65535 workgroups. Returns the grid plus
 /// `row_stride` (threads per grid row = gx·64) so the kernel can reconstruct a flat index.
 pub(crate) fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
@@ -1912,11 +1909,13 @@ pub(crate) fn groups2d(n: usize) -> ((u32, u32, u32), u32) {
 // keys on `(device pointer, CONTENT HASH of the wgsl)`, so a generated `String` is fine and
 // multiple devices on one thread are fine. A stale comment about a cache key reads exactly like a
 // live hazard — this one cost a wrong bug report before anyone read the function it describes.
+type PipelineKey = (usize, u64);
+type CachedPipeline = (wgpu::ComputePipeline, std::rc::Rc<wgpu::BindGroupLayout>);
 thread_local! {
     // Pipeline AND its bind-group layout. The layout is cached because `get_bind_group_layout` is
     // not a getter on every backend: on WebGPU it materialises a fresh JS object per call, and
     // `run()` called it once per dispatch — 6303 times per speech encode.
-    static PIPELINES: std::cell::RefCell<std::collections::HashMap<(usize, u64), (wgpu::ComputePipeline, std::rc::Rc<wgpu::BindGroupLayout>)>> =
+    static PIPELINES: std::cell::RefCell<std::collections::HashMap<PipelineKey, CachedPipeline>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     // Autotuner: shape-bucket → measured-fastest GEMM kernel for this device.
     static GEMM_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, u32, u32), Gemm>> =
@@ -3709,7 +3708,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 // it measures *where* work is, not the fastest achievable — exactly what's needed to pick a target.
 thread_local! {
     static PROF: std::cell::RefCell<(std::collections::BTreeMap<String, f64>, Option<std::time::Instant>)>
-        = std::cell::RefCell::new((std::collections::BTreeMap::new(), None));
+        = const { std::cell::RefCell::new((std::collections::BTreeMap::new(), None)) };
 }
 
 /// Block until the GPU has finished all submitted work.
@@ -3808,12 +3807,12 @@ impl Tensor {
     pub fn matmul_coop(&self, other: &Tensor) -> Tensor {
         let (m, k) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
         let n = other.shape[other.rank() - 1];
-        assert!(m % 8 == 0 && k % 8 == 0 && n % 8 == 0, "matmul_coop needs M,K,N multiples of 8");
+        assert!(m % 8 == 0 && k % 8 == 0 && n.is_multiple_of(8), "matmul_coop needs M,K,N multiples of 8");
         let (a, b) = (self.contiguous(), other.contiguous());
         let out = empty(&self.ctx, m * n); // zeroed accumulator
         // Register-blocked (2×2 of 8×8 tiles per workgroup) when M,N are 16-aligned: each subgroup
         // reuses 2 A-tiles + 2 B-tiles across 4 MMAs (half the loads per MMA), so it's compute-denser.
-        if m % 16 == 0 && n % 16 == 0 {
+        if m % 16 == 0 && n.is_multiple_of(16) {
             run(&self.ctx, COOP_GEMM_RB_WGSL, "coop_gemm_rb",
                 &[a.buf.as_ref(), b.buf.as_ref(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
                 ((n / 16) as u32, (m / 16) as u32, 1));
@@ -3832,13 +3831,13 @@ impl Tensor {
     pub fn matmul_coop16(&self, other: &Tensor) -> Tensor {
         let (m, k) = (self.shape[self.rank() - 2], self.shape[self.rank() - 1]);
         let n = other.shape[other.rank() - 1];
-        assert!(m % 16 == 0 && k % 16 == 0 && n % 16 == 0, "matmul_coop16 needs M,K,N multiples of 16");
+        assert!(m % 16 == 0 && k % 16 == 0 && n.is_multiple_of(16), "matmul_coop16 needs M,K,N multiples of 16");
         let ah = self.contiguous().to_half(dtype::DType::F16);
         let bh = other.contiguous().to_half(dtype::DType::F16);
         let out = empty(&self.ctx, m * n); // zeroed f32 accumulator
         // Register-blocked (2×2 of 16×16 tiles / workgroup) when M,N are 32-aligned — each subgroup
         // reuses 2 A-tiles + 2 B-tiles across 4 MMAs, ~halving loads per MMA. Else the single-tile path.
-        if m % 32 == 0 && n % 32 == 0 {
+        if m % 32 == 0 && n.is_multiple_of(32) {
             run(&self.ctx, COOP_GEMM16_RB_WGSL, "coop_gemm16_rb",
                 &[ah.buffer(), bh.buffer(), &out, &unibuf(&self.ctx, &[m as u32, k as u32, n as u32, 0])],
                 ((n / 32) as u32, (m / 32) as u32, 1));
@@ -4026,6 +4025,7 @@ mod reduce_tests {
 mod conv_tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)] // input shape, kernel shape, and the stride and pad are independent
     fn cpu_conv2d(
         x: &[f32], w: &[f32], n: usize, h: usize, wd: usize, c: usize,
         kh: usize, kw: usize, o: usize, stride: (usize, usize), pad: (usize, usize),
@@ -4661,7 +4661,7 @@ mod mrope_tests {
                     let (comp, start) = if mode == MropeMode::Interleaved {
                         if sector % 3 == 1 && sector < 3 * s[1] { (1usize, s[0]) }
                         else if sector % 3 == 2 && sector < 3 * s[2] { (2, sec_w) }
-                        else if sector % 3 == 0 && sector < 3 * s[0] { (0, 0) }
+                        else if sector.is_multiple_of(3) && sector < 3 * s[0] { (0, 0) }
                         else { (3, sec_e) }
                     } else if sector < s[0] { (0, 0) }
                     else if sector < sec_w { (1, s[0]) }
@@ -4965,6 +4965,7 @@ mod flash_offset_tests {
     use super::*;
 
     /// Causal attention for queries at positions `off..off+t` over `off+t` keys, in float64 on the host.
+    #[allow(clippy::too_many_arguments)] // the query block, its offset, and the two head counts stay separate
     fn reference(q: &[f32], k: &[f32], v: &[f32], t: usize, off: usize, nh: usize, nkv: usize, dh: usize) -> Vec<f64> {
         let (g, scale) = (nh / nkv, 1.0 / (dh as f64).sqrt());
         let mut out = vec![0f64; t * nh * dh];

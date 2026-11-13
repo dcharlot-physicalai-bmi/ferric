@@ -175,7 +175,7 @@ impl Mock {
                 match cfg.framing {
                     Framing::Close => {
                         let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n");
-                        for l in lines { let _ = write!(s, "{l}\n"); let _ = s.flush(); }
+                        for l in lines { let _ = writeln!(s, "{l}"); let _ = s.flush(); }
                     }
                     Framing::Chunked => {
                         let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n");
@@ -264,8 +264,8 @@ fn ferric(t: &Tmp, host: &str, args: &[&str], stdin: &str, env: &[(&str, &str)])
     for (k, v) in env { c.env(k, v); }
     let mut child = c.spawn().unwrap();
     child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    out
+    
+    child.wait_with_output().unwrap()
 }
 
 fn text(b: &[u8]) -> String { String::from_utf8_lossy(b).into_owned() }

@@ -71,7 +71,7 @@ async fn run() {
     let mask_tok = tv(seq(d, 99.0), &[1, d]);               // [1,d] broadcast
     let mrow: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect(); // mask evens
     let m = tv(mrow, &[n, 1]);
-    let keep = tv(vec![1.0; n * 1], &[n, 1]).sub(&m);       // 1 − m
+    let keep = tv(vec![1.0; n], &[n, 1]).sub(&m);       // 1 − m
     let pred_in = x.mul(&keep).add(&mask_tok.mul(&m));      // where(masked, mask_tok, x)
 
     // predictor (1 block) → predicted latents

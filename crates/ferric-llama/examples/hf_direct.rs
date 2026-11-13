@@ -24,7 +24,7 @@ use ferric_llama::lfm2::{Cache, Lfm2};
 use ferric_load::hf::HfCheckpoint;
 use std::sync::Arc;
 
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
 
 fn main() { pollster::block_on(run()); }
 

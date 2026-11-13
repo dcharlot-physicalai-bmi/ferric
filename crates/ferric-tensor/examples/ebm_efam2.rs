@@ -38,7 +38,7 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3] }
@@ -46,7 +46,7 @@ impl Efa1 {
     fn act1(&self, s: [f32; 2], g: f32) -> f32 {
         let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
         let d = s[0] - g; f[0] = d.cos(); f[1] = d.sin(); f[2] = s[1]; f[3] = s[0].sin();
-        for c in 0..EMB { f[16 + c] = self.emb[c]; }
+        f[16..(EMB + 16)].copy_from_slice(&self.emb[..EMB]);
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3[0]; for j in 0..H { o += h2[j] * self.fw3[j * 3]; }
@@ -95,7 +95,7 @@ fn mk_chain(goals: &[f32], seed: u32) -> SeqMem {
     let mut xi = Vec::with_capacity(goals.len());
     for (k, g) in goals.iter().enumerate() { let mut p = [0.0f32; PDIM]; let mut n = 0.0;
         for c in 0..CDIM { p[c] = u(seed + k as u32, 100 + c as u32) * 2.0 - 1.0; n += p[c] * p[c]; }
-        let n = n.sqrt().max(1e-6); for c in 0..CDIM { p[c] /= n; }
+        let n = n.sqrt().max(1e-6); for item in p[..CDIM].iter_mut() { *item /= n; }
         p[CDIM] = g.cos(); p[CDIM + 1] = g.sin(); xi.push(p); }
     SeqMem { xi }
 }
@@ -173,9 +173,9 @@ fn main() {
     let (mut ok_entry, ne) = (0, 200);
     for tr in 0..ne { let wps: Vec<f32> = (0..8).map(|k| 0.9 * (k as f32 * 1.9).sin()).collect();
         let mem = mk_chain(&wps, 9000 + (tr % 60) * 41);
-        let k = 1 + (u(tr as u32, 61) * 6.0) as usize;                  // enter at phase 1..6
+        let k = 1 + (u(tr, 61) * 6.0) as usize;                  // enter at phase 1..6
         let mut cue = mem.xi[k];
-        for c in 0..CDIM { if u(tr as u32, 300 + c as u32) < 0.25 { cue[c] = 0.0; } }  // 25% corrupted cue
+        for c in 0..CDIM { if u(tr, 300 + c as u32) < 0.25 { cue[c] = 0.0; } }  // 25% corrupted cue
         cue[CDIM] = 0.0; cue[CDIM + 1] = 0.0;                           // goal coords unknown
         let q = mem.settle(&cue);
         if mem.slot(&q) == k { ok_entry += 1; } }

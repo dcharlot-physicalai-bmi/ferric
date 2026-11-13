@@ -88,7 +88,7 @@ async fn run() {
         let nh = m.cfg.n_head;
         let splits = if s < 1024 { 1 } else { (s / 512).min(256 / nh.max(1)).max(1) };
 
-        let mut bench = |force: Option<&str>| {
+        let bench = |force: Option<&str>| {
             match force {
                 // FIXME: Audit that the environment access only happens in single-threaded code.
                 Some(v) => unsafe { std::env::set_var("FERRIC_SPLITKV", v) },

@@ -66,8 +66,8 @@ pub(crate) fn wav(b: &[u8]) -> Result<(Vec<f32>, usize), String> {
     let ((tag, ch, rate, bits), d) = (fmt.ok_or("WAV without a fmt chunk")?, data.ok_or("WAV without a data chunk")?);
     if ch == 0 || rate == 0 { return Err("WAV declares 0 channels or 0 Hz".into()); }
     let frames: Vec<f32> = match (tag, bits) {
-        (1, 16) => d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
-        (3, 32) => d.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        (1, 16) => d.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
+        (3, 32) => d.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         _ => return Err(format!("WAV format tag {tag} at {bits} bits: only 16-bit PCM and 32-bit float are read")),
     };
     Ok((frames.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect(), rate))

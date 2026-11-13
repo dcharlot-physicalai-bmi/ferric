@@ -18,8 +18,9 @@ const B: usize = 64; // functions per batch
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u01(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
+#[allow(dead_code)] // example helper, not on the default path
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> {
-    (0..n).map(|i| { let a = u01(i as u32, seed); let b = u01(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect()
+    (0..n).map(|i| { let a = u01(i as u32, seed); let b = u01(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect()
 }
 
 // a random smooth function f = Σ_{k=1..4} a_k sin(kπx), sampled on the sensor grid; + its exact antiderivative

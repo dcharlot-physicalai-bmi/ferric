@@ -1186,7 +1186,7 @@ pub mod reference {
     fn put_half(scales: &mut [u32], b: usize, d: f32) {
         let w = b / 2;
         let bits = f32_to_f16_bits(d) as u32;
-        if b % 2 == 0 {
+        if b.is_multiple_of(2) {
             scales[w] = (scales[w] & 0xffff_0000) | bits;
         } else {
             scales[w] = (scales[w] & 0x0000_ffff) | (bits << 16);
@@ -1252,7 +1252,7 @@ pub mod reference {
 
     fn get_half(scales: &[u32], b: usize) -> f32 {
         let w = scales[b / 2];
-        f16_bits_to_f32(if b % 2 == 0 { (w & 0xffff) as u16 } else { (w >> 16) as u16 })
+        f16_bits_to_f32(if b.is_multiple_of(2) { (w & 0xffff) as u16 } else { (w >> 16) as u16 })
     }
 
     /// Quantize then dequantize — the reconstruction a runtime would actually attend over.
@@ -1532,7 +1532,7 @@ mod tests {
         let mut r = Lcg::new(0xC0FFEE);
         for i in 0..200_000 {
             // Sweep magnitudes across the whole f16 range: normals, subnormals, overflow.
-            let mag = 10f32.powf((r.next_f32() * 9.0) as f32);
+            let mag = 10f32.powf(r.next_f32() * 9.0);
             let v = r.next_f32() * mag;
             assert_eq!(
                 f32_to_f16_bits(v),
@@ -1557,7 +1557,7 @@ mod tests {
         let nblk = rows * (width / QK);
         let mut x = vec![0f32; rows * width];
         let mut want = vec![[0i32; 32]; nblk];
-        for b in 0..nblk {
+        for (b, block) in want.iter_mut().enumerate() {
             let row = b / (width / QK);
             let cb = b % (width / QK);
             let s = 2f32.powi(-3 + (b % 5) as i32);
@@ -1588,7 +1588,7 @@ mod tests {
                     }
                 };
                 x[row * width + cb * QK + j] = v;
-                want[b][j] = if zero {
+                block[j] = if zero {
                     match fmt {
                         KvqFmt::Q8_0 => 0,
                         // an all-zero block has d == 0; q4_0 stores floor(0 + 8.5) = 8, q4_1 floor(0.5) = 0
@@ -1628,10 +1628,10 @@ mod tests {
                                                    // shared scale word straddles rows
             let (x, want) = exact_case(rows, width, fmt, 7);
             let (codes, _scales) = reference::quantize(&x, rows, width, fmt);
-            for b in 0..rows * (width / QK) {
+            for (b, expected) in want.iter().enumerate() {
                 assert_eq!(
                     codes_of(&codes, b, fmt),
-                    want[b],
+                    *expected,
                     "{}: block {b} codes wrong",
                     fmt.name()
                 );
@@ -1724,13 +1724,13 @@ mod tests {
             let q = QKvCache::from_tensor(&ctx, &t, fmt);
             let (codes, scales) = pollster::block_on(q.to_host(&ctx));
             let (rc, rs) = reference::quantize(&x, rows, width, fmt);
-            for b in 0..rows * (width / QK) {
-                assert_eq!(codes_of(&codes, b, fmt), want[b], "{}: GPU block {b} codes wrong", fmt.name());
+            for (b, expected) in want.iter().enumerate() {
+                assert_eq!(codes_of(&codes, b, fmt), *expected, "{}: GPU block {b} codes wrong", fmt.name());
             }
-            first_diff(&codes, &rc).map(|(i, a, b)| panic!(
-                "{}: GPU code word {i} is {a:#010x}, CPU reference says {b:#010x}", fmt.name(), ));
-            first_diff(&scales, &rs).map(|(i, a, b)| panic!(
-                "{}: GPU scale word {i} is {a:#010x}, CPU reference says {b:#010x}", fmt.name(), ));
+            if let Some((i, a, b)) = first_diff(&codes, &rc) { panic!(
+                "{}: GPU code word {i} is {a:#010x}, CPU reference says {b:#010x}", fmt.name(), ) }
+            if let Some((i, a, b)) = first_diff(&scales, &rs) { panic!(
+                "{}: GPU scale word {i} is {a:#010x}, CPU reference says {b:#010x}", fmt.name(), ) }
         }
     }
 
@@ -1934,12 +1934,12 @@ mod tests {
             let q = QKvCache::from_tensor(&ctx, &t, fmt);
             let (gc, gs) = pollster::block_on(q.to_host(&ctx));
             let (rc, rs) = reference::quantize(&x, rows, width, fmt);
-            first_diff(&gc, &rc).map(|(i, a, b)| panic!(
+            if let Some((i, a, b)) = first_diff(&gc, &rc) { panic!(
                 "{}: GPU code word {i} is {a:#010x}, reference says {b:#010x} ({} of {} differ)",
-                fmt.name(), gc.iter().zip(&rc).filter(|(x, y)| x != y).count(), gc.len()));
-            first_diff(&gs, &rs).map(|(i, a, b)| panic!(
+                fmt.name(), gc.iter().zip(&rc).filter(|(x, y)| x != y).count(), gc.len()) }
+            if let Some((i, a, b)) = first_diff(&gs, &rs) { panic!(
                 "{}: GPU scale word {i} is {a:#010x}, reference says {b:#010x} ({} of {} differ)",
-                fmt.name(), gs.iter().zip(&rs).filter(|(x, y)| x != y).count(), gs.len()));
+                fmt.name(), gs.iter().zip(&rs).filter(|(x, y)| x != y).count(), gs.len()) }
         }
     }
 
@@ -2022,24 +2022,20 @@ mod tests {
             }
             let (ic, is) = pollster::block_on(inc.to_host(&ctx));
 
-            first_diff(&ic, &oc).map(|(i, a, b)| {
-                panic!(
+            if let Some((i, a, b)) = first_diff(&ic, &oc) { panic!(
                     "{}: row-at-a-time codes differ from one-shot at word {i} ({a:#010x} vs {b:#010x}); \
                      {} of {} words differ",
                     fmt.name(),
                     ic.iter().zip(&oc).filter(|(x, y)| x != y).count(),
                     ic.len()
-                )
-            });
-            first_diff(&is, &os).map(|(i, a, b)| {
-                panic!(
+                ) }
+            if let Some((i, a, b)) = first_diff(&is, &os) { panic!(
                     "{}: row-at-a-time scales differ from one-shot at word {i} ({a:#010x} vs {b:#010x}); \
                      {} of {} words differ",
                     fmt.name(),
                     is.iter().zip(&os).filter(|(x, y)| x != y).count(),
                     is.len()
-                )
-            });
+                ) }
 
             let a = pollster::block_on(inc.dequantize(&ctx).to_vec());
             let b = pollster::block_on(one_shot.dequantize(&ctx).to_vec());
@@ -2195,12 +2191,12 @@ mod tests {
             let q = QKvCache::from_tensor(&ctx, &view, fmt);
             let (codes, scales) = pollster::block_on(q.to_host(&ctx));
             let (rc, rs) = reference::quantize(&want, rows, width, fmt);
-            first_diff(&codes, &rc).map(|(i, a, b)| panic!(
+            if let Some((i, a, b)) = first_diff(&codes, &rc) { panic!(
                 "{}: strided-view append read the wrong elements — code word {i} is {a:#010x}, \
-                 packing the same rows by hand gives {b:#010x}", fmt.name()));
-            first_diff(&scales, &rs).map(|(i, a, b)| panic!(
+                 packing the same rows by hand gives {b:#010x}", fmt.name()) }
+            if let Some((i, a, b)) = first_diff(&scales, &rs) { panic!(
                 "{}: strided-view append wrote the wrong scales — word {i} is {a:#010x} vs {b:#010x}",
-                fmt.name()));
+                fmt.name()) }
         }
     }
 

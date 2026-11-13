@@ -11,8 +11,8 @@ const GS: usize = 128; // group size (one f16 scale per GS weights)
 
 // per-group ternary (Δ=0.7·mean|w|, scale=mean|w| over kept) + 5 trits/byte packing. scale stored f16.
 fn ternary_encode(w: &[f32], gs: usize) -> (Vec<u8>, Vec<f32>) {
-    let ng = (w.len() + gs - 1) / gs;
-    let bpg = (gs + 4) / 5;
+    let ng = w.len().div_ceil(gs);
+    let bpg = gs.div_ceil(5);
     let mut packed = vec![0u8; ng * bpg];
     let mut scales = vec![0f32; ng];
     for gi in 0..ng {
@@ -32,7 +32,7 @@ fn ternary_encode(w: &[f32], gs: usize) -> (Vec<u8>, Vec<f32>) {
     (packed, scales)
 }
 fn ternary_decode(packed: &[u8], scales: &[f32], n: usize, gs: usize) -> Vec<f32> {
-    let bpg = (gs + 4) / 5;
+    let bpg = gs.div_ceil(5);
     let mut out = vec![0f32; n];
     for gi in 0..scales.len() {
         let (s, base) = (scales[gi], gi * gs);

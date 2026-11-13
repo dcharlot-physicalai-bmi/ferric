@@ -119,7 +119,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    if variants < 1 || variants > HELD_BASE {
+    if !(1..=HELD_BASE).contains(&variants) {
         eprintln!("--variants must be in 1..={HELD_BASE}: train variants are 0..N and held-out \
                    variants are {HELD_BASE}..{}, and the ranges must not overlap",
                   HELD_BASE + HELD_PER_KIND);

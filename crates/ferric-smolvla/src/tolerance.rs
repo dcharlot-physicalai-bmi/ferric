@@ -95,10 +95,10 @@ pub fn element_bounds() -> BTreeMap<&'static str, (f64, u32)> {
     let vision_post = rss(&[vec![patch, reduction_diff(768)], vec![layer; 12]].concat());
     let connector = rss(&[vision_post, matmul_diff(12288)]);
     let text_l0_k = rss(&[reduction_diff(960), matmul_diff(960)]);
-    let text_stack = rss(&vec![text_layer(); 16]);
+    let text_stack = rss(&[text_layer(); 16]);
     let prefix = rss(&[connector, text_stack]);
     let expert = rss(&[vec![prefix], vec![expert_layer(); 16]].concat());
-    let raw = rss(&vec![0.1 * expert; 10]);
+    let raw = rss(&[0.1 * expert; 10]);
     BTreeMap::from([
         ("prepared_image0", (8.0 * F32_U, 3 * 512 * 512)),
         ("patch_token0", (patch, 768)),
@@ -178,7 +178,7 @@ pub fn rope_residual(
     dh: usize,
     base: f32,
 ) -> Result<RopeResidual, String> {
-    if dh == 0 || dh % 2 != 0 {
+    if dh == 0 || !dh.is_multiple_of(2) {
         return Err(format!("rope head dim {dh} is not a positive even number"));
     }
     let seq = pos.len();
@@ -198,8 +198,8 @@ pub fn rope_residual(
     let mut angles = 0usize;
     let mut norm_exceeded = false;
     let mut angle_exceeded = false;
-    for t in 0..seq {
-        let p = pos[t] as f32;
+    for (t, &p_u) in pos.iter().enumerate() {
+        let p = p_u as f32;
         for h in 0..heads {
             let off = (t * heads + h) * dh;
             for c in 0..half {
@@ -235,9 +235,9 @@ pub fn rope_residual(
     }
     Ok(RopeResidual {
         max_norm_abs: max_norm,
-        max_norm_bound: max_norm_bound,
+        max_norm_bound,
         max_angle_abs: max_angle,
-        max_angle_bound: max_angle_bound,
+        max_angle_bound,
         pairs: seq * heads * half,
         angles_checked: angles,
         norm_exceeded,

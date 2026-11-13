@@ -41,7 +41,7 @@
 //!   cargo run -p ferric-llama --example q2k_q3k_kernel --release -- <model.gguf>
 use ferric_core::Context;
 use ferric_gguf::quantize::{quantize_q2_k, quantize_q3_k};
-use ferric_gguf::{deq_raw, GgufFile, GgufSource};
+use ferric_gguf::{deq_raw, GgufFile};
 use ferric_tensor::{QMatrix, Tensor};
 use std::sync::Arc;
 

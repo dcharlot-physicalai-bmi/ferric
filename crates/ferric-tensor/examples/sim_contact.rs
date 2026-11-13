@@ -34,7 +34,8 @@ fn solve_ground(b: &mut Body, _pen: f64, e: f64, mu: f64) {
     b.v[1] += jn * b.inv_m;
     // friction impulse: clamp tangential to μ·jn (Coulomb cone)
     let vt = b.v[0]; let mut jt = -vt * b.m; let max_t = mu * jn;
-    if jt > max_t { jt = max_t; } if jt < -max_t { jt = -max_t; }
+    if jt > max_t { jt = max_t; }
+            if jt < -max_t { jt = -max_t; }
     b.v[0] += jt * b.inv_m;
 }
 fn main() {

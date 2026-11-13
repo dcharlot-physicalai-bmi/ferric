@@ -134,7 +134,7 @@ pub fn select(files: &[String], tag: Option<&str>) -> Result<Vec<String>, String
 }
 
 fn hf_token() -> Option<String> {
-    if let Ok(t) = std::env::var("HF_TOKEN") { if !t.trim().is_empty() { return Some(t.trim().to_string()); } }
+    if let Ok(t) = std::env::var("HF_TOKEN") && !t.trim().is_empty() { return Some(t.trim().to_string()); }
     let hf_home = std::env::var_os("HF_HOME").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface"));
     std::fs::read_to_string(hf_home.join("token")).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
@@ -164,7 +164,8 @@ fn url_path(p: &str) -> String {
 
 /// The repo's files and sizes, and the commit to pin every part to (so a set is never mixed across
 /// two commits of the repo).
-fn listing(r: &HfRef) -> Result<(Vec<(String, Option<u64>)>, String), String> {
+type ListedFile = (String, Option<u64>);
+fn listing(r: &HfRef) -> Result<(Vec<ListedFile>, String), String> {
     let url = format!("{}/api/models/{}?blobs=true", endpoint(), r.repo);
     let (st, out) = curl(&["-w", "\n%{http_code}", &url], true)?;
     let text = String::from_utf8_lossy(&out);
@@ -197,9 +198,8 @@ fn fetch(url: &str, dest: &Path, expect: Option<u64>, label: &str) -> Result<(),
         // (ferric-serve writes in place): resume it rather than trust it or throw it away.
         std::fs::rename(dest, &partial).map_err(|e| format!("{}: {e}", dest.display()))?;
     }
-    if let (Some(have), Some(e)) = (len(&partial), expect) {
-        if have > e { let _ = std::fs::remove_file(&partial); }
-    }
+    if let (Some(have), Some(e)) = (len(&partial), expect)
+        && have > e { let _ = std::fs::remove_file(&partial); }
     let have = len(&partial).unwrap_or(0);
     let size = expect.map(hub::human_size).unwrap_or_else(|| "size unknown".into());
     if have > 0 { eprintln!("{label}: resuming at {} of {size}", hub::human_size(have)); } else { eprintln!("{label}: {size}"); }
@@ -216,9 +216,8 @@ fn fetch(url: &str, dest: &Path, expect: Option<u64>, label: &str) -> Result<(),
         }
     }
     let got = len(&partial).unwrap_or(0);
-    if let Some(e) = expect {
-        if got != e { return Err(format!("{}: {got} bytes, the repo says {e}; run the pull again to resume", partial.display())); }
-    }
+    if let Some(e) = expect
+        && got != e { return Err(format!("{}: {got} bytes, the repo says {e}; run the pull again to resume", partial.display())); }
     std::fs::rename(&partial, dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     Ok(())
 }

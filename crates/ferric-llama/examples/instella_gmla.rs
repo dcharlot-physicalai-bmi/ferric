@@ -37,7 +37,7 @@ async fn run() {
         kv_lora_rank: 512,
         // DeepSeek-V3 MLA scaling with YaRN mscale, taken from the reference rather than derived —
         // 1/sqrt(128) would be 0.0884, which is a different model.
-        scaling: 0.16562687709876717,
+        scaling: 0.165_626_88,
         eps: 1e-6,
         rope_interleaved: true,
     };

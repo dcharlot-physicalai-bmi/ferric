@@ -63,7 +63,6 @@ struct Merger {
 }
 
 pub struct VisionTower {
-    ctx: Arc<Context>,
     pub cfg: VisionCfg,
     patch_w: Tensor,   // [hidden, 3*tps*patch*patch] — a plain linear, see the header
     patch_b: Tensor,
@@ -75,7 +74,7 @@ pub struct VisionTower {
 
 fn t2(ctx: &Arc<Context>, st: &SafeTensors, name: &str) -> Result<Tensor, String> {
     let s = st.get(name)?;
-    Ok(Tensor::from_vec(ctx, &s.data, &s.shape.iter().copied().collect::<Vec<_>>()))
+    Ok(Tensor::from_vec(ctx, &s.data, &s.shape.to_vec()))
 }
 
 /// A `[out, in]` weight as the `[in, out]` matrix `matmul` wants. Done once, at load.
@@ -172,7 +171,7 @@ impl VisionTower {
             deep.push(m);
         }
         Ok(VisionTower {
-            ctx: ctx.clone(), cfg, patch_w, patch_b: t2(ctx, &st, "model.visual.patch_embed.proj.bias")?,
+            cfg, patch_w, patch_b: t2(ctx, &st, "model.visual.patch_embed.proj.bias")?,
             pos: t2(ctx, &st, "model.visual.pos_embed.weight")?, blocks, merger, deep,
         })
     }
@@ -259,7 +258,7 @@ impl VisionTower {
         -> Result<(Tensor, Vec<Tensor>, Tensor), String> {
         let c = &self.cfg;
         let (m, m2) = (c.merge, c.merge * c.merge);
-        if gh % m != 0 || gw % m != 0 {
+        if !gh.is_multiple_of(m) || !gw.is_multiple_of(m) {
             return Err(format!("grid {gh}x{gw} is not a multiple of the merge size {m}"));
         }
         let n = gh * gw;

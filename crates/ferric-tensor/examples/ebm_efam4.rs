@@ -41,7 +41,7 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3] }
@@ -49,7 +49,7 @@ impl Efa1 {
     fn act1(&self, s: [f32; 2], g: f32) -> f32 {
         let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
         let d = s[0] - g; f[0] = d.cos(); f[1] = d.sin(); f[2] = s[1]; f[3] = s[0].sin();
-        for c in 0..EMB { f[16 + c] = self.emb[c]; }
+        f[16..(EMB + 16)].copy_from_slice(&self.emb[..EMB]);
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3[0]; for j in 0..H { o += h2[j] * self.fw3[j * 3]; }
@@ -88,7 +88,7 @@ impl Proj {
         let mut c = [0.0f32; CDIM];
         for k in 0..CDIM { let mut z = 0.0; for p in 0..NPIX { z += px[p] * self.w[p * CDIM + k]; } c[k] = z; }
         let n = c.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-        for k in 0..CDIM { c[k] /= n; } c
+        for item in c[..CDIM].iter_mut() { *item /= n; } c
     }
 }
 // ---- memory (stage-3 machinery: context-space gate + certificates) ----
@@ -183,8 +183,8 @@ fn main() {
             if wrap(g_new - g_old).abs() > goal_agree { return 3; }       // refuse-contradiction
             let k = mem.writes[i] as f32;
             for c in 0..PDIM { mem.xi[i][c] = mem.xi[i][c] * (k / (k + 1.0)) + p[c] / (k + 1.0); }
-            let mut n = 0.0; for c in 0..CDIM { n += mem.xi[i][c] * mem.xi[i][c]; }
-            let n = n.sqrt().max(1e-6); for c in 0..CDIM { mem.xi[i][c] /= n; }
+            let mut n = 0.0; for item in mem.xi[i][..CDIM].iter() { n += *item * *item; }
+            let n = n.sqrt().max(1e-6); for item in mem.xi[i][..CDIM].iter_mut() { *item /= n; }
             let gn = (mem.xi[i][CDIM].powi(2) + mem.xi[i][CDIM + 1].powi(2)).sqrt().max(1e-6);
             mem.xi[i][CDIM] /= gn; mem.xi[i][CDIM + 1] /= gn;
             mem.writes[i] += 1; 1 }                                       // consolidate

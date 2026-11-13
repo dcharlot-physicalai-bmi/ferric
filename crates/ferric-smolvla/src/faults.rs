@@ -874,7 +874,7 @@ mod tests {
     fn a_real_rmse_change_is_not_a_libm_ulp() {
         let report = cpu_fault_report();
         let path = ["kernels", "elementwise", "cases", "index_off_by_one_row", "rmse"];
-        let mut nudge = |delta: f64| {
+        let nudge = |delta: f64| {
             let mut v = report.clone();
             let slot = path.iter().take(path.len() - 1).fold(&mut v, |a, k| &mut a[*k]);
             let key = path[path.len() - 1];

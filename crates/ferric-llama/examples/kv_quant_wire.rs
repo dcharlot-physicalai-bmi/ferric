@@ -132,7 +132,7 @@ async fn accuracy(ctx: &Arc<Context>, m: &Qwen3, bpe: &Bpe, bos: Option<u32>, ad
     let _ = ctx;
     let c = &m.cfg;
     let mut ids = bpe.encode(PASSAGE);
-    if add_bos { if let Some(b) = bos { ids.insert(0, b); } }
+    if add_bos && let Some(b) = bos { ids.insert(0, b); }
     println!("passage {} tokens · teacher-forced ONE TOKEN PER STEP (the append path)", ids.len());
 
     // Reference: the f32 cache, same code path a default run takes.
@@ -196,7 +196,7 @@ async fn memory(ctx: &Arc<Context>, m: &Qwen3, bpe: &Bpe, bos: Option<u32>, add_
     let _ = ctx;
     let c = &m.cfg;
     let mut base = bpe.encode(PASSAGE);
-    if add_bos { if let Some(b) = bos { base.insert(0, b); } }
+    if add_bos && let Some(b) = bos { base.insert(0, b); }
     let ids: Vec<u32> = base.iter().copied().cycle().take(n_tokens).collect();
     const CHUNK: usize = 256;
     println!("growing a {n_tokens}-token cache in {CHUNK}-token chunks\n");

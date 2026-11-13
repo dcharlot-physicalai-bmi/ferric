@@ -37,7 +37,7 @@ impl Dec {
         let (t, h, w, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
         let ct = t.min(2);
         let mut newcache = x.narrow(0, t - ct, ct);
-        if ct < 2 { if let Slot::Frames(prev) = &self.cache[idx] { newcache = prev.narrow(0, prev.shape[0] - 1, 1).cat(&newcache, 0); } }
+        if ct < 2 && let Slot::Frames(prev) = &self.cache[idx] { newcache = prev.narrow(0, prev.shape[0] - 1, 1).cat(&newcache, 0); }
         let xin = match &self.cache[idx] {
             Slot::Frames(prev) => {
                 let lp = 2 * padt - prev.shape[0];
@@ -132,7 +132,7 @@ async fn nearest2x(ctx: &Arc<Context>, x: &Tensor) -> Tensor {
     let mut o = vec![0f32; t * (h * 2) * (w * 2) * c];
     for ti in 0..t { for hi in 0..h { for wi in 0..w { for ci in 0..c {
         let v = d[((ti * h + hi) * w + wi) * c + ci];
-        for a in 0..2 { for bb in 0..2 { o[(((ti * (h * 2) + hi * 2 + a) * (w * 2) + wi * 2 + bb)) * c + ci] = v; } }
+        for a in 0..2 { for bb in 0..2 { o[((ti * (h * 2) + hi * 2 + a) * (w * 2) + wi * 2 + bb) * c + ci] = v; } }
     }}}}
     Tensor::from_vec(ctx, &o, &[t, h * 2, w * 2, c])
 }
@@ -154,7 +154,7 @@ async fn dupup(ctx: &Arc<Context>, x: &Tensor, cin: usize, cout: usize, ft: usiz
             let in_ch = flat / repeats;
             for hi in 0..h { for wi in 0..w {
                 let ot = ti * ft_out + fti;
-                o[(((ot * (h * fs) + hi * fs + fi) * (w * fs) + wi * fs + fj)) * cout + oc] = d[((ti * h + hi) * w + wi) * cin + in_ch];
+                o[((ot * (h * fs) + hi * fs + fi) * (w * fs) + wi * fs + fj) * cout + oc] = d[((ti * h + hi) * w + wi) * cin + in_ch];
             }}
         }}}
     }}

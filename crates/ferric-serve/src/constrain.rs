@@ -1,10 +1,11 @@
 //! **Constrained decoding: which constraint a request asks for, and the token mask it implies.**
 //!
 //! One reader for every spelling peers accept (parity gap S10, 8.5 of 14 serving peers):
-//! - OpenAI `response_format` — `json_object` (the JSON guide), `json_schema`;
-//! - llama-server `grammar` — GBNF;
-//! - vLLM `guided_json` / `guided_regex` / `guided_choice` / `guided_grammar` (GBNF), and its newer
-//!   `structured_outputs: {json | regex | choice | grammar}`; a bare `regex` too.
+//!   - OpenAI `response_format` — `json_object` (the JSON guide), `json_schema`;
+//!   - llama-server `grammar` — GBNF;
+//!   - vLLM `guided_json` / `guided_regex` / `guided_choice` / `guided_grammar` (GBNF), and its newer
+//!     `structured_outputs: {json | regex | choice | grammar}`; a bare `regex` too.
+//!
 //! A JSON Schema compiles to GBNF as llama.cpp compiles it (`ferric_agent::json_schema`, byte-identical to
 //! llama.cpp's converter), and regex and choice compile to GBNF too (`ferric_agent::regex`), so every
 //! constraint but `json_object` runs on the one grammar matcher checked against llama.cpp's own grammar tests,
@@ -51,6 +52,7 @@ impl Spec {
             Spec::Grammar(g) => Some(Guide::Grammar(Matcher::new(g.clone()))),
         }
     }
+    #[allow(dead_code)] // callers match on Spec; this is the predicate for a present constraint
     pub fn is_some(&self) -> bool { !matches!(self, Spec::None) }
 }
 
@@ -282,7 +284,8 @@ const KEPT_STATES: usize = 1 << 14;
 /// across thousands of trie nodes (inside a string, every character leads back to the same state). So
 /// states are interned by what they are (`Matcher::state_key`) and each (state, byte) step is computed
 /// once. Same answers as stepping the matcher — it is the matcher's own step, memoized.
-pub(crate) struct Dfa { states: Vec<(Matcher, bool)>, ids: HashMap<(Vec<Vec<Pos>>, (u32, i8)), u32>, next: Vec<Box<[u32; 256]>> }
+type DfaKey = (Vec<Vec<Pos>>, (u32, i8));
+pub(crate) struct Dfa { states: Vec<(Matcher, bool)>, ids: HashMap<DfaKey, u32>, next: Vec<[u32; 256]> }
 
 /// A transition not computed yet.
 const UNKNOWN: u32 = u32::MAX - 1;
@@ -295,7 +298,7 @@ impl Dfa {
         let i = self.states.len() as u32;
         let bottom = !m.mid_char() && m.reached_bottom();
         self.states.push((m, bottom));
-        self.next.push(Box::new([UNKNOWN; 256]));
+        self.next.push([UNKNOWN; 256]);
         self.ids.insert(key, i);
         i
     }

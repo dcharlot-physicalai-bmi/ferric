@@ -50,7 +50,7 @@ async fn run() {
         (Tensor::from_vec(&ctx, &s.data, &[s.shape[0], s.shape[1]]), Tensor::from_vec(&ctx, &w[&format!("{name}.bias")].data, &[s.shape[0]]))
     };
     let gam = |name: &str| -> Tensor { let s = &w[name]; Tensor::from_vec(&ctx, &s.data, &[s.shape[0]]) };
-    let has = |name: &str| w.contains_key(&format!("{name}.weight"));
+    let _has = |name: &str| w.contains_key(&format!("{name}.weight"));
 
     // causal conv3d: left-pad T by 2*padt, symmetric spatial (padh,padw)
     let conv = |x: &Tensor, wt: &Tensor, b: &Tensor, padt: usize, padh: usize, padw: usize| -> Tensor {

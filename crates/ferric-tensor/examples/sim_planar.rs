@@ -76,7 +76,7 @@ impl Arm {
 }
 // solve A x = b (Gaussian elimination with partial pivot), general small n
 fn solve(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> { let n = b.len();
-    let mut m: Vec<Vec<f64>> = a.iter().map(|r| r.clone()).collect(); let mut x = b.to_vec();
+    let mut m: Vec<Vec<f64>> = a.to_vec(); let mut x = b.to_vec();
     for c in 0..n { let mut p = c; for r in (c + 1)..n { if m[r][c].abs() > m[p][c].abs() { p = r; } }
         m.swap(c, p); x.swap(c, p);
         for r in 0..n { if r != c { let f = m[r][c] / m[c][c];

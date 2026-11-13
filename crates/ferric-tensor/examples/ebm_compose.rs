@@ -22,7 +22,7 @@ const NC: usize = 4;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 fn sat(c: usize, x0: f32, x1: f32) -> bool {
     match c { 0 => x0 < 0.0, 1 => x1 > 0.0, 2 => x0 * x0 + x1 * x1 < 2.0, _ => x0 * x0 + x1 * x1 > 0.5 }
@@ -34,6 +34,7 @@ fn gen_concept(c: usize, m: usize, seed: u32) -> Vec<f32> {
 }
 fn gen_uniform(m: usize, seed: u32) -> Vec<f32> { (0..m * 2).map(|i| (u(i as u32, seed) * 2.0 - 1.0) * DOM).collect() }
 // negatives = the concept's COMPLEMENT (harder negatives → crisp decision boundary; fixes soft half-plane energies)
+#[allow(dead_code)] // example helper, not on the default path
 fn gen_complement(c: usize, m: usize, seed: u32) -> Vec<f32> {
     let mut o = Vec::with_capacity(m * 2); let mut s = seed;
     while o.len() < m * 2 { let x0 = (u(s, 1) * 2.0 - 1.0) * DOM; let x1 = (u(s, 2) * 2.0 - 1.0) * DOM; s = s.wrapping_add(2749); if !sat(c, x0, x1) { o.push(x0); o.push(x1); } }

@@ -18,7 +18,7 @@ const TG: [(f32, f32); 4] = [(0.8, -0.8), (-1.0, 0.6), (0.5, 1.0), (-0.6, -0.9)]
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(s: [f32; 4], u1: f32, u2: f32) -> [f32; 4] {
     let (t1, t2, o1, o2) = (s[0], s[1], s[2], s[3]); let (c1, c2) = (u1.clamp(-UMAX, UMAX), u2.clamp(-UMAX, UMAX));
@@ -44,13 +44,13 @@ impl Vn {
 const KAPPA: f32 = 2.0;
 struct Ef { w: [Vec<f32>; 11], b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: f32 }
 impl Ef {
-    fn e(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> f32 { let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+    fn e(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> f32 { let mut f = [0.0f32; 11]; let ff = feat8(s, g); f[..8].copy_from_slice(&ff); f[8] = a1; f[9] = a2; f[10] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.b3; for j in 0..H { o += h2[j] * self.w3[j]; } o }
     // EXACT action-gradient: analytic backprop through the relu net (replaces finite differences)
     fn grad_a(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) {
-        let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+        let mut f = [0.0f32; 11]; let ff = feat8(s, g); f[..8].copy_from_slice(&ff); f[8] = a1; f[9] = a2; f[10] = t;
         let mut h1 = [0.0f32; H]; let mut m1 = [false; H];
         for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } m1[j] = z > 0.0; h1[j] = z.max(0.0); }
         let mut m2 = [false; H];
@@ -133,10 +133,12 @@ async fn run() {
     let mut inits: Vec<[f32; 4]> = vec![]; let mut goals: Vec<(f32, f32)> = vec![];
     for (gi, &g) in TG.iter().enumerate() { for e in 0..nep { let sd = (gi * nep + e) as u32; inits.push([(u(900 + sd, 7) * 2.0 - 1.0) * PI, (u(900 + sd, 8) * 2.0 - 1.0) * PI, 0.0, 0.0]); goals.push(g); } }
     let reached = |s: [f32; 4], g: (f32, f32)| wrap(s[0] - g.0).abs() < 0.35 && wrap(s[1] - g.1).abs() < 0.35 && s[2].abs() < 0.7 && s[3].abs() < 0.7;
-    let run_disc = |grid: &[f32]| -> f32 { let mut r = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..260 { let uu = vn.ustar(s, g, grid); s = step(s, uu.0, uu.1); } if reached(s, g) { r += 1; } } r as f32 / n as f32 * 100.0 };
+    let run_disc = |grid: &[f32]| -> f32 { let mut r = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..260 { let uu = vn.ustar(s, g, grid); s = step(s, uu.0, uu.1); }
+            if reached(s, g) { r += 1; } } r as f32 / n as f32 * 100.0 };
     let rf = run_disc(&G9);
     // (a) ACTUATION: integrate v=−∇ₐE
-    let run_act = |k: usize| -> f32 { let mut r = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..260 { let (u1, u2) = ef.act(s, g, k); s = step(s, u1, u2); } if reached(s, g) { r += 1; } } r as f32 / n as f32 * 100.0 };
+    let run_act = |k: usize| -> f32 { let mut r = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..260 { let (u1, u2) = ef.act(s, g, k); s = step(s, u1, u2); }
+            if reached(s, g) { r += 1; } } r as f32 / n as f32 * 100.0 };
     // (b) VERIFY from the SAME potential at t=1: is E(s,u*,1) < E(s,bad,1)?
     let (mut vg, mut vt) = (0, 0); for k in 0..3000 { let s = [(u(k as u32, 41) * 2.0 - 1.0) * PI, (u(k as u32, 42) * 2.0 - 1.0) * PI, (u(k as u32, 43) * 2.0 - 1.0) * 3.0, (u(k as u32, 44) * 2.0 - 1.0) * 3.0];
         let g = ((u(k as u32, 45) * 2.0 - 1.0) * 1.2, (u(k as u32, 46) * 2.0 - 1.0) * 1.2); let us = vn.ustar(s, g, &G5); let bad = ((u(k as u32, 47) * 2.0 - 1.0) * UMAX, (u(k as u32, 48) * 2.0 - 1.0) * UMAX);

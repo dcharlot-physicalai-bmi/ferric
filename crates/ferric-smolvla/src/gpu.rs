@@ -160,6 +160,7 @@ impl<'a> Dev<'a> {
         Ok(self.ctx.layernorm_t(x, &weight, &bias, rows, dim, 1e-6))
     }
 
+    #[allow(clippy::too_many_arguments)] // sequence lengths, head counts, and the optional mask are independent
     fn attend(
         &mut self,
         q: &Tensor,
@@ -199,8 +200,6 @@ impl<'a> Dev<'a> {
 
 fn mask_tensor(ctx: &Context, mask: &[bool]) -> Tensor {
     let data: Vec<f32> = mask.iter().map(|keep| if *keep { 0.0 } else { f32::MIN }).collect();
-    let cols = if mask.is_empty() { 1 } else { 1 };
-    let _ = cols;
     ctx.tensor(&data, &[data.len()])
 }
 
@@ -307,7 +306,6 @@ pub async fn forward_gpu(store: &Store, sample: &Sample) -> Result<GpuForward, S
 }
 
 async fn run_graph(dev: &mut Dev<'_>, sample: &Sample) -> Result<(Vec<f32>, ActivationTrace), String> {
-    let mut dev = dev;
     let mut prefix_host = Vec::new();
     let mut pad = Vec::new();
     let mut att = Vec::new();
@@ -320,7 +318,7 @@ async fn run_graph(dev: &mut Dev<'_>, sample: &Sample) -> Result<(Vec<f32>, Acti
         if image == 0 {
             prepared_image0 = pixels.clone();
         }
-        let (tokens, snap) = vision_image(&mut dev, &pixels, image == 0).await?;
+        let (tokens, snap) = vision_image(dev, &pixels, image == 0).await?;
         if image == 0 {
             vision = snap;
         }
@@ -362,7 +360,7 @@ async fn run_graph(dev: &mut Dev<'_>, sample: &Sample) -> Result<(Vec<f32>, Acti
     let mask_t = mask_tensor(dev.ctx, &mask);
     eprintln!("wgpu text prefix");
     let prefix = dev.ctx.tensor(&prefix_host, &[seq as usize, TEXT_DIM as usize]);
-    let (cache, k0) = text_prefix(&mut dev, &prefix, seq, &mask_t, &pos).await?;
+    let (cache, k0) = text_prefix(dev, &prefix, seq, &mask_t, &pos).await?;
     dev.flush();
     let mut x = sample.noise.clone();
     let dt = -1.0 / STEPS as f32;
@@ -370,7 +368,7 @@ async fn run_graph(dev: &mut Dev<'_>, sample: &Sample) -> Result<(Vec<f32>, Acti
     for step in 0..STEPS {
         eprintln!("wgpu euler step {step}");
         let time = 1.0 + step as f32 * dt;
-        let v = denoise(&mut dev, &cache, &pad, &x, time).await?;
+        let v = denoise(dev, &cache, &pad, &x, time).await?;
         if step == 0 {
             velocity0 = v[..MAX_ACTION].to_vec();
         }
@@ -534,7 +532,7 @@ async fn denoise(dev: &mut Dev<'_>, cache: &[(Tensor, Tensor)], prefix_pad: &[bo
     let pos0: Vec<u32> = (0..CHUNK).collect();
     let self_m = mask_tensor(dev.ctx, &self_mask(prefix_pad, CHUNK as usize));
     let cross_m = mask_tensor(dev.ctx, &cross_mask(prefix_pad));
-    for layer in 0..TEXT_LAYERS {
+    for (layer, (pk, pv)) in cache.iter().enumerate() {
         let p = format!("model.vlm_with_expert.lm_expert.layers.{layer}");
         let normed = dev.rms(&hidden, &format!("{p}.input_layernorm.weight"), CHUNK, EXPERT_DIM)?;
         let q = dev.linear(&normed, &format!("{p}.self_attn.q_proj.weight"), None, CHUNK, EXPERT_DIM, HEADS * HEAD_DIM)?;
@@ -544,12 +542,10 @@ async fn denoise(dev: &mut Dev<'_>, cache: &[(Tensor, Tensor)], prefix_pad: &[bo
             let q = dev.ctx.rope_positions_t(&q, &pos, HEADS, HEAD_DIM, 10_000.0);
             let k = dev.ctx.rope_positions_t(&k, &pos, KV_HEADS, HEAD_DIM, 10_000.0);
             dev.dispatches += 2;
-            let (pk, pv) = &cache[layer];
             let k = concat_seq(dev, pk, &k, prefix, CHUNK, KV_HEADS * HEAD_DIM).await?;
             let v = concat_seq(dev, pv, &v, prefix, CHUNK, KV_HEADS * HEAD_DIM).await?;
             dev.attend(&q, &k, &v, CHUNK, prefix + CHUNK, HEADS, KV_HEADS, HEAD_DIM, Some(&self_m))
         } else {
-            let (pk, pv) = &cache[layer];
             let flat_k = Tensor { buf: pk.buf.clone(), shape: vec![prefix as usize, (KV_HEADS * HEAD_DIM) as usize] };
             let flat_v = Tensor { buf: pv.buf.clone(), shape: vec![prefix as usize, (KV_HEADS * HEAD_DIM) as usize] };
             let k = dev.linear(&flat_k, &format!("{p}.self_attn.k_proj.weight"), None, prefix, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM)?;

@@ -36,12 +36,11 @@ async fn run() {
     let cpu = fabric.devices.iter().position(|d| matches!(d, Device::Cpu)).expect("a CPU device");
     let gpu = fabric.devices.iter().position(|d| matches!(d, Device::Gpu(_)));
 
-    if let Some(g) = gpu {
-        if let Some(f) = planner.crossover(cpu, g) {
+    if let Some(g) = gpu
+        && let Some(f) = planner.crossover(cpu, g) {
             let n = (f / 2.0).cbrt(); // f = 2 N³ for an N×N×N matmul
             println!("\n  predicted crossover: GPU overtakes CPU above ~{:.0}×{:.0} matmuls ({:.1e} flops)", n, n, f);
         }
-    }
 
     println!("\n=== routing sweep (verify each result vs the CPU oracle) ===");
     println!("  {:>5}  {:>28}  {:>10}  {:>10}  {:>9}", "N", "routed to", "cpu (ms)", "gpu (ms)", "max err");

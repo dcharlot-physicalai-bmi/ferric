@@ -27,7 +27,7 @@ fn load_st(path: &str) -> std::io::Result<std::collections::HashMap<String, Vec<
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; } Ok(out)
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; } Ok(out)
 }
 const H: usize = 128; const HV: usize = 128; const EMB: usize = 6; const DT: f32 = 0.05; const GAMMA: f32 = 0.97; const UMAX: f32 = 4.0; const CPL: f32 = 0.5;
 const G5: [f32; 5] = [-4.0, -2.0, 0.0, 2.0, 4.0];
@@ -36,7 +36,7 @@ const NJ: [usize; NB] = [1, 2, 3];
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 // generalized nj-joint coupled chain (state = [θ×3, ω×3] padded; only first nj joints active)
 fn step(nj: usize, s: [f32; 6], uu: [f32; 3]) -> [f32; 6] {
@@ -81,8 +81,8 @@ struct Efa1 { emb: Vec<f32>,   // [NB, EMB]
 // flow input layout: [12 joint-feat, a0,a1,a2, t, EMB…] = 12+3+1+EMB ; potential input: [12, a0,a1,a2, EMB] = 12+3+EMB
 impl Efa1 {
     fn flow_vel(&self, bi: usize, s: [f32; 6], g: [f32; 3], a: [f32; 3], t: f32) -> [f32; 3] {
-        let nj = NJ[bi]; let ff = feat12(nj, s, g); let mut f = vec![0.0f32; 12 + 3 + 1 + EMB];
-        for c in 0..12 { f[c] = ff[c]; } f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; f[15] = t; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
+        let nj = NJ[bi]; let ff = feat12(nj, s, g); let mut f = [0.0f32; 12 + 3 + 1 + EMB];
+        f[..12].copy_from_slice(&ff); f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; f[15] = t; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..f.len() { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3; for j in 0..H { for c in 0..3 { o[c] += h2[j] * self.fw3[j * 3 + c]; } } o }
@@ -90,8 +90,8 @@ impl Efa1 {
         let v = self.flow_vel(bi, s, g, [0.0; 3], 0.0); let nj = NJ[bi]; let mut a = [0.0f32; 3];
         for i in 0..nj { a[i] = v[i].clamp(-UMAX, UMAX); } a }
     fn energy(&self, bi: usize, s: [f32; 6], g: [f32; 3], a: [f32; 3]) -> f32 {
-        let nj = NJ[bi]; let ff = feat12(nj, s, g); let mut f = vec![0.0f32; 12 + 3 + EMB];
-        for c in 0..12 { f[c] = ff[c]; } f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; for c in 0..EMB { f[15 + c] = self.emb[bi * EMB + c]; }
+        let nj = NJ[bi]; let ff = feat12(nj, s, g); let mut f = [0.0f32; 12 + 3 + EMB];
+        f[..12].copy_from_slice(&ff); f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; for c in 0..EMB { f[15 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.pb1[j]; for c in 0..f.len() { z += f[c] * self.pw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.pb2[j]; for k in 0..H { z += h1[k] * self.pw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.pb3; for j in 0..H { o += h2[j] * self.pw3[j]; } o }
@@ -177,7 +177,7 @@ async fn run() {
     pp.push(Tensor::zeros(&ctx, &[H])); pp.push(Tensor::from_vec(&ctx, &randn(H * H, 660, 1.0 / (H as f32).sqrt()), &[H, H])); pp.push(Tensor::zeros(&ctx, &[H]));
     pp.push(Tensor::from_vec(&ctx, &randn(H, 661, 1.0 / (H as f32).sqrt()), &[H, 1])); pp.push(Tensor::zeros(&ctx, &[1]));
     let mut emb = Tensor::from_vec(&ctx, &randn(NB * EMB, 700, 0.5), &[NB, EMB]);   // shared body embedding
-    let mut adamf = Adam::new(&fp, 0.0015); let mut adamp = Adam::new(&pp, 0.0015); let mut adame = Adam::new(&std::slice::from_ref(&emb), 0.0015);
+    let mut adamf = Adam::new(&fp, 0.0015); let mut adamp = Adam::new(&pp, 0.0015); let mut adame = Adam::new(std::slice::from_ref(&emb), 0.0015);
     let embsel: Vec<Tensor> = (0..EMB).map(|c| { let mut v = vec![0.0f32; EMB]; v[c] = 1.0; Tensor::from_vec(&ctx, &v, &[EMB, 1]) }).collect();
     let marg = Var::leaf(Tensor::from_vec(&ctx, &[0.5], &[1]));
     for it in 0..14000 {
@@ -208,7 +208,7 @@ async fn run() {
         let v = fnet(&ff, &fpv);
         let d = v.sub(&Var::leaf(Tensor::from_vec(&ctx, &tb, &[bs, 3]))); let floss = d.mul(&d).mean_all(); floss.backward();
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamf.step(&mut fp, &gf);
-        let ge = ev.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; NB * EMB], &[NB, EMB])); adame.step(&mut std::slice::from_mut(&mut emb), &[ge]);
+        let ge = ev.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &[0.0; NB * EMB], &[NB, EMB])); adame.step(std::slice::from_mut(&mut emb), &[ge]);
         // ---- potential update (contrastive; + emb) ----
         let ppv: Vec<Var> = pp.iter().map(|t| Var::leaf(t.clone())).collect(); let ev2 = Var::leaf(emb.clone());
         let embp = Var::leaf(Tensor::from_vec(&ctx, &ohp, &[bs, NB])).matmul(&ev2);
@@ -218,7 +218,7 @@ async fn run() {
         let hinge = ep.sub(&en).add(&marg).relu(); let anch = ep.mul(&ep).mul(&Var::leaf(Tensor::from_vec(&ctx, &[0.02], &[1])));
         let ploss = hinge.add(&anch).mean_all(); ploss.backward();
         let gp: Vec<Tensor> = ppv.iter().zip(&pp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamp.step(&mut pp, &gp);
-        let ge2 = ev2.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; NB * EMB], &[NB, EMB])); adame.step(&mut std::slice::from_mut(&mut emb), &[ge2]);
+        let ge2 = ev2.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &[0.0; NB * EMB], &[NB, EMB])); adame.step(std::slice::from_mut(&mut emb), &[ge2]);
     }
     // extract shared model
     let mut fw: Vec<Vec<f32>> = Vec::new(); for c in 0..fin { fw.push(fp[c].to_vec().await); }

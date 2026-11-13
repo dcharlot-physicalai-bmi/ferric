@@ -674,8 +674,8 @@ mod tests {
             let b = Var::leaf(Tensor::from_vec(&ctx, &[1.0, -2.0, 0.5, 3.0, 1.0, -1.0], &[3, 2]));
             let mm = x.matmul(&b).value().to_vec().await;
             close(mm[0], 0.5 * 1.0 + 1.5 * 0.5 + 2.0 * 1.0, "matmul [0][0]");
-            close(mm[1], 0.5 * -2.0 + 1.5 * 3.0 + 2.0 * -1.0, "matmul [0][1]");
-            close(mm[3], 3.0 * -2.0 + 0.25 * 3.0 + 4.0 * -1.0, "matmul [1][1]");
+            close(mm[1], 0.5 * -2.0 + 1.5 * 3.0 + -2.0, "matmul [0][1]");
+            close(mm[3], 3.0 * -2.0 + 0.25 * 3.0 + -4.0, "matmul [1][1]");
 
             // layout ops move elements without changing them
             let tr = x.transpose(0, 1).value().to_vec().await;

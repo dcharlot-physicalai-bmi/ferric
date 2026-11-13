@@ -45,13 +45,15 @@ fn hinv_chol(x: &[f32], c: usize, ncal: usize) -> Vec<f32> {
     for i in 0..c { for j in 0..=i { let mut s = 0.0; for n in 0..ncal { s += x[i * ncal + n] * x[j * ncal + n]; } h[i * c + j] = s; h[j * c + i] = s; } }
     let damp = 0.10 * (0..c).map(|i| h[i * c + i]).sum::<f32>() / c as f32; for i in 0..c { h[i * c + i] += damp; }
     let mut l = vec![0f32; c * c];
-    for i in 0..c { for j in 0..=i { let mut s = h[i * c + j]; for k in 0..j { s -= l[i * c + k] * l[j * c + k]; } if i == j { l[i * c + i] = s.max(1e-12).sqrt(); } else { l[i * c + j] = s / l[j * c + j]; } } }
+    for i in 0..c { for j in 0..=i { let mut s = h[i * c + j]; for k in 0..j { s -= l[i * c + k] * l[j * c + k]; }
+            if i == j { l[i * c + i] = s.max(1e-12).sqrt(); } else { l[i * c + j] = s / l[j * c + j]; } } }
     let mut li = vec![0f32; c * c];
     for i in 0..c { li[i * c + i] = 1.0 / l[i * c + i]; for j in 0..i { let mut s = 0.0; for k in j..i { s -= l[i * c + k] * li[k * c + j]; } li[i * c + j] = s / l[i * c + i]; } }
     let mut hinv = vec![0f32; c * c];
     for i in 0..c { for j in i..c { let mut s = 0.0; for k in j..c { s += li[k * c + i] * li[k * c + j]; } hinv[i * c + j] = s; hinv[j * c + i] = s; } }
     let mut lh = vec![0f32; c * c];
-    for i in 0..c { for j in 0..=i { let mut s = hinv[i * c + j]; for k in 0..j { s -= lh[i * c + k] * lh[j * c + k]; } if i == j { lh[i * c + i] = s.max(1e-20).sqrt(); } else { lh[i * c + j] = s / lh[j * c + j]; } } }
+    for i in 0..c { for j in 0..=i { let mut s = hinv[i * c + j]; for k in 0..j { s -= lh[i * c + k] * lh[j * c + k]; }
+            if i == j { lh[i * c + i] = s.max(1e-20).sqrt(); } else { lh[i * c + j] = s / lh[j * c + j]; } } }
     lh
 }
 
@@ -71,7 +73,7 @@ fn main() {
     let mut u = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 40) as f32 + 0.5) / (1u32 << 24) as f32 };
     let mut gg = |u: &mut dyn FnMut() -> f32| { let (a, b) = (u().max(1e-7), u()); (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos() };
     let load: Vec<f32> = (0..c * nf).map(|_| gg(&mut u)).collect();
-    let mut genx = |u: &mut dyn FnMut() -> f32, gg: &mut dyn FnMut(&mut dyn FnMut() -> f32) -> f32, n: usize| {
+    let genx = |u: &mut dyn FnMut() -> f32, gg: &mut dyn FnMut(&mut dyn FnMut() -> f32) -> f32, n: usize| {
         let mut x = vec![0f32; c * n];
         for s in 0..n { let f: Vec<f32> = (0..nf).map(|_| gg(u)).collect();
             for i in 0..c { let mut acc = 0.3 * gg(u); for k in 0..nf { acc += load[i * nf + k] * f[k]; } x[i * n + s] = acc; } }

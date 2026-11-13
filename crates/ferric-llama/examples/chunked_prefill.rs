@@ -93,7 +93,7 @@ async fn run() {
     let ref_arg = arg(&reference);
 
     println!("  768-token prompt (the largest one pass can do here):");
-    println!("  {:>10}  {:>10}  {:>13}   {}", "chunk", "wall", "max|Δ|", "argmax");
+    println!("  {:>10}  {:>10}  {:>13}   argmax", "chunk", "wall", "max|Δ|");
     println!("  {:-<52}", "");
     println!("  {:>10}  {:>7.0} ms  {:>13}   {ref_arg}", "one pass", ref_ms, "—");
     for chunk in [512usize, 256, 128] {

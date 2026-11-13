@@ -24,7 +24,7 @@ async fn run() {
     let (nh, nkv, hd, eps, base) = (16usize, 8usize, 128usize, 1e-5f32, 1e8f32);
     let (ta, td) = (4usize, 3usize);
     // deterministic synthetic AR + DM tokens (numpy regenerates identically)
-    let mk = |t: usize, s: f32| -> Vec<f32> { (0..t * 2048).map(|i| ((i as f32 * 0.01 + s).sin() * 0.1)).collect() };
+    let mk = |t: usize, s: f32| -> Vec<f32> { (0..t * 2048).map(|i| (i as f32 * 0.01 + s).sin() * 0.1).collect() };
     let xa = Tensor::from_vec(&ctx, &mk(ta, 0.0), &[ta, 2048]);
     let xd = Tensor::from_vec(&ctx, &mk(td, 1.0), &[td, 2048]);
 
@@ -50,6 +50,6 @@ async fn run() {
     let xd2 = xd1.add(&mlp(&xd1.rmsnorm(&t("post_attention_layernorm_moe_gen.weight"), eps), &t("mlp_moe_gen.up_proj.weight"), &t("mlp_moe_gen.down_proj.weight")));
 
     let o = xd2.to_vec().await;
-    println!("Ferric DM layer-0 out (token0[:6]) = {:?}", &o[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
+    println!("Ferric DM layer-0 out (token0[:6]) = {:?}", o[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
     println!("  DM out sum = {:.5} · finite = {}", o.iter().sum::<f32>(), o.iter().all(|x| x.is_finite()));
 }

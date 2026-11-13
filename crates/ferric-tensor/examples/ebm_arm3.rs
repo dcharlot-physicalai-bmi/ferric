@@ -16,7 +16,7 @@ const TG: [(f32, f32, f32); 4] = [(0.8, -0.6, 0.5), (-0.7, 0.5, -0.6), (0.5, 0.9
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 // 3-joint chain: gravity + damping + neighbor coupling + per-joint torque
 fn step(s: [f32; 6], uu: [f32; 3]) -> [f32; 6] {
@@ -46,7 +46,7 @@ impl Vn {
 // flow velocity field: [12 state, a1..a3, t] (16) → 3 outputs. relu/linear.
 struct Fl { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: [f32; 3] }
 impl Fl {
-    fn vel(&self, s: [f32; 6], g: (f32, f32, f32), a: [f32; 3], t: f32) -> [f32; 3] { let mut f = [0.0f32; 16]; let ff = feat(s, g); for c in 0..NF { f[c] = ff[c]; } f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; f[15] = t;
+    fn vel(&self, s: [f32; 6], g: (f32, f32, f32), a: [f32; 3], t: f32) -> [f32; 3] { let mut f = [0.0f32; 16]; let ff = feat(s, g); f[..NF].copy_from_slice(&ff[..NF]); f[12] = a[0]; f[13] = a[1]; f[14] = a[2]; f[15] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..16 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = [self.b3[0], self.b3[1], self.b3[2]]; for j in 0..H { for c in 0..3 { o[c] += h2[j] * self.w3[j * 3 + c]; } } o }
@@ -83,7 +83,7 @@ async fn run() {
         let e = vnet(&(0..NF).map(|c| l(&fc[c], bs)).collect::<Vec<_>>(), &pv, &ov); let d = e.sub(&Var::leaf(Tensor::from_vec(&ctx, &target, &[bs, 1]))); let loss = d.mul(&d).mean_all(); loss.backward();
         let g: Vec<Tensor> = pv.iter().zip(&p).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adam.step(&mut p, &g); if it % 200 == 0 { tgt = p.clone(); }
     }
-    let mut vw: Vec<Vec<f32>> = Vec::new(); for c in 0..NF { vw.push(p[c].to_vec().await); }
+    let mut vw: Vec<Vec<f32>> = Vec::new(); for item in p[..NF].iter() { vw.push(item.to_vec().await); }
     let vn = Vn { w: vw, b1: p[NF].to_vec().await, w2: p[NF + 1].to_vec().await, b2: p[NF + 2].to_vec().await, w3: p[NF + 3].to_vec().await, b3: p[NF + 4].to_vec().await[0] };
 
     // ---- Stage 2: flow-matching distill (velocity field → 3 torques) ----
@@ -108,7 +108,7 @@ async fn run() {
         let g: Vec<Tensor> = pv.iter().zip(&q).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamq.step(&mut q, &g);
     }
     let fb3 = q[20].to_vec().await;
-    let mut fw: Vec<Vec<f32>> = Vec::new(); for c in 0..16 { fw.push(q[c].to_vec().await); }
+    let mut fw: Vec<Vec<f32>> = Vec::new(); for item in q[..16].iter() { fw.push(item.to_vec().await); }
     let fl = Fl { w: fw, b1: q[16].to_vec().await, w2: q[17].to_vec().await, b2: q[18].to_vec().await, w3: q[19].to_vec().await, b3: [fb3[0], fb3[1], fb3[2]] };
 
     // ---- Stage 3: eval — discrete-125 vs flow-K ----
@@ -117,11 +117,13 @@ async fn run() {
     for (gi, &g) in TG.iter().enumerate() { for e in 0..nep { let sd = (gi * nep + e) as u32;
         inits.push([(u(900 + sd, 7) * 2.0 - 1.0) * PI, (u(900 + sd, 8) * 2.0 - 1.0) * PI, (u(900 + sd, 9) * 2.0 - 1.0) * PI, 0.0, 0.0, 0.0]); goals.push(g); } }
     let reached = |s: [f32; 6], g: (f32, f32, f32)| wrap(s[0] - g.0).abs() < 0.35 && wrap(s[1] - g.1).abs() < 0.35 && wrap(s[2] - g.2).abs() < 0.35 && s[3].abs() < 0.7 && s[4].abs() < 0.7 && s[5].abs() < 0.7;
-    let mut rd = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let uu = vn.ustar(s, g); s = step(s, uu); } if reached(s, g) { rd += 1; } }
+    let mut rd = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let uu = vn.ustar(s, g); s = step(s, uu); }
+            if reached(s, g) { rd += 1; } }
     println!("  3-joint coupled chain (6-D state, 3 torques). eval: {} ep × {} goal-triples.\n", nep, TG.len());
     println!("     controller                        reach     evals/decision   note");
     println!("     discrete argmin, 5×5×5             {:>4.0}%         125          Gᵈ — exponential in DOF (9³ would be 729)", rd as f32 / n as f32 * 100.0);
-    for k in [1usize, 2, 4] { let mut rr = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let a = fl.act(s, g, k); s = step(s, a); } if reached(s, g) { rr += 1; } }
+    for k in [1usize, 2, 4] { let mut rr = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i]; for _ in 0..300 { let a = fl.act(s, g, k); s = step(s, a); }
+            if reached(s, g) { rr += 1; } }
         println!("     flow-matching, K={:<2} fwd passes    {:>4.0}%          {:>2}          constant in DOF", k, rr as f32 / n as f32 * 100.0, k); }
     println!("\n  At 1-DOF the edge was 5:1, at 2-DOF 25:1 — here matching discrete at K forward passes is worth 125:1 (729:1 vs a");
     println!("  fine grid): the eval-budget compounding of the corrected recipe, demonstrated. HONEST: fully-actuated chain;");

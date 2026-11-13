@@ -64,7 +64,7 @@ async fn run() {
     // learned per-mode complex weights R_k (Rr + i·Ri), [1,K] (broadcast over the batch)
     let mut wp = vec![
         Tensor::from_vec(&ctx, &(0..K).map(|k| uni(k as u32, 11) * 0.1).collect::<Vec<_>>(), &[1, K]),
-        Tensor::from_vec(&ctx, &vec![0.0f32; K], &[1, K]),
+        Tensor::from_vec(&ctx, &[0.0f32; K], &[1, K]),
     ];
     let mut adam = Adam::new(&wp, 5e-3);
 

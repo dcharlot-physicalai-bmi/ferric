@@ -6,7 +6,7 @@ use std::collections::HashMap;
 fn main() { pollster::block_on(run()); }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 fn ref_y(json: &str) -> Vec<f32> {
     let s = json.split("\"y\"").nth(1).unwrap();

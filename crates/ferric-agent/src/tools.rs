@@ -53,9 +53,8 @@ pub fn parse_tool_calls(text: &str) -> Vec<Value> {
     }
     if calls.is_empty() {
         for obj in balanced_objects(text) {
-            if let Ok(v) = serde_json::from_str::<Value>(obj) {
-                if v.get("name").is_some() && v.get("arguments").is_some() { push_call(&mut calls, &v); }
-            }
+            if let Ok(v) = serde_json::from_str::<Value>(obj)
+                && v.get("name").is_some() && v.get("arguments").is_some() { push_call(&mut calls, &v); }
         }
     }
     calls
@@ -179,9 +178,8 @@ pub fn parse_tool_calls_any(text: &str, tools: &[Value]) -> (String, Vec<Value>)
                 let Some(ai) = after.find("[ARGS]") else { break };
                 let name = after[..ai].trim().to_string();
                 let objs = balanced_objects(&after[ai + "[ARGS]".len()..]);
-                if let Some(o) = objs.first() {
-                    if let Ok(v) = serde_json::from_str::<Value>(o) { add(&mut calls, &name, v); }
-                }
+                if let Some(o) = objs.first()
+                    && let Ok(v) = serde_json::from_str::<Value>(o) { add(&mut calls, &name, v); }
                 rest = &after[ai + "[ARGS]".len()..];
             }
         }
@@ -193,9 +191,8 @@ pub fn parse_tool_calls_any(text: &str, tools: &[Value]) -> (String, Vec<Value>)
             let seg = seg.split("<｜tool▁call▁end｜>").next().unwrap_or("");
             let Some((_, rest)) = seg.split_once("<｜tool▁sep｜>") else { continue };
             let name = rest.lines().next().unwrap_or("").trim().to_string();
-            if let Some(o) = balanced_objects(rest).first() {
-                if let Ok(v) = serde_json::from_str::<Value>(o) { add(&mut calls, &name, v); }
-            }
+            if let Some(o) = balanced_objects(rest).first()
+                && let Ok(v) = serde_json::from_str::<Value>(o) { add(&mut calls, &name, v); }
         }
         if !calls.is_empty() {
             let m = if text.contains("<｜tool▁calls▁begin｜>") { "<｜tool▁calls▁begin｜>" } else { "<｜tool▁call▁begin｜>" };
@@ -205,11 +202,10 @@ pub fn parse_tool_calls_any(text: &str, tools: &[Value]) -> (String, Vec<Value>)
     // Llama 3.x (and the bare-object fallback for any model): {"name":…, "parameters"|"arguments":…}
     let scope = text.find("<|python_tag|>").map(|a| &text[a + "<|python_tag|>".len()..]).unwrap_or(text);
     for obj in balanced_objects(scope) {
-        if let Ok(v) = serde_json::from_str::<Value>(obj) {
-            if let (Some(name), Some(args)) = (v["name"].as_str(), v.get("parameters").or_else(|| v.get("arguments"))) {
+        if let Ok(v) = serde_json::from_str::<Value>(obj)
+            && let (Some(name), Some(args)) = (v["name"].as_str(), v.get("parameters").or_else(|| v.get("arguments"))) {
                 add(&mut calls, name, args.clone());
             }
-        }
     }
     if !calls.is_empty() {
         let m = if text.contains("<|python_tag|>") { "<|python_tag|>" } else { "{" };
@@ -305,9 +301,20 @@ fn python_calls(body: &str) -> Vec<(String, Vec<(String, Value)>)> {
             let (mut depth, mut q) = (0i32, 0u8);
             while i < b.len() {
                 let c = b[i];
-                if q != 0 { if c == b'\\' { i += 2; continue; } if c == q { q = 0; } i += 1; continue; }
-                match c { b'\'' | b'"' => q = c, b'[' | b'{' | b'(' => depth += 1, b']' | b'}' => depth -= 1,
-                          b')' if depth == 0 => break, b')' => depth -= 1, b',' if depth == 0 => break, _ => {} }
+                if q != 0 {
+                    if c == b'\\' { i += 2; continue; }
+                    else if c == q { q = 0; }
+                    i += 1;
+                    continue;
+                }
+                match c {
+                    b'\'' | b'"' => q = c,
+                    b'[' | b'{' | b'(' => depth += 1,
+                    b']' | b'}' => depth -= 1,
+                    b')' => { if depth == 0 { break; } depth -= 1; }
+                    b',' if depth == 0 => break,
+                    _ => {}
+                }
                 i += 1;
             }
             let raw = s[vs..i.min(b.len())].trim();

@@ -1,4 +1,4 @@
-//! EFA-2 · PUSHT — the universal contact smoke-test, on our verified Rust physics. A T-shaped block (two rigidly
+//! EFA-2 · PUSHT — the universal contact smoke-test, on our verified Rust physics. a T-shaped block (two rigidly
 //! joined rectangles) is pushed by a circle to a target SE(2) POSE; success = coverage of the target region by the
 //! block (the published PushT metric). Full-pose control (position AND orientation) — the crux difficulty of PushT.
 //! Built on the verified oriented-box↔circle contact + 2D rigid-body dynamics; the T is two sub-boxes rigidly fixed to
@@ -15,7 +15,6 @@
 use ferric_core::Context;
 use ferric_tensor::{Adam, Tensor, Var};
 use std::f32::consts::PI;
-use std::sync::Arc;
 const DT: f32 = 0.02; const TMAX: f32 = 9.0; const RU: f32 = 0.07; const PUSH_V: f32 = 0.9;
 const MU_T: f32 = 3.0; const MU_W: f32 = 5.0; const ARENA: f32 = 1.5; const COV_OK: f32 = 0.90;
 // T sub-boxes in body(COM) frame: (offset_x, offset_y, half_w, half_h). COM computed so bar+stem centroid = origin.
@@ -29,9 +28,9 @@ fn nrm(v: [f32; 2]) -> f32 { (v[0] * v[0] + v[1] * v[1]).sqrt() }
 fn unit(v: [f32; 2]) -> [f32; 2] { let n = nrm(v).max(1e-6); [v[0] / n, v[1] / n] }
 fn rot(v: [f32; 2], a: f32) -> [f32; 2] { let (c, s) = (a.cos(), a.sin()); [c * v[0] - s * v[1], s * v[0] + c * v[1]] }
 fn in_box(local: [f32; 2], b: &[f32; 4]) -> bool { (local[0] - b[0]).abs() <= b[2] && (local[1] - b[1]).abs() <= b[3] }
-fn in_T(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
+fn in_t(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
 // sample a point uniformly inside the T (body frame), area-weighted between bar and stem
-fn sample_T(seed: u32) -> [f32; 2] {
+fn sample_t(seed: u32) -> [f32; 2] {
     let (a_bar, a_stem) = (4.0 * BAR[2] * BAR[3], 4.0 * STEM[2] * STEM[3]);
     if u(seed, 1) < a_bar / (a_bar + a_stem) { [BAR[0] + (u(seed, 2) * 2.0 - 1.0) * BAR[2], BAR[1] + (u(seed, 3) * 2.0 - 1.0) * BAR[3]] }
     else { [STEM[0] + (u(seed, 2) * 2.0 - 1.0) * STEM[2], STEM[1] + (u(seed, 3) * 2.0 - 1.0) * STEM[3]] }
@@ -47,12 +46,12 @@ fn contact(p: [f32; 2], th: f32, c: [f32; 2]) -> Option<([f32; 2], [f32; 2], f32
             if dx < dy { let s = (local[0] - b[0]).signum(); nloc = [s, 0.0]; pen = dx + RU; cloc = [b[0] + s * b[2], local[1]]; }
             else { let s = (local[1] - b[1]).signum(); nloc = [0.0, s]; pen = dy + RU; cloc = [local[0], b[1] + s * b[3]]; } }
         else { let d = [local[0] - cl[0], local[1] - cl[1]]; let dist = nrm(d); if dist > RU { continue; } nloc = unit(d); pen = RU - dist; cloc = cl; }
-        if best.map_or(true, |bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
+        if best.is_none_or(|bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
     }
     best.map(|(cp, n, pen)| ([cp[0] + p[0], cp[1] + p[1]], n, pen))
 }
 // moment of inertia about COM (mass=1), by point-sampling the T
-fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_T(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
+fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_t(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
 #[derive(Clone)]
 struct World { p: [f32; 2], th: f32, v: [f32; 2], w: f32, tp: [f32; 2], tth: f32, im: f32, push: [f32; 2] }
 impl World {
@@ -78,8 +77,8 @@ impl World {
         }
     }
     fn cov(&self, n: usize) -> f32 { let mut c = 0;                            // coverage with n samples (cheap for training, full for eval)
-        for k in 0..n { let q = sample_T(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
-            if in_T(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
+        for k in 0..n { let q = sample_t(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
+            if in_t(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
     fn coverage(&self) -> f32 { self.cov(400) }
     fn obs(&self) -> [f32; 12] { let ep = [self.tp[0] - self.p[0], self.tp[1] - self.p[1]]; let dpt = unit(ep); let et = wrap(self.tth - self.th);
         [self.th.cos(), self.th.sin(), self.push[0] - self.p[0], self.push[1] - self.p[1], ep[0], ep[1], dpt[0], dpt[1], et.cos(), et.sin(), self.tth.cos(), self.tth.sin()] }
@@ -90,6 +89,7 @@ impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
 // multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
 // push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
+#[allow(dead_code)] // example helper, not on the default path
 fn demo(w: &World) -> [f32; 2] {
     let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
     let contact = if et.abs() > 0.12 {                                   // ROTATION phase
@@ -105,6 +105,7 @@ fn demo(w: &World) -> [f32; 2] {
     let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
+#[allow(dead_code)] // example helper, not on the default path
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
     let mut w = World::new(seed, im); let mut best = 0.0f32;
     for _ in 0..((TMAX / DT) as usize) { let c = pol(&w); w.step(c); best = best.max(w.coverage()); if best >= 0.98 { break; } } best }
@@ -130,19 +131,21 @@ fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
             (rollout_score(w, &seq), seq) }).collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         for h in 0..HZ {                                               // refit mean/std from the elite set
-            let (mut m0, mut m1) = (0.0f32, 0.0f32); for e in 0..ELITE { m0 += scored[e].1[h][0]; m1 += scored[e].1[h][1]; }
+            let (mut m0, mut m1) = (0.0f32, 0.0f32); for item in scored.iter().take(ELITE) { m0 += item.1[h][0]; m1 += item.1[h][1]; }
             m0 /= ELITE as f32; m1 /= ELITE as f32;
-            let (mut v0, mut v1) = (0.0f32, 0.0f32); for e in 0..ELITE { v0 += (scored[e].1[h][0] - m0).powi(2); v1 += (scored[e].1[h][1] - m1).powi(2); }
+            let (mut v0, mut v1) = (0.0f32, 0.0f32); for item in scored.iter().take(ELITE) { v0 += (item.1[h][0] - m0).powi(2); v1 += (item.1[h][1] - m1).powi(2); }
             mu[h] = [m0, m1]; sd[h] = ((v0 + v1) / (2.0 * ELITE as f32)).sqrt().max(0.05); }
     }
-    let act = mu[0]; for h in 0..HZ - 1 { mean[h] = mu[h + 1]; } mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
+    let act = mu[0]; mean[..(HZ - 1)].copy_from_slice(&mu[1..((HZ - 1) + 1)]); mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
     act }
 fn gauss(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32), u(seed, i as u32 + 777)); (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }
+#[allow(dead_code)] // example helper, not on the default path
 fn mpc_episode(seed: u32, im: f32) -> f32 {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let mut best = 0.0f32;
     let decisions = ((TMAX / DT) as usize) / STRIDE;
     for t in 0..decisions { let a = mpc_act(&w, &mut mean, seed.wrapping_mul(31) + t as u32 * 7919);
-        for _ in 0..STRIDE { w.step(a); best = best.max(w.coverage()); } if best >= 0.98 { break; } }
+        for _ in 0..STRIDE { w.step(a); best = best.max(w.coverage()); }
+            if best >= 0.98 { break; } }
     best }
 // ─────────────────────────────────────────────────────────────────────────────
 // HISTORY-conditioned distillation: the memoryless flow collapsed (0.078) because MPC is non-Markovian w.r.t. the
@@ -175,11 +178,11 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let im = moment();
     println!("  EFA-2 · PUSHT — HISTORY-conditioned distillation from MPC demos ({}-frame history, spacing {})\n", KH, SP);
-    let n_demo = 50u32; let mut H: Vec<Vec<f32>> = vec![]; let mut A: Vec<[f32; 2]> = vec![];
+    let n_demo = 50u32; let mut h: Vec<Vec<f32>> = vec![]; let mut a: Vec<[f32; 2]> = vec![];
     print!("  generating {} MPC demo episodes… ", n_demo);
-    for k in 0..n_demo { let (obs, act) = mpc_demo_ep(3000 + k, im); for t in 0..obs.len() { H.push(hist_at(&obs, t)); A.push(act[t]); } }
-    println!("collected {} (history,action) pairs", H.len());
-    let ctx = std::sync::Arc::new(Context::new().await.expect("ctx")); let fin = IN + 3; let bs = 256; let np = H.len();
+    for k in 0..n_demo { let (obs, act) = mpc_demo_ep(3000 + k, im); for t in 0..obs.len() { h.push(hist_at(&obs, t)); a.push(act[t]); } }
+    println!("collected {} (history,action) pairs", h.len());
+    let ctx = std::sync::Arc::new(Context::new().await.expect("ctx")); let fin = IN + 3; let bs = 256; let np = h.len();
     let mut fp: Vec<Tensor> = (0..fin).map(|c| Tensor::from_vec(&ctx, &randn(HF, 500 + c as u32, 0.4), &[1, HF])).collect();
     fp.push(Tensor::zeros(&ctx, &[HF])); fp.push(Tensor::from_vec(&ctx, &randn(HF * HF, 560, 1.0 / (HF as f32).sqrt()), &[HF, HF])); fp.push(Tensor::zeros(&ctx, &[HF]));
     fp.push(Tensor::from_vec(&ctx, &randn(HF * 2, 561, 1.0 / (HF as f32).sqrt()), &[HF, 2])); fp.push(Tensor::zeros(&ctx, &[2]));
@@ -189,7 +192,7 @@ async fn run() {
     println!("  distilling the HISTORY-conditioned flow (in {} → {} → {} → 2; CFM to MPC actions):", IN, HF, HF);
     for it in 0..18000u32 {
         let mut cols: Vec<Vec<f32>> = (0..fin).map(|_| vec![0.0f32; bs]).collect(); let mut tb = vec![0.0f32; bs * 2];
-        for i in 0..bs { let idx = (u(it * 131 + i as u32, 5) * np as f32) as usize % np; let hh = &H[idx]; let un = A[idx];
+        for i in 0..bs { let idx = (u(it * 131 + i as u32, 5) * np as f32) as usize % np; let hh = &h[idx]; let un = a[idx];
             let g1 = (-2.0 * u(it * 131 + i as u32, 30).ln()).sqrt() * (2.0 * PI * u(it * 131 + i as u32, 32)).cos();
             let g2 = (-2.0 * u(it * 131 + i as u32, 31).ln()).sqrt() * (2.0 * PI * u(it * 131 + i as u32, 33)).cos();
             let t = u(it * 131 + i as u32, 9) * 0.9; let a0 = [0.2 * g1, 0.2 * g2];
@@ -201,13 +204,15 @@ async fn run() {
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
         if it % 4500 == 4499 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
-    let mut wv = Vec::new(); for c in 0..fin { wv.push(fp[c].to_vec().await); }
+    let mut wv = Vec::new(); for item in fp[..fin].iter() { wv.push(item.to_vec().await); }
     let netf = FNet { w: wv, b1: fp[fin].to_vec().await, w2: fp[fin + 1].to_vec().await, b2: fp[fin + 2].to_vec().await, w3: fp[fin + 3].to_vec().await, b3: fp[fin + 4].to_vec().await };
     println!("\n  the card — HISTORY-conditioned distilled flow, PushT (200 held-out, 1 fwd pass/decision):");
     for kk in [1usize, 2] { let (mut mc, mut ok, mut c5, mut c7) = (0.0f32, 0, 0, 0);
         for k in 500..700u32 { let mut w = World::new(k, im); let mut seq: Vec<[f32; 12]> = vec![]; let mut best = 0.0f32;
             for _ in 0..((TMAX / DT) as usize) { seq.push(w.obs()); let h = hist_at(&seq, seq.len() - 1); let a = flow_act(&netf, &h, kk); w.step(a); best = best.max(w.coverage()); if best >= 0.98 { break; } }
-            mc += best; if best >= COV_OK { ok += 1; } if best >= 0.5 { c5 += 1; } if best >= 0.7 { c7 += 1; } }
+            mc += best; if best >= COV_OK { ok += 1; }
+            if best >= 0.5 { c5 += 1; }
+            if best >= 0.7 { c7 += 1; } }
         println!("     flow K={}: mean coverage {:.3} · success(≥0.90) {:.0}% · ≥0.7 {:.0}% · ≥0.5 {:.0}%", kk, mc / 200.0, ok as f32 / 2.0, c7 as f32 / 2.0, c5 as f32 / 2.0); }
     println!("     [anchors] MPC teacher 0.69 · MEMORYLESS flow 0.078 · scripted 0.20 · ES 0.28");
     println!("\n  Tests the diagnosis: if non-Markovianity was the cause, history recovers coverage; residual gap = the");

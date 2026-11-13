@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 
 use crate::meter::delta_uj;
 
@@ -418,6 +418,7 @@ fn drift_json(series: &EnergySeries) -> serde_json::Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one argument per receipt field; packing them hides which series is which
 fn phase_json(reached: bool, grade: Grade, load1: &[f64], busy: &[f64], package_w: &[f64], core_w: &[f64], ppt_w: &[f64], tctl: Option<f64>, edge: Option<f64>) -> serde_json::Value {
     serde_json::json!({
         "reached": reached,
@@ -546,18 +547,17 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
 pub fn try_lock_exclusive(path: &Path) -> Result<Option<LockGuard>, String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-    }
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    match file.try_lock_exclusive() {
+    match FileExt::try_lock(&file) {
         Ok(()) =>         Ok(Some(LockGuard {
             file: {
                 use std::io::Write;
@@ -571,8 +571,8 @@ pub fn try_lock_exclusive(path: &Path) -> Result<Option<LockGuard>, String> {
             acquire_unix_ns: unix_ns(),
             first_attempt_contended: false,
         })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(format!("flock {}: {e}", path.display())),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(format!("flock {}: {e}", path.display())),
     }
 }
 
@@ -633,7 +633,7 @@ where
                 wait_s: 0.0,
             };
             let receipt = refused("deadline reached before a quiet attributable run".into(), lock, &series, None);
-            write_receipt(&out_dir.join(format!("refusal-deadline.json")), &receipt)?;
+            write_receipt(&out_dir.join("refusal-deadline.json"), &receipt)?;
             return Ok(receipt);
         }
         match poll_host_lock(lock_path, lock_wait_s)? {
@@ -838,19 +838,17 @@ fn take_bracket(cfg: &LiveConfig, origin: std::time::Instant) -> Result<Bracket,
                 return Ok(bracket);
             }
         }
-        if let Some(path) = &cfg.ppt {
-            if let Ok(uw) = read_uj(path) {
+        if let Some(path) = &cfg.ppt
+            && let Ok(uw) = read_uj(path) {
                 bracket.ppt_w.push(uw as f64 * 1e-6);
             }
-        }
         note_temp(&mut bracket.cpu_tctl_c, millic_to_c(&cfg.cpu_tctl));
         note_temp(&mut bracket.gpu_edge_c, millic_to_c(&cfg.gpu_edge));
         if let Ok(now) = read_cpu_ticks() {
-            if let Some(prev) = &prev_ticks {
-                if let Ok(b) = busy_fraction(prev, &now, &cfg.pin_cores) {
+            if let Some(prev) = &prev_ticks
+                && let Ok(b) = busy_fraction(prev, &now, &cfg.pin_cores) {
                     bracket.busy.push(b.fraction);
                 }
-            }
             prev_ticks = Some(now);
         }
         if crate::fleet_gate::bracket_load_offender(&bracket.load1.iter().copied().map(Some).collect::<Vec<_>>()).is_some() {
@@ -954,11 +952,10 @@ pub fn run_locked_attempt(cfg: &LiveConfig, lock: &LockGuard) -> DriveReceipt {
                 let t_ns = origin.elapsed().as_nanos() as u64;
                 note_temp(&mut tctl_workload, millic_to_c(&cfg.cpu_tctl));
                 note_temp(&mut edge_workload, millic_to_c(&cfg.gpu_edge));
-                if let Some(path) = &cfg.ppt {
-                    if let Ok(uw) = read_uj(path) {
+                if let Some(path) = &cfg.ppt
+                    && let Ok(uw) = read_uj(path) {
                         ppt_series.push((t_ns, uw as f64 * 1e-6));
                     }
-                }
                 if let Ok(now_ticks) = read_cpu_ticks() {
                     if let Ok(interval) = busy_fraction(&prev_ticks, &now_ticks, &cfg.pin_cores) {
                         workload_busy.push(interval.fraction);
@@ -1090,18 +1087,16 @@ pub fn macmon_receipt(attempt: &MacmonAttempt, lock: &LockHold) -> serde_json::V
         ok = false;
         reason = e.clone();
     }
-    if ok {
-        if let Err(e) = load_is_quiet(&attempt.load1_pre, attempt.load1_max) {
+    if ok
+        && let Err(e) = load_is_quiet(&attempt.load1_pre, attempt.load1_max) {
             ok = false;
             reason = format!("pre-trial idle: {e}");
         }
-    }
-    if ok && attempt.post_reached {
-        if let Err(e) = load_is_quiet(&attempt.load1_post, attempt.load1_max) {
+    if ok && attempt.post_reached
+        && let Err(e) = load_is_quiet(&attempt.load1_post, attempt.load1_max) {
             ok = false;
             reason = format!("post-trial idle: {e}");
         }
-    }
     let pre_sys = sys(&attempt.pre);
     let post_sys = sys(&attempt.post);
     let drift = if !attempt.pre_reached {
@@ -1305,11 +1300,10 @@ pub fn run_locked_macmon(cfg: &MacmonConfig, lock: &LockGuard) -> serde_json::Va
             Ok(None) => {
                 sleep(Duration::from_secs(1));
                 if let Ok(now) = crate::fleet_gate::read_ps_cpu() {
-                    if let Some(prev) = &prev_ps {
-                        if let Some(frac) = crate::fleet_gate::foreign_cpu_fraction(prev, &now, std::process::id(), 1.0) {
+                    if let Some(prev) = &prev_ps
+                        && let Some(frac) = crate::fleet_gate::foreign_cpu_fraction(prev, &now, std::process::id(), 1.0) {
                             foreign.push(frac);
                         }
-                    }
                     prev_ps = Some(now);
                 }
             }

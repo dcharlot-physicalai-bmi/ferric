@@ -481,6 +481,7 @@ impl Mla {
     /// ⚠ The score is a dot over `kv_lora_rank + qk_rope_dim` but the scale is still the one the
     /// checkpoint gives, which is set by `qk_head_dim`. Deriving `1/sqrt(width of the dot)` here is
     /// the natural thing to write and is a different model.
+    #[allow(clippy::too_many_arguments)] // absorbed MLA takes the two query parts, the latent, and both projections
     fn attend_absorbed(&self, q_pass: &Tensor, q_rot: &Tensor, latent: &Tensor, k_rot: &Tensor,
                        k_b: &Tensor, v_b: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let c = &self.cfg;
@@ -801,9 +802,9 @@ mod absorbed_tests {
             Ok(_) => panic!("CachePolicy::Expanded constructed a cache — it must refuse"),
         };
         assert!(e.contains("not implemented"), "the refusal must say what is missing: {e}");
-        let ok = MlaCache::new(CachePolicy::Latent).ok().expect("Latent must construct");
+        let ok = MlaCache::new(CachePolicy::Latent).expect("Latent must construct");
         assert_eq!(ok.policy(), CachePolicy::Latent);
-        assert!(ok.is_empty() && ok.len() == 0, "a fresh cache must be empty");
+        assert!(ok.is_empty() && ok.is_empty(), "a fresh cache must be empty");
     }
 
     /// **Absorption is exact, so each path is the other's oracle.**

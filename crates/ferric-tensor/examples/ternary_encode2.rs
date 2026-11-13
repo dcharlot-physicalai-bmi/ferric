@@ -31,7 +31,7 @@ fn rotate_rows(m: &mut [f32], rows: usize, cols: usize) { for r in 0..rows { fwh
 // one group-wise ternary plane → dequantized reconstruction (TWN threshold + optimal scale, f16 scale)
 fn ternary_plane(w: &[f32], gs: usize) -> Vec<f32> {
     let mut out = vec![0f32; w.len()];
-    for g in 0..(w.len() + gs - 1) / gs {
+    for g in 0..w.len().div_ceil(gs) {
         let (lo, hi) = (g * gs, ((g + 1) * gs).min(w.len()));
         let grp = &w[lo..hi];
         let mean_abs = grp.iter().map(|x| x.abs()).sum::<f32>() / grp.len() as f32;

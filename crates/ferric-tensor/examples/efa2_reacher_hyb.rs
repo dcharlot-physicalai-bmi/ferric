@@ -124,7 +124,7 @@ async fn run() {
         adamp.step(&mut pp, &gp); adamw.step(&mut wp, &gw);
         if it % 4500 == 4499 { println!("     iter {:>5}: loss {:.4}", it + 1, loss.value().to_vec().await[0]); }
     }
-    let ex = async |p: &Vec<Tensor>, no: usize| -> Net { let mut w = Vec::new(); for c in 0..nin { w.push(p[c].to_vec().await); }
+    let ex = async |p: &Vec<Tensor>, no: usize| -> Net { let mut w = Vec::new(); for item in p[..nin].iter() { w.push(item.to_vec().await); }
         Net { w, b1: p[nin].to_vec().await, w2: p[nin + 1].to_vec().await, b2: p[nin + 2].to_vec().await, w3: p[nin + 3].to_vec().await, b3: p[nin + 4].to_vec().await, no } };
     let pot = ex(&pp, 1).await; let cor = ex(&wp, 2).await;
     // field split: mean |κ∇E| vs mean |w| over random states (the energy-firstness number)

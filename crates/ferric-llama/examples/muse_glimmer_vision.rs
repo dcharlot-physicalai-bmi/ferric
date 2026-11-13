@@ -25,7 +25,7 @@
 //!
 //!   cargo run -p ferric-llama --example muse_glimmer_vision --release -- <mmproj.gguf> <image.ppm>
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_tensor::image::{preprocess, read_ppm};
 use ferric_tensor::{nn, QMatrix, Tensor};
 use std::sync::Arc;
@@ -150,7 +150,7 @@ async fn run() {
     let mut mask = vec![f32::NEG_INFINITY; n_tok * n_tok];
     { let mut off = 0usize;
       for &s in &slens { for a in 0..s { for b in 0..s { mask[(off + a) * n_tok + off + b] = 0.0; } } off += s; } }
-    let sp_mask = Tensor::from_vec(&ctx, &mask, &[1, n_tok, n_tok]);
+    let _sp_mask = Tensor::from_vec(&ctx, &mask, &[1, n_tok, n_tok]);
     // Pixel-shuffle gather, in ORIGINAL order: the merge×merge neighbours of each output cell.
     let mut ds_perm: Vec<u32> = Vec::with_capacity(n_tok);
     for oy in 0..grid / merge { for ox in 0..grid / merge {

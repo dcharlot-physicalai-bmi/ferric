@@ -46,7 +46,8 @@ async fn run() {
         let k4 = flow(t1 + h * k3.0, w1 + h * k3.1, t2 + h * k3.2, w2 + h * k3.3);
         t1 += h / 6.0 * (k1.0 + 2.0 * k2.0 + 2.0 * k3.0 + k4.0); w1 += h / 6.0 * (k1.1 + 2.0 * k2.1 + 2.0 * k3.1 + k4.1);
         t2 += h / 6.0 * (k1.2 + 2.0 * k2.2 + 2.0 * k3.2 + k4.2); w2 += h / 6.0 * (k1.3 + 2.0 * k2.3 + 2.0 * k3.3 + k4.3);
-        let e = energy(t1, w1, t2, w2); if e > emax { emax = e; } if e < emin { emin = e; } }
+        let e = energy(t1, w1, t2, w2); if e > emax { emax = e; }
+            if e < emin { emin = e; } }
       println!("  consistency check — energy along a 20s trajectory: E0={:.3}, range [{:.3},{:.3}], drift={:.4}", e0, emin, emax, emax - emin);
       println!("  (small drift ⇒ my flow()+energy() are consistent, so a low corr below is a LEARNING issue not a bug)\n"); }
     let mut p = vec![
@@ -76,7 +77,7 @@ async fn run() {
         let sl = Var::leaf(Tensor::from_vec(&ctx, &sf, &[bs, 4]));
         let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone());
         let hh = inet(&sl, &pv, &ov);
-        let gh = grad(&hh.sum_all(), &[sl.clone()], None).remove(0);       // ∇H [bs,4] in input order [θ1,θ2,p1,p2]
+        let gh = grad(&hh.sum_all(), std::slice::from_ref(&sl), None).remove(0);       // ∇H [bs,4] in input order [θ1,θ2,p1,p2]
         let diff = gh.sub(&Var::leaf(Tensor::from_vec(&ctx, &tg, &[bs, 4])));
         let loss = diff.mul(&diff).mean_all();
         loss.backward();

@@ -9,7 +9,7 @@ fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "len {} vs {}", a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.37 + s).sin())).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (i as f32 * 0.37 + s).sin()).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

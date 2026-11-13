@@ -5,7 +5,7 @@
 use ferric_tensor::{Tensor, Var};
 use std::sync::Arc;
 
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract()) * 0.4 - 0.2).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43_758.547).fract()) * 0.4 - 0.2).collect() }
 fn noise(n: usize, step: usize) -> Vec<f32> {
     (0..n).map(|i| { let mut h = (i as u32 ^ (step as u32).wrapping_mul(2654435761)).wrapping_mul(2246822519); h ^= h >> 13; (h % 1000) as f32 / 1000.0 - 0.5 }).collect()
 }

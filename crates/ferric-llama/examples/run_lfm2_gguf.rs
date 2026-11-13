@@ -38,7 +38,7 @@
 //!
 //!   cargo run -p ferric-llama --example run_lfm2_gguf --release -- <lfm2.gguf> "prompt" [n]
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_tensor::{nn, QMatrix, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ async fn run() {
             "this loader is for general.architecture = lfm2 or lfm2moe, got {arch:?}");
 
     let u = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => panic!("missing {arch}.{k}") };
-    let uo = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => 0 };
+    let _uo = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::U(v)) => *v as usize, _ => 0 };
     let f = |k: &str| match g.metadata.get(&format!("{arch}.{k}")) { Some(Meta::F(v)) => *v, _ => panic!("missing {arch}.{k}") };
     let n_layer = u("block_count");
     let d = u("embedding_length");
@@ -159,9 +159,8 @@ async fn run() {
     };
     let bpe = ferric_tokenizer::Bpe::new(vocab, &merges);
     let mut ids: Vec<u32> = bpe.encode(prompt);
-    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id") {
-        if matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) { ids.insert(0, *bos as u32); }
-    }
+    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id")
+        && matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) { ids.insert(0, *bos as u32); }
     println!("prompt: {prompt:?}  ({} tokens)", ids.len());
 
     // ---- forward: full prefix each step ----

@@ -265,7 +265,7 @@ impl Split {
             return Err("only one unit: nothing to split across".into());
         }
         let s = self.speedup_vs_best_single();
-        if !(s > 1.0) {
+        if s.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
             return Err(format!("split is {s:.2}x against the best single unit, so it is a regression"));
         }
         if s < 1.05 {

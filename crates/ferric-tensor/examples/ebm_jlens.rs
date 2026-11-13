@@ -25,7 +25,7 @@ const IN: usize = 2 * NC + M;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn rel(j: usize, c: usize) -> usize { (c * 5 + 7 * j + 3) % NC } // fixed relation maps concept→concept
 
 // build a batch: marked query q, one distractor d, task j; input = [q_onehot, {q,d} multihot, task_onehot]
@@ -92,20 +92,21 @@ async fn run() {
     let lf = zv.matmul(&pv[2]).add(&pv[3]);
     let ld = zv.matmul(&pv[4]).add(&pv[5]);
     let (lfv, ldv, zvec) = (lf.value().to_vec().await, ld.value().to_vec().await, zval.to_vec().await);
-    let facc = |ll: &[f32]| { let mut ok = 0; for i in 0..eb { let mut am = 0; for k in 1..NC { if ll[i * NC + k] > ll[i * NC + am] { am = k; } } if am == flex[i] { ok += 1; } } ok as f32 / eb as f32 };
+    let facc = |ll: &[f32]| { let mut ok = 0; for i in 0..eb { let mut am = 0; for k in 1..NC { if ll[i * NC + k] > ll[i * NC + am] { am = k; } }
+            if am == flex[i] { ok += 1; } } ok as f32 / eb as f32 };
     let dacc = |ll: &[f32]| { let mut ok = 0; let mut tot = 0; for i in 0..eb * NC { let pred = if ll[i] > 0.0 { 1.0 } else { 0.0 }; if det[i] > 0.5 { tot += 1; if pred > 0.5 { ok += 1; } } } ok as f32 / tot as f32 };
     let f0 = facc(&lfv); let d0 = dacc(&ldv);
 
     // J-lens: J[o,i] = mean_x ∂flexible_logit_o / ∂z_i   (averaged linearized causal effect)
-    let mut jcol = vec![0.0f32; NZ]; // causal power per latent dim = Σ_o |J[o,i]|
+    let mut jcol = [0.0f32; NZ]; // causal power per latent dim = Σ_o |J[o,i]|
     for o in 0..NC {
         let sel = { let mut s = vec![0.0f32; eb * NC]; for i in 0..eb { s[i * NC + o] = 1.0; } Var::leaf(Tensor::from_vec(&ctx, &s, &[eb, NC])) };
         let scalar = lf.mul(&sel).sum_all();                          // Σ_x logit_o(x)
-        let gz = grad(&scalar, &[zv.clone()], None).remove(0).value().to_vec().await; // [eb,NZ] rows = ∂logit_o/∂z
+        let gz = grad(&scalar, std::slice::from_ref(&zv), None).remove(0).value().to_vec().await; // [eb,NZ] rows = ∂logit_o/∂z
         for i in 0..NZ { let mut m = 0.0; for b in 0..eb { m += gz[b * NZ + i]; } jcol[i] += (m / eb as f32).abs(); }
     }
     // variance share per latent dim
-    let mut var = vec![0.0f32; NZ];
+    let mut var = [0.0f32; NZ];
     for i in 0..NZ { let mut mean = 0.0; for b in 0..eb { mean += zvec[b * NZ + i]; } mean /= eb as f32;
         let mut v = 0.0; for b in 0..eb { let d = zvec[b * NZ + i] - mean; v += d * d; } var[i] = v / eb as f32; }
     let vtot: f32 = var.iter().sum::<f32>().max(1e-9);

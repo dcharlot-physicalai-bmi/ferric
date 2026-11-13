@@ -15,7 +15,7 @@ const HH: usize = 64; const EPS: f32 = 0.03;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn e_true(th: f32, w: f32) -> f32 { 0.5 * w * w - th.cos() }
 
 fn inet(s: &Var, p: &[Var], one: &Var) -> Var { let sp = |z: Var| z.exp().add(one).log(); let h = sp(s.matmul(&p[0]).add(&p[1])); let h2 = sp(h.matmul(&p[2]).add(&p[3])); h2.matmul(&p[4]).add(&p[5]) }
@@ -34,7 +34,7 @@ async fn run() {
     let mut adam = Adam::new(&p, 0.002); let (one_c, beta) = (Tensor::from_vec(&ctx, &[1.0], &[1]), Tensor::from_vec(&ctx, &[1.0], &[1]));
     for _step in 0..6000 {
         let mut th = vec![0.0f32; bs]; let mut w = vec![0.0f32; bs];
-        for i in 0..bs { th[i] = (u(i as u32, _step as u32 * 3 + 1) * 2.0 - 1.0) * 3.1416; w[i] = (u(i as u32, _step as u32 * 3 + 2) * 2.0 - 1.0) * 2.5; }
+        for i in 0..bs { th[i] = (u(i as u32, _step as u32 * 3 + 1) * 2.0 - 1.0) * std::f32::consts::PI; w[i] = (u(i as u32, _step as u32 * 3 + 2) * 2.0 - 1.0) * 2.5; }
         let mk = |dth: f32, dw: f32| -> Tensor { let mut v = vec![0.0f32; bs * 2]; for i in 0..bs { v[i * 2] = th[i] + dth; v[i * 2 + 1] = w[i] + dw; } Tensor::from_vec(&ctx, &v, &[bs, 2]) };
         let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone()); let i2 = Var::leaf(i2e.clone());
         let git = inet(&Var::leaf(mk(EPS, 0.0)), &pv, &ov).sub(&inet(&Var::leaf(mk(-EPS, 0.0)), &pv, &ov)).mul(&i2); // ∂I/∂θ
@@ -52,7 +52,7 @@ async fn run() {
 
     // ---- eval: (1) I ≈ function of E? correlation over a grid. (2) conserved along trajectories? ----
     let m = 3000usize; let mut grid = vec![0.0f32; m * 2]; let mut et = vec![0.0f32; m];
-    for i in 0..m { let th = (u(i as u32, 71) * 2.0 - 1.0) * 3.1416; let w = (u(i as u32, 72) * 2.0 - 1.0) * 2.5; grid[i * 2] = th; grid[i * 2 + 1] = w; et[i] = e_true(th, w); }
+    for i in 0..m { let th = (u(i as u32, 71) * 2.0 - 1.0) * std::f32::consts::PI; let w = (u(i as u32, 72) * 2.0 - 1.0) * 2.5; grid[i * 2] = th; grid[i * 2 + 1] = w; et[i] = e_true(th, w); }
     let iv = inet_t(&Tensor::from_vec(&ctx, &grid, &[m, 2]), &p, &one).to_vec().await;
     let corr = |a: &[f32], b: &[f32]| -> f32 { let n = a.len() as f32; let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
         let mut cov = 0.0; let mut va = 0.0; let mut vb = 0.0; for i in 0..a.len() { cov += (a[i] - ma) * (b[i] - mb); va += (a[i] - ma).powi(2); vb += (b[i] - mb).powi(2); } cov / (va.sqrt() * vb.sqrt() + 1e-9) };

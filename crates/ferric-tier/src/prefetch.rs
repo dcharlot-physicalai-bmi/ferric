@@ -157,12 +157,11 @@ impl PrefetchCache {
 
     /// Reclaim whatever the worker is holding, discarding the data but keeping the buffer.
     fn drain_pending(&mut self) {
-        if self.pending.take().is_some() {
-            if let Ok(d) = self.done_rx.recv() {
+        if self.pending.take().is_some()
+            && let Ok(d) = self.done_rx.recv() {
                 self.pool.push(d.buf);
                 self.stats.mispredicts += 1;
             }
-        }
     }
 
     /// Ask the worker to start reading `layer`, if we have a buffer free and the layer actually streams.
@@ -225,6 +224,12 @@ impl PrefetchCache {
                 .done_rx
                 .recv()
                 .map_err(|_| TierError::Io("prefetch worker vanished".into()))?;
+            if d.layer != layer {
+                return Err(TierError::Io(format!(
+                    "prefetch completed layer {} while {layer} was in flight",
+                    d.layer
+                )));
+            }
             // Recycle the buffer FIRST, so an I/O error cannot cost us a slot.
             let recycled = self.current.take().map(|(_, b)| b);
             match d.result {

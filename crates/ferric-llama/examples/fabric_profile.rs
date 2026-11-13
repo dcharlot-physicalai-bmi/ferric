@@ -271,7 +271,7 @@ async fn run() {
     // ---- the real model's geometry ---------------------------------------------------------
     let (n_exp, top_k, s_expert, blocks) = match GgufFile::open(&path) {
         Ok(g) => {
-            let u = |k: &str| match g.metadata.get(k) { Some(Meta::U(v)) => *v as u64, _ => 0 };
+            let u = |k: &str| match g.metadata.get(k) { Some(Meta::U(v)) => *v, _ => 0 };
             let arch = match g.metadata.get("general.architecture") { Some(Meta::Str(s)) => s.clone(), _ => String::new() };
             let n = u(&format!("{arch}.expert_count"));
             let k = u(&format!("{arch}.expert_used_count"));

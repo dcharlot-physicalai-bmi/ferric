@@ -94,6 +94,7 @@ pub struct TokenSpec {
 }
 
 impl TokenSpec {
+    #[allow(clippy::too_many_arguments)] // each argument is one field of the token receipt
     pub fn from_parts(
         signal_digest: impl Into<String>,
         channels: usize,

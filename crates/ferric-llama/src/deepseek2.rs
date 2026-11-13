@@ -203,16 +203,17 @@ impl Cfg {
     }
 }
 
+struct RoutedMoe {
+    router: QMatrix,
+    bias: Option<Tensor>,
+    /// All experts' gate|up fused expert-major, so one dispatch serves every routed expert.
+    gate_up: ferric_tensor::Q4_KWeights,
+    down: crate::qwen35::DownSlab,
+    sh_gate: QMatrix, sh_up: QMatrix, sh_down: QMatrix,
+}
 enum Ffn {
     Dense { gate: QMatrix, up: QMatrix, down: QMatrix },
-    Moe {
-        router: QMatrix,
-        bias: Option<Tensor>,
-        /// All experts' gate|up fused expert-major, so one dispatch serves every routed expert.
-        gate_up: ferric_tensor::Q4_KWeights,
-        down: crate::qwen35::DownSlab,
-        sh_gate: QMatrix, sh_up: QMatrix, sh_down: QMatrix,
-    },
+    Moe(Box<RoutedMoe>),
 }
 
 /// Fuse per-expert `gate` and `up` into ONE expert-major slab: `[e0 gate | e0 up | e1 gate | ...]`.
@@ -392,7 +393,7 @@ impl DeepSeek2 {
                 let dn = b("ffn_down_exps.weight");
                 let dt = g.tensor(&dn).ok_or("no down_exps")?;
                 let (dd, drows) = (dt.dims[0] as usize, dt.dims[1] as usize * cfg.n_expert);
-                Ffn::Moe {
+                Ffn::Moe(Box::new(RoutedMoe {
                     router: qm(&b("ffn_gate_inp.weight"))?,
                     bias: g.tensor(&b("ffn_exp_probs_b.bias")).map(|_| ft(&b("ffn_exp_probs_b.bias"), &[cfg.n_expert])).transpose()?,
                     gate_up: fuse_gate_up(ctx, g, il, cfg.n_expert)?,
@@ -408,7 +409,7 @@ impl DeepSeek2 {
                     sh_gate: qm(&b("ffn_gate_shexp.weight"))?,
                     sh_up: qm(&b("ffn_up_shexp.weight"))?,
                     sh_down: qm(&b("ffn_down_shexp.weight"))?,
-                }
+                }))
             } else {
                 Ffn::Dense { gate: qm(&b("ffn_gate.weight"))?, up: qm(&b("ffn_up.weight"))?, down: qm(&b("ffn_down.weight"))? }
             };
@@ -537,12 +538,12 @@ impl DeepSeek2 {
         let cfg = &self.cfg;
         match &blk.ffn {
             Ffn::Dense { gate, up, down } => f.matmul_q(gate).silu().mul(&f.matmul_q(up)).matmul_q(down),
-            Ffn::Moe { router, bias, gate_up, down, sh_gate, sh_up, sh_down } => {
-                let selw = f.matmul_q(router).moe_topk_ex(
-                    bias.as_ref(), cfg.n_expert_used, cfg.sigmoid_gate, cfg.routed_scale, cfg.expert_norm);
-                let mid = f.matmul_q4_k_swiglu_id(gate_up, &selw, cfg.n_expert_used, cfg.expert_ff);
-                let routed = down.wsum(&mid, &selw, cfg.d);
-                let shared = f.matmul_q(sh_gate).silu().mul(&f.matmul_q(sh_up)).matmul_q(sh_down);
+            Ffn::Moe(m) => {
+                let selw = f.matmul_q(&m.router).moe_topk_ex(
+                    m.bias.as_ref(), cfg.n_expert_used, cfg.sigmoid_gate, cfg.routed_scale, cfg.expert_norm);
+                let mid = f.matmul_q4_k_swiglu_id(&m.gate_up, &selw, cfg.n_expert_used, cfg.expert_ff);
+                let routed = m.down.wsum(&mid, &selw, cfg.d);
+                let shared = f.matmul_q(&m.sh_gate).silu().mul(&f.matmul_q(&m.sh_up)).matmul_q(&m.sh_down);
                 routed.add(&shared)
             }
         }

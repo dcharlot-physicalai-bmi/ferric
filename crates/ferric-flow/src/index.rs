@@ -433,11 +433,10 @@ impl<Id: Eq + Hash + Clone> LiveIndex<Id> {
                         self.id_of.push(id.clone());
                     }
                 }
-            } else if !is_live && was_live {
-                if let Some(&iid) = self.internal.get(&id) {
+            } else if !is_live && was_live
+                && let Some(&iid) = self.internal.get(&id) {
                     self.hnsw.tombstone(iid);
                 }
-            }
         }
     }
 
@@ -507,9 +506,10 @@ impl LiveIndex<String> {
 fn hnsw_byte_len(h: &Hnsw) -> usize {
     let dim = h.vecs.first().map(|v| v.len()).unwrap_or(0);
     let mut n = 4 * 6 + 4 * 4; // magic,m,m0,efc,efs + ml + count,dim,max_layer,entry
-    for i in 0..h.vecs.len() {
+    assert_eq!(h.links.len(), h.vecs.len());
+    for links in &h.links {
         n += 4 + 1 + dim * 4; // level + tomb + vec
-        for layer in &h.links[i] {
+        for layer in links {
             n += 4 + layer.len() * 4;
         }
     }

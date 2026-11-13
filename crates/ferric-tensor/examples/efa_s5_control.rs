@@ -10,7 +10,6 @@
 //! The certified region is a SAFETY GUARANTEE: inside it, this controller provably stabilizes.
 //! Run: `cargo run -p ferric-tensor --example efa_s5_control --release`
 use ferric_tensor::{Adam, Tensor, Var};
-use std::f64::consts::PI;
 use std::sync::Arc;
 use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded). Replaces the local
 // round-to-nearest implementation this example used to carry: the naive form can NARROW an
@@ -58,7 +57,8 @@ fn verify(a:f64,b:f64,c:f64,k1:f64,k2:f64, r:f64) -> (usize, Vec<(f64,f64)>) {
 fn stabilizes(x1:f64,x2:f64,k1:f64,k2:f64)->bool{
     let (mut a,mut b)=(x1,x2); let dt=0.002;
     for _ in 0..20000 { let (f1,f2)=fcl(a,b,k1,k2); a+=dt*f1; b+=dt*f2;
-        if (a*a+b*b).sqrt()>8.0 {return false;} if (a*a+b*b).sqrt()<1e-3 {return true;} }
+        if (a*a+b*b).sqrt()>8.0 {return false;}
+            if (a*a+b*b).sqrt()<1e-3 {return true;} }
     (a*a+b*b).sqrt()<0.3
 }
 fn pointwise_ok(a:f64,b:f64,c:f64,k1:f64,k2:f64,r:f64)->bool{ // dense check V̇+α‖x‖²<0

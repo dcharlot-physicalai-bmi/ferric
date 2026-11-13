@@ -53,7 +53,7 @@ impl LocalModel {
         let opts = self.eng.gen_opts(req, false)?;
         let prompt = req["prompt"].as_str().ok_or("`prompt` must be a string")?;
         let mut ids = Vec::new();
-        if self.eng.add_bos { if let Some(b) = self.eng.bos_id { ids.push(b); } }
+        if self.eng.add_bos && let Some(b) = self.eng.bos_id { ids.push(b); }
         ids.extend(self.eng.enc(prompt, true));
         let max = self.eng.budget(ids.len(), &opts)?;
         let spec = self.eng.constraint(req)?;

@@ -132,8 +132,8 @@ impl Huff {
     fn new(t: &RawHuff, dc: bool) -> Result<Huff, String> {
         let mut size = [0u8; 257];
         let mut p = 0usize;
-        for l in 1..=16 {
-            let i = t.bits[l] as usize;
+        for (l, &count) in t.bits.iter().enumerate().skip(1).take(16) {
+            let i = count as usize;
             if p + i > 256 { return Err("bad Huffman table (more than 256 codes)".into()); }
             for _ in 0..i { size[p] = l as u8; p += 1; }
         }
@@ -609,10 +609,10 @@ impl<'a> Dec<'a> {
             for &(ci, _, _) in &sc {
                 let cb = &mut f.comps[ci].coef_bits;
                 if !dc_band && cb[0] < 0 { return Err("corrupt progression: an AC scan before the DC scan".into()); }
-                for k in ss..=se {
-                    let expected = cb[k].max(0);
+                for slot in cb.iter_mut().skip(ss).take(se + 1 - ss) {
+                    let expected = (*slot).max(0);
                     if ah as i32 != expected { return Err("corrupt progression: a refinement out of order".into()); }
-                    cb[k] = al as i32;
+                    *slot = al as i32;
                 }
             }
             if dc_band && ah == 0 {
@@ -675,8 +675,8 @@ impl<'a> Dec<'a> {
             }
             let out = &mut px[y * w * 3..(y + 1) * w * 3];
             match color {
-                Color::Gray => for (o, &g) in out.chunks_exact_mut(3).zip(&rows[0][..w]) { o.fill(g); },
-                Color::Rgb => for (x, o) in out.chunks_exact_mut(3).enumerate() {
+                Color::Gray => for (o, &g) in out.as_chunks_mut::<3>().0.iter_mut().zip(&rows[0][..w]) { o.fill(g); },
+                Color::Rgb => for (x, o) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                     o.copy_from_slice(&[rows[0][x], rows[1][x], rows[2][x]]);
                 },
                 Color::Ycc => t.convert(&rows[0][..w], &rows[1][..w], &rows[2][..w], out),
@@ -1129,7 +1129,7 @@ impl YccTables {
     /// `ycc_rgb_convert`, with `sample_range_limit` as a clamp (its table spans [-256, 639]).
     fn convert(&self, y: &[u8], cb: &[u8], cr: &[u8], out: &mut [u8]) {
         let clamp = |v: i32| v.clamp(0, 255) as u8;
-        for (((o, &y), &cb), &cr) in out.chunks_exact_mut(3).zip(y).zip(cb).zip(cr) {
+        for (((o, &y), &cb), &cr) in out.as_chunks_mut::<3>().0.iter_mut().zip(y).zip(cb).zip(cr) {
             let (y, cb, cr) = (y as i32, cb as usize, cr as usize);
             o[0] = clamp(y + self.cr_r[cr]);
             o[1] = clamp(y + ((self.cb_g[cb] + self.cr_g[cr]) >> 16));

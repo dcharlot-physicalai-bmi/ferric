@@ -20,7 +20,7 @@ const EV: [f32; 4] = [-2.0, -1.0, 1.0, 2.0]; // evidence values (uniform over 4 
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 // energy E(z, h) = softplus(z·Wz + h·Wh + b1)·W2 + b2
 fn energy(z: &Var, h: &Var, p: &[Var], one: &Var) -> Var {
@@ -90,7 +90,7 @@ async fn run() {
     let lg = logit.value().to_vec().await;
     let mut acc = 0; for i in 0..eb { let pred = if lg[i] > 0.0 { 1.0 } else { 0.0 }; if pred == lbl[i] { acc += 1; } }
     // z per position
-    let mut zt: Vec<Vec<f32>> = Vec::new(); for t in 0..T { zt.push(zsnap[t].value().to_vec().await); }
+    let mut zt: Vec<Vec<f32>> = Vec::new(); for item in zsnap[..T].iter() { zt.push(item.value().to_vec().await); }
     // effort per (item, position>=1) and reanalysis flag
     let (mut eff_re, mut n_re, mut eff_no, mut n_no) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for i in 0..eb { for t in 1..T {
@@ -104,7 +104,7 @@ async fn run() {
     let cl = [3usize, 2, 3, 2, 3];   // e = +2,+1,+2,+1,+2 → cumsum monotone up, no flip
     let mut dt = vec![vec![0usize; 2]; T]; for t in 0..T { dt[t][0] = gp[t]; dt[t][1] = cl[t]; }
     let (_lg2, zs2, _p2) = forward(&p, &dt, 2);
-    let mut zt2: Vec<Vec<f32>> = Vec::new(); for t in 0..T { zt2.push(zs2[t].value().to_vec().await); }
+    let mut zt2: Vec<Vec<f32>> = Vec::new(); for item in zs2[..T].iter() { zt2.push(item.value().to_vec().await); }
     let effpos = |item: usize| { let mut v = vec![0.0f32; T]; for t in 1..T { let mut d = 0.0; for k in 0..DZ { let dd = zt2[t][item * DZ + k] - zt2[t - 1][item * DZ + k]; d += dd * dd; } v[t] = d.sqrt(); } v };
     let (eg, ec) = (effpos(0), effpos(1));
 

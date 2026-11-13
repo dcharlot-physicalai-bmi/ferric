@@ -87,7 +87,7 @@ fn load_avg() -> Option<f64> {
     let s = String::from_utf8_lossy(&out.stdout).to_string();
     let tail = s.split("load average").nth(1)?.to_string();
     tail.trim_start_matches(|c: char| !c.is_ascii_digit())
-        .split(|c: char| c == ',' || c == ' ')
+        .split([',', ' '])
         .find(|p| !p.is_empty())?.parse().ok()
 }
 

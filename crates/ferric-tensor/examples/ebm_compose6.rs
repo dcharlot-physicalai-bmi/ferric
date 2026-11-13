@@ -19,7 +19,7 @@ const HELD: [(usize, usize); 2] = [(0, 1), (1, 2)];
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(th: f32, om: f32, uu: f32) -> (f32, f32) { let no = om + DT * (-th.sin() - 0.05 * om + uu.clamp(-UMAX, UMAX)); (wrap(th + DT * no), no) }
 fn goal(dir: usize, dist: usize) -> f32 { (if dir == 0 { -1.0 } else { 1.0 }) * DIST[dist] }
@@ -45,7 +45,7 @@ impl En {
             // settle: run 200 steps, then check reach over a last-K window (anti-timing-luck)
             let mut ok_window = true;
             for t in 0..260 { let uu = self.greedy(th, om, dir, dist); let (nt, no) = step(th, om, uu); th = nt; om = no;
-                if t >= 200 { if !(wrap(th - g).abs() < 0.3 && om.abs() < 0.6) { ok_window = false; } } }
+                if t >= 200 && !(wrap(th - g).abs() < 0.3 && om.abs() < 0.6) { ok_window = false; } }
             if ok_window { reach += 1; } }
         (wrap(bth - g).abs(), reach as f32 / nn as f32 * 100.0)
     }

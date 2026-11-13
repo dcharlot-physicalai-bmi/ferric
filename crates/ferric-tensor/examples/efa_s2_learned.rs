@@ -174,7 +174,8 @@ fn pointwise_worst(p: &[f64], head: bool, rr: f64) -> (f64, f64) {
 fn converges(x1: f64, x2: f64) -> bool {
     let (mut a, mut b) = (x1, x2); let dt = 0.003;
     for _ in 0..12000 { let (f1, f2) = f(a, b); a += dt*f1; b += dt*f2;
-        if (a*a + b*b).sqrt() > 5.0 { return false; } if (a*a + b*b).sqrt() < 1e-3 { return true; } }
+        if (a*a + b*b).sqrt() > 5.0 { return false; }
+            if (a*a + b*b).sqrt() < 1e-3 { return true; } }
     (a*a + b*b).sqrt() < 0.5
 }
 fn sublevel_roa(p: &[f64], head: bool, rr: f64) -> (f64, f64, bool) {
@@ -191,7 +192,10 @@ fn sublevel_roa(p: &[f64], head: bool, rr: f64) -> (f64, f64, bool) {
     if inset_ok[idx(g/2,g/2)] { seen[idx(g/2,g/2)] = true;
         while let Some((i, j)) = stack.pop() { cnt += 1;
             let (x1, x2) = inset(i, j); let rad = x1*x1 + x2*x2; if rad > worst.2 { worst = (x1, x2, rad); }
-            let mut nb = vec![]; if i>0 {nb.push((i-1,j));} if i+1<g {nb.push((i+1,j));} if j>0 {nb.push((i,j-1));} if j+1<g {nb.push((i,j+1));}
+            let mut nb = vec![]; if i>0 {nb.push((i-1,j));}
+            if i+1<g {nb.push((i+1,j));}
+            if j>0 {nb.push((i,j-1));}
+            if j+1<g {nb.push((i,j+1));}
             for (ni, nj) in nb { if !seen[idx(ni,nj)] && inset_ok[idx(ni,nj)] { seen[idx(ni,nj)] = true; stack.push((ni, nj)); } } } }
     (cstar, cnt as f64 * cell * cell, converges(worst.0, worst.1))
 }

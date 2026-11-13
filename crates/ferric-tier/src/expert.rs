@@ -164,7 +164,7 @@ impl ExpertCache {
     /// of long-lived hot entries intact while letting a one-off spike fade geometrically.
     pub fn end_token(&mut self) {
         self.tokens += 1;
-        if self.tokens % DECAY_TOKENS == 0 {
+        if self.tokens.is_multiple_of(DECAY_TOKENS) {
             for h in self.hotness.iter_mut() { *h >>= 1; }
         }
     }

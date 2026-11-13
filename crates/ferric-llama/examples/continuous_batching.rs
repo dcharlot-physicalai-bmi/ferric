@@ -25,7 +25,7 @@
 use ferric_core::Context;
 use ferric_gguf::GgufFile;
 use ferric_llama::qwen3::{Cache, Qwen3};
-use ferric_llama::sched::{Done, Scheduler, SeqId};
+use ferric_llama::sched::{Scheduler, SeqId};
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -27,7 +27,7 @@ pub fn bind_clock(s: &ClockSnapshot) -> Result<u64, String> {
         return Err("t0_ns is before origin_ns".into());
     }
     let delta = s.t0_ns - s.origin_ns;
-    if delta % s.period_ns != 0 {
+    if !delta.is_multiple_of(s.period_ns) {
         return Err("t0_ns is not origin_ns plus an integer number of periods".into());
     }
     Ok(delta / s.period_ns)

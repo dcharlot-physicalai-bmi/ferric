@@ -151,7 +151,7 @@ fn codegen(e: &E) -> (String, usize) {
 pub fn eval(inputs: &[&Tensor], e: &E) -> Tensor {
     let (shader, n_in) = codegen(e);
     assert!(n_in <= inputs.len(), "expression uses more inputs than given");
-    assert!(n_in + 1 <= 4, "fused kernel exceeds the 4-storage-buffer limit ({n_in} inputs)");
+    assert!(n_in < 4, "fused kernel exceeds the 4-storage-buffer limit ({n_in} inputs)");
     let ctx = &inputs[0].ctx;
     let n = inputs[0].numel();
     let cs: Vec<Tensor> = inputs.iter().map(|t| t.contiguous()).collect();

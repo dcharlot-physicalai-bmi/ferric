@@ -46,10 +46,10 @@ pub async fn ferric_worker_exec(input: Vec<u8>) -> Vec<u8> {
     let dims = [ru32(1), ru32(5), ru32(9), ru32(13)];
     let mut off = 17;
     let la = ru32(off); off += 4;
-    let a: Vec<f32> = input[off..off + la * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let a: Vec<f32> = input[off..off + la * 4].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
     off += la * 4;
     let lb = ru32(off); off += 4;
-    let b: Vec<f32> = input[off..off + lb * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let b: Vec<f32> = input[off..off + lb * 4].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
 
     let ctx = Arc::new(Context::new().await.unwrap());
     let out = if op == 0 {
@@ -309,9 +309,8 @@ pub async fn bonsai_stream(model: Vec<u8>, prompt: String, steps: usize, on_toke
         if step == 0 { prompt_ms = js_sys::Date::now() - t_prompt; }
         seq.push(next);
         let full = detok(&seq[ids.len()..]);
-        if let Some(delta) = full.strip_prefix(&emitted) {
-            if !delta.is_empty() { emit("token", delta); }
-        }
+        if let Some(delta) = full.strip_prefix(&emitted)
+            && !delta.is_empty() { emit("token", delta); }
         emitted = full;
         if next == 151645 || next == 151643 { break; }
     }
@@ -384,7 +383,7 @@ pub async fn bonsai_generate_json(model: Vec<u8>, prompt: String, steps: usize, 
         if let Some(b) = &token_bytes[next as usize] { for &ch in b { guide.step(ch); } }
         seq.push(next);
         let full = detok(&seq[ids.len()..]);
-        if let Some(delta) = full.strip_prefix(&emitted) { if !delta.is_empty() { emit("token", delta); } }
+        if let Some(delta) = full.strip_prefix(&emitted) && !delta.is_empty() { emit("token", delta); }
         emitted = full;
     }
     emit("done", &emitted);
@@ -438,7 +437,7 @@ fn encode_with_bos(g: &impl GgufSource, bpe: &Bpe, prompt: &str) -> Vec<u32> {
     let bos = match g.metadata().get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
     let add = match g.metadata().get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos.is_some() };
     let mut ids = bpe.encode(prompt);
-    if add { if let Some(b) = bos { ids.insert(0, b); } }
+    if add && let Some(b) = bos { ids.insert(0, b); }
     ids
 }
 
@@ -654,9 +653,8 @@ impl FerricModel {
         let mut eos_set: Vec<u32> = eos_id.into_iter().collect();
         // `<turn|>` is Gemma 4's end-of-turn (id 106, CONTROL) — the family renamed its markers.
         for name in ["<|im_end|>", "<|endoftext|>", "</s>", "<eos>", "<end_of_turn>", "<|eot_id|>", "<turn|>"] {
-            if let Some((_, id)) = specials.iter().find(|(t, _)| t == name) {
-                if is_control(*id) && !eos_set.contains(id) { eos_set.push(*id); }
-            }
+            if let Some((_, id)) = specials.iter().find(|(t, _)| t == name)
+                && is_control(*id) && !eos_set.contains(id) { eos_set.push(*id); }
         }
         let ctx = Arc::new(Context::new().await.map_err(err)?);
         let model = match arch.as_str() {
@@ -718,9 +716,8 @@ impl FerricModel {
         'outer: while !rest.is_empty() {
             let mut best: Option<(usize, &str, u32)> = None;
             for (s, id) in &self.specials {
-                if let Some(pos) = rest.find(s.as_str()) {
-                    if best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
-                }
+                if let Some(pos) = rest.find(s.as_str())
+                    && best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
             }
             match best {
                 Some((pos, s, id)) => {
@@ -731,7 +728,7 @@ impl FerricModel {
                 None => { let start = ids.is_empty(); ids.extend(self.enc_piece(rest, start)); break 'outer; }
             }
         }
-        if self.add_bos { if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } } }
+        if self.add_bos && let Some(b) = self.bos_id && ids.first() != Some(&b) { ids.insert(0, b); }
         ids
     }
 
@@ -788,7 +785,7 @@ impl FerricModel {
             return Err(jserr("transcribe() needs a speech model (parakeet / asr)"));
         };
         if sample_rate as usize != m.cfg.sample_rate {
-            return Err(jserr(&format!(
+            return Err(jserr(format!(
                 "audio is {sample_rate} Hz, model wants {} Hz — decode through \
                  new AudioContext({{sampleRate: {}}}) so the browser resamples for you",
                 m.cfg.sample_rate, m.cfg.sample_rate)));
@@ -829,7 +826,7 @@ impl FerricModel {
         // Raw piece tokenization (like native Engine::embed) — embeddings embed literal text, so DON'T
         // split on control tokens or prepend BOS; only the trained EOS is appended below.
         let mut ids = self.enc_piece(&text, true);
-        if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } } // Qwen3-Embedding pools the EOS position
+        if self.add_eos && let Some(e) = self.eos_id { ids.push(e); } // Qwen3-Embedding pools the EOS position
         if ids.is_empty() { return Ok(vec![0.0; n]); }
         let v = m.forward_hidden(&ids).to_vec().await; // [T·n_embd]
         let t = (v.len() / n).max(1);
@@ -899,7 +896,7 @@ impl FerricModel {
             "q8_0" => Some(KvqFmt::Q8_0),
             "q4_0" => Some(KvqFmt::Q4_0),
             "q4_1" => Some(KvqFmt::Q4_1),
-            other => return Err(jserr(&format!(
+            other => return Err(jserr(format!(
                 "setKvCache: {other:?} is not a KV cache format. Use \"off\", \"q8_0\", \"q4_0\" or \"q4_1\"."))),
         };
         self.kv_grouped_k = grouped_k;
@@ -1041,10 +1038,10 @@ impl FerricModel {
                 match best { Some(t) => t, None => break }
             } else { (0..n_vocab).max_by(|&a, &b| row[a].partial_cmp(&row[b]).unwrap()).unwrap() as u32 };
             if eos(next) { break; }
-            if let Some(g) = guide.as_deref_mut() { if let Some(b) = &self.token_bytes[next as usize] { for &ch in b { g.step(ch); } } }
+            if let Some(g) = guide.as_deref_mut() && let Some(b) = &self.token_bytes[next as usize] { for &ch in b { g.step(ch); } }
             seq.push(next);
             let full = self.detok(&seq[ids.len()..]);
-            if let Some(d) = full.strip_prefix(&emitted) { if !d.is_empty() { emit("token", d); } }
+            if let Some(d) = full.strip_prefix(&emitted) && !d.is_empty() { emit("token", d); }
             emitted = full;
         }
         emit("done", &emitted);
@@ -1169,7 +1166,7 @@ pub async fn ferric_sqrt_forensic() -> std::result::Result<String, JsValue> {
             let t = x * x;
             let u = hy * t;
             let w = 1.5 - u;
-            x = x * w;
+            x *= w;
         }
         y * x
     }
@@ -1229,7 +1226,7 @@ pub async fn ferric_rsqrt_stages() -> std::result::Result<String, JsValue> {
             out[idx + 1] = u;
             let w = 1.5 - u;
             out[idx + 2] = w;
-            x = x * w;
+            x *= w;
             out[idx + 3] = x;
             idx += 4;
         }
@@ -1280,7 +1277,7 @@ pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
         for _ in 0..3 {
             let t = y * x;
             let w = 2.0 - t;
-            x = x * w;
+            x *= w;
         }
         x
     }
@@ -1291,7 +1288,7 @@ pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
             let t = x * x;
             let u = hy * t;
             let w = 1.5 - u;
-            x = x * w;
+            x *= w;
         }
         x
     }
@@ -1301,7 +1298,7 @@ pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
     let wn: Vec<f32> = det(D, 3).iter().map(|v| v + 1.0).collect();
     // CPU replica per row
     let mut cpu = vec![[0f32; 7]; T];
-    for row in 0..T {
+    for (row, slot) in cpu.iter_mut().enumerate() {
         let base = row * D;
         let mut ms_acc = 0f32;
         for j in 0..D {
@@ -1314,7 +1311,7 @@ pub async fn ferric_rmsnorm_stages() -> std::result::Result<String, JsValue> {
         let arg = ms + 1e-5;
         let inv = cpu_rsqrt(arg);
         let t = x[base] * inv;
-        cpu[row] = [ms_acc, rc, ms, arg, inv, t, t * wn[0]];
+        *slot = [ms_acc, rc, ms, arg, inv, t, t * wn[0]];
     }
     let ctx = Context::new().await.map_err(|e| jserr(&e))?;
     let mut rows = Vec::new();
@@ -1361,7 +1358,7 @@ pub async fn ferric_rmsnorm_diff() -> std::result::Result<String, JsValue> {
         for _ in 0..3 {
             let t = y * x;
             let w = 2.0 - t;
-            x = x * w;
+            x *= w;
         }
         x
     }
@@ -1372,7 +1369,7 @@ pub async fn ferric_rmsnorm_diff() -> std::result::Result<String, JsValue> {
             let t = x * x;
             let u = hy * t;
             let w = 1.5 - u;
-            x = x * w;
+            x *= w;
         }
         x
     }

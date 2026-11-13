@@ -1,5 +1,5 @@
 //! Q8_0 tensor-core prefill matmul vs scalar.
-use ferric_core::Context; use ferric_gguf::{deq_raw, quant_q8_0}; use ferric_tensor::{Q8_0Weights, Tensor};
+use ferric_core::Context; use ferric_gguf::quant_q8_0; use ferric_tensor::{Q8_0Weights, Tensor};
 use std::sync::Arc; use std::time::Instant;
 fn main(){pollster::block_on(run());}
 async fn run(){let ctx=Arc::new(Context::new().await.unwrap());

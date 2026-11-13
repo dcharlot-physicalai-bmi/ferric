@@ -71,65 +71,6 @@ pub fn noise_from_seed(seed: u64) -> Vec<f32> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_proj_column_matches_the_extracted_weights() {
-        let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/state_proj.safetensors");
-        let store = weights::Store::open_bytes(bytes).unwrap();
-        let w = store.tensor("model.state_proj.weight").unwrap();
-        let b = store.tensor("model.state_proj.bias").unwrap();
-        let mut x = [0.0f32; 32];
-        x[0] = 1.0;
-        let y = project_state(&w, &b, &x);
-        assert!((y[0] - -0.13992482).abs() < 1e-6, "{}", y[0]);
-        assert!((y[1] - -0.08349697).abs() < 1e-6, "{}", y[1]);
-    }
-
-    #[test]
-    fn mean_std_refuses_a_stats_file_without_observation_state() {
-        let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/policy_preprocessor_step_5_normalizer_processor.safetensors");
-        let err = require_mean_std(bytes, "observation.state", "action").unwrap_err();
-        assert!(err.contains("MEAN_STD"));
-        assert!(err.contains("observation.state"));
-        assert!(!err.contains("IDENTITY is applied"));
-        let mapped = require_mean_std(bytes, "observation.state", "so100.buffer.action").unwrap_err();
-        assert!(mapped.contains("observation.state"));
-    }
-
-    #[test]
-    fn simulation_gate_keeps_the_rollout_refused() {
-        use ferric_accept::smolvla::{ChunkIdentity, JointMeta};
-        let id = ChunkIdentity {
-            model_id: "lerobot/smolvla_base".into(),
-            weight_sha256: "ab".repeat(32),
-            stats_sha256: "cd".repeat(32),
-            noise_sha256: "ef".repeat(32),
-            embodiment: "simulation-embodiment".into(),
-            t0_ns: 1_000_000_000,
-            step_duration_ns: 20_000_000,
-            joints: vec![JointMeta {
-                name: "action_0".into(),
-                unit: "dataset_native".into(),
-                frame: "model_action_index".into(),
-                min: -10.0,
-                max: 10.0,
-            }],
-        };
-        let report = simulation_validation(&[0.25, -0.5], id, 1_000_000_000).unwrap();
-        assert_eq!(report.gate, "simulation-validation");
-        assert!(!report.authorized_rollout);
-        assert_eq!(report.authorize_error, "ProposedEntryInvoked");
-        assert!(!report.robot_actuated);
-        assert_eq!(report.steps.len(), 2);
-        assert_eq!(report.steps[0].1, 1_000_000_000);
-        assert_eq!(report.steps[1].1, 1_020_000_000);
-        assert_eq!(report.steps[1].2, vec![-0.5]);
-    }
-}
-
 fn next_unit(state: &mut u64) -> f64 {
     let mut x = *state;
     x ^= x << 13;
@@ -257,7 +198,7 @@ pub struct SimulationReport {
 /// into an authorized rollout or a robot write.
 pub fn simulation_validation(actions: &[f32], identity: ChunkIdentity, origin_ns: u64) -> Result<SimulationReport, String> {
     let action_dim = identity.joints.len() as u32;
-    if action_dim == 0 || actions.len() % action_dim as usize != 0 {
+    if action_dim == 0 || !actions.len().is_multiple_of(action_dim as usize) {
         return Err("simulation actions are not a multiple of the joint count".into());
     }
     let n = (actions.len() / action_dim as usize) as u32;
@@ -397,4 +338,63 @@ pub struct WgpuCheck {
     pub max_abs: Option<f32>,
     pub listed: Vec<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_proj_column_matches_the_extracted_weights() {
+        let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/state_proj.safetensors");
+        let store = weights::Store::open_bytes(bytes).unwrap();
+        let w = store.tensor("model.state_proj.weight").unwrap();
+        let b = store.tensor("model.state_proj.bias").unwrap();
+        let mut x = [0.0f32; 32];
+        x[0] = 1.0;
+        let y = project_state(&w, &b, &x);
+        assert!((y[0] - -0.13992482).abs() < 1e-6, "{}", y[0]);
+        assert!((y[1] - -0.08349697).abs() < 1e-6, "{}", y[1]);
+    }
+
+    #[test]
+    fn mean_std_refuses_a_stats_file_without_observation_state() {
+        let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/policy_preprocessor_step_5_normalizer_processor.safetensors");
+        let err = require_mean_std(bytes, "observation.state", "action").unwrap_err();
+        assert!(err.contains("MEAN_STD"));
+        assert!(err.contains("observation.state"));
+        assert!(!err.contains("IDENTITY is applied"));
+        let mapped = require_mean_std(bytes, "observation.state", "so100.buffer.action").unwrap_err();
+        assert!(mapped.contains("observation.state"));
+    }
+
+    #[test]
+    fn simulation_gate_keeps_the_rollout_refused() {
+        use ferric_accept::smolvla::{ChunkIdentity, JointMeta};
+        let id = ChunkIdentity {
+            model_id: "lerobot/smolvla_base".into(),
+            weight_sha256: "ab".repeat(32),
+            stats_sha256: "cd".repeat(32),
+            noise_sha256: "ef".repeat(32),
+            embodiment: "simulation-embodiment".into(),
+            t0_ns: 1_000_000_000,
+            step_duration_ns: 20_000_000,
+            joints: vec![JointMeta {
+                name: "action_0".into(),
+                unit: "dataset_native".into(),
+                frame: "model_action_index".into(),
+                min: -10.0,
+                max: 10.0,
+            }],
+        };
+        let report = simulation_validation(&[0.25, -0.5], id, 1_000_000_000).unwrap();
+        assert_eq!(report.gate, "simulation-validation");
+        assert!(!report.authorized_rollout);
+        assert_eq!(report.authorize_error, "ProposedEntryInvoked");
+        assert!(!report.robot_actuated);
+        assert_eq!(report.steps.len(), 2);
+        assert_eq!(report.steps[0].1, 1_000_000_000);
+        assert_eq!(report.steps[1].1, 1_020_000_000);
+        assert_eq!(report.steps[1].2, vec![-0.5]);
+    }
 }

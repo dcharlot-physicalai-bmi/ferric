@@ -97,13 +97,12 @@ impl Cfg {
         // chat template. A wrong V width does not fail: it generates fluently and wrongly.
         for (kl, vl, what) in [("attention.key_length", "attention.value_length", "global"),
                                ("attention.key_length_swa", "attention.value_length_swa", "sliding")] {
-            if let (Ok(k), Ok(v)) = (u(kl), u(vl)) {
-                if k != v {
+            if let (Ok(k), Ok(v)) = (u(kl), u(vl))
+                && k != v {
                     return Err(format!(
                         "gemma4 {what} blocks declare key_length {k} and value_length {v}; this loader \
                          carries one head width per layer class and would silently use {k} for both"));
                 }
-            }
         }
 
         // Both of these are ARRAYS. A scalar accessor returns Err on an array and would fall back to a
@@ -223,11 +222,10 @@ impl Cache {
     /// axis env var to be read from. Same shape as `qwen3`/`lfm2`.
     pub fn with_kv_config(cfg: &Cfg, fmt: Option<KvqFmt>, grouped_k: bool) -> Cache {
         let mut c = Cache::with_kvq(cfg, fmt);
-        if let Some(f) = fmt {
-            if grouped_k {
+        if let Some(f) = fmt
+            && grouped_k {
                 c.q = (0..cfg.n_layer).map(|_| (KvStore::grouped(f), KvStore::block(f))).collect();
             }
-        }
         c
     }
 
@@ -422,7 +420,7 @@ impl Gemma4 {
 
         // Token embeddings are scaled by sqrt(d) BEFORE anything else, including the per-layer
         // projection, which reads this scaled value.
-        let mut x = self
+        let x = self
             .gather(&self.embd_raw, self.embd_ty, d, tokens);
         let mut x = x.mul(&x.scalar((d as f32).sqrt()));
 
@@ -892,7 +890,7 @@ mod kv_width_tests {
     }
 
     #[test]
-    fn a_v_width_that_differs_from_k_is_REFUSED_rather_than_silently_halved() {
+    fn a_v_width_that_differs_from_k_is_refused_rather_than_silently_halved() {
         // This loader carries ONE head width per layer class and uses it for K and V both. Every
         // checkpoint seen declares them equal, so the assumption is invisible — and a model that
         // separated them would not fail, it would attend over the wrong V width and generate

@@ -16,7 +16,7 @@ const HE: usize = 128;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 // a problem: pick a∈[amin,amax], x∈0..9, b∈0..9 → c = a·x + b. Returns (a,b,c,x_correct).
 fn problem(seed: u32, amin: usize, amax: usize) -> (usize, usize, usize, usize) {
     let a = amin + (u(seed, 1) * (amax - amin + 1) as f32) as usize % (amax - amin + 1);
@@ -34,8 +34,11 @@ async fn eval(ctx: &Arc<ferric_core::Context>, p: &[Tensor], amin: usize, amax: 
     let (mut bon, mut orc, mut rnd) = (0usize, 0usize, 0usize);
     for tr in 0..trials { let (a, b, c, _) = probs[tr];
         let (mut bi, mut bv) = (tr * nn, f32::MIN); let mut any = false;
-        for j in 0..nn { let idx = tr * nn + j; let valid_logit = lg[idx * 2] - lg[idx * 2 + 1]; if valid_logit > bv { bv = valid_logit; bi = idx; } if a * cand[idx] + b == c { any = true; } }
-        if a * cand[bi] + b == c { bon += 1; } if any { orc += 1; } if a * cand[tr * nn] + b == c { rnd += 1; }
+        for j in 0..nn { let idx = tr * nn + j; let valid_logit = lg[idx * 2] - lg[idx * 2 + 1]; if valid_logit > bv { bv = valid_logit; bi = idx; }
+            if a * cand[idx] + b == c { any = true; } }
+        if a * cand[bi] + b == c { bon += 1; }
+            if any { orc += 1; }
+            if a * cand[tr * nn] + b == c { rnd += 1; }
     }
     (bon as f32 / trials as f32, orc as f32 / trials as f32, rnd as f32 / trials as f32)
 }
@@ -44,7 +47,7 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
     println!("  EFA energy-first — algebra VERIFIER: solve a·x+b=c by best-of-N energy selection (train a∈1..3)");
-    let one = Tensor::from_vec(&ctx, &[1.0], &[1]); let eps = Tensor::from_vec(&ctx, &[1e-6], &[1]);
+    let _one = Tensor::from_vec(&ctx, &[1.0], &[1]); let eps = Tensor::from_vec(&ctx, &[1e-6], &[1]);
     let bs = 512usize;
 
     // verifier = valid/invalid classifier over [a,b,c,x]: 4 → HE → HE → 2, softmax-CE

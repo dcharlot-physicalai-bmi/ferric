@@ -23,6 +23,7 @@
 //! model can only emit conformant JSON, deterministically across fabrics (see `ferric_agent::guide`):
 //!   - `{"type":"json_object"}` → any single valid JSON object.
 //!   - `{"type":"json_schema","json_schema":{"schema": <JSON-Schema>}}` → schema-conformant JSON.
+//!
 //! Supported schema: objects with `properties` in *declaration* order, `required` (absent ⇒ all
 //! required; a subset makes the rest optional & skippable), nesting ≤ 8 and ≤ 32 props per object;
 //! `string` (with `minLength`/`maxLength` in Unicode code points), `integer` (with inclusive
@@ -74,9 +75,9 @@ use ferric_llama::qwen3::Qwen3;
 use ferric_llama::qwen35::Qwen35;
 use ferric_tensor::Tensor;
 
-/// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid** (gated delta net
-/// + periodic full attention). Both expose a `forward_cached` returning logits, so the generate loop and
-/// guided decoding are architecture-agnostic; only the KV/recurrent cache type differs.
+/// The loaded model — a dense Qwen3/Llama/Gemma/Phi, or the Qwen3.5/3.6 **GDN-hybrid**
+/// (gated delta net plus periodic full attention). Both expose a `forward_cached` returning logits,
+/// so the generate loop and guided decoding are architecture-agnostic; only the cache type differs.
 pub(crate) enum Model { Dense(Qwen3), Hybrid(Qwen35), Lfm2(ferric_llama::lfm2::Lfm2), Gemma4(ferric_llama::gemma4::Gemma4), DeepSeek2(ferric_llama::deepseek2::DeepSeek2), NemotronH(ferric_llama::nemotron_h::NemotronH), Hyv4(ferric_llama::hyv4::Hyv4) }
 pub(crate) enum ModelCache { Dense(qwen3::Cache), Hybrid(qwen35::Cache), Lfm2(ferric_llama::lfm2::Cache), Gemma4(ferric_llama::gemma4::Cache), DeepSeek2(ferric_llama::deepseek2::Cache), NemotronH(ferric_llama::nemotron_h::Cache), Hyv4(ferric_llama::hyv4::Hyv4Cache) }
 impl Model {
@@ -402,8 +403,6 @@ pub(crate) struct Engine {
     add_space_prefix: bool,
     tokens: Vec<String>,
     u2b: HashMap<char, u8>,
-    im_start: Option<u32>,
-    im_end: Option<u32>,
     bos_id: Option<u32>,
     add_bos: bool,
     /// `tokenizer.ggml.eos_token_id` + `add_eos_token` — embedding models (Qwen3-Embedding) append EOS
@@ -431,8 +430,6 @@ pub(crate) struct Engine {
     /// Special tokens after which the authors' tokenizer strips whitespace (`AddedToken(rstrip=True)`). A
     /// GGUF does not record the flag; it is restored from the authors' `tokenizer.json` per family.
     rstrip_after: std::collections::HashSet<u32>,
-    /// The GGUF `chat_template` string (used only to detect the model's template family).
-    template: String,
     /// One-slot prompt-prefix cache (hybrid speculative path): the last request's fed tokens plus
     /// the carried main + draft caches. Multi-turn chat re-sends the whole conversation; when the
     /// new prompt extends the cached tokens, only the new suffix is prefilled. Output is identical
@@ -575,13 +572,12 @@ impl Engine {
         let mut eos: Vec<u32> = Vec::new();
         if let Some(e) = eos_id { eos.push(e); }
         let im_end = vocab.get("<|im_end|>").copied();
-        let im_start = vocab.get("<|im_start|>").copied();
-        if let Some(e) = im_end { if !eos.contains(&e) { eos.push(e); } }
-        if let Some(&e) = vocab.get("<|endoftext|>") { if !eos.contains(&e) { eos.push(e); } }
+        if let Some(e) = im_end && !eos.contains(&e) { eos.push(e); }
+        if let Some(&e) = vocab.get("<|endoftext|>") && !eos.contains(&e) { eos.push(e); }
         // Gemma ends a turn with <end_of_turn>; Phi-3 with <|end|> — treat both as stop tokens.
         // Llama 3.1+ ends a tool-call message with <|eom_id|> ("end of message", more to come from the tool),
         // which llama.cpp also treats as end-of-generation; without it a tool call ran to max_tokens.
-        for t in ["<end_of_turn>", "<|end|>", "<|eom_id|>"] { if let Some(&e) = vocab.get(t) { if !eos.contains(&e) { eos.push(e); } } }
+        for t in ["<end_of_turn>", "<|end|>", "<|eom_id|>"] { if let Some(&e) = vocab.get(t) && !eos.contains(&e) { eos.push(e); } }
         // Dispatch through the architecture REGISTRY, which refuses anything this runtime has not been
         // taught. The previous form was `if starts_with("qwen35") … else { Dense }`, and that `else`
         // was a catch-all: a gemma4 / deepseek2 / glm4 / minimax / hunyuan checkpoint loaded as a dense
@@ -702,7 +698,7 @@ impl Engine {
                 Err(e) => { eprintln!("ferric-serve: ⚠ {e}; falling back to the vocabulary-family template"); None }
             }
         };
-        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, im_start, im_end, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, template, prefix: std::cell::RefCell::new(None), spec_gate, aux: shared.aux.clone(), card, chat_template, reasoning_markers, energy: shared.energy.clone(), responses: shared.responses.clone(), metrics: shared.metrics.clone(),
+        Engine { ctx, model, bpe, spm, add_space_prefix, tokens, u2b, bos_id, add_bos, eos_id, add_eos, pooling, eos, name, token_bytes, specials, prefix: std::cell::RefCell::new(None), spec_gate, aux: shared.aux.clone(), card, chat_template, reasoning_markers, energy: shared.energy.clone(), responses: shared.responses.clone(), metrics: shared.metrics.clone(),
                  prefix_cache: {
                      let n: usize = std::env::var("FERRIC_PREFIX_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
                      (n > 0).then(|| std::cell::RefCell::new(ferric_llama::prefix::PrefixCache::new(n)))
@@ -726,9 +722,8 @@ impl Engine {
             // find the earliest special-token occurrence
             let mut best: Option<(usize, &str, u32)> = None;
             for (s, id) in &self.specials {
-                if let Some(pos) = rest.find(s.as_str()) {
-                    if best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
-                }
+                if let Some(pos) = rest.find(s.as_str())
+                    && best.map(|(bp, _, _)| pos < bp).unwrap_or(true) { best = Some((pos, s, *id)); }
             }
             match best {
                 // Every text fragment here starts the string or follows a special token, and a
@@ -822,7 +817,7 @@ impl Engine {
         let n = self.model.n_embd();
         let mut ids = self.enc(text, true);
         // Qwen3-Embedding (add_eos_token) appends EOS and pools ITS hidden state; append it to match.
-        if self.add_eos { if let Some(e) = self.eos_id { ids.push(e); } }
+        if self.add_eos && let Some(e) = self.eos_id { ids.push(e); }
         // Empty input: keep the response's vectors equal-length (a zero vector), not a []; some clients
         // build a matrix over a batch and a ragged row breaks them.
         if ids.is_empty() { return Ok(vec![0.0; n]); }
@@ -858,9 +853,8 @@ impl Engine {
     pub(crate) fn batchable(&self) -> bool {
         if std::env::var("FERRIC_NOBATCH").is_ok() { return false; }
         if !self.model.supports_batching() { return false; }
-        if let Model::Hybrid(m) = &self.model {
-            if m.mtp.is_some() && std::env::var("FERRIC_NOSPEC").is_err() { return false; }
-        }
+        if let Model::Hybrid(m) = &self.model
+            && m.mtp.is_some() && std::env::var("FERRIC_NOSPEC").is_err() { return false; }
         true
     }
 
@@ -888,28 +882,26 @@ impl Engine {
         if let Some(t) = &self.chat_template {
             // Templates read `content` as a string, and tool-call `arguments` as an object (OpenAI clients
             // send a JSON string; vLLM parses it the same way before templating).
-            let msgs: Vec<Value> = messages.iter().map(|m| prepare_for_template(m)).collect();
+            let msgs: Vec<Value> = messages.iter().map(prepare_for_template).collect();
             let text = t.render(&msgs, tools, true, kwargs)?;
             let mut ids = self.encode_special(&text);
-            if self.spm.is_some() && self.add_bos {
-                if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
-            }
+            if self.spm.is_some() && self.add_bos
+                && let Some(b) = self.bos_id && ids.first() != Some(&b) { ids.insert(0, b); }
             return Ok(ids);
         }
         if !self.has_chat_family() {
             // No recognized chat family in the vocab → a base model — plain concatenation.
             let text: String = messages.iter().map(|m| format!("{}: {}\n", m["role"].as_str().unwrap_or("user"), genopts::content_text(&m["content"]).unwrap_or_default())).collect();
             let mut ids = Vec::new();
-            if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
+            if self.add_bos && let Some(b) = self.bos_id { ids.push(b); }
             ids.extend(self.enc(&text, true));
             return Ok(ids);
         }
         let mut ids = self.encode_special(&self.render_chat(messages));
         // SentencePiece templates (Phi-3/Mistral) don't embed BOS; add_bos prepends it. (BPE templates
         // like Llama-3 carry their own <|begin_of_text|>, so guard on it not already leading.)
-        if self.spm.is_some() && self.add_bos {
-            if let Some(b) = self.bos_id { if ids.first() != Some(&b) { ids.insert(0, b); } }
-        }
+        if self.spm.is_some() && self.add_bos
+            && let Some(b) = self.bos_id && ids.first() != Some(&b) { ids.insert(0, b); }
         Ok(ids)
     }
 
@@ -963,7 +955,7 @@ impl Engine {
     /// A raw prompt's ids: BOS when the model adds one, then the text — no chat template.
     pub(crate) fn encode_prompt(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
+        if self.add_bos && let Some(b) = self.bos_id { ids.push(b); }
         ids.extend(self.enc(text, true));
         ids
     }
@@ -1149,9 +1141,8 @@ impl Engine {
             }
         }
         // Prompt-lookup speculation (opt-in): dense runtime, f32 cache, no constraint, no image.
-        if let (Some(k), true, None, Model::Dense(_)) = (lookup_k(), guide.is_none(), opts.image.as_ref(), &self.model) {
-            if crate::qwen3_cache_is_f32() { return self.generate_lookup(prompt, max_tokens, opts, k, on_delta); }
-        }
+        if let (Some(k), true, None, Model::Dense(_)) = (lookup_k(), guide.is_none(), opts.image.as_ref(), &self.model)
+            && crate::qwen3_cache_is_f32() { return self.generate_lookup(prompt, max_tokens, opts, k, on_delta); }
         // ⛔ An image prompt never touches the prefix cache: two images of one size are the SAME ids.
         let mm = opts.image.clone();
         let (mut cache, skip) = if mm.is_some() { (self.model.new_cache(), 0) } else { self.seeded_cache(prompt, &opts.lora) };
@@ -1492,11 +1483,10 @@ fn prepare_for_template(m: &Value) -> Value {
     }
     if let Some(calls) = m.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
         for c in calls {
-            if let Some(f) = c.get_mut("function") {
-                if let Some(a) = f.get("arguments").and_then(|a| a.as_str()).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            if let Some(f) = c.get_mut("function")
+                && let Some(a) = f.get("arguments").and_then(|a| a.as_str()).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                     f["arguments"] = a;
                 }
-            }
         }
     }
     m
@@ -1703,7 +1693,7 @@ pub fn run() {
             // Debug: print the prompt token ids (BOS + first-fragment prefix), to diff against llama-tokenize.
             let text = args.get(i + 1).cloned().unwrap_or_default();
             let mut ids = Vec::new();
-            if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
+            if eng.add_bos && let Some(b) = eng.bos_id { ids.push(b); }
             ids.extend(eng.enc(&text, true));
             eprintln!("TOKENS {}: {:?}", ids.len(), ids);
             return;
@@ -2265,7 +2255,7 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     // llama-server's `/completion` takes `grammar`; vLLM's completions take `guided_*` — both here.
     let spec = match eng.constraint(&req) { Ok(s) => s, Err(e) => return bad_request(stream, &e) };
     let mut ids = Vec::new();
-    if eng.add_bos { if let Some(b) = eng.bos_id { ids.push(b); } }
+    if eng.add_bos && let Some(b) = eng.bos_id { ids.push(b); }
     ids.extend(eng.enc(prompt_text, true));
     let max = match eng.budget(ids.len(), &opts) { Ok(m) => m, Err(e) => return bad_request(stream, &e) };
     let cid = format!("cmpl-ferric-{}", ids.len());
@@ -2312,7 +2302,8 @@ fn completions(eng: &Engine, stream: &mut TcpStream, body: &[u8]) {
     }));
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>, Vec<(String, String)>)> {
+type HttpRequest = (String, String, Vec<u8>, Vec<(String, String)>);
+fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     let peer = stream.try_clone().ok()?;
     let mut reader = BufReader::new(peer);
     let mut line = String::new();
@@ -2453,7 +2444,7 @@ mod tests {
         let m = super::byte_decoder();
         assert_eq!(m.len(), 256, "every byte value must have exactly one printable alias");
         let mut seen = [false; 256];
-        for (_, &b) in m.iter() {
+        for &b in m.values() {
             assert!(!seen[b as usize], "byte {b} is produced by two different characters");
             seen[b as usize] = true;
         }

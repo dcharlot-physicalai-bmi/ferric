@@ -37,10 +37,12 @@ fn physical(n: usize, seeds: usize, seed0: u32) -> (f32, f32) {
             let mut fx = vec![0.0f32; n]; let mut fy = vec![0.0f32; n];
             for i in 0..n { for j in i + 1..n {
                 let (dx, dy) = (x[i] - x[j], y[i] - y[j]); let d = (dx * dx + dy * dy).sqrt() + 1e-6;
-                if d < 2.0 * R { let f = (2.0 * R - d); fx[i] += f * dx / d; fy[i] += f * dy / d; fx[j] -= f * dx / d; fy[j] -= f * dy / d; } } }
+                if d < 2.0 * R { let f = 2.0 * R - d; fx[i] += f * dx / d; fy[i] += f * dy / d; fx[j] -= f * dx / d; fy[j] -= f * dy / d; } } }
             for i in 0..n { // walls
-                if x[i] < R { fx[i] += R - x[i]; } if x[i] > 1.0 - R { fx[i] -= x[i] - (1.0 - R); }
-                if y[i] < R { fy[i] += R - y[i]; } if y[i] > 1.0 - R { fy[i] -= y[i] - (1.0 - R); } }
+                if x[i] < R { fx[i] += R - x[i]; }
+            if x[i] > 1.0 - R { fx[i] -= x[i] - (1.0 - R); }
+                if y[i] < R { fy[i] += R - y[i]; }
+            if y[i] > 1.0 - R { fy[i] -= y[i] - (1.0 - R); } }
             for i in 0..n { x[i] = (x[i] + alpha * fx[i]).clamp(0.0, 1.0); y[i] = (y[i] + alpha * fy[i]).clamp(0.0, 1.0); }
             if valid(&x, &y, n) { solved_at = step + 1; break; }
         }

@@ -52,7 +52,7 @@ fn fnv(seed: u64, data: &[u8]) -> u64 {
 const FNV_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn main() { pollster::block_on(run()); }
@@ -102,7 +102,7 @@ async fn run() {
              union.len(), cfg.top_k + 1);
 
     // ---- the ladder: minimum legal capacity, up to fully resident ----
-    println!("\n  {:>10}  {:>9}  {:>11}  {:>9}   {}", "capacity", "resident", "expert reads", "hit rate", "checksum");
+    println!("\n  {:>10}  {:>9}  {:>11}  {:>9}   checksum", "capacity", "resident", "expert reads", "hit rate");
     println!("  {:-<72}", "");
     let mut reference: Option<Vec<f32>> = None;
     let (mut saw_evict, mut saw_resident) = (false, false);
@@ -165,7 +165,7 @@ async fn run() {
     // keys per layer — exercises the policy for real while keeping the delivered bytes verifiable.
     const LAYERS: u32 = 6;
     println!("\n  --- cache spanning {LAYERS} MoE layers ({} entries) ---", LAYERS as usize * cfg.n_experts);
-    println!("  {:>10}  {:>10}  {:>11}  {:>9}   {}", "capacity", "evictions", "expert reads", "hit rate", "delivered-bytes hash");
+    println!("  {:>10}  {:>10}  {:>11}  {:>9}   delivered-bytes hash", "capacity", "evictions", "expert reads", "hit rate");
     println!("  {:-<80}", "");
     let mut multi_ref: Option<u64> = None;
     let mut evicting_case_seen = false;

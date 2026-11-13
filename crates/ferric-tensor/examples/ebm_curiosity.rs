@@ -25,7 +25,7 @@ use std::sync::Arc;
 const HE: usize = 96;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn ctx_ab(seed: u32) -> (f32, f32) { let a = 0.6 + u(seed, 1) * 0.8; let b = (u(seed, 2) * 2.0 - 1.0) * (a / 2.0); (a, b) }
 fn sols(a: f32, b: f32) -> Vec<(f32, f32)> { let d = a * a - 4.0 * b * b; if d < 0.0 { return vec![]; } let mut v = vec![]; for s in [(a + d.sqrt()) / 2.0, (a - d.sqrt()) / 2.0] { if s > 1e-4 { let y = s.sqrt(); v.push((y, b / y)); v.push((-y, -b / y)); } } v }
 fn correct(a: f32, b: f32, y0: f32, y1: f32) -> bool { (y0 * y0 + y1 * y1 - a).abs() < 0.15 && (y0 * y1 - b).abs() < 0.15 }

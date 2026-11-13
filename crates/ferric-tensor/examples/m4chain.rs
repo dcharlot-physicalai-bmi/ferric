@@ -42,7 +42,7 @@ fn main() {
     println!("qkv 3-chain (immediate): {:.3} ms/iter  (3 waits)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
 
     // the op-DAG: same 3 ops deferred inside batch() → ONE command buffer, ONE wait
-    let _ = ferric_tensor::batch(&ctx, || {
+    ferric_tensor::batch(&ctx, || {
         let _ = x.matmul_bt(&wq);
         let _ = x.matmul_bt(&wk);
         let _ = x.matmul_bt(&wv);
@@ -59,7 +59,7 @@ fn main() {
     println!("qkv 3-chain (deferred):  {:.3} ms/iter  (1 wait)", t0.elapsed().as_secs_f64() / 10.0 * 1e3);
 
     // same-shape deferred: 3 single-op runs, queue-chained → still ONE host wait
-    let _ = ferric_tensor::batch(&ctx, || {
+    ferric_tensor::batch(&ctx, || {
         let _ = x.matmul_bt(&wq);
         let _ = x.matmul_bt(&wq);
         let _ = x.matmul_bt(&wq);

@@ -49,14 +49,15 @@ fn main() {
         let utv = (field[t + 1][i] - field[t - 1][i]) / (2.0 * dt);
         let nz = 1.0 + 0.01 * uni((t * NX + i) as u32, 1);
         let lib = [1.0, uu, ux, uxx, uu * uu, uu * ux, uu * uxx, ux * uxx];
-        for k in 0..K { theta.push(lib[k] * nz); } ut.push(utv * nz); n += 1;
+        for item in lib[..K].iter() { theta.push(*item * nz); } ut.push(utv * nz); n += 1;
     } }
     let mut scale = [1.0f64; K]; for k in 0..K { let mut s = 0.0; for i in 0..n { s += theta[i * K + k] * theta[i * K + k]; } scale[k] = (s / n as f64).sqrt().max(1e-6); }
 
     // STLSQ sparse energy-min
     let mut active = [true; K]; let mut xi = [0.0f64; K];
     for _ in 0..12 { xi = lstsq(&theta, &ut, n, &active, &scale); let mut ch = false;
-        for k in 0..K { let keep = xi[k].abs() > 0.03; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } } if !ch { break; } }
+        for k in 0..K { let keep = xi[k].abs() > 0.03; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } }
+            if !ch { break; } }
 
     println!("\n  TRUE:       u_t = −1.00·u·u_x +{:.2}·u_xx        (ν = {NU})\n", NU);
     let terms: Vec<String> = (0..K).filter(|&k| xi[k].abs() > 0.03).map(|k| format!("{:+.3}·{}", xi[k], NAMES[k])).collect();

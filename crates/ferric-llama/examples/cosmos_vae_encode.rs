@@ -93,7 +93,7 @@ async fn run() {
     let (ph, pw) = (ih / 2, iw / 2);
     let mut patched = vec![0f32; ph * pw * (ic * 4)];
     for c in 0..ic { for hi in 0..ph { for wi in 0..pw { for psh in 0..2 { for psw in 0..2 {
-        let v = img[((c * 1) * ih + (hi * 2 + psh)) * iw + (wi * 2 + psw)] as f32;
+        let v = img[(c * ih + (hi * 2 + psh)) * iw + (wi * 2 + psw)] as f32;
         patched[(hi * pw + wi) * (ic * 4) + (c * 4 + psw * 2 + psh)] = v;
     }}}}}
     let mut x = Tensor::from_vec(&ctx, &patched, &[1, ph, pw, ic * 4]);

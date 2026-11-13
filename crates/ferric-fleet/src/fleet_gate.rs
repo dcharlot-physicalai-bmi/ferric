@@ -104,7 +104,7 @@ pub fn foreign_cpu_fraction(
     self_pid: u32,
     wall_s: f64,
 ) -> Option<f64> {
-    if !(wall_s > 0.0) {
+    if wall_s.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
     let mut parent = std::collections::BTreeMap::new();
@@ -314,7 +314,7 @@ mod tests {
         let mut s = vec![Some(1.0); 59];
         assert!(!settle_outcome(&s).settled);
         s.push(Some(2.5));
-        s.extend(std::iter::repeat(Some(1.0)).take(60));
+        s.extend(std::iter::repeat_n(Some(1.0), 60));
         let done = settle_outcome(&s);
         assert!(done.settled);
         assert_eq!(done.samples.len(), 120);

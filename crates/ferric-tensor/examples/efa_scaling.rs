@@ -17,7 +17,7 @@ const MOVES: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
 fn randn(n: usize, seed: u32, scale: f32) -> Vec<f32> {
-    (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * scale }).collect()
+    (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * scale }).collect()
 }
 fn clampc(v: i32) -> usize { v.max(0).min(G as i32 - 1) as usize }
 fn next_pos(p: (usize, usize), a: usize) -> (usize, usize) { (clampc(p.0 as i32 + MOVES[a].0), clampc(p.1 as i32 + MOVES[a].1)) }

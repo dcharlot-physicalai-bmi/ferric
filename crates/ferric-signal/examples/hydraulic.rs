@@ -82,6 +82,10 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
+type TokenRuns = Vec<Vec<Vec<u32>>>;
+type Arm = (&'static str, TokenRuns, HashSet<u32>);
+type Cell = (String, TokenRuns, Sequencer);
+
 /// (name, samples per cycle, samples per patch). Patch length is one second of machine time where
 /// that is at least eight samples, and ten seconds otherwise.
 const CHANNELS: &[(&str, usize, usize)] = &[
@@ -314,7 +318,7 @@ fn main() {
     // permutation that shortcut survives and the signal does not, which is what makes the two
     // separable at all.
     if args.iter().any(|a| a == "--control") {
-        let order = shuffled(labels.len(), 0xBADC_0DE);
+        let order = shuffled(labels.len(), 0x0BAD_C0DE);
         labels = order.iter().map(|&i| labels[i].clone()).collect();
         println!("  CONTROL: cycle-to-caption assignment permuted");
     }
@@ -381,8 +385,8 @@ fn main() {
     let mut trained: Option<Vec<(usize, EncoderConfig, EncoderWeights)>> = None;
     if tok_steps > 0 {
         println!("  TOKENIZER TRAINING  {tok_steps} steps per patch length, train cycles only");
-        println!("  {:>6} {:>8} {:>10} {:>12} {:>12} {:>10}  {}",
-                 "patch", "blocks", "step 0", "final", "held MSE", "held SNR", "digest");
+        println!("  {:>6} {:>8} {:>10} {:>12} {:>12} {:>10}  digest",
+                 "patch", "blocks", "step 0", "final", "held MSE", "held SNR");
         println!("  {:->6} {:->8} {:->10} {:->12} {:->12} {:->10}  {:->12}", "", "", "", "", "", "", "");
         let mut out = Vec::new();
         for &p in &lengths {
@@ -417,7 +421,7 @@ fn main() {
     }
 
     // ---- tokenize, one arm per tokenizer ----
-    let mut arms: Vec<(&str, Vec<Vec<Vec<u32>>>, HashSet<u32>)> = Vec::new();
+    let mut arms: Vec<Arm> = Vec::new();
     let (pc, codes) = tokenize(&ctx, &q, &untrained, &patches, n);
     arms.push(("untrained", pc, codes));
     if let Some(t) = &trained {
@@ -536,7 +540,7 @@ fn main() {
 
     // Every (tokenizer, vocabulary) cell runs at the SAME seeds, so a difference between cells is
     // a difference between cells and not between draws.
-    let mut cells: Vec<(String, Vec<Vec<Vec<u32>>>, Sequencer)> = Vec::new();
+    let mut cells: Vec<Cell> = Vec::new();
     for (name, pc, _) in &arms {
         for v in &vocabs {
             match *v {

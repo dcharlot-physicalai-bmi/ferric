@@ -23,7 +23,7 @@ fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<
         let shape: Vec<usize> = after[sh_s..sh_e].split(',').filter(|s| !s.is_empty()).map(|s| s.trim().parse().unwrap()).collect();
         let of_s = after.find("\"data_offsets\":[").unwrap() + 16; let of_e = after[of_s..].find(']').unwrap() + of_s;
         let offs: Vec<usize> = after[of_s..of_e].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        let vals: Vec<f32> = data[offs[0]..offs[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let vals: Vec<f32> = data[offs[0]..offs[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         out.push((name, shape, vals)); rest = &after[of_e..]; }
     Ok(out)
 }
@@ -40,9 +40,9 @@ fn mlp_vec(w: &[Vec<f32>], b1: &[f32], w2: &[f32], b2: &[f32], w3: &[f32], b3: &
 }
 // exact ∂E/∂a for the scalar relu MLP (backprop; action inputs at indices 8,9)
 fn grad_a2(w: &[Vec<f32>], b1: &[f32], w2: &[f32], b2: &[f32], w3: &[f32], f: &[f32]) -> (f32, f32) {
-    let mut h1 = vec![0.0f32; H]; let mut m1 = vec![false; H];
+    let mut h1 = vec![0.0f32; H]; let mut m1 = [false; H];
     for j in 0..H { let mut z = b1[j]; for c in 0..f.len() { z += f[c] * w[c][j]; } m1[j] = z > 0.0; h1[j] = z.max(0.0); }
-    let mut m2 = vec![false; H];
+    let mut m2 = [false; H];
     for j in 0..H { let mut z = b2[j]; for k in 0..H { z += h1[k] * w2[k * H + j]; } m2[j] = z > 0.0; }
     let mut d2 = vec![0.0f32; H]; for j in 0..H { if m2[j] { d2[j] = w3[j]; } }
     let mut d1 = vec![0.0f32; H]; for k in 0..H { if m1[k] { let mut z = 0.0; for j in 0..H { z += w2[k * H + j] * d2[j]; } d1[k] = z; } }
@@ -52,7 +52,7 @@ fn grad_a2(w: &[Vec<f32>], b1: &[f32], w2: &[f32], b2: &[f32], w3: &[f32], f: &[
 fn get<'a>(t: &'a [(String, Vec<usize>, Vec<f32>)], n: &str) -> &'a Vec<f32> { &t.iter().find(|(nm, _, _)| nm == n).unwrap().2 }
 fn getv(t: &[(String, Vec<usize>, Vec<f32>)], prefix: &str, n: usize) -> Vec<Vec<f32>> { (0..n).map(|c| get(t, &format!("{prefix}.in{c}")).clone()).collect() }
 fn cfg_num(cfg: &str, key: &str) -> f32 { let i = cfg.find(&format!("\"{key}\"")).unwrap(); let rest = &cfg[i..]; let c = rest.find(':').unwrap();
-    rest[c + 1..].trim_start().split(|ch: char| ch == ',' || ch == '}' || ch == '\n').next().unwrap().trim().parse().unwrap() }
+    rest[c + 1..].trim_start().split([',', '}', '\n']).next().unwrap().trim().parse().unwrap() }
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "/Users/dcharlot/vibe-coding/efa/models/efa-hybrid-arm2".into());

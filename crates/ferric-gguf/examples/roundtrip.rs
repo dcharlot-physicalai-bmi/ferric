@@ -5,7 +5,7 @@ use ferric_gguf::{parse, quant_q1_0, quant_q2_0, quant_q4_0, quant_q8_0, quant_t
 use half::f16;
 
 fn w_str(o: &mut Vec<u8>, s: &str) { o.extend_from_slice(&(s.len() as u64).to_le_bytes()); o.extend_from_slice(s.as_bytes()); }
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.3 + s).sin())).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (i as f32 * 0.3 + s).sin()).collect() }
 fn maxrel(a: &[f32], b: &[f32]) -> f32 { let den = b.iter().map(|v| v.abs()).fold(1e-6, f32::max); a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) / den }
 
 fn main() {

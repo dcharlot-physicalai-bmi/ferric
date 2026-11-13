@@ -183,11 +183,10 @@ fn check_historical(
     require_nonempty(src, "excerpt", e);
     require_enum(src, "kind", &["prose", "in_tree_gate", "audit"], e);
     require_nonempty(src, "git_commit", e);
-    if let Some(c) = src.get("git_commit").and_then(|v| v.as_str()) {
-        if !is_hex(c, 7, 40) {
+    if let Some(c) = src.get("git_commit").and_then(|v| v.as_str())
+        && !is_hex(c, 7, 40) {
             e.push("source.git_commit is 7 to 40 lowercase hex characters".into());
         }
-    }
     require_date(src, "date", e);
     require_nonempty(src, "author_name", e);
     let email = src.get("author_email").and_then(|v| v.as_str()).unwrap_or("");
@@ -725,11 +724,10 @@ fn check_energy_pass(obj: &Map<String, Value>, e: &mut Vec<String>, require_wind
     }
     require_finite(en, "gross_joules", e);
     require_finite(en, "above_idle_joules", e);
-    if let Some(j) = en.get("above_idle_joules").and_then(|v| v.as_f64()) {
-        if j < 0.0 {
+    if let Some(j) = en.get("above_idle_joules").and_then(|v| v.as_f64())
+        && j < 0.0 {
             e.push("above_idle_joules below zero is an unresolved baseline, not a pass".into());
         }
-    }
     if en.get("boundary_gross").and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
         || en.get("boundary_above_idle").and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
     {
@@ -836,13 +834,13 @@ pub fn check_protocol(text: &str) -> Vec<String> {
         e.push("missing <!-- ferric-accept-protocol ... --> header".into());
         return e;
     };
-    let id = header_value(&header, "id");
-    let track = header_value(&header, "track");
+    let id = header_value(header, "id");
+    let track = header_value(header, "track");
     if !id.starts_with(&(track.clone() + ".")) || track.len() != 1 || !"ABCDEF".contains(track.as_str()) {
         e.push(format!("protocol id `{id}` must start with its track `{track}.`"));
     }
     for h in REQUIRED_PROTOCOL_HEADINGS {
-        if !text.lines().any(|l| l == &format!("## {h}")) {
+        if !text.lines().any(|l| l == format!("## {h}")) {
             e.push(format!("missing heading `## {h}`"));
         }
     }
@@ -881,8 +879,8 @@ pub fn check_issue(text: &str) -> Vec<String> {
         e.push("missing <!-- ferric-accept-issue ... --> header".into());
         return e;
     };
-    let track = header_value(&header, "track");
-    let title = header_value(&header, "title");
+    let track = header_value(header, "track");
+    let title = header_value(header, "title");
     if track.len() != 1 || !"ABCDEF".contains(track.as_str()) {
         e.push(format!("issue track `{track}` is not A-F"));
     }
@@ -890,7 +888,7 @@ pub fn check_issue(text: &str) -> Vec<String> {
         e.push("issue title is shorter than 20 characters".into());
     }
     for h in REQUIRED_ISSUE_HEADINGS {
-        if !text.lines().any(|l| l == &format!("## {h}")) {
+        if !text.lines().any(|l| l == format!("## {h}")) {
             e.push(format!("missing heading `## {h}`"));
         }
     }
@@ -1170,7 +1168,7 @@ pub fn check_corpus(root: &Path) -> Vec<String> {
                 e.push(format!("{}: {msg}", ent.file_name().to_string_lossy()));
             }
             if let Some(h) = header_block(&text, "ferric-accept-protocol") {
-                tracks_p.insert(header_value(&h, "track"));
+                tracks_p.insert(header_value(h, "track"));
             }
             if ent.file_name().to_string_lossy().starts_with('C') {
                 for needle in [
@@ -1187,9 +1185,9 @@ pub fn check_corpus(root: &Path) -> Vec<String> {
                     }
                 }
             }
-            if ent.file_name().to_string_lossy().starts_with('B') {
-                if let Some(cells) = read_json(&acc.join("corpus/fabric-cells.json"), &mut Vec::new()) {
-                    if let Some(arr) = cells.get("cells").and_then(|c| c.as_array()) {
+            if ent.file_name().to_string_lossy().starts_with('B')
+                && let Some(cells) = read_json(&acc.join("corpus/fabric-cells.json"), &mut Vec::new())
+                    && let Some(arr) = cells.get("cells").and_then(|c| c.as_array()) {
                         for c in arr {
                             let id = c.get("cell_id").and_then(|v| v.as_str()).unwrap_or("");
                             if !text.contains(id) {
@@ -1197,8 +1195,6 @@ pub fn check_corpus(root: &Path) -> Vec<String> {
                             }
                         }
                     }
-                }
-            }
         }
     }
     if let Ok(rd) = fs::read_dir(acc.join("issues")) {
@@ -1208,7 +1204,7 @@ pub fn check_corpus(root: &Path) -> Vec<String> {
                 e.push(format!("{}: {msg}", ent.file_name().to_string_lossy()));
             }
             if let Some(h) = header_block(&text, "ferric-accept-issue") {
-                tracks_i.insert(header_value(&h, "track"));
+                tracks_i.insert(header_value(h, "track"));
             }
         }
     }
@@ -1237,11 +1233,10 @@ fn author_is_physicalai(email: &str) -> bool {
 
 fn reject_openie(obj: &Map<String, Value>, e: &mut Vec<String>) {
     for key in ["email", "account"] {
-        if let Some(s) = obj.get("actor").and_then(|a| a.get(key)).and_then(|v| v.as_str()) {
-            if s.to_ascii_lowercase().contains("openie") {
+        if let Some(s) = obj.get("actor").and_then(|a| a.get(key)).and_then(|v| v.as_str())
+            && s.to_ascii_lowercase().contains("openie") {
                 e.push(format!("actor.{key} is an OpenIE identity; remote attribution must not use it"));
             }
-        }
     }
 }
 

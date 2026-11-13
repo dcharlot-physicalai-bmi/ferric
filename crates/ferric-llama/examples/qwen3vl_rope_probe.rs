@@ -29,7 +29,7 @@ async fn run() {
     let mut probe = vec![0f32; t * head_dim];
     for i in 0..t { for c in 0..half { probe[i * head_dim + c] = 1.0; } }
     let x = Tensor::from_vec(&ctx, &probe, &[t, head_dim]);
-    let out = x.rope_mrope(1, head_dim, base, &pos, sections, MropeMode::Interleaved).to_vec().await;
+    let _out = x.rope_mrope(1, head_dim, base, &pos, sections, MropeMode::Interleaved).to_vec().await;
 
     // ⛔ ONE-HOT POSITIONS, not a difference. A first attempt compared two tokens whose w
     // differed by 1 and called a sector "unmoved" below 1e-6 — but inv_freq[58] is 8.5e-7, so the
@@ -52,7 +52,7 @@ async fn run() {
         let inv = (-2.0 * c as f64 / head_dim as f64 * lb).exp();
         let mut hit = Vec::new();
         for (k, r) in runs.iter().enumerate() {
-            let (cs, sn) = (r[1 * head_dim + c] as f64, r[1 * head_dim + c + half] as f64);
+            let (cs, sn) = (r[head_dim + c] as f64, r[head_dim + c + half] as f64);
             // angle is exactly inv (this component) or exactly 0 (not) — compare against inv/2
             if sn.atan2(cs).abs() > inv / 2.0 { hit.push(k); }
         }

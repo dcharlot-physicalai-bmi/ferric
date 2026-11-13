@@ -123,7 +123,7 @@ async fn run() {
     // B != A assertion needs.
     let blk_bytes = |seed: u64, n: usize| -> Vec<u8> {
         let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut v: Vec<u8> = (0..n).map(|_| {
+        let v: Vec<u8> = (0..n).map(|_| {
             st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (st >> 33) as u8
         }).collect();

@@ -185,6 +185,7 @@ impl ReasoningBudget {
         (self.state == BudgetState::Forcing).then(|| self.forced.get(self.force_pos).copied()).flatten()
     }
     /// llama.cpp's `common_reasoning_budget_force`: from COUNTING only, start forcing now.
+    #[cfg_attr(not(test), allow(dead_code))] // the tests drive a forced stop; the serve loop uses forced_token
     pub fn force(&mut self) -> bool {
         if self.state != BudgetState::Counting { return false; }
         self.state = BudgetState::Forcing;
@@ -245,7 +246,7 @@ pub(crate) fn model_sampling_defaults(meta: &std::collections::HashMap<String, f
         if let Some(v) = num(key) { out.insert(field.into(), f(v)); }
     }
     for (key, field) in [("top_k", "top_k"), ("penalty_last_n", "repeat_last_n")] {
-        if let Some(v) = num(key) { if v >= 0.0 { out.insert(field.into(), serde_json::json!(v as i64)); } }
+        if let Some(v) = num(key) && v >= 0.0 { out.insert(field.into(), serde_json::json!(v as i64)); }
     }
     match num("mirostat") {
         Some(m) if m == 0.0 || m == 2.0 => { out.insert("mirostat".into(), serde_json::json!(m as i64)); }
@@ -487,9 +488,8 @@ pub(crate) fn apply_dry(scores: &mut [f32], context: &[u32], multiplier: f32, ba
         *e = (*e).max(len);
     }
     for (t, len) in lengths {
-        if len >= allowed {
-            if let Some(x) = scores.get_mut(t as usize) { *x -= multiplier * base.powi((len - allowed) as i32); }
-        }
+        if len >= allowed
+            && let Some(x) = scores.get_mut(t as usize) { *x -= multiplier * base.powi((len - allowed) as i32); }
     }
 }
 
@@ -626,13 +626,12 @@ pub(crate) fn sample(row: &[f32], s: &Sampling, prompt: &[u32], generated: &[u32
         let zk: f64 = ps[..k].iter().sum();
         let r = next_unit(rng) as f64;
         let (mut acc, mut pick) = (0.0f64, 0usize);
-        for j in 0..k { acc += ps[j] / zk; if acc >= r { pick = j; break; } pick = j; }
+        for (j, p) in ps[..k].iter().enumerate() { acc += p / zk; if acc >= r { pick = j; break; } pick = j; }
         s.mirostat_mu.set(mirostat_update(mu as f64, ps[pick] / zk, s.mirostat_tau as f64, s.mirostat_eta as f64) as f32);
         return cand[pick] as u32;
     }
-    if s.xtc_probability > 0.0 && next_unit(rng) < s.xtc_probability {
-        if let Some(kept) = xtc_filter(&cand, &probs, s.xtc_threshold, &s.xtc_specials) { cand = kept; }
-    }
+    if s.xtc_probability > 0.0 && next_unit(rng) < s.xtc_probability
+        && let Some(kept) = xtc_filter(&cand, &probs, s.xtc_threshold, &s.xtc_specials) { cand = kept; }
     let tot: f32 = cand.iter().map(|&i| probs[i]).sum();
     let r = next_unit(rng) * tot;
     let (mut acc, mut pick) = (0.0f32, cand[0]);
@@ -922,7 +921,8 @@ mod tests {
     fn run(e: &mut Emitter, pieces: &[&str]) -> String {
         let mut full = String::new();
         let mut out = String::new();
-        for p in pieces { full.push_str(p); if let Some(d) = e.update(&full) { out.push_str(&d); } if e.hit_stop { break; } }
+        for p in pieces { full.push_str(p); if let Some(d) = e.update(&full) { out.push_str(&d); }
+            if e.hit_stop { break; } }
         if let Some(d) = e.flush() { out.push_str(&d); }
         out
     }

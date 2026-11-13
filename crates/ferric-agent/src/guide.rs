@@ -139,6 +139,12 @@ impl Json {
     }
 }
 
+impl Default for Json {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===== JSON-Schema-conformant decoding =====
 // A schema compiles to a flat template: fixed structural literals (`{"key":`, `,"key":`, `}`) with
 // typed value slots between them, properties emitted in declaration order (compact, no free
@@ -461,7 +467,7 @@ impl<'a> Schema<'a> {
             Val::Str(n @ 2..=5, c) => { if b.is_ascii_hexdigit() { self.val = if n == 5 { Val::Str(0, c.saturating_add(1)) } else { Val::Str(n + 1, c) }; true } else { false } }
             Val::Str(6, c) => { if (0x80..0xC0).contains(&b) { self.val = Val::Str(0, c.saturating_add(1)); true } else { false } } // last continuation → code point complete
             Val::Str(7, c) => { if (0x80..0xC0).contains(&b) { self.val = Val::Str(6, c); true } else { false } }
-            Val::Str(8, c) => { if (0x80..0xC0).contains(&b) { self.val = Val::Str(7, c); true } else { false } }
+            Val::Str(8, c) if (0x80..0xC0).contains(&b) => { self.val = Val::Str(7, c); true }
             _ => false,
         }
     }
@@ -716,6 +722,14 @@ impl<'a> Guide<'a> {
         match self { Guide::Grammar(m) => m.token_allows(id), _ => false }
     }
     pub fn wants_token(&self) -> bool { matches!(self, Guide::Grammar(m) if m.wants_token()) }
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // helper for grammar tests that drive Json to a finished value
+pub(crate) fn accepts_top(s: &str) -> bool {
+    let mut j = Json::new();
+    for &b in s.as_bytes() { if !j.step(b) { return false; } }
+    j.can_stop()
 }
 
 #[cfg(test)]
@@ -1077,11 +1091,4 @@ mod tests {
         assert!(!ok("42", true));         // bare number rejected in object mode
         assert!(ok("[1,2]", false));      // array fine in general mode
     }
-}
-
-#[cfg(test)]
-pub(crate) fn accepts_top(s: &str) -> bool {
-    let mut j = Json::new();
-    for &b in s.as_bytes() { if !j.step(b) { return false; } }
-    j.can_stop()
 }

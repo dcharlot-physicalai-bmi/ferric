@@ -23,7 +23,7 @@ pub use energy_drive::{
     EnergySeries, Grade, LiveConfig, LockHold, MacmonAttempt, MacmonConfig, LOAD1_MAX, LOCK_PATH, SETTLE_S,
 };
 pub use macmon::{
-    incremental_joules, integrate, overlaps, parse_line, parse_proc_load1, parse_sysctl_loadavg, pipe_args,
+    incremental_joules, integrate, mean_power, overlaps, parse_line, parse_proc_load1, parse_sysctl_loadavg, pipe_args,
     Reading, Sampler, BUSY_FRACTION_REASON, PINNING, PINNING_REASON,
 };
 pub use meter::{

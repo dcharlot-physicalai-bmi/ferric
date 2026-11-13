@@ -71,7 +71,7 @@ impl EncoderConfig {
     }
 
     pub fn validate(&self) -> Result<(), PatchError> {
-        if self.d_model == 0 || self.n_heads == 0 || self.d_model % self.n_heads != 0 {
+        if self.d_model == 0 || self.n_heads == 0 || !self.d_model.is_multiple_of(self.n_heads) {
             return Err(PatchError::Ragged { len: self.d_model, channels: self.n_heads });
         }
         if self.patch_len == 0 || self.latent_dim == 0 || self.n_layers == 0 || self.d_ff == 0 {
@@ -127,7 +127,7 @@ impl EncoderConfig {
 /// even; an odd width would leave the final channel with a sine and no matching cosine, which is a
 /// silent half-feature rather than an error.
 pub fn sinusoidal_positions(t_len: usize, d: usize) -> Result<Vec<f32>, PatchError> {
-    if d == 0 || d % 2 != 0 {
+    if d == 0 || !d.is_multiple_of(2) {
         return Err(PatchError::Ragged { len: d, channels: 2 });
     }
     let mut out = vec![0.0f32; t_len * d];

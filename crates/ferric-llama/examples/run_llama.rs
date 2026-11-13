@@ -4,7 +4,7 @@
 use ferric_core::max_abs_diff;
 use ferric_core::Context;
 use ferric_llama::{Config, Llama};
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
 fn main() { pollster::block_on(run()); }
 async fn run() {
     // ⛔ THIS EXAMPLE TAKES NO ARGUMENTS, AND SAYING SO IS THE POINT. It runs a FIXED 2-layer

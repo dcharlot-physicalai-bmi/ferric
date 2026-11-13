@@ -93,7 +93,7 @@ impl Fsq {
     /// Total number of distinct codes: the product of the level counts.
     #[inline]
     pub fn codebook_size(&self) -> u32 {
-        self.levels.iter().fold(1u32, |a, &l| a * l)
+        self.levels.iter().product()
     }
 
     /// Half-width and offset for one dimension, following the paper's bounding function.
@@ -105,7 +105,7 @@ impl Fsq {
     fn bound_params(l: u32) -> (f32, f32, f32) {
         const EPS: f32 = 1e-3;
         let half_l = (l as f32 - 1.0) * (1.0 - EPS) / 2.0;
-        let offset = if l % 2 == 0 { 0.5f32 } else { 0.0f32 };
+        let offset = if l.is_multiple_of(2) { 0.5f32 } else { 0.0f32 };
         // `tan`, NOT `atanh`. Reading "shift the tanh so the levels stay symmetric" as an inverse
         // hyperbolic tangent is the intuitive move and it is wrong: at L=2 the argument is
         // 0.5/0.4995 > 1, atanh is undefined there, and the shift comes out NaN. The tokenizer

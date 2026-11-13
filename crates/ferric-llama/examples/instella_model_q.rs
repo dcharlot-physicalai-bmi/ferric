@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const EPS: f32 = 1e-6;
-const SCALING: f32 = 0.16562687709876717;
+const SCALING: f32 = 0.165_626_88;
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

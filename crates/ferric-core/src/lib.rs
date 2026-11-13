@@ -213,7 +213,7 @@ impl Context {
         let adapter = adapters.into_iter().nth(idx).ok_or_else(|| format!("no adapter at index {idx}"))?;
         let info = adapter.get_info();
         let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP);
-        let max_binding = wgpu::Limits::downlevel_defaults().max_storage_buffer_binding_size as u64;
+        let max_binding = wgpu::Limits::downlevel_defaults().max_storage_buffer_binding_size;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ferric"),
@@ -420,8 +420,8 @@ impl Context {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let gx = (m + 15) / 16;
-            let gy = (n + 15) / 16;
+            let gx = m.div_ceil(16);
+            let gy = n.div_ceil(16);
             pass.dispatch_workgroups(gx, gy, 1);
         }
         // copy to a mappable staging buffer for readback

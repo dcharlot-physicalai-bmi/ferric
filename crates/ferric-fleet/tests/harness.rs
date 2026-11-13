@@ -7,7 +7,7 @@ use ferric_fleet::{
 #[test]
 fn model_and_joint_step_stay_unrun() {
     assert_eq!(MODEL_RECEIPTS, 0);
-    assert!(!JOINT_STEP_EXECUTED);
+    const _: () = assert!(!JOINT_STEP_EXECUTED);
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn real_state_proj_column_matches_the_weight_file() {
     assert_eq!(y.len(), 960);
     assert!((y[0] - (-0.13992482)).abs() < 1e-6, "{}", y[0]);
     assert!((y[1] - (-0.08349697)).abs() < 1e-6, "{}", y[1]);
-    assert!((y[2] - (-0.13289170)).abs() < 1e-6, "{}", y[2]);
+    assert!((y[2] - (-0.132_891_7)).abs() < 1e-6, "{}", y[2]);
     assert!((y[3] - 0.04185394).abs() < 1e-6, "{}", y[3]);
     let full = std::path::Path::new("/tmp/smolvla/model.safetensors");
     if full.exists() {

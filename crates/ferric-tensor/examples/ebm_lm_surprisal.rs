@@ -23,7 +23,7 @@ const HE: usize = 96;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 // true generative process: each context (c1,c2) has a peaked-preference softened by a temperature τ that rises
 // with (c1+c2) → a smooth entropy gradient from near-deterministic (low surprisal) to near-uniform (high).
@@ -99,7 +99,7 @@ async fn run() {
     }
     // model fit: KL(true‖model) per context (sanity that the LM learned the distribution)
     let pfin = y.softmax(1).value().to_vec().await;
-    let mut work = vec![0.0f32; NC]; let mut steps95 = vec![0.0f32; NC]; let mut efinal = vec![0.0f32; NC]; let mut kl = vec![0.0f32; NC];
+    let mut work = vec![0.0f32; NC]; let mut steps95 = vec![0.0f32; NC]; let mut efinal = vec![0.0f32; NC]; let mut kl = [0.0f32; NC];
     for c in 0..NC {
         let e0 = etraj[0][c]; let ef = etraj[kmax][c]; efinal[c] = ef;
         let drop = (e0 - ef).max(1e-6);

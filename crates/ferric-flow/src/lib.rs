@@ -317,7 +317,7 @@ mod tests {
         out_batches.push(reducer.step(vec![]));
 
         for o in &orders {
-            let jd = join.step(vec![o.clone()], vec![]);
+            let jd = join.step(vec![*o], vec![]);
             // reshape join output (customer, amount, region) → (region, amount) for the reducer
             let red_in: Vec<((String, i64), Diff)> =
                 jd.iter().map(|((_, amt, region), d)| ((region.clone(), *amt), *d)).collect();
@@ -350,11 +350,12 @@ mod tests {
         // The final aggregate must reflect only the corrected truth — Pathway's "handles corrected data".
         let mut reducer =
             Reduce::new(|m: &BTreeMap<i64, Diff>| m.iter().map(|(v, d)| v * d).sum::<i64>());
-        let mut outs = Vec::new();
-        outs.push(reducer.step(vec![(("acct".to_string(), 100), 1)])); // wrong: 100
-        outs.push(reducer.step(vec![(("acct".to_string(), 5), 1)])); // add a correct 5 → 105
-        // correction: that 100 was wrong, it should have been 10
-        outs.push(reducer.step(vec![(("acct".to_string(), 100), -1), (("acct".to_string(), 10), 1)]));
+        let outs = vec![
+            reducer.step(vec![(("acct".to_string(), 100), 1)]), // wrong: 100
+            reducer.step(vec![(("acct".to_string(), 5), 1)]), // add a correct 5 → 105
+            // correction: that 100 was wrong, it should have been 10
+            reducer.step(vec![(("acct".to_string(), 100), -1), (("acct".to_string(), 10), 1)]),
+        ];
         let final_state = accumulate(&outs);
         assert_eq!(final_state, vec![(("acct".to_string(), 15), 1)], "correction did not converge to 5+10");
     }

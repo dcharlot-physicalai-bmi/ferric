@@ -19,7 +19,7 @@ use std::sync::Arc;
 fn init_scale(w: &[f32], indim: usize, outdim: usize) -> Vec<f32> {
     let mut s = vec![0f32; outdim];
     for i in 0..indim { let b = i * outdim; for j in 0..outdim { s[j] += w[b + j].abs(); } }
-    for j in 0..outdim { s[j] = (s[j] / indim as f32).max(1e-8); }
+    for item in s[..outdim].iter_mut() { *item = (*item / indim as f32).max(1e-8); }
     s
 }
 // LSQ forward: ŵ = clamp(round(w/s),-1,1)·s, per-output-channel s. [indim,outdim] row-major.
@@ -44,7 +44,7 @@ fn lsq_grads(gg: &[f32], w: &[f32], s: &[f32], indim: usize, outdim: usize) -> (
         wgrad[b + j] = if inr { gg[b + j] } else { 0.0 };
         sgrad[j] += gg[b + j] * if inr { wbar - r } else { wbar };
     }}
-    for j in 0..outdim { sgrad[j] *= scale_g; }
+    for item in sgrad[..outdim].iter_mut() { *item *= scale_g; }
     (wgrad, sgrad)
 }
 

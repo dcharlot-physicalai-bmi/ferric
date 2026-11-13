@@ -241,7 +241,7 @@ impl Naming {
                     "conv.bn.bias" => "conv.batch_norm.bias",
                     "conv.bn.running_mean" => "conv.batch_norm.running_mean",
                     "conv.bn.running_var" => "conv.batch_norm.running_var",
-                    o if o.starts_with("attn.") => return format!("encoder.layers.{il}.self_{}", &o[..]),
+                    o if o.starts_with("attn.") => return format!("encoder.layers.{il}.self_{}", o),
                     o => o,
                 };
                 format!("encoder.layers.{il}.{r}")
@@ -397,11 +397,11 @@ impl Cfg {
         let mut att_ctx_choices: Vec<(usize, usize)> = match md.get("stt.parakeet.encoder.att_context_size_choices") {
             Some(Meta::Arr(a)) => {
                 let v: Vec<i64> = a.iter().filter_map(|m| match m { Meta::U(x) => Some(*x as i64), Meta::I(x) => Some(*x), _ => None }).collect();
-                v.chunks_exact(2).filter(|c| c[0] >= 0 && c[1] >= 0).map(|c| (c[0] as usize, c[1] as usize)).collect()
+                v.as_chunks::<2>().0.iter().filter(|c| c[0] >= 0 && c[1] >= 0).map(|c| (c[0] as usize, c[1] as usize)).collect()
             }
             _ => Vec::new(),
         };
-        if let Some(c) = att_ctx { if !att_ctx_choices.contains(&c) { att_ctx_choices.push(c); } }
+        if let Some(c) = att_ctx && !att_ctx_choices.contains(&c) { att_ctx_choices.push(c); }
 
         let sample_rate = ua("stt.frontend.sample_rate", "asr.preprocessor.sample_rate")?;
         // asr states window/stride in SECONDS; parakeet in SAMPLES. Convert once, here.
@@ -430,7 +430,7 @@ impl Cfg {
         let causal_sub = {
             let stages = subsampling_factor.trailing_zeros();
             let (mut fs, mut fc) = (num_mels, num_mels);
-            for _ in 0..stages { fs = (fs + 1) / 2; fc = fc / 2 + 1; }
+            for _ in 0..stages { fs = fs.div_ceil(2); fc = fc / 2 + 1; }
             let w = g.tensor(naming.pre_out()).map(|t| t.dims[0] as usize).ok_or("missing the pre_encode projection")?;
             if w == subsampling_channels * fs { false }
             else if w == subsampling_channels * fc { true }
@@ -936,7 +936,7 @@ pub mod frontend {
         let half = cfg.n_fft / 2;
         let mut padded = vec![0f32; half];
         padded.extend_from_slice(&x);
-        padded.extend(std::iter::repeat(0.0).take(half));
+        padded.extend(std::iter::repeat_n(0.0, half));
         // PAD=reflect: torch's `pad_mode="reflect"`, NeMo 1.x's STFT — x[half]..x[1] on the left,
         // x[n-2]..x[n-1-half] on the right. Only frames within half a window of an end see it.
         if neg.pad_reflect && x.len() > half {
@@ -1322,17 +1322,10 @@ impl Parakeet {
             let (lo, hi) = (r0.iter().cloned().fold(f32::MAX, f32::min),
                             r0.iter().cloned().fold(f32::MIN, f32::max));
             eprintln!("       [last] row0 mean={mu0:.4} var={va0:.3e} min={lo:.4} max={hi:.4}  \
-                       first8={:?}", &r0[..8].iter().map(|z| (z * 1e3).round() / 1e3).collect::<Vec<_>>());
+                       first8={:?}", r0[..8].iter().map(|z| (z * 1e3).round() / 1e3).collect::<Vec<_>>());
         }
         b.norm_out.apply(&x, Self::EPS)
     }
-
-    /// Transformer-XL relative-position attention.
-    ///
-    /// `score = (q + u)·kᵀ + (q + v)·posᵀ`, the second term shifted so entry `(i, j)` reads relative
-    /// offset `i - j`. `u` and `v` are the learned content and position biases (`pos_bias_u/v`);
-    /// folding them into one term, or dropping the shift, both yield finite scores and a model that
-    /// attends to the wrong places.
 
     /// The `chunked_limited` additive attention mask, `[T, T]`, or `None` for full context.
     ///
@@ -1357,6 +1350,12 @@ impl Parakeet {
         Some(Tensor::from_vec(&self.ctx, &chunked_limited_mask(t, left, right), &[t, t]))
     }
 
+    /// Transformer-XL relative-position attention.
+    ///
+    /// `score = (q + u)·kᵀ + (q + v)·posᵀ`, the second term shifted so entry `(i, j)` reads relative
+    /// offset `i - j`. `u` and `v` are the learned content and position biases (`pos_bias_u/v`);
+    /// folding them into one term, or dropping the shift, both yield finite scores and a model that
+    /// attends to the wrong places.
     fn rel_pos_attn(&self, x: &Tensor, a: &RelPosAttn, pos: &Tensor, mask: Option<&Tensor>) -> Tensor {
         let (t, nh) = (x.shape[0], self.cfg.n_heads);
         let hd = self.cfg.d_model / nh;
@@ -1970,6 +1969,7 @@ impl Parakeet {
     }
 
     /// `FERRIC_ASR_DEBUG` / `FERRIC_ASR_NOBLANK` output for the first joint call at frame `t`.
+    #[allow(clippy::too_many_arguments)] // the diagnostic prints the joint's three vectors and both debug flags together
     fn joint_diagnostics(&self, host: &RnntHost, t: usize, ep: &[f32], pp: &[f32], logits: &[f32],
                          dbg: bool, noblank: bool) {
         let jh = self.cfg.joint_hidden;

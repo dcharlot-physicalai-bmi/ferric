@@ -83,22 +83,32 @@ impl Iv {
         if self.lo <= 0.0 && self.hi >= 0.0 { 0.0 } else { self.lo.abs().min(self.hi.abs()) }
     }
 
+    /// Sum, widened outward. Inherent so callers do not import `Add`: Rust 1.100
+    /// does not put the operator traits in the method-call prelude.
     #[inline]
-    pub fn add(self, o: Iv) -> Iv { outward(self.lo + o.lo, self.hi + o.hi) }
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, o: Iv) -> Iv { add_iv(self, o) }
 
+    /// Difference, widened outward. The lower bound uses the other interval's upper end.
     #[inline]
-    pub fn sub(self, o: Iv) -> Iv { outward(self.lo - o.hi, self.hi - o.lo) }
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(self, o: Iv) -> Iv { sub_iv(self, o) }
 
+    /// Exact negation. It never rounds.
     #[inline]
-    pub fn neg(self) -> Iv { Iv { lo: -self.hi, hi: -self.lo } } // exact: negation never rounds
+    #[allow(clippy::should_implement_trait)]
+    pub fn neg(self) -> Iv { neg_iv(self) }
 
-    /// Product. All four corner products, because a sign change inside either operand moves the extrema
-    /// off the corners of the naive `[lo*lo, hi*hi]` guess.
+    /// Product of every pair of endpoints. A sign change inside either operand moves the
+    /// extrema off the corners of the naive `[lo*lo, hi*hi]` guess.
     #[inline]
-    pub fn mul(self, o: Iv) -> Iv {
-        let (a, b, c, d) = (self.lo * o.lo, self.lo * o.hi, self.hi * o.lo, self.hi * o.hi);
-        outward(a.min(b).min(c).min(d), a.max(b).max(c).max(d))
-    }
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(self, o: Iv) -> Iv { mul_iv(self, o) }
+
+    /// Quotient. `None` when the denominator straddles zero: that range is unbounded.
+    #[inline]
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, o: Iv) -> Option<Iv> { div_iv(self, o) }
 
     #[inline]
     pub fn scale(self, k: f64) -> Iv {
@@ -129,8 +139,6 @@ impl Iv {
         if self.lo <= 0.0 && self.hi >= 0.0 { return None; }
         Some(outward(1.0 / self.hi, 1.0 / self.lo))
     }
-
-    pub fn div(self, o: Iv) -> Option<Iv> { Some(self.mul(o.recip()?)) }
 
     /// Monotone increasing function applied at both ends. Correct for `exp`, `sinh`, odd powers, etc.
     #[inline]
@@ -179,6 +187,42 @@ impl Iv {
         let m = self.mid();
         (Iv { lo: self.lo, hi: m }, Iv { lo: m, hi: self.hi })
     }
+}
+
+fn add_iv(a: Iv, b: Iv) -> Iv { outward(a.lo + b.lo, a.hi + b.hi) }
+fn sub_iv(a: Iv, b: Iv) -> Iv { outward(a.lo - b.hi, a.hi - b.lo) }
+fn neg_iv(a: Iv) -> Iv { Iv { lo: -a.hi, hi: -a.lo } }
+fn mul_iv(a: Iv, b: Iv) -> Iv {
+    let (p, q, r, s) = (a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi);
+    outward(p.min(q).min(r).min(s), p.max(q).max(r).max(s))
+}
+fn div_iv(a: Iv, b: Iv) -> Option<Iv> { Some(mul_iv(a, b.recip()?)) }
+
+// Sum, difference, product, and quotient. The quotient is `None` when the denominator
+// straddles zero, because that range is unbounded. Negation is exact.
+impl std::ops::Add for Iv {
+    type Output = Iv;
+    fn add(self, o: Iv) -> Iv { add_iv(self, o) }
+}
+
+impl std::ops::Sub for Iv {
+    type Output = Iv;
+    fn sub(self, o: Iv) -> Iv { sub_iv(self, o) }
+}
+
+impl std::ops::Neg for Iv {
+    type Output = Iv;
+    fn neg(self) -> Iv { neg_iv(self) }
+}
+
+impl std::ops::Mul for Iv {
+    type Output = Iv;
+    fn mul(self, o: Iv) -> Iv { mul_iv(self, o) }
+}
+
+impl std::ops::Div for Iv {
+    type Output = Option<Iv>;
+    fn div(self, o: Iv) -> Option<Iv> { div_iv(self, o) }
 }
 
 #[cfg(test)]

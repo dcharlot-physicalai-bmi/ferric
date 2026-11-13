@@ -32,7 +32,7 @@
 //!
 //!   cargo run -p ferric-gguf --example quant_real_weights --release -- <model.gguf>
 use ferric_gguf::quantize::{encode_q2_k_super, quantize_q3_k};
-use ferric_gguf::{deq_raw, GgufFile, GgufSource};
+use ferric_gguf::{deq_raw, GgufFile};
 
 const Q2_K: u32 = 10;
 const Q3_K: u32 = 11;
@@ -74,7 +74,7 @@ fn main() {
         // Ferric: both priced, better kept — and count how often the unconventional one wins.
         let mut both = Vec::with_capacity(n / 256 * 84);
         let mut neg = 0usize;
-        for sb in w.chunks_exact(256) {
+        for sb in w.as_chunks::<256>().0 {
             let (ba, sa) = encode_q2_k_super(sb, 3, 1.0);
             let (bb, sbb) = encode_q2_k_super(sb, 3, -1.0);
             conv.extend_from_slice(&ba);

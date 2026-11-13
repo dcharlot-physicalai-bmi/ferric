@@ -28,7 +28,7 @@
 //! ceiling is reached, or the generator stops on its own. That division is deliberate: adequacy is
 //! domain knowledge, accounting is not.
 
-use crate::{Meter, Reading, measure};
+use crate::{Meter, Reading};
 
 /// Why generation ended. Every one of these is reported; none is silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,21 +141,18 @@ impl Budget {
         let start = meter.read_joules();
         let t0 = std::time::Instant::now();
         let mut tokens = 0usize;
-        let mut stop = Stop::Natural;
 
-        loop {
-            if tokens >= self.max_tokens { stop = Stop::TokenLimit; break; }
-            if !step() { stop = Stop::Natural; break; }
+        let stop = loop {
+            if tokens >= self.max_tokens { break Stop::TokenLimit; }
+            if !step() { break Stop::Natural; }
             tokens += 1;
 
-            if adequacy.adequate(tokens) { stop = Stop::Adequate; break; }
+            if adequacy.adequate(tokens) { break Stop::Adequate; }
 
-            if tokens % self.check_every == 0 {
-                if let (Some(a), Some(b)) = (start, meter.read_joules()) {
-                    if b - a >= self.ceiling_joules { stop = Stop::Exhausted; break; }
-                }
-            }
-        }
+            if tokens.is_multiple_of(self.check_every)
+                && let (Some(a), Some(b)) = (start, meter.read_joules())
+                    && b - a >= self.ceiling_joules { break Stop::Exhausted; }
+        };
 
         let reading = match (start, meter.read_joules()) {
             (Some(a), Some(b)) if b >= a => Some(Reading {
@@ -255,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ceiling_that_bites_produces_an_INCOMPLETE_outcome() {
+    fn a_ceiling_that_bites_produces_an_incomplete_outcome() {
         // Truncation is allowed, but it is never silent. This is the whole contract.
         let m = Step::new(10.0);
         let b = Budget::new(25.0).max_tokens(1000).check_every(1);

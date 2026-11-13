@@ -156,12 +156,11 @@ pub fn resolve(arg: &str) -> Result<Target, String> {
         let dir = hub.join(r.dir_name());
         let names: Vec<String> = std::fs::read_dir(&dir).map(|rd| rd.flatten()
             .filter_map(|e| e.file_name().to_str().map(str::to_string)).filter(|n| is_gguf(n)).collect()).unwrap_or_default();
-        if !names.is_empty() {
-            if let Ok(set) = crate::pull::select(&names, r.tag.as_deref()) {
+        if !names.is_empty()
+            && let Ok(set) = crate::pull::select(&names, r.tag.as_deref()) {
                 let m = LocalModel::from_file(&dir.join(&set[0]));
                 if m.missing == 0 { return Ok(Target::Local(m)); }
             }
-        }
         return Ok(Target::Hf(r));
     }
     Ok(Target::Name(arg.to_string()))

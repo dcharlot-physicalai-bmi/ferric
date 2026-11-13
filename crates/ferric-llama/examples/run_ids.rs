@@ -114,7 +114,7 @@ async fn run() {
         let mut census = ferric_tensor::op_census();
         if !census.is_empty() {
             let toks = out.len().max(1) as f64;
-            census.sort_by(|a, b| b.1.cmp(&a.1));
+            census.sort_by_key(|a| std::cmp::Reverse(a.1));
             println!("\n  per-kernel dispatches (per token):");
             for (k, n) in census.iter().take(24) {
                 println!("    {:<34} {:>7.2}", k, *n as f64 / toks);

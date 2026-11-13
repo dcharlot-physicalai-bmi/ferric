@@ -62,7 +62,7 @@ impl Arm {
 #[derive(Clone)]
 struct Stack { q: [f32; 2], qd: [f32; 2], puck: [f32; 2], pv: [f32; 2], tgt: [f32; 2] }
 impl Stack {
-    fn new(arm: &Arm, seed: u32) -> Stack {
+    fn new(_arm: &Arm, seed: u32) -> Stack {
         let tgt = [(u(seed, 1) * 2.0 - 1.0) * 0.7, -0.4 - u(seed, 2) * 0.9];       // targets in the lower workspace
         let puck = [(u(seed, 3) * 2.0 - 1.0) * 0.5, -0.5 - u(seed, 4) * 0.6];
         // start the arm with its fingertip behind the puck (opposite the target)
@@ -132,7 +132,7 @@ async fn run() {
     // the fragile velocity micro-test tracks worse near workspace boundaries; the unambiguous validation is the
     // end-to-end task success through the full articulation→contact stack (below).
     println!("  [0] fingertip-velocity tracking (informational, boundary-sensitive): mean |v_ee − cmd| = {:.3} of {:.2}", terr, nrm(cmd));
-    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(&arm, k, |a, s| demo_v(a, s)); dd += d; if d < TOL { dok += 1; } }
+    let (mut dok, mut dd) = (0, 0.0f32); for k in 0..200u32 { let d = episode(&arm, k, demo_v); dd += d; if d < TOL { dok += 1; } }
     println!("      scripted commander through the FULL STACK: reach {:.0}% · mean final distance {:.3}", dok as f32 / 2.0, dd / 200.0);
     // ── distill the EFA flow through the full stack (CFM to the scripted commander over on-policy states) ──
     println!("\n  distilling the EFA flow (obs 8 → {H} → {H} → 2 fingertip-velocity; CFM to the commander):");
@@ -158,7 +158,7 @@ async fn run() {
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
         if it % 4000 == 3999 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
-    let mut w = Vec::new(); for c in 0..fin { w.push(fp[c].to_vec().await); }
+    let mut w = Vec::new(); for item in fp[..fin].iter() { w.push(item.to_vec().await); }
     let net = Net { w, b1: fp[fin].to_vec().await, w2: fp[fin + 1].to_vec().await, b2: fp[fin + 2].to_vec().await, w3: fp[fin + 3].to_vec().await, b3: fp[fin + 4].to_vec().await };
     println!("\n  the card — full-stack reach (puck within {:.2}; 200 episodes):", TOL);
     for kk in [1usize, 2, 4] { let (mut ok, mut md) = (0, 0.0f32);

@@ -7,7 +7,7 @@ use ferric_tensor::ws;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 0.21 + s).sin())) * 0.3).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.21 + s).sin()) * 0.3).collect() }
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
 
 fn main() {

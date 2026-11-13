@@ -356,8 +356,8 @@ fn main() {
     // what pairs this with a training run — check them before pairing anything.
     if args.iter().any(|a| a == "--baseline-only") {
         println!("\n  MATCHED-BIT-RATE BASELINE ONLY. No model is trained or evaluated here.");
-        println!("\n  {:<12} {:>8} {:>12} {:>10}  {}",
-                 "corpus", "windows", "MSE", "SNR", "strongest coder");
+        println!("\n  {:<12} {:>8} {:>12} {:>10}  strongest coder",
+                 "corpus", "windows", "MSE", "SNR");
         println!("  {:-<12} {:->8} {:->12} {:->10}  {:->16}", "", "", "", "", "");
         for c in &corpora {
             let (mse, code) = best_dct_baseline(c.held.iter().flat_map(|b| b.chunks(PATCH())));
@@ -571,8 +571,8 @@ fn main() {
     // the whole claim a universal tokenizer makes is about the hard ones.
     println!("\n  HELD-OUT RECONSTRUCTION, PER CORPUS");
     println!("  recordings the training set never touched.\n");
-    println!("  {:<12} {:>8} {:>12} {:>10} {:>12} {:>12}  {}",
-             "corpus", "windows", "MSE", "SNR", "1-coef DCT", "codes used", "coder");
+    println!("  {:<12} {:>8} {:>12} {:>10} {:>12} {:>12}  coder",
+             "corpus", "windows", "MSE", "SNR", "1-coef DCT", "codes used");
     println!("  {:-<12} {:->8} {:->12} {:->10} {:->12} {:->12}", "", "", "", "", "", "");
     let mut all_codes: HashSet<u32> = HashSet::new();
     for c in &corpora {

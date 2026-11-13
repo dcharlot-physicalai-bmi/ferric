@@ -28,7 +28,7 @@ use ferric_gguf::{deq_raw, GgufFile};
 /// alternate. The threshold sweep is what STQ1_0 does not get to have.
 fn free_ternary(xb: &[f32], w: &[f32]) -> (Vec<i8>, f32, usize) {
     let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-    if !(amax > 0.0) { return (vec![0; xb.len()], 0.0, xb.len()) }
+    if amax.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { return (vec![0; xb.len()], 0.0, xb.len()) }
     let (mut best_sel, mut best_d, mut best_err) = (vec![0i8; xb.len()], 0.0f32, f32::INFINITY);
     for step in 0..=40 {
         let t = amax * step as f32 / 80.0;
@@ -39,9 +39,9 @@ fn free_ternary(xb: &[f32], w: &[f32]) -> (Vec<i8>, f32, usize) {
             num += w[j] * q * xb[j];
             den += w[j] * q * q;
         }
-        if !(den > 0.0) { continue }
+        if den.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { continue }
         let d = num / den;
-        if !(d > 0.0) { continue }
+        if d.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { continue }
         let err: f32 = (0..xb.len()).map(|j| { let r = xb[j] - d * sel[j] as f32; w[j] * r * r }).sum();
         if err < best_err { best_err = err; best_d = d; best_sel = sel; }
     }
@@ -93,7 +93,7 @@ fn main() -> Result<(), String> {
 
         let mut sse_free = 0.0f64;
         let mut zeros = 0usize;
-        for xb in x.chunks_exact(256) {
+        for xb in x.as_chunks::<256>().0 {
             let w = ls_weights(xb);
             let (sel, d, z) = free_ternary(xb, &w);
             zeros += z;

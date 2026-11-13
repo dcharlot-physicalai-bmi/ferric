@@ -6,8 +6,8 @@ async fn run() {
     let ctx = Arc::new(Context::new().await.unwrap());
     println!("backend {:?} · {} · coop_matrix={} subgroups={}", ctx.backend, ctx.adapter_name, ctx.coop_matrix, ctx.subgroups);
     if !ctx.coop_gemm_ok() { println!("⏭  coop matrix not usable here"); return; }
-    let a: Vec<f32> = (0..64).map(|i| ((i as f32 * 0.1).sin())).collect();
-    let b: Vec<f32> = (0..64).map(|i| ((i as f32 * 0.07).cos())).collect();
+    let a: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+    let b: Vec<f32> = (0..64).map(|i| (i as f32 * 0.07).cos()).collect();
     let got = ferric_tensor::run_coop_matmul_test(&ctx, &a, &b).await;
     // CPU reference C = A·B, row-major 8×8
     let mut exp = vec![0f32; 64];

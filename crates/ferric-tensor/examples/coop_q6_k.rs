@@ -1,5 +1,5 @@
 //! Q6_K tensor-core prefill matmul vs scalar — used by every K-quant model's embed/output.
-use ferric_core::Context; use ferric_gguf::deq_raw; use ferric_tensor::{Q6_KWeights, Tensor};
+use ferric_core::Context;  use ferric_tensor::{Q6_KWeights, Tensor};
 use std::sync::Arc; use std::time::Instant; use half::f16;
 fn q6k_block(seed:u32)->Vec<u8>{let mut b=vec![0u8;210];
  for i in 0..128u32{b[i as usize]=((seed.wrapping_add(i.wrapping_mul(2246822519)))%256)as u8;}

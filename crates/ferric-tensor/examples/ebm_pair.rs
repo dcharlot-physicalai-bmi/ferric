@@ -17,7 +17,7 @@ const TESTG: [f32; 4] = [-1.5, -0.5, 0.5, 1.5];
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(th: f32, om: f32, uu: f32) -> (f32, f32) { let no = om + DT * (-th.sin() - 0.05 * om + uu.clamp(-UMAX, UMAX)); (wrap(th + DT * no), no) }
 fn feat5(th: f32, om: f32, g: f32) -> [f32; 5] { let d = th - g; [d.cos(), d.sin(), om, th.cos(), th.sin()] }
@@ -33,7 +33,7 @@ impl Vn {
 // flow velocity field v(s,a,t): [5 state, a, t] → scalar velocity (relu hidden, linear out)
 struct Fl { w: [Vec<f32>; 7], b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: f32 }
 impl Fl {
-    fn vel(&self, th: f32, om: f32, g: f32, a: f32, t: f32) -> f32 { let mut f = [0.0f32; 7]; let ff = feat5(th, om, g); for c in 0..5 { f[c] = ff[c]; } f[5] = a; f[6] = t;
+    fn vel(&self, th: f32, om: f32, g: f32, a: f32, t: f32) -> f32 { let mut f = [0.0f32; 7]; let ff = feat5(th, om, g); f[..5].copy_from_slice(&ff); f[5] = a; f[6] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..7 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.b3; for j in 0..H { o += h2[j] * self.w3[j]; } o }
@@ -42,7 +42,7 @@ impl Fl {
 // verify energy E(s,a): [5 state, a, a²] → scalar (softplus ≥0), LOW on good actions
 struct Ev { w: [Vec<f32>; 7], b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: f32 }
 impl Ev {
-    fn eval(&self, th: f32, om: f32, g: f32, a: f32) -> f32 { let mut f = [0.0f32; 7]; let ff = feat5(th, om, g); for c in 0..5 { f[c] = ff[c]; } f[5] = a; f[6] = a * a;
+    fn eval(&self, th: f32, om: f32, g: f32, a: f32) -> f32 { let mut f = [0.0f32; 7]; let ff = feat5(th, om, g); f[..5].copy_from_slice(&ff); f[5] = a; f[6] = a * a;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..7 { z += f[c] * self.w[c][j]; } h1[j] = (z.exp() + 1.0).ln(); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = (z.exp() + 1.0).ln(); }
         let mut o = self.b3; for j in 0..H { o += h2[j] * self.w3[j]; } (o.exp() + 1.0).ln() }
@@ -119,7 +119,8 @@ async fn run() {
     let nep = 60usize; let n = nep * TESTG.len();
     let mut inits = vec![]; let mut goals = vec![]; for (gi, &g) in TESTG.iter().enumerate() { for e in 0..nep { let sd = (gi * nep + e) as u32; inits.push(((u(900 + sd, 7) * 2.0 - 1.0) * PI, 0.0f32)); goals.push(g); } }
     // (a) flow actuation reach%
-    let mut reach = 0; for i in 0..n { let (mut th, mut om) = inits[i]; let g = goals[i]; for _ in 0..220 { let a = fl.act(th, om, g, 2); let (nt, no) = step(th, om, a); th = nt; om = no; } if wrap(th - g).abs() < 0.3 && om.abs() < 0.6 { reach += 1; } }
+    let mut reach = 0; for i in 0..n { let (mut th, mut om) = inits[i]; let g = goals[i]; for _ in 0..220 { let a = fl.act(th, om, g, 2); let (nt, no) = step(th, om, a); th = nt; om = no; }
+            if wrap(th - g).abs() < 0.3 && om.abs() < 0.6 { reach += 1; } }
     // (b) verify accuracy: over random (state,goal), does E rank u* below a random bad action? + does flow's action get low E?
     let (mut vgood, mut vtot, mut agree) = (0, 0, 0); let ntv = 3000;
     for k in 0..ntv { let th = (u(k as u32, 51) * 2.0 - 1.0) * PI; let om = (u(k as u32, 52) * 2.0 - 1.0) * 3.0; let g = (u(k as u32, 53) * 2.0 - 1.0) * 2.0;

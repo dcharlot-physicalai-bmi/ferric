@@ -23,7 +23,7 @@ fn dataset(n: usize, s: u32) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
     }
     (x, onehot, labels)
 }
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract()) * 0.4).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43_758.547).fract()) * 0.4).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

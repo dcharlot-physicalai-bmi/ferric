@@ -27,7 +27,7 @@ impl Dec {
         let idx = self.idx; self.idx += 1; while self.cache.len() <= idx { self.cache.push(Slot::Empty); }
         let (t, h, w, c) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]); let ct = t.min(2);
         let mut newcache = x.narrow(0, t - ct, ct);
-        if ct < 2 { if let Slot::Frames(prev) = &self.cache[idx] { newcache = prev.narrow(0, prev.shape[0] - 1, 1).cat(&newcache, 0); } }
+        if ct < 2 && let Slot::Frames(prev) = &self.cache[idx] { newcache = prev.narrow(0, prev.shape[0] - 1, 1).cat(&newcache, 0); }
         let xin = match &self.cache[idx] {
             Slot::Frames(prev) => { let lp = 2 * padt - prev.shape[0]; let cat = prev.cat(x, 0); if lp > 0 { self.zeros(lp, h, w, c).cat(&cat, 0) } else { cat } }
             _ => self.zeros(2 * padt, h, w, c).cat(x, 0),
@@ -203,8 +203,8 @@ async fn encode(ctx: &Arc<Context>, w: &HashMap<String, STensor>, img: &[f32]) -
 // ============================ physics scene ============================
 const G: f64 = 9.81; const FLOOR: f64 = 2.0; const WORLDU: f64 = 10.0; const DT: f64 = 0.05;
 fn sim(g: f64, e: f64, floor: bool, n: usize) -> Vec<(f64, f64)> {
-    let (mut x, mut y, mut vx, mut vy) = (3.0f64, 8.0, 1.0, 0.0); let mut tr = Vec::new();
-    for _ in 0..n { tr.push((x, y)); vy -= g * DT; x += vx * DT; y += vy * DT; if floor && y < FLOOR { y = FLOOR; vy = -e * vy; } }
+    let (mut x, mut y, vx, mut vy) = (3.0f64, 8.0, 1.0, 0.0); let mut tr = Vec::new();
+    for _ in 0..n { tr.push((x, y)); vy -= g * DT; x += vx * DT; y += vy * DT; if floor && y < FLOOR { y = FLOOR; vy *= -e; } }
     tr
 }
 // render a ball at world (x,y) to a [3,64,64] image in [-1,1]: bright disk on mid-gray
@@ -272,7 +272,7 @@ async fn run() {
     // ---- SELF-CHECK 2: decode golden frame0 latent -> matches chunk0 (decoder output) ----
     let dg = json_min::parse(&std::fs::read_to_string(format!("{}/.cache/ferric/cosmos_ref/vae_t2_chunks_golden.json", std::env::var("HOME").unwrap())).unwrap());
     let dl = dg.get("lat").as_f64_vec(); let dls = dg.get("lat_shape").as_usize_vec(); let (zc, zt, zh, zw) = (dls[1], dls[2], dls[3], dls[4]);
-    let mut lf = vec![0f32; zh * zw * zc]; for c in 0..zc { for hh in 0..zh { for ww in 0..zw { lf[(hh * zw + ww) * zc + c] = dl[((c * zt + 0) * zh + hh) * zw + ww] as f32; }}}
+    let mut lf = vec![0f32; zh * zw * zc]; for c in 0..zc { for hh in 0..zh { for ww in 0..zw { lf[(hh * zw + ww) * zc + c] = dl[((c * zt) * zh + hh) * zw + ww] as f32; }}}
     // decode frame0 but capture the decoder output (pre-unpatchify) for the golden compare
     dec.cache = Vec::new(); dec.idx = 0;
     let latf = Tensor::from_vec(&ctx, &lf, &[1, zh, zw, zc]);
@@ -281,7 +281,7 @@ async fn run() {
     // chunk0 is decoder output [1,12,1,32,32]; unpatchify it the same way and compare to our recovered [3,64,64]
     let (cc12, cht, chh, chw) = (chs[1], chs[2], chs[3], chs[4]); let oc = cc12 / 4; let mut e2 = 0.0f64;
     for c in 0..oc { for hh in 0..chh { for ww in 0..chw { for a in 0..2 { for bb in 0..2 {
-        let r = chd[(((c * 4 + bb * 2 + a) * cht + 0) * chh + hh) * chw + ww].clamp(-1.0, 1.0);
+        let r = chd[(((c * 4 + bb * 2 + a) * cht) * chh + hh) * chw + ww].clamp(-1.0, 1.0);
         let m = rec0[(c * 64 + hh * 2 + a) * 64 + ww * 2 + bb] as f64; e2 = e2.max((m - r).abs());
     }}}}}
     println!("  self-check DECODE  (golden latent → frame):  Δ={:.2e}  {}\n", e2, if e2 < 3e-3 { "MATCH ✓" } else { "MISMATCH ✗" });

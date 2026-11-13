@@ -689,7 +689,8 @@ mod tests {
     /// The malformed inputs that produce a file no other loader will open.
     #[test]
     fn structurally_invalid_tensors_and_alignments_are_refused() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut GgufWriter)>, &str)> = vec![
+        type Case = (&'static str, Box<dyn Fn(&mut GgufWriter)>, &'static str);
+        let cases: Vec<Case> = vec![
             ("empty name", Box::new(|w: &mut GgufWriter| { w.tensor("", &[32], 8, vec![0; 34]); }), "may not be empty"),
             ("64-byte name", Box::new(|w: &mut GgufWriter| { w.tensor(&"x".repeat(64), &[32], 8, vec![0; 34]); }), "GGML_MAX_NAME"),
             ("duplicate name", Box::new(|w: &mut GgufWriter| { w.tensor("a", &[32], 8, vec![0; 34]); w.tensor("a", &[32], 8, vec![0; 34]); }), "added twice"),

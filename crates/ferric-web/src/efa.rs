@@ -20,7 +20,7 @@ const UMAX: f32 = 4.0;
 struct Net { win: Tensor, b1: Tensor, w2: Tensor, b2: Tensor, w3: Tensor, b3: Tensor }
 struct Efa { ctx: Arc<Context>, pot: Option<Net>, cor: Option<Net>, flow: Option<Net>,
     e1_flow: Option<Net>, e1_pot: Option<Net>, e1_emb: Option<Vec<f32>> }
-thread_local! { static EFA: RefCell<Option<Efa>> = RefCell::new(None); }
+thread_local! { static EFA: RefCell<Option<Efa>> = const { RefCell::new(None) }; }
 
 fn parse_st(bytes: &[u8]) -> HashMap<String, Vec<f32>> {
     let hl = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
@@ -33,7 +33,7 @@ fn parse_st(bytes: &[u8]) -> HashMap<String, Vec<f32>> {
         let name = pre[name_start..name_end].to_string(); let after = &rest[q..];
         let of_s = after.find("\"data_offsets\":[").unwrap() + 16; let of_e = after[of_s..].find(']').unwrap() + of_s;
         let offs: Vec<usize> = after[of_s..of_e].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        let vals: Vec<f32> = data[offs[0]..offs[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let vals: Vec<f32> = data[offs[0]..offs[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         out.insert(name, vals); rest = &after[of_e..];
     }
     out
@@ -81,6 +81,7 @@ pub async fn efa_load(which: u32, bytes: Vec<u8>) -> Result<String, JsValue> {
     Ok(format!("loaded {} tensors on WebGPU", t.len()))
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is one joint angle, rate, goal, or the time the page passes in
 fn feat2(th1: f32, th2: f32, om1: f32, om2: f32, g1: f32, g2: f32, a1: f32, a2: f32, t: f32) -> Vec<f32> {
     let (d1, d2) = (th1 - g1, th2 - g2);
     vec![d1.cos(), d1.sin(), om1, d2.cos(), d2.sin(), om2, th1.sin(), th2.sin(), a1, a2, t]
@@ -89,6 +90,7 @@ fn feat2(th1: f32, th2: f32, om1: f32, om2: f32, g1: f32, g2: f32, a1: f32, a2: 
 /// One hybrid decision on WebGPU: K=2 steps of a ← a + (−κ∇ₐE + w)/K, then the verify readout from the SAME potential.
 /// Returns [u1, u2, e_policy, e_random, ms].
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)] // the page passes each joint's angle, rate, and goal as its own number
 pub async fn efa_hybrid_act(th1: f32, th2: f32, om1: f32, om2: f32, g1: f32, g2: f32, r1: f32, r2: f32) -> Result<Vec<f32>, JsValue> {
     let t0 = js_sys::Date::now();
     let (ctx, pot, cor) = EFA.with(|e| { let e = e.borrow(); let f = e.as_ref().unwrap();
@@ -101,7 +103,7 @@ pub async fn efa_hybrid_act(th1: f32, th2: f32, om1: f32, om2: f32, g1: f32, g2:
         let tt = k as f32 / 2.0;
         let fv = Var::leaf(Tensor::from_vec(&ctx, &feat2(th1, th2, om1, om2, g1, g2, a1, a2, tt), &[1, 11]));
         let e = fwd(&pot, &fv);
-        let gr = grad(&e.sum_all(), &[fv.clone()], None);          // ∇feat E on WebGPU (2nd-order autograd path)
+        let gr = grad(&e.sum_all(), std::slice::from_ref(&fv), None);          // ∇feat E on WebGPU (2nd-order autograd path)
         let gvec = gr[0].value().to_vec().await;
         let w = fwd(&cor, &fv).value().to_vec().await;
         a1 += (-KAPPA * gvec[8] + w[0]) / 2.0;
@@ -123,6 +125,7 @@ fn feat12(nj: usize, th: &[f32], om: &[f32], g: &[f32]) -> [f32; 12] {
 /// if E > τ does it think harder (K=4 — the L2 escalation from config.json). body = joint count (1..3).
 /// r1..r3 = caller-supplied random action for the verify readout. Returns [u1,u2,u3, e, escalated, e_policy, e_random, ms].
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)] // three joints, each with an angle, a rate, and a goal, plus the gate and the random action
 pub async fn efa1_act(body: u32, th1: f32, th2: f32, th3: f32, o1: f32, o2: f32, o3: f32,
                       g1: f32, g2: f32, g3: f32, tau: f32, r1: f32, r2: f32, r3: f32) -> Result<Vec<f32>, JsValue> {
     let t0 = js_sys::Date::now();
@@ -165,6 +168,7 @@ pub async fn efa1_act(body: u32, th1: f32, th2: f32, th3: f32, o1: f32, o2: f32,
 
 /// One flow decision on WebGPU (K=1 forward pass). Returns [u1, u2, u3, ms].
 #[wasm_bindgen]
+#[allow(clippy::too_many_arguments)] // three joints, each with an angle, a rate, and a goal
 pub async fn efa_flow_act(t1: f32, t2: f32, t3: f32, o1: f32, o2: f32, o3: f32, g1: f32, g2: f32, g3: f32) -> Result<Vec<f32>, JsValue> {
     let t0 = js_sys::Date::now();
     let (ctx, fl) = EFA.with(|e| { let e = e.borrow(); let f = e.as_ref().unwrap();

@@ -163,7 +163,7 @@ mod tests {
         let Some(ctx) = ctx() else { return };
         let q = Fsq::signal_15bit();
         let z: Vec<f32> = (0..30).map(|i| ((i * 37) % 23) as f32 * 0.4 - 4.0).collect();
-        let tv = Var::leaf(Tensor::from_vec(&ctx, &vec![0.0f32; 30], &[6, 5]));
+        let tv = Var::leaf(Tensor::from_vec(&ctx, &[0.0f32; 30], &[6, 5]));
 
         let a = Var::leaf(Tensor::from_vec(&ctx, &z, &[6, 5]));
         // Quantize as a detached constant: exactly what a naive implementation does.

@@ -23,7 +23,7 @@
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 #[allow(unused_imports)] use ferric_gguf::GgufFile;
-use ferric_tensor::dtype::{Q2_0Weights, Q4_KWeights, Q6_KWeights, Q8_0Weights};
+use ferric_tensor::dtype::{Q4_KWeights, Q6_KWeights, Q8_0Weights};
 use ferric_tensor::QMatrix;
 // PrismML Bonsai 2: folded weights carry their activation transform; see prism_rot.rs.
 use crate::prism_rot::{rproj, rq, RProj, Rotations, RQ};
@@ -143,7 +143,7 @@ impl Cfg {
         })
     }
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
-    pub fn head_v_dim(&self) -> usize { if self.n_v_heads == 0 { 0 } else { self.d_inner / self.n_v_heads } }
+    pub fn head_v_dim(&self) -> usize { self.d_inner.checked_div(self.n_v_heads).unwrap_or(0) }
     pub fn key_dim(&self) -> usize { self.head_k_dim * self.n_k_heads }
     /// The delta rule's query scale: 1/√d_KEY. The authors (`transformers`' `torch_chunk_gated_delta_rule`,
     /// `1 / query.shape[-1] ** 0.5`) and llama.cpp (`delta-net-base.cpp`, `1.0f / sqrtf(S_k)`) agree.
@@ -152,7 +152,7 @@ impl Cfg {
     /// d_k != d_v would have run with the wrong temperature on every recurrent layer and no error.
     pub fn q_scale(&self) -> f32 { 1.0 / (self.head_k_dim as f32).sqrt() }
     /// llama.cpp: layer is recurrent (linear attention) unless it's every `interval`-th one.
-    pub fn is_recurrent(&self, il: usize) -> bool { (il + 1) % self.full_attention_interval != 0 }
+    pub fn is_recurrent(&self, il: usize) -> bool { !(il + 1).is_multiple_of(self.full_attention_interval) }
 }
 
 pub struct AttnW {
@@ -292,18 +292,26 @@ impl DownSlab {
 }
 
 /// The routed experts' weights, in one of two layouts:
+pub struct MoeSlab {
+    pub gate_up: Q4_KWeights,
+    pub down: DownSlab,
+}
+pub struct MoeSlab8 {
+    pub gate_up: Q8_0Weights,
+    pub down: Q8_0Weights,
+}
 pub enum MoeExperts {
     /// ALL experts packed expert-major into ONE slab per projection — the batched-kernel fast path
     /// (one `matmul_q4_k_swiglu_id` + one down+weighted-sum dispatch for ALL tokens instead of ~2k
     /// per token). Also collapses the buffer count from ~500/layer to 4/layer. Q4_K gate|up with a
     /// Q6_K or Q4_K down (the two formats real Q4_K_M GGUFs use).
-    Slab { gate_up: Q4_KWeights, down: DownSlab },
+    Slab(Box<MoeSlab>),
     /// All-Q8_0 slab — the MTP draft block's expert format.
-    Slab8 { gate_up: Q8_0Weights, down: Q8_0Weights },
+    Slab8(Box<MoeSlab8>),
     /// **A slab holding only C experts, filled on demand.** Runs a MoE whose routed experts do not
     /// fit: the kernel derives its row base as `e * 2*eff` from whatever id `selw` carries, so a
     /// C-expert slab with ids remapped to `[0, C)` runs the SAME kernel unchanged.
-    Streamed(StreamedExperts),
+    Streamed(Box<StreamedExperts>),
     /// One QMatrix pair per expert — the general fallback for other quant combinations.
     /// ⚠️ Routes on the CPU via a mid-forward readback: correct but slow, and the readback lands
     /// inside the caller's `batch()` — avoid for anything on the hot path.
@@ -317,8 +325,8 @@ impl MoeExperts {
     /// thing on a busy box as on an idle one, and it is the quantity streaming exists to reduce.
     pub fn device_bytes(&self) -> u64 {
         (match self {
-            MoeExperts::Slab { gate_up, down } => gate_up.nbytes() + down.nbytes(),
-            MoeExperts::Slab8 { gate_up, down } => gate_up.nbytes() + down.nbytes(),
+            MoeExperts::Slab(s) => s.gate_up.nbytes() + s.down.nbytes(),
+            MoeExperts::Slab8(s) => s.gate_up.nbytes() + s.down.nbytes(),
             MoeExperts::Streamed(st) => return st.slab_bytes(),
             MoeExperts::PerExpert(es) => es.iter().map(|e| e.gate_up.nbytes() + e.down.nbytes()).sum(),
         }) as u64
@@ -346,8 +354,8 @@ impl ferric_tier::Backing for RangeBacking {
 
 /// One expert's gate bytes immediately followed by its up bytes.
 ///
-/// ⚠ The gate|up slab is INTERLEAVED per expert — it matches `swiglu_id`'s `base + o` / `base + eff
-/// + o` addressing — and that interleaving exists nowhere on disk: gate and up are two separate
+/// ⚠ The gate|up slab is INTERLEAVED per expert — it matches `swiglu_id`'s `base + o` /
+/// `base + eff + o` addressing — and that interleaving exists nowhere on disk: gate and up are two separate
 /// tensors. So a per-expert read is two reads, and this is the only place that knows it. Reads must
 /// be whole experts; a partial one would silently straddle the seam between the two tensors.
 #[cfg(not(target_arch = "wasm32"))]
@@ -357,7 +365,7 @@ struct PairBacking { g: RangeBacking, u: RangeBacking, g_per: usize, u_per: usiz
 impl ferric_tier::Backing for PairBacking {
     fn read_at(&self, off: u64, dst: &mut [u8]) -> Result<(), ferric_tier::TierError> {
         let per = (self.g_per + self.u_per) as u64;
-        if off % per != 0 || dst.len() as u64 != per {
+        if !off.is_multiple_of(per) || dst.len() as u64 != per {
             return Err(ferric_tier::TierError::Io(format!(
                 "paired backing serves whole experts only ({per} bytes, aligned); got {} at {off}",
                 dst.len())));
@@ -452,7 +460,7 @@ impl StreamedExperts {
     /// `capacity` means the geometry is wrong, and silently flooring would place every expert past
     /// the first at a drifting offset — plausible weights, wrong ones.
     fn rows_per_expert(&self, rows: usize) -> usize {
-        assert!(self.capacity > 0 && rows % self.capacity == 0,
+        assert!(self.capacity > 0 && rows.is_multiple_of(self.capacity),
                 "slab has {rows} rows for {} experts — not expert-major", self.capacity);
         rows / self.capacity
     }
@@ -511,7 +519,7 @@ pub struct MoeFfn {
 
 pub enum Ffn {
     Dense { gate_up: RProj, gate_out: usize, down: RQ }, // gate|up fused, then down
-    Moe(MoeFfn),
+    Moe(Box<MoeFfn>),
 }
 
 pub struct Layer {
@@ -546,35 +554,6 @@ pub struct Qwen35 {
     pub mtp: Option<Mtp>,
     /// PrismML's Hadamard contract (Bonsai 2), or `None` for an ordinary file.
     pub rot: Option<Arc<Rotations>>,
-}
-
-/// GGUF stores dims fastest-varying first, so a listed `[in, out]` is a row-major `[out, in]`
-/// weight — the HF linear convention, which is what `matmul_q2_0` wants.
-pub(crate) fn q2(ctx: &Arc<Context>, g: &impl GgufSource, name: &str) -> Result<Q2_0Weights, String> {
-    let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
-    if t.ggml_type != 42 { return Err(format!("{name}: expected Q2_0 (42), got {}", t.ggml_type)); }
-    let (inn, out) = (t.dims[0] as usize, t.dims[1] as usize);
-    Ok(Q2_0Weights::from_bytes(ctx, &g.raw(name)?, out, inn))
-}
-
-/// Stack several same-input `[out, in]` weights along the output dim into one `[Σout, in]`.
-/// Q2_0 is row-major (each output row is a contiguous run of 34-byte blocks), so stacking outputs
-/// is literally concatenating the raw byte streams — no repacking. One fused matmul over the group
-/// beats the separate ones at decode width (1.79× measured on gate+up), because a lone-token GEMV
-/// is occupancy-starved and merging the output counts fills the machine.
-pub(crate) fn q2_cat(ctx: &Arc<Context>, g: &impl GgufSource, names: &[&str]) -> Result<Q2_0Weights, String> {
-    let mut inn = None;
-    let mut out = 0usize;
-    let mut raw = Vec::new();
-    for &name in names {
-        let t = g.tensor(name).ok_or_else(|| format!("no tensor '{name}'"))?;
-        if t.ggml_type != 42 { return Err(format!("{name}: expected Q2_0 (42), got {}", t.ggml_type)); }
-        let i = t.dims[0] as usize;
-        if *inn.get_or_insert(i) != i { return Err(format!("{name}: input dim differs")); }
-        out += t.dims[1] as usize;
-        raw.extend(g.raw(name)?);
-    }
-    Ok(Q2_0Weights::from_bytes(ctx, &raw, out, inn.unwrap()))
 }
 
 pub(crate) fn f32t(ctx: &Arc<Context>, g: &impl GgufSource, name: &str, shape: &[usize]) -> Result<Tensor, String> {
@@ -766,7 +745,7 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: 
     // kernels. gate|up interleaved per expert (matching swiglu_id's `base + o` / `base + eff + o`
     // addressing); the down tensor is already expert-major on disk — its raw bytes ARE the slab.
     let experts = match streamed {
-      Some(st) => MoeExperts::Streamed(st),
+      Some(st) => MoeExperts::Streamed(Box::new(st)),
       None => {
         // Eager reads live HERE and nowhere earlier: `raw()` on an expert tensor materialises every
         // expert, which is the bulk of the checkpoint.
@@ -781,11 +760,11 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: 
             gu.extend_from_slice(&u_full[e * u_per..(e + 1) * u_per]);
         }
         let d_full = g.raw(&b("ffn_down_exps.weight"))?;
-        MoeExperts::Slab {
+        MoeExperts::Slab(Box::new(MoeSlab {
             gate_up: Q4_KWeights::from_bytes(ctx, &gu, ne * 2 * eff, d),
             down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) }
                   else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &d_full, ne * d, eff)) },
-        }
+        }))
     } else if gt == 8 && dt == 8 {
         // All-Q8_0 experts (the MTP draft block): same slab layout, Q8_0 kernels.
         let mut gu = Vec::with_capacity(g_full.len() + u_full.len());
@@ -794,10 +773,10 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: 
             gu.extend_from_slice(&u_full[e * u_per..(e + 1) * u_per]);
         }
         let d_full = g.raw(&b("ffn_down_exps.weight"))?;
-        MoeExperts::Slab8 {
+        MoeExperts::Slab8(Box::new(MoeSlab8 {
             gate_up: Q8_0Weights::from_bytes(ctx, &gu, ne * 2 * eff, d),
             down: Q8_0Weights::from_bytes(ctx, &d_full, ne * d, eff),
-        }
+        }))
     } else {
         let down = experts_of(&b("ffn_down_exps.weight"), d, eff)?;
         MoeExperts::PerExpert(down.into_iter().enumerate().map(|(e, down)| {
@@ -820,7 +799,7 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: 
         Some(g.dequant(&b("exp_probs_b.bias"))?)
     } else { None };
     let gpu_bias = sel_bias.as_ref().map(|v| Tensor::from_vec(ctx, v, &[v.len()]));
-    Ok(Ffn::Moe(MoeFfn {
+    Ok(Ffn::Moe(Box::new(MoeFfn {
         router: f32t(ctx, g, &b("ffn_gate_inp.weight"), &[ne, d])?,
         experts,
         // Presence, not the metadata width: `expert_shared_feed_forward_length` and the tensors
@@ -840,7 +819,7 @@ fn load_ffn(ctx: &Arc<Context>, g: &impl GgufSource, il: usize, cfg: &Cfg, rot: 
         sel_bias,
         gpu_bias,
         scale: cfg.expert_scale,
-    }))
+    })))
 }
 
 
@@ -910,7 +889,7 @@ impl Qwen35 {
     pub fn load(ctx: &Arc<Context>, g: &impl GgufSource) -> Result<Qwen35, String> {
         let mut cfg = Cfg::from_gguf(g)?;
         // Debug aid: FERRIC_MAX_LAYERS=N truncates the model (e.g. to isolate GPU-resource-limit issues).
-        if let Ok(n) = std::env::var("FERRIC_MAX_LAYERS") { if let Ok(n) = n.parse::<usize>() { cfg.n_layer = cfg.n_layer.min(n); } }
+        if let Ok(n) = std::env::var("FERRIC_MAX_LAYERS") && let Ok(n) = n.parse::<usize>() { cfg.n_layer = cfg.n_layer.min(n); }
         let conv_dim = cfg.key_dim() * 2 + cfg.d_inner;
 
         // PrismML Bonsai 2: validate the Hadamard contract and refuse what this runtime does not
@@ -986,7 +965,7 @@ impl Qwen35 {
             let mixer = if cfg.arch == "laguna" {
                 // laguna: full attention (48 heads, YaRN θ) at il%4==0, sliding-512 (64 heads, plain
                 // θ_swa) elsewhere — the per-layer head_count array encodes the same pattern.
-                let full = il % cfg.full_attention_interval == 0;
+                let full = il.is_multiple_of(cfg.full_attention_interval);
                 let (base, n_rot) = if full { (cfg.rope_base, cfg.n_rot) } else { (cfg.freq_base_swa, cfg.n_rot_swa) };
                 let yarn = if full && cfg.yarn_factor > 0.0 {
                     let scale = yarn_freq_scale(n_rot, base, cfg.yarn_factor, cfg.yarn_orig, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
@@ -1021,11 +1000,10 @@ impl Qwen35 {
                 // else), so the transform gathers tiled→grouped first — the fork's perm_hd/nk/rep.
                 let out_perm = rot.filter(|r| r.contract.gdn_v_grouped && r.contract.is_folded(&b("ssm_out.weight")))
                     .map(|_| (cfg.head_v_dim(), cfg.n_k_heads, cfg.n_v_heads / cfg.n_k_heads.max(1)));
-                if let Some((hd, nk, rep)) = out_perm {
-                    if nk == 0 || cfg.n_v_heads % nk != 0 || hd * nk * rep != cfg.d_inner {
+                if let Some((hd, nk, rep)) = out_perm
+                    && (nk == 0 || !cfg.n_v_heads.is_multiple_of(nk) || hd * nk * rep != cfg.d_inner) {
                         return Err(format!("prism.hadamard: bad GDN head geometry for blk.{il}.ssm_out"));
                     }
-                }
                 Mixer::Gdn(GdnW {
                     in_proj, ab,
                     qkv_out: g.tensor(&b("attn_qkv.weight")).ok_or("no attn_qkv")?.dims[1] as usize,
@@ -1298,11 +1276,6 @@ impl Qwen35 {
             Ffn::Dense { gate_up, gate_out, down } => down.mm(&gate_up.gate_up_swiglu(h, *gate_out)),
             Ffn::Moe(m) => self.moe_ffn(h, m),
         }
-    }
-
-    /// One SwiGLU expert: `down(swiglu(gate_up(x)))` — `ff` is the split point of the fused gate|up output.
-    fn expert(&self, h: &Tensor, e: &Expert, ff: usize) -> Tensor {
-        h.matmul_q(&e.gate_up).swiglu(ff).matmul_q(&e.down)
     }
 
     /// Mixture-of-experts FFN (each token routes independently): softmax the router logits over all
@@ -1790,10 +1763,10 @@ impl Qwen35 {
         // Per-sequence again: one recurrent state per row, advanced by exactly one step.
         let mut outs: Vec<Tensor> = Vec::with_capacity(n);
         let mut states: Vec<Tensor> = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, prev) in prev_states.iter().enumerate() {
             let (qi, ki, vi) = (q.narrow(0, i, 1), k.narrow(0, i, 1), v.narrow(0, i, 1));
             let gbi = gb.narrow(0, i, 1);
-            let (o, st) = qi.gated_delta_rule_stateful(&ki, &vi, &gbi, nv, dk, dv, prev_states[i].as_ref());
+            let (o, st) = qi.gated_delta_rule_stateful(&ki, &vi, &gbi, nv, dk, dv, prev.as_ref());
             outs.push(o.reshape(&[1, nv * dv])); // flatten so the join is a rank-2 row cat
             states.push(st);
         }
@@ -1892,10 +1865,7 @@ mod kvq_tests {
     /// this asserts is clonable.
     #[test]
     fn a_quantized_cache_is_still_clonable_for_speculative_rollback() {
-        let mut c = Cache::default();
-        c.fmt = Some(KvqFmt::Q8_0);
-        c.layers = vec![None, None];
-        c.pos = 7;
+        let mut c = Cache { fmt: Some(KvqFmt::Q8_0), layers: vec![None, None], pos: 7 };
 
         let snap = c.snapshot();
         assert_eq!(snap.pos, 7, "snapshot carries the position");
@@ -2040,13 +2010,13 @@ impl MoeFfn {
             let selw = h.matmul_bt(&m.router).moe_topk(m.gpu_bias.as_ref(), k, m.sigmoid, m.scale); // [T, 2k]
             if route_trace::enabled() { route_trace::record(selw.clone()); }
             let routed = match &m.experts {
-                MoeExperts::Slab { gate_up, down } => {
-                    let mid = h.matmul_q4_k_swiglu_id(gate_up, &selw, k, dims.expert_ff); // [T, k, eff]
-                    down.wsum(&mid, &selw, d)                                                 // [T, d]
+                MoeExperts::Slab(s) => {
+                    let mid = h.matmul_q4_k_swiglu_id(&s.gate_up, &selw, k, dims.expert_ff); // [T, k, eff]
+                    s.down.wsum(&mid, &selw, d)                                                 // [T, d]
                 }
-                MoeExperts::Slab8 { gate_up, down } => {
-                    let mid = h.matmul_q8_0_swiglu_id(gate_up, &selw, k, dims.expert_ff);
-                    mid.matmul_q8_0_id_wsum(down, &selw, d)
+                MoeExperts::Slab8(s) => {
+                    let mid = h.matmul_q8_0_swiglu_id(&s.gate_up, &selw, k, dims.expert_ff);
+                    mid.matmul_q8_0_id_wsum(&s.down, &selw, d)
                 }
                 MoeExperts::PerExpert(_) | MoeExperts::Streamed(_) => unreachable!("handled above"),
             };
@@ -2071,7 +2041,7 @@ impl MoeFfn {
         for ti in 0..t {
             let h_t = h.narrow(0, ti, 1).contiguous(); // [1, d]
             let routed = match &m.experts {
-                MoeExperts::Slab { .. } | MoeExperts::Slab8 { .. } | MoeExperts::Streamed(_) =>
+                MoeExperts::Slab(_) | MoeExperts::Slab8(_) | MoeExperts::Streamed(_) =>
                     unreachable!("slab and streamed paths handled above"),
                 // General fallback (other quant combos): CPU routing via one small readback.
                 MoeExperts::PerExpert(experts) => {

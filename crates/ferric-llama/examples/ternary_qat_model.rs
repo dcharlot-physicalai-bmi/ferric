@@ -24,7 +24,7 @@ fn ternarize(w: &[f32], indim: usize, outdim: usize, planes: usize) -> Vec<f32> 
     for _ in 0..planes {
         let mut g = vec![0f32; outdim];
         for i in 0..indim { let b = i * outdim; for j in 0..outdim { g[j] += resid[b + j].abs(); } }
-        for j in 0..outdim { g[j] = (g[j] / indim as f32).max(1e-8); }
+        for item in g[..outdim].iter_mut() { *item = (*item / indim as f32).max(1e-8); }
         for i in 0..indim { let b = i * outdim; for j in 0..outdim {
             let q = (resid[b + j] / g[j]).round().clamp(-1.0, 1.0) * g[j];
             out[b + j] += q; resid[b + j] -= q;

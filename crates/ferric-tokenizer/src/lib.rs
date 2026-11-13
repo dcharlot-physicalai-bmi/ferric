@@ -210,6 +210,9 @@ impl Pre {
     }
 }
 
+mod unicode_classes;
+pub use unicode_classes::{is_letter, is_mark, is_number_cat};
+
 /// Does this `tokenizer.ggml.model` name a **SentencePiece-convention** vocabulary?
 ///
 /// ⛔ ONE DEFINITION, because two definitions is exactly how this went wrong. `ferric-web` listed
@@ -217,10 +220,6 @@ impl Pre {
 /// scored greedy merge in the browser and byte-level BPE in the server — measured on
 /// `gemma-4-E2B-it-Q8_0.gguf`: 0 of 4 prompts agreed, 28 ids where the browser emits 17, and the lone
 /// `Ġ` token 245237 appeared 11 times, i.e. `[The, Ġ, capital, Ġ, of, Ġ, France, Ġ, is]`. Q8_0 was
-
-mod unicode_classes;
-pub use unicode_classes::{is_letter, is_mark, is_number_cat};
-
 /// robust enough to answer through it, which is why it survived.
 pub fn is_sentencepiece_model(model: &str) -> bool {
     matches!(model, "llama" | "gemma4" | "t5")
@@ -322,9 +321,8 @@ impl Bpe {
             // find the best (lowest-rank) adjacent pair
             let mut best: Option<(usize, u32)> = None;
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&r) = self.ranks.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
-                    if best.is_none_or(|(_, br)| r < br) { best = Some((i, r)); }
-                }
+                if let Some(&r) = self.ranks.get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                    && best.is_none_or(|(_, br)| r < br) { best = Some((i, r)); }
             }
             let Some((i, _)) = best else { break };
             symbols[i] = format!("{}{}", symbols[i], symbols[i + 1]);
@@ -404,7 +402,7 @@ impl Spm {
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
         // longest first: leftmost-longest is the match rule, and a shorter run would otherwise win
-        me.user_defined.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        me.user_defined.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         me
     }
 
@@ -453,9 +451,8 @@ impl Spm {
             let mut best: Option<(usize, f32)> = None;
             for i in 0..syms.len().saturating_sub(1) {
                 let merged = format!("{}{}", syms[i], syms[i + 1]);
-                if let Some(sc) = self.score_of(&merged) {
-                    if best.is_none_or(|(_, bs)| sc > bs) { best = Some((i, sc)); }
-                }
+                if let Some(sc) = self.score_of(&merged)
+                    && best.is_none_or(|(_, bs)| sc > bs) { best = Some((i, sc)); }
             }
             let Some((i, _)) = best else { break };
             let right = syms.remove(i + 1);
@@ -490,12 +487,6 @@ impl Spm {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
-
-/// The HF SmolLM/GPT-2 pre-tokenizer: a `Digits(individual)` split (each digit isolated) followed by
-/// the ByteLevel GPT-2 regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
-/// Hand-rolled to match `tokenizers` token-for-token — contractions, leading-space attach, multi-space
-/// runs (last space joins the next word), punctuation runs, digits individual.
-fn pretokenize(text: &str) -> Vec<String> { pretokenize_with(text, Pre::Gpt2) }
 
 /// The `hyv4` / deepseek3-llm / hunyuan-dense splitter: six alternatives, leftmost-first.
 ///
@@ -754,8 +745,7 @@ fn pretokenize_qwen_family(text: &str, pre: Pre) -> Vec<String> {
             let at = |k: usize, want: char| i + k < n && fold(cs[i + k]) == want
                 && cs[i + k].to_lowercase().count() == 1;
             let len = if at(1, 's') || at(1, 't') { 2 }
-                else if at(1, 'r') && at(2, 'e') { 3 }
-                else if at(1, 'v') && at(2, 'e') { 3 }
+                else if (at(1, 'r') || at(1, 'v')) && at(2, 'e') { 3 }
                 else if at(1, 'm') { 2 }
                 else if at(1, 'l') && at(2, 'l') { 3 }
                 else if at(1, 'd') { 2 }
@@ -1032,7 +1022,7 @@ mod wordpiece_tests {
     }
 
     #[test]
-    fn the_word_start_marker_is_SPM_not_huggingface() {
+    fn the_word_start_marker_is_spm_not_huggingface() {
         // The defect this replaced: reading the vocab the HuggingFace way (bare initial, `##`
         // continuation) makes almost every word [UNK], because GGUF stores the mirror image.
         // `▁una` + `ffa` + `ble` is how bge-small-en-v1.5 actually holds "unaffable".
@@ -1052,7 +1042,7 @@ mod wordpiece_tests {
     }
 
     #[test]
-    fn an_unmatched_word_is_UNK_as_a_WHOLE_not_piecewise() {
+    fn an_unmatched_word_is_unk_as_a_whole_not_piecewise() {
         // BERT discards the pieces it did match. Emitting them would silently change the input the
         // model sees rather than marking it unknown.
         let t = wp(&[("\u{2581}ab", 1), ("\u{2581}zz", 9)]);
@@ -1356,7 +1346,7 @@ mod spm_user_defined_tests {
         // "a  b": the two literal spaces must come back as id 4, NOT as `▁` twice
         let ids = spm.encode_piece("a  b", false);
         assert!(ids.contains(&4), "the USER_DEFINED run token must be used: {ids:?}");
-        assert!(!ids.iter().any(|&i| i == 0), "no bare `▁` should survive: {ids:?}");
+        assert!(!ids.contains(&0), "no bare `▁` should survive: {ids:?}");
     }
 
     /// ⛔ Leftmost-LONGEST. A three-space run must take id 5, not id 4 followed by a stray space —

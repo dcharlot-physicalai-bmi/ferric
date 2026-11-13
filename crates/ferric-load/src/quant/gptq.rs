@@ -38,7 +38,8 @@ pub(crate) fn discover(qc: &serde_json::Value, st: &SafeTensors) -> Result<Vec<Q
         "gptq_v2" => false,
         other => return Err(format!("gptq: checkpoint_format '{other}' (planar / other layouts) is not read here")),
     };
-    if let Some(p) = qc["pack_dtype"].as_str() { if p != "int32" { return Err(format!("gptq: pack_dtype {p} is not read here")) } }
+    if let Some(p) = qc["pack_dtype"].as_str()
+        && p != "int32" { return Err(format!("gptq: pack_dtype {p} is not read here")) }
     if qc["dynamic"].as_object().is_some_and(|d| !d.is_empty()) {
         return Err("gptq: per-module `dynamic` overrides are not read here — refusing rather than apply one config to all".into());
     }
@@ -50,7 +51,7 @@ pub(crate) fn discover(qc: &serde_json::Value, st: &SafeTensors) -> Result<Vec<Q
         let qz = st.info(&format!("{prefix}.qzeros")).ok_or_else(|| format!("{prefix}: qweight without qzeros"))?.shape.clone();
         if qw.len() != 2 || sc.len() != 2 || qz.len() != 2 { return Err(format!("{prefix}: GPTQ tensors must be 2-D")) }
         let (out, inp) = (qw[1], qw[0] * 32 / bits as usize);
-        if (qw[0] * 32) % bits as usize != 0 || inp % 32 != 0 { return Err(format!("{prefix}: qweight rows {} do not pack {bits}-bit codes", qw[0])) }
+        if !(qw[0] * 32).is_multiple_of(bits as usize) || !inp.is_multiple_of(32) { return Err(format!("{prefix}: qweight rows {} do not pack {bits}-bit codes", qw[0])) }
         let group = if gs <= 0 { inp } else { gs as usize };
         let ng = sc[0];
         if sc[1] != out || ng != inp.div_ceil(group) || qz[0] != ng || qz[1] * 32 != out * bits as usize {

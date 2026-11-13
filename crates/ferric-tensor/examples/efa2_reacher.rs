@@ -139,7 +139,7 @@ async fn run() {
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect();
         adamf.step(&mut fp, &gf);
         if it % 6000 == 5999 { println!("     iter {:>5}: CFM loss {:.4}", it + 1, loss.value().to_vec().await[0]); } }
-    let ex = async |p: &Vec<Tensor>, nin: usize, no: usize| -> Net { let mut w = Vec::new(); for c in 0..nin { w.push(p[c].to_vec().await); }
+    let ex = async |p: &Vec<Tensor>, nin: usize, no: usize| -> Net { let mut w = Vec::new(); for item in p[..nin].iter() { w.push(item.to_vec().await); }
         Net { w, b1: p[nin].to_vec().await, w2: p[nin + 1].to_vec().await, b2: p[nin + 2].to_vec().await, w3: p[nin + 3].to_vec().await, b3: p[nin + 4].to_vec().await, no } };
     let flow = Flow { net: ex(&fp, fin, 2).await };
     // ── [1]/[2] the card ──
@@ -154,7 +154,7 @@ async fn run() {
         for k in 0..200u32 { let tgt = sample_target(k); let d = episode(&arm, k, |q, qd| { let ob = obs(&arm, q, qd, tgt); flow.act(&ob, kk) });
             md += d; if d < TOL { ok += 1; } }
         println!("     flow K={}: reach {:>3.0}% · mean final distance {:.3} · {} forward pass/decision", kk, ok as f32 / 2.0, md / 200.0, kk); }
-    let (mut ro, mut rd) = (0, 0.0f32); for k in 0..200u32 { let tgt = sample_target(k);
+    let (mut ro, mut rd) = (0, 0.0f32); for k in 0..200u32 { let _tgt = sample_target(k);
         let d = episode(&arm, k, |_, _| [(u(k, 40) * 2.0 - 1.0) * UMAX, (u(k, 41) * 2.0 - 1.0) * UMAX]); rd += d; if d < TOL { ro += 1; } }
     println!("     [anchors] PD demonstrator {:.0}% · random-torque {:.0}% ({:.3} mean dist)", dem_ok as f32 / 2.0, ro as f32 / 2.0, rd / 200.0);
     // determinism

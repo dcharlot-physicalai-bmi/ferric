@@ -319,24 +319,24 @@ fn main() {
         d.sort();
         d
     };
-    for e in 0..ENDS.len() {
+    for (e, end_name) in ENDS.iter().enumerate() {
         let n: usize = ends.iter().filter(|(k, _)| k.0 == e).map(|(_, v)| v).sum();
         if n == 0 {
             continue;
         }
         println!("\n  {} — {n} recordings, by fault and defect diameter (thousandths of an inch)",
-                 ENDS[e]);
+                 end_name);
         print!("  {:<10}", "");
         for d in &diams {
             print!(" {:>7}", format!("{d:03}\""));
         }
         println!();
-        for f in 0..FAULTS.len() {
+        for (f, fault) in FAULTS.iter().enumerate() {
             let row: usize = diams.iter().map(|d| ends.get(&(e, f, *d)).copied().unwrap_or(0)).sum();
             if row == 0 {
                 continue;
             }
-            print!("  {:<10}", FAULTS[f]);
+            print!("  {:<10}", fault);
             for d in &diams {
                 print!(" {:>7}", ends.get(&(e, f, *d)).copied().unwrap_or(0));
             }
@@ -537,7 +537,7 @@ fn main() {
         }
         let maj = majority(labels, &train, &held);
         let acc = nb_probe(&docs, labels, &train, &held);
-        let ctl = permutation_control(&docs, labels, &train, &held, 20, 0xC0FF_EE);
+        let ctl = permutation_control(&docs, labels, &train, &held, 20, 0x00C0_FFEE);
         // ⛔ THE STAR ONCE FIRED ON A BELOW-CHANCE NUMBER. `majority` is the accuracy of
         // predicting the training set's most common class, and when the training classes tie, the
         // class it picks can be one that does not occur in the held-out set at all — a 0.0%

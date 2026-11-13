@@ -46,7 +46,8 @@ fn main() {
     let avg: f32 = grid.iter().map(|(_, _, j)| sigmax(*j, best.0, best.1)).sum::<f32>() / grid.len() as f32;
     // empirical check: do trajectories from the certified ball actually converge?
     let mut conv = 0; let n = 200; for k in 0..n { let mut th = G + ((k as f32 / n as f32) * 2.0 - 1.0) * rad.min(1.2); let mut om = 0.0f32;
-        for _ in 0..240 { let (nt, no) = clstep(th, om); th = nt; om = no; } if wrap(th - G).abs() < 0.05 && om.abs() < 0.05 { conv += 1; } }
+        for _ in 0..240 { let (nt, no) = clstep(th, om); th = nt; om = no; }
+            if wrap(th - G).abs() < 0.05 && om.abs() < 0.05 { conv += 1; } }
 
     println!("  closed-loop = energy-shaping controller on the pendulum; goal θ={:.1}. grid {}×{} over ±{:.1}rad × ±{:.1}rad·s.\n", G, nth, nom, thw, omw);
     println!("     metric M=I (identity):            certified contraction region = {:>5.1}% of the box", f_i);

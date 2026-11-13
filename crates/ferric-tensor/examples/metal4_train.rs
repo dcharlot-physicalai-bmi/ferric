@@ -68,7 +68,7 @@ async fn run_size(ctx: &Arc<ferric_core::Context>, b: usize, d: usize) {
         // warm (shader/pipeline/shape caches), then measure
         let run_step = |params: &mut Vec<Tensor>, adam: &mut Adam| -> f32 {
             if dag {
-                let loss = ferric_tensor::batch(&ctx, || step(params, adam));
+                let loss = ferric_tensor::batch(ctx, || step(params, adam));
                 pollster::block_on(loss.value().to_vec())[0]
             } else {
                 pollster::block_on(step(params, adam).value().to_vec())[0]

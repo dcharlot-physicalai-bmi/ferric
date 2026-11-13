@@ -1,10 +1,16 @@
 //! macmon `pipe` samples.
 //!
-//! The field names are the ones `macmon` serializes from `Metrics` on current
-//! main: `cpu_power`, `gpu_power`, `ane_power`, `sys_power`, `chip_power`,
-//! `ram_power`, and `temp.cpu_temp_avg` / `temp.gpu_temp_avg`. A line that
-//! only has the grouped `power` object from the unreleased schema is accepted
-//! as a fallback (`power.cpu`, `power.gpu`, `power.ane`, `power.board`).
+//! The field names are the ones `macmon` serializes from `Metrics` on v0.11.0
+//! (2026-11-06): `cpu_power`, `gpu_power`, `ane_power`, `sys_power`,
+//! `chip_power`, `ram_power`, and `temp.cpu_temp_avg` / `temp.gpu_temp_avg`.
+//! v0.11.0 adds `memory.pressure_level`, `memory.pressure_percent`, and
+//! `cpu_tiers`. Those are not power samples and are not read. `ecpu_*` and
+//! `pcpu_*` are deprecated in favour of `cpu_tiers` and are still emitted, so
+//! the frequency fields stay. A temperature that is JSON `null` is absent, not
+//! 0 °C. An exact 0 `ram_power` or `gpu_ram_power` is unavailable, not a
+//! measured zero. A line that only has the grouped `power` object from the
+//! unreleased schema is accepted as a fallback (`power.cpu`, `power.gpu`,
+//! `power.ane`, `power.board`).
 //!
 //! `chip_power` is at least CPU + GPU + ANE + DRAM, and `sys_power` is at
 //! least `chip_power`. Those domains overlap. This module never adds them.
@@ -286,6 +292,24 @@ mod tests {
         assert!((r.ram_w.unwrap() - 0.25657692551612854).abs() < 1e-12);
         assert!(r.gpu_ram_w.is_none(), "an exact 0 gpu_ram_power is unavailable");
         assert!(parse_line(GROUPED_LINE).is_err());
+    }
+
+    /// v0.11.0 pipe line: nested `memory` pressure, `cpu_tiers`, integer MHz,
+    /// and a null GPU temperature. Power keys are unchanged.
+    const V011_LINE: &str = r#"{"timestamp":"2025-02-24T20:38:15.427569+00:00","temp":{"cpu_temp_avg":43.73614,"gpu_temp_avg":null},"memory":{"ram_total":25769803776,"ram_usage":20985479168,"swap_total":4294967296,"swap_usage":2602434560,"pressure_level":0,"pressure_percent":25},"cpu_tiers":[{"label":"E","freq_mhz":1100,"active_ratio":0.18}],"ecpu_freq_mhz":1100,"pcpu_freq_mhz":1800,"gpu_freq_mhz":461,"cpu_active_ratio":0.092,"gpu_active_ratio":0.09,"cpu_power":0.20486385,"gpu_power":0.017451683,"ane_power":0.0,"sys_power":5.876533,"ram_power":0.11635789,"gpu_ram_power":0.0009615385}"#;
+
+    #[test]
+    fn v011_keeps_power_fields_and_treats_null_temperature_as_absent() {
+        let r = parse_line(V011_LINE).unwrap();
+        assert!((r.cpu_w - 0.20486385).abs() < 1e-9);
+        assert!((r.ram_w.unwrap() - 0.11635789).abs() < 1e-9);
+        assert!((r.gpu_ram_w.unwrap() - 0.0009615385).abs() < 1e-12);
+        assert!(!r.dram_unavailable);
+        assert!((r.cpu_temp_c.unwrap() - 43.73614).abs() < 1e-5);
+        assert!(r.gpu_temp_c.is_none(), "a null gpu_temp_avg is absent, not 0 C");
+        assert!((r.ecpu_mhz.unwrap() - 1100.0).abs() < 1e-9);
+        assert!((r.pcpu_mhz.unwrap() - 1800.0).abs() < 1e-9);
+        assert!((r.gpu_mhz.unwrap() - 461.0).abs() < 1e-9);
     }
 
     #[test]

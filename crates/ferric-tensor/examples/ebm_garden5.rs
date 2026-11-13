@@ -17,14 +17,14 @@ const DH: usize = 8; const T: usize = 6; const EARLY: usize = 2;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 // STRONG pressure: early 2 tokens = reliable +2·dir (label=dir); late 4 tokens = STRONG ±2 noise (drags a smooth solver).
 // tokens are indices into values {−2,−1,+1,+2}; strong tokens use idx 0(−2) / 3(+2).
 fn item(seed: u32) -> (Vec<usize>, usize) {
     let dir = if u(seed, 1) > 0.5 { 1.0 } else { -1.0 };
     let mut e = vec![0usize; T];
-    for t in 0..EARLY { e[t] = if dir > 0.0 { 3 } else { 0 }; }               // +2·dir reliable signal
+    for item in e[..EARLY].iter_mut() { *item = if dir > 0.0 { 3 } else { 0 }; }               // +2·dir reliable signal
     for t in EARLY..T { e[t] = if u(seed.wrapping_add(777), t as u32 + 1) > 0.5 { 3 } else { 0 }; } // ±2 strong noise
     (e, if dir > 0.0 { 1 } else { 0 })
 }
@@ -76,7 +76,7 @@ async fn train(ctx: &Arc<ferric_core::Context>, learn_a: bool, log: bool, a_init
         let g: Vec<Tensor> = (0..ntrain).map(|i| tpv[i].grad().unwrap_or_else(|| Tensor::from_vec(ctx, &vec![0.0; tp[i].numel()], &tp[i].shape))).collect();
         let mut head: Vec<Tensor> = tp[..ntrain].to_vec();
         adam.step(&mut head, &g);
-        for i in 0..ntrain { tp[i] = head[i].clone(); }
+        tp[..ntrain].clone_from_slice(&head[..ntrain]);
         if log && step % 650 == 0 { let a = tp[4].to_vec().await[0]; atraj.push((a.exp()).ln_1p()); }
     }
     let a = tp[4].to_vec().await[0]; atraj.push((a.exp()).ln_1p());

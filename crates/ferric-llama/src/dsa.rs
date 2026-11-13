@@ -373,10 +373,10 @@ mod tests {
         // would be about the random numbers rather than about the code.
         const EPS: f64 = f32::EPSILON as f64;
         const SAFETY: f64 = 2.0;
-        let mut on_dot = vec![0.0f64; T * M];
+        let mut on_dot = [0.0f64; T * M];
         let mut on_score = vec![0.0f64; T * M];
         let mut no_relu = vec![0.0f64; T * M];
-        let mut bound = vec![0.0f64; T * M];
+        let mut bound = [0.0f64; T * M];
         for t in 0..T {
             for j in 0..M {
                 let (mut a, mut c) = (0.0f64, 0.0f64);
@@ -483,9 +483,9 @@ mod tests {
         let ctx = ctx_or_skip!();
         let ix = indexer(&ctx);
         // A constant-offset input: RMSNorm keeps the offset (it only divides), LayerNorm removes it.
-        let cur = Tensor::from_vec(&ctx, &vec![1.0f32; T * HID], &[T, HID]);
-        let (cos, sin) = (Tensor::from_vec(&ctx, &vec![1.0; T * R], &[T, R]),
-                          Tensor::from_vec(&ctx, &vec![0.0; T * R], &[T, R]));
+        let cur = Tensor::from_vec(&ctx, &[1.0f32; T * HID], &[T, HID]);
+        let (cos, sin) = (Tensor::from_vec(&ctx, &[1.0; T * R], &[T, R]),
+                          Tensor::from_vec(&ctx, &[0.0; T * R], &[T, R]));
         let k = get(&ix.keys(&cur, &cos, &sin));
 
         // With cos=1,sin=0 the rotation is the identity, so the key is exactly the normed vector.
@@ -568,8 +568,8 @@ mod tests {
         let n = DK - R;
         let half = R / 2;
 
-        let ones = Tensor::from_vec(&ctx, &vec![1.0f32; T * R], &[T, R]);
-        let zeros = Tensor::from_vec(&ctx, &vec![0.0f32; T * R], &[T, R]);
+        let ones = Tensor::from_vec(&ctx, &[1.0f32; T * R], &[T, R]);
+        let zeros = Tensor::from_vec(&ctx, &[0.0f32; T * R], &[T, R]);
         let ident = get(&ix.queries(&qr, &ones, &zeros));
         let raw = get(&qr.matmul_bt(&ix.w.q_b));
         for (i, (a, b)) in ident.iter().zip(&raw).enumerate() {
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn the_offset_moves_the_causal_horizon() {
         let ctx = ctx_or_skip!();
-        let scores = Tensor::from_vec(&ctx, &vec![1.0f32; 1 * M], &[1, M]);
+        let scores = Tensor::from_vec(&ctx, &[1.0f32; M], &[1, M]);
         let mask = get(&top_k_mask(&scores, M, 4));
         let kept: Vec<usize> = (0..M).filter(|&j| mask[j] == 0.0).collect();
         assert_eq!(kept, vec![0, 1, 2, 3, 4], "a query at absolute position 4 sees keys 0..=4");

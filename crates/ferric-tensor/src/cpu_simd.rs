@@ -142,7 +142,7 @@ mod tests {
         for r in 0..rows {
             for b in 0..nblk {
                 // A scale that is exactly representable in f16, so ground truth is unambiguous.
-                let dbits: u16 = 0x1C00 | ((rnd() & 0x3F) as u16); // ~0.0039 .. 0.0042
+                let dbits: u16 = 0x1C00 | (rnd() & 0x3F); // ~0.0039 .. 0.0042
                 raw.extend_from_slice(&dbits.to_le_bytes());
                 let d = f16(dbits);
                 for j in 0..32 {

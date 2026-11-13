@@ -21,7 +21,7 @@ fn is_wall(x: usize, y: usize) -> bool { x == 6 && y < 9 }
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, scale: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * scale }).collect() }
+fn randn(n: usize, seed: u32, scale: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * scale }).collect() }
 fn clampc(v: i32) -> usize { v.max(0).min(G as i32 - 1) as usize }
 fn next_pos(p: (usize, usize), a: usize) -> (usize, usize) { let nx = clampc(p.0 as i32 + MOVES[a].0); let ny = clampc(p.1 as i32 + MOVES[a].1); if is_wall(nx, ny) { p } else { (nx, ny) } }
 fn free_cell(seed: u32) -> (usize, usize) { let mut s = seed; loop { let x = (u(s, 1) * G as f32) as usize % G; let y = (u(s, 2) * G as f32) as usize % G; if !is_wall(x, y) { return (x, y); } s = s.wrapping_add(101); } }
@@ -78,7 +78,7 @@ async fn run() {
             Tensor::from_vec(&ctx, &randn(hv, 12 + si, 1.0 / (hv as f32).sqrt()), &[hv, 1]), Tensor::zeros(&ctx, &[1]),
         ];
         let mut vadam = Adam::new(&vp, 0.003);
-        let mut vp_t: Vec<Tensor> = vp.iter().map(|t| t.clone()).collect();
+        let mut vp_t: Vec<Tensor> = vp.to_vec();
         for it in 0..9000 {
             let mut cx: Vec<(usize, usize)> = Vec::with_capacity(bb);
             let mut cg: Vec<(usize, usize)> = Vec::with_capacity(bb);
@@ -100,7 +100,7 @@ async fn run() {
             let diff = v.sub(&Var::leaf(target)); let loss = diff.mul(&diff).mean_all();
             loss.backward();
             let grads: Vec<Tensor> = p.iter().map(|vv| vv.grad().unwrap()).collect(); vadam.step(&mut vp, &grads);
-            if it % 250 == 249 { vp_t = vp.iter().map(|t| t.clone()).collect(); }
+            if it % 250 == 249 { vp_t = vp.to_vec(); }
         }
         ens.push(vp);
     }

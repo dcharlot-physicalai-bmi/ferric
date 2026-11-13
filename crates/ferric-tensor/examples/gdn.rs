@@ -5,7 +5,7 @@ use ferric_core::Context;
 use ferric_tensor::Tensor;
 use std::sync::Arc;
 
-fn f32s(p: &str) -> Vec<f32> { std::fs::read(p).unwrap().chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
+fn f32s(p: &str) -> Vec<f32> { std::fs::read(p).unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

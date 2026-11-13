@@ -325,7 +325,7 @@ fn left_recursion(rules: &[Vec<El>], i: usize, visited: &mut [bool], in_progress
         if e.ty == Ty::RuleRef && recurse {
             if left_recursion(rules, e.v as usize, visited, in_progress, may_be_empty) { return true; }
             if !may_be_empty[e.v as usize] { recurse = false; }
-        } else if is_end(e) { recurse = true; } else { recurse = false; }
+        } else { recurse = is_end(e); }
     }
     in_progress[i] = false;
     visited[i] = true;

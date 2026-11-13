@@ -114,7 +114,7 @@ impl Patcher {
     ///
     /// Returns a buffer of `covered(original_len)` samples; the dropped tail is not invented.
     pub fn unpatchify(&self, patches: &[f32]) -> Result<Vec<f32>, PatchError> {
-        if patches.len() % self.patch_len != 0 {
+        if !patches.len().is_multiple_of(self.patch_len) {
             return Err(PatchError::Ragged { len: patches.len(), channels: self.patch_len });
         }
         let n = patches.len() / self.patch_len;
@@ -162,7 +162,7 @@ impl RevIn {
     /// Measure per-channel statistics from an interleaved multi-channel buffer
     /// (`sample0_ch0, sample0_ch1, …`).
     pub fn fit(signal: &[f32], channels: usize) -> Result<Self, PatchError> {
-        if channels == 0 || signal.len() % channels != 0 {
+        if channels == 0 || !signal.len().is_multiple_of(channels) {
             return Err(PatchError::Ragged { len: signal.len(), channels });
         }
         let n = signal.len() / channels;
@@ -211,7 +211,7 @@ impl RevIn {
     /// Remove level and scale, in place semantics on a copy.
     pub fn apply(&self, signal: &[f32]) -> Result<Vec<f32>, PatchError> {
         let c = self.channels();
-        if c == 0 || signal.len() % c != 0 {
+        if c == 0 || !signal.len().is_multiple_of(c) {
             return Err(PatchError::Ragged { len: signal.len(), channels: c });
         }
         Ok(signal
@@ -224,7 +224,7 @@ impl RevIn {
     /// Put level and scale back. Exact inverse of [`RevIn::apply`] up to float rounding.
     pub fn invert(&self, norm: &[f32]) -> Result<Vec<f32>, PatchError> {
         let c = self.channels();
-        if c == 0 || norm.len() % c != 0 {
+        if c == 0 || !norm.len().is_multiple_of(c) {
             return Err(PatchError::Ragged { len: norm.len(), channels: c });
         }
         Ok(norm

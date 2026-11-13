@@ -22,7 +22,7 @@ fn uforce(t: f32) -> f32 { 0.5 * (0.7 * t).sin() }           // the "motor": a d
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 fn energy(s: &Var, p: &[Var], one: &Var) -> Var {
     let sp = |z: Var| z.exp().add(one).log();
@@ -30,8 +30,8 @@ fn energy(s: &Var, p: &[Var], one: &Var) -> Var {
     h1.matmul(&p[2]).add(&p[3])
 }
 // ∇H w.r.t. state; returns (∂H/∂q, ∂H/∂p) as [B,1] each
-fn gradH(ctx: &Arc<ferric_core::Context>, sl: &Var, p: &[Var], one: &Var) -> (Var, Var) {
-    let gh = grad(&energy(sl, p, one).sum_all(), &[sl.clone()], None).remove(0); // [B,2]
+fn grad_h(ctx: &Arc<ferric_core::Context>, sl: &Var, p: &[Var], one: &Var) -> (Var, Var) {
+    let gh = grad(&energy(sl, p, one).sum_all(), std::slice::from_ref(sl), None).remove(0); // [B,2]
     let selq = Var::leaf(Tensor::from_vec(ctx, &[1.0, 0.0], &[2, 1]));
     let selp = Var::leaf(Tensor::from_vec(ctx, &[0.0, 1.0], &[2, 1]));
     (gh.matmul(&selq), gh.matmul(&selp))
@@ -56,7 +56,7 @@ async fn train_h(ctx: &Arc<ferric_core::Context>, dissipative: bool) -> (Vec<Ten
             dq[i] = pp[i] / M; dp[i] = -K * q[i] - C * pp[i] + uu[i]; }
         let sl = Var::leaf(Tensor::from_vec(ctx, &sf, &[bs, 2]));
         let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone());
-        let (gq, gp) = gradH(ctx, &sl, &pv, &ov);
+        let (gq, gp) = grad_h(ctx, &sl, &pv, &ov);
         let uv = Var::leaf(Tensor::from_vec(ctx, &uu, &[bs, 1]));
         let dq_pred = gp.clone();                                   // q̇ = ∂H/∂p
         let mut dp_pred = gq.neg().add(&uv);                        // ṗ = −∂H/∂q + u  (+ dissipation below)
@@ -97,7 +97,7 @@ async fn rollout_mse(ctx: &Arc<ferric_core::Context>, p: &[Tensor], r: f32, naiv
             let mut sf = vec![0.0f32; nb * 2]; for i in 0..nb { sf[i * 2] = q[i]; sf[i * 2 + 1] = pp[i]; }
             let sl = Var::leaf(Tensor::from_vec(ctx, &sf, &[nb, 2]));
             let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone());
-            let (gq, gp) = gradH(ctx, &sl, &pv, &ov);
+            let (gq, gp) = grad_h(ctx, &sl, &pv, &ov);
             let gqv = gq.value().to_vec().await; let gpv = gp.value().to_vec().await;
             for i in 0..nb { let dpi = -gqv[i] - r * gpv[i] + uf; pp[i] += dt * dpi; q[i] += dt * gpv[i]; }
         }

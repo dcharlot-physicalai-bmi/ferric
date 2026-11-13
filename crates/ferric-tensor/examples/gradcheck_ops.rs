@@ -36,7 +36,7 @@ async fn run() {
     }
 
     println!("gradcheck new Var ops (narrow, cat, apply_rope_costable):");
-    let x12: Vec<f32> = (0..24).map(|i| ((i as f32 * 0.7).sin())).collect();
+    let x12: Vec<f32> = (0..24).map(|i| (i as f32 * 0.7).sin()).collect();
 
     // narrow: [4,6] → narrow(dim1, start2, len3)
     check("narrow(1,2,3)", &ctx, &x12, &[4, 6], |xv| xv.narrow(1, 2, 3)).await;
@@ -49,7 +49,7 @@ async fn run() {
 
     // apply_rope_costable: x [s=2, heads=2, hd=4] flattened [2, 8]; cos/sin doubled tables [2,4]
     let s = 2; let heads = 2; let hd = 4;
-    let xr: Vec<f32> = (0..s * heads * hd).map(|i| ((i as f32 * 0.37 + 0.1).cos())).collect();
+    let xr: Vec<f32> = (0..s * heads * hd).map(|i| (i as f32 * 0.37 + 0.1).cos()).collect();
     // doubled layout: cos[t] = [c0,c1,c0,c1], sin[t] = [s0,s1,s0,s1]
     let mut cosv = vec![0f32; s * hd]; let mut sinv = vec![0f32; s * hd];
     for t in 0..s { for j in 0..hd / 2 { let ang = 0.3 * (t as f32 + 1.0) * (j as f32 + 1.0);

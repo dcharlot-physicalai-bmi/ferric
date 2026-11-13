@@ -3,7 +3,7 @@
 //! defaults to it). Each request is translated into the OpenAI chat shape and run through `run_chat`, so
 //! a conversation means the same thing whichever door it came through — template, tool formats, reasoning
 //! split, stop strings, joules. Images are refused by name, as everywhere else.
-use crate::{run_chat, write_json, write_sse_headers, send_sse, mcp, Engine, ChatResult};
+use crate::{run_chat, write_json, write_sse_headers, mcp, Engine, ChatResult};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::net::TcpStream;
@@ -215,14 +215,13 @@ impl ResponseStore {
 /// A Responses item's content for a chat message: its text, or — when it carries an `input_image` — its
 /// parts, which the vision path reads.
 fn item_content(content: &Value) -> Result<Value, String> {
-    if let Value::Array(parts) = content {
-        if parts.iter().any(|p| p["type"] == "input_image") {
+    if let Value::Array(parts) = content
+        && parts.iter().any(|p| p["type"] == "input_image") {
             return parts.iter().map(|p| match p["type"].as_str() {
                 Some("input_image") => Ok(p.clone()),
                 _ => item_text(&Value::Array(vec![p.clone()])).map(|t| json!({"type": "text", "text": t})),
             }).collect::<Result<Vec<_>, _>>().map(Value::Array);
         }
-    }
     item_text(content).map(Value::String)
 }
 

@@ -23,7 +23,7 @@
 //!
 //!   cargo run -p ferric-llama --example iq4_real_weights --release
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource};
+use ferric_gguf::{GgufFile};
 use ferric_tensor::{Iq4NlWeights, Iq4XsWeights, Tensor};
 use std::sync::Arc;
 

@@ -53,7 +53,8 @@ fn main() {
 
     let stlsq = |yd: &[f64]| -> [f64; K] { let mut active = [true; K]; let mut xi = [0.0f64; K];
         for _ in 0..10 { xi = lstsq(&theta, yd, n, &active, &scale); let mut ch = false;
-            for k in 0..K { let keep = xi[k].abs() > 0.5; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } } if !ch { break; } } xi };
+            for k in 0..K { let keep = xi[k].abs() > 0.5; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } }
+            if !ch { break; } } xi };
     let show = |xi: &[f64], t: &str| { let s: Vec<String> = (0..K).filter(|&k| xi[k].abs() > 0.5).map(|k| format!("{:+.2}·{}", xi[k], NAMES[k])).collect(); println!("     {t:<7}{}", s.join(" ")); };
     let (dx, dy, dz) = (stlsq(&yd[0]), stlsq(&yd[1]), stlsq(&yd[2]));
     println!("\n  TRUE:   ẋ = −10.00·x +10.00·y   ẏ = +28.00·x −1.00·y −1.00·xz   ż = +1.00·xy −2.67·z\n");

@@ -31,7 +31,7 @@ fn ternarize(w: &[f32]) -> Vec<f32> {
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
-    let (t, d, hid) = (16usize, 1usize, 24usize); // T steps, 1-d signal, hidden width
+    let (t, _d, hid) = (16usize, 1usize, 24usize); // T steps, 1-d signal, hidden width
     let nseq = 24usize;
 
     // ── task: SELECTIVE COPY. A value appears at a random early step, then the channel is noise;

@@ -162,7 +162,7 @@ impl HadamardContract {
             }
             let mut off = 0usize;
             for &w in &widths {
-                if w <= 0 || (w as usize) % block != 0 || off + w as usize > values.len() {
+                if w <= 0 || !(w as usize).is_multiple_of(block) || off + w as usize > values.len() {
                     return Err(format!("invalid prism.hadamard sign width: {w}"));
                 }
                 let w = w as usize;
@@ -216,7 +216,7 @@ impl HadamardContract {
     /// explicit mode when the table has no entry — the fork refuses that too (`llama-model.cpp:2080`),
     /// because a missing entry read as "no signs" silently changes the function.
     pub fn signs_for(&self, width: usize) -> Result<Option<&[f32]>, String> {
-        if width % self.block_size != 0 {
+        if !width.is_multiple_of(self.block_size) {
             return Err(format!("prism.hadamard block size {} does not divide input dimension {width}", self.block_size));
         }
         if self.signs.is_empty() { return Ok(None); }
@@ -238,7 +238,7 @@ impl HadamardContract {
 /// `(a, b) → (a + b, a − b)`. Every stage pairs the same two values in the same order, so the result
 /// is the same sum tree — for `n = 1024` the prescale is `2⁻⁵`, exact.
 pub fn fwht_normalized(x: &mut [f32], n: usize) {
-    assert!(n.is_power_of_two() && x.len() % n == 0, "fwht: {} values in blocks of {n}", x.len());
+    assert!(n.is_power_of_two() && x.len().is_multiple_of(n), "fwht: {} values in blocks of {n}", x.len());
     let scale = 1.0 / (n as f32).sqrt();
     for blk in x.chunks_exact_mut(n) {
         for v in blk.iter_mut() { *v *= scale; }
@@ -262,7 +262,7 @@ pub fn fwht_normalized(x: &mut [f32], n: usize) {
 /// The permutation takes feature `d + hd·(k + nk·r)` (tiled head `k + nk·r`) to `d + hd·(r + rep·k)`
 /// (grouped head `k·rep + r`) — ggml's `permute(x[hd,nk,rep,·], 0,2,1,3)`, `llama-graph.cpp:1561-1567`.
 pub fn forward_rows(x: &mut [f32], width: usize, block: usize, signs: Option<&[f32]>, perm: Option<(usize, usize, usize)>) {
-    assert!(width % block == 0 && x.len() % width == 0);
+    assert!(width.is_multiple_of(block) && x.len().is_multiple_of(width));
     let mut tmp = vec![0.0f32; width];
     for row in x.chunks_exact_mut(width) {
         if let Some((hd, nk, rep)) = perm {
@@ -280,7 +280,7 @@ pub fn forward_rows(x: &mut [f32], width: usize, block: usize, signs: Option<&[f
 /// The inverse after a latent-table lookup, `h = s ⊙ (H z)` (`qwen35.cpp:645-648`): `H` is its own
 /// inverse (normalized, symmetric) and `s` is ±1, so this undoes [`forward_rows`] without a permutation.
 pub fn inverse_rows(x: &mut [f32], width: usize, block: usize, signs: Option<&[f32]>) {
-    assert!(width % block == 0 && x.len() % width == 0);
+    assert!(width.is_multiple_of(block) && x.len().is_multiple_of(width));
     for row in x.chunks_exact_mut(width) {
         fwht_normalized(row, block);
         if let Some(s) = signs { for (v, s) in row.iter_mut().zip(s) { *v *= *s; } }
@@ -295,7 +295,7 @@ pub fn deq_ptq1_0(raw: &[u8], n: usize) -> Vec<f32> {
     const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
     const STAGES: [usize; 3] = [32, 16, 8];
     let mut out = Vec::with_capacity(n);
-    for blk in raw.chunks_exact(PTQ1_0_BYTES).take(n / 128) {
+    for blk in raw.as_chunks::<PTQ1_0_BYTES>().0.iter().take(n / 128) {
         let (qs, qh) = (&blk[0..24], &blk[24..26]);
         let d = crate::rd_f16(&blk[26..28]);
         let mut j = 0usize;
@@ -324,7 +324,7 @@ pub fn deq_ptq1_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// then 16 code bytes; element j is bits `(j%4)·2` of byte `j/4`; value `(q − 1)·d`, q ∈ 0..=3.
 pub fn deq_q2_0_g64(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
-    for blk in raw.chunks_exact(18).take(n / 64) {
+    for blk in raw.as_chunks::<18>().0.iter().take(n / 64) {
         let d = crate::rd_f16(&blk[0..2]);
         for j in 0..64 {
             let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 3) as i32;
@@ -339,12 +339,12 @@ pub fn deq_q2_0_g64(raw: &[u8], n: usize) -> Vec<f32> {
 /// GPU runs PTQ1_0 today — through the Q2_0 kernels, at Q2_0's 34-byte footprint rather than
 /// PTQ1_0's 28. Element order is the dequantizer's, so decode(transcode(x)) == deq_ptq1_0(x) bit for bit.
 pub fn ptq1_0_to_q2_0(raw: &[u8]) -> Result<Vec<u8>, String> {
-    if raw.len() % PTQ1_0_BYTES != 0 { return Err(format!("PTQ1_0: {} bytes is not whole 28-byte blocks", raw.len())); }
+    if !raw.len().is_multiple_of(PTQ1_0_BYTES) { return Err(format!("PTQ1_0: {} bytes is not whole 28-byte blocks", raw.len())); }
     let mut out = Vec::with_capacity(raw.len() / PTQ1_0_BYTES * 34);
     let ones = [0x00u8, 0x3C]; // f16 1.0: decode codes with d = 1 → t − 1 exactly
     let mut unit = raw.to_vec();
-    for blk in unit.chunks_exact_mut(PTQ1_0_BYTES) { blk[26] = ones[0]; blk[27] = ones[1]; }
-    for (bi, blk) in unit.chunks_exact(PTQ1_0_BYTES).enumerate() {
+    for blk in unit.as_chunks_mut::<PTQ1_0_BYTES>().0 { blk[26] = ones[0]; blk[27] = ones[1]; }
+    for (bi, blk) in unit.as_chunks::<PTQ1_0_BYTES>().0.iter().enumerate() {
         let t = deq_ptq1_0(blk, 128);
         out.extend_from_slice(&raw[bi * PTQ1_0_BYTES + 26..bi * PTQ1_0_BYTES + 28]);
         let mut qs = [0u8; 32];
@@ -366,9 +366,9 @@ pub fn ptq1_0_to_q2_0(raw: &[u8]) -> Result<Vec<u8>, String> {
 /// at group 128 has this property everywhere. Anything else is refused by name — a general
 /// group-64 file needs a per-64-scale kernel, which is not written.
 pub fn q2_0_g64_to_g128(raw: &[u8]) -> Result<Vec<u8>, String> {
-    if raw.len() % 36 != 0 { return Err(format!("Q2_0 (g64): {} bytes is not whole pairs of 18-byte blocks", raw.len())); }
+    if !raw.len().is_multiple_of(36) { return Err(format!("Q2_0 (g64): {} bytes is not whole pairs of 18-byte blocks", raw.len())); }
     let mut out = Vec::with_capacity(raw.len() / 36 * 34);
-    for (bi, pair) in raw.chunks_exact(36).enumerate() {
+    for (bi, pair) in raw.as_chunks::<36>().0.iter().enumerate() {
         let (a, b) = (&pair[0..18], &pair[18..36]);
         let zero = |h: &[u8]| h[2..18].iter().all(|&c| c == 0x55); // every code q = 1
         let d = if a[0..2] == b[0..2] || zero(b) { [a[0], a[1]] }
@@ -393,7 +393,7 @@ pub fn q2_0_g64_to_g128(raw: &[u8]) -> Result<Vec<u8>, String> {
 /// ⚠ `cols` must be a multiple of 128: the transcodes work on the flat byte stream, and a row whose
 /// width is an odd number of 64-blocks would pair its last half-block with the NEXT row's first.
 pub fn as_q2_0_g128(ty: u32, raw: &[u8], cols: usize) -> Result<Option<Vec<u8>>, String> {
-    if matches!(ty, PTQ1_0 | Q2_0_G64) && cols % 128 != 0 {
+    if matches!(ty, PTQ1_0 | Q2_0_G64) && !cols.is_multiple_of(128) {
         return Err(format!("ggml type {ty}: {cols} inputs per row is not a multiple of 128; no group-128 carrier"));
     }
     match ty {
@@ -499,7 +499,7 @@ mod tests {
                 for m in 0..c {
                     let mut q: u16 = 0;
                     for n in 0..5 { q = q * 3 + trits[x + m + n * c] as u16; }
-                    blk[j + m] = ((q * 256 + 242) / 243) as u8;
+                    blk[j + m] = (q * 256).div_ceil(243) as u8;
                 }
                 x += 5 * c;
                 j += c;
@@ -509,7 +509,7 @@ mod tests {
             let mut q: u16 = 0;
             for m in 0..4 { q = q * 3 + trits[x + h + m * 2] as u16; }
             q *= 3;
-            blk[24 + h] = ((q * 256 + 242) / 243) as u8;
+            blk[24 + h] = (q * 256).div_ceil(243) as u8;
         }
         blk[26..28].copy_from_slice(&half::f16::from_f32(0.4375).to_le_bytes());
         let d = deq_ptq1_0(&blk, 128);

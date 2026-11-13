@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 fn problem(d: usize, seed: u32, scale: f32) -> (Vec<f32>, Vec<f32>) {
     let ys: Vec<f32> = (0..d).map(|i| { let m = 0.4 + u(seed, i as u32 * 3 + 1) * (0.7 * scale); if u(seed, i as u32 * 3 + 2) > 0.5 { m } else { -m } }).collect();
@@ -123,7 +123,7 @@ async fn run() {
 
     let he = 256usize; let k = 12usize; let t = 400usize;
     println!("  [width he={he}, thinking K={k}, {t} problems]");
-    println!("    {:>3} {:>8} {:>11} {:>16} {:>10}   {}", "D", "links", "per-link p", "p^(D−1) predict", "GLOBAL", "histogram of #links satisfied (0 → D−1)");
+    println!("    {:>3} {:>8} {:>11} {:>16} {:>10}   histogram of #links satisfied (0 → D−1)", "D", "links", "per-link p", "p^(D−1) predict", "GLOBAL");
     for &d in &[2usize, 3, 4, 5, 6, 7] {
         let p = train(&ctx, d, he, &one).await;
         let (g, pl, hist) = diagnose(&ctx, d, &p, &one, k, t, 4000 + d as u32 * 91).await;

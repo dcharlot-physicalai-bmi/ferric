@@ -31,6 +31,8 @@ use ferric_gguf::{GgufSource, Meta, TensorInfo};
 use std::collections::HashMap;
 use std::path::Path;
 
+type NameMap = (HashMap<String, Meta>, Vec<(String, String)>);
+
 /// A published checkpoint presented as a `GgufSource`.
 pub struct HfCheckpoint {
     st: SafeTensors,
@@ -179,8 +181,8 @@ impl GgufSource for HfCheckpoint {
         if let Some(q) = self.quant.as_ref().filter(|q| q.module(hf).is_some()) { return q.gq_bytes(&self.st, hf); }
         let bytes = self.st.raw(hf)?;
         if self.narrow_bf16 && self.st.info(hf).is_some_and(|e| e.dtype == "F32") {
-            return Ok(bytes.chunks_exact(4)
-                .flat_map(|c| f32_to_bf16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes())
+            return Ok(bytes.as_chunks::<4>().0.iter()
+                .flat_map(|c| f32_to_bf16_bits(f32::from_le_bytes(*c)).to_le_bytes())
                 .collect());
         }
         Ok(bytes)
@@ -212,7 +214,7 @@ impl GgufSource for HfCheckpoint {
 /// attention output is `o_proj` (not `out_proj`, which is LFM2's spelling). Both are the kind of
 /// difference that loads fine and produces confident nonsense.
 fn qwen3vl_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     // Qwen3-VL nests everything real under `text_config`; a flat lookup silently finds nothing.
     let t = cfg.get("text_config").unwrap_or(cfg);
@@ -299,7 +301,7 @@ fn qwen3vl_map(cfg: &serde_json::Value, st: &SafeTensors)
 /// authors' code then makes every layer `full_attention`. Mapping the width alone would window a
 /// model that never windows.
 fn qwen25vl_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     // 4.x configs are flat; 5.x ones nest under `text_config`. Read whichever carries the keys.
     let t = match cfg.get("text_config") { Some(tc) if tc.get("hidden_size").is_some() => tc, _ => cfg };
@@ -391,7 +393,7 @@ fn qwen25vl_map(cfg: &serde_json::Value, st: &SafeTensors)
 /// ⚠ `use_sliding_window: true` is refused rather than half-mapped: Qwen2's window applies only to layers
 /// past `max_window_layers`, and a width without that schedule would window the wrong layers.
 fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
     let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
@@ -411,9 +413,8 @@ fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
     m.insert("qwen2.attention.head_count".into(), Meta::U(nh));
     m.insert("qwen2.attention.head_count_kv".into(), Meta::U(need_u("num_key_value_heads")?));
     // head_dim may be explicit; when it is, it must agree with hidden/heads, which is what the loader assumes
-    if let Some(hd) = cfg_u(cfg, "head_dim") {
-        if hd != h / nh { return Err(format!("head_dim {hd} != hidden {h} / heads {nh}")); }
-    }
+    if let Some(hd) = cfg_u(cfg, "head_dim")
+        && hd != h / nh { return Err(format!("head_dim {hd} != hidden {h} / heads {nh}")); }
     m.insert("qwen2.attention.layer_norm_rms_epsilon".into(), Meta::F(need_f("rms_norm_eps")?));
     m.insert("qwen2.rope.freq_base".into(), Meta::F(need_f("rope_theta")?));
     m.insert("tokenizer.ggml.tokens".into(),
@@ -462,7 +463,7 @@ fn qwen2_map(cfg: &serde_json::Value, st: &SafeTensors)
 /// ⛔ Refused rather than half-mapped: `rope_scaling` (YaRN et al.), sliding window, and MoE (`qwen3_moe`
 /// is a different model_type and never reaches this).
 fn qwen3_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
     let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
@@ -535,7 +536,7 @@ fn qwen3_map(cfg: &serde_json::Value, st: &SafeTensors)
 /// different forward pass that would load and run and be wrong.
 /// ⚠ `fc11` is the UP projection and `fc12` the GATE: the authors compute `fc11(x) * silu(fc12(x))`.
 fn nomic_bert_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
     let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
@@ -600,7 +601,7 @@ fn nomic_bert_map(cfg: &serde_json::Value, st: &SafeTensors)
 }
 
 fn lfm2_map(cfg: &serde_json::Value, st: &SafeTensors)
-    -> Result<(HashMap<String, Meta>, Vec<(String, String)>), String>
+    -> Result<NameMap, String>
 {
     let need_u = |k: &str| cfg_u(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
     let need_f = |k: &str| cfg_f(cfg, k).ok_or_else(|| format!("config.json: missing {k}"));
@@ -638,8 +639,8 @@ fn lfm2_map(cfg: &serde_json::Value, st: &SafeTensors)
     if st.info("lm_head.weight").is_some() {
         n.push(("output.weight".into(), "lm_head.weight".into()));
     }
-    for il in 0..n_layer {
-        let attn = types[il].as_str() == Some("full_attention");
+    for (il, kind) in types.iter().enumerate() {
+        let attn = kind.as_str() == Some("full_attention");
         let mut pairs: Vec<(&str, String)> = vec![
             ("attn_norm.weight", format!("model.layers.{il}.operator_norm.weight")),
             ("ffn_norm.weight", format!("model.layers.{il}.ffn_norm.weight")),

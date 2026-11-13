@@ -203,13 +203,11 @@ pub fn rm(host: &Host, args: &[String], yes: bool) -> Result<(), String> {
             if !matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes") { eprintln!("kept '{arg}'"); continue; }
         }
         // Unload first if a ferric server holds it, as `ollama rm` does; a failure here is not a reason to keep the files.
-        if let Probe::Up(k) = server::probe(host) {
-            if k.is_ferric() { let _ = http::post(host, "/api/generate", &json!({"model": crate::wire_name(&m), "keep_alive": 0})).map(|r| r.text()); }
-        }
+        if let Probe::Up(k) = server::probe(host)
+            && k.is_ferric() { let _ = http::post(host, "/api/generate", &json!({"model": crate::wire_name(&m), "keep_alive": 0})).map(|r| r.text()); }
         for f in &files { std::fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?; }
-        if let Some(dir) = m.path.parent() {
-            if dir != hub::absolute(&hub) && std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none()) { let _ = std::fs::remove_dir(dir); }
-        }
+        if let Some(dir) = m.path.parent()
+            && dir != hub::absolute(&hub) && std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none()) { let _ = std::fs::remove_dir(dir); }
         println!("deleted '{arg}'");
     }
     Ok(())

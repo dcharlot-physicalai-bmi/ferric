@@ -13,7 +13,7 @@ const DH: usize = 64; const CONV_L: usize = 3; const VOCAB: usize = 65536;
 const BASE: f32 = 1_000_000.0; const EPS: f32 = 1e-5;
 const ATTN: [usize; 6] = [2, 5, 8, 10, 12, 14];
 
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

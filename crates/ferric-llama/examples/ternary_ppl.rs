@@ -18,7 +18,7 @@ fn ternarize(w: &[f32], planes: usize) -> Vec<f32> {
     let mut resid = w.to_vec();
     let mut recon = vec![0f32; w.len()];
     for _ in 0..planes {
-        for g in 0..(w.len() + GS - 1) / GS {
+        for g in 0..w.len().div_ceil(GS) {
             let (lo, hi) = (g * GS, ((g + 1) * GS).min(w.len()));
             let grp = &resid[lo..hi];
             let ma = grp.iter().map(|x| x.abs()).sum::<f32>() / grp.len() as f32;
@@ -52,7 +52,7 @@ impl GgufSource for TGguf<'_> {
     }
 }
 
-async fn perplexity(ctx: &Arc<Context>, m: &Qwen3, ids: &[u32]) -> f64 {
+async fn perplexity(_ctx: &Arc<Context>, m: &Qwen3, ids: &[u32]) -> f64 {
     let c = &m.cfg;
     let v = m.forward_cached(ids, &mut Cache::new(c)).to_vec().await; // [n*vocab]
     let (mut nll, mut cnt) = (0f64, 0usize);

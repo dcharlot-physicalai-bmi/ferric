@@ -6,7 +6,7 @@ use ferric_gguf::quant_q2_0;
 use ferric_tensor::{Q2_0Weights, Tensor};
 use std::sync::Arc;
 
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.013 + s).sin())).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (i as f32 * 0.013 + s).sin()).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

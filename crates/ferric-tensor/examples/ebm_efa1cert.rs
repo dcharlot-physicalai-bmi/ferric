@@ -39,23 +39,25 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3] }
 impl Efa1 {
     fn act(&self, bi: usize, s: [f32; 6], g: [f32; 3]) -> [f32; 3] {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
-        for c in 0..12 { f[c] = ff[c]; } f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
+        f[..12].copy_from_slice(&ff); f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3; for j in 0..H { for c in 0..3 { o[c] += h2[j] * self.fw3[j * 3 + c]; } }
         let mut a = [0.0f32; 3]; for i in 0..nj { a[i] = o[i].clamp(-UMAX, UMAX); } a }
 }
 fn fcl(m: &Efa1, bi: usize, x: &[f32], g: [f32; 3]) -> Vec<f32> {
-    let nj = NJ[bi]; let mut s = [0.0f32; 6]; for i in 0..nj { s[i] = x[i]; s[3 + i] = x[nj + i]; }
+    let nj = NJ[bi]; let mut s = [0.0f32; 6]; s[..nj].copy_from_slice(&x[..nj]);
+    s[3..(nj + 3)].copy_from_slice(&x[nj..(nj + nj)]);
     let ns = step(nj, s, m.act(bi, s, g));
-    let mut y = vec![0.0f32; 2 * nj]; for i in 0..nj { y[i] = ns[i]; y[nj + i] = ns[3 + i]; } y
+    let mut y = vec![0.0f32; 2 * nj]; y[..nj].copy_from_slice(&ns[..nj]);
+    y[nj..(nj + nj)].copy_from_slice(&ns[3..(nj + 3)]); y
 }
 fn jac_at(m: &Efa1, bi: usize, x: &[f32], g: [f32; 3]) -> Vec<f32> {
     let nj = NJ[bi]; let d = 2 * nj; let h = 1e-3; let mut jac = vec![0.0f32; d * d];
@@ -117,8 +119,8 @@ fn main() {
     for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj;
         // ── Stage 1: attractor per card goal — roll long from the goal, then polish; measure residual to (g,0) ──
         let mut residuals = vec![]; let mut xstar_rep = vec![0.0f32; d]; let mut fp_gap_rep = 0.0;
-        for (gi, gtk) in gt4.iter().enumerate() { let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gtk[j]; }
-            let mut x = vec![0.0f32; d]; for j in 0..nj { x[j] = g[j]; }
+        for (gi, gtk) in gt4.iter().enumerate() { let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gtk[..nj]);
+            let mut x = vec![0.0f32; d]; x[..nj].copy_from_slice(&g[..nj]);
             for _ in 0..800 { x = fcl(&m, bi, &x, g); }
             let fx = fcl(&m, bi, &x, g);
             let fp_gap: f32 = (0..d).map(|c| { let mut e = fx[c] - x[c]; if c < nj { e = wrap(e); } e * e }).sum::<f32>().sqrt();
@@ -127,7 +129,7 @@ fn main() {
             if gi == 0 { xstar_rep = x.clone(); fp_gap_rep = fp_gap; } }
         let res_max = residuals.iter().cloned().fold(0.0f32, f32::max);
         // ── Stage 2: Lyapunov metric P at x* (representative goal), then grid-certify σmax(P^½JP^-½)<1 ──
-        let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gt4[0][j]; }
+        let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gt4[0][..nj]);
         let a = jac_at(&m, bi, &xstar_rep, g);
         // ρ(A) estimate: ‖Aᵏ‖^(1/k) at k=60
         let mut ak = a.clone(); for _ in 0..59 { ak = matmul(&ak, &a, d); }

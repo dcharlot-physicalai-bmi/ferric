@@ -1,7 +1,7 @@
 // Round-trip: parse a mixed-dtype safetensors container (F32/F16/BF16) with Ferric's pure-Rust
 // reader and verify every tensor dequantizes to f32 exactly matching the source.
 use ferric_load::safetensors;
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
 fn main() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let bytes = std::fs::read(format!("{dir}/testdata/model.safetensors")).unwrap();

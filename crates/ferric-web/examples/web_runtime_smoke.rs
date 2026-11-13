@@ -20,7 +20,7 @@ async fn run() {
     // set must still COVER both (a smaller set silently generates past the end of turn); for any model
     // it must be non-empty, or generation only ever ends by running out of steps.
     assert!(!eos.is_empty(), "no stop token resolved — generation can only end by exhausting steps");
-    if m.info().contains("dense") && eos.iter().any(|&t| t == 151643) {
+    if m.info().contains("dense") && eos.contains(&151643) {
         assert!(eos.contains(&151645) && eos.contains(&151643),
                 "Qwen checkpoint lost part of the old hardcoded stop set: {eos:?}");
     }

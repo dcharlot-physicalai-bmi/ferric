@@ -12,7 +12,7 @@
 //! → gather(inv_perm) → pixel-shuffle merge² → adapter mm_0/1/2 (exact erf GELU between)
 //! ```
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_tensor::image::{preprocess, read_ppm, Rgb8};
 use ferric_tensor::{nn, QMatrix, Tensor};
 use std::sync::Arc;

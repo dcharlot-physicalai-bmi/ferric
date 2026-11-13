@@ -127,7 +127,7 @@ fn layer_bytes_are_identical_at_every_budget() {
             ),
         }
         rates.push((budget, rate));
-        if tiers.iter().any(|t| *t == Tier::Backing) { any_streamed = true; }
+        if tiers.contains(&Tier::Backing) { any_streamed = true; }
         if tiers.iter().all(|t| *t == Tier::Pinned) { any_fully_resident = true; }
     }
 
@@ -166,7 +166,7 @@ fn expert_bytes_are_identical_at_every_capacity() {
             while sel.len() < TOP_K {
                 s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 // Bias toward a hot head: two thirds of picks land in the first 8 experts.
-                let e = if (s >> 60) % 3 != 0 { ((s >> 20) % 8) as u32 } else { ((s >> 20) % N_EXPERTS as u64) as u32 };
+                let e = if !(s >> 60).is_multiple_of(3) { ((s >> 20) % 8) as u32 } else { ((s >> 20) % N_EXPERTS as u64) as u32 };
                 if !sel.contains(&e) { sel.push(e); }
             }
             trace.push((l, sel));

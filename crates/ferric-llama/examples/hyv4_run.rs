@@ -130,7 +130,7 @@ fn main() {
         println!("prefill last-row logits: sum {:.6}  sum_abs {:.6}  min {mn:.6}  max {mx:.6}  first3 {:?}",
                  row.iter().map(|v| *v as f64).sum::<f64>(),
                  row.iter().map(|v| v.abs() as f64).sum::<f64>(),
-                 &row[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
+                 row[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
         // ⭐ THE PICK, in the same form the patched reference prints it
         // (`common_debug_print_argmax`). Aggregates of a 120832-wide logit row can agree while the
         // two implementations would emit different tokens, and the token is the whole product.

@@ -242,6 +242,8 @@ fn check_peft_config(c: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+type LoraPair = (String, Vec<f32>, Vec<f32>, usize, usize, usize);
+
 impl LoraAdapter {
     /// Open a PEFT adapter directory, or a llama.cpp `.gguf` adapter file.
     pub fn open(path: impl AsRef<Path>) -> Result<LoraAdapter, String> {
@@ -383,7 +385,7 @@ impl LoraAdapter {
     /// An adapter built in memory — a Ferric fine-tune — from `(gguf name, lora_A [r,in], lora_B
     /// [out,r])` triples, with rows in the base GGUF's order (which is what the runtime trained against).
     pub fn from_pairs(name: &str, alpha: f32, use_rslora: bool, arch: &str,
-                      pairs: Vec<(String, Vec<f32>, Vec<f32>, usize, usize, usize)>) -> Result<LoraAdapter, String> {
+                      pairs: Vec<LoraPair>) -> Result<LoraAdapter, String> {
         let mut targets = BTreeMap::new();
         let mut rank = 0;
         for (n, a, b, r, n_in, n_out) in pairs {
@@ -405,11 +407,10 @@ impl LoraAdapter {
     /// ⛔ Refuses architectures whose GGUF q/k row order has not been audited against their converter:
     /// guessing "unpermuted" for one that is permuted produces a model that runs and is wrong.
     pub fn bind(&self, arch: &str, n_head: usize, n_head_kv: usize, to: RowOrder) -> Result<LoraAdapter, String> {
-        if let Some(a) = &self.arch {
-            if self.format == LoraFormat::Gguf && a != arch {
+        if let Some(a) = &self.arch
+            && self.format == LoraFormat::Gguf && a != arch {
                 return Err(format!("adapter '{}' is for architecture '{a}', the base is '{arch}'", self.name));
             }
-        }
         // convert_hf_to_gguf.py: `LlamaModel.permute` on q_proj/k_proj for `llama`; none of the Qwen,
         // Phi-3 or Gemma converters permute.
         let permuted = match arch {
@@ -600,7 +601,7 @@ fn write_safetensors(path: &Path, entries: &[(String, Vec<usize>, &[f32])]) -> R
     let mut h = serde_json::to_vec(&serde_json::Value::Object(hdr)).unwrap();
     // The header is padded with spaces to 8 bytes, as the reference writer does, so the data that
     // follows is aligned for readers that map it.
-    while h.len() % 8 != 0 { h.push(b' '); }
+    while !h.len().is_multiple_of(8) { h.push(b' '); }
     let mut out = Vec::with_capacity(8 + h.len() + off);
     out.extend((h.len() as u64).to_le_bytes());
     out.extend(h);

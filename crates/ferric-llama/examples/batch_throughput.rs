@@ -22,7 +22,7 @@
 //!
 //!   cargo run -p ferric-llama --example batch_throughput --release
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource};
+use ferric_gguf::GgufFile;
 use ferric_llama::qwen3::{Cache, Qwen3};
 use std::sync::Arc;
 

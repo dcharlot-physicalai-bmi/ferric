@@ -60,7 +60,7 @@ pub fn quantize_q2_k(x: &[f32], out: &mut Vec<u8>) { quantize_q2_k_iters(x, out,
 /// hand-picked error bound that only says the author guessed a number.
 pub fn quantize_q2_k_iters(x: &[f32], out: &mut Vec<u8>, iters: usize) {
     assert_eq!(x.len() % 256, 0, "Q2_K quantizes whole 256-element super-blocks");
-    for sb in x.chunks_exact(256) {
+    for sb in x.as_chunks::<256>().0 {
         // σ = +1 anchors every floor at or below zero (dmin ≥ 0); σ = −1 anchors at or above it.
         // One super-block shares ONE dmin, so the sign is a per-super-block choice — and that is
         // why the negative branch is rare rather than common: a single negative weight anywhere in
@@ -83,7 +83,7 @@ pub fn quantize_q2_k_iters(x: &[f32], out: &mut Vec<u8>, iters: usize) {
 pub fn encode_q2_k_super(sb: &[f32], iters: usize, sigma: f32) -> ([u8; 84], f32) {
     let mut scale_f = [0.0f32; 16];
     let mut base_f = [0.0f32; 16];
-    for (j, g) in sb.chunks_exact(16).enumerate() {
+    for (j, g) in sb.as_chunks::<16>().0.iter().enumerate() {
         let (lo, hi) = g.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         // At σ=+1 the floor may not rise above zero; at σ=−1 it may not fall below it.
         let mut base = if sigma > 0.0 { lo.min(0.0) } else { lo.max(0.0) };
@@ -101,7 +101,7 @@ pub fn encode_q2_k_super(sb: &[f32], iters: usize, sigma: f32) -> ([u8; 84], f32
             let det = 16.0 * sqq - sq * sq;
             if det.abs() < 1e-12 { break }
             let (ns, nb) = ((16.0 * sqx - sq * sx) / det, (sqq * sx - sq * sqx) / det);
-            if !(ns > 0.0) || !nb.is_finite() { break }
+            if ns.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !nb.is_finite() { break }
             scale = ns;
             base = if sigma > 0.0 { nb.min(0.0) } else { nb.max(0.0) };
         }
@@ -126,7 +126,7 @@ pub fn encode_q2_k_super(sb: &[f32], iters: usize, sigma: f32) -> ([u8; 84], f32
     // pre-rounding scale biases every weight in the sub-block in the same direction.
     let (d, dmin) = (f16::from_f32(d).to_f32(), f16::from_f32(dmin).to_f32());
     let mut sse = 0.0f32;
-    for (j, g) in sb.chunks_exact(16).enumerate() {
+    for (j, g) in sb.as_chunks::<16>().0.iter().enumerate() {
         let dl = d * sc_i[j] as f32;
         let ml = dmin * m_i[j] as f32;
         for (l, &v) in g.iter().enumerate() {
@@ -153,9 +153,9 @@ pub fn quantize_q3_k(x: &[f32], out: &mut Vec<u8>) { quantize_q3_k_iters(x, out,
 /// See [`quantize_q2_k_iters`] for why `iters` is reachable.
 pub fn quantize_q3_k_iters(x: &[f32], out: &mut Vec<u8>, iters: usize) {
     assert_eq!(x.len() % 256, 0, "Q3_K quantizes whole 256-element super-blocks");
-    for sb in x.chunks_exact(256) {
+    for sb in x.as_chunks::<256>().0 {
         let mut scale_f = [0.0f32; 16];
-        for (j, g) in sb.chunks_exact(16).enumerate() {
+        for (j, g) in sb.as_chunks::<16>().0.iter().enumerate() {
             let (lo, hi) = g.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
             let mut scale = (hi / 3.0).max(-lo / 4.0).max(0.0);
             for _ in 0..iters { // symmetric, so one unknown: scale = <x,q>/<q,q>
@@ -167,7 +167,7 @@ pub fn quantize_q3_k_iters(x: &[f32], out: &mut Vec<u8>, iters: usize) {
                 }
                 if sqq <= 0.0 { break }
                 let ns = sqx / sqq;
-                if !(ns > 0.0) { break }
+                if ns.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { break }
                 scale = ns;
             }
             scale_f[j] = scale;
@@ -182,7 +182,7 @@ pub fn quantize_q3_k_iters(x: &[f32], out: &mut Vec<u8>, iters: usize) {
         pack_q3_scales(&s6, &mut blk[96..108]);
         wr_f16(d_all, &mut blk[108..110]);
         let d_all = f16::from_f32(d_all).to_f32();
-        for (j, g) in sb.chunks_exact(16).enumerate() {
+        for (j, g) in sb.as_chunks::<16>().0.iter().enumerate() {
             let dl = d_all * (s6[j] as i32 - 32) as f32;
             for (l, &v) in g.iter().enumerate() {
                 let q = if dl != 0.0 { (v / dl).round().clamp(-4.0, 3.0) as i32 } else { 0 };
@@ -254,7 +254,7 @@ mod tests {
             let tmp = aux[2];
             aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
             aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-            aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+            aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
             aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
             let got: Vec<u8> = aux.iter().flat_map(|w| w.to_le_bytes()).collect();
             assert_eq!(&got[..], &s[..], "6-bit scale packing is not its own inverse at seed {seed}");
@@ -422,8 +422,8 @@ fn stq1_0_emit(sel: &[i8; 256], d: f32, out: &mut Vec<u8>) {
 /// surviving lane is reconstructed at ±max, so a block with one heavy tail drags all 192 of its
 /// non-zero weights out with it.
 pub fn quantize_stq1_0_amax(x: &[f32], out: &mut Vec<u8>) {
-    assert!(x.len() % 256 == 0, "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
-    for xb in x.chunks_exact(256) {
+    assert!(x.len().is_multiple_of(256), "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
+    for xb in x.as_chunks::<256>().0 {
         let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
         let mut sel = [0i8; 256];
         for g in 0..64 {
@@ -468,13 +468,13 @@ pub fn quantize_stq1_0(x: &[f32], imatrix: Option<&[f32]>, out: &mut Vec<u8>) {
 /// `iters = 0` fits `d` once from the amax selection and stops — the ablation point for the doc
 /// comment above.
 pub fn quantize_stq1_0_iters(x: &[f32], imatrix: Option<&[f32]>, out: &mut Vec<u8>, iters: usize) {
-    assert!(x.len() % 256 == 0, "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
+    assert!(x.len().is_multiple_of(256), "STQ1_0 needs a multiple of 256 elements, got {}", x.len());
     if let Some(im) = imatrix {
         assert_eq!(im.len(), x.len(), "imatrix must have one importance per element");
     }
-    for (bi, xb) in x.chunks_exact(256).enumerate() {
+    for (bi, xb) in x.as_chunks::<256>().0.iter().enumerate() {
         let amax = xb.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        if !(amax > 0.0) {
+        if amax.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             // ⚠ STQ1_0 cannot express an all-zero block through its SELECTION: the container
             // forces three non-zero lanes into every group, so `[0; 256]` is not encodable at all
             // and `stq1_0_emit` rightly refuses it. A zero block is expressed through the SCALE —
@@ -546,7 +546,7 @@ mod stq1_0_tests {
 
     fn lanes_of(qpack: u8) -> [i32; 4] {
         let mut l = [0i32; 4];
-        for p in 0..4 { l[p] = (((qpack >> (2 * p)) & 3) as i32) - 1 }
+        for (p, lane) in l.iter_mut().enumerate() { *lane = (((qpack >> (2 * p)) & 3) as i32) - 1 }
         l
     }
 
@@ -562,14 +562,14 @@ mod stq1_0_tests {
                        "entry {i} = {c:#04x} decodes to {l:?} — the format forces exactly one zero");
         }
         // The sign bit is a whole-group negation, so the two halves must mirror.
-        for slot in 0..16 {
-            let a = lanes_of(STQ1_0_CODEBOOK[slot]);
+        for (slot, &code) in STQ1_0_CODEBOOK.iter().take(16).enumerate() {
+            let a = lanes_of(code);
             let b = lanes_of(STQ1_0_CODEBOOK[16 + slot]);
             assert_eq!(a.map(|v| -v), b, "slot {slot}: sign=1 is not the negation of sign=0");
         }
         // Sign 0 is defined as "first non-zero lane is +1".
-        for slot in 0..16 {
-            let a = lanes_of(STQ1_0_CODEBOOK[slot]);
+        for (slot, &code) in STQ1_0_CODEBOOK.iter().take(16).enumerate() {
+            let a = lanes_of(code);
             assert_eq!(*a.iter().find(|&&v| v != 0).unwrap(), 1, "slot {slot} breaks the sign convention");
         }
         // 4 zero positions x 8 sign patterns.

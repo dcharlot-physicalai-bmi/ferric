@@ -90,5 +90,5 @@ async fn run() {
 }
 
 fn seed(n: usize, s: f32) -> Vec<f32> {
-    (0..n).map(|i| ((i as f32 * 12.9898 + s).sin() * 43758.5453).fract() * 2.0 - 1.0).collect()
+    (0..n).map(|i| ((i as f32 * 12.9898 + s).sin() * 43_758.547).fract() * 2.0 - 1.0).collect()
 }

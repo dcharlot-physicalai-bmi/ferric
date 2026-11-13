@@ -8,12 +8,12 @@ use ferric_tensor::{nn, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
-    let (n_layers, d, nh, nkv, dh, hidden, vocab, base, eps) = (2usize, 64usize, 8usize, 2usize, 8usize, 128usize, 32usize, 10000.0f32, 1e-5f32);
+    let (n_layers, _d, nh, nkv, dh, _hidden, vocab, base, eps) = (2usize, 64usize, 8usize, 2usize, 8usize, 128usize, 32usize, 10000.0f32, 1e-5f32);
     let dir = env!("CARGO_MANIFEST_DIR");
     let w = safetensors(&std::fs::read(format!("{dir}/testdata/llama.safetensors")).unwrap()).unwrap();
     let ids: Vec<u32> = std::fs::read_to_string(format!("{dir}/testdata/llama.ids")).unwrap().trim().split(',').map(|s| s.parse().unwrap()).collect();

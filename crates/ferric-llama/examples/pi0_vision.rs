@@ -19,7 +19,7 @@ async fn run() {
     let w: HashMap<String, STensor> = safetensors_filtered(&std::fs::read(&wp).unwrap(), |_| true).unwrap();
     let g = |n: &str| { let s = &w[n]; Tensor::from_vec(&ctx, &s.data, &s.shape) };
     let vm = "vision_tower.vision_model";
-    let (nh, hd, hidden) = (16usize, 72usize, 1152usize);
+    let (nh, _hd, hidden) = (16usize, 72usize, 1152usize);
     let (ps, imsz) = (14usize, 224usize);
     let grid = imsz / ps; // 16
     let np = grid * grid;  // 256

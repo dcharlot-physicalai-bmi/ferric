@@ -44,11 +44,11 @@ pub fn load_tensor(file: &[u8], name: &str) -> Result<Tensor, String> {
     let raw = &file[base + start..base + end];
     let data: Vec<f32> = match dtype.as_str() {
         "F32" => raw
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         "BF16" => raw
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
             .collect(),
         other => return Err(format!("unsupported dtype {other}")),

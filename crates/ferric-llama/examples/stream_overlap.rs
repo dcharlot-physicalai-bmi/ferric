@@ -92,7 +92,7 @@ async fn run() {
 
     println!("Overlap vs synchronous streaming — Qwen2.5-0.5B, {} layers, {GEN} tokens", runs.len());
     println!("  budget {:.1} MB (nothing pinned: every layer of every token is a real read)\n", budget as f64 / 1e6);
-    println!("  {:>10}  {:>12}  {:>12}  {:>9}   {}", "read delay", "synchronous", "overlapped", "speedup", "tokens match");
+    println!("  {:>10}  {:>12}  {:>12}  {:>9}   tokens match", "read delay", "synchronous", "overlapped", "speedup");
     println!("  {:-<74}", "");
 
     let mut reference: Option<Vec<u32>> = None;

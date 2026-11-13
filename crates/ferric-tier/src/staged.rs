@@ -166,7 +166,7 @@ mod tests {
         let mut got = vec![0u8; 32];
         b.read_at(100, &mut got).unwrap();
         assert_eq!(got, &data(1024)[100..132]);
-        assert!(matches!(b.read_at(1000, &mut vec![0u8; 100]), Err(TierError::ShortRead { .. })));
+        assert!(matches!(b.read_at(1000, &mut [0u8; 100]), Err(TierError::ShortRead { .. })));
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         // The failure this prevents: a browser prefetch that missed, serving zeros, producing a model
         // that runs and is quietly wrong. The error names the range so the miss is diagnosable.
         let s = StagedBacking::new();
-        let e = s.read_at(4096, &mut vec![0u8; 16]).unwrap_err();
+        let e = s.read_at(4096, &mut [0u8; 16]).unwrap_err();
         match e {
             TierError::NotStaged { offset, len } => { assert_eq!(offset, 4096); assert_eq!(len, 16); }
             other => panic!("expected NotStaged, got {other:?}"),
@@ -191,7 +191,7 @@ mod tests {
         s.read_at(1200, &mut got).unwrap();
         assert_eq!(got, &data(500)[200..264]);
         // A read that runs off the end of the staged range is NOT silently truncated.
-        assert!(s.read_at(1400, &mut vec![0u8; 200]).is_err());
+        assert!(s.read_at(1400, &mut [0u8; 200]).is_err());
     }
 
     #[test]
@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(s.resident_bytes(), 8192);
         s.release(0);
         assert_eq!(s.resident_bytes(), 4096);
-        assert!(s.read_at(0, &mut vec![0u8; 8]).is_err(), "released range still readable");
-        assert!(s.read_at(4096, &mut vec![0u8; 8]).is_ok());
+        assert!(s.read_at(0, &mut [0u8; 8]).is_err(), "released range still readable");
+        assert!(s.read_at(4096, &mut [0u8; 8]).is_ok());
         s.release(4096);
         assert_eq!(s.resident_bytes(), 0);
         assert_eq!(s.peak_bytes(), 8192, "peak must survive the releases — it is what a budget is judged on");

@@ -17,7 +17,7 @@ const H: usize = 64; // shared local-energy hidden width — the SAME tiny net f
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 fn problem(d: usize, seed: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let ys: Vec<f32> = (0..d).map(|i| { let m = 0.4 + u(seed, i as u32 * 3 + 1) * 0.7; if u(seed, i as u32 * 3 + 2) > 0.5 { m } else { -m } }).collect();
@@ -26,7 +26,8 @@ fn problem(d: usize, seed: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (a, b, ys)
 }
 fn correct(d: usize, a: &[f32], b: &[f32], y: &[f32]) -> bool {
-    for i in 0..d - 1 { if (y[i] * y[i] + y[i + 1] * y[i + 1] - a[i]).abs() > 0.15 { return false; } if (y[i] * y[i + 1] - b[i]).abs() > 0.15 { return false; } }
+    for i in 0..d - 1 { if (y[i] * y[i] + y[i + 1] * y[i + 1] - a[i]).abs() > 0.15 { return false; }
+            if (y[i] * y[i + 1] - b[i]).abs() > 0.15 { return false; } }
     true
 }
 
@@ -105,7 +106,7 @@ async fn run() {
     println!("  (the first run used a FIXED K≤25 which cannot propagate constraints along a long chain — a possible design artifact)");
     let one = Tensor::from_vec(&ctx, &[1.0], &[1]); let al = Tensor::from_vec(&ctx, &[0.2], &[1]);
     println!("\n  solve accuracy (%) vs D, sweeping the thinking budget K in MULTIPLES of D   (fixed-K≤25 first run: D2/4/6/8/12 = 90/8/2/0/0):");
-    print!("    D            K=D    K=2D   K=4D   K=8D   K=16D  K=32D   | best\n");
+    println!("    D            K=D    K=2D   K=4D   K=8D   K=16D  K=32D   | best");
     for &d in &[6usize, 8] {
         let (l, r) = selectors(&ctx, d);
         let g = train(&ctx, d, &l, &r, &one).await;

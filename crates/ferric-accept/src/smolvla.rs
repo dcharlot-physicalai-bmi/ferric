@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(padded.len(), 32);
         assert_eq!(&padded[..2], &[1.0, 2.0]);
         assert!(padded[2..].iter().all(|v| *v == 0.0));
-        assert!(pad_state(&vec![0.0; 33]).is_err());
+        assert!(pad_state(&[0.0; 33]).is_err());
     }
 
     #[test]

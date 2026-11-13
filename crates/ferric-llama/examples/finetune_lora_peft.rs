@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn seed_vec(n: usize, s: f32, scale: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract() * 2.0 - 1.0) * scale).collect()
+    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43_758.547).fract() * 2.0 - 1.0) * scale).collect()
 }
 fn env_or(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
 fn nums(s: &str) -> Vec<u32> { s.split(',').filter(|x| !x.trim().is_empty()).map(|x| x.trim().parse().unwrap()).collect() }

@@ -46,12 +46,13 @@ fn main() {
         let ux = (field[t][ip] - field[t][im]) / (2.0 * dx); let uxx = (field[t][ip] - 2.0 * uu + field[t][im]) / (dx * dx);
         let utv = (field[t + 1][i] - field[t - 1][i]) / (2.0 * dt); let nz = 1.0 + 0.01 * uni((t * NX + i) as u32, 1);
         let lib = [1.0, uu, uu * uu, uu * uu * uu, ux, uxx, uu * ux];
-        for k in 0..K { theta.push(lib[k] * nz); } ut.push(utv * nz); n += 1;
+        for item in lib[..K].iter() { theta.push(*item * nz); } ut.push(utv * nz); n += 1;
     } }
     let mut scale = [1.0f64; K]; for k in 0..K { let mut s = 0.0; for i in 0..n { s += theta[i * K + k] * theta[i * K + k]; } scale[k] = (s / n as f64).sqrt().max(1e-6); }
     let mut active = [true; K]; let mut xi = [0.0f64; K];
     for _ in 0..12 { xi = lstsq(&theta, &ut, n, &active, &scale); let mut ch = false;
-        for k in 0..K { let keep = xi[k].abs() > 0.05; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } } if !ch { break; } }
+        for k in 0..K { let keep = xi[k].abs() > 0.05; if keep != active[k] { ch = true; } active[k] = keep; if !keep { xi[k] = 0.0; } }
+            if !ch { break; } }
 
     println!("\n  TRUE:       u_t = +1.00·u_xx +1.00·u −1.00·u²   (diffusion + logistic reaction)\n");
     let terms: Vec<String> = (0..K).filter(|&k| xi[k].abs() > 0.05).map(|k| format!("{:+.3}·{}", xi[k], NAMES[k])).collect();

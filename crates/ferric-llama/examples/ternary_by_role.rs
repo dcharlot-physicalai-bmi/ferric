@@ -124,6 +124,7 @@ async fn nll_chunks(ctx: &Arc<Context>, m: &Qwen3, chunks: &[Vec<u32>]) -> Vec<f
 }
 
 fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
+#[allow(dead_code)] // example helper, not on the default path
 fn spread_pct(v: &[f64]) -> f64 {
     let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
     100.0 * (hi - lo) / mean(v)

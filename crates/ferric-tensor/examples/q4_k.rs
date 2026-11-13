@@ -32,7 +32,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
         }
     }
     b.extend_from_slice(&s);
-    for i in 0..128u32 { b.push((((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8) & 0xff); } // 128 quant bytes
+    for i in 0..128u32 { b.push(((seed.wrapping_add(i.wrapping_mul(2246822519))) % 256) as u8); } // 128 quant bytes
     b
 }
 

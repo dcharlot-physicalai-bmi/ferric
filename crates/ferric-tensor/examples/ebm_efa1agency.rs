@@ -39,7 +39,7 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3],
@@ -47,7 +47,7 @@ struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb
 impl Efa1 {
     fn flow(&self, bi: usize, s: [f32; 6], g: [f32; 3], a: [f32; 3], t: f32) -> [f32; 3] {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
-        for c in 0..12 { f[c] = ff[c]; } for j in 0..3 { f[12 + j] = a[j]; } f[15] = t;
+        f[..12].copy_from_slice(&ff); f[12..(3 + 12)].copy_from_slice(&a); f[15] = t;
         for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
@@ -59,7 +59,7 @@ impl Efa1 {
         for i in 0..nj { a[i] = a[i].clamp(-UMAX, UMAX); } for i in nj..3 { a[i] = 0.0; } a }
     fn energy(&self, bi: usize, s: [f32; 6], g: [f32; 3], a: [f32; 3]) -> f32 {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let pin = 12 + 3 + EMB; let mut f = vec![0.0f32; pin];
-        for c in 0..12 { f[c] = ff[c]; } for j in 0..3 { f[12 + j] = a[j]; }
+        f[..12].copy_from_slice(&ff); f[12..(3 + 12)].copy_from_slice(&a);
         for c in 0..EMB { f[15 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.pb1[j]; for c in 0..pin { z += f[c] * self.pw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.pb2[j]; for k in 0..H { z += h1[k] * self.pw2[k * H + j]; } h2[j] = z.max(0.0); }

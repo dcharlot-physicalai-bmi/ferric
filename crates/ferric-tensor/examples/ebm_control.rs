@@ -82,7 +82,7 @@ async fn run() {
         let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone());
         let sp = |z: Var| z.exp().add(&ov).log();
         let hh = sp(sl.matmul(&pv[0]).add(&pv[1])).matmul(&pv[2]).add(&pv[3]);
-        let g = grad(&hh.sum_all(), &[sl.clone()], None).remove(0); // [bs,2] = (∂H/∂θ, ∂H/∂ω)
+        let g = grad(&hh.sum_all(), std::slice::from_ref(&sl), None).remove(0); // [bs,2] = (∂H/∂θ, ∂H/∂ω)
         let selq = Var::leaf(Tensor::from_vec(&ctx, &[1.0, 0.0], &[2, 1]));
         let selp = Var::leaf(Tensor::from_vec(&ctx, &[0.0, 1.0], &[2, 1]));
         let eth = g.matmul(&selq).sub(&Var::leaf(Tensor::from_vec(&ctx, &gth, &[bs, 1]))); // ∂H/∂θ − sinθ

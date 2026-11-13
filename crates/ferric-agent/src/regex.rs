@@ -84,7 +84,7 @@ impl Rx<'_> {
             _ => return Ok(atom),
         };
         // Lazy and possessive suffixes do not change which strings fully match.
-        if matches!(self.peek(), Some('?') | Some('+')) && q.len() >= 1 {
+        if matches!(self.peek(), Some('?') | Some('+')) && !q.is_empty() {
             if self.peek() == Some('+') { return Err(self.err("possessive quantifiers are not supported")); }
             self.p += 1;
         }

@@ -29,7 +29,7 @@ const N: usize = 262_144;
 /// stride. Same 256 values per block, same multiset, 256 wrong positions.
 fn deq_contiguous(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(42).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<42>().0.iter().take(n / 256).enumerate() {
         let d = half::f16::from_le_bytes([blk[40], blk[41]]).to_f32();
         for g in 0..64 {
             let slot = (blk[g / 2] >> (4 * (g & 1))) & 0x0F;
@@ -46,7 +46,7 @@ fn deq_contiguous(raw: &[u8], n: usize) -> Vec<f32> {
 /// ...and by someone who assumed the scale leads the block, as it does in every other ggml type.
 fn deq_scale_first(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(42).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<42>().0.iter().take(n / 256).enumerate() {
         let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
         for g in 0..64 {
             let slot = (blk[2 + g / 2] >> (4 * (g & 1))) & 0x0F;
@@ -107,7 +107,7 @@ fn main() -> Result<(), String> {
 
     let zeros = ferric.iter().filter(|v| **v == 0.0).count();
     println!("\n  forced zeros: {:.1}% (the container guarantees exactly 25.0%)", 100.0 * zeros as f64 / N as f64);
-    let scales: Vec<f32> = rs.chunks_exact(42).map(|b| half::f16::from_le_bytes([b[40], b[41]]).to_f32()).collect();
+    let scales: Vec<f32> = rs.as_chunks::<42>().0.iter().map(|b| half::f16::from_le_bytes([b[40], b[41]]).to_f32()).collect();
     let bad = scales.iter().filter(|d| !d.is_finite() || **d <= 0.0).count();
     println!("  block scales: {} of {} finite and positive, median {:.5}",
              scales.len() - bad, scales.len(), { let mut s = scales.clone(); s.sort_by(f32::total_cmp); s[s.len() / 2] });
@@ -121,7 +121,7 @@ fn main() -> Result<(), String> {
         let (mine, orc) = (deq_raw(&ra, N, ty)?, deq_raw(&rb, N, 12)?);
         let (sa, _) = sign_agreement(&mine, &orc);
         let c = cosine(&mine, &orc);
-        println!("{:<26} {:>10.4} {:>13.1}%          {}", tag, c, 100.0 * sa, "(vs Q4_K)");
+        println!("{:<26} {:>10.4} {:>13.1}%          (vs Q4_K)", tag, c, 100.0 * sa);
         assert!(c > 0.8, "{tag} decode disagrees with the Q4_K oracle at cos {c:.4}");
     }
 

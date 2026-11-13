@@ -25,7 +25,7 @@ impl Context {
         let out = self.empty(&[m as usize, n as usize]);
         let dims = self.uniform_u32("d", &[m, k, n, 0]);
         let pipe = self.pipeline("mm", crate::MATMUL_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((m + 15) / 16, (n + 15) / 16, 1));
+        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], (m.div_ceil(16), n.div_ceil(16), 1));
         out
     }
     /// C = scale·(A(m×k)·B(n×k)ᵀ), on-GPU.
@@ -33,7 +33,7 @@ impl Context {
         let out = self.empty(&[m as usize, n as usize]);
         let dims = self.uniform_u32("d", &[m, n, k, scale.to_bits()]);
         let pipe = self.pipeline("mm_bt", MATMUL_BT_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((m + 15) / 16, (n + 15) / 16, 1));
+        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], (m.div_ceil(16), n.div_ceil(16), 1));
         out
     }
     pub fn silu_t(&self, x: &Tensor) -> Tensor {
@@ -41,7 +41,7 @@ impl Context {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("silu", SILU_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     /// Reinterpret a tensor's data under a new shape (contiguous row-major) — Reshape/Cast/Squeeze.
@@ -96,7 +96,7 @@ impl Context {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline(name, wgsl);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     fn binary(&self, a: &Tensor, b: &Tensor, wgsl: &str, name: &str) -> Tensor {
@@ -104,7 +104,7 @@ impl Context {
         let out = self.empty(&a.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline(name, wgsl);
-        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     /// Elementwise C = A ⊙ B.
@@ -113,7 +113,7 @@ impl Context {
         let out = self.empty(&a.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("mul", MUL_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     /// C = A · scalar, where `s` is a 1-element tensor (broadcast).
@@ -122,7 +122,7 @@ impl Context {
         let out = self.empty(&a.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("mul_scalar", MUL_SCALAR_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &s.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&a.buf, &s.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     /// 2D transpose [rows×cols] → [cols×rows].
@@ -130,7 +130,7 @@ impl Context {
         let out = self.empty(&[cols as usize, rows as usize]);
         let dims = self.uniform_u32("d", &[rows, cols, 0, 0]);
         let pipe = self.pipeline("transpose", TRANSPOSE_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((rows + 15) / 16, (cols + 15) / 16, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], (rows.div_ceil(16), cols.div_ceil(16), 1));
         out
     }
     /// C = A + bias broadcast per row: out[i] = a[i] + bias[i % d]. (a is [.,d], bias is [d].)
@@ -139,7 +139,7 @@ impl Context {
         let out = self.empty(&a.shape);
         let dims = self.uniform_u32("d", &[n as u32, d as u32, 0, 0]);
         let pipe = self.pipeline("add_bias", ADD_BIAS_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &bias.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&a.buf, &bias.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     pub fn relu_t(&self, x: &Tensor) -> Tensor {
@@ -147,7 +147,7 @@ impl Context {
         let out = self.empty(&x.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("relu", RELU_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
@@ -155,7 +155,7 @@ impl Context {
         let out = self.empty(&a.shape);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("add", ADD_WGSL);
-        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&a.buf, &b.buf, &out.buf, &dims], ((n as u32).div_ceil(64), 1, 1));
         out
     }
     pub fn softmax_t(&self, x: &Tensor, rows: u32, d: u32) -> Tensor {
@@ -164,7 +164,7 @@ impl Context {
         // det-scratch: storage slot for the exp-sum
         let scr = self.out_buffer(rows as usize * 2);
         let pipe = self.pipeline("softmax", SOFTMAX_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims, &scr], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims, &scr], (rows.div_ceil(64), 1, 1));
         out
     }
     /// Rotary position embedding (rotate-half, NeoX/Llama style). x is [T, H·dh]; rotates each head's
@@ -184,6 +184,9 @@ impl Context {
     }
     /// Attention for one query token against a KV cache of `s` past keys/values (incremental decode).
     /// q is [1, H·dh]; k/v are [s, H·dh]; no mask (all cached keys precede the query). Returns [1, H·dh].
+    // Eight parameters: the three tensors plus the GQA shape and the cache length.
+    // They stay separate so a swapped head count cannot hide inside one packed value.
+    #[allow(clippy::too_many_arguments)]
     pub fn mha_decode_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, hq: u32, hkv: u32, dh: u32, s: u32) -> Tensor {
         let out = self.empty(&q.shape);
         let scale = 1.0f32 / (dh as f32).sqrt();
@@ -196,6 +199,9 @@ impl Context {
     /// Causal multi-head attention, single flash-style pass, with grouped-query attention (GQA): Q has
     /// `hq` heads, K/V have `hkv` heads (hq % hkv == 0); query head h reads kv head h/(hq/hkv). q is
     /// [T, hq·dh]; k/v are [T, hkv·dh]; scale = 1/√dh; query i attends to keys 0..=i. Returns [T, hq·dh].
+    // The head counts are independent of the sequence length. Packing them would
+    // make a swapped `hq`/`hkv` a field-order bug instead of a type error at the call.
+    #[allow(clippy::too_many_arguments)]
     pub fn mha_causal_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: u32, hq: u32, hkv: u32, dh: u32) -> Tensor {
         let out = self.empty(&q.shape);
         let scale = 1.0f32 / (dh as f32).sqrt();
@@ -221,10 +227,11 @@ impl Context {
         // det-scratch: storage-space slots for the per-row scalar chain
         let scr = self.out_buffer(rows as usize * 16);
         let pipe = self.pipeline("layernorm", LAYERNORM_WGSL);
-        self.dispatch(&pipe, &[&x.buf, &w.buf, &b.buf, &out.buf, &dims, &scr], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&x.buf, &w.buf, &b.buf, &out.buf, &dims, &scr], (rows.div_ceil(64), 1, 1));
         out
     }
     /// Single-head attention on-GPU: softmax(scale·Q·Kᵀ)·V, all buffers stay on device.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, rq: u32, rk: u32, d: u32, dv: u32, scale: f32) -> Tensor {
         let scores = self.mm_bt(q, k, rq, rk, d, scale);
         let probs = self.softmax_t(&scores, rq, rk);
@@ -241,7 +248,7 @@ impl Context {
         let out = self.out_buffer(n);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("add", ADD_WGSL);
-        self.dispatch(&pipe, &[&ab, &bb, &out, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&ab, &bb, &out, &dims], ((n as u32).div_ceil(64), 1, 1));
         self.readback(&out, n).await
     }
 
@@ -252,7 +259,7 @@ impl Context {
         let out = self.out_buffer(n);
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("silu", SILU_WGSL);
-        self.dispatch(&pipe, &[&xb, &out, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &out, &dims], ((n as u32).div_ceil(64), 1, 1));
         self.readback(&out, n).await
     }
 
@@ -266,7 +273,7 @@ impl Context {
         let dims = self.uniform_u32("dims", &[rows, d, eps.to_bits(), 0]);
         let scr = self.out_buffer(rows as usize * 16);
         let pipe = self.pipeline("layernorm", LAYERNORM_WGSL);
-        self.dispatch(&pipe, &[&xb, &wb, &bb, &out, &dims, &scr], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &wb, &bb, &out, &dims, &scr], (rows.div_ceil(64), 1, 1));
         self.readback(&out, (rows * d) as usize).await
     }
 
@@ -278,7 +285,7 @@ impl Context {
         let dims = self.uniform_u32("dims", &[rows, d, 0, 0]);
         let scr = self.out_buffer(rows as usize * 2);
         let pipe = self.pipeline("softmax", SOFTMAX_WGSL);
-        self.dispatch(&pipe, &[&xb, &out, &dims, &scr], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &out, &dims, &scr], (rows.div_ceil(64), 1, 1));
         self.readback(&out, (rows * d) as usize).await
     }
 
@@ -291,12 +298,13 @@ impl Context {
         let out = self.out_buffer((m * n) as usize);
         let dims = self.uniform_u32("dims", &[m, n, k, scale.to_bits()]);
         let pipe = self.pipeline("matmul_bt", MATMUL_BT_WGSL);
-        self.dispatch(&pipe, &[&ab, &bb, &out, &dims], ((m + 15) / 16, (n + 15) / 16, 1));
+        self.dispatch(&pipe, &[&ab, &bb, &out, &dims], (m.div_ceil(16), n.div_ceil(16), 1));
         self.readback(&out, (m * n) as usize).await
     }
 
     /// Single-head scaled dot-product attention: softmax(scale · Q·Kᵀ) · V.
     /// Q[rows_q×d], K[rows_k×d], V[rows_k×dv] → [rows_q×dv]. Composed from matmul_bt + softmax + matmul.
+    #[allow(clippy::too_many_arguments)]
     pub async fn attention(&self, q: &[f32], k: &[f32], v: &[f32], rows_q: u32, rows_k: u32, d: u32, dv: u32, scale: f32) -> Result<Vec<f32>> {
         let scores = self.matmul_bt(q, k, rows_q, rows_k, d, scale).await?; // [rows_q × rows_k], scaled
         let probs = self.softmax(&scores, rows_q, rows_k).await?;
@@ -964,7 +972,9 @@ pub mod cpu {
     fn libm_erf(z: f32) -> f32 {
         let s = z.signum(); let a = z.abs();
         let t = 1.0 / (1.0 + 0.3275911 * a);
-        let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-a * a).exp();
+        // These decimals are the shortest spellings of the f32 values. Longer
+        // source digits round to the same bits.
+        let y = 1.0 - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t + 0.254_829_6) * t * (-a * a).exp();
         s * y
     }
     pub fn layernorm(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize, eps: f32) -> Vec<f32> {
@@ -1037,9 +1047,9 @@ pub mod cpu {
                 let kvhead = head / (hq / hkv);
                 let qo = (i * hq + head) * dh;
                 let mut scores = vec![0.0f32; i + 1];
-                for j in 0..=i {
+                for (j, score) in scores.iter_mut().enumerate() {
                     let ko = (j * hkv + kvhead) * dh;
-                    scores[j] = (0..dh).map(|c| q[qo + c] * k[ko + c]).sum::<f32>() * scale;
+                    *score = (0..dh).map(|c| q[qo + c] * k[ko + c]).sum::<f32>() * scale;
                 }
                 let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0;
@@ -1053,6 +1063,7 @@ pub mod cpu {
         }
         o
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn attention(q: &[f32], k: &[f32], v: &[f32], rows_q: usize, rows_k: usize, d: usize, dv: usize, scale: f32) -> Vec<f32> {
         let scores = matmul_bt(q, k, rows_q, rows_k, d, scale);
         let probs = softmax(&scores, rows_q, rows_k);
@@ -1070,13 +1081,12 @@ impl Context {
     pub async fn det_rsqrt_stage(&self, y: &[f32], stage: u32) -> crate::Result<Vec<f32>> {
         // NOTE: pipeline() auto-prepends DET_MATH_WGSL when it sees det_ —
         // do not embed it here or det_bar gets redeclared.
-        let src = format!(
-            r#"@group(0) @binding(0) var<storage, read>       y: array<f32>;
+        let src = r#"@group(0) @binding(0) var<storage, read>       y: array<f32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform>             dims: vec4<u32>; // n, z, stage, _
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x; if (i >= dims.x) {{ return; }}
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= dims.x) { return; }
     let z = dims.y;
     let yy = y[i];
     let hy = 0.5 * yy;
@@ -1097,15 +1107,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     x = det_bar(x * w, z);          stages[12] = x;
     stages[13] = yy * det_bar(x, z);
     out[i] = stages[dims.z];
-}}
-"#
-        );
+}
+"#.to_string();
         let n = y.len();
         let yb = self.storage("fy", y);
         let ob = self.out_buffer(n);
         let dims = self.uniform_u32("fd", &[n as u32, 0, stage, 0]);
         let pipe = self.pipeline("rsqrt_stage", &src);
-        self.dispatch(&pipe, &[&yb, &ob, &dims], ((n as u32 + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&yb, &ob, &dims], ((n as u32).div_ceil(64), 1, 1));
         self.readback(&ob, n).await
     }
 }
@@ -1178,7 +1187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         let ob = self.out_buffer(rows as usize);
         let dims = self.uniform_u32("fd", &[rows, d, eps.to_bits(), stage]);
         let pipe = self.pipeline("rmsnorm_stage", src);
-        self.dispatch(&pipe, &[&xb, &wb, &ob, &dims], ((rows + 63) / 64, 1, 1));
+        self.dispatch(&pipe, &[&xb, &wb, &ob, &dims], (rows.div_ceil(64), 1, 1));
         self.readback(&ob, rows as usize).await
     }
 }
@@ -1294,7 +1303,7 @@ pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -
         for _ in 0..3 {
             let t = y * r;
             let ww = 2.0 - t;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1305,7 +1314,7 @@ pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -
             let t = r * r;
             let u = hy * t;
             let ww = 1.5 - u;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1328,7 +1337,7 @@ pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -
                     let base = row * d;
                     // squares (rounded muls), then 64 strided partials
                     let mut red = [0f32; 64];
-                    for li in 0..64usize {
+                    for (li, slot) in red.iter_mut().enumerate() {
                         let cls = (li + 1) & 63;
                         let mut p = 0f32;
                         let mut j = cls;
@@ -1337,7 +1346,7 @@ pub fn rmsnorm_tree_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -
                             p += sq;
                             j += 64;
                         }
-                        red[li] = p;
+                        *slot = p;
                     }
                     // fixed 6-level tree
                     let mut s = 32usize;
@@ -1475,7 +1484,7 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
         for _ in 0..3 {
             let t = y * r;
             let ww = 2.0 - t;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1486,7 +1495,7 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
             let t = r * r;
             let u = hy * t;
             let ww = 1.5 - u;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1505,7 +1514,7 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
     for row in 0..rows {
         let base = row * d;
         let mut red = [0f32; 64];
-        for li in 0..64usize {
+        for (li, slot) in red.iter_mut().enumerate() {
             let cls = (li + 1) & 63;
             let mut p = 0f32;
             let mut j = cls;
@@ -1513,12 +1522,12 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
                 p += x[base + j];
                 j += 64;
             }
-            red[li] = p;
+            *slot = p;
         }
         let rc = recip(d as f32);
         let mean = tree64(&mut red) * rc;
         let mut red = [0f32; 64];
-        for li in 0..64usize {
+        for (li, slot) in red.iter_mut().enumerate() {
             let cls = (li + 1) & 63;
             let mut p = 0f32;
             let mut j = cls;
@@ -1528,7 +1537,7 @@ pub fn layernorm_tree_cpu(x: &[f32], w: &[f32], b: &[f32], rows: usize, d: usize
                 p += sq;
                 j += 64;
             }
-            red[li] = p;
+            *slot = p;
         }
         let var = tree64(&mut red) * rc;
         let inv = rsqrt(var + eps);
@@ -1621,7 +1630,7 @@ pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
     fn exp_det(v: f32) -> f32 {
         let xx = v.clamp(-87.0, 88.0);
         let log2e = f32::from_bits(0x3FB8_AA3B);
-        let ln2hi = 0.693115234375f32;
+        let ln2hi = 0.693_115_23_f32;
         let ln2lo = f32::from_bits(0x3805_FDF4);
         let kf = (xx * log2e + 0.5).floor();
         let a = xx - kf * ln2hi;
@@ -1642,7 +1651,7 @@ pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
         for _ in 0..3 {
             let t = y * r;
             let ww = 2.0 - t;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1669,7 +1678,7 @@ pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
             ws[j] = exp_det(x[base + j] - mx);
         }
         let mut red = [0f32; 64];
-        for li in 0..64usize {
+        for (li, slot) in red.iter_mut().enumerate() {
             let cls = (li + 1) & 63;
             let mut p = 0f32;
             let mut j = cls;
@@ -1677,7 +1686,7 @@ pub fn softmax_tree_cpu(x: &[f32], rows: usize, d: usize) -> Vec<f32> {
                 p += ws[j];
                 j += 64;
             }
-            red[li] = p;
+            *slot = p;
         }
         let inv = recip(tree64(&mut red));
         for j in 0..d {
@@ -1794,7 +1803,7 @@ pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> 
         for _ in 0..3 {
             let t = y * r;
             let ww = 2.0 - t;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1805,7 +1814,7 @@ pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> 
             let t = r * r;
             let u = hy * t;
             let ww = 1.5 - u;
-            r = r * ww;
+            r *= ww;
         }
         r
     }
@@ -1822,7 +1831,7 @@ pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> 
     for row in 0..rows {
         let base = row * d;
         let mut red = [0f32; 64];
-        for li in 0..64usize {
+        for (li, slot) in red.iter_mut().enumerate() {
             let cls = (li + 1) & 63;
             let mut p = 0f32;
             let mut j = cls;
@@ -1831,7 +1840,7 @@ pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> 
                 p += sq;
                 j += 64;
             }
-            red[li] = p;
+            *slot = p;
         }
         let mut sg0: [f32; 32] = red[0..32].try_into().unwrap();
         let mut sg1: [f32; 32] = red[32..64].try_into().unwrap();

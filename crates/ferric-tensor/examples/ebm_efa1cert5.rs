@@ -34,23 +34,25 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3] }
 impl Efa1 {
     fn act(&self, bi: usize, s: [f32; 6], g: [f32; 3]) -> [f32; 3] {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
-        for c in 0..12 { f[c] = ff[c]; } f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
+        f[..12].copy_from_slice(&ff); f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3; for j in 0..H { for c in 0..3 { o[c] += h2[j] * self.fw3[j * 3 + c]; } }
         let mut a = [0.0f32; 3]; for i in 0..nj { a[i] = o[i].clamp(-UMAX, UMAX); } a }
 }
 fn fcl(m: &Efa1, bi: usize, x: &[f32], g: [f32; 3]) -> Vec<f32> {
-    let nj = NJ[bi]; let mut s = [0.0f32; 6]; for i in 0..nj { s[i] = x[i]; s[3 + i] = x[nj + i]; }
+    let nj = NJ[bi]; let mut s = [0.0f32; 6]; s[..nj].copy_from_slice(&x[..nj]);
+    s[3..(nj + 3)].copy_from_slice(&x[nj..(nj + nj)]);
     let ns = step(nj, s, m.act(bi, s, g));
-    let mut y = vec![0.0f32; 2 * nj]; for i in 0..nj { y[i] = ns[i]; y[nj + i] = ns[3 + i]; } y
+    let mut y = vec![0.0f32; 2 * nj]; y[..nj].copy_from_slice(&ns[..nj]);
+    y[nj..(nj + nj)].copy_from_slice(&ns[3..(nj + 3)]); y
 }
 fn matmul(a: &[f32], b: &[f32], d: usize) -> Vec<f32> { let mut c = vec![0.0f32; d * d];
     for i in 0..d { for k in 0..d { let aik = a[i * d + k]; for j in 0..d { c[i * d + j] += aik * b[k * d + j]; } } } c }
@@ -93,15 +95,15 @@ fn main() {
         let mut rows: Vec<String> = vec![];
         // ω envelope measured once per body (goal-independent enough; conservative max over goals)
         let mut om_env = 0.0f32;
-        for (gi, gtk) in gt4.iter().enumerate() { let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gtk[j]; }
+        for (gi, gtk) in gt4.iter().enumerate() { let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gtk[..nj]);
             for k in 0..30u32 { let mut x = vec![0.0f32; d];
                 for j in 0..nj { x[j] = (u(k + gi as u32 * 100, 7 + j as u32) * 2.0 - 1.0) * PI; x[nj + j] = (u(k + gi as u32 * 100, 17 + j as u32) * 2.0 - 1.0) * 1.5; }
                 for _ in 0..300 { x = fcl(&m, bi, &x, g); for j in 0..nj { om_env = om_env.max(x[nj + j].abs()); } } } }
         let om_b = (om_env * 1.3).ceil();
         for (gi, gtk) in gt4.iter().enumerate() {
-            let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gtk[j]; }
+            let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gtk[..nj]);
             // attractor
-            let mut xstar = vec![0.0f32; d]; for j in 0..nj { xstar[j] = g[j]; }
+            let mut xstar = vec![0.0f32; d]; xstar[..nj].copy_from_slice(&g[..nj]);
             for _ in 0..800 { xstar = fcl(&m, bi, &xstar, g); }
             let residual: f32 = (0..d).map(|c| { let v = if c < nj { wrap(xstar[c] - g[c]) } else { xstar[c] }; v * v }).sum::<f32>().sqrt();
             // constant P at x*

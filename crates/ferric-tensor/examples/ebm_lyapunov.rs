@@ -17,7 +17,7 @@ const G: f32 = 1.0;                       // single designated goal angle (regio
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(th: f32, om: f32, uu: f32) -> (f32, f32) { let no = om + DT * (-th.sin() - 0.05 * om + uu.clamp(-UMAX, UMAX)); (wrap(th + DT * no), no) }
 fn d2(th: f32, om: f32) -> f32 { wrap(th - G).powi(2) + om * om }   // ‖x−g‖²
@@ -109,7 +109,7 @@ fn verify(e: &E) -> (f32, f32, f32, f32) {
         tot += 1.0; if dv >= -eps || v <= 0.0 { viol += 1.0; } pts.push((v, dv)); } }
     // largest c such that every grid point with V≤c (away from g) is strictly descending (dV<−eps) and V>0
     let mut c = f32::MAX;
-    for &(v, dv) in &pts { if dv >= -eps || v <= 0.0 { if v < c { c = v; } } }   // smallest V among violators = ceiling of certified sublevel
+    for &(v, dv) in &pts { if (dv >= -eps || v <= 0.0) && v < c { c = v; } }   // smallest V among violators = ceiling of certified sublevel
     let cert = if c == f32::MAX { f32::MAX } else { c };
     let inside = pts.iter().filter(|&&(v, _)| v <= cert && v > 0.0).count() as f32;
     let region = inside / tot * 100.0;

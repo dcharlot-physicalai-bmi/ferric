@@ -17,7 +17,7 @@ const TESTG: [f32; 4] = [-1.5, -0.5, 0.5, 1.5];
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(th: f32, om: f32, uu: f32) -> (f32, f32) { let no = om + DT * (-th.sin() - 0.05 * om + uu.clamp(-UMAX, UMAX)); (wrap(th + DT * no), no) }
 // grid of candidate next-actions for the Bellman min (9 pts) and for the discrete baseline eval
@@ -102,7 +102,7 @@ async fn run() {
                     let u2: Vec<f32> = ucur.iter().map(|&x| x * x).collect();
                     let uv = Var::leaf(Tensor::from_vec(&ctx, &ucur, &[n, 1])); let u2v = Var::leaf(Tensor::from_vec(&ctx, &u2, &[n, 1]));
                     let qval = enet(&rcv, &rsv, &omv, &ctv, &stv, &uv, &u2v, &pv, &ov);
-                    let gu = grad(&qval.sum_all(), &[uv.clone()], None);                          // ∂Q/∂u, O(1) — u is a direct input
+                    let gu = grad(&qval.sum_all(), std::slice::from_ref(&uv), None);                          // ∂Q/∂u, O(1) — u is a direct input
                     let du = gu[0].value().to_vec().await;
                     for i in 0..n { ucur[i] = (ucur[i] - alpha * du[i]).clamp(-UMAX, UMAX); }
                 }

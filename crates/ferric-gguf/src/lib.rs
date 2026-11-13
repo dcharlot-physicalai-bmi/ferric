@@ -273,10 +273,10 @@ pub fn resolve_type_42(n_elements: usize, declared_bytes: usize) -> Result<u32, 
     // Decoded since 2026-09-28 (`prism::deq_q2_0_g64`, bit-exact vs `dequantize_row_q2_0` in
     // PrismML's fork @ adfffbe): PrismML's Bonsai 2 ships a group-64 file under this id, and so will
     // any mainline Q2_0 quantization. Internal id Q2_0_G64 (2042), like F8_E4M3_B128 is 1042.
-    if n_elements % 64 == 0 && declared_bytes == n_elements / 64 * 18 {
+    if n_elements.is_multiple_of(64) && declared_bytes == n_elements / 64 * 18 {
         return Ok(Q2_0_G64);
     }
-    if n_elements % 128 != 0 {
+    if !n_elements.is_multiple_of(128) {
         return Err(format!("ggml type 42 needs a multiple of 128 elements, got {n_elements}"));
     }
     let blocks = n_elements / 128;
@@ -350,7 +350,7 @@ const F8_E4M3_B128: u32 = 1042; // internal id; the FILE always says 42
 
 /// Dequantize `F8_E4M3_B128`: each block is one E8M0 scale byte, then 128 E4M3 elements.
 pub fn deq_f8_e4m3_b128(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
-    if n % 128 != 0 { return Err(format!("F8_E4M3_B128 needs a multiple of 128 elements, got {n}")); }
+    if !n.is_multiple_of(128) { return Err(format!("F8_E4M3_B128 needs a multiple of 128 elements, got {n}")); }
     let blocks = n / 128;
     let need = blocks * F8_E4M3_B128_BYTES;
     if raw.len() < need { return Err(format!("F8_E4M3_B128 needs {need} bytes for {n} elements, got {}", raw.len())); }
@@ -574,7 +574,7 @@ impl GgufSource for Gguf {
 /// from code that did not exist yet.
 pub fn type_size(ty: u32, n: usize) -> Result<usize, String> {
     let blk = block_elems(ty);
-    if blk > 1 && n % blk != 0 {
+    if blk > 1 && !n.is_multiple_of(blk) {
         return Err(format!("ggml type {ty} stores {blk} elements per block; {n} is not a multiple \
                             of that, so it has no on-disk size"));
     }
@@ -662,9 +662,9 @@ pub fn block_elems(ty: u32) -> usize {
 /// Dequantize `n` elements of ggml type `ty` out of a raw byte slice.
 pub fn deq_raw(raw: &[u8], n: usize, ty: u32) -> Result<Vec<f32>, String> {
     Ok(match ty {
-        F32 => raw[..n * 4].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-        F16T => raw[..n * 2].chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
-        BF16T => raw[..n * 2].chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
+        F32 => raw[..n * 4].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+        F16T => raw[..n * 2].as_chunks::<2>().0.iter().map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
+        BF16T => raw[..n * 2].as_chunks::<2>().0.iter().map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
         Q8_0 => deq_q8_0(raw, n),
         Q4_0 => deq_q4_0(raw, n),
         Q4_1 => deq_q4_1(raw, n),
@@ -721,7 +721,8 @@ struct Shard { f: std::cell::RefCell<std::fs::File>, data_start: u64, len: u64,
                path: std::path::PathBuf }
 
 /// Parse one file's header, growing the prefix read until it succeeds.
-fn open_one(path: &std::path::Path) -> Result<(HashMap<String, Meta>, Vec<TensorInfo>, Shard), String> {
+type OpenedShard = (HashMap<String, Meta>, Vec<TensorInfo>, Shard);
+fn open_one(path: &std::path::Path) -> Result<OpenedShard, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
     // Header = magic + metadata (which includes the tokenizer vocab, often megabytes) + tensor
@@ -797,7 +798,7 @@ impl GgufFile {
             if no == 0 { md = Some(m); }
             let idx = shards.len();
             shards.push(sh);
-            owner.extend(std::iter::repeat(idx).take(ts.len()));
+            owner.extend(std::iter::repeat_n(idx, ts.len()));
             all.extend(ts);
         }
 
@@ -950,7 +951,7 @@ pub(crate) fn rd_f16_one(b: &[u8]) -> f32 { if b[0] == 0x00 && b[1] == 0x3C { 1.
 /// Q8_0: blocks of 32 → [f16 scale, i8 qs[32]] (34 bytes). x = qs·scale.
 fn deq_q8_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
-    for blk in raw.chunks_exact(34).take(n / 32) {
+    for blk in raw.as_chunks::<34>().0.iter().take(n / 32) {
         let d = rd_f16(&blk[0..2]);
         for &q in &blk[2..34] { out.push(q as i8 as f32 * d); }
     }
@@ -960,7 +961,7 @@ fn deq_q8_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// Q4_0: blocks of 32 → [f16 scale, u8 qs[16]] (18 bytes). x = (nibble-8)·scale, low nibbles then high.
 fn deq_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(18).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<18>().0.iter().take(n / 32).enumerate() {
         let d = rd_f16(&blk[0..2]);
         for i in 0..16 {
             let byte = blk[2 + i];
@@ -975,7 +976,7 @@ fn deq_q4_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// nibbles then high. The affine (min-offset) sibling of Q4_0 — better for asymmetric weights.
 fn deq_q4_1(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(20).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<20>().0.iter().take(n / 32).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let m = rd_f16(&blk[2..4]);
         for i in 0..16 {
@@ -992,7 +993,7 @@ fn deq_q4_1(raw: &[u8], n: usize) -> Vec<f32> {
 /// value i+16 — reassembled and offset: x = ((nibble | (bit<<4)) − 16)·d. (llama.cpp ggml layout.)
 fn deq_q5_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(22).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<22>().0.iter().take(n / 32).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
         for i in 0..16 {
@@ -1010,7 +1011,7 @@ fn deq_q5_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// value = (nibble | (5th-bit<<4))·d + m (no −16). 5th bit i for value i, bit i+16 for value i+16.
 fn deq_q5_1(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(24).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<24>().0.iter().take(n / 32).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let m = rd_f16(&blk[2..4]);
         let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
@@ -1036,7 +1037,7 @@ fn deq_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
         if j < 4 { (scales[j] & 63, scales[j + 4] & 63) }
         else { ((scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4), (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4)) }
     };
-    for (bi, blk) in raw.chunks_exact(176).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<176>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let dmin = rd_f16(&blk[2..4]);
         let scales = &blk[4..16];
@@ -1069,7 +1070,7 @@ fn deq_q5_k(raw: &[u8], n: usize) -> Vec<f32> {
 /// `dequantize_row_q2_K`'s exact loop nesting instead of restructuring it.
 fn deq_q2_k(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(84).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<84>().0.iter().take(n / 256).enumerate() {
         let sc = &blk[0..16];
         let d = rd_f16(&blk[80..82]);
         let dmin = rd_f16(&blk[82..84]);
@@ -1111,7 +1112,7 @@ fn deq_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
     const KMASK1: u32 = 0x0303_0303;
     const KMASK2: u32 = 0x0f0f_0f0f;
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(110).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<110>().0.iter().take(n / 256).enumerate() {
         let hm = &blk[0..32];
         let d_all = rd_f16(&blk[108..110]);
 
@@ -1122,7 +1123,7 @@ fn deq_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
         let tmp = aux[2];
         aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
         aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-        aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
         aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
         let mut scales = [0i8; 16];
         for k in 0..4 {
@@ -1158,7 +1159,7 @@ fn deq_q3_k(raw: &[u8], n: usize) -> Vec<f32> {
 /// quant. Layout follows llama.cpp exactly (two 128-value halves, 4 quant groups per half).
 fn deq_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(210).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<210>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[208..210]);
         let ql = &blk[0..128];
         let qh = &blk[128..192];
@@ -1168,7 +1169,7 @@ fn deq_q6_k(raw: &[u8], n: usize) -> Vec<f32> {
             let (qlh, qhh, sch) = (&ql[half * 64..], &qh[half * 32..], &sc[half * 8..]);
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((qlh[l] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) as i32 - 32;
+                let q1 = ((qlh[l] & 0xF) | ((qhh[l] & 3) << 4)) as i32 - 32;
                 let q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) as i32 - 32;
                 let q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i32 - 32;
                 let q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i32 - 32;
@@ -1192,7 +1193,7 @@ const KVALUES_IQ4NL: [i32; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 1
 /// value = `d · kvalues_iq4nl[idx]`.
 fn deq_iq4_nl(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(18).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<18>().0.iter().take(n / 32).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs = &blk[2..18];
         let y = bi * 32;
@@ -1209,7 +1210,7 @@ fn deq_iq4_nl(raw: &[u8], n: usize) -> Vec<f32> {
 /// high 2 bits from `scales_h` at bit `2·ib`); `dl = d·(ls − 32)`, value = `dl · kvalues_iq4nl[idx]`.
 fn deq_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(136).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<136>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
         let scales_l = &blk[4..8];
@@ -1240,7 +1241,7 @@ fn deq_q4_k(raw: &[u8], n: usize) -> Vec<f32> {
             )
         }
     };
-    for (bi, blk) in raw.chunks_exact(144).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<144>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let dmin = rd_f16(&blk[2..4]);
         let scales = &blk[4..16];
@@ -1294,7 +1295,7 @@ pub(crate) fn ksigns_for_proof(i: u8) -> u8 { ksigns(i) }
 /// gives a plausible small float and a quietly rescaled group.
 fn deq_iq2_xxs(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(66).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<66>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         for ib32 in 0..8 {
             let q = &blk[2 + 8 * ib32..2 + 8 * ib32 + 8];
@@ -1327,7 +1328,7 @@ fn deq_iq2_xxs(raw: &[u8], n: usize) -> Vec<f32> {
 /// IQ2_XXS's `0.25`.
 fn deq_iq3_xxs(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(98).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<98>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs = &blk[2..2 + 64];
         let sas = &blk[2 + 64..2 + 96];
@@ -1395,7 +1396,7 @@ pub const STQ1_0_CODEBOOK: [u8; 32] = [
 /// layout under the wrong permutation.
 pub(crate) fn deq_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(STQ1_0_BLOCK_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<STQ1_0_BLOCK_BYTES>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[40..42]);
         for g in 0..64 {
             let slot = (blk[g / 2] >> (4 * (g & 1))) & 0x0F;
@@ -1413,7 +1414,7 @@ pub(crate) fn deq_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
 
 fn deq_tq2_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(66).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<66>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[64..66]);
         for jg in 0..2 {               // two 128-value halves (byte groups 0..32, 32..64)
             for l in 0..4 {            // the 4 two-bit lanes in each byte
@@ -1480,7 +1481,7 @@ fn e8m0_half_to_f32(e: u8) -> f32 {
 /// representable and correct where it is not.
 fn deq_mxfp4(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(17).take(n / 32).enumerate() {
+    for (bi, blk) in raw.as_chunks::<17>().0.iter().take(n / 32).enumerate() {
         let d = e8m0_half_to_f32(blk[0]);
         for i in 0..16 {
             let byte = blk[1 + i];
@@ -1495,7 +1496,7 @@ fn deq_mxfp4(raw: &[u8], n: usize) -> Vec<f32> {
 /// then `qs[16]`; element j → byte j/8, bit j%8 (LSB-first); value = bit ? +d : −d. 1.125 bpw.
 fn deq_q1_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(18).take(n / 128).enumerate() {
+    for (bi, blk) in raw.as_chunks::<18>().0.iter().take(n / 128).enumerate() {
         let d = rd_f16(&blk[0..2]);
         for j in 0..128 {
             let bit = (blk[2 + j / 8] >> (j % 8)) & 1;
@@ -1510,7 +1511,7 @@ fn deq_q1_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// (q=3 → +2d is reserved/unused for ternary, but decode the arithmetic form). 2.125 bpw on disk.
 fn deq_q2_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(34).take(n / 128).enumerate() {
+    for (bi, blk) in raw.as_chunks::<34>().0.iter().take(n / 128).enumerate() {
         let d = rd_f16(&blk[0..2]);
         for j in 0..128 {
             let q = ((blk[2 + j / 4] >> ((j % 4) * 2)) & 3) as i32;
@@ -1622,10 +1623,10 @@ pub fn quant_q5_0(x: &[f32]) -> Vec<u8> {
         let enc = |v: f32| -> u32 { if df != 0.0 { (((v / df).round().clamp(-16.0, 15.0) as i32) + 16) as u32 } else { 16 } };
         let mut qh: u32 = 0;
         let mut nibbles = [0u8; 16];
-        for i in 0..16 {
+        for (i, nibble) in nibbles.iter_mut().enumerate() {
             let c0 = enc(blk.get(i).copied().unwrap_or(0.0));       // 0..31
             let c1 = enc(blk.get(i + 16).copied().unwrap_or(0.0));
-            nibbles[i] = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
+            *nibble = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
             qh |= ((c0 >> 4) & 1) << i;
             qh |= ((c1 >> 4) & 1) << (i + 16);
         }
@@ -1647,10 +1648,10 @@ pub fn quant_q5_1(x: &[f32]) -> Vec<u8> {
         let enc = |v: f32| -> u32 { if df != 0.0 { ((v - mf) / df).round().clamp(0.0, 31.0) as u32 } else { 0 } };
         let mut qh: u32 = 0;
         let mut nibbles = [0u8; 16];
-        for i in 0..16 {
+        for (i, nibble) in nibbles.iter_mut().enumerate() {
             let c0 = enc(blk.get(i).copied().unwrap_or(0.0));
             let c1 = enc(blk.get(i + 16).copied().unwrap_or(0.0));
-            nibbles[i] = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
+            *nibble = ((c0 & 0xF) | ((c1 & 0xF) << 4)) as u8;
             qh |= ((c0 >> 4) & 1) << i;
             qh |= ((c1 >> 4) & 1) << (i + 16);
         }
@@ -1884,8 +1885,8 @@ mod mxfp4_tests {
             b.extend(n_elems.to_le_bytes());
             b.extend(42u32.to_le_bytes());              // the contested id
             b.extend(0u64.to_le_bytes());               // offset
-            while b.len() % 32 != 0 { b.push(0); }      // default alignment
-            b.extend(std::iter::repeat(0u8).take(data_bytes));
+            while !b.len().is_multiple_of(32) { b.push(0); }      // default alignment
+            b.extend(std::iter::repeat_n(0u8, data_bytes));
             b
         }
         // 128 blocks at 129 B: unambiguous within one 32-byte alignment -> resolves to F8 (1042).

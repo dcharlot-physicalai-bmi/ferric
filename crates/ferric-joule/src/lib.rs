@@ -146,9 +146,9 @@ impl Reading {
 
 impl std::fmt::Display for Reading {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.3} J over {:.3} s ({:.1} W) [{} via {}]",
+        write!(f, "{:.3} J over {:.3} s ({:.1} W) [{} via {} :: {}]",
                self.joules, self.seconds, self.watts(), self.class.label(),
-               format!("{} :: {}", self.source, self.boundary.label()))
+               self.source, self.boundary.label())
     }
 }
 
@@ -276,7 +276,7 @@ impl Saving {
     /// [`percent`]: Saving::percent
     pub fn percent_per_success(&self) -> f64 {
         let (b, c) = self.per_success();
-        if !(b > 0.0) { return f64::NAN; }
+        if b.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { return f64::NAN; }
         (b - c) / b * 100.0
     }
 
@@ -854,12 +854,11 @@ impl Macmon {
 
     /// Stop the sampler. Also runs on drop, so a forgotten meter does not outlive its program.
     pub fn stop(&self) {
-        if let Ok(mut c) = self.child.lock() {
-            if let Some(mut child) = c.take() {
+        if let Ok(mut c) = self.child.lock()
+            && let Some(mut child) = c.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-        }
     }
 }
 
@@ -1296,7 +1295,7 @@ pub fn stable_median(samples: &[f64], max_spread: f64, what: &str) -> Result<f64
     let mut v: Vec<f64> = samples.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).expect("all samples were checked finite above"));
     let (lo, hi) = (v[0], v[v.len() - 1]);
-    if !(lo > 0.0) {
+    if lo.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return Err(format!("{what}: minimum sample is {lo}, which is not a rate or a duration"));
     }
     let spread = hi / lo;

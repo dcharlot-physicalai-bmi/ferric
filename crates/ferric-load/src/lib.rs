@@ -82,22 +82,22 @@ pub fn safetensors_filtered(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Result
 /// Dequantize a raw dtype slice to f32.
 fn dequant(dtype: &str, raw: &[u8]) -> Result<Vec<f32>, String> {
     Ok(match dtype {
-        "F32" => raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
-        "F16" => raw.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
-        "BF16" => raw.chunks_exact(2).map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32()).collect(),
-        "F64" => raw.chunks_exact(8).map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
+        "F32" => raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect(),
+        "F16" => raw.as_chunks::<2>().0.iter().map(|b| f16::from_le_bytes(*b).to_f32()).collect(),
+        "BF16" => raw.as_chunks::<2>().0.iter().map(|b| bf16::from_le_bytes(*b).to_f32()).collect(),
+        "F64" => raw.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b) as f32).collect(),
         // Signed and unsigned integers appear in real checkpoints as quantization codes,
         // zero-points and token-id tables. Decoding them to f32 is lossless up to I32/I64's range,
         // which is checked below rather than assumed.
         "I8" => raw.iter().map(|&b| b as i8 as f32).collect(),
         "U8" => raw.iter().map(|&b| b as f32).collect(),
         "BOOL" => raw.iter().map(|&b| if b != 0 { 1.0 } else { 0.0 }).collect(),
-        "I16" => raw.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32).collect(),
-        "U16" => raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32).collect(),
-        "I32" => raw.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
-        "U32" => raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
-        "I64" => raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
-        "U64" => raw.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as f32).collect(),
+        "I16" => raw.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32).collect(),
+        "U16" => raw.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as f32).collect(),
+        "I32" => raw.as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b) as f32).collect(),
+        "U32" => raw.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b) as f32).collect(),
+        "I64" => raw.as_chunks::<8>().0.iter().map(|b| i64::from_le_bytes(*b) as f32).collect(),
+        "U64" => raw.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b) as f32).collect(),
         // ⚠ FP8 IS NOT THE WEIGHT — see [`fp8`]. These return the stored coefficients; the scale
         // lives in a sibling tensor and [`SafeTensors::get`] refuses to hand them back without it.
         "F8_E4M3" | "F8_E4M3FN" => raw.iter().map(|&b| fp8::e4m3_to_f32(b)).collect(),

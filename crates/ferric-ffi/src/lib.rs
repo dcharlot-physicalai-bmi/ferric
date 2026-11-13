@@ -12,6 +12,7 @@
 //! - `ferric_complete`: a `/v1/completions` body in, a `text_completion` object out.
 //! - `ferric_generate` / `ferric_generate_json`: the original two calls, now on the same engine (greedy
 //!   completion; schema-constrained JSON).
+//!
 //! Every string returned is released with `ferric_free_string`; the handle with `ferric_free`. An error is
 //! returned as `{"error": {"message": ...}}` rather than NULL, so a caller always gets a reason.
 use serde_json::{json, Value};
@@ -60,8 +61,13 @@ pub extern "C" fn ferric_chat_stream(h: *mut FerricHandle, request_json: *const 
 }
 
 /// An OpenAI `/v1/completions` request (JSON, a string `prompt`) → the `text_completion` object. Caller frees.
+///
+/// # Safety
+///
+/// `h` is a handle from `ferric_load` or null. `request_json` is a NUL-terminated UTF-8 string or null.
+/// A null pointer is reported in the returned JSON rather than dereferenced.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferric_complete(h: *mut FerricHandle, request_json: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ferric_complete(h: *mut FerricHandle, request_json: *const c_char) -> *mut c_char {
     let Some(h) = (unsafe { h.as_ref() }) else { return err("null handle") };
     let req: Value = match cstr(request_json).map(serde_json::from_str) { Some(Ok(v)) => v, Some(Err(e)) => return err(&format!("bad json: {e}")), None => return err("null request") };
     match h.m.complete(&req, |_| {}) { Ok(v) => out(v.to_string()), Err(e) => err(&e) }
@@ -70,16 +76,26 @@ pub extern "C" fn ferric_complete(h: *mut FerricHandle, request_json: *const c_c
 fn text_of(v: &Value) -> String { v["choices"][0]["text"].as_str().unwrap_or_default().to_string() }
 
 /// Greedy free-text completion of `prompt` for up to `max_tokens`. Caller frees the result string.
+///
+/// # Safety
+///
+/// `h` is a handle from `ferric_load` or null. `prompt` is a NUL-terminated UTF-8 string or null.
+/// A null pointer returns an empty string rather than being dereferenced.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, max_tokens: u32) -> *mut c_char {
+pub unsafe extern "C" fn ferric_generate(h: *mut FerricHandle, prompt: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
     out(h.m.complete(&json!({"prompt": p, "max_tokens": max_tokens, "temperature": 0}), |_| {}).map(|v| text_of(&v)).unwrap_or_default())
 }
 
 /// Schema-constrained generation: output is guaranteed-conformant JSON. `schema` is a JSON-Schema
 /// string (empty → any valid JSON object). Caller frees the result string.
+///
+/// # Safety
+///
+/// `h` is a handle from `ferric_load` or null. `prompt` and `schema` are NUL-terminated UTF-8
+/// strings or null. A null pointer returns an empty string rather than being dereferenced.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_char, schema: *const c_char, max_tokens: u32) -> *mut c_char {
+pub unsafe extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_char, schema: *const c_char, max_tokens: u32) -> *mut c_char {
     let (Some(h), Some(p)) = (unsafe { h.as_ref() }, cstr(prompt)) else { return out(String::new()) };
     let format = match cstr(schema).map(str::trim).filter(|s| !s.is_empty()).map(serde_json::from_str::<Value>) {
         Some(Ok(s)) => json!({"type": "json_schema", "json_schema": {"schema": s}}),
@@ -91,9 +107,17 @@ pub extern "C" fn ferric_generate_json(h: *mut FerricHandle, prompt: *const c_ch
 }
 
 /// Free a string returned by any `ferric_*` call.
+///
+/// # Safety
+///
+/// `s` is a pointer returned by a `ferric_*` call, or null. It must not be used again after this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferric_free_string(s: *mut c_char) { if !s.is_null() { unsafe { drop(CString::from_raw(s)); } } }
+pub unsafe extern "C" fn ferric_free_string(s: *mut c_char) { if !s.is_null() { unsafe { drop(CString::from_raw(s)); } } }
 
 /// Free a model handle.
+///
+/// # Safety
+///
+/// `h` is a pointer returned by `ferric_load`, or null. It must not be used again after this call.
 #[unsafe(no_mangle)]
-pub extern "C" fn ferric_free(h: *mut FerricHandle) { if !h.is_null() { unsafe { drop(Box::from_raw(h)); } } }
+pub unsafe extern "C" fn ferric_free(h: *mut FerricHandle) { if !h.is_null() { unsafe { drop(Box::from_raw(h)); } } }

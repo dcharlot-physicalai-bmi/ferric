@@ -1,0 +1,26 @@
+{
+  "receipt": "toolchain-1.100 SmolVLA fault catalogue",
+  "date": "2026-11-13",
+  "seed": "0x5a17",
+  "rustc_vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5",
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "cargo_lock_sha256": "3addbafb869cbd7511ec5064f7248be1b1990389f55e3b01a88a5b3c2de296c5",
+  "cpu": {
+    "test": "faults::tests::the_committed_receipt_matches_the_cpu_catalogue",
+    "comparison": "assert_eq on Linux against docs/fleet/smolvla-fault-injection.json",
+    "result": "bit-exact. The test passed.",
+    "rope": {
+      "end_to_end_rate": "6/9",
+      "end_to_end_with_invariant_rate": "8/9",
+      "per_stage_rate": "8/9",
+      "low_mantissa": "inside the invariant; digest sees it",
+      "dropped_and_duplicated": "invariant detects both"
+    }
+  },
+  "llvmpipe": {
+    "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "probe": "FERRIC_FAULT_DEVICE=1 cargo test -p ferric-smolvla --lib device_probe_writes_when_requested",
+    "compared_to": "docs/fleet/smolvla-fault-injection.json llvmpipe",
+    "delta": "none. The probe JSON matches the committed llvmpipe object, including rope max_norm_abs 1.2218507450256766e-7 and max_angle_abs 4.890638010124349e-7."
+  }
+}

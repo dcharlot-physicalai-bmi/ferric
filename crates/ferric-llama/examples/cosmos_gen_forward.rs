@@ -28,8 +28,8 @@ async fn run() {
 
     // synthetic AR conditioning [Ta,2048] + noisy DM latents [Td,192]
     let (ta, td) = (5usize, 4usize);
-    let xa0: Vec<f32> = (0..ta * 2048).map(|i| ((i as f32 * 0.01).sin() * 0.1)).collect();
-    let lat: Vec<f32> = (0..td * 192).map(|i| ((i as f32 * 0.03 + 1.0).sin() * 0.2)).collect();
+    let xa0: Vec<f32> = (0..ta * 2048).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let lat: Vec<f32> = (0..td * 192).map(|i| (i as f32 * 0.03 + 1.0).sin() * 0.2).collect();
     let mut xa = Tensor::from_vec(&ctx, &xa0, &[ta, 2048]);
     let mut xd = Tensor::from_vec(&ctx, &lat, &[td, 192]).matmul_bt(&g("proj_in.weight")).add(&g("proj_in.bias").reshape(&[1, 2048])); // [Td,2048]
 
@@ -78,6 +78,6 @@ async fn run() {
     let vel = xd.rmsnorm(&g("norm_moe_gen.weight"), eps).matmul_bt(&g("proj_out.weight")).add(&g("proj_out.bias").reshape(&[1, 192]));
     let o = vel.to_vec().await; // [Td, 192] predicted velocity
     println!("full 28-layer generator forward {:?}", t0.elapsed());
-    println!("Ferric velocity token0[:6] = {:?}", &o[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
+    println!("Ferric velocity token0[:6] = {:?}", o[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
     println!("  velocity sum = {:.5} · finite = {}", o.iter().sum::<f32>(), o.iter().all(|x| x.is_finite()));
 }

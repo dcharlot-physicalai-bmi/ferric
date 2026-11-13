@@ -852,9 +852,6 @@ mod var_tests {
         }
     }
 
-    /// A gradient must reach EVERY parameter. A weight that receives none is a weight that never
-    /// trains, and the loss still falls because the others compensate.
-
     /// The decoder's two implementations must agree for the same reason the encoder's must.
     #[test]
     fn the_var_decoder_matches_the_tensor_decoder() {
@@ -928,6 +925,8 @@ mod var_tests {
         }
     }
 
+    /// A gradient must reach EVERY parameter. A weight that receives none is a weight that never
+    /// trains, and the loss still falls because the others compensate.
     #[test]
     fn every_parameter_receives_a_gradient() {
         let Some(ctx) = ctx() else { return };
@@ -956,7 +955,7 @@ mod var_tests {
         let vars: Vec<Var> = flat.into_iter().map(Var::leaf).collect();
         // One short must be refused rather than silently reinterpreted.
         assert!(forward_var(&ctx, cfg, &vars[..vars.len() - 1],
-                            &Var::leaf(Tensor::from_vec(&ctx, &vec![0.0; 8], &[1, 8]))).is_err());
+                            &Var::leaf(Tensor::from_vec(&ctx, &[0.0; 8], &[1, 8]))).is_err());
     }
 }
 #[cfg(test)]

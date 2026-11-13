@@ -40,7 +40,7 @@ pub fn decode_id(id: u32) -> Option<GqId> {
     if id >> 24 != 0x47 { return None }
     let s = GqId { kind: (id >> 20) & 0xf, act: (id >> 16) & 1 == 1, bits: (id >> 12) & 0xf, group: id & 0xfff };
     let ok_bits = match s.kind { 0 => matches!(s.bits, 2 | 3 | 4 | 8), 1 => s.bits == 8, 2 => s.bits == 4, _ => false };
-    (ok_bits && s.group > 0 && (s.group * s.bits) % 32 == 0).then_some(s)
+    (ok_bits && s.group > 0 && (s.group * s.bits).is_multiple_of(32)).then_some(s)
 }
 
 pub fn is_gq(id: u32) -> bool { decode_id(id).is_some() }
@@ -58,6 +58,7 @@ pub fn block_bytes(id: u32) -> Option<(usize, usize)> {
 }
 
 pub struct GqWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,
     sz: Arc<wgpu::Buffer>,
@@ -73,7 +74,7 @@ impl GqWeights {
     pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], id: u32, rows: usize, cols: usize) -> Result<GqWeights, String> {
         let spec = decode_id(id).ok_or_else(|| format!("{id:#x} is not a GQ type id"))?;
         let (g, bits) = (spec.group as usize, spec.bits as usize);
-        if cols % g != 0 || cols % 32 != 0 {
+        if !cols.is_multiple_of(g) || !cols.is_multiple_of(32) {
             return Err(format!("GQ: {cols} columns is not a whole number of {g}-value groups and 32-value chunks"));
         }
         let (ng, bb, cb) = (cols / g, block_len(&spec), g * bits / 8);

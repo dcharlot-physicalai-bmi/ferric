@@ -149,9 +149,8 @@ pub fn probe_npu() -> NpuInfo {
 pub async fn detect_devices() -> (Vec<Device>, NpuInfo) {
     let mut devices = Vec::new();
     for (idx, (_name, _backend, dt)) in Context::enumerate().await.into_iter().enumerate() {
-        if dt != wgpu::DeviceType::Cpu {
-            if let Ok(ctx) = Context::for_adapter(idx).await { devices.push(Device::Gpu(Arc::new(ctx))); }
-        }
+        if dt != wgpu::DeviceType::Cpu
+            && let Ok(ctx) = Context::for_adapter(idx).await { devices.push(Device::Gpu(Arc::new(ctx))); }
     }
     devices.push(Device::Cpu);
     #[cfg(target_os = "macos")]
@@ -206,6 +205,7 @@ impl Fabric {
     }
 
     /// Data-parallel: split the batch across devices by `weights`, run concurrently, concatenate.
+    #[allow(clippy::too_many_arguments)] // the GEMM shape is four independent sizes plus the per-device weights
     pub fn data_parallel_bmm(&self, a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize, weights: &[f32]) -> (Vec<f32>, Vec<usize>) {
         // assign a contiguous batch range to each device, sized by weight
         let mut counts: Vec<usize> = weights.iter().map(|w| (w * batch as f32).round() as usize).collect();
@@ -430,9 +430,7 @@ pub fn spawn_worker(backend: Device) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind worker");
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut s) = stream { let _ = serve_one(&mut s, &backend); }
-        }
+        for mut s in listener.incoming().flatten() { let _ = serve_one(&mut s, &backend); }
     });
     addr
 }

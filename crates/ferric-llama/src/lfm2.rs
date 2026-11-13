@@ -20,7 +20,7 @@
 use ferric_core::Context;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_tensor::kvquant::{KvStore, KvqFmt};
-use crate::qwen35::{DownSlab, MoeDims, MoeExperts, MoeFfn};
+use crate::qwen35::{DownSlab, MoeDims, MoeExperts, MoeFfn, MoeSlab};
 use ferric_tensor::{append2, nn, KvBuf, Q4_KWeights, Q6_KWeights, QMatrix, Tensor};
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ enum Ffn {
     /// This variant carried its own router + slab + wsum because the MoE forward was a method on
     /// `Qwen35` and unreachable from here. It is `MoeFfn::forward(ctx, h, MoeDims)` now, so lfm2moe
     /// runs the SAME path qwen35moe does, and a fix to one is a fix to both.
-    Moe(MoeFfn),
+    Moe(Box<MoeFfn>),
 }
 
 struct Block {
@@ -144,11 +144,10 @@ impl Cache {
     /// pins a tab to block-K. Same reasoning as `qwen3::Cache::with_kv_config`.
     pub fn with_kv_config(cfg: &Cfg, fmt: Option<KvqFmt>, grouped_k: bool) -> Cache {
         let mut c = Cache::with_kvq(cfg, fmt);
-        if let Some(f) = fmt {
-            if grouped_k {
+        if let Some(f) = fmt
+            && grouped_k {
                 c.q = (0..cfg.n_layer).map(|_| (KvStore::grouped(f), KvStore::block(f))).collect();
             }
-        }
         c
     }
 
@@ -332,17 +331,17 @@ impl Lfm2 {
                            "blk.{il}: down_exps is {} B, shape says {want_d}", df.len());
                 // No shared expert on lfm2moe — unlike qwen35moe and laguna, which both carry one.
                 // Its absence is why this does not reuse qwen35's MoeFfn, whose `shared` is required.
-                let bias = g.dequant(&b("exp_probs_b.bias"))
+                let _bias = g.dequant(&b("exp_probs_b.bias"))
                     .unwrap_or_else(|_| vec![0f32; n_expert]);
                 let bias = g.dequant(&b("exp_probs_b.bias"))
                     .unwrap_or_else(|_| vec![0f32; n_expert]);
-                Ffn::Moe(MoeFfn {
+                Ffn::Moe(Box::new(MoeFfn {
                     router: ft(&b("ffn_gate_inp.weight"), &[n_expert, d]),
-                    experts: MoeExperts::Slab {
+                    experts: MoeExperts::Slab(Box::new(MoeSlab {
                         gate_up: Q4_KWeights::from_bytes(ctx, &gu, n_expert * 2 * eff, d),
                         down: if dt == 14 { DownSlab::Q6(Q6_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) }
                               else { DownSlab::Q4(Q4_KWeights::from_bytes(ctx, &df, n_expert * d, eff)) },
-                    },
+                    })),
                     // No shared expert on lfm2moe, unlike qwen35moe and laguna. That this is now an
                     // Option is what let this variant stop being a second implementation.
                     shared: None,
@@ -352,7 +351,7 @@ impl Lfm2 {
                     gpu_bias: Some(Tensor::from_vec(ctx, &bias, &[n_expert])),
                     sel_bias: Some(bias),
                     scale: 1.0,
-                })
+                }))
             } else {
                 Ffn::Dense { gate: qm(&b("ffn_gate.weight")), up: qm(&b("ffn_up.weight")),
                              down: qm(&b("ffn_down.weight")) }

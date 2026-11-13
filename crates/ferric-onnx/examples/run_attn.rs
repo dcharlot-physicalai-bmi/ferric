@@ -1,7 +1,7 @@
 use ferric_core::{max_abs_diff, Context};
 use std::collections::HashMap;
 fn main() { pollster::block_on(run()); }
-fn f32s(b:&[u8])->Vec<f32>{ b.chunks_exact(4).map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
+fn f32s(b:&[u8])->Vec<f32>{ b.as_chunks::<4>().0.iter().map(|c|f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect() }
 fn ref_y(j:&str)->Vec<f32>{ let s=j.split("\"y\"").nth(1).unwrap(); let i=s.split('[').nth(1).unwrap().split(']').next().unwrap(); i.split(',').filter_map(|x|x.trim().parse().ok()).collect() }
 async fn run(){
     let ctx=Context::new().await.unwrap();

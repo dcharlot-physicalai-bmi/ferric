@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 // SmolLM2-135M config (config.json)
 const NL: usize = 30;
+#[allow(dead_code)] // example helper, not on the default path
 const D: usize = 576;
 const NH: usize = 9;
 const NKV: usize = 3;
@@ -17,7 +18,7 @@ const VOCAB: usize = 49152;
 const BASE: f32 = 100000.0;
 const EPS: f32 = 1e-5;
 
-fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+fn f32s(b: &[u8]) -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {

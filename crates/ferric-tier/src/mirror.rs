@@ -63,7 +63,7 @@ impl MirroredBacking {
         }
         if devices.is_empty() { return Err("a mirror needs at least one device".into()) }
         for (i, b) in bandwidths.iter().enumerate() {
-            if !(*b > 0.0) || !b.is_finite() {
+            if (*b).partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !b.is_finite() {
                 return Err(format!("device {i} bandwidth is {b}, which is not a rate a split can \
                                     be built from"));
             }
@@ -319,7 +319,7 @@ mod tests {
         let m = mirror(&[7, 7], &[3.0e9, 9.0e9]); // fastest is device 1
         let plan = m.plan(4096);
         assert_eq!(plan, vec![(1, 0, 4096)], "a 4 KB read should go whole to the fastest device");
-        assert!(MIN_SPLIT_BYTES > 4096);
+        const _: () = assert!(MIN_SPLIT_BYTES > 4096);
     }
 
     #[test]

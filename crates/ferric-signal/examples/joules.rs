@@ -80,7 +80,7 @@ fn main() {
 
     // ---- admission gates, before anything else ----
     println!("\nMACHINE STATE");
-    println!("  {:<24} {:>10}  {}", "gate", "state", "reading");
+    println!("  {:<24} {:>10}  reading", "gate", "state");
     println!("  {:-<24} {:->10}  {:-<50}", "", "", "");
     let gates = power_gates();
     for g in &gates {

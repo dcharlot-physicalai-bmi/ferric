@@ -42,23 +42,25 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }
 struct Efa1 { emb: Vec<f32>, fw: Vec<Vec<f32>>, fb1: Vec<f32>, fw2: Vec<f32>, fb2: Vec<f32>, fw3: Vec<f32>, fb3: [f32; 3] }
 impl Efa1 {
     fn act(&self, bi: usize, s: [f32; 6], g: [f32; 3]) -> [f32; 3] {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let fin = 12 + 3 + 1 + EMB; let mut f = vec![0.0f32; fin];
-        for c in 0..12 { f[c] = ff[c]; } f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
+        f[..12].copy_from_slice(&ff); f[15] = 0.0; for c in 0..EMB { f[16 + c] = self.emb[bi * EMB + c]; }
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.fb1[j]; for c in 0..fin { z += f[c] * self.fw[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.fb2[j]; for k in 0..H { z += h1[k] * self.fw2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.fb3; for j in 0..H { for c in 0..3 { o[c] += h2[j] * self.fw3[j * 3 + c]; } }
         let mut a = [0.0f32; 3]; for i in 0..nj { a[i] = o[i].clamp(-UMAX, UMAX); } a }
 }
 fn fcl(m: &Efa1, bi: usize, x: &[f32], g: [f32; 3]) -> Vec<f32> {
-    let nj = NJ[bi]; let mut s = [0.0f32; 6]; for i in 0..nj { s[i] = x[i]; s[3 + i] = x[nj + i]; }
+    let nj = NJ[bi]; let mut s = [0.0f32; 6]; s[..nj].copy_from_slice(&x[..nj]);
+    s[3..(nj + 3)].copy_from_slice(&x[nj..(nj + nj)]);
     let ns = step(nj, s, m.act(bi, s, g));
-    let mut y = vec![0.0f32; 2 * nj]; for i in 0..nj { y[i] = ns[i]; y[nj + i] = ns[3 + i]; } y
+    let mut y = vec![0.0f32; 2 * nj]; y[..nj].copy_from_slice(&ns[..nj]);
+    y[nj..(nj + nj)].copy_from_slice(&ns[3..(nj + 3)]); y
 }
 fn matmul(a: &[f32], b: &[f32], d: usize) -> Vec<f32> { let mut c = vec![0.0f32; d * d];
     for i in 0..d { for k in 0..d { let aik = a[i * d + k]; for j in 0..d { c[i * d + j] += aik * b[k * d + j]; } } } c }
@@ -76,7 +78,8 @@ impl Dim {
         else { self.lo + self.span * i as f32 / (self.n as f32 - 1.0) } }
     fn cell(&self, x: f32) -> Option<(usize, f32)> {
         if self.periodic { let mut gc = (wrap(x) - self.lo) / self.span * self.n as f32;
-            if gc < 0.0 { gc += self.n as f32; } if gc >= self.n as f32 { gc -= self.n as f32; }
+            if gc < 0.0 { gc += self.n as f32; }
+            if gc >= self.n as f32 { gc -= self.n as f32; }
             let b = gc.floor() as usize % self.n; Some((b, gc - gc.floor()))
         } else { let gc = (x - self.lo) / self.span * (self.n as f32 - 1.0);
             if gc < 0.0 || gc > self.n as f32 - 1.0 { return None; }
@@ -94,7 +97,7 @@ fn main() {
     let mut certjson: Vec<String> = vec![];
     for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gt[j]; }
         // attractor + measured ω envelope
-        let mut xstar = vec![0.0f32; d]; for j in 0..nj { xstar[j] = g[j]; }
+        let mut xstar = vec![0.0f32; d]; xstar[..nj].copy_from_slice(&g[..nj]);
         for _ in 0..800 { xstar = fcl(&m, bi, &xstar, g); }
         let mut om_env = 0.0f32;
         for k in 0..60u32 { let mut x = vec![0.0f32; d];

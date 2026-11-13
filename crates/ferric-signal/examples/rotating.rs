@@ -360,7 +360,7 @@ fn main() {
         }
         let maj = majority(labels, &train, &held);
         let acc = nb_probe(&docs, labels, &train, &held);
-        let ctl = permutation_control(&docs, labels, &train, &held, 20, 0xC0FF_EE);
+        let ctl = permutation_control(&docs, labels, &train, &held, 20, 0x00C0_FFEE);
         controls.push(ctl);
         // ⛔ THE STAR ONCE FIRED ON A BELOW-CHANCE NUMBER. `majority` is the accuracy of
         // predicting the training set's most common class, and when the training classes tie, the

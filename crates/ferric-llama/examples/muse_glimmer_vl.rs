@@ -22,7 +22,6 @@ use ferric_core::Context;
 use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::glimmer_vision::VisionTower;
 use ferric_llama::qwen3::{Cache, Qwen3};
-use ferric_tensor::Tensor;
 use std::sync::Arc;
 
 fn main() { pollster::block_on(run()); }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 const H: usize = 2048; const NL: usize = 27; const HEADS: usize = 16;
 const QK: usize = 128; const NOPE: usize = 96; const ROPE: usize = 32; const VH: usize = 128; const KVL: usize = 512;
 const E: usize = 64; const TOPK: usize = 6; const SCALE: f32 = 2.5;
-const VOCAB: usize = 128896; const EPS: f32 = 1e-6; const SCALING: f32 = 0.16562687709876717;
+const VOCAB: usize = 128896; const EPS: f32 = 1e-6; const SCALING: f32 = 0.165_626_88;
 
 struct Loader { dir: String, map: HashMap<String, (String, u64, u64, Vec<usize>, String)> }
 impl Loader {
@@ -46,8 +46,8 @@ impl Loader {
         f.seek(SeekFrom::Start(*off)).unwrap();
         let mut raw = vec![0u8; *len as usize]; f.read_exact(&mut raw).unwrap();
         let v: Vec<f32> = match dtype.as_str() {
-            "BF16" => raw.chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
-            "F32" => raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            "BF16" => raw.as_chunks::<2>().0.iter().map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
+            "F32" => raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
             other => panic!("dtype {other}"),
         };
         (v, shape.clone())
@@ -58,7 +58,7 @@ impl Loader {
 fn ternarize(w: &[f32], indim: usize, outdim: usize) -> Vec<f32> {
     let mut g = vec![0f32; outdim];
     for i in 0..indim { let b = i * outdim; for j in 0..outdim { g[j] += w[b + j].abs(); } }
-    for j in 0..outdim { g[j] = (g[j] / indim as f32).max(1e-8); }
+    for item in g[..outdim].iter_mut() { *item = (*item / indim as f32).max(1e-8); }
     let mut out = vec![0f32; w.len()];
     for i in 0..indim { let b = i * outdim; for j in 0..outdim { out[b + j] = (w[b + j] / g[j]).round().clamp(-1.0, 1.0) * g[j]; } }
     out
@@ -75,7 +75,7 @@ async fn run() {
         format!("{base}/{snap}")
     };
     let ld = Loader::new(&dir);
-    let rd_bin = |n: &str| -> Vec<f32> { std::fs::read(format!("{home}/.cache/ferric/instella_ref/{n}")).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
+    let rd_bin = |n: &str| -> Vec<f32> { std::fs::read(format!("{home}/.cache/ferric/instella_ref/{n}")).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect() };
     let cos = Tensor::from_vec(&ctx, &rd_bin("rope_cos.bin"), &[64, ROPE]);
     let sin = Tensor::from_vec(&ctx, &rd_bin("rope_sin.bin"), &[64, ROPE]);
 

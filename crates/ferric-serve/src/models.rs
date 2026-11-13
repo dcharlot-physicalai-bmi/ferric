@@ -57,9 +57,8 @@ fn hf_cache() -> PathBuf {
 /// the directory's name otherwise.
 pub(crate) fn default_name(p: &Path) -> String {
     let s = p.to_string_lossy();
-    if let Some(i) = s.find("/models--") {
-        if let Some(repo) = s[i + 9..].split('/').next() { return repo.replacen("--", "/", 1); }
-    }
+    if let Some(i) = s.find("/models--")
+        && let Some(repo) = s[i + 9..].split('/').next() { return repo.replacen("--", "/", 1); }
     p.file_stem().and_then(|x| x.to_str()).unwrap_or("model").to_string()
 }
 
@@ -174,9 +173,8 @@ impl Hub {
         if e.dir { return crate::vision::card(&e.name, &e.path); }
         let md = std::fs::metadata(&e.path).ok()?;
         let (len, mt) = (md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
-        if let Some((l, m, c)) = self.headers.get(&e.path) {
-            if *l == len && *m == mt { return c.clone().map(|mut c| { c.name = e.name.clone(); c }); }
-        }
+        if let Some((l, m, c)) = self.headers.get(&e.path)
+            && *l == len && *m == mt { return c.clone().map(|mut c| { c.name = e.name.clone(); c }); }
         let card = GgufFile::open(&e.path).ok().and_then(|g| {
             let s = |k: &str| match g.metadata.get(k) { Some(Meta::Str(v)) => Some(v.clone()), _ => None };
             let u = |k: &str| match g.metadata.get(k) { Some(Meta::U(v)) => Some(*v as usize), _ => None };
@@ -223,9 +221,8 @@ impl batch::Source for Hub {
                 let t = t.to_lowercase();
                 hits.retain(|e| e.path.file_name().and_then(|s| s.to_str()).is_some_and(|f| f.to_lowercase().contains(&t)));
             }
-            if hits.len() > 1 && tag.is_none() {
-                if let Some(q) = hits.iter().find(|e| e.name.to_lowercase().contains("q4_k_m")) { hits = vec![*q]; }
-            }
+            if hits.len() > 1 && tag.is_none()
+                && let Some(q) = hits.iter().find(|e| e.name.to_lowercase().contains("q4_k_m")) { hits = vec![*q]; }
             match hits.as_slice() {
                 [e] => return Ok((Hub::key_of(&e.path), e.bytes)),
                 [] => {}

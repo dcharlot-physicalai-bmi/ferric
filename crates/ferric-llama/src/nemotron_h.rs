@@ -243,9 +243,9 @@ impl NemotronH {
         // architecture from quietly disagreeing with the rest of the crate about quant handling.
         let qm = |n: &str| crate::qwen35::qm(ctx, g, n);
         let (mut ssm, mut ffn, mut attn) = (Vec::new(), Vec::new(), Vec::new());
-        for il in 0..cfg.n_layer {
+        for (il, kind) in cfg.kind.iter().enumerate() {
             let n = |s: &str| format!("blk.{il}.{s}");
-            match cfg.kind[il] {
+            match *kind {
                 BlockKind::Ssm => {
                     // conv1d is stored [L, C]; depthwise_conv1d_causal wants [C, L]. The transpose is
                     // explicit because a silently mis-shaped kernel still convolves — it just mixes

@@ -29,7 +29,7 @@
 //! console.log(await s.generate("Hello", 16));
 //! ```
 
-use ferric_gguf::backed::{header_probe, GgufBacked};
+use ferric_gguf::backed::GgufBacked;
 use ferric_gguf::{GgufSource, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_llama::stream::layer_runs_of;
@@ -144,8 +144,7 @@ impl FerricStream {
                 staged.stage(off, b);
             }
         }
-        for il in 0..plan.npin {
-            let d = runs[il];
+        for d in runs.iter().take(plan.npin) {
             let b = fetch_range(&fetcher, d.offset, d.bytes as usize).await?;
             staged.stage(d.offset, b);
         }
@@ -202,11 +201,17 @@ impl FerricStream {
     pub fn fetched_bytes(&self) -> f64 { self.staged.staged_total() as f64 }
     pub fn n_layers(&self) -> usize { self.runs.len() }
     pub fn pinned_layers(&self) -> usize { self.plan.npin }
+    /// Embedding table bytes. They stay resident and dominate the peak on a small model
+    /// with a large vocabulary.
+    pub fn embedding_bytes(&self) -> f64 { self.embd_bytes as f64 }
 
     /// Stage every streamed layer for the next step, releasing the previous one to stay in budget.
     ///
     /// Pinned layers are staged once at `open` and never released — that is the pinned prefix, and it is
     /// why a cyclic walk gets `npin/n` reuse instead of the zero an LRU would give.
+    /// Prefetch every streamed layer. Generate binds on demand instead, so this stays
+    /// available for a caller that wants the wire traffic up front.
+    #[allow(dead_code)]
     async fn stage_streamed(&self) -> Result<(), JsValue> {
         for il in self.plan.npin..self.runs.len() {
             let d = self.runs[il];
@@ -274,7 +279,7 @@ impl FerricStream {
         for _ in 0..n {
             // Chunked prefill. Only the first iteration has more than one pending token, so this costs
             // nothing during decode and bounds the peak exactly where it would otherwise be quadratic.
-            let mut logits = Vec::new();
+            let mut logits;
             let mut i = fed;
             loop {
                 let end = (i + PREFILL_CHUNK).min(all.len());

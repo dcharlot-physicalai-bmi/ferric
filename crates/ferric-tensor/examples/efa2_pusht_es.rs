@@ -12,10 +12,7 @@
 //! are faithful); kinematic pusher; Coulomb linear+angular friction; distills a scripted demonstrator; one seed.
 //!
 //! Run: `cargo run -p ferric-tensor --example efa2_pusht --release`
-use ferric_core::Context;
-use ferric_tensor::{Adam, Tensor, Var};
 use std::f32::consts::PI;
-use std::sync::Arc;
 const DT: f32 = 0.02; const TMAX: f32 = 9.0; const RU: f32 = 0.07; const PUSH_V: f32 = 0.9;
 const MU_T: f32 = 3.0; const MU_W: f32 = 5.0; const ARENA: f32 = 1.5; const COV_OK: f32 = 0.90;
 // T sub-boxes in body(COM) frame: (offset_x, offset_y, half_w, half_h). COM computed so bar+stem centroid = origin.
@@ -29,9 +26,9 @@ fn nrm(v: [f32; 2]) -> f32 { (v[0] * v[0] + v[1] * v[1]).sqrt() }
 fn unit(v: [f32; 2]) -> [f32; 2] { let n = nrm(v).max(1e-6); [v[0] / n, v[1] / n] }
 fn rot(v: [f32; 2], a: f32) -> [f32; 2] { let (c, s) = (a.cos(), a.sin()); [c * v[0] - s * v[1], s * v[0] + c * v[1]] }
 fn in_box(local: [f32; 2], b: &[f32; 4]) -> bool { (local[0] - b[0]).abs() <= b[2] && (local[1] - b[1]).abs() <= b[3] }
-fn in_T(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
+fn in_t(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
 // sample a point uniformly inside the T (body frame), area-weighted between bar and stem
-fn sample_T(seed: u32) -> [f32; 2] {
+fn sample_t(seed: u32) -> [f32; 2] {
     let (a_bar, a_stem) = (4.0 * BAR[2] * BAR[3], 4.0 * STEM[2] * STEM[3]);
     if u(seed, 1) < a_bar / (a_bar + a_stem) { [BAR[0] + (u(seed, 2) * 2.0 - 1.0) * BAR[2], BAR[1] + (u(seed, 3) * 2.0 - 1.0) * BAR[3]] }
     else { [STEM[0] + (u(seed, 2) * 2.0 - 1.0) * STEM[2], STEM[1] + (u(seed, 3) * 2.0 - 1.0) * STEM[3]] }
@@ -47,12 +44,12 @@ fn contact(p: [f32; 2], th: f32, c: [f32; 2]) -> Option<([f32; 2], [f32; 2], f32
             if dx < dy { let s = (local[0] - b[0]).signum(); nloc = [s, 0.0]; pen = dx + RU; cloc = [b[0] + s * b[2], local[1]]; }
             else { let s = (local[1] - b[1]).signum(); nloc = [0.0, s]; pen = dy + RU; cloc = [local[0], b[1] + s * b[3]]; } }
         else { let d = [local[0] - cl[0], local[1] - cl[1]]; let dist = nrm(d); if dist > RU { continue; } nloc = unit(d); pen = RU - dist; cloc = cl; }
-        if best.map_or(true, |bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
+        if best.is_none_or(|bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
     }
     best.map(|(cp, n, pen)| ([cp[0] + p[0], cp[1] + p[1]], n, pen))
 }
 // moment of inertia about COM (mass=1), by point-sampling the T
-fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_T(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
+fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_t(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
 #[derive(Clone)]
 struct World { p: [f32; 2], th: f32, v: [f32; 2], w: f32, tp: [f32; 2], tth: f32, im: f32, push: [f32; 2] }
 impl World {
@@ -78,8 +75,8 @@ impl World {
         }
     }
     fn cov(&self, n: usize) -> f32 { let mut c = 0;                            // coverage with n samples (cheap for training, full for eval)
-        for k in 0..n { let q = sample_T(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
-            if in_T(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
+        for k in 0..n { let q = sample_t(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
+            if in_t(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
     fn coverage(&self) -> f32 { self.cov(400) }
     fn obs(&self) -> [f32; 12] { let ep = [self.tp[0] - self.p[0], self.tp[1] - self.p[1]]; let dpt = unit(ep); let et = wrap(self.tth - self.th);
         [self.th.cos(), self.th.sin(), self.push[0] - self.p[0], self.push[1] - self.p[1], ep[0], ep[1], dpt[0], dpt[1], et.cos(), et.sin(), self.tth.cos(), self.tth.sin()] }
@@ -138,7 +135,7 @@ async fn run() {
     let self_cov = { let w = World { p: [0.3, -0.2], th: 0.7, v: [0.0; 2], w: 0.0, tp: [0.3, -0.2], tth: 0.7, im, push: [9.0, 9.0] }; w.coverage() };
     println!("  [V1] coverage metric self-check (block AT target) = {:.3} · moment {:.4} — {}", self_cov, im, if self_cov > 0.98 { "✓" } else { "✗" });
     // anchors
-    let (mut dcov, mut dok) = (0.0f32, 0); for k in 0..200u32 { let c = episode(k, im, |w| demo(w)); dcov += c; if c >= COV_OK { dok += 1; } }
+    let (mut dcov, mut dok) = (0.0f32, 0); for k in 0..200u32 { let c = episode(k, im, demo); dcov += c; if c >= COV_OK { dok += 1; } }
     println!("  [anchor] scripted planner demonstrator: mean coverage {:.3} · success {:.0}%\n", dcov / 200.0, dok as f32 / 2.0);
     // OpenAI-ES
     // RECORDED NEGATIVE (naive compute-scaling): σ-decay 0.12→0.03 over 500 gens made it WORSE — held-out coverage
@@ -171,7 +168,9 @@ async fn run() {
     // final eval on 200 held-out seeds
     let pol = Pol { p: theta };
     let (mut mc, mut ok, mut c5, mut c7) = (0.0f32, 0, 0, 0);
-    for k in 500..700u32 { let c = episode(k, im, |w| pol.act(&w.obs())); mc += c; if c >= COV_OK { ok += 1; } if c >= 0.5 { c5 += 1; } if c >= 0.7 { c7 += 1; } }
+    for k in 500..700u32 { let c = episode(k, im, |w| pol.act(&w.obs())); mc += c; if c >= COV_OK { ok += 1; }
+            if c >= 0.5 { c5 += 1; }
+            if c >= 0.7 { c7 += 1; } }
     println!("\n  the card — ES-learned policy, PushT (coverage; 200 HELD-OUT episodes):");
     println!("     mean coverage {:.3} · success(≥0.90) {:.0}% · ≥0.7 {:.0}% · ≥0.5 {:.0}%", mc / 200.0, ok as f32 / 2.0, c7 as f32 / 2.0, c5 as f32 / 2.0);
     println!("     [anchors] scripted planner {:.3} coverage / {:.0}% · vs learned above", dcov / 200.0, dok as f32 / 2.0);

@@ -15,7 +15,7 @@ const Q8_0: u32 = 8;
 
 fn ternarize(w: &[f32]) -> Vec<f32> { // 1 group-wise plane
     let mut out = vec![0f32; w.len()];
-    for g in 0..(w.len() + GS - 1) / GS {
+    for g in 0..w.len().div_ceil(GS) {
         let (lo, hi) = (g * GS, ((g + 1) * GS).min(w.len()));
         let grp = &w[lo..hi];
         let d = 0.7 * grp.iter().map(|x| x.abs()).sum::<f32>() / grp.len() as f32;
@@ -34,13 +34,15 @@ fn lh_from_acts(acts: &[f32], t: usize, c: usize) -> Vec<f32> {
     let damp = 0.1 * (0..c).map(|i| h[i * c + i]).sum::<f32>() / c as f32;
     for i in 0..c { h[i * c + i] += damp.max(1e-6); }
     let mut l = vec![0f32; c * c];
-    for i in 0..c { for j in 0..=i { let mut s = h[i * c + j]; for k in 0..j { s -= l[i * c + k] * l[j * c + k]; } if i == j { l[i * c + i] = s.max(1e-12).sqrt(); } else { l[i * c + j] = s / l[j * c + j]; } } }
+    for i in 0..c { for j in 0..=i { let mut s = h[i * c + j]; for k in 0..j { s -= l[i * c + k] * l[j * c + k]; }
+            if i == j { l[i * c + i] = s.max(1e-12).sqrt(); } else { l[i * c + j] = s / l[j * c + j]; } } }
     let mut li = vec![0f32; c * c];
     for i in 0..c { li[i * c + i] = 1.0 / l[i * c + i]; for j in 0..i { let mut s = 0.0; for k in j..i { s -= l[i * c + k] * li[k * c + j]; } li[i * c + j] = s / l[i * c + i]; } }
     let mut hinv = vec![0f32; c * c];
     for i in 0..c { for j in i..c { let mut s = 0.0; for k in j..c { s += li[k * c + i] * li[k * c + j]; } hinv[i * c + j] = s; hinv[j * c + i] = s; } }
     let mut lh = vec![0f32; c * c];
-    for i in 0..c { for j in 0..=i { let mut s = hinv[i * c + j]; for k in 0..j { s -= lh[i * c + k] * lh[j * c + k]; } if i == j { lh[i * c + i] = s.max(1e-20).sqrt(); } else { lh[i * c + j] = s / lh[j * c + j]; } } }
+    for i in 0..c { for j in 0..=i { let mut s = hinv[i * c + j]; for k in 0..j { s -= lh[i * c + k] * lh[j * c + k]; }
+            if i == j { lh[i * c + i] = s.max(1e-20).sqrt(); } else { lh[i * c + j] = s / lh[j * c + j]; } } }
     lh
 }
 // GPTQ-ternarize a weight [r,c] (row-major, c=input dim) with Cholesky factor lh → reconstruction
@@ -63,7 +65,7 @@ impl GgufSource for MapGguf<'_> {
     fn metadata(&self) -> &HashMap<String, Meta> { self.inner.metadata() }
     fn tensor(&self, n: &str) -> Option<&TensorInfo> { self.inner.tensor(n) }
     fn raw(&self, n: &str) -> Result<Vec<u8>, String> {
-        if let Some(r) = self.recon.get(n) { if self.inner.tensor(n).map(|t| t.ggml_type) == Some(Q8_0) { return Ok(quant_q8_0(r)); } }
+        if let Some(r) = self.recon.get(n) && self.inner.tensor(n).map(|t| t.ggml_type) == Some(Q8_0) { return Ok(quant_q8_0(r)); }
         self.inner.raw(n)
     }
     fn dequant(&self, n: &str) -> Result<Vec<f32>, String> {

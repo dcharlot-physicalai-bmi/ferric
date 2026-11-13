@@ -16,7 +16,7 @@ const TESTG: [f32; 4] = [-1.5, -0.5, 0.5, 1.5];
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn stepu(th: f32, om: f32, uu: f32) -> (f32, f32) { let no = om + DT * (-th.sin() - 0.05 * om + uu.clamp(-UMAX, UMAX)); (wrap(th + DT * no), no) }
 
@@ -68,7 +68,7 @@ async fn run() {
         // energy-shaping control: dV/dθ via autograd on the learned potential; u = sinθ − dV/dθ + (0.05−R)ω
         let thv = Var::leaf(Tensor::from_vec(&ctx, &th, &[n, 1])); let gv = Var::leaf(Tensor::from_vec(&ctx, &gg, &[n, 1]));
         let d = thv.sub(&gv); let vphi_v = vnet(&d.cos(), &d.sin(), &pv, &ov);
-        let gd = grad(&vphi_v.sum_all(), &[thv.clone()], None); let dvdth = gd[0].value().to_vec().await;
+        let gd = grad(&vphi_v.sum_all(), std::slice::from_ref(&thv), None); let dvdth = gd[0].value().to_vec().await;
         let uu: Vec<f32> = (0..n).map(|i| (th[i].sin() - dvdth[i] + (0.05 - R) * om[i]).clamp(-UMAX, UMAX)).collect();
         for i in 0..n { let e0 = energy(th[i], om[i], gg[i]); let (nt, no) = stepu(th[i], om[i], uu[i]); let e1 = energy(nt, no, gg[i]);
             if wrap(th[i] - gg[i]).abs() > 0.05 || om[i].abs() > 0.05 { dtot += 1.0; if e1 <= e0 + 1e-6 { desc += 1.0; } }   // monotone-descent fraction away from equilibrium

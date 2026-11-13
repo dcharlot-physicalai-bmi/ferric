@@ -20,7 +20,7 @@ const OUTDIR: &str = "/Users/dcharlot/vibe-coding/efa/models/efa-hybrid-arm2";
 use std::f32::consts::PI;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 fn step(s: [f32; 4], u1: f32, u2: f32) -> [f32; 4] {
     let (t1, t2, o1, o2) = (s[0], s[1], s[2], s[3]); let (c1, c2) = (u1.clamp(-UMAX, UMAX), u2.clamp(-UMAX, UMAX));
@@ -65,7 +65,7 @@ fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<
         let shape: Vec<usize> = after[sh_s..sh_e].split(',').filter(|s| !s.is_empty()).map(|s| s.trim().parse().unwrap()).collect();
         let of_s = after.find("\"data_offsets\":[").unwrap() + 16; let of_e = after[of_s..].find(']').unwrap() + of_s;
         let offs: Vec<usize> = after[of_s..of_e].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        let vals: Vec<f32> = data[offs[0]..offs[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let vals: Vec<f32> = data[offs[0]..offs[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         out.push((name, shape, vals));
         rest = &after[of_e..];
     }
@@ -75,12 +75,12 @@ fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<
 // ---------- CPU model structs (identical to ebm_hflow) ----------
 struct Ef { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: f32 }
 impl Ef {
-    fn e(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> f32 { let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+    fn e(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> f32 { let mut f = [0.0f32; 11]; let ff = feat8(s, g); f[..8].copy_from_slice(&ff); f[8] = a1; f[9] = a2; f[10] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let mut o = self.b3; for j in 0..H { o += h2[j] * self.w3[j]; } o }
     fn grad_a(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) {
-        let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+        let mut f = [0.0f32; 11]; let ff = feat8(s, g); f[..8].copy_from_slice(&ff); f[8] = a1; f[9] = a2; f[10] = t;
         let mut h1 = [0.0f32; H]; let mut m1 = [false; H];
         for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } m1[j] = z > 0.0; h1[j] = z.max(0.0); }
         let mut m2 = [false; H];
@@ -92,7 +92,7 @@ impl Ef {
 }
 struct Wn { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: [f32; 2] }
 impl Wn {
-    fn vel(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) { let mut f = [0.0f32; 11]; let ff = feat8(s, g); for c in 0..8 { f[c] = ff[c]; } f[8] = a1; f[9] = a2; f[10] = t;
+    fn vel(&self, s: [f32; 4], g: (f32, f32), a1: f32, a2: f32, t: f32) -> (f32, f32) { let mut f = [0.0f32; 11]; let ff = feat8(s, g); f[..8].copy_from_slice(&ff); f[8] = a1; f[9] = a2; f[10] = t;
         let mut h1 = [0.0f32; H]; for j in 0..H { let mut z = self.b1[j]; for c in 0..11 { z += f[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; H]; for j in 0..H { let mut z = self.b2[j]; for k in 0..H { z += h1[k] * self.w2[k * H + j]; } h2[j] = z.max(0.0); }
         let (mut o1, mut o2) = (self.b3[0], self.b3[1]); for j in 0..H { o1 += h2[j] * self.w3[j * 2]; o2 += h2[j] * self.w3[j * 2 + 1]; } (o1, o2) }
@@ -163,7 +163,7 @@ async fn run() {
             let e = vnet(&(0..8).map(|c| l(&fc[c], bs)).collect::<Vec<_>>(), &pv, &ov); let d = e.sub(&Var::leaf(Tensor::from_vec(&ctx, &target, &[bs, 1]))); let loss = d.mul(&d).mean_all(); loss.backward();
             let g: Vec<Tensor> = pv.iter().zip(&p).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adam.step(&mut p, &g); if it % 200 == 0 { tgt = p.clone(); }
         }
-        let mut vw: Vec<Vec<f32>> = Vec::new(); for c in 0..8 { vw.push(p[c].to_vec().await); }
+        let mut vw: Vec<Vec<f32>> = Vec::new(); for item in p[..8].iter() { vw.push(item.to_vec().await); }
         let vn = Vn { w: vw, b1: p[8].to_vec().await, w2: p[9].to_vec().await, b2: p[10].to_vec().await, w3: p[11].to_vec().await, b3: p[12].to_vec().await[0] };
         // ---- joint hybrid training (E + w) ----
         let mut q: Vec<Tensor> = (0..11).map(|c| Tensor::from_vec(&ctx, &randn(H, 60 + soff + c as u32, 0.4), &[1, H])).collect();
@@ -199,9 +199,9 @@ async fn run() {
             let gr2: Vec<Tensor> = rv.iter().zip(&r).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamr.step(&mut r, &gr2);
         }
         // ---- gate ----
-        let mut ew: Vec<Vec<f32>> = Vec::new(); for c in 0..11 { ew.push(q[c].to_vec().await); }
+        let mut ew: Vec<Vec<f32>> = Vec::new(); for item in q[..11].iter() { ew.push(item.to_vec().await); }
         let ef = Ef { w: ew, b1: q[11].to_vec().await, w2: q[12].to_vec().await, b2: q[13].to_vec().await, w3: q[14].to_vec().await, b3: q[15].to_vec().await[0] };
-        let mut ww: Vec<Vec<f32>> = Vec::new(); for c in 0..11 { ww.push(r[c].to_vec().await); }
+        let mut ww: Vec<Vec<f32>> = Vec::new(); for item in r[..11].iter() { ww.push(item.to_vec().await); }
         let wb3 = r[15].to_vec().await; let wn = Wn { w: ww, b1: r[11].to_vec().await, w2: r[12].to_vec().await, b2: r[13].to_vec().await, w3: r[14].to_vec().await, b3: [wb3[0], wb3[1]] };
         let (act, ver, field) = eval_hybrid(&ef, &wn, &vn);
         println!("     trained: actuate {act:.0}%  verify {ver:.1}%  potential-share {field:.0}%");

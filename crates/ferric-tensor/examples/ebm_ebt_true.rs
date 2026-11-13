@@ -18,7 +18,7 @@ const HE: usize = 96;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn ctx_ab(seed: u32, amin: f32, amax: f32) -> (f32, f32) { let a = amin + u(seed, 1) * (amax - amin); let b = (u(seed, 2) * 2.0 - 1.0) * (a / 2.0); (a, b) }
 // up-to-4 real solutions of ŷ₀²+ŷ₁²=a, ŷ₀ŷ₁=b
 fn sols(a: f32, b: f32) -> Vec<(f32, f32)> {

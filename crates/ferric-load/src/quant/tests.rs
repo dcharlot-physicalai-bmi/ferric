@@ -17,7 +17,7 @@ fn read_ref(p: &Path) -> Vec<(String, Vec<f32>)> {
         let n = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize; i += 4;
         let name = String::from_utf8(b[i..i + n].to_vec()).unwrap(); i += n;
         let k = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) as usize; i += 8;
-        out.push((name, b[i..i + 4 * k].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()));
+        out.push((name, b[i..i + 4 * k].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()));
         i += 4 * k;
     }
     out

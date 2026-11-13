@@ -166,9 +166,9 @@ fn belady_hits(seq: &[Access], cap: usize) -> (u64, u64) {
     for (i, a) in seq.iter().enumerate() {
         gets += 1;
         let key = (a.layer, a.expert);
-        if resident.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = resident.entry(key) {
             hits += 1;
-            resident.insert(key, next_use[i]);
+            e.insert(next_use[i]);
             continue;
         }
         if resident.len() == cap {
@@ -300,7 +300,7 @@ async fn run() {
     println!("  {:-<60}", "");
 
     let mut caps: Vec<usize> = vec![k + 1, floor / 4, floor / 2, floor, floor * 2, floor * 4, floor * 8];
-    caps.retain(|&c| c >= k + 1);
+    caps.retain(|&c| c > k);
     caps.sort_unstable(); caps.dedup();
     for cap in caps {
         let (lh, lg) = lru_hits(&seq, cap);

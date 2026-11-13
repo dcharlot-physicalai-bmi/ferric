@@ -115,8 +115,8 @@ pub fn build_words(axis_names: &[&str], labels: &[Vec<i32>]) -> (Vec<String>, Ve
     }
     let idx = |a: usize, v: i32| -> u32 {
         let mut base = 1usize;
-        for k in 0..a {
-            base += per_axis[k].len();
+        for axis in per_axis.iter().take(a) {
+            base += axis.len();
         }
         (base + per_axis[a].iter().position(|&x| x == v).unwrap()) as u32
     };
@@ -238,7 +238,6 @@ pub fn train_captions(
     seed: u64,
 ) -> Result<SeedResult, CaptionError> {
     let rows = seq.embedding_rows();
-    let lm_cfg = lm_cfg;
     let cfg = lm_cfg;
     let lm = SensorLm::deterministic(ctx, cfg, rows, seed)?;
     // The embedding table trains with the rest: a signal code the corpus never visited is an

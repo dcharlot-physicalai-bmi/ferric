@@ -18,7 +18,7 @@ fn is_wall(x: usize, y: usize) -> bool { x == 6 && y < 9 } // vertical wall col 
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, scale: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * scale }).collect() }
+fn randn(n: usize, seed: u32, scale: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * scale }).collect() }
 fn clampc(v: i32) -> usize { v.max(0).min(G as i32 - 1) as usize }
 fn next_pos(p: (usize, usize), a: usize) -> (usize, usize) { let nx = clampc(p.0 as i32 + MOVES[a].0); let ny = clampc(p.1 as i32 + MOVES[a].1); if is_wall(nx, ny) { p } else { (nx, ny) } }
 fn free_cell(seed: u32) -> (usize, usize) { let mut s = seed; loop { let x = (u(s, 1) * G as f32) as usize % G; let y = (u(s, 2) * G as f32) as usize % G; if !is_wall(x, y) { return (x, y); } s = s.wrapping_add(101); } }
@@ -116,7 +116,7 @@ async fn run() {
       println!("\n  maze world-model 6-step fidelity: {:.3}", c / ft as f32); }
 
     // ---- 3) compare energy-descent vs value-guided reach on CROSS-WALL goals ----
-    async fn reach(ctx: &Arc<ferric_core::Context>, value: bool, encode_t: &dyn Fn(&Tensor) -> Tensor, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+    async fn reach(ctx: &Arc<ferric_core::Context>, value: bool, _encode_t: &dyn Fn(&Tensor) -> Tensor, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
         let (t, maxsteps) = (150usize, 60usize);
         // start one side of the wall (cols 0-5), goal the other (cols 7-12), or swap → must use the gap.
         // cols 0-5 and 7-12 are never the wall (wall is col 6), so all cells are free.

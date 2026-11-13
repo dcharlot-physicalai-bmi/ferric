@@ -14,7 +14,7 @@ const N: usize = 2 * 5120;
 
 fn read(name: &str) -> Vec<u8> { std::fs::read(format!("{DIR}/{name}")).unwrap_or_else(|e| panic!("{name}: {e}")) }
 fn reference() -> Vec<f32> {
-    read("fork_dequant.blk0_attn_qkv_r100x2.f32").chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    read("fork_dequant.blk0_attn_qkv_r100x2.f32").as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 fn bits_differ(a: &[f32], b: &[f32]) -> usize { a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() }
 

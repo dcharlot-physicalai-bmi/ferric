@@ -38,6 +38,7 @@ pub fn iq_raw_block_bytes(ty: u32) -> Option<usize> {
 
 /// One IQ-family weight `[rows (out), cols (in)]` with its block bytes resident unchanged.
 pub struct IqRawWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     raw: Arc<wgpu::Buffer>,
     grid: Arc<wgpu::Buffer>,

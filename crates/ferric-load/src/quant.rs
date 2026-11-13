@@ -173,7 +173,7 @@ impl Rows {
     /// duplicated parameter is the same number.
     fn encode(&self, spec: &GqSpec) -> Result<Vec<u8>, String> {
         let gs = spec.group as usize;
-        if self.inp % gs != 0 { return Err(format!("{} inputs is not a whole number of {gs}-value blocks", self.inp)) }
+        if !self.inp.is_multiple_of(gs) { return Err(format!("{} inputs is not a whole number of {gs}-value blocks", self.inp)) }
         let nb = self.inp / gs;
         let has_zero = spec.has_zero();
         if spec.act && (gs != self.group || nb != self.ng) {
@@ -198,9 +198,9 @@ impl Rows {
 /// group itself when the GQ form can hold it, else the widest of 128/64/32/16 that divides `inp` and
 /// packs into whole words (the source parameter is then duplicated per block — exact).
 pub(crate) fn storage_group(group: usize, inp: usize, bits: u32) -> Result<u32, String> {
-    let fits = |g: usize| g > 0 && g < 4096 && inp % g == 0 && (g * bits as usize) % 32 == 0;
+    let fits = |g: usize| g > 0 && g < 4096 && inp.is_multiple_of(g) && (g * bits as usize).is_multiple_of(32);
     if fits(group) { return Ok(group as u32) }
-    [128usize, 64, 32, 16].into_iter().find(|&g| fits(g) && group % g == 0)
+    [128usize, 64, 32, 16].into_iter().find(|&g| fits(g) && group.is_multiple_of(g))
         .map(|g| g as u32).ok_or_else(|| format!("no storage group divides {inp} inputs for source group {group} at {bits} bits"))
 }
 
@@ -210,7 +210,7 @@ pub(crate) fn i32s(st: &SafeTensors, name: &str) -> Result<(Vec<u32>, Vec<usize>
     let e = st.info(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if e.dtype != "I32" && e.dtype != "U32" { return Err(format!("{name} is {}, expected packed int32", e.dtype)) }
     let raw = st.raw(name)?;
-    Ok((raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), e.shape.clone()))
+    Ok((raw.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(), e.shape.clone()))
 }
 
 pub(crate) fn u8s(st: &SafeTensors, name: &str) -> Result<(Vec<u8>, Vec<usize>), String> {
@@ -223,9 +223,9 @@ pub(crate) fn ints(st: &SafeTensors, name: &str) -> Result<Vec<i64>, String> {
     let e = st.info(name).ok_or_else(|| format!("missing tensor {name}"))?;
     let raw = st.raw(name)?;
     Ok(match e.dtype.as_str() {
-        "I32" => raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64).collect(),
-        "I64" => raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect(),
-        "I16" => raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as i64).collect(),
+        "I32" => raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as i64).collect(),
+        "I64" => raw.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect(),
+        "I16" => raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as i64).collect(),
         "I8" => raw.iter().map(|&b| b as i8 as i64).collect(),
         "U8" => raw.iter().map(|&b| b as i64).collect(),
         other => return Err(format!("{name}: {other} is not an integer dtype")),

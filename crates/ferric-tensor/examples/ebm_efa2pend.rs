@@ -169,7 +169,7 @@ async fn run() {
     }
     // extract to CPU
     let ex = async |p: &Vec<Tensor>, nin: usize| -> Net1 {
-        let mut w = Vec::new(); for c in 0..nin { w.push(p[c].to_vec().await); }
+        let mut w = Vec::new(); for item in p[..nin].iter() { w.push(item.to_vec().await); }
         Net1 { w, b1: p[nin].to_vec().await, w2: p[nin + 1].to_vec().await, b2: p[nin + 2].to_vec().await,
                w3: p[nin + 3].to_vec().await, b3: p[nin + 4].to_vec().await[0] } };
     let m = M2 { flow: ex(&fp, fin).await, pot: ex(&pp, pin).await };
@@ -269,6 +269,6 @@ fn load_st(path: &str) -> std::collections::HashMap<String, Vec<f32>> {
     while let Some(q) = rest.find("\"dtype\"") { let pre = &rest[..q]; let ne = pre.rfind("\":{").unwrap(); let ns = pre[..ne].rfind('"').unwrap() + 1;
         let name = pre[ns..ne].to_string(); let a = &rest[q..]; let os = a.find("\"data_offsets\":[").unwrap() + 16; let oe = a[os..].find(']').unwrap() + os;
         let of: Vec<usize> = a[os..oe].split(',').map(|s| s.trim().parse().unwrap()).collect();
-        out.insert(name, data[of[0]..of[1]].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()); rest = &a[oe..]; }
+        out.insert(name, data[of[0]..of[1]].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()); rest = &a[oe..]; }
     out
 }

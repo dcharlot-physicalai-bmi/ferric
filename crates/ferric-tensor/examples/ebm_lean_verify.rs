@@ -17,8 +17,8 @@ const DIR: &str = "/private/tmp/claude-501/-Users-dcharlot-vibe-coding-bmi-conce
 const DS: usize = 384; const DT: usize = 384; const D: usize = 768; const C: usize = 8; const HE: usize = 256;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
-fn read_f32(p: &str) -> Vec<f32> { let b = std::fs::read(p).unwrap(); b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = (h32(i as u32 ^ seed) % 1_000_000 + 1) as f32 / 1e6; let b = (h32((i as u32).wrapping_mul(2654435761) ^ seed) % 1_000_000 + 1) as f32 / 1e6; ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn read_f32(p: &str) -> Vec<f32> { let b = std::fs::read(p).unwrap(); b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = (h32(i as u32 ^ seed) % 1_000_000 + 1) as f32 / 1e6; let b = (h32((i as u32).wrapping_mul(2654435761) ^ seed) % 1_000_000 + 1) as f32 / 1e6; ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 
 fn main() { pollster::block_on(run()); }
 async fn run() {
@@ -55,7 +55,8 @@ async fn run() {
     let s = score_t(&Tensor::from_vec(&ctx, &te, &[tg * C, D])).to_vec().await;
     let (mut top1, mut top3) = (0usize, 0usize);
     for g in 0..tg { let mut v: Vec<(f32, usize)> = (0..C).map(|j| (s[g * C + j], j)).collect(); v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        if v[0].1 == 0 { top1 += 1; } if v[..3].iter().any(|&(_, j)| j == 0) { top3 += 1; } }
+        if v[0].1 == 0 { top1 += 1; }
+            if v[..3].iter().any(|&(_, j)| j == 0) { top3 += 1; } }
     println!("\n  best-of-{C} tactic selection — pick the REAL mathlib tactic among {C} candidates:");
     println!("     energy verifier  top-1: {:>4.0}%   top-3: {:>4.0}%", top1 as f32 / tg as f32 * 100.0, top3 as f32 / tg as f32 * 100.0);
     println!("     random baseline  top-1: {:>4.1}%   top-3: {:>4.1}%", 100.0 / C as f32, 300.0 / C as f32);

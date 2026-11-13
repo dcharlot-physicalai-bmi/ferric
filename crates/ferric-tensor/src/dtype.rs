@@ -176,6 +176,7 @@ impl QRow {
 /// each), with a per-output-channel scale (absmean). The matmul is effectively multiply-free — each
 /// weight just adds, subtracts, or skips an activation. 1.58 bits/weight ≈ 1/16 the memory of f32.
 pub struct Ternary {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     buf: Arc<wgpu::Buffer>,
     scale: Arc<wgpu::Buffer>, // [out] = absmean per row
@@ -220,7 +221,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0 && inn % 8 == 0, "matmul_ternary_coop needs N,K multiples of 8");
+        assert!(w.rows.is_multiple_of(8) && inn % 8 == 0, "matmul_ternary_coop needs N,K multiples of 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -236,7 +237,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 16 == 0 && inn % 8 == 0, "matmul_ternary_coop_n16 needs N mult 16, K mult 8");
+        assert!(w.rows.is_multiple_of(16) && inn % 8 == 0, "matmul_ternary_coop_n16 needs N mult 16, K mult 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -252,7 +253,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 32 == 0 && inn % 8 == 0, "matmul_ternary_coop_n32 needs N mult 16, K mult 8");
+        assert!(w.rows.is_multiple_of(32) && inn % 8 == 0, "matmul_ternary_coop_n32 needs N mult 16, K mult 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -268,7 +269,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 64 == 0 && inn % 8 == 0, "matmul_ternary_coop_n64 needs N mult 16, K mult 8");
+        assert!(w.rows.is_multiple_of(64) && inn % 8 == 0, "matmul_ternary_coop_n64 needs N mult 16, K mult 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -284,7 +285,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0 && inn % 32 == 0, "matmul_ternary_coop4 needs N mult of 8, K mult of 32");
+        assert!(w.rows.is_multiple_of(8) && inn % 32 == 0, "matmul_ternary_coop4 needs N mult of 8, K mult of 32");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -584,6 +585,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// instead of the 108 GB it would need dequantized to f32 — so the matmul must read the packed
 /// blocks directly, which is what `Tensor::matmul_q2_0` does.
 pub struct Q2_0Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 8 u32 per block — 16 two-bit codes per word, u32-aligned
     scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
@@ -652,6 +654,7 @@ impl Q2_0Weights {
 /// GEMV every weight word is read exactly once, so coalescing requires adjacent *threads* to read
 /// adjacent addresses, and adjacent threads own adjacent outputs.
 pub struct Stq1_0Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 8 u32 per block — 8 four-bit slot codes per word
     signs: Arc<wgpu::Buffer>,  // 2 u32 per block — one bit per group of 4
@@ -743,6 +746,7 @@ fn grid_buffer(ctx: &Arc<Context>, label: &str, data: &[u32]) -> Arc<wgpu::Buffe
 /// Almost all of the information is *which* of 256 magnitude patterns and *which* of 128 sign
 /// patterns, not the magnitudes: every byte of the grid is one of `{8, 25, 43}`.
 pub struct Iq2XxsWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 16 u32 per block, output-major
     scales: Arc<wgpu::Buffer>, // f16 per block, two per u32
@@ -796,6 +800,7 @@ impl Iq2XxsWeights {
 /// byte splits across them — bits 0..3 for the first, 4..7 for the second. The sub-scale multiplier
 /// is `0.5`, not IQ2_XXS's `0.25`.
 pub struct Iq3XxsWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 24 u32 per block (16 index words then 8 sign/scale words)
     scales: Arc<wgpu::Buffer>,
@@ -844,6 +849,7 @@ impl Iq3XxsWeights {
 /// way `Q2_0Weights` does for ternary. Same repack-on-upload trick: the 18-byte block isn't u32-
 /// aligned, so split it into an aligned `codes` array (4 u32/block) and a separate `scales` array.
 pub struct Q4_0Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 4 u32 per block (16 nibble-bytes)
     scales: Arc<wgpu::Buffer>, // f16 per block, two packed per u32
@@ -883,6 +889,7 @@ impl Q4_0Weights {
 /// −8). Same repack trick as Q4_0; the 20-byte block adds an `f16 min`, so `d` and `m` are packed
 /// together — one u32 per block — and read back with `unpack2x16float` as `(d, m)`.
 pub struct Q4_1Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 4 u32 per block (16 nibble-bytes)
     scales: Arc<wgpu::Buffer>, // (d, m) f16 pair packed one u32 per block
@@ -994,9 +1001,8 @@ impl Q5_0Weights {
         // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
         // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(dev) = &self.cuda {
-            if !dev.write_words(blk0 * 4, &codes, blk0 * 2, &scales) { return Err("cuda mirror write failed".into()); }
-        }
+        if let Some(dev) = &self.cuda
+            && !dev.write_words(blk0 * 4, &codes, blk0 * 2, &scales) { return Err("cuda mirror write failed".into()); }
         Ok(())
     }
 
@@ -1005,6 +1011,7 @@ impl Q5_0Weights {
 /// **Q5_1** weights held packed on the GPU — the affine 5-bit (`value = (nibble|5th-bit)·d + m`).
 /// Combines Q5_0's `qh` with Q4_1's `min`; `scales` holds two words per block — `[pack(d,m), qh]`.
 pub struct Q5_1Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>,  // 4 u32 per block (16 nibble-bytes)
     scales: Arc<wgpu::Buffer>, // [(d,m) f16 pair, qh (u32)] per block
@@ -1048,6 +1055,7 @@ impl Q5_1Weights {
 /// same forward code runs a Q2_0 ternary model, a Q4_K_M model, a Q8_0 model, … — each with its
 /// weights dequantized inside the matmul, never expanded to f32.
 /// One packed-quant weight shard that fits in a single GPU storage buffer.
+#[allow(non_camel_case_types)] // variant names are the GGUF type ids: Q4_K, not Q4K
 pub enum QShard {
     Q2_0(Q2_0Weights),
     Stq1_0(Stq1_0Weights),
@@ -1100,6 +1108,8 @@ impl DenseWeight {
 }
 
 impl QShard {
+    /// Row count of the loaded shard. Callers that only need the byte size use `nbytes`.
+    #[allow(dead_code)]
     fn rows(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.rows, QShard::Iq3Xxs(w) => w.rows, QShard::Stq1_0(w) => w.rows, QShard::Q2_0(w) => w.rows, QShard::Q4_0(w) => w.rows, QShard::Q4_1(w) => w.rows, QShard::Q5_0(w) => w.rows, QShard::Q5_1(w) => w.rows, QShard::Q2_K(w) => w.rows, QShard::Q3_K(w) => w.rows, QShard::Q4_K(w) => w.rows, QShard::Q5_K(w) => w.rows, QShard::Q6_K(w) => w.rows, QShard::Q8_0(w) => w.rows, QShard::Iq4Xs(w) => w.rows, QShard::Iq4Nl(w) => w.rows, QShard::Mxfp4(w) => w.rows, QShard::Nvfp4(w) => w.rows, QShard::IqRaw(w) => w.rows, QShard::Gq(w) => w.rows, QShard::Half(w) => w.rows, QShard::Dense(w) => w.rows } }
     fn nbytes(&self) -> usize { match self { QShard::Iq2Xxs(w) => w.nbytes(), QShard::Iq3Xxs(w) => w.nbytes(), QShard::Stq1_0(w) => w.nbytes(), QShard::Q2_0(w) => w.nbytes(), QShard::Q4_0(w) => w.nbytes(), QShard::Q4_1(w) => w.nbytes(), QShard::Q5_0(w) => w.nbytes(), QShard::Q5_1(w) => w.nbytes(), QShard::Q2_K(w) => w.nbytes(), QShard::Q3_K(w) => w.nbytes(), QShard::Q4_K(w) => w.nbytes(), QShard::Q5_K(w) => w.nbytes(), QShard::Q6_K(w) => w.nbytes(), QShard::Q8_0(w) => w.nbytes(), QShard::Iq4Xs(w) => w.nbytes(), QShard::Iq4Nl(w) => w.nbytes(), QShard::Mxfp4(w) => w.nbytes(), QShard::Nvfp4(w) => w.nbytes(), QShard::IqRaw(w) => w.nbytes(), QShard::Gq(w) => w.nbytes(), QShard::Half(w) => w.nbytes(), QShard::Dense(w) => w.nbytes() } }
     fn build(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QShard, String> {
@@ -1124,11 +1134,11 @@ impl QShard {
             43 => QShard::Stq1_0(Stq1_0Weights::from_bytes(ctx, bytes, rows, cols)),
             16 => QShard::Iq2Xxs(Iq2XxsWeights::from_bytes(ctx, bytes, rows, cols)),
             18 => QShard::Iq3Xxs(Iq3XxsWeights::from_bytes(ctx, bytes, rows, cols)),
-            1 | 30 if cols % 4 == 0 => QShard::Half(HalfWeights::from_bytes(ctx, bytes, rows, cols, ggml_type == 30)),
+            1 | 30 if cols.is_multiple_of(4) => QShard::Half(HalfWeights::from_bytes(ctx, bytes, rows, cols, ggml_type == 30)),
             // The kernel reads four input values per step. A 16-bit weight too narrow for that is widened
             // here instead — the old path, for the rare shape that needs it — rather than refused.
             1 | 30 => {
-                let w: Vec<f32> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+                let w: Vec<f32> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes([b[0], b[1]]))
                     .map(|h| if ggml_type == 30 { f32::from_bits((h as u32) << 16) } else { f16_bits_to_f32(h) }).collect();
                 QShard::Dense(DenseWeight::from_f32(ctx, &w, rows, cols))
             }
@@ -1164,6 +1174,7 @@ impl QMatrix {
     /// its "reference" `x.matmul_q(&qm)` had itself been routed to CUDA by that hook. A reference
     /// that silently takes the path under test is the vacuous-test mechanism in its purest form.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    #[cfg_attr(not(test), allow(dead_code))] // the flat Q5_K path the CUDA conformance tests call
     pub(crate) fn q5k_flat_wgsl(&self, x: &Tensor) -> Option<Tensor> {
         let [QShard::Q5_K(w)] = &self.shards[..] else { return None };
         let (l, opw) = splitk_lanes(w.cols / 256);
@@ -1171,6 +1182,7 @@ impl QMatrix {
     }
     /// The WGSL FLAT Q6_K kernel on a single-shard matrix, bypassing any native hook (test seam).
     #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
+    #[cfg_attr(not(test), allow(dead_code))] // the flat Q6_K path the CUDA conformance tests call
     pub(crate) fn q6k_flat_wgsl(&self, x: &Tensor) -> Option<Tensor> {
         let [QShard::Q6_K(w)] = &self.shards[..] else { return None };
         Some(x.matmul_q6_k_cfg(w, false))
@@ -1225,11 +1237,11 @@ impl QMatrix {
     /// shard's buffers exceed the device's binding limit. The derived (codes/scales/aux) buffers are
     /// each ≤ the raw block bytes, so bounding raw shard bytes bounds every buffer.
     pub fn from_bytes(ctx: &Arc<Context>, bytes: &[u8], ggml_type: u32, rows: usize, cols: usize) -> Result<QMatrix, String> {
-        let row_bytes = if rows == 0 { 0 } else { bytes.len() / rows };
+        let row_bytes = bytes.len().checked_div(rows).unwrap_or(0);
         // Effective per-shard byte budget: the device limit, or a smaller test override, with headroom.
         let limit = std::env::var("FERRIC_MAX_BINDING").ok().and_then(|s| s.parse().ok())
             .unwrap_or_else(|| (ctx.max_binding as usize).saturating_sub(1 << 20).max(1 << 20));
-        let max_rows = if row_bytes == 0 { rows } else { (limit / row_bytes).max(1) };
+        let max_rows = limit.checked_div(row_bytes).map(|n| n.max(1)).unwrap_or(rows);
         let mut shards = Vec::new();
         let mut r0 = 0;
         while r0 < rows {
@@ -1247,7 +1259,7 @@ impl QMatrix {
         let row_bytes = cols * 4;
         let limit = std::env::var("FERRIC_MAX_BINDING").ok().and_then(|s| s.parse().ok())
             .unwrap_or_else(|| (ctx.max_binding as usize).saturating_sub(1 << 20).max(1 << 20));
-        let max_rows = if row_bytes == 0 { rows.max(1) } else { (limit / row_bytes).max(1) };
+        let max_rows = limit.checked_div(row_bytes).map(|n| n.max(1)).unwrap_or(rows.max(1));
         let mut shards = Vec::new();
         let mut r0 = 0;
         while r0 < rows {
@@ -1318,7 +1330,7 @@ impl Tensor {
         if gate_up.shards.len() != 1 || down.shards.len() != 1 { return None; }
         let gu = match &gate_up.shards[0] { QShard::Q4_K(w) => w, _ => return None };
         let dn = match &down.shards[0] { QShard::Q6_K(w) => w, _ => return None };
-        if gu.rows != 2 * n_ff || dn.cols != n_ff || n_ff % 256 != 0 || dn.rows % 256 != 0 { return None; }
+        if gu.rows != 2 * n_ff || dn.cols != n_ff || !n_ff.is_multiple_of(256) || dn.rows % 256 != 0 { return None; }
         Some(self.ffn_mega_q4k_q6k(gu, dn, n_ff))
     }
     pub fn ffn_mega_q4k_q6k(&self, gu: &Q4_KWeights, dn: &Q6_KWeights, n_ff: usize) -> Tensor {
@@ -1369,7 +1381,9 @@ impl Tensor {
 /// higher-quality choice). Same super-block as Q4_K plus a 32-byte `qh` array giving each quant a 5th
 /// (high) bit: value = `d·scaleₛ·(nibble + 16·qh_bit) − dmin·minₛ`. codes = qs|qh (40 u32/block);
 /// aux = d/dmin + 12 scale bytes (4 u32/block), identical to Q4_K.
+#[allow(non_camel_case_types)] // the type name is the GGUF block name Q5_KWeights
 pub struct Q5_KWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 40 u32/block: 32 words qs, then 8 words qh
     aux: Arc<wgpu::Buffer>,   // 4 u32/block: d|dmin, 12 scale bytes
@@ -1412,14 +1426,13 @@ impl Tensor {
     pub fn matmul_q5_k(&self, w: &Q5_KWeights) -> Tensor {
         // NVIDIA native tier first (opt-in, decode rows only); any `None` falls through to WGSL.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if self.shape[0] == 1 {
-            if let Some(dev) = &w.cuda {
+        if self.shape[0] == 1
+            && let Some(dev) = &w.cuda {
                 let xv = pollster::block_on(self.contiguous().to_vec());
                 if let Some(out) = dev.gemv(&xv, w.rows, w.cols) {
                     return Tensor::from_vec(&self.ctx, &out, &[1, w.rows]);
                 }
             }
-        }
         let split = q2_0_split_k(self.shape[0], w.rows, w.cols);
         self.matmul_q5_k_cfg(w, split, splitk_lanes_sub(w.cols / 256))
     }
@@ -1447,7 +1460,7 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q5_K_FLAT_WGSL, "matmul_q5_k_flat")
         };
-        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+        if rows >= 8 && w.rows.is_multiple_of(8) && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q5_k_coop(w);
         }
         // ⚠ __LS__ before __L__: a plain string replace of "__L__" would also eat the "__L" inside
@@ -1470,7 +1483,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "matmul_q5_k_coop needs N a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "matmul_q5_k_coop needs N a multiple of 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -1530,7 +1543,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// `codes` is the 64 `qs` bytes as 16 words; `aux` is `[d|dmin, 16 scale bytes]` as 5 words. Both
 /// super-block scales ride in ONE word so a single `unpack2x16float` yields the pair, and the 16
 /// sub-block bytes need no rearrangement — each already packs its 4-bit scale and 4-bit min.
+#[allow(non_camel_case_types)] // the type name is the GGUF block name Q2_KWeights
 pub struct Q2_KWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 16 u32/block: qs
     aux: Arc<wgpu::Buffer>,   // 5 u32/block: [d|dmin, 16 scale/min bytes]
@@ -1572,7 +1587,9 @@ impl Q2_KWeights {
 /// through 12 bytes as low-nibbles plus a plane of high-2-bit pairs; every matmul would otherwise
 /// redo that `aux`/`kmask` dance per super-block per output row. Done once here, `aux` carries them
 /// as plain bytes and the kernel does one subtract.
+#[allow(non_camel_case_types)] // the type name is the GGUF block name Q3_KWeights
 pub struct Q3_KWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 24 u32/block: 8 words hmask, then 16 words qs
     aux: Arc<wgpu::Buffer>,   // 5 u32/block: [d, 16 already-unshuffled 6-bit scale bytes]
@@ -1596,11 +1613,11 @@ impl Q3_KWeights {
             for w in 0..16 { codes[b * 24 + 8 + w] = word(src, 32 + w * 4); }  // qs (64 B)
             aux[b * 5] = u16::from_le_bytes([src[108], src[109]]) as u32;      // d
             let mut a = [0u32; 4];
-            for k in 0..3 { a[k] = word(src, 96 + k * 4); }
+            for (k, word_slot) in a.iter_mut().take(3).enumerate() { *word_slot = word(src, 96 + k * 4); }
             let tmp = a[2];
             a[2] = ((a[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
             a[3] = ((a[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-            a[0] = (a[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+            a[0] = (a[0] & KMASK2) | ((tmp & KMASK1) << 4);
             a[1] = (a[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
             aux[b * 5 + 1..b * 5 + 5].copy_from_slice(&a);
         }
@@ -1629,6 +1646,7 @@ impl Tensor {
     /// The two shells bind exactly `(x, codes, aux, out, info)` and know nothing about the format —
     /// only the spliced body does — so a new K-quant needs a body, not a kernel. They carry Q6_K's
     /// name because it was the first to use them.
+    #[allow(clippy::too_many_arguments)] // codes, aux, shape, and the two shader fragments stay distinct
     fn matmul_k_packed(&self, codes: &Arc<wgpu::Buffer>, aux: &Arc<wgpu::Buffer>, o_dim: usize,
                        cols: usize, helpers: &str, body: &str, tag: &str) -> Tensor {
         let x = self.contiguous();
@@ -1664,6 +1682,7 @@ impl Tensor {
 /// it. 210-byte super-block / 256 values: `ql[128]` (low 4 bits), `qh[64]` (high 2 bits),
 /// `scales[16]` (int8), `d` (f16); value = `d·scale·(q − 32)`. codes = ql|qh (48 u32/block); aux =
 /// d + 16 scale bytes (5 u32/block), keeping within the 4-storage-buffer baseline.
+#[allow(non_camel_case_types)] // the type name is the GGUF block name Q6_KWeights
 pub struct Q6_KWeights {
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 48 u32/block: 32 words ql, then 16 words qh
@@ -1736,9 +1755,8 @@ impl Q6_KWeights {
         // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
         // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(dev) = &self.cuda {
-            if !dev.write_words(blk0 * 48, &codes, blk0 * 5, &aux) { return Err("cuda mirror write failed".into()); }
-        }
+        if let Some(dev) = &self.cuda
+            && !dev.write_words(blk0 * 48, &codes, blk0 * 5, &aux) { return Err("cuda mirror write failed".into()); }
         Ok(())
     }
 
@@ -1770,7 +1788,7 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q6_K_FLAT_WGSL, "matmul_q6_k_flat")
         };
-        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+        if rows >= 8 && w.rows.is_multiple_of(8) && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q6_k_coop(w);
         }
         let src = wgsl.replace("__HELPERS__", Q6_K_HELPERS).replace("__BODY__", Q6_K_BODY)
@@ -1791,7 +1809,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "matmul_q6_k_coop needs N (out) a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "matmul_q6_k_coop needs N (out) a multiple of 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -1874,6 +1892,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 /// in — and a 9B bf16 model became 36 GB resident. Kept 16-bit it is 18 GB, and the weights in memory
 /// are the authors' own, bit for bit, which is what a conformance check against them needs.
 pub struct HalfWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     words: Arc<wgpu::Buffer>,
     pub rows: usize,
@@ -2099,9 +2118,8 @@ impl Q8_0Weights {
         // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
         // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(dev) = &self.cuda {
-            if !dev.write_words(blk0 * 8, &codes, blk0 / 2, &scales) { return Err("cuda mirror write failed".into()); }
-        }
+        if let Some(dev) = &self.cuda
+            && !dev.write_words(blk0 * 8, &codes, blk0 / 2, &scales) { return Err("cuda mirror write failed".into()); }
         Ok(())
     }
 
@@ -2123,7 +2141,7 @@ impl Tensor {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             (((gw as u32), wg.div_ceil(gw) as u32, 1u32), (gw * 64) as u32, MATMUL_Q8_0_FLAT_WGSL, "matmul_q8_0_flat")
         };
-        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+        if rows >= 8 && w.rows.is_multiple_of(8) && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q8_0_coop(w);
         }
         let src = if use_subgroup(&self.ctx) { sg_reduce(wgsl) } else { wgsl.to_string() };
@@ -2138,7 +2156,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "matmul_q8_0_coop needs N a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "matmul_q8_0_coop needs N a multiple of 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -2192,6 +2210,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// `d·scaleₛ·q − dmin·minₛ` for its sub-block s. Native packed matmul (dequant in-kernel) instead of
 /// dequant-to-f32. To stay within WebGPU's 4-storage-buffer baseline, d/dmin + the 12 scale bytes are
 /// packed together into one `aux` buffer (4 u32/block); the 128 quant bytes are `codes` (32 u32/block).
+#[allow(non_camel_case_types)] // the type name is the GGUF block name Q4_KWeights
 pub struct Q4_KWeights {
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 32 u32 per block (128 quant bytes)
@@ -2294,9 +2313,8 @@ impl Q4_KWeights {
         // ⛔ The NVIDIA mirror is a SECOND copy of these words. Writing only the WGSL buffers would leave
         // it holding the previous expert — finite, plausible, and wrong, and only when FERRIC_CUDA is set.
         #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
-        if let Some(dev) = &self.cuda {
-            if !dev.write_words(blk0 * 32, &codes, blk0 * 4, &aux) { return Err("cuda mirror write failed".into()); }
-        }
+        if let Some(dev) = &self.cuda
+            && !dev.write_words(blk0 * 32, &codes, blk0 * 4, &aux) { return Err("cuda mirror write failed".into()); }
         Ok(())
     }
 
@@ -2325,8 +2343,8 @@ impl Tensor {
         // Coalesced-GEMV experiment: transposed weight layout so output-threads read contiguous memory.
         // Gated on a SEPARATE flag (measured to HURT the small qkv/o matmuls) so FERRIC_Q4K_TRANS alone
         // isolates the fused-swiglu transpose on the big gate_up.
-        if let (Some(ct), Some(at)) = (&w.codes_t, &w.aux_t) {
-          if std::env::var("FERRIC_Q4K_TRANS_M").is_ok() {
+        if let (Some(ct), Some(at)) = (&w.codes_t, &w.aux_t)
+          && std::env::var("FERRIC_Q4K_TRANS_M").is_ok() {
             let wg = n.div_ceil(64); let gw = wg.min(32768);
             let grid = ((gw as u32), wg.div_ceil(gw) as u32, 1u32);
             run(&self.ctx, MATMUL_Q4_K_TRANS_WGSL, "matmul_q4_k_trans",
@@ -2334,7 +2352,6 @@ impl Tensor {
                   &unibuf(&self.ctx, &[rows as u32, w.rows as u32, inn as u32, (gw * 64) as u32])], grid);
             return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
           }
-        }
         // K-split subgroup GEMV (opt-in, needs subgroups): one subgroup per output, lanes split the
         // blocks then subgroupAdd. Non-bit-identical → opt-in fast path.
         if std::env::var("FERRIC_SGGEMV").is_ok() && self.ctx.subgroups {
@@ -2347,7 +2364,7 @@ impl Tensor {
             return Tensor::from_parts(&self.ctx, out, vec![rows, w.rows]);
         }
         // Prefill tensor-core fast-path (opt-in, Metal), same discipline as Q2_0.
-        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+        if rows >= 8 && w.rows.is_multiple_of(8) && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q4_k_coop(w);
         }
         let src = wgsl.replace("__HELPERS__", Q4_K_HELPERS).replace("__INNER__", Q4_K_INNER)
@@ -2369,7 +2386,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "coop2pass needs N a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "coop2pass needs N a multiple of 8");
         // dispatch 1: packed Q2_0 [N,K] → f32 **[K,N]** (transposed), so the plain row-major coop GEMM
         // computes x·[K,N] = x·Wᵀ. Column-major coop-load (the direct-Wᵀ approach) is mis-generated on
         // NVIDIA's SPIR-V; only row-major loads work there, so we transpose in the dequant instead.
@@ -2417,7 +2434,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 16 == 0 && inn % 16 == 0, "coop16 needs N,K multiples of 16");
+        assert!(w.rows.is_multiple_of(16) && inn % 16 == 0, "coop16 needs N,K multiples of 16");
         let (n, k) = (w.rows, inn);
         let wf = empty(&self.ctx, k * n);
         let (grid, rs) = groups2d(n * k);
@@ -2738,7 +2755,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "matmul_q4_k_coop needs N (out) a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "matmul_q4_k_coop needs N (out) a multiple of 8");
         let mrows = rows.div_ceil(8) * 8;
         let xp = if mrows == rows { x } else { x.pad_rows(mrows) };
         let out = empty(&self.ctx, mrows * w.rows);
@@ -2936,7 +2953,7 @@ impl Tensor {
         // Prefill tensor-core fast-path (opt-in, Metal): many tokens make this a real GEMM where the
         // matrix unit's 3-4× beats the scalar dequant kernel. Decode (rows < 8) stays on the scalar
         // path. fp-order/precision dependent, so gated behind FERRIC_COOP, never the default.
-        if rows >= 8 && w.rows % 8 == 0 && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
+        if rows >= 8 && w.rows.is_multiple_of(8) && self.ctx.coop_shared_ok() && std::env::var("FERRIC_COOP").is_ok() {
             return self.matmul_q2_0_coop(w);
         }
         // NOTE: a model-facing coop16 hook (route prefill Q2_0 through matmul_q2_0_coop16 on Vulkan)
@@ -2985,7 +3002,7 @@ impl Tensor {
         let x = self.contiguous();
         let (rows, inn) = (x.shape[0], x.shape[1]);
         assert_eq!(inn, w.cols, "inner dim mismatch");
-        assert!(w.rows % 8 == 0, "matmul_q2_0_coop needs N (out) a multiple of 8");
+        assert!(w.rows.is_multiple_of(8), "matmul_q2_0_coop needs N (out) a multiple of 8");
         // Pad the token dimension up to a multiple of 8 (the coop tile), compute, then slice back —
         // so any prompt length works. The pad rows are wasted tiles, cheap at prefill.
         // `FERRIC_COOP_2PASS` selects the two-pass (dequant→f32, then row-major coop GEMM) alternative;
@@ -3121,6 +3138,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // directly (the packed layout's own row order), so the dequant is a straight linear write —
 // coalesced on both sides, where the transposed variant's 68 KB-strided writes ran ~7x below
 // bandwidth and dominated small prefills.
+#[allow(dead_code)] // non-transposed Q2_0 dequant shader for the Metal-4 path above
 const DEQ_Q2_0_NT_WGSL: &str = r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
@@ -4426,6 +4444,7 @@ const IQ4_XS_BODY: &str = r#"
 /// fallback is correct and was an 8x memory blow-up over the 4.25 bits/weight this format actually
 /// costs, which is the entire reason it was worth writing a kernel for.
 pub struct Iq4XsWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 32 u32/block: qs[128]
     aux: Arc<wgpu::Buffer>,   // 3 u32/block: [d|_, scales_h, scales_l packed]
@@ -4507,6 +4526,7 @@ const IQ4_NL_BODY: &str = r#"
 /// tensors / 250.5 M params** — the majority of the model. Wiring IQ4_XS alone leaves 51% of the
 /// weights on the f32 dense fallback, so the format's byte cost is never actually paid at runtime.
 pub struct Iq4NlWeights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 4 u32/block: qs[16]
     aux: Arc<wgpu::Buffer>,   // 1 u32/block: f16 d in the low half
@@ -4695,6 +4715,7 @@ const NVFP4_BODY: &str = r#"
 /// where a single scale byte had to be stuffed four blocks to a word to avoid a 3-byte hole.
 /// Resident total is 36 B/block, bit-for-bit the on-disk size.
 pub struct Nvfp4Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 8 u32/block: qs[32]
     aux: Arc<wgpu::Buffer>,   // 1 u32/block: d[4], the UE4M3 sub-block scales
@@ -4740,6 +4761,7 @@ impl Nvfp4Weights {
 /// one-word-per-scale layout that IQ4_NL/Q4_0 use would cost 20 B/block (0.625 B/elem); it is only
 /// their `f16` scale that makes a whole word the natural unit, and MXFP4's scale is one byte.
 pub struct Mxfp4Weights {
+    #[allow(dead_code)] // owns the device that allocated the buffers on this value
     ctx: Arc<Context>,
     codes: Arc<wgpu::Buffer>, // 4 u32/block: qs[16]
     aux: Arc<wgpu::Buffer>,   // 1 BYTE/block: the E8M0 scale, 4 blocks packed per u32
@@ -6010,7 +6032,7 @@ mod mxfp4_kernel_tests {
             // that ignored three of the four sub-scales PASSED — the per-sub-block scale is exactly
             // what distinguishes NVFP4 from MXFP4, and the fixture could not see it. Four DIFFERENT
             // bytes, so each sub-block's scale must be read from its own slot.
-            for sb in 0..4 { b[sb] = (r as u8).wrapping_add((sb as u8) * 53); }
+            for (sb, byte) in b.iter_mut().take(4).enumerate() { *byte = (r as u8).wrapping_add((sb as u8) * 53); }
             for j in 0..32 { b[4 + j] = ((j % 16) as u8) | (((15 - (j % 16)) as u8) << 4); }
         }
         let w = Nvfp4Weights::from_bytes(&ctx, &raw, rows, cols);
@@ -6096,7 +6118,7 @@ mod mxfp4_kernel_tests {
 
         // ---- split-K: 1 activation row, 8192 weight rows ----
         let w = Mxfp4Weights::from_bytes(&ctx, &raw, 8192, 32);
-        let x = Tensor::from_vec(&ctx, &vec![1.0f32; 32], &[1, 32]);
+        let x = Tensor::from_vec(&ctx, &[1.0f32; 32], &[1, 32]);
         let got = pollster::block_on(x.matmul_mxfp4(&w).to_vec());
         // A divergence is EXCUSED only if the exact answer is a subnormal f32 AND this device was
         // independently measured not to keep subnormals AND the kernel returned a clean zero. Every
@@ -6136,7 +6158,7 @@ mod mxfp4_kernel_tests {
         raw2.extend_from_slice(&raw);
         let w2 = Mxfp4Weights::from_bytes(&ctx, &raw2, 16384, 32);
         let mults = [1.0f32, 2.0, 4.0];
-        let xv: Vec<f32> = mults.iter().flat_map(|&m| std::iter::repeat(m).take(32)).collect();
+        let xv: Vec<f32> = mults.iter().flat_map(|&m| std::iter::repeat_n(m, 32)).collect();
         let x2 = Tensor::from_vec(&ctx, &xv, &[3, 32]);
         let got2 = pollster::block_on(x2.matmul_mxfp4(&w2).to_vec());
         let mut ndiff2 = 0usize;
@@ -6847,7 +6869,7 @@ mod iq_kernel {
             let nblk = inn / 256;
             let (l, opw1) = splitk_lanes(nblk);
             let sub = (64 / l).min(8);
-            let flat = pollster::block_on(x.matmul_q5_k_cfg(&m, false, (l, 1, opw1)).to_vec());
+            let flat = pollster::block_on(x.matmul_q5_k_cfg(m, false, (l, 1, opw1)).to_vec());
 
             let scale = flat.iter().fold(0f32, |a, &v| a.max(v.abs()));
             assert!(scale > 1e-3, "{label} in={inn}: FLAT reference is ~zero, this would pass on anything");
@@ -6859,7 +6881,7 @@ mod iq_kernel {
             // contribution, and the arithmetic would still look plausible.
             for (ll, sl, o, lay) in [(l, 1u32, opw1, "S=1"), (l, sub, 64 / (l * sub), "S=8"),
                                      (8, 8, 1, "wide 8x8 (idle lanes)")] {
-                let got = pollster::block_on(x.matmul_q5_k_cfg(&m, true, (ll, sl, o)).to_vec());
+                let got = pollster::block_on(x.matmul_q5_k_cfg(m, true, (ll, sl, o)).to_vec());
                 assert_eq!(got.len(), flat.len(), "{label} in={inn} {lay}: length");
                 assert!(got.iter().all(|v| v.is_finite()), "{label} in={inn} out={out} {lay}: non-finite");
                 let worst = flat.iter().zip(&got).fold(0f32, |a, (&w, &g)| a.max((w - g).abs()));

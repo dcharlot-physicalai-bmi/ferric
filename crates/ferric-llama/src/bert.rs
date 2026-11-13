@@ -150,8 +150,11 @@ impl Cfg {
 }
 
 /// Q, K and V as three projections (BERT) or one fused `Wqkv` whose output rows are `(three h d)`.
+struct SplitQkv {
+    q: Tensor, qb: Option<Tensor>, k: Tensor, kb: Option<Tensor>, v: Tensor, vb: Option<Tensor>,
+}
 enum Qkv {
-    Split { q: Tensor, qb: Option<Tensor>, k: Tensor, kb: Option<Tensor>, v: Tensor, vb: Option<Tensor> },
+    Split(Box<SplitQkv>),
     Fused { w: Tensor, b: Option<Tensor> },
 }
 
@@ -220,11 +223,11 @@ impl Bert {
             let qkv = if g.tensor(&n("attn_qkv.weight")).is_some() {
                 Qkv::Fused { w: t2(ctx, g, &n("attn_qkv.weight"))?, b: t1o(ctx, g, &n("attn_qkv.bias"))? }
             } else {
-                Qkv::Split {
+                Qkv::Split(Box::new(SplitQkv {
                     q: t2(ctx, g, &n("attn_q.weight"))?, qb: t1o(ctx, g, &n("attn_q.bias"))?,
                     k: t2(ctx, g, &n("attn_k.weight"))?, kb: t1o(ctx, g, &n("attn_k.bias"))?,
                     v: t2(ctx, g, &n("attn_v.weight"))?, vb: t1o(ctx, g, &n("attn_v.bias"))?,
-                }
+                }))
             };
             let gate = if g.tensor(&n("ffn_gate.weight")).is_some() { Some(t2(ctx, g, &n("ffn_gate.weight"))?) } else { None };
             Ok(Block {
@@ -301,8 +304,8 @@ impl Bert {
         let mut e = vec![0f32; t * d];
         for (p, &id) in ids.iter().enumerate() {
             let (tk, ps) = ((id as usize) * d, p * d);
-            for j in 0..d { e[ps + j] = self.tok_embd[tk + j]; }
-            if let Some(ty) = &self.typ_embd { if neg != "no_type" { for j in 0..d { e[ps + j] += ty[j]; } } }
+            e[ps..(d + ps)].copy_from_slice(&self.tok_embd[tk..(d + tk)]);
+            if let Some(ty) = &self.typ_embd && neg != "no_type" { for j in 0..d { e[ps + j] += ty[j]; } }
             if let Some(pe) = &self.pos_embd {
                 let o = (p + self.cfg.pos_offset) * d;
                 for j in 0..d { e[ps + j] += pe[o + j]; }
@@ -343,8 +346,8 @@ impl Bert {
         });
         for (_il, b) in self.blocks.iter().enumerate() {
             let (q, k, v) = match &b.qkv {
-                Qkv::Split { q, qb, k, kb, v, vb } =>
-                    (bias(h.matmul_bt(q), qb), bias(h.matmul_bt(k), kb), bias(h.matmul_bt(v), vb)),
+                Qkv::Split(s) =>
+                    (bias(h.matmul_bt(&s.q), &s.qb), bias(h.matmul_bt(&s.k), &s.kb), bias(h.matmul_bt(&s.v), &s.vb)),
                 // The authors' `rearrange(qkv, "... (three h d) -> ... three h d")`: the first d
                 // columns are Q for every head in order, then K, then V.
                 Qkv::Fused { w, b: bb } => {

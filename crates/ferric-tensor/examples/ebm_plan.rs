@@ -18,7 +18,7 @@ use std::f32::consts::PI;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn nrm(seed: u32) -> f32 { let a = u(seed, 1); let b = u(seed, 2); (-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos() }
+fn nrm(seed: u32) -> f32 { let a = u(seed, 1); let b = u(seed, 2); (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos() }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 
 // learned dynamics: dω = g(sinθ, cosθ, ω, u); dθ = ω (kinematics). CPU eval from read-out weights.

@@ -5,7 +5,7 @@
 use ferric_core::Context;
 use ferric_tensor::sched::{detect_devices, Fabric};
 
-fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| (((i as f32 * 0.13 + s).sin())) * 0.1).collect() }
+fn seq(n: usize, s: f32) -> Vec<f32> { (0..n).map(|i| ((i as f32 * 0.13 + s).sin()) * 0.1).collect() }
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
 
 fn main() { pollster::block_on(run()); }

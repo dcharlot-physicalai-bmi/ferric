@@ -94,7 +94,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub fn hadamard_rows(x: &Tensor, n: usize, signs: Option<&Tensor>, perm: Option<(usize, usize, usize)>) -> Tensor {
     let width = *x.shape.last().expect("fwht of a scalar");
     assert!(n.is_power_of_two() && n >= 2, "fwht block {n} is not a power of two >= 2");
-    assert!(width % n == 0, "fwht block {n} does not divide the width {width}");
+    assert!(width.is_multiple_of(n), "fwht block {n} does not divide the width {width}");
     if let Some(s) = signs { assert_eq!(s.numel(), width, "fwht sign vector length"); }
     if let Some((hd, nk, rep)) = perm { assert_eq!(hd * nk * rep, width, "fwht permutation geometry"); }
     let xc = x.contiguous();
@@ -166,7 +166,8 @@ mod tests {
         // (rows, width, block, signs?, perm?) — incl. Bonsai 2's 1024 over 5120/6144/17408 widths, the
         // GDN permutation at 48 = 16x3 heads of 128, and blocks past the shared-memory limit (8192,
         // 16384) that exercise the global stage passes.
-        let cases: &[(usize, usize, usize, bool, Option<(usize, usize, usize)>)] = &[
+        type HadamardCase = (usize, usize, usize, bool, Option<(usize, usize, usize)>);
+        let cases: &[HadamardCase] = &[
             (3, 5120, 1024, true, None), (2, 6144, 1024, true, Some((128, 16, 3))), (1, 17408, 1024, true, None),
             (5, 256, 64, false, None), (2, 16384, 8192, true, None), (1, 16384, 16384, false, None),
             (4, 1024, 2, true, None),

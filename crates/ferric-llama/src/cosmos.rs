@@ -96,6 +96,11 @@ impl Cosmos {
 
     /// Stateless prefill: logits [T, vocab] for the whole sequence (no KV cache — re-run per token for
     /// a simple greedy loop; a cache is the obvious next step).
+    /// Key norm for the generation path. The text reasoner does not apply it.
+    pub fn generation_k_norm(&self, layer: usize) -> &Tensor {
+        &self.layers[layer].k_norm
+    }
+
     pub fn forward(&self, tokens: &[u32]) -> Tensor {
         use ferric_tensor::batch;
         let c = &self.cfg;

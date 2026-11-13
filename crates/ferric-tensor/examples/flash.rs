@@ -62,7 +62,7 @@ async fn run() {
         let p = e < 1e-4; ok &= p;
         let bench = |f: &dyn Fn()->Tensor| { let mut l=None; let t0=Instant::now(); for _ in 0..20 { l=Some(f()); } let _=pollster::block_on(l.unwrap().to_vec()); t0.elapsed().as_secs_f64()/20.0 };
         let ft = bench(&|| qc.flash_attention_prefill(&kc,&vc,nhc,nkvc,dh));
-        let ct = bench(&|| { let x = nn::causal_attention(&qc,&kc,&vc,nhc,nkvc, 0.0); x });
+        let ct = bench(&|| {  nn::causal_attention(&qc,&kc,&vc,nhc,nkvc, 0.0) });
         let scores_mb = (nhc*t*t*4) as f64/1e6;
         println!("{} T={t:<4} nh={nhc}: flash {:.2}ms  composed {:.2}ms ({:.1}×, saves {:.0}MB scores)  max|Δ|={e:.1e}",
             if p {"✅"} else {"❌"}, ft*1e3, ct*1e3, ct/ft, scores_mb);

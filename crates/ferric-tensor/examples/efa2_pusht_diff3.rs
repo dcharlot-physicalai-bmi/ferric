@@ -15,7 +15,6 @@
 use ferric_core::Context;
 use ferric_tensor::{Adam, Tensor, Var};
 use std::f32::consts::PI;
-use std::sync::Arc;
 const DT: f32 = 0.02; const TMAX: f32 = 9.0; const RU: f32 = 0.07; const PUSH_V: f32 = 0.9;
 const MU_T: f32 = 3.0; const MU_W: f32 = 5.0; const ARENA: f32 = 1.5; const COV_OK: f32 = 0.90;
 // T sub-boxes in body(COM) frame: (offset_x, offset_y, half_w, half_h). COM computed so bar+stem centroid = origin.
@@ -29,9 +28,9 @@ fn nrm(v: [f32; 2]) -> f32 { (v[0] * v[0] + v[1] * v[1]).sqrt() }
 fn unit(v: [f32; 2]) -> [f32; 2] { let n = nrm(v).max(1e-6); [v[0] / n, v[1] / n] }
 fn rot(v: [f32; 2], a: f32) -> [f32; 2] { let (c, s) = (a.cos(), a.sin()); [c * v[0] - s * v[1], s * v[0] + c * v[1]] }
 fn in_box(local: [f32; 2], b: &[f32; 4]) -> bool { (local[0] - b[0]).abs() <= b[2] && (local[1] - b[1]).abs() <= b[3] }
-fn in_T(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
+fn in_t(world: [f32; 2], p: [f32; 2], th: f32) -> bool { let l = rot([world[0] - p[0], world[1] - p[1]], -th); in_box(l, &BAR) || in_box(l, &STEM) }
 // sample a point uniformly inside the T (body frame), area-weighted between bar and stem
-fn sample_T(seed: u32) -> [f32; 2] {
+fn sample_t(seed: u32) -> [f32; 2] {
     let (a_bar, a_stem) = (4.0 * BAR[2] * BAR[3], 4.0 * STEM[2] * STEM[3]);
     if u(seed, 1) < a_bar / (a_bar + a_stem) { [BAR[0] + (u(seed, 2) * 2.0 - 1.0) * BAR[2], BAR[1] + (u(seed, 3) * 2.0 - 1.0) * BAR[3]] }
     else { [STEM[0] + (u(seed, 2) * 2.0 - 1.0) * STEM[2], STEM[1] + (u(seed, 3) * 2.0 - 1.0) * STEM[3]] }
@@ -47,12 +46,12 @@ fn contact(p: [f32; 2], th: f32, c: [f32; 2]) -> Option<([f32; 2], [f32; 2], f32
             if dx < dy { let s = (local[0] - b[0]).signum(); nloc = [s, 0.0]; pen = dx + RU; cloc = [b[0] + s * b[2], local[1]]; }
             else { let s = (local[1] - b[1]).signum(); nloc = [0.0, s]; pen = dy + RU; cloc = [local[0], b[1] + s * b[3]]; } }
         else { let d = [local[0] - cl[0], local[1] - cl[1]]; let dist = nrm(d); if dist > RU { continue; } nloc = unit(d); pen = RU - dist; cloc = cl; }
-        if best.map_or(true, |bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
+        if best.is_none_or(|bb| pen > bb.2) { best = Some((rot(cloc, th), rot([-nloc[0], -nloc[1]], th), pen)); }
     }
     best.map(|(cp, n, pen)| ([cp[0] + p[0], cp[1] + p[1]], n, pen))
 }
 // moment of inertia about COM (mass=1), by point-sampling the T
-fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_T(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
+fn moment() -> f32 { let mut s = 0.0; let n = 4000; for k in 0..n { let q = sample_t(70000 + k as u32); s += q[0] * q[0] + q[1] * q[1]; } s / n as f32 }
 #[derive(Clone)]
 struct World { p: [f32; 2], th: f32, v: [f32; 2], w: f32, tp: [f32; 2], tth: f32, im: f32, push: [f32; 2] }
 impl World {
@@ -78,8 +77,8 @@ impl World {
         }
     }
     fn cov(&self, n: usize) -> f32 { let mut c = 0;                            // coverage with n samples (cheap for training, full for eval)
-        for k in 0..n { let q = sample_T(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
-            if in_T(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
+        for k in 0..n { let q = sample_t(50000 + k as u32); let w = rot(q, self.tth).map0(self.tp);
+            if in_t(w, self.p, self.th) { c += 1; } } c as f32 / n as f32 }
     fn coverage(&self) -> f32 { self.cov(400) }
     fn obs(&self) -> [f32; 12] { let ep = [self.tp[0] - self.p[0], self.tp[1] - self.p[1]]; let dpt = unit(ep); let et = wrap(self.tth - self.th);
         [self.th.cos(), self.th.sin(), self.push[0] - self.p[0], self.push[1] - self.p[1], ep[0], ep[1], dpt[0], dpt[1], et.cos(), et.sin(), self.tth.cos(), self.tth.sin()] }
@@ -90,6 +89,7 @@ impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
 // multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
 // push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
+#[allow(dead_code)] // example helper, not on the default path
 fn demo(w: &World) -> [f32; 2] {
     let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
     let contact = if et.abs() > 0.12 {                                   // ROTATION phase
@@ -105,6 +105,7 @@ fn demo(w: &World) -> [f32; 2] {
     let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
+#[allow(dead_code)] // example helper, not on the default path
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
     let mut w = World::new(seed, im); let mut best = 0.0f32;
     for _ in 0..((TMAX / DT) as usize) { let c = pol(&w); w.step(c); best = best.max(w.coverage()); if best >= 0.98 { break; } } best }
@@ -119,6 +120,7 @@ fn cov_at(w: &World) -> f32 { w.cov(120) }
 fn rollout_score(w0: &World, seq: &[[f32; 2]]) -> f32 {                 // action-repeat STRIDE → HZ*STRIDE effective horizon
     let mut w = w0.clone(); let mut s = 0.0; for a in seq { for _ in 0..STRIDE { w.step(*a); } s += cov_at(&w); }
     0.15 * s / seq.len() as f32 + 0.85 * cov_at(&w) }
+#[allow(dead_code)] // example helper, not on the default path
 fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
     let mut mu = mean.clone(); let mut sd = vec![0.5f32; HZ];
     for it in 0..NITER {
@@ -135,14 +137,17 @@ fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
             let (mut v0, mut v1) = (0.0f32, 0.0f32); for e in 0..ELITE { v0 += (scored[e].1[h][0] - m0).powi(2); v1 += (scored[e].1[h][1] - m1).powi(2); }
             mu[h] = [m0, m1]; sd[h] = ((v0 + v1) / (2.0 * ELITE as f32)).sqrt().max(0.05); }
     }
-    let act = mu[0]; for h in 0..HZ - 1 { mean[h] = mu[h + 1]; } mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
+    let act = mu[0]; mean[..(HZ - 1)].copy_from_slice(&mu[1..((HZ - 1) + 1)]); mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
     act }
+#[allow(dead_code)] // example helper, not on the default path
 fn gauss(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32), u(seed, i as u32 + 777)); (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }
+#[allow(dead_code)] // example helper, not on the default path
 fn mpc_episode(seed: u32, im: f32) -> f32 {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let mut best = 0.0f32;
     let decisions = ((TMAX / DT) as usize) / STRIDE;
     for t in 0..decisions { let a = mpc_act(&w, &mut mean, seed.wrapping_mul(31) + t as u32 * 7919);
-        for _ in 0..STRIDE { w.step(a); best = best.max(w.coverage()); } if best >= 0.98 { break; } }
+        for _ in 0..STRIDE { w.step(a); best = best.max(w.coverage()); }
+            if best >= 0.98 { break; } }
     best }
 // ─────────────────────────────────────────────────────────────────────────────
 // FULL-SCALE diffusion policy — corrected. The nano run failed on a schedule BUG (T=16, β≤0.02 → ᾱ_T≈0.85, data never
@@ -153,7 +158,7 @@ const NDEMO: u32 = 100; const NS2: usize = 64; const NITER2: usize = 6; const DE
 struct DNet { w: Vec<Vec<f32>>, b1: Vec<f32>, w2: Vec<f32>, b2: Vec<f32>, w3: Vec<f32>, b3: Vec<f32> }
 impl DNet { fn eps(&self, a: &[f32; AD], t: f32, ob: &[f32; ODP]) -> [f32; AD] {
     let nin = AD + 1 + ODP; let mut x = vec![0.0f32; nin];
-    for c in 0..AD { x[c] = a[c]; } x[AD] = t; for c in 0..ODP { x[AD + 1 + c] = ob[c]; }
+    x[..AD].copy_from_slice(&a[..AD]); x[AD] = t; for c in 0..ODP { x[AD + 1 + c] = ob[c]; }
     let mut h1 = [0.0f32; HD]; for j in 0..HD { let mut z = self.b1[j]; for c in 0..nin { z += x[c] * self.w[c][j]; } h1[j] = z.max(0.0); }
     let mut h2 = [0.0f32; HD]; for j in 0..HD { let mut z = self.b2[j]; for k in 0..HD { z += h1[k] * self.w2[k * HD + j]; } h2[j] = z.max(0.0); }
     let mut o = [0.0f32; AD]; for c in 0..AD { o[c] = self.b3[c]; for j in 0..HD { o[c] += h2[j] * self.w3[j * AD + c]; } } o } }
@@ -181,12 +186,13 @@ fn cmpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {   // T
             m0 /= ELITE as f32; m1 /= ELITE as f32;
             let (mut v0, mut v1) = (0.0f32, 0.0f32); for e in 0..ELITE { v0 += (scored[e].1[h][0] - m0).powi(2); v1 += (scored[e].1[h][1] - m1).powi(2); }
             mu[h] = [m0, m1]; sd[h] = ((v0 + v1) / (2.0 * ELITE as f32)).sqrt().max(0.03); } }
-    let act = mu[0]; for h in 0..HZ - 1 { mean[h] = mu[h + 1]; } mean[HZ - 1] = [0.0, 0.0]; act }
+    let act = mu[0]; mean[..(HZ - 1)].copy_from_slice(&mu[1..((HZ - 1) + 1)]); mean[HZ - 1] = [0.0, 0.0]; act }
 fn mpc_chunks(seed: u32, im: f32, ob: &mut Vec<[f32; ODP]>, ch: &mut Vec<[f32; AD]>) {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let decisions = ((TMAX / DT) as usize) / STRIDE;
     let mut macros: Vec<[f32; 2]> = vec![]; let mut obs_at: Vec<[f32; ODP]> = vec![];
     for _t in 0..decisions { let a = cmpc_act(&w, &mut mean, seed.wrapping_mul(31) + _t as u32 * 7919);
-        obs_at.push(w.obs()); macros.push([a[0] / PUSH_V, a[1] / PUSH_V]); for _ in 0..STRIDE { w.step(a); } if w.coverage() >= 0.98 { break; } }
+        obs_at.push(w.obs()); macros.push([a[0] / PUSH_V, a[1] / PUSH_V]); for _ in 0..STRIDE { w.step(a); }
+            if w.coverage() >= 0.98 { break; } }
     for t in 0..macros.len() { let mut c = [0.0f32; AD]; for j in 0..CM { let idx = (t + j).min(macros.len() - 1); c[j * 2] = macros[idx][0]; c[j * 2 + 1] = macros[idx][1]; }
         ob.push(obs_at[t]); ch.push(c); }
 }
@@ -197,7 +203,7 @@ async fn run() {
     println!("  schedule sanity: abar_0={:.3} abar_T={:.4} (must be ~0 to fully noise — the nano-run bug was abar_T~0.85)", abar[0], abar[T - 1]);
     // ── demos (cached) ──
     let mut ob: Vec<[f32; ODP]> = vec![]; let mut ch: Vec<[f32; AD]> = vec![];
-    if let Ok(bytes) = std::fs::read(DEMOF) { let f: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    if let Ok(bytes) = std::fs::read(DEMOF) { let f: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         let rec = ODP + AD; let n = f.len() / rec; for i in 0..n { let mut o = [0.0f32; ODP]; let mut c = [0.0f32; AD];
             for k in 0..ODP { o[k] = f[i * rec + k]; } for k in 0..AD { c[k] = f[i * rec + ODP + k]; } ob.push(o); ch.push(c); }
         println!("  loaded {} cached (obs,chunk) demo pairs", ob.len());
@@ -241,9 +247,12 @@ async fn run() {
     for k in 500..700u32 { let mut w = World::new(k, im); let mut best = 0.0f32; let steps = (TMAX / DT) as usize; let mut t = 0; let mut sd = k * 101 + 7;
         while t < steps { let chunk = sample(&w.obs(), sd); sd = sd.wrapping_add(1);
             for j in 0..CM { let a = [chunk[j * 2].clamp(-1.0, 1.0) * PUSH_V, chunk[j * 2 + 1].clamp(-1.0, 1.0) * PUSH_V];
-                for _ in 0..STRIDE { if t >= steps { break; } w.step(a); best = best.max(w.coverage()); t += 1; } if best >= 0.98 { break; } }
+                for _ in 0..STRIDE { if t >= steps { break; } w.step(a); best = best.max(w.coverage()); t += 1; }
             if best >= 0.98 { break; } }
-        mc += best; if best >= COV_OK { ok += 1; } if best >= 0.5 { c5 += 1; } if best >= 0.7 { c7 += 1; } }
+            if best >= 0.98 { break; } }
+        mc += best; if best >= COV_OK { ok += 1; }
+            if best >= 0.5 { c5 += 1; }
+            if best >= 0.7 { c7 += 1; } }
     println!("     diffusion policy: mean coverage {:.3} · success(≥0.90) {:.0}% · ≥0.7 {:.0}% · ≥0.5 {:.0}%", mc / 200.0, ok as f32 / 2.0, c7 as f32 / 2.0, c5 as f32 / 2.0);
     println!("     [anchors] MPC teacher 0.69 · nano-diffusion 0.096 (schedule bug) · chunk-regress 0.125 · scripted 0.20");
     println!("\n  Fixed schedule (abar_T≈0) + x0-posterior sampling + scale. If this is a competitive number vs MPC 0.69,");

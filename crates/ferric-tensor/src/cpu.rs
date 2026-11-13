@@ -56,11 +56,11 @@ pub fn reduce(x: &[f32], shape: &[usize], axes: &[usize], op: &str, keepdim: boo
     } else if keep.is_empty() { vec![1] } else { keep.iter().map(|&d| shape[d]).collect() };
     let on: usize = oshape.iter().product();
     let mut acc = vec![if op == "max" { f32::NEG_INFINITY } else { 0.0 }; on];
-    for i in 0..x.len() {
+    for (i, &value) in x.iter().enumerate() {
         let idx = unravel(i, shape);
         let oidx: Vec<usize> = keep.iter().map(|&d| idx[d]).collect();
         let o = if oidx.is_empty() { 0 } else { ravel(&oidx, &keep.iter().map(|&d| shape[d]).collect::<Vec<_>>()) };
-        if op == "max" { acc[o] = acc[o].max(x[i]); } else { acc[o] += x[i]; }
+        if op == "max" { acc[o] = acc[o].max(value); } else { acc[o] += value; }
     }
     if op == "mean" {
         let red: usize = axes.iter().map(|&d| shape[d]).product();

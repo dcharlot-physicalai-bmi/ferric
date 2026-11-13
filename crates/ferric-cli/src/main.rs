@@ -80,9 +80,8 @@ pub fn open_model(host: &Host, arg: &str, allow_pull: bool) -> Result<(Kind, Str
         Target::Hf(r) => return Err(format!("{} is not in the hub; `ferric pull {arg}` first", r.repo)),
         Target::Name(_) => None,
     };
-    if let Some(m) = &local {
-        if m.missing > 0 { return Err(format!("{}: {} of {} split parts are missing; pull it again to finish", m.name, m.missing, m.parts.len())); }
-    }
+    if let Some(m) = &local
+        && m.missing > 0 { return Err(format!("{}: {} of {} split parts are missing; pull it again to finish", m.name, m.missing, m.parts.len())); }
     let kind = match probed {
         Probe::Up(k) => k,
         _ => match &local {

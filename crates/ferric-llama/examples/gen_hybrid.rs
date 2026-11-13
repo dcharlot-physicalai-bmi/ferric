@@ -41,11 +41,10 @@ async fn run() {
     let mut ids: Vec<u32> = bpe.encode(prompt);
     // Same policy as ferric-serve: an ABSENT add_bos_token with a declared bos_token_id means ADD.
     // Treating absence as denial is what made LFM2.5-8B-A1B answer "France is France is France is".
-    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id") {
-        if !matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(false))) {
+    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id")
+        && !matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(false))) {
             ids.insert(0, *bos as u32);
         }
-    }
     let n_prompt = ids.len();
     let mut cache = Cache::new(&m.cfg);
     let vn = m.cfg.n_vocab;

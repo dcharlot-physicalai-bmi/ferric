@@ -56,7 +56,7 @@ fn read_wav(path: &str) -> (Vec<i16>, usize) {
             assert_eq!(bits, 16, "expected 16-bit PCM");
         } else if id == b"data" {
             let d = &b[i + 8..(i + 8 + sz).min(b.len())];
-            pcm = d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            pcm = d.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
             break;
         }
         i += 8 + sz + (sz & 1);
@@ -127,12 +127,11 @@ async fn run() {
     let bytes: Vec<u8> = pcm16.iter().flat_map(|s| s.to_le_bytes()).collect();
     let sha = sha256::hex(&sha256::sha256(&bytes));
     println!("PCM {sha}");
-    if let Some(want) = fx["clip"]["pcm_sha256"].as_str() {
-        if want != sha {
+    if let Some(want) = fx["clip"]["pcm_sha256"].as_str()
+        && want != sha {
             eprintln!("PCM MISMATCH: fixture {want}, audio {sha} — not the clip the reference ran on");
             std::process::exit(3);
         }
-    }
     let pcm: Vec<f32> = pcm16.iter().map(|&s| s as f32 / 32768.0).collect();
 
     // Only the stages the fixture recorded, in the order the forward pass produces them.

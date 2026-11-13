@@ -792,7 +792,7 @@ mod online_rate_tests {
     fn on_a_workload_with_structure_the_router_spends_fewer_joules_than_escalation() {
         let pr = profile();
         // Deterministic pseudo-random workload; no rand dependency and no wall clock.
-        let reqs: Vec<usize> = (0..400).map(|i| if (i * 2654435761usize >> 3) % 2 == 0 { 16 } else { 4096 }).collect();
+        let reqs: Vec<usize> = (0..400).map(|i| if ((i * 2654435761usize) >> 3).is_multiple_of(2) { 16 } else { 4096 }).collect();
         let cheap_works = |n: usize| n <= 32;
 
         let mut r = OnlineRate::new(|&n: &usize| prompt_len_bucket(n));

@@ -36,7 +36,7 @@ fn type_name(t: u32) -> &'static str {
 fn grid_mode(refpath: &str) {
     let rb = std::fs::read(refpath).expect("read grid reference");
     assert_eq!(rb.len(), 256 * 16 * 4, "grid reference should be 256*16 f32");
-    let want: Vec<f32> = rb.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let want: Vec<f32> = rb.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let mut ndiff = 0usize;
     let mut first = None;
     for e in 0..256usize {
@@ -117,7 +117,7 @@ fn main() {
     if t.ggml_type == 39 {
         let raw = g.raw(name).expect("raw");
         let (mut codes, mut scales) = ([0u64; 16], std::collections::BTreeSet::new());
-        for blk in raw.chunks_exact(17) {
+        for blk in raw.as_chunks::<17>().0 {
             scales.insert(blk[0]);
             for &b in &blk[1..17] { codes[(b & 0x0F) as usize] += 1; codes[(b >> 4) as usize] += 1; }
         }
@@ -136,7 +136,7 @@ fn main() {
     };
     let rb = std::fs::read(refpath).expect("read reference");
     assert_eq!(rb.len(), n * 4, "reference has {} bytes, expected {}", rb.len(), n * 4);
-    let want: Vec<f32> = rb.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let want: Vec<f32> = rb.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
 
     let (mut maxabs, mut at, mut nbitdiff) = (0.0f32, usize::MAX, 0usize);
     for i in 0..n {

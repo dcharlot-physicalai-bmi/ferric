@@ -6,7 +6,7 @@
 //!
 //! usage: finetune_qwen3_multilayer <qwen3-0.6b.gguf> [K]
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_llama::qwen3::{Cache, Qwen3};
 use ferric_tensor::{Adam, Tensor, Var};
 use ferric_tokenizer::Bpe;
@@ -20,7 +20,7 @@ fn byte_decoder() -> HashMap<char, u8> {
     m
 }
 fn seed_vec(n: usize, s: f32, scale: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43758.5453).fract() * 2.0 - 1.0) * scale).collect()
+    (0..n).map(|i| (((i as f32 * 12.9898 + s).sin() * 43_758.547).fract() * 2.0 - 1.0) * scale).collect()
 }
 
 /// Frozen weights of one transformer block, as autograd leaves.
@@ -41,7 +41,7 @@ async fn run() {
     let detok = |id: u32| String::from_utf8_lossy(&toks.get(id as usize).map(|s| s.as_str()).unwrap_or("?").chars().filter_map(|c| u2b.get(&c).copied()).collect::<Vec<u8>>()).into_owned();
     let bos = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
     let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos.is_some() };
-    let enc = |s: &str| { let mut ids = bpe.encode(s); if add_bos { if let Some(b) = bos { if ids.first() != Some(&b) { ids.insert(0, b); } } } ids };
+    let enc = |s: &str| { let mut ids = bpe.encode(s); if add_bos && let Some(b) = bos && ids.first() != Some(&b) { ids.insert(0, b); } ids };
 
     let ctx = Arc::new(Context::new().await.unwrap());
     let m = Qwen3::load(&ctx, &g).unwrap();

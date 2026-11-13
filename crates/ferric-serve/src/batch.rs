@@ -743,8 +743,8 @@ impl<S: Source> Pool<S> {
             answer_load(&mut j.stream, &name, "unload", j.path == "/api/chat");
             return None;
         }
-        if j.path == "/api/show" {
-            if let Some(sp) = spec.as_deref().filter(|sp| !self.slots.iter().any(|s| s.answers_to(sp))) {
+        if j.path == "/api/show"
+            && let Some(sp) = spec.as_deref().filter(|sp| !self.slots.iter().any(|s| s.answers_to(sp))) {
                 match self.src.resolve(sp).map(|(k, _)| self.src.show(&k)) {
                     Ok(Some(v)) => write_json(&mut j.stream, 200, &v),
                     Ok(None) => refuse(&mut j.stream, 404, &format!("model '{sp}' has no readable header")),
@@ -752,7 +752,6 @@ impl<S: Source> Pool<S> {
                 }
                 return None;
             }
-        }
         let i = match self.slot_for(spec.as_deref(), opts) {
             Ok(Some(i)) => i,
             Ok(None) => { j.span = crate::trace::leave(); return Some(j) }
@@ -953,7 +952,7 @@ impl ServeModel for Engine {
 
     fn encode_text(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        if self.add_bos { if let Some(b) = self.bos_id { ids.push(b); } }
+        if self.add_bos && let Some(b) = self.bos_id { ids.push(b); }
         ids.extend(self.enc(text, true));
         ids
     }

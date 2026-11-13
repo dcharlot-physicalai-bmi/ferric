@@ -76,7 +76,7 @@ async fn run() {
     let ref_ids = generate(&resident, &prompt, GEN).await;
     let res_ms = t0.elapsed().as_secs_f64() * 1000.0 / GEN as f64;
     drop(resident);
-    println!("  {:>12}  {:>8}  {:>9}  {:>9}  {:>8}  {:>5}/{:<5}  {}", "budget", "pinned", "hit rate", "ms/token", "vs res", "built", "reused", "token ids");
+    println!("  {:>12}  {:>8}  {:>9}  {:>9}  {:>8}  {:>5}/{:<5}  token ids", "budget", "pinned", "hit rate", "ms/token", "vs res", "built", "reused");
     println!("  {:-<100}", "");
     println!("  {:>12}  {:>8}  {:>9}  {:>9.1}  {:>8}  {:>5}/{:<5}  {:?}", "resident", "24/24", "100.0%", res_ms, "1.0x", 24, "-", &ref_ids[..GEN.min(4)]);
 

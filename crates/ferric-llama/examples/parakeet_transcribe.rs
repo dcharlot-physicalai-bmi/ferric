@@ -25,7 +25,7 @@ fn read_wav(path: &str) -> (Vec<f32>, usize) {
             assert_eq!(bits, 16, "expected 16-bit PCM");
         } else if id == b"data" {
             let d = &b[i + 8..(i + 8 + sz).min(b.len())];
-            pcm = d.chunks_exact(2)
+            pcm = d.as_chunks::<2>().0.iter()
                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                    .collect();
             break;

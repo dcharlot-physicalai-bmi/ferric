@@ -17,7 +17,7 @@ async fn run() {
         .unwrap_or_else(|| format!("{}/.cache/ferric/cosmos3-edge", std::env::var("HOME").unwrap()));
     let gp = format!("{}/.cache/ferric/cosmos_ref/action_forward_golden.json", std::env::var("HOME").unwrap());
     let jg = json_min::parse(&std::fs::read_to_string(&gp).expect("run cosmos_capture.py first"));
-    let (l, alen, adim, lc) = (jg.get("L").as_usize(), jg.get("ALEN").as_usize(), jg.get("ADIM").as_usize(), jg.get("LC").as_usize());
+    let (_l, alen, adim, lc) = (jg.get("L").as_usize(), jg.get("ALEN").as_usize(), jg.get("ADIM").as_usize(), jg.get("LC").as_usize());
     let ts = jg.get("TS").as_f64() as f32;
     let und_len = jg.get("und_len").as_usize();
     let seq_len = jg.get("seq_len").as_usize();
@@ -152,8 +152,8 @@ async fn run() {
     }}
 
     let maxerr = vel.iter().zip(&vel_ref).map(|(x, y)| (*x as f64 - y).abs()).fold(0.0, f64::max);
-    println!("Ferric velocity token0[:6] = {:?}", &vel[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
-    println!("real   velocity token0[:6] = {:?}", &vel_ref[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
+    println!("Ferric velocity token0[:6] = {:?}", vel[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
+    println!("real   velocity token0[:6] = {:?}", vel_ref[..6].iter().map(|v| (v * 1e5).round() / 1e5).collect::<Vec<_>>());
     println!("Ferric sum = {:.5}   real sum = {:.5}", vel.iter().sum::<f32>(), vel_ref.iter().sum::<f64>());
     println!("vision velocity: Ferric sum = {:.5}  real sum = {:.5}  maxΔ = {vverr:.3e}",
              vvel.iter().sum::<f32>(), vvel_ref.iter().sum::<f64>());

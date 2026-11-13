@@ -1,6 +1,5 @@
 //! Q4_K tensor-core prefill matmul vs the scalar Q4_K kernel (the default llama.cpp format).
 use ferric_core::Context;
-use ferric_gguf::deq_raw;
 use ferric_tensor::{Q4_KWeights, Tensor};
 use std::sync::Arc; use std::time::Instant; use half::f16;
 fn q4k_block(seed: u32) -> Vec<u8> {
@@ -13,7 +12,7 @@ fn q4k_block(seed: u32) -> Vec<u8> {
     for j in 0..8u32 { if j<4 { s[j as usize]|=sc(j)&63; s[(j+4)as usize]|=mn(j)&63; }
         else { let(a,m)=(sc(j),mn(j)); s[(j+4)as usize]|=(a&0x0F)|((m&0x0F)<<4); s[(j-4)as usize]|=(a>>4)<<6; s[j as usize]|=(m>>4)<<6; } }
     b.extend_from_slice(&s);
-    for i in 0..128u32 { b.push((((seed.wrapping_add(i.wrapping_mul(2246822519)))%256) as u8)&0xff); }
+    for i in 0..128u32 { b.push(((seed.wrapping_add(i.wrapping_mul(2246822519)))%256) as u8); }
     b
 }
 fn main() { pollster::block_on(run()); }

@@ -161,7 +161,7 @@ pub fn decode_attention_win(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, 
     let scores = softcapped(qh.matmul(&kh.transpose(2, 1)).mul(&q.scalar(scale)), softcap); // [nh, 1, S]
     // Mask every key older than the window from the query at S−1.
     let mut m = vec![0.0f32; s];
-    for j in 0..(s - window) { m[j] = -1e30; }
+    for slot in m.iter_mut().take(s.saturating_sub(window)) { *slot = -1e30; }
     let mask = Tensor::from_vec(&q.ctx_arc(), &m, &[1, 1, s]);
     probs_matmul(scores.add(&mask).softmax(2), &vh, n_heads, d)
 }
@@ -172,6 +172,7 @@ fn probs_matmul(probs: Tensor, vh: &Tensor, n_heads: usize, d: usize) -> Tensor 
 }
 
 /// Additive banded mask: −inf where `j > i` (future) or `i − j >= window` (older than the window).
+#[allow(dead_code)] // zero-offset form of sliding_causal_mask_off; callers pass the offset explicitly
 fn sliding_causal_mask(like: &Tensor, t: usize, window: usize) -> Tensor {
     sliding_causal_mask_off(like, t, t, 0, window)
 }
@@ -634,6 +635,7 @@ pub fn causal_attention_kv(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize, n
 ///
 /// `k`/`v` may be longer than `q` (a decode step or a prefill chunk against a filled cache); the
 /// query block is taken to sit at the end, at offset `s - t`.
+#[allow(clippy::too_many_arguments)] // q/k width and v width are different on MLA and must not be one number
 pub fn causal_attention_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
                               qk_dim: usize, v_dim: usize, softcap: f32) -> Tensor {
     attend_split(q, k, v, n_heads, qk_dim, v_dim, None, softcap)
@@ -641,11 +643,13 @@ pub fn causal_attention_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize
 
 /// [`causal_attention_split`] with a per-head learnable sink, `[n_heads]`. See
 /// [`softmax_with_sinks`] for what a sink does and what must not be done to it.
+#[allow(clippy::too_many_arguments)] // the sink tensor is a separate input from the two head widths
 pub fn causal_attention_split_sinks(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
                                     qk_dim: usize, v_dim: usize, sinks: &Tensor, softcap: f32) -> Tensor {
     attend_split(q, k, v, n_heads, qk_dim, v_dim, Some(sinks), softcap)
 }
 
+#[allow(clippy::too_many_arguments)] // the two head widths and the optional sink are independent of the head count
 fn attend_split(q: &Tensor, k: &Tensor, v: &Tensor, n_heads: usize,
                 qk_dim: usize, v_dim: usize, sinks: Option<&Tensor>, softcap: f32) -> Tensor {
     let t = q.shape[0];

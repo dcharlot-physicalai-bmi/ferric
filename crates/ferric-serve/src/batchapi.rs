@@ -16,6 +16,7 @@
 //! streamed request. Files and batches live in memory: a restart forgets them (said, not hidden: the
 //! `ferric_note` on every batch object).
 use crate::write_json;
+type BatchRow = Option<(bool, Value)>;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -225,7 +226,7 @@ fn run(id: String, endpoint: String, bytes: Arc<Vec<u8>>, cancel: Arc<AtomicBool
     let workers = SELF.get().map(|s| s.2).unwrap_or(1).min(n);
     let lines = Arc::new(lines);
     let next = Arc::new(AtomicU64::new(0));
-    let results: Arc<Mutex<Vec<Option<(bool, Value)>>>> = Arc::new(Mutex::new(vec![None; n]));
+    let results: Arc<Mutex<Vec<BatchRow>>> = Arc::new(Mutex::new(vec![None; n]));
     let handles: Vec<_> = (0..workers).map(|_| {
         let (lines, next, results, cancel, id) = (lines.clone(), next.clone(), results.clone(), cancel.clone(), id.clone());
         std::thread::spawn(move || loop {
@@ -266,7 +267,7 @@ fn run(id: String, endpoint: String, bytes: Arc<Vec<u8>>, cancel: Arc<AtomicBool
         buf.extend_from_slice(&serde_json::to_vec(line).unwrap_or_default());
         buf.push(b'\n');
     }
-    let mut keep = |bytes: Vec<u8>, name: &str| -> Value {
+    let keep = |bytes: Vec<u8>, name: &str| -> Value {
         if bytes.is_empty() { return Value::Null; }
         let f = File { id: new_id("file-"), bytes: Arc::new(bytes), filename: format!("{id}_{name}.jsonl"), purpose: "batch_output".into(), created_at: now() };
         let fid = f.id.clone();

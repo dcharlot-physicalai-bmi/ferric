@@ -15,7 +15,7 @@ const N: usize = 12; const HH: usize = 96; const BETA: f32 = 0.5;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn diffs(q: &[f32]) -> Vec<f32> { let mut d = vec![0.0f32; N + 1]; for i in 0..=N { let a = if i == 0 { 0.0 } else { q[i - 1] }; let b = if i == N { 0.0 } else { q[i] }; d[i] = b - a; } d }
 fn u_true(q: &[f32]) -> f32 { diffs(q).iter().map(|&d| 0.5 * d * d + 0.25 * BETA * d * d * d * d).sum() }
 fn force_true(q: &[f32]) -> Vec<f32> { let d = diffs(q); (0..N).map(|i| { let fr = d[i + 1] + BETA * d[i + 1].powi(3); let fl = d[i] + BETA * d[i].powi(3); fr - fl }).collect() }

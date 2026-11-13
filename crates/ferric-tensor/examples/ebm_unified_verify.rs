@@ -100,8 +100,7 @@ fn bound_action(c1: f64, c2: f64, r1: f64, r2: f64, u: f64) -> f64 {
     let rem = 0.5 * (habs[0][0] * r1 * r1 + habs[0][1] * r1 * r2 + habs[1][0] * r2 * r1 + habs[1][1] * r2 * r2);
     dvc + gd1.abs() * r1 + gd2.abs() * r2 + rem + ALPHA * ss_hi
 }
-/// greedy = OR over torques: certified if SOME torque contracts the whole box
-
+/// greedy = OR over torques: certified if SOME torque contracts the whole box///
 /// Conservative soundness margin — see `ebm_cert_verify` for the swept methodology. Every operation in
 /// the Taylor bound is round-to-nearest f64, so the true bound can sit slightly ABOVE the computed one;
 /// `bound + EPS < 0` makes the accept decision robust rather than resting on the sign of a value that may

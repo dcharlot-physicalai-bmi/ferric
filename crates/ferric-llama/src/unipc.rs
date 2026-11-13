@@ -202,7 +202,7 @@ fn trim(r: &[Vec<f64>]) -> Vec<Vec<f64>> {
 /// Solve the small dense linear system A x = b via Gaussian elimination with partial pivoting.
 fn solve(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let n = b.len();
-    let mut m: Vec<Vec<f64>> = a.iter().map(|r| r.clone()).collect();
+    let mut m: Vec<Vec<f64>> = a.to_vec();
     let mut y = b.to_vec();
     for col in 0..n {
         let mut piv = col;

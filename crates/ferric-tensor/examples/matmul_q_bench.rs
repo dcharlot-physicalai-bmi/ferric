@@ -271,9 +271,8 @@ async fn run() {
             // The impossible direction is a BIGGER weight coming out materially FASTER than a smaller
             // one. Writing this the other way round rejected a hand-built clean table on its first
             // replay, which is the only reason the inversion was caught.
-            if let Some(pus) = prev {
-                if us_b < pus * 0.7 { flag = "  ⛔ FASTER THAN A SMALLER WEIGHT — CONTENDED, DISCARD"; bad += 1; }
-            }
+            if let Some(pus) = prev
+                && us_b < pus * 0.7 { flag = "  ⛔ FASTER THAN A SMALLER WEIGHT — CONTENDED, DISCARD"; bad += 1; }
             prev = Some(us_b);
             println!("{out:>10}  {:>10.2}  {us_un:>11.1}  {us_b:>11.1}  {:>9.1}{flag}",
                      each as f64 / 1048576.0, each as f64 / (us_b * 1e-6) / 1e9);

@@ -10,7 +10,7 @@
 //!
 //! Projection-fusion + KV-cache tricks proven on the 27B: q/k/v fuse into one matmul (when they share
 //! a format), gate/up into another, attention resumes from cached K/V so decode is one step per token.
-use crate::qwen35::{f32t, qm, qm_cat};
+use crate::qwen35::{qm, qm_cat};
 use ferric_core::Context;
 use ferric_gguf::{deq_raw, GgufSource, Meta};
 use ferric_tensor::kvquant::{KvStore, KvqFmt};
@@ -215,6 +215,7 @@ pub(crate) enum RopeScale {
 ///     base 10000 / d 96 (torch's `pow` is not itself correctly rounded; 9e-6 rad at position 5000).
 ///     With it, at position 30,000: Qwen2.5-0.5B worst 1.59x the floor, Llama-3.2-1B 2.21x, Qwen3-0.6B
 ///     2.31x (device angles: 18x, 46x, 109x). Gate: scripts/lm_floor_conformance.sh.
+///
 /// The exponent must be the float32 quotient: for d = 96 (Phi-3) `2c/96` is inexact, and an f64
 /// exponent is a different number.
 pub(crate) fn rope_inv_freq(base: f32, head_dim: usize, scale: &RopeScale) -> Vec<f32> {
@@ -544,11 +545,9 @@ impl Proj {
     /// does both (no [t, 2·n_ff] intermediate); otherwise the plain matmul + SwiGLU. Same result either way.
     pub(crate) fn gate_up_swiglu(&self, x: &Tensor, n_ff: usize) -> Tensor {
         // FERRIC_NOFUSE forces the un-fused path — for controlled A/B of the fusion, same binary.
-        if std::env::var("FERRIC_NOFUSE").is_err() {
-            if let Proj::Fused(w) = self {
-                if let Some(o) = x.try_matmul_swiglu(w) { return o; }
-            }
-        }
+        if std::env::var("FERRIC_NOFUSE").is_err()
+            && let Proj::Fused(w) = self
+                && let Some(o) = x.try_matmul_swiglu(w) { return o; }
         self.matmul(x).swiglu(n_ff)
     }
 }
@@ -971,6 +970,8 @@ enum EmbdTable {
     Streamed { backing: Arc<dyn ferric_tier::Backing + Send + Sync>, base: u64 },
 }
 
+type RopeTab = ((RopeRows, u32, Option<bool>), Tensor, Tensor);
+
 pub struct Qwen3 {
     pub cfg: Cfg,
     /// Set when layer weights are streamed rather than resident. `None` is the ordinary path and costs
@@ -989,7 +990,7 @@ pub struct Qwen3 {
     rope_scale: RopeScale,
     /// Host-built cos/sin tables for the forward in flight, keyed by rows, base and LongRoPE table:
     /// built once and read by every layer (Gemma 3 alternates two bases, so there can be two).
-    rope_tabs: std::cell::RefCell<Vec<((RopeRows, u32, Option<bool>), Tensor, Tensor)>>,
+    rope_tabs: std::cell::RefCell<Vec<RopeTab>>,
     /// GPTQ calibration hook: when Some, each linear's input activation is captured (name → tensor) during
     /// the forward, for building per-layer input Hessians. None (default) = zero overhead.
     pub cap: std::cell::RefCell<Option<Vec<(String, Tensor)>>>,
@@ -1008,7 +1009,7 @@ pub struct Qwen3 {
 /// every token.
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))]
 #[derive(Default)]
-enum NativeSlot { #[default] Untried, Refused, Ready(ferric_tensor::cuda::DecodeGraph, Option<Vec<f32>>) }
+enum NativeSlot { #[default] Untried, Refused, Ready(Box<ferric_tensor::cuda::DecodeGraph>, Option<Vec<f32>>) }
 /// Build one transformer layer from a weight source.
 ///
 /// Extracted from `Qwen3::load` unchanged, so a layer can also be built **on demand** from bytes a tier
@@ -1483,11 +1484,10 @@ impl Qwen3 {
         // LongRoPE multiplies cos AND sin by its attention factor (1.1902 on Phi-3.5-mini), on q and on
         // k — so every q.k is 1.4167x — at every length, whichever table is in force. The host table
         // carries it (`rope_table`, rounded where the authors round it); the device path applies it here.
-        if let Some(lr) = &self.longrope {
-            if rope_on_device() && lr.attn_factor != 1.0 && std::env::var("FERRIC_LONGROPE_NO_ATTN_FACTOR").is_err() {
+        if let Some(lr) = &self.longrope
+            && rope_on_device() && lr.attn_factor != 1.0 && std::env::var("FERRIC_LONGROPE_NO_ATTN_FACTOR").is_err() {
                 return r.mul(&r.scalar(lr.attn_factor));
             }
-        }
         r
     }
 
@@ -1573,6 +1573,7 @@ impl Qwen3 {
         self.logits_from_normed(&x.rmsnorm(&self.out_norm, self.cfg.eps))
     }
 
+    #[allow(clippy::too_many_arguments)] // the cache, position, layer index, and the two optional position modes are independent
     fn attn(&self, h: &Tensor, l: &Layer, cache: LayerKv<'_>, offset: usize, il: usize,
             mrope: Option<&[u32]>, lr: &Active) -> Tensor {
         let (t, hd, nh, nkv) = (h.shape[0], self.cfg.head_dim, self.cfg.n_head, self.cfg.n_head_kv);
@@ -1764,9 +1765,8 @@ impl Qwen3 {
         }
         // Whole-FFN megakernel (gate_up Q4_K + SwiGLU + down Q6_K in one dispatch), OPT-IN via
         // FERRIC_MEGA — correct but ~2× slower at decode (occupancy-bound); off by default.
-        if let Proj::Fused(gu) = &l.ffn_gate_up {
-            if let Some(o) = h.try_ffn_mega(gu, &l.ffn_down, l.ffn_gate_out) { return o; }
-        }
+        if let Proj::Fused(gu) = &l.ffn_gate_up
+            && let Some(o) = h.try_ffn_mega(gu, &l.ffn_down, l.ffn_gate_out) { return o; }
         // staged: gate_up + SwiGLU (one fused kernel when gate|up is a k-quant) → down projection.
         let sw = l.ffn_gate_up.gate_up_swiglu(h, l.ffn_gate_out);
         self.grab(format!("l{il}.ffn_down"), &sw); // GPTQ calibration: capture ffn_down input
@@ -1786,13 +1786,14 @@ impl Qwen3 {
     /// Pulling it out is what makes a **stepping** forward possible: a caller that must await something
     /// between layers — a browser fetching the next layer's weights — cannot use a loop that runs to
     /// completion. See [`Qwen3::step_layer`].
+    #[allow(clippy::too_many_arguments)] // one layer step carries the cache, position, layer index, and both rope modes
     fn apply_layer(&self, x: &Tensor, l: &Layer, lc: LayerKv<'_>, pos: usize, il: usize,
                    mrope: Option<&[u32]>, lr: &Active) -> Tensor {
         use ferric_tensor::{batch, prof};
         dump("inpL", il, x);
         dump_with("attn_norm", il, || x.rmsnorm(&l.attn_norm, self.cfg.eps));
         let profiling = std::env::var("FERRIC_PROFILE").is_ok();
-        let mut out;
+        let out;
         let xin = x;
         if profiling {
             // Eager per-category so the sync'd timer attributes attn vs ffn (see qwen35).
@@ -2339,7 +2340,7 @@ impl Qwen3 {
                                   if g.rope_host() { "from the host table" } else { "derived on the device (FERRIC_ROPE_DEVICE / FERRIC_CUDA_ROPE_DEVICE)" });
                         // The same inverse frequencies `rope_table` uses; LongRoPE was refused above.
                         let inv = g.rope_host().then(|| rope_inv_freq(self.cfg.rope_base, self.cfg.head_dim, &self.rope_scale));
-                        NativeSlot::Ready(g, inv)
+                        NativeSlot::Ready(Box::new(g), inv)
                     }
                 },
             };
@@ -2366,8 +2367,8 @@ impl Qwen3 {
             // prefix-cache seed, a batched step). They must ALL be there, or the push has nothing to copy.
             if have < rows || !n.kv.reserve(rows + 1) { return None; }
             let (from, cnt) = (n.kv.len, rows - n.kv.len);
-            for il in 0..self.cfg.n_layer {
-                let (kb, vb) = &cache.kv[il];
+            assert_eq!(cache.kv.len(), self.cfg.n_layer, "kv cache has one slot per layer");
+            for (il, (kb, vb)) in cache.kv.iter().enumerate() {
                 let rows = |b: &KvBuf| pollster::block_on(b.view(&self.ctx).narrow(0, from, cnt).contiguous().to_vec());
                 if !n.kv.write_rows(il, from, &rows(kb), &rows(vb)) { return None; }
             }

@@ -671,7 +671,7 @@ mod embed_var_tests {
     #[test]
     fn out_of_range_and_empty_ids_are_refused() {
         let Some(ctx) = ctx() else { return };
-        let table = Var::leaf(Tensor::from_vec(&ctx, &vec![0.0; 10 * 4], &[10, 4]));
+        let table = Var::leaf(Tensor::from_vec(&ctx, &[0.0; 10 * 4], &[10, 4]));
         assert!(embed_var(&ctx, &table, &[10]).is_err(), "an id past the table was accepted");
         assert!(embed_var(&ctx, &table, &[]).is_err(), "an empty id list was accepted");
     }

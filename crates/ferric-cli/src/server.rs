@@ -116,12 +116,11 @@ fn wait(host: &Host, mut child: Option<std::process::Child>, log: Option<&Path>)
             if tty { eprint!("\r\x1b[2K"); }
             return Ok(k);
         }
-        if let Some(c) = child.as_mut() {
-            if let Ok(Some(st)) = c.try_wait() {
+        if let Some(c) = child.as_mut()
+            && let Ok(Some(st)) = c.try_wait() {
                 if tty { eprint!("\r\x1b[2K"); }
                 return Err(format!("ferric-serve exited ({st}) before it answered on {}{}", host.addr(), log_tail(20)));
             }
-        }
         let el = t0.elapsed().as_secs_f64();
         if el > limit {
             return Err(format!("no answer from {} after {el:.0} s (FERRIC_START_TIMEOUT){}", host.addr(), log_tail(20)));

@@ -40,13 +40,13 @@ fn sgn(bits: u8, j: usize) -> f32 { if bits & (1u8 << j) != 0 { -1.0 } else { 1.
 /// has TWO 4-bit sub-scales, one per 16 values: `db[l/2]` — the high nibble governs the second half.
 pub(crate) fn deq_iq2_xs(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(IQ2_XS_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<IQ2_XS_BYTES>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs = |i: usize| u16::from_le_bytes([blk[2 + 2 * i], blk[3 + 2 * i]]);
         let scales = &blk[66..74];
-        for ib32 in 0..8 {
-            let db = [d * (0.5 + (scales[ib32] & 0xf) as f32) * 0.25,
-                      d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25];
+        for (ib32, scale_byte) in scales.iter().enumerate() {
+            let db = [d * (0.5 + (scale_byte & 0xf) as f32) * 0.25,
+                      d * (0.5 + (scale_byte >> 4) as f32) * 0.25];
             for l in 0..4 {
                 let q = qs(4 * ib32 + l);
                 let g = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
@@ -67,15 +67,15 @@ pub(crate) fn deq_iq2_xs(raw: &[u8], n: usize) -> Vec<f32> {
 /// 64 bytes as interleaved (index, sign) pairs keeps every size right and scrambles every group.
 pub(crate) fn deq_iq2_s(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(IQ2_S_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<IQ2_S_BYTES>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs = &blk[2..34];
         let signs = &blk[34..66];
         let qh = &blk[66..74];
         let scales = &blk[74..82];
-        for ib32 in 0..8 {
-            let db = [d * (0.5 + (scales[ib32] & 0xf) as f32) * 0.25,
-                      d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25];
+        for (ib32, scale_byte) in scales.iter().enumerate() {
+            let db = [d * (0.5 + (scale_byte & 0xf) as f32) * 0.25,
+                      d * (0.5 + (scale_byte >> 4) as f32) * 0.25];
             for l in 0..4 {
                 let dl = db[l / 2];
                 let idx = qs[4 * ib32 + l] as usize | (((qh[ib32] as usize) << (8 - 2 * l)) & 0x300);
@@ -97,7 +97,7 @@ pub(crate) fn deq_iq2_s(raw: &[u8], n: usize) -> Vec<f32> {
 /// halves take `db1`/`db2` from the low/high nibble of one scale byte.
 pub(crate) fn deq_iq3_s(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(IQ3_S_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<IQ3_S_BYTES>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs_all = &blk[2..66];
         let qh_all = &blk[66..74];
@@ -133,7 +133,7 @@ pub(crate) fn deq_iq3_s(raw: &[u8], n: usize) -> Vec<f32> {
 /// delta's sign (bit 15).
 pub(crate) fn deq_iq1_s(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(IQ1_S_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<IQ1_S_BYTES>().0.iter().take(n / 256).enumerate() {
         let d = rd_f16(&blk[0..2]);
         let qs = &blk[2..34];
         for ib in 0..8 {
@@ -160,7 +160,7 @@ pub(crate) fn deq_iq1_s(raw: &[u8], n: usize) -> Vec<f32> {
 /// finite, plausible number — and shifts everything after it by two bytes.
 pub(crate) fn deq_iq1_m(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(IQ1_M_BYTES).take(n / 256).enumerate() {
+    for (bi, blk) in raw.as_chunks::<IQ1_M_BYTES>().0.iter().take(n / 256).enumerate() {
         let qs_all = &blk[0..32];
         let qh_all = &blk[32..48];
         let sc: [u16; 4] = std::array::from_fn(|k| u16::from_le_bytes([blk[48 + 2 * k], blk[49 + 2 * k]]));
@@ -210,7 +210,7 @@ const KVALUES_E2M1_2X: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -
 /// `dequantize_row_nvfp4` forms it.
 pub(crate) fn deq_nvfp4(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
-    for (bi, blk) in raw.chunks_exact(NVFP4_BYTES).take(n / 64).enumerate() {
+    for (bi, blk) in raw.as_chunks::<NVFP4_BYTES>().0.iter().take(n / 64).enumerate() {
         for s in 0..4 {
             let d = ue4m3_to_f32(blk[s]);
             let y = bi * 64 + s * 16;
@@ -236,7 +236,7 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ggml_quants");
         let raw = std::fs::read(dir.join(format!("{name}.raw"))).ok()?;
         let f = std::fs::read(dir.join(format!("{name}.f32"))).ok()?;
-        Some((raw, f.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
+        Some((raw, f.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()))
     }
 
     /// Every fixture — real published blocks AND the crafted every-grid-entry sweeps — bit-equal to

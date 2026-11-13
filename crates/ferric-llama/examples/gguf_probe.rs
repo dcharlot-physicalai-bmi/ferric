@@ -119,7 +119,7 @@ fn main() {
         e.1 += t.dims.iter().product::<u64>();
     }
     println!("\n  quant formats present:");
-    println!("    {:>5} {:>9} {:>8} {:>12}   {}", "type", "tensors", "M params", "packed?", "name");
+    println!("    {:>5} {:>9} {:>8} {:>12}   name", "type", "tensors", "M params", "packed?");
     let mut missing: Vec<u32> = Vec::new();
     for (ty, (n, p)) in &by {
         let native = ferric_tensor::QMatrix::block_bytes(*ty).is_some();

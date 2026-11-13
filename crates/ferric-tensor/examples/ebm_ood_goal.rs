@@ -20,7 +20,7 @@ const D: usize = 64;
 
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (6.2831853 * b).cos()) * sc }).collect() }
+fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
 fn clampc(v: i32) -> usize { v.max(0).min(G as i32 - 1) as usize }
 fn next_pos(p: (usize, usize), a: usize) -> (usize, usize) { (clampc(p.0 as i32 + MOVES[a].0), clampc(p.1 as i32 + MOVES[a].1)) }
 fn cell(seed: u32) -> (usize, usize) { ((u(seed, 1) * G as f32) as usize % G, (u(seed, 2) * G as f32) as usize % G) }
@@ -82,7 +82,7 @@ async fn run() {
     let val_v = |xv: &Var, gv: &Var, p: &[Var]| -> Var { let h = xv.matmul(&p[0]).add(&gv.matmul(&p[1])).add(&p[2]).relu(); h.matmul(&p[3]).add(&p[4]) };
     let val_t = |x: &Tensor, g: &Tensor, p: &[Tensor]| -> Tensor { let h = x.matmul(&p[0]).add(&g.matmul(&p[1])).add(&p[2]).relu(); h.matmul(&p[3]).add(&p[4]) };
     let gamma_t = Tensor::from_vec(&ctx, &[0.95f32], &[1]); let bb = 1024usize;
-    let mut vp_t: Vec<Tensor> = vp.iter().map(|t| t.clone()).collect();
+    let mut vp_t: Vec<Tensor> = vp.to_vec();
     for it in 0..9000 {
         let mut cx: Vec<(usize, usize)> = Vec::with_capacity(bb); let mut cg: Vec<(usize, usize)> = Vec::with_capacity(bb);
         for i in 0..bb { let s = it as u32 * 1103 + i as u32; cx.push(cell(s)); cg.push(train_goal(s ^ 0x9e37_79b9)); } // goals: RIGHT only
@@ -101,7 +101,7 @@ async fn run() {
         let v = val_v(&Var::leaf(x), &Var::leaf(g), &p);
         let diff = v.sub(&Var::leaf(target)); let loss = diff.mul(&diff).mean_all(); loss.backward();
         let grads: Vec<Tensor> = p.iter().map(|vv| vv.grad().unwrap()).collect(); vadam.step(&mut vp, &grads);
-        if it % 250 == 249 { vp_t = vp.iter().map(|t| t.clone()).collect(); }
+        if it % 250 == 249 { vp_t = vp.to_vec(); }
     }
 
     // ---- behavior-cloned feed-forward policy π(enc(x),enc(g)) → action, SAME goals (right only), SAME data ----

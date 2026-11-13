@@ -76,7 +76,7 @@ mod pool_tests {
     use super::pool;
 
     #[test]
-    fn mean_pooling_averages_down_COLUMNS_not_along_rows() {
+    fn mean_pooling_averages_down_columns_not_along_rows() {
         // Rows are tokens, columns are channels. The transposed version of this loop returns a vector
         // of the right length and the right magnitude and no meaning — which is why it is worth a
         // test with an asymmetric shape, where the two readings cannot coincide.

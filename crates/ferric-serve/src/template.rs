@@ -138,7 +138,8 @@ fn strip_generation_tags(src: &str) -> String {
         let (lead, body) = match inner.chars().next() { Some(c @ ('-' | '+')) => (c.to_string(), &inner[1..]), _ => (String::new(), inner) };
         let (body, trail) = match body.chars().last() { Some(c @ ('-' | '+')) => (&body[..body.len() - 1], c.to_string()), _ => (body, String::new()) };
         match body.trim() {
-            "generation" => out.push_str(&format!("{{%{lead} if true {trail}%}}")),
+            "generation" => out.push_str(&format!("{{%{lead}
+            if true {trail}%}}")),
             "endgeneration" => out.push_str(&format!("{{%{lead} endif {trail}%}}")),
             _ => out.push_str(&tag[..end + 2]),
         }
@@ -152,8 +153,13 @@ impl ChatTemplate {
     pub fn compile(src: &str, bos: &str, eos: &str) -> Result<ChatTemplate, String> {
         let src = &strip_generation_tags(src);
         let mut env = Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        env.set_syntax(
+            minijinja::syntax::SyntaxConfig::builder()
+                .trim_blocks(true)
+                .lstrip_blocks(true)
+                .build()
+                .map_err(|e| format!("chat template syntax: {e}"))?,
+        );
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", tojson);
         env.add_function("raise_exception", |msg: String| -> Result<J, Error> { Err(Error::new(ErrorKind::InvalidOperation, msg)) });
@@ -175,7 +181,7 @@ impl ChatTemplate {
         ctx.insert("eos_token".into(), Value::String(self.eos.clone()));
         for (k, v) in kwargs { ctx.insert(k.clone(), v.clone()); }
         let t = self.env.get_template("chat").map_err(|e| e.to_string())?;
-        t.render(J::from_serialize(&Value::Object(ctx))).map_err(|e| {
+        t.render(minijinja::value::Serde(&Value::Object(ctx))).map_err(|e| {
             // A template's own raise_exception (e.g. "roles must alternate") is the model's rule; say so.
             format!("the model's chat template refused this conversation: {e}")
         })

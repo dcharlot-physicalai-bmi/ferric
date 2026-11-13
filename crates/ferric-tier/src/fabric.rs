@@ -138,7 +138,7 @@ impl FabricProfile {
             let mut w: Vec<f64> = v.to_vec();
             w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let (lo, hi) = (w[0], w[w.len() - 1]);
-            if !(lo > 0.0) || !hi.is_finite() {
+            if lo.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !hi.is_finite() {
                 return Err(format!("{name}: samples span {lo}..{hi}, which is not a rate"));
             }
             let spread = hi / lo;
@@ -160,7 +160,7 @@ impl FabricProfile {
     /// ⚠ Prefer [`FabricProfile::from_samples`]: this cannot tell a solid rate from a lucky one.
     pub fn measured(pcie: f64, host: f64, disk: f64) -> Result<FabricProfile, String> {
         for (v, n) in [(pcie, "pcie"), (host, "host"), (disk, "disk")] {
-            if !(v > 0.0) || !v.is_finite() {
+            if v.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !v.is_finite() {
                 return Err(format!("{n} bandwidth measured as {v}, which is not a rate a plan can \
                                     be built from"));
             }
@@ -243,7 +243,7 @@ impl FabricProfile {
         -> Option<Split>
     {
         if m == 0 { return Some(Split { to_device: 0, on_host: 0 }) }
-        if !(budget_s > 0.0) { return None }
+        if budget_s.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { return None }
         let best = self.split_for_latency(m);
         if self.latency_s(&best, bytes_per_expert) > budget_s { return None }
 
@@ -311,7 +311,7 @@ pub fn split_n(bandwidths: &[f64], m: u64) -> Vec<u64> {
 pub fn makespan(bandwidths: &[f64], split: &[u64], bytes_per_item: u64) -> f64 {
     split.iter().zip(bandwidths).fold(0.0f64, |acc, (&n, &b)| {
         if n == 0 { acc }
-        else if !(b > 0.0) { f64::INFINITY }   // work parked on a dead path never finishes
+        else if b.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) { f64::INFINITY }   // work parked on a dead path never finishes
         else { acc.max(n as f64 * bytes_per_item as f64 / b) }
     })
 }

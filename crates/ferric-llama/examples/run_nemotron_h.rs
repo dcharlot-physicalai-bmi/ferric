@@ -43,7 +43,7 @@
 //!
 //!   cargo run -p ferric-llama --example run_nemotron_h --release -- <model.gguf> "prompt" [n]
 use ferric_core::Context;
-use ferric_gguf::{GgufFile, GgufSource, Meta};
+use ferric_gguf::{GgufFile, Meta};
 use ferric_tensor::dtype::{Q5_0Weights, Q8_0Weights};
 use ferric_tensor::{nn, QMatrix, Tensor};
 use std::sync::Arc;
@@ -211,9 +211,8 @@ async fn run() {
     };
     let bpe = ferric_tokenizer::Bpe::new(vocab, &merges);
     let mut ids: Vec<u32> = bpe.encode(prompt);
-    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id") {
-        if matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) { ids.insert(0, *bos as u32); }
-    }
+    if let Some(Meta::U(bos)) = g.metadata.get("tokenizer.ggml.bos_token_id")
+        && matches!(g.metadata.get("tokenizer.ggml.add_bos_token"), Some(Meta::Bool(true))) { ids.insert(0, *bos as u32); }
     println!("prompt: {prompt:?} ({} tokens)", ids.len());
 
     // Prefix re-run per step: the Mamba state and KV cache both fall out of running the whole prefix,

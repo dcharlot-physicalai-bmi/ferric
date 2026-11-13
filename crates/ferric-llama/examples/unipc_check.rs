@@ -75,8 +75,8 @@ mod json_min {
         pub fn parse(s: &str) -> Node {
             let b = s.as_bytes();
             let mut i = 0;
-            let v = parse_val(b, &mut i);
-            v
+            
+            parse_val(b, &mut i)
         }
         fn skip_ws(b: &[u8], i: &mut usize) { while *i < b.len() && (b[*i] as char).is_whitespace() { *i += 1; } }
         fn parse_val(b: &[u8], i: &mut usize) -> Node {

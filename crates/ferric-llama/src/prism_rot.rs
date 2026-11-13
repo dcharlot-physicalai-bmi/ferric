@@ -61,7 +61,6 @@ impl RQ {
 pub struct RProj { p: Proj, rot: Option<Arc<RotIn>> }
 
 impl RProj {
-    pub(crate) fn plain(p: Proj) -> RProj { RProj { p, rot: None } }
     fn input(&self, x: &Tensor) -> Tensor { match &self.rot { Some(r) => r.apply(x), None => x.clone() } }
     pub fn matmul(&self, x: &Tensor) -> Tensor { self.p.matmul(&self.input(x)) }
     pub fn gate_up_swiglu(&self, x: &Tensor, n_ff: usize) -> Tensor { self.p.gate_up_swiglu(&self.input(x), n_ff) }

@@ -328,9 +328,11 @@ impl Hyv4Stream {
 }
 
 /// A block for one forward step: borrowed when resident, owned when streamed.
+type RouteTable = std::collections::HashMap<(usize, usize), Vec<usize>>;
+
 pub enum BlockRef<'a> {
     Borrowed(&'a Block),
-    Built(Block),
+    Built(Box<Block>),
 }
 
 impl std::ops::Deref for BlockRef<'_> {
@@ -795,9 +797,9 @@ impl Hyv4 {
     /// Format: one line per (block, token), `block token e0 e1 … e{k-1}`. The WEIGHTS stay Ferric's
     /// own — the point is to hold the selection fixed and compare everything else, not to import the
     /// reference's arithmetic and compare it with itself.
-    fn forced_routing() -> Option<&'static std::collections::HashMap<(usize, usize), Vec<usize>>> {
+    fn forced_routing() -> Option<&'static RouteTable> {
         use std::sync::OnceLock;
-        static TABLE: OnceLock<Option<std::collections::HashMap<(usize, usize), Vec<usize>>>> = OnceLock::new();
+        static TABLE: OnceLock<Option<RouteTable>> = OnceLock::new();
         TABLE.get_or_init(|| {
             let path = std::env::var("FERRIC_FORCE_ROUTING").ok()?;
             let text = std::fs::read_to_string(&path)
@@ -838,7 +840,7 @@ impl Hyv4 {
             let s: f32 = e.iter().sum();
             e.iter().map(|v| v / s).collect()
         };
-        let mut order: Vec<usize> = match Self::forced_routing().and_then(|m| m.get(&(il, tok))) {
+        let order: Vec<usize> = match Self::forced_routing().and_then(|m| m.get(&(il, tok))) {
             // Selection imposed from outside; everything after this line is unchanged, so the
             // weights and the expert arithmetic remain entirely Ferric's.
             Some(sel) => sel.clone(),
@@ -1036,7 +1038,7 @@ impl Hyv4 {
         assert_eq!(cache.mla.len(), cfg.n_layer, "cache was built for a different model");
         let n_past = cache.n_past;
 
-        let emb = self.tok_embd.gather_rows(&tokens.to_vec());
+        let emb = self.tok_embd.gather_rows(tokens);
         dump("embd", -1, &emb);
         let (cos, sin) = self.rope_tables_at(n_past, t);
 
@@ -1125,7 +1127,7 @@ impl Hyv4 {
 
         // Per-sequence RoPE: each row sits at its own absolute position.
         let rope: Vec<(Tensor, Tensor)> = caches.iter().map(|c| self.rope_tables_at(c.n_past, 1)).collect();
-        let emb = self.tok_embd.gather_rows(&tokens.to_vec());
+        let emb = self.tok_embd.gather_rows(tokens);
         let mut h = self.hc.replicate(&emb);
         // One carried selection PER SEQUENCE — the schedule is per layer, the selection is per stream.
         let mut last_mask: Vec<Option<Tensor>> = vec![None; n];
@@ -1192,10 +1194,10 @@ impl Hyv4 {
             .unwrap_or_else(|e| panic!("tier bind for block {il}: {e}"));
         let src = BlockBytes { inner: &s.src, run_start: s.runs[il].offset, bytes };
         s.rebuilds.set(s.rebuilds.get() + 1);
-        BlockRef::Built(
+        BlockRef::Built(Box::new(
             build_block(&self.ctx, &src, &self.cfg, &self.schedule, il)
                 .unwrap_or_else(|e| panic!("rebuild block {il}: {e}")),
-        )
+        ))
     }
 
     /// The tier, when this model is streamed. `None` for a resident one.

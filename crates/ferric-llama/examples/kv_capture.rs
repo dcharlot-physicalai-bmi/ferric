@@ -58,7 +58,7 @@ async fn run() {
     let bos_id = match g.metadata.get("tokenizer.ggml.bos_token_id") { Some(Meta::U(v)) => Some(*v as u32), _ => None };
     let add_bos = match g.metadata.get("tokenizer.ggml.add_bos_token") { Some(Meta::Bool(b)) => *b, _ => bos_id.is_some() };
     let mut ids = bpe.encode(prompt);
-    if add_bos { if let Some(b) = bos_id { ids.insert(0, b); } }
+    if add_bos && let Some(b) = bos_id { ids.insert(0, b); }
 
     // A real prefill: the K/V written here are the ones a real generation would attend over —
     // post-projection, post-RoPE for K, and per-layer.

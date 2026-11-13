@@ -19,7 +19,8 @@ use ferric_gguf::gq::{GqKind, GqSpec};
 pub struct Mod { bm: usize, bn: usize }
 
 pub(crate) fn discover(qc: &serde_json::Value, st: &SafeTensors) -> Result<Vec<QModule>, String> {
-    if let Some(f) = qc["fmt"].as_str() { if f != "e4m3" { return Err(format!("fp8: fmt '{f}' is not read here")) } }
+    if let Some(f) = qc["fmt"].as_str()
+        && f != "e4m3" { return Err(format!("fp8: fmt '{f}' is not read here")) }
     let skip = str_list(&qc["modules_to_not_convert"]);
     let mut mods = Vec::new();
     for prefix in prefixes(st, ".weight_scale_inv") {
@@ -29,7 +30,7 @@ pub(crate) fn discover(qc: &serde_json::Value, st: &SafeTensors) -> Result<Vec<Q
         let s = &st.info(&format!("{prefix}.weight_scale_inv")).unwrap().shape;
         let (out, inp) = (w.shape[0], w.shape[1]);
         let (sr, sc) = match s.as_slice() { [a, b] => (*a, *b), [] | [1] => (1, 1), _ => return Err(format!("{prefix}: scale shape {s:?}")) };
-        if out % sr != 0 || inp % sc != 0 {
+        if !out.is_multiple_of(sr) || !inp.is_multiple_of(sc) {
             return Err(format!("{prefix}: weight [{out}, {inp}] not divisible by scale grid [{sr}, {sc}] (transformers refuses this too)"));
         }
         let (bm, bn) = (out / sr, inp / sc);
