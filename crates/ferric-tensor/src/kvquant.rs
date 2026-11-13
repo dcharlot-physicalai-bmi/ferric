@@ -141,7 +141,81 @@ pub struct QKvCache {
 /// exactly what the test demands (the old path stays as the oracle).
 ///
 ///   info[0] = (n, grid_w, width, GROUP)   info[1] = (rows, 0, 0, 0)
-const DEQUANT_GROUPED_Q8_0_WGSL: &str = r#"
+/// IEEE binary16 in integer ops, not `unpack2x16float` / `pack2x16float`.
+///
+/// Those builtins lower through `SHADER_FLOAT16_IN_FLOAT32`. Lavapipe on Mesa 26.0.8 (the
+/// GitHub ubuntu runner, LLVM 21) accepts the capability and then SIGSEGVs in the JIT the
+/// first time a KV shader runs it: `cargo test -p ferric-llama` died with signal 11 and no
+/// assertion, after every test that does not touch these shaders had passed. With the
+/// capability absent (sse2 llvmpipe) the same shaders are rejected as a validation error.
+/// These bit ops match [`reference::f16_bits_to_f32`] / [`reference::f32_to_f16_bits`].
+macro_rules! f16_bits_wgsl {
+    () => { r#"
+fn f16_bits_to_f32(h: u32) -> f32 {
+    let bits = h & 0xffffu;
+    let sign = (bits & 0x8000u) << 16u;
+    let exp = (bits >> 10u) & 0x1fu;
+    let mant = bits & 0x3ffu;
+    if (exp == 0u) {
+        if (mant == 0u) { return bitcast<f32>(sign); }
+        var m = mant;
+        var s = 0u;
+        loop {
+            if ((m & 0x400u) != 0u) { break; }
+            m = m << 1u;
+            s = s + 1u;
+        }
+        return bitcast<f32>(sign | ((113u - s) << 23u) | ((m & 0x3ffu) << 13u));
+    }
+    if (exp == 31u) {
+        return bitcast<f32>(sign | 0x7f800000u | (mant << 13u));
+    }
+    return bitcast<f32>(sign | ((exp + 112u) << 23u) | (mant << 13u));
+}
+fn f32_to_f16_bits(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    let sign = (b >> 16u) & 0x8000u;
+    let exp = (b >> 23u) & 0xffu;
+    let mant = b & 0x007fffffu;
+    if (exp == 255u) {
+        var extra = 0u;
+        if (mant != 0u) { extra = 0x0200u | (mant >> 13u); }
+        return sign | 0x7c00u | extra;
+    }
+    let e = i32(exp) - 112;
+    if (e >= 31) { return sign | 0x7c00u; }
+    if (e <= 0) {
+        if (e < -10) { return sign; }
+        let mfull = mant | 0x00800000u;
+        let shift = u32(14 - e);
+        var r = mfull >> shift;
+        let rem = mfull & ((1u << shift) - 1u);
+        let halfb = 1u << (shift - 1u);
+        if (rem > halfb || (rem == halfb && (r & 1u) == 1u)) { r = r + 1u; }
+        return sign | r;
+    }
+    var m = mant >> 13u;
+    let remn = mant & 0x1fffu;
+    if (remn > 0x1000u || (remn == 0x1000u && (m & 1u) == 1u)) { m = m + 1u; }
+    var ee = u32(e);
+    if (m == 0x400u) {
+        m = 0u;
+        ee = ee + 1u;
+        if (ee >= 31u) { return sign | 0x7c00u; }
+    }
+    return sign | (ee << 10u) | m;
+}
+fn unpack_f16_pair(w: u32) -> vec2<f32> {
+    return vec2<f32>(f16_bits_to_f32(w), f16_bits_to_f32(w >> 16u));
+}
+fn pack_f16_pair(v: vec2<f32>) -> u32 {
+    return f32_to_f16_bits(v.x) | (f32_to_f16_bits(v.y) << 16u);
+}
+"# };
+}
+
+
+const DEQUANT_GROUPED_Q8_0_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -154,15 +228,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = (i / width) / info[0].w;
     let j = (i / width) % info[0].w;
     let b = g * width + (i % width);
-    let sw = unpack2x16float(scales[b >> 1u]);
+    let sw = unpack_f16_pair(scales[b >> 1u]);
     let d = select(sw.y, sw.x, (b & 1u) == 0u);
     let word = codes[b * 8u + (j >> 2u)];
     let q = i32(word << (24u - 8u * (j & 3u))) >> 24u;
     out[i] = f32(q) * d;
 }
-"#;
+"#);
 
-const DEQUANT_GROUPED_Q4_0_WGSL: &str = r#"
+const DEQUANT_GROUPED_Q4_0_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -175,7 +249,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = (i / width) / info[0].w;
     let j = (i / width) % info[0].w;
     let b = g * width + (i % width);
-    let sw = unpack2x16float(scales[b >> 1u]);
+    let sw = unpack_f16_pair(scales[b >> 1u]);
     let d = select(sw.y, sw.x, (b & 1u) == 0u);
     let byte_i = j & 15u;
     let word = codes[b * 4u + (byte_i >> 2u)];
@@ -183,9 +257,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let nib = select(byte >> 4u, byte & 15u, j < 16u);
     out[i] = (f32(nib) - 8.0) * d;
 }
-"#;
+"#);
 
-const DEQUANT_GROUPED_Q4_1_WGSL: &str = r#"
+const DEQUANT_GROUPED_Q4_1_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -198,14 +272,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = (i / width) / info[0].w;
     let j = (i / width) % info[0].w;
     let b = g * width + (i % width);
-    let dm = unpack2x16float(scales[b]);
+    let dm = unpack_f16_pair(scales[b]);
     let byte_i = j & 15u;
     let word = codes[b * 4u + (byte_i >> 2u)];
     let byte = (word >> (8u * (byte_i & 3u))) & 255u;
     let nib = select(byte >> 4u, byte & 15u, j < 16u);
     out[i] = f32(nib) * dm.x + dm.y;
 }
-"#;
+"#);
 
 /// Tokens per group in [`GroupedKvCache`]. Fixed at the block size so a group's transpose is exactly
 /// one block per channel, which is what lets this reuse [`QKvCache`] instead of new kernels.
@@ -715,6 +789,7 @@ macro_rules! quant_wgsl {
 @group(0) @binding(3) var<uniform>            info:   array<vec4<u32>, 2>;
 fn rnd(x: f32) -> f32 { return sign(x) * floor(abs(x) + 0.5); }
 "#,
+            f16_bits_wgsl!(),
             $body
         )
     };
@@ -727,7 +802,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= info[0].x) { return; }
     let w = (info[0].z >> 1u) + i;
     let nblk = info[1].z;
-    var sw = unpack2x16float(scales[w]);
+    var sw = unpack_f16_pair(scales[w]);
     for (var h: u32 = 0u; h < 2u; h = h + 1u) {
         let b = 2u * w + h;
         if (b < info[0].z || b >= info[0].w) { continue; }
@@ -749,7 +824,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (h == 0u) { sw.x = d; } else { sw.y = d; }
     }
-    scales[w] = pack2x16float(sw);
+    scales[w] = pack_f16_pair(sw);
 }
 "#);
 
@@ -763,7 +838,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= info[0].x) { return; }
     let w = (info[0].z >> 1u) + i;
     let nblk = info[1].z;
-    var sw = unpack2x16float(scales[w]);
+    var sw = unpack_f16_pair(scales[w]);
     for (var h: u32 = 0u; h < 2u; h = h + 1u) {
         let b = 2u * w + h;
         if (b < info[0].z || b >= info[0].w) { continue; }
@@ -791,7 +866,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (h == 0u) { sw.x = d; } else { sw.y = d; }
     }
-    scales[w] = pack2x16float(sw);
+    scales[w] = pack_f16_pair(sw);
 }
 "#);
 
@@ -830,7 +905,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             codes[b * 4u + k] = word;
         }
-        scales[b] = pack2x16float(vec2<f32>(d, mn));
+        scales[b] = pack_f16_pair(vec2<f32>(d, mn));
     }
 }
 "#);
@@ -838,7 +913,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Dequantize: one invocation per output element.
 //   info[0] = (n, grid_w, nblk_per_row, width)
 //   info[1] = (row0, _, _, _)
-const DEQUANT_Q8_0_WGSL: &str = r#"
+const DEQUANT_Q8_0_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -852,15 +927,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = i - r * width;
     let b = (info[1].x + r) * info[0].z + (c >> 5u);
     let j = c & 31u;
-    let sw = unpack2x16float(scales[b >> 1u]);
+    let sw = unpack_f16_pair(scales[b >> 1u]);
     let d = select(sw.y, sw.x, (b & 1u) == 0u);
     let word = codes[b * 8u + (j >> 2u)];
     let q = i32(word << (24u - 8u * (j & 3u))) >> 24u;
     out[i] = f32(q) * d;
 }
-"#;
+"#);
 
-const DEQUANT_Q4_0_WGSL: &str = r#"
+const DEQUANT_Q4_0_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -874,7 +949,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = i - r * width;
     let b = (info[1].x + r) * info[0].z + (c >> 5u);
     let j = c & 31u;
-    let sw = unpack2x16float(scales[b >> 1u]);
+    let sw = unpack_f16_pair(scales[b >> 1u]);
     let d = select(sw.y, sw.x, (b & 1u) == 0u);
     let byte_i = j & 15u;
     let word = codes[b * 4u + (byte_i >> 2u)];
@@ -882,9 +957,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let nib = select(byte >> 4u, byte & 15u, j < 16u);
     out[i] = (f32(nib) - 8.0) * d;
 }
-"#;
+"#);
 
-const DEQUANT_Q4_1_WGSL: &str = r#"
+const DEQUANT_Q4_1_WGSL: &str = concat!(f16_bits_wgsl!(), r#"
 @group(0) @binding(0) var<storage,read>       codes:  array<u32>;
 @group(0) @binding(1) var<storage,read>       scales: array<u32>;
 @group(0) @binding(2) var<storage,read_write> out:    array<f32>;
@@ -898,14 +973,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = i - r * width;
     let b = (info[1].x + r) * info[0].z + (c >> 5u);
     let j = c & 31u;
-    let dm = unpack2x16float(scales[b]);
+    let dm = unpack_f16_pair(scales[b]);
     let byte_i = j & 15u;
     let word = codes[b * 4u + (byte_i >> 2u)];
     let byte = (word >> (8u * (byte_i & 3u))) & 255u;
     let nib = select(byte >> 4u, byte & 15u, j < 16u);
     out[i] = f32(nib) * dm.x + dm.y;
 }
-"#;
+"#);
 
 /// Read `n` u32 words back to the host.
 ///
@@ -949,7 +1024,7 @@ pub mod reference {
 
     use super::{KvqFmt, QK};
 
-    /// f32 → IEEE binary16 bits, round-to-nearest-even. Matches WGSL `pack2x16float`.
+    /// f32 → IEEE binary16 bits, round-to-nearest-even. Matches WGSL `pack_f16_pair`.
     ///
     /// Written out rather than pulled from `half`, which this crate only depends on for macOS
     /// targets; the tests below check this against `half` exhaustively over the f16 grid.
@@ -994,7 +1069,7 @@ pub mod reference {
         sign | ((ee as u16) << 10) | m as u16
     }
 
-    /// IEEE binary16 bits → f32. Matches WGSL `unpack2x16float`.
+    /// IEEE binary16 bits → f32. Matches WGSL `unpack_f16_pair`.
     pub fn f16_bits_to_f32(h: u16) -> f32 {
         let sign = ((h as u32) & 0x8000) << 16;
         let exp = ((h >> 10) & 0x1f) as u32;
@@ -1418,6 +1493,29 @@ mod tests {
                     "f16 bits {b:#06x} decoded to {mine} (half says {theirs})"
                 );
             }
+        }
+    }
+
+    /// The KV shaders must not ask naga for the f16 capability. CI run 43431738320
+    /// (software GPU) SIGSEGV'd in `ferric-llama` on Mesa 26 lavapipe; the two tests still
+    /// in flight were the quantized-prefix ones, and forcing sse2 (no f16 capability) makes
+    /// those same tests fail in `create_shader_module` for `kvq_quant_q8_0`.
+    #[test]
+    fn kv_shaders_do_not_use_pack_unpack_2x16float() {
+        for (name, src) in [
+            ("quant q8_0", QUANT_Q8_0_WGSL),
+            ("quant q4_0", QUANT_Q4_0_WGSL),
+            ("quant q4_1", QUANT_Q4_1_WGSL),
+            ("dequant q8_0", DEQUANT_Q8_0_WGSL),
+            ("dequant q4_0", DEQUANT_Q4_0_WGSL),
+            ("dequant q4_1", DEQUANT_Q4_1_WGSL),
+            ("dequant grouped q8_0", DEQUANT_GROUPED_Q8_0_WGSL),
+            ("dequant grouped q4_0", DEQUANT_GROUPED_Q4_0_WGSL),
+            ("dequant grouped q4_1", DEQUANT_GROUPED_Q4_1_WGSL),
+        ] {
+            assert!(!src.contains("unpack2x16float"), "{name} uses unpack2x16float");
+            assert!(!src.contains("pack2x16float"), "{name} uses pack2x16float");
+            assert!(src.contains("fn f16_bits_to_f32"), "{name} lost the integer f16 widening");
         }
     }
 
