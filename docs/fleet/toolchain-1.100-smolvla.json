@@ -30,15 +30,42 @@
   "cpu_vs_pytorch": {
     "previous_receipt": "docs/fleet/smolvla-f32-reference.json",
     "stages": {
-      "prepared_image0": {"old_max_abs": 2.384185791015625e-07, "new_max_abs": 2.384185791015625e-07},
-      "patch_token0": {"old_max_abs": 7.152557373046875e-07, "new_max_abs": 7.152557373046875e-07},
-      "vision_l0_token0": {"old_max_abs": 3.814697265625e-06, "new_max_abs": 3.814697265625e-06},
-      "vision_post_token0": {"old_max_abs": 1.5735626220703125e-05, "new_max_abs": 1.5735626220703125e-05},
-      "connector_token0": {"old_max_abs": 6.866455078125e-05, "new_max_abs": 6.866455078125e-05},
-      "state_token": {"old_max_abs": 0.0, "new_max_abs": 0.0},
-      "text_l0_k_token0": {"old_max_abs": 4.291534423828125e-06, "new_max_abs": 4.291534423828125e-06},
-      "velocity0": {"old_max_abs": 2.86102294921875e-06, "new_max_abs": 2.86102294921875e-06},
-      "raw_actions": {"old_max_abs": 3.6954879760742188e-06, "new_max_abs": 3.6954879760742188e-06}
+      "prepared_image0": {
+        "old_max_abs": 2.384185791015625e-07,
+        "new_max_abs": 2.384185791015625e-07
+      },
+      "patch_token0": {
+        "old_max_abs": 7.152557373046875e-07,
+        "new_max_abs": 7.152557373046875e-07
+      },
+      "vision_l0_token0": {
+        "old_max_abs": 3.814697265625e-06,
+        "new_max_abs": 3.814697265625e-06
+      },
+      "vision_post_token0": {
+        "old_max_abs": 1.5735626220703125e-05,
+        "new_max_abs": 1.5735626220703125e-05
+      },
+      "connector_token0": {
+        "old_max_abs": 6.866455078125e-05,
+        "new_max_abs": 6.866455078125e-05
+      },
+      "state_token": {
+        "old_max_abs": 0.0,
+        "new_max_abs": 0.0
+      },
+      "text_l0_k_token0": {
+        "old_max_abs": 4.291534423828125e-06,
+        "new_max_abs": 4.291534423828125e-06
+      },
+      "velocity0": {
+        "old_max_abs": 2.86102294921875e-06,
+        "new_max_abs": 2.86102294921875e-06
+      },
+      "raw_actions": {
+        "old_max_abs": 3.6954879760742188e-06,
+        "new_max_abs": 3.6954879760742188e-06
+      }
     },
     "delta": "none. Every stage max_abs and rmse matches the previous receipt."
   },
@@ -46,10 +73,22 @@
     "previous_receipt": "docs/fleet/smolvla-wgpu-llvmpipe.json",
     "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
     "mesa": "25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)",
-    "raw_action_max_abs_vs_cpu": {"old": 4.291534423828125e-06, "new": 4.291534423828125e-06},
-    "raw_action_rmse_vs_cpu": {"old": 6.731323196618177e-07, "new": 6.731323196618177e-07},
-    "connector_token0_max_abs_vs_cpu": {"old": 0.0001068115234375, "new": 0.0001068115234375},
-    "velocity0_max_abs_vs_cpu": {"old": 3.337860107421875e-06, "new": 3.337860107421875e-06},
+    "raw_action_max_abs_vs_cpu": {
+      "old": 4.291534423828125e-06,
+      "new": 4.291534423828125e-06
+    },
+    "raw_action_rmse_vs_cpu": {
+      "old": 6.731323196618177e-07,
+      "new": 6.731323196618177e-07
+    },
+    "connector_token0_max_abs_vs_cpu": {
+      "old": 0.0001068115234375,
+      "new": 0.0001068115234375
+    },
+    "velocity0_max_abs_vs_cpu": {
+      "old": 3.337860107421875e-06,
+      "new": 3.337860107421875e-06
+    },
     "dispatches": 27482,
     "delta": "none. The new gpu receipt matches docs/fleet/smolvla-wgpu-llvmpipe.json field for field."
   },
@@ -57,5 +96,18 @@
     "status": "pending hardware",
     "previous": "docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json raw_actions radv_vs_pytorch_f32 max_abs 9.357929229736328e-06, inside the 1.95e-4 bound",
     "reason": "This VM has lavapipe only. RADV on gfx1151 was not re-run."
+  },
+  "remeasure": {
+    "remeasured_on": "2026-11-13 after the example clippy edits and the generation-tag string restore",
+    "cpu_stage_files_vs_prior_upgraded_trace": "bitwise identical: prepared_image0, patch_token0, vision_l0_token0, vision_post_token0, connector_token0, state_token, text_l0_k_token0, velocity0, raw_actions",
+    "cpu_vs_pytorch": "every stage max_abs, rmse, and n equals docs/fleet/smolvla-f32-reference.json",
+    "llvmpipe_vs_committed_receipt": "every recorded field equals docs/fleet/smolvla-wgpu-llvmpipe.json",
+    "fault_catalogue": "faults::tests::the_committed_receipt_matches_the_cpu_catalogue passed (seed 0x5a17)",
+    "suite": {
+      "passed": 1164,
+      "failed": 0,
+      "ignored": 39,
+      "command": "cargo test --workspace --no-fail-fast"
+    }
   }
 }

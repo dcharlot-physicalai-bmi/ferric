@@ -138,8 +138,7 @@ fn strip_generation_tags(src: &str) -> String {
         let (lead, body) = match inner.chars().next() { Some(c @ ('-' | '+')) => (c.to_string(), &inner[1..]), _ => (String::new(), inner) };
         let (body, trail) = match body.chars().last() { Some(c @ ('-' | '+')) => (&body[..body.len() - 1], c.to_string()), _ => (body, String::new()) };
         match body.trim() {
-            "generation" => out.push_str(&format!("{{%{lead}
-            if true {trail}%}}")),
+            "generation" => out.push_str(&format!("{{%{lead} if true {trail}%}}")),
             "endgeneration" => out.push_str(&format!("{{%{lead} endif {trail}%}}")),
             _ => out.push_str(&tag[..end + 2]),
         }

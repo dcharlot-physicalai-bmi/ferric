@@ -22,5 +22,18 @@
     "probe": "FERRIC_FAULT_DEVICE=1 cargo test -p ferric-smolvla --lib device_probe_writes_when_requested",
     "compared_to": "docs/fleet/smolvla-fault-injection.json llvmpipe",
     "delta": "none. The probe JSON matches the committed llvmpipe object, including rope max_norm_abs 1.2218507450256766e-7 and max_angle_abs 4.890638010124349e-7."
+  },
+  "remeasure": {
+    "remeasured_on": "2026-11-13 after the example clippy edits and the generation-tag string restore",
+    "cpu_stage_files_vs_prior_upgraded_trace": "bitwise identical: prepared_image0, patch_token0, vision_l0_token0, vision_post_token0, connector_token0, state_token, text_l0_k_token0, velocity0, raw_actions",
+    "cpu_vs_pytorch": "every stage max_abs, rmse, and n equals docs/fleet/smolvla-f32-reference.json",
+    "llvmpipe_vs_committed_receipt": "every recorded field equals docs/fleet/smolvla-wgpu-llvmpipe.json",
+    "fault_catalogue": "faults::tests::the_committed_receipt_matches_the_cpu_catalogue passed (seed 0x5a17)",
+    "suite": {
+      "passed": 1164,
+      "failed": 0,
+      "ignored": 39,
+      "command": "cargo test --workspace --no-fail-fast"
+    }
   }
 }
