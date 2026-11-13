@@ -4,10 +4,12 @@
 //! generated shader SIGSEGVs. LLVM 22 fixes the pseudo (llvm/llvm-project#169009);
 //! codegen limited to AVX2 does not hit it.
 //!
-//! The software-GPU job therefore sets `GALLIUM_OVERRIDE_CPU_CAPS=avx2` and
-//! `LP_NATIVE_VECTOR_WIDTH=256` before any Ferric process starts. These tests are
-//! what makes deleting that pin fail `cargo test` on every machine, and what makes
-//! running against that exact driver without the pin fail on the runner.
+//! The software-GPU job therefore sets `GALLIUM_OVERRIDE_CPU_CAPS=avx` and
+//! `LP_NATIVE_VECTOR_WIDTH=256` before any Ferric process starts. Mesa's
+//! `u_cpu_detect.c` treats that value as a ceiling: `avx` clears `has_avx512f`
+//! and leaves AVX2 on. `avx2` is not a token, so it leaves AVX-512 enabled.
+//! These tests are what makes deleting that pin, or spelling it `avx2`, fail
+//! `cargo test`.
 
 use std::path::PathBuf;
 
@@ -27,8 +29,12 @@ fn software_gpu_job() -> String {
 fn the_software_gpu_job_pins_lavapipe_off_avx512() {
     let job = software_gpu_job();
     assert!(
-        job.contains("GALLIUM_OVERRIDE_CPU_CAPS: avx2"),
+        job.contains("GALLIUM_OVERRIDE_CPU_CAPS: avx\n"),
         "the software GPU job lost the LLVM 21 AVX-512 pin"
+    );
+    assert!(
+        !job.contains("GALLIUM_OVERRIDE_CPU_CAPS: avx2"),
+        "avx2 is not a Mesa ceiling; it leaves has_avx512f set and the JIT still SIGSEGVs"
     );
     assert!(
         job.contains("LP_NATIVE_VECTOR_WIDTH: \"256\""),
@@ -52,8 +58,10 @@ fn llvm21_lavapipe_is_not_left_on_its_native_target() {
         return;
     }
     let caps = std::env::var("GALLIUM_OVERRIDE_CPU_CAPS").unwrap_or_default();
+    // Ceilings that clear has_avx512f in Mesa 26 u_cpu_detect.c. `avx` is the
+    // highest of them, so AVX2 stays. `avx2` is absent from that list.
     assert!(
-        caps == "avx2" || caps == "sse4_2" || caps == "sse2",
+        matches!(caps.as_str(), "avx" | "sse4.1" | "ssse3" | "sse3" | "sse2" | "sse" | "nosse"),
         "llvmpipe ({name}) still JITs with GALLIUM_OVERRIDE_CPU_CAPS={caps:?}; LLVM 21.1.8 SIGSEGVs on AVX-512"
     );
     let width = std::env::var("LP_NATIVE_VECTOR_WIDTH").unwrap_or_default();
