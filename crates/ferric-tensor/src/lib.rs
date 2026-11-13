@@ -5007,24 +5007,17 @@ mod flash_offset_tests {
 #[cfg(test)]
 mod qgemm_source {
     #[test]
-    fn operand_tiles_use_static_extents() {
+    fn the_accumulator_is_a_threadgroup_tensor_not_a_cooperative_tensor() {
         let src = include_str!("qgemm.metal");
-        // CI run 36869740122: the paravirtualized Metal compiler rejected
-        // `cooperative_tensor<float, extents<int, dynamic, dynamic>, ...>` with
-        // "unsupported deferred-static-alloca-size". Those dynamic extents came from wrapping
-        // the constexpr tiles in `dextents`. The tiles are exactly KT×MT and KT×NT.
-        for needle in [
-            "extents<int32_t, KT, MT>",
-            "extents<int32_t, KT, NT>",
-            "extents<int32_t, NT, MT>",
-            "metal::remove_addrspace_t<decltype(tX)>",
-            "metal::remove_addrspace_t<decltype(tW)>",
-        ] {
-            assert!(src.contains(needle), "qgemm.metal lost `{needle}`");
-        }
+        // Runs 36869740122 and 43431738320: the paravirtualized Metal compiler rejects
+        // get_destination_cooperative_tensor with "unsupported deferred-static-alloca-size"
+        // on cooperative_tensor<float, extents<int, dynamic, dynamic>>. Static operand extents
+        // did not change the instantiated type. matmul2d into an ordinary tensor is what the
+        // same runner already executes for metal4.
+        assert!(src.contains("auto tC = tensor<threadgroup float, extents<int32_t, NT, MT>"),
+                "accumulator is no longer a static threadgroup tensor");
+        assert!(!src.contains("get_destination_cooperative_tensor"),
+                "qgemm.metal went back to a destination cooperative_tensor");
         assert!(!src.contains("dextents<int32_t, 2>(KT, MT)"), "activation tile went back to dynamic extents");
-        assert!(!src.contains("dextents<int32_t, 2>(KT, NT)"), "weight tile went back to dynamic extents");
-        assert!(!src.contains("get_destination_cooperative_tensor<decltype(tX), decltype(tW)"),
-                "destination cooperative tensor is built from an address-space-qualified decltype");
     }
 }
