@@ -12,7 +12,7 @@ use ferric_core::cpu::{layernorm, rmsnorm, softmax};
 
 use crate::gemm::gemm_nt;
 use crate::model::{attention, gelu_tanh, rope};
-use crate::tolerance::max_abs_bound;
+use crate::tolerance::{max_abs_bound, rope_invariant_holds, rope_residual};
 
 pub const FAULT_SEED: u64 = 0x5a17;
 
@@ -206,10 +206,21 @@ struct Case {
     clean: Vec<f32>,
     faulty: Vec<f32>,
     abft_detected: Option<bool>,
+    invariant_norm: Option<bool>,
+    invariant_angle: Option<bool>,
 }
 
 fn finish(stage: &'static str, rows: usize, cols: usize, clean: Vec<f32>, faulty: Vec<f32>, abft: Option<bool>) -> Case {
-    Case { stage, rows, cols, clean, faulty, abft_detected: abft }
+    Case {
+        stage,
+        rows,
+        cols,
+        clean,
+        faulty,
+        abft_detected: abft,
+        invariant_norm: None,
+        invariant_angle: None,
+    }
 }
 
 fn matmul_case(kind: Kind) -> Case {
@@ -345,7 +356,7 @@ fn rope_case(kind: Kind) -> Case {
     let dh = 64;
     let x = series(seq * heads * dh, 0.15);
     let pos = vec![1u32, 5];
-    let clean = rope(&x, &pos, heads);
+    let clean = rope(&x, &pos, heads).expect("clean rope satisfies the invariant");
     let faulty = match kind {
         Kind::Dropped | Kind::Duplicated => {
             let mut y = clean.clone();
@@ -378,7 +389,11 @@ fn rope_case(kind: Kind) -> Case {
         }
         other => apply_output(&clean, seq, dh, other, 40),
     };
-    finish("text_l0_k_token0", seq, dh, clean, faulty, None)
+    let residual = rope_residual(&x, &faulty, &pos, heads, dh, 10_000.0).expect("rope shape");
+    let mut case = finish("text_l0_k_token0", seq, dh, clean, faulty, None);
+    case.invariant_norm = Some(residual.norm_exceeded);
+    case.invariant_angle = Some(residual.angle_exceeded);
+    case
 }
 
 fn attention_case(kind: Kind) -> Case {
@@ -459,6 +474,10 @@ fn one(kernel_case: Case) -> serde_json::Value {
     let e2e = max_abs > e2e_bound;
     let stage = max_abs > stage_bound;
     let digest = stage_digest(&kernel_case.clean) != stage_digest(&kernel_case.faulty);
+    let invariant = match (kernel_case.invariant_norm, kernel_case.invariant_angle) {
+        (None, None) => None,
+        (n, a) => Some(n.unwrap_or(false) || a.unwrap_or(false)),
+    };
     serde_json::json!({
         "rows": kernel_case.rows,
         "cols": kernel_case.cols,
@@ -468,6 +487,10 @@ fn one(kernel_case: Case) -> serde_json::Value {
         "per_stage_bound": stage_bound,
         "per_stage_name": kernel_case.stage,
         "end_to_end_detected": e2e,
+        "end_to_end_with_invariant_detected": e2e || invariant.unwrap_or(false),
+        "invariant_detected": invariant,
+        "invariant_norm_detected": kernel_case.invariant_norm,
+        "invariant_angle_detected": kernel_case.invariant_angle,
         "per_stage_detected": stage,
         "digest_detected": digest,
         "abft_detected": kernel_case.abft_detected,
@@ -488,8 +511,8 @@ fn run_kernel(name: &str, kind: Kind) -> Case {
     }
 }
 
-fn classify(fault: &str, e2e: bool, stage: bool, max_abs: f64) -> &'static str {
-    if e2e || stage {
+fn classify(fault: &str, e2e: bool, stage: bool, invariant: bool, max_abs: f64) -> &'static str {
+    if e2e || stage || invariant {
         return "detected";
     }
     if fault == "bit_mantissa_low" || (fault.starts_with("bit_") && max_abs < 1.0e-4) {
@@ -515,6 +538,7 @@ pub fn cpu_fault_report() -> serde_json::Value {
     for kernel in kernels {
         let mut faults = serde_json::Map::new();
         let mut e2e_hit = 0;
+        let mut e2e_inv_hit = 0;
         let mut stage_hit = 0;
         let mut n = 0;
         for kind in Kind::all() {
@@ -522,10 +546,16 @@ pub fn cpu_fault_report() -> serde_json::Value {
             let case = run_kernel(kernel, *kind);
             let row = one(case);
             let e2e = row["end_to_end_detected"].as_bool().unwrap();
+            let e2e_inv = row["end_to_end_with_invariant_detected"].as_bool().unwrap();
             let stage = row["per_stage_detected"].as_bool().unwrap();
+            let invariant = row["invariant_detected"].as_bool().unwrap_or(false);
             if e2e {
                 e2e_hit += 1;
-            } else {
+            }
+            if e2e_inv {
+                e2e_inv_hit += 1;
+            }
+            if !e2e {
                 missed_by_end_to_end.push(serde_json::json!({
                     "kernel": kernel,
                     "fault": kind.name(),
@@ -537,7 +567,7 @@ pub fn cpu_fault_report() -> serde_json::Value {
                 stage_hit += 1;
             }
             let max_abs = row["max_abs"].as_f64().unwrap();
-            let class = classify(kind.name(), e2e, stage, max_abs);
+            let class = classify(kind.name(), e2e, stage, invariant, max_abs);
             let mut row = row;
             row.as_object_mut().unwrap().insert("classification".into(), serde_json::json!(class));
             if class != "detected" {
@@ -562,8 +592,10 @@ pub fn cpu_fault_report() -> serde_json::Value {
                 "device": "cpu",
                 "faults": n,
                 "end_to_end_detected": e2e_hit,
+                "end_to_end_with_invariant_detected": e2e_inv_hit,
                 "per_stage_detected": stage_hit,
                 "end_to_end_rate": format!("{e2e_hit}/{n}"),
+                "end_to_end_with_invariant_rate": format!("{e2e_inv_hit}/{n}"),
                 "per_stage_rate": format!("{stage_hit}/{n}"),
                 "cases": faults,
             }),
@@ -574,8 +606,10 @@ pub fn cpu_fault_report() -> serde_json::Value {
         "deterministic": true,
         "qgemm": "absent. The SmolVLA CPU and wgpu paths use f32 gemm_nt, not a quantized GEMM.",
         "end_to_end_check": "max abs of the faulty kernel output against the raw_actions bound",
+        "end_to_end_with_invariant_check": "the raw_actions bound, or the RoPE norm and angle invariant when this kernel is RoPE",
         "per_stage_check": "the same max abs against the mapped stage bound",
-        "added_checks": ["stage_digest", "matmul row and column checksum"],
+        "rope_invariant": "each pair keeps its norm within sqrt(2) * gamma(5) * (|x0|+|x1|), and the recovered angle matches pos/base^(2c/dh) within gamma(5) * (1 + |theta|) radians",
+        "added_checks": ["stage_digest", "matmul row and column checksum", "rope norm and angle"],
         "kernels": out,
         "missed_by_end_to_end": missed_by_end_to_end,
         "undetected": undetected,
@@ -635,11 +669,34 @@ async fn device_fault_probe() -> Result<serde_json::Value, String> {
     let wt = ctx.tensor(&w, &[d]);
     let rms_t = ctx.rmsnorm_t(&xt, &wt, rows as u32, d as u32, 1e-5);
     let gpu_rms = ctx.to_vec(&rms_t).await?;
+    let seq = 2usize;
+    let heads = 1usize;
+    let dh = 64usize;
+    let rope_x = series(seq * heads * dh, 0.15);
+    let rope_pos = vec![1u32, 5];
+    let rope_cpu = rope(&rope_x, &rope_pos, heads)?;
+    let rope_in = ctx.tensor(&rope_x, &[rope_x.len()]);
+    let rope_out = ctx.rope_positions_t(&rope_in, &rope_pos, heads as u32, dh as u32, 10_000.0);
+    let rope_gpu = ctx.to_vec(&rope_out).await?;
+    let rope_res = rope_residual(&rope_x, &rope_gpu, &rope_pos, heads, dh, 10_000.0)?;
+    let rope_holds = rope_invariant_holds(&rope_x, &rope_gpu, &rope_pos, heads, dh, 10_000.0).is_ok();
+    let (rope_vs_cpu, rope_rmse) = distance(&rope_cpu, &rope_gpu);
     let software = {
         let n = ctx.adapter_name.to_lowercase();
         n.contains("llvmpipe") || n.contains("lavapipe")
     };
     Ok(serde_json::json!({
+        "rope": {
+            "kernel": "rope_positions",
+            "clean_gpu_vs_cpu_max_abs": rope_vs_cpu,
+            "clean_gpu_vs_cpu_rmse": rope_rmse,
+            "max_norm_abs": rope_res.max_norm_abs,
+            "max_norm_bound": rope_res.max_norm_bound,
+            "max_angle_abs": rope_res.max_angle_abs,
+            "max_angle_bound": rope_res.max_angle_bound,
+            "pairs": rope_res.pairs,
+            "invariant_holds": rope_holds,
+        },
         "adapter": ctx.adapter_name,
         "backend": format!("{:?}", ctx.backend),
         "software_adapter": software,
@@ -676,6 +733,51 @@ mod tests {
             });
             std::fs::write(path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn clean_cpu_rope_across_positions_and_scales_holds() {
+        for scale in [1.0e-3f32, 0.25, 1.0, 4.0, 32.0] {
+            for start in [0u32, 1, 7, 48, 200] {
+                let seq = 4usize;
+                let heads = 2usize;
+                let dh = 64usize;
+                let mut x = series(seq * heads * dh, scale);
+                for v in &mut x {
+                    *v *= scale;
+                }
+                let pos: Vec<u32> = (0..seq).map(|i| start + i as u32 * 3).collect();
+                rope(&x, &pos, heads).unwrap_or_else(|e| panic!("scale {scale} start {start}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn rope_cross_terms_need_the_invariant_and_the_low_bit_stays_inside_it() {
+        let report = cpu_fault_report();
+        let rope = &report["kernels"]["rope"];
+        assert_eq!(rope["end_to_end_rate"], "6/9");
+        assert_eq!(rope["end_to_end_with_invariant_rate"], "8/9");
+        assert_eq!(rope["per_stage_rate"], "8/9");
+        for (name, kernel) in report["kernels"].as_object().unwrap() {
+            if name == "rope" {
+                continue;
+            }
+            assert_eq!(
+                kernel["end_to_end_rate"], kernel["per_stage_rate"],
+                "{name} is the only kernel whose raw-action check is behind its stage check"
+            );
+        }
+        let dropped = &rope["cases"]["accum_dropped"];
+        let duplicated = &rope["cases"]["accum_duplicated"];
+        assert_eq!(dropped["end_to_end_detected"], false);
+        assert_eq!(duplicated["end_to_end_detected"], false);
+        assert_eq!(dropped["invariant_detected"], true);
+        assert_eq!(duplicated["invariant_detected"], true);
+        let low = &rope["cases"]["bit_mantissa_low"];
+        assert_eq!(low["end_to_end_with_invariant_detected"], false);
+        assert_eq!(low["digest_detected"], true);
+        assert_eq!(low["classification"], "numerically_benign_under_the_derived_bound");
     }
 
     #[test]
@@ -721,6 +823,7 @@ mod tests {
         let path = std::env::var("FERRIC_FAULT_DEVICE_OUT").unwrap_or_else(|_| "/tmp/device-fault.json".into());
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         assert!(v["kernels"]["matmul"]["low_mantissa_on_readback"]["digest_detected"].as_bool().unwrap());
+        assert_eq!(v["rope"]["invariant_holds"], true);
     }
 
     #[test]

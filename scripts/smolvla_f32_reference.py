@@ -60,6 +60,47 @@ def resize_with_pad(img, height, width):
     return F.pad(out, (width - rw, 0, height - rh, 0), value=0.0)
 
 
+U = 2.0 ** -23
+ROPE_MEASURED = {"max_norm_abs": 0.0, "max_angle_abs": 0.0, "pairs": 0}
+
+
+def gamma(n):
+    nu = n * U
+    return nu / (1.0 - nu)
+
+
+def observe_rope(x, y, positions, base=10000.0):
+    """Same derived RoPE invariant as ferric_smolvla::rope_invariant_holds."""
+    dh = x.shape[-1]
+    half = dh // 2
+    x0 = x[..., :half].double()
+    x1 = x[..., half:].double()
+    y0 = y[..., :half].double()
+    y1 = y[..., half:].double()
+    n_in = torch.sqrt(x0 * x0 + x1 * x1)
+    n_out = torch.sqrt(y0 * y0 + y1 * y1)
+    norm_err = (n_out - n_in).abs()
+    norm_bound = (2.0 ** 0.5) * gamma(5) * (x0.abs() + x1.abs())
+    if torch.any(norm_err > norm_bound):
+        raise RuntimeError(f"reference rope norm {float(norm_err.max())} exceeds {float(norm_bound.max())}")
+    freq = base ** (torch.arange(half, dtype=torch.float64) * (2.0 / dh))
+    expected = positions.to(torch.float64)[:, None] / freq[None, :]
+    expected = expected[None, :, None, :]
+    n2 = x0 * x0 + x1 * x1
+    determined = n2 > U
+    c_hat = torch.where(determined, (x0 * y0 + x1 * y1) / n2.clamp_min(1e-30), torch.zeros_like(n2))
+    s_hat = torch.where(determined, (x0 * y1 - x1 * y0) / n2.clamp_min(1e-30), torch.zeros_like(n2))
+    recovered = torch.atan2(s_hat, c_hat)
+    delta = torch.remainder(recovered - expected + torch.pi, 2 * torch.pi) - torch.pi
+    ang_err = torch.where(determined, delta.abs(), torch.zeros_like(delta))
+    ang_bound = gamma(5) * (1.0 + expected.abs())
+    if torch.any(ang_err > ang_bound):
+        raise RuntimeError(f"reference rope angle {float(ang_err.max())} exceeds {ang_bound}")
+    ROPE_MEASURED["max_norm_abs"] = max(ROPE_MEASURED["max_norm_abs"], float(norm_err.max()))
+    ROPE_MEASURED["max_angle_abs"] = max(ROPE_MEASURED["max_angle_abs"], float(ang_err.max()))
+    ROPE_MEASURED["pairs"] += int(determined.sum())
+
+
 def rope(x, positions, base=10000.0):
     # x [1, seq, heads, dh]
     dh = x.shape[-1]
@@ -69,7 +110,9 @@ def rope(x, positions, base=10000.0):
     sin = torch.sin(ang)[:, None, :]
     cos = torch.cos(ang)[:, None, :]
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    y = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    observe_rope(x, y, positions, base)
+    return y
 
 
 def linear(x, w, b=None):
@@ -319,6 +362,13 @@ def main():
         "text_l0_k_token0": err(k0, load_f32(d / "text_l0_k_token0.f32")),
         "velocity0": err(velocity0, load_f32(d / "velocity0.f32")),
         "raw_actions": err(x[0].reshape(-1), load_f32(d / "raw_actions.f32")),
+    }
+    profile["rope_invariant"] = {
+        "max_norm_abs": ROPE_MEASURED["max_norm_abs"],
+        "max_angle_abs": ROPE_MEASURED["max_angle_abs"],
+        "pairs_checked": ROPE_MEASURED["pairs"],
+        "holds": True,
+        "evidence": "measured on this reference forward",
     }
     Path(args.out).write_text(json.dumps(profile, indent=2))
     print(json.dumps(profile, indent=2))

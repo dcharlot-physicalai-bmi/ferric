@@ -120,6 +120,155 @@ pub fn within_bound(stage: &str, measured_max_abs: f64) -> Option<bool> {
     max_abs_bound(stage).map(|b| measured_max_abs <= b)
 }
 
+/// `γ_n = n u / (1 - n u)`, the Higham bound for n rounding errors.
+pub fn gamma(n: u32) -> f64 {
+    let nu = f64::from(n) * F32_U;
+    nu / (1.0 - nu)
+}
+
+/// One RoPE pair is two multiplies and one add, then sin and cos each
+/// contribute one extra unit roundoff on those multiplies. `γ_5` is that count.
+/// The Euclidean norm of the two component errors is at most `√2 γ_5 (|x0|+|x1|)`.
+pub fn rope_norm_bound(x0: f64, x1: f64) -> f64 {
+    std::f64::consts::SQRT_2 * gamma(5) * (x0.abs() + x1.abs())
+}
+
+/// Recovering the angle is two length-2 dots, a length-2 sum of squares, a
+/// division and `atan2`: `γ_5` radians. The angle itself is `pos / base^(2c/dh)`.
+/// A relative error `γ_5` in that quotient, which is what an f32 power and
+/// division admit, is an absolute error `γ_5 |θ|`. The two add.
+/// A pair whose squared radius is at most `u` does not determine an angle, so
+/// the angle check is not applied there.
+pub fn rope_angle_bound(theta: f64) -> f64 {
+    gamma(5) * (1.0 + theta.abs())
+}
+
+pub fn rope_angle_is_determined(radius: f64) -> bool {
+    radius * radius > F32_U
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RopeResidual {
+    pub max_norm_abs: f64,
+    pub max_norm_bound: f64,
+    pub max_angle_abs: f64,
+    pub max_angle_bound: f64,
+    pub pairs: usize,
+    pub angles_checked: usize,
+    pub norm_exceeded: bool,
+    pub angle_exceeded: bool,
+}
+
+fn wrap_pi(d: f64) -> f64 {
+    let tau = 2.0 * std::f64::consts::PI;
+    let mut x = d.rem_euclid(tau);
+    if x > std::f64::consts::PI {
+        x -= tau;
+    }
+    x
+}
+
+/// Norm preservation and angle of a SmolVLA RoPE.
+/// `y` must be the rotation of `x` by `pos / base^(2c/dh)` on each pair.
+pub fn rope_residual(
+    x: &[f32],
+    y: &[f32],
+    pos: &[u32],
+    heads: usize,
+    dh: usize,
+    base: f32,
+) -> Result<RopeResidual, String> {
+    if dh == 0 || dh % 2 != 0 {
+        return Err(format!("rope head dim {dh} is not a positive even number"));
+    }
+    let seq = pos.len();
+    let need = seq * heads * dh;
+    if x.len() < need || y.len() < need || heads == 0 {
+        return Err(format!(
+            "rope tensors are {} and {}, shape is {seq}x{heads}x{dh}",
+            x.len(),
+            y.len()
+        ));
+    }
+    let half = dh / 2;
+    let mut max_norm = 0.0f64;
+    let mut max_norm_bound = 0.0f64;
+    let mut max_angle = 0.0f64;
+    let mut max_angle_bound = 0.0f64;
+    let mut angles = 0usize;
+    let mut norm_exceeded = false;
+    let mut angle_exceeded = false;
+    for t in 0..seq {
+        let p = pos[t] as f32;
+        for h in 0..heads {
+            let off = (t * heads + h) * dh;
+            for c in 0..half {
+                let x0 = f64::from(x[off + c]);
+                let x1 = f64::from(x[off + c + half]);
+                let y0 = f64::from(y[off + c]);
+                let y1 = f64::from(y[off + c + half]);
+                let n_in = (x0 * x0 + x1 * x1).sqrt();
+                let n_out = (y0 * y0 + y1 * y1).sqrt();
+                let norm_err = (n_out - n_in).abs();
+                let norm_bound = rope_norm_bound(x0, x1);
+                max_norm = max_norm.max(norm_err);
+                max_norm_bound = max_norm_bound.max(norm_bound);
+                norm_exceeded |= norm_err > norm_bound;
+                if rope_angle_is_determined(n_in) {
+                    let timescale = f64::from(base.powf((2.0 * c as f32) / dh as f32));
+                    let expected = f64::from(p) / timescale;
+                    let n2 = x0 * x0 + x1 * x1;
+                    let c_hat = (x0 * y0 + x1 * y1) / n2;
+                    let s_hat = (x0 * y1 - x1 * y0) / n2;
+                    let recovered = s_hat.atan2(c_hat);
+                    let ang_err = wrap_pi(recovered - expected).abs();
+                    let ang_bound = rope_angle_bound(expected);
+                    if ang_err > max_angle {
+                        max_angle = ang_err;
+                        max_angle_bound = ang_bound;
+                    }
+                    angle_exceeded |= ang_err > ang_bound;
+                    angles += 1;
+                }
+            }
+        }
+    }
+    Ok(RopeResidual {
+        max_norm_abs: max_norm,
+        max_norm_bound: max_norm_bound,
+        max_angle_abs: max_angle,
+        max_angle_bound: max_angle_bound,
+        pairs: seq * heads * half,
+        angles_checked: angles,
+        norm_exceeded,
+        angle_exceeded,
+    })
+}
+
+pub fn rope_invariant_holds(
+    x: &[f32],
+    y: &[f32],
+    pos: &[u32],
+    heads: usize,
+    dh: usize,
+    base: f32,
+) -> Result<RopeResidual, String> {
+    let r = rope_residual(x, y, pos, heads, dh, base)?;
+    if r.norm_exceeded {
+        return Err(format!(
+            "rope norm drifted by {} above the derived bound {}",
+            r.max_norm_abs, r.max_norm_bound
+        ));
+    }
+    if r.angle_exceeded {
+        return Err(format!(
+            "rope angle drifted by {} rad above the derived bound {}",
+            r.max_angle_abs, r.max_angle_bound
+        ));
+    }
+    Ok(r)
+}
+
 pub fn bounds_json() -> serde_json::Value {
     let mut stages = serde_json::Map::new();
     for (name, (elem, n)) in element_bounds() {

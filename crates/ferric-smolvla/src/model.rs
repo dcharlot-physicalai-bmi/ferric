@@ -622,7 +622,7 @@ fn text_prefix(
             TEXT_DIM,
             KV_HEADS * HEAD_DIM,
         );
-        let (q, k) = (rope(&q, pos, HEADS), rope(&k, pos, KV_HEADS));
+        let (q, k) = (rope(&q, pos, HEADS)?, rope(&k, pos, KV_HEADS)?);
         if capture && layer == 0 {
             k0 = k[..KV_HEADS * HEAD_DIM].to_vec();
         }
@@ -706,8 +706,8 @@ fn denoise(
                 EXPERT_DIM,
                 KV_HEADS * HEAD_DIM,
             );
-            let q = rope(&q, &pos, HEADS);
-            let k = rope(&k, &pos, KV_HEADS);
+            let q = rope(&q, &pos, HEADS)?;
+            let k = rope(&k, &pos, KV_HEADS)?;
             let (k, v) = concat_kv(&cache[layer].k, &k, &cache[layer].v, &v, prefix, CHUNK);
             let mask = self_mask(prefix_pad, CHUNK);
             attention(
@@ -740,7 +740,7 @@ fn denoise(
                 KV_HEADS * HEAD_DIM,
                 KV_HEADS * HEAD_DIM,
             );
-            let q = rope(&q, &pos0, HEADS);
+            let q = rope(&q, &pos0, HEADS)?;
             let mask = cross_mask(prefix_pad);
             attention(
                 &q,
@@ -893,7 +893,7 @@ fn rmsnorm_cpu(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f
     ferric_core::cpu::rmsnorm(x, w, rows, dim, eps)
 }
 
-pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Vec<f32> {
+pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Result<Vec<f32>, String> {
     let seq = pos.len();
     let mut o = x.to_vec();
     let half = HEAD_DIM / 2;
@@ -912,7 +912,8 @@ pub(crate) fn rope(x: &[f32], pos: &[u32], heads: usize) -> Vec<f32> {
             }
         }
     }
-    o
+    crate::tolerance::rope_invariant_holds(x, &o, pos, heads, HEAD_DIM, ROPE_BASE)?;
+    Ok(o)
 }
 
 pub(crate) fn attention(

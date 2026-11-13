@@ -16,7 +16,10 @@ mod model;
 mod tolerance;
 pub mod weights;
 
-pub use tolerance::{bounds_json, max_abs_bound, within_bound, F32_U};
+pub use tolerance::{
+    bounds_json, gamma, max_abs_bound, rope_angle_bound, rope_invariant_holds, rope_norm_bound, rope_residual,
+    within_bound, F32_U, RopeResidual,
+};
 
 pub use gpu::{forward_gpu, GpuForward, GpuSession};
 
