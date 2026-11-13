@@ -77,9 +77,14 @@ jobs:
 
       # The unit + integration suites. These were absent from CI entirely, which meant the
       # placement-invariance test, the prefix-hash guards, the interval-arithmetic soundness check and
-      # every other assertion in the workspace ran only on a developer's machine. They take ~1.5s.
+      # every other assertion in the workspace ran only on a developer's machine.
+      #
+      # Lavapipe's LLVM JIT SIGSEGVs when several tests in one process compile shaders
+      # at once. One test at a time, the same ferric-llama binary passed 168 and ignored
+      # 1 (run 43456824764, gdb, --test-threads=1); the parallel workspace step then died
+      # with signal 11. Every assertion still runs. Metal keeps the parallel suite.
       - name: Test workspace
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose -- --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
