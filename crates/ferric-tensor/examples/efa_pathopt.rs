@@ -11,6 +11,9 @@
 use ferric_tensor::{Adam, Tensor, Var};
 use std::collections::VecDeque;
 use std::sync::Arc;
+type Cell = (usize, usize);
+type Cells = Vec<Cell>;
+type TaskEnds = (Cells, Cells);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -111,17 +114,17 @@ async fn run() {
 
     println!("\n  {:<28}  {:>6}  {:>14}", "scoring (MPPI K=512, H=6)", "reach", "path vs optimal");
     // c < 0 → terminal-value only (the current 2.48× baseline)
-    let (r0, p0) = mppi(&ctx, 512, 6, 0.5, -1.0, &pos0, &goal, &opt_len, &predict_t, &vt, &enc_batch).await;
+    let (r0, p0) = mppi(&ctx, MppiPlan { kk: 512, hh: 6, lambda: 0.5, cost: -1.0, opt_len: &opt_len }, &pos0, &goal, &predict_t, &vt, &enc_batch).await;
     println!("  {:<28}  {:>5.0}%  {:>13.2}×", "terminal value (baseline)", r0 * 100.0, p0);
     for &c in &[0.0f32, 0.03, 0.06, 0.10] {
-        let (r, pr) = mppi(&ctx, 512, 6, 0.5, c, &pos0, &goal, &opt_len, &predict_t, &vt, &enc_batch).await;
+        let (r, pr) = mppi(&ctx, MppiPlan { kk: 512, hh: 6, lambda: 0.5, cost: c, opt_len: &opt_len }, &pos0, &goal, &predict_t, &vt, &enc_batch).await;
         println!("  {:<28}  {:>5.0}%  {:>13.2}×", format!("early-reward  c={c}"), r * 100.0, pr);
     }
     println!("\n  optimal path = 1.00×. early-reward scoring should pull the ratio DOWN (shorter routes) — the honest test");
     println!("  is whether reach holds while paths shorten (c too high → over-greedy → reach drops).");
 }
 
-fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+fn make_task(t: usize) -> TaskEnds {
     let pos: Vec<(usize, usize)> = (0..t).map(|i| { let left = u(i as u32, 21) < 0.5;
         if left { ((u(i as u32, 22) * 6.0) as usize % 6, (u(i as u32, 23) * G as f32) as usize % G) }
         else { (7 + (u(i as u32, 24) * 6.0) as usize % 6, (u(i as u32, 25) * G as f32) as usize % G) } }).collect();
@@ -132,7 +135,9 @@ fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
 }
 
 // MPPI; cost<0 → score by terminal value; cost>=0 → score by max_h [ V(x_h) − cost·(h−1) ] (early-reward).
-async fn mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32, cost: f32, pos0: &[(usize, usize)], goal: &[(usize, usize)], opt_len: &[i32], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> (f32, f32) {
+struct MppiPlan<'a> { kk: usize, hh: usize, lambda: f32, cost: f32, opt_len: &'a [i32] }
+async fn mppi(ctx: &Arc<ferric_core::Context>, plan: MppiPlan<'_>, pos0: &[(usize, usize)], goal: &[(usize, usize)], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> (f32, f32) {
+    let MppiPlan { kk, hh, lambda, cost, opt_len } = plan;
     let t = pos0.len(); let maxsteps = 60usize;
     let mut pos = pos0.to_vec();
     let mut reached = vec![false; t]; let mut steps_at = vec![0usize; t];
@@ -143,17 +148,17 @@ async fn mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32
         let mut goal_rep: Vec<(usize, usize)> = Vec::with_capacity(m);
         for i in 0..t { for _ in 0..kk { pos_rep.push(pos[i]); goal_rep.push(goal[i]); } }
         let mut acts: Vec<Vec<usize>> = vec![vec![0usize; m]; hh];
-        for i in 0..t { for k in 0..kk { for h in 0..hh {
+        for i in 0..t { for k in 0..kk { for (h, item_h) in acts.iter_mut().enumerate().take(hh) {
             let seed = h32((stp as u32).wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503) ^ (k as u32).wrapping_mul(2_246_822_519) ^ (h as u32).wrapping_mul(3_266_489_917));
-            acts[h][i * kk + k] = (seed as usize) % NA;
+            item_h[i * kk + k] = (seed as usize) % NA;
         } } }
         let first: Vec<usize> = acts[0].clone();
         let xg = enc_batch(&goal_rep);
         // roll H steps; collect the score (terminal or early-reward) per candidate
         let mut xh = enc_batch(&pos_rep);
         let mut score = vec![f32::MIN; m];
-        for h in 0..hh {
-            let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + acts[h][r]] = 1.0; }
+        for (h, item_h) in acts.iter().enumerate().take(hh) {
+            let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + item_h[r]] = 1.0; }
             xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA]));
             if cost < 0.0 { if h == hh - 1 { let v = val_t(&xh, &xg).to_vec().await; score[..m].copy_from_slice(&v[..m]); } }
             else { let v = val_t(&xh, &xg).to_vec().await; for r in 0..m { let s = v[r] - cost * h as f32; if s > score[r] { score[r] = s; } } }
@@ -161,7 +166,7 @@ async fn mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32
         for i in 0..t { if reached[i] { continue; } let base = i * kk;
             let mut vmax = f32::MIN; for k in 0..kk { if score[base + k] > vmax { vmax = score[base + k]; } }
             let mut wsum = [0.0f32; NA]; for k in 0..kk { let w = ((score[base + k] - vmax) / lambda).exp(); wsum[first[base + k]] += w; }
-            let (mut ba, mut best) = (0usize, wsum[0]); for a in 1..NA { if wsum[a] > best { best = wsum[a]; ba = a; } }
+            let (mut ba, mut best) = (0usize, wsum[0]); for (a, item_a) in wsum.iter().enumerate().take(NA).skip(1) { if *item_a > best { best = *item_a; ba = a; } }
             pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; steps_at[i] = stp + 1; }
         }
     }

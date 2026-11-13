@@ -221,11 +221,11 @@ async fn run() {
     let outdir = "/Users/dcharlot/vibe-coding/efa/models/efa-2-pendulum";
     std::fs::create_dir_all(outdir).unwrap();
     let mut ts: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
-    for c in 0..fin { ts.push((format!("flow.in{}", c), vec![1, H], m.flow.w[c].clone())); }
+    for (c, item_c) in m.flow.w.iter().enumerate().take(fin) { ts.push((format!("flow.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("flow.b1".into(), vec![H], m.flow.b1.clone())); ts.push(("flow.w2".into(), vec![H, H], m.flow.w2.clone()));
     ts.push(("flow.b2".into(), vec![H], m.flow.b2.clone())); ts.push(("flow.w3".into(), vec![H, 1], m.flow.w3.clone()));
     ts.push(("flow.b3".into(), vec![1], vec![m.flow.b3]));
-    for c in 0..pin { ts.push((format!("potential.in{}", c), vec![1, H], m.pot.w[c].clone())); }
+    for (c, item_c) in m.pot.w.iter().enumerate().take(pin) { ts.push((format!("potential.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("potential.b1".into(), vec![H], m.pot.b1.clone())); ts.push(("potential.w2".into(), vec![H, H], m.pot.w2.clone()));
     ts.push(("potential.b2".into(), vec![H], m.pot.b2.clone())); ts.push(("potential.w3".into(), vec![H, 1], m.pot.w3.clone()));
     ts.push(("potential.b3".into(), vec![1], vec![m.pot.b3]));

@@ -85,7 +85,8 @@ predictions without being explicitly programmed to do so.";
     println!("original Q8_0 perplexity = {base:.3}  ({} eval tokens)\n", ids.len());
     println!("  {:<40} {:>10}  {:>7}  {:>9}", "calibration-free ternary target", "ppl", "×base", "%params");
 
-    let configs: Vec<(&str, Box<dyn Fn(&str) -> bool>)> = vec![
+    type LayerConfigs<'a> = Vec<(&'a str, Box<dyn Fn(&str) -> bool + 'a>)>;
+    let configs: LayerConfigs<'_> = vec![
         ("attention only (all layers)", Box::new(|n: &str| is_attn(n))),
         ("FFN only (all layers)", Box::new(|n: &str| is_ffn(n))),
         ("FFN, middle layers 6..18", Box::new(|n: &str| is_ffn(n) && layer_of(n).is_some_and(|l| (6..18).contains(&l)))),

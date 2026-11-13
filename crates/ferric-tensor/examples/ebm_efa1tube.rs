@@ -87,7 +87,7 @@ fn main() {
     let th_pts = [0usize, 41, 21, 11]; let om_pts = [0usize, 33, 13, 7];
     let core_r = [0.757f32, 0.42, 0.64];
     let mut certjson: Vec<String> = vec![];
-    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gt[j]; }
+    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gt[..nj]);
         // attractor + P (cert1 construction) + ω envelope
         let mut xstar = vec![0.0f32; d]; xstar[..nj].copy_from_slice(&g[..nj]);
         for _ in 0..800 { xstar = fcl(&m, bi, &xstar, g); }
@@ -104,7 +104,7 @@ fn main() {
             if tn < 1e-7 { break; } term = matmul(&term, &a, d); }
         let sqlam = lammax_sym(&p, d).sqrt();
         let pnorm = |x: &[f32]| -> f32 { let mut dx = vec![0.0f32; d];
-            for c in 0..d { let mut e = x[c] - xstar[c]; if c < nj { e = wrap(e); } dx[c] = e; }
+            for (c, item_c) in x.iter().enumerate().take(d) { let mut e = *item_c - xstar[c]; if c < nj { e = wrap(e); } dx[c] = e; }
             let mut q = 0.0; for i in 0..d { for j in 0..d { q += dx[i] * p[i * d + j] * dx[j]; } } q.max(0.0).sqrt() };
         let mut om_env = 0.0f32;
         for k in 0..60u32 { let mut x = vec![0.0f32; d];
@@ -114,7 +114,7 @@ fn main() {
         // L̂: sampled Jacobian Lipschitz constant (max over ~300 probe pairs at scales 0.01–0.1)
         let mut lhat = 0.0f32;
         for k in 0..300u32 { let mut x = vec![0.0f32; d];
-            for c in 0..d { x[c] = if c < nj { (u(k, 31 + c as u32) * 2.0 - 1.0) * PI } else { (u(k, 41 + c as u32) * 2.0 - 1.0) * om_b }; }
+            for (c, item_c) in x.iter_mut().enumerate().take(d) { *item_c = if c < nj { (u(k, 31 + c as u32) * 2.0 - 1.0) * PI } else { (u(k, 41 + c as u32) * 2.0 - 1.0) * om_b }; }
             let eps = 0.01 + u(k, 51) * 0.09;
             let mut y = x.clone(); let cdir = (u(k, 52) * d as f32) as usize % d; y[cdir] += eps;
             let (jx, jy) = (jac_at(&x), jac_at(&y));

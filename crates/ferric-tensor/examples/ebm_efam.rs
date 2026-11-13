@@ -17,7 +17,7 @@
 //!
 //! Run: `cargo run -p ferric-tensor --example ebm_efam --release`
 use std::f32::consts::PI;
-const H: usize = 128; const EMB: usize = 6; const DT: f32 = 0.05; const UMAX: f32 = 4.0; const CPL: f32 = 0.5;
+const H: usize = 128; const EMB: usize = 6; const DT: f32 = 0.05; const UMAX: f32 = 4.0;
 const MDIR: &str = "/Users/dcharlot/vibe-coding/efa/models/efa-1";
 const CDIM: usize = 16;                       // context feature dims
 const PDIM: usize = CDIM + 2;                // pattern = context ⊕ [cos g, sin g]
@@ -89,7 +89,7 @@ impl Dam {
 fn mk_pairs(m: usize, seed: u32) -> (Vec<[f32; CDIM]>, Vec<f32>, Dam) {
     let mut ctx = Vec::with_capacity(m); let mut goals = Vec::with_capacity(m); let mut xi = Vec::with_capacity(m);
     for i in 0..m { let mut c = [0.0f32; CDIM]; let mut n = 0.0;
-        for k in 0..CDIM { c[k] = u(seed + i as u32, 100 + k as u32) * 2.0 - 1.0; n += c[k] * c[k]; }
+        for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k = u(seed + i as u32, 100 + k as u32) * 2.0 - 1.0; n += *item_k * *item_k; }
         let n = n.sqrt().max(1e-6); for item in c[..CDIM].iter_mut() { *item /= n; }
         let g = (u(seed + i as u32, 200) * 2.0 - 1.0) * 1.0;
         let mut p = [0.0f32; PDIM]; p[..CDIM].copy_from_slice(&c); p[CDIM] = g.cos(); p[CDIM + 1] = g.sin();
@@ -98,7 +98,7 @@ fn mk_pairs(m: usize, seed: u32) -> (Vec<[f32; CDIM]>, Vec<f32>, Dam) {
 }
 fn corrupt(c: &[f32; CDIM], frac: f32, seed: u32) -> [f32; PDIM] {
     let mut q = [0.0f32; PDIM];
-    for k in 0..CDIM { q[k] = if u(seed, 300 + k as u32) < frac { 0.0 } else { c[k] }; }   // masked dims; goal coords unknown (0)
+    for (k, item_k) in c.iter().enumerate().take(CDIM) { q[k] = if u(seed, 300 + k as u32) < frac { 0.0 } else { *item_k }; }   // masked dims; goal coords unknown (0)
     q
 }
 fn goal_of(q: &[f32; PDIM]) -> f32 { q[CDIM + 1].atan2(q[CDIM]) }
@@ -125,7 +125,7 @@ fn main() {
     println!("\n  [2] energy as memory-confidence certificate (certificate = CUE energy E(q0), pre-descent):");
     let mut e_novel: Vec<f32> = vec![]; let mut ec_novel: Vec<f32> = vec![];
     for tr in 0..400u32 { let mut c = [0.0f32; CDIM]; let mut n = 0.0;
-        for k in 0..CDIM { c[k] = u(90000 + tr, 100 + k as u32) * 2.0 - 1.0; n += c[k] * c[k]; }
+        for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k = u(90000 + tr, 100 + k as u32) * 2.0 - 1.0; n += *item_k * *item_k; }
         let n = n.sqrt().max(1e-6); for item in c[..CDIM].iter_mut() { *item /= n; }
         let (_, e0, ec, _) = dam.retrieve(&corrupt(&c, 0.25, 91000 + tr));
         e_novel.push(e0); ec_novel.push(ec); }
@@ -161,7 +161,7 @@ fn main() {
     for ep in 0..120u32 { let stored = ep < 60;
         let (q, e0, _, slot) = if stored { let i = ep as usize % m; dam.retrieve(&corrupt(&ctx[i], 0.25, 9500 + ep)) }
             else { let mut c = [0.0f32; CDIM]; let mut n = 0.0;
-                for k in 0..CDIM { c[k] = u(95000 + ep, 100 + k as u32) * 2.0 - 1.0; n += c[k] * c[k]; }
+                for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k = u(95000 + ep, 100 + k as u32) * 2.0 - 1.0; n += *item_k * *item_k; }
                 let n = n.sqrt().max(1e-6); for item in c[..CDIM].iter_mut() { *item /= n; }
                 dam.retrieve(&corrupt(&c, 0.25, 96000 + ep)) };
         if e0 > tau_mem { if stored { refuse_stored += 1; } else { refuse_novel += 1; } continue; }

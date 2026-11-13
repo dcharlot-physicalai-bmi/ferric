@@ -56,7 +56,7 @@ impl Efa1 {
         let nj = NJ[bi]; let mut a = [0.0f32; 3];
         for k in 0..kk { let t = k as f32 / kk as f32; let v = self.flow(bi, s, g, a, t);
             for i in 0..nj { a[i] += v[i] / kk as f32; } }
-        for i in 0..nj { a[i] = a[i].clamp(-UMAX, UMAX); } for i in nj..3 { a[i] = 0.0; } a }
+        for item_i in a.iter_mut().take(nj) { *item_i = item_i.clamp(-UMAX, UMAX); } for item_i in a.iter_mut().skip(nj) { *item_i = 0.0; } a }
     fn energy(&self, bi: usize, s: [f32; 6], g: [f32; 3], a: [f32; 3]) -> f32 {
         let nj = NJ[bi]; let ff = feat12(nj, s, g); let pin = 12 + 3 + EMB; let mut f = vec![0.0f32; pin];
         f[..12].copy_from_slice(&ff); f[12..(3 + 12)].copy_from_slice(&a);

@@ -25,11 +25,11 @@ async fn run() {
     for t in 0..n {
         let coords = [t / (gh * gw), (t / gw) % gh, t % gw];
         for head in 0..nh {
-            for gi in 0..3 {
+            for (gi, item_gi) in coords.iter().enumerate() {
                 let off = (t * nh + head) * dh + gi * g;
                 for c in 0..half {
                     let inv = (-2.0 * c as f32 / g as f32 * base.ln()).exp();
-                    let ang = coords[gi] as f32 * inv;
+                    let ang = *item_gi as f32 * inv;
                     let (cs, sn) = (ang.cos(), ang.sin());
                     let (x1, x2) = (xd[off + c], xd[off + c + half]);
                     cref[off + c] = x1 * cs - x2 * sn;

@@ -11,6 +11,9 @@
 //! Run: `cargo run -p ferric-tensor --example ebm_ood_goal --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+type Cell = (usize, usize);
+type Cells = Vec<Cell>;
+type TaskEnds = (Cells, Cells);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -126,7 +129,7 @@ async fn run() {
     }
 
     // ---- eval reach on TRAIN goals (right) and OOD goals (left) for both actors ----
-    let goalset = |ood: bool| -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let goalset = |ood: bool| -> TaskEnds {
         let pos: Vec<(usize, usize)> = (0..150).map(|i| cell(50 + i as u32 * 3)).collect();
         let goal: Vec<(usize, usize)> = (0..150).map(|i| if ood { ood_goal(900 + i as u32 * 5) } else { train_goal(900 + i as u32 * 5) }).collect();
         (pos, goal)
@@ -141,7 +144,7 @@ async fn run() {
           for _ in 0..50 { if done.iter().all(|&d| d) { break; }
             let x = enc_batch(&pos); let mut dist: Vec<Vec<f32>> = Vec::new();
             for a in 0..NA { let xa = predict_t(&x, &onehot(a, t)); let df = xa.sub(&xg); dist.push(df.mul(&df).sum(&[1], true).to_vec().await); }
-            for i in 0..t { if done[i] { continue; } let (mut ba, mut bd) = (0usize, dist[0][i]); for a in 1..NA { if dist[a][i] < bd { bd = dist[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { done[i] = true; } } }
+            for i in 0..t { if done[i] { continue; } let (mut ba, mut bd) = (0usize, dist[0][i]); for (a, item_a) in dist.iter().enumerate().take(NA).skip(1) { if item_a[i] < bd { bd = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { done[i] = true; } } }
           dr[oi] = done.iter().filter(|&&d| d).count() as f32 / t as f32; }
         // learned goal-conditioned VALUE planner (depth-2 lookahead) — trained only on train-region goals
         { let (mut pos, goal) = goalset(ood); let t = pos.len(); let xg = enc_batch(&goal); let mut done = vec![false; t];
@@ -149,7 +152,7 @@ async fn run() {
             let x = enc_batch(&pos); let mut sc: Vec<Vec<f32>> = Vec::new();
             for a in 0..NA { let xa = predict_t(&x, &onehot(a, t)); let mut m = val_t(&xa, &xg, &vp);
                 for a2 in 0..NA { m = m.maximum(&val_t(&predict_t(&xa, &onehot(a2, t)), &xg, &vp)); } sc.push(m.to_vec().await); }
-            for i in 0..t { if done[i] { continue; } let (mut ba, mut bv) = (0usize, sc[0][i]); for a in 1..NA { if sc[a][i] > bv { bv = sc[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { done[i] = true; } } }
+            for i in 0..t { if done[i] { continue; } let (mut ba, mut bv) = (0usize, sc[0][i]); for (a, item_a) in sc.iter().enumerate().take(NA).skip(1) { if item_a[i] > bv { bv = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { done[i] = true; } } }
           pr[oi] = done.iter().filter(|&&d| d).count() as f32 / t as f32; }
         // behavior-cloned feed-forward policy
         { let (mut pos, goal) = goalset(ood); let t = pos.len(); let xg = enc_batch(&goal); let mut done = vec![false; t];

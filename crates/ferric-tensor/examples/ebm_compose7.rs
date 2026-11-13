@@ -120,7 +120,7 @@ async fn run() {
     let (da, db) = stage_a(&ctx).await;
     println!("  STAGE A learned factors from NEUTRAL init (b=[1,1,1]):  a=({:+.2},{:+.2})  b=({:.2},{:.2},{:.2})", da[0], da[1], db[0], db[1], db[2]);
     println!("  composed goals gθ=a·b vs truth (held-out never supervised — this is the discovery test):");
-    for dir in 0..2 { for dist in 0..3 { let g = da[dir] * db[dist]; let held = HELD.contains(&(dir, dist));
+    for (dir, item_dir) in da.iter().enumerate() { for (dist, item_dist) in db.iter().enumerate() { let g = *item_dir * *item_dist; let held = HELD.contains(&(dir, dist));
         println!("     {}   gθ={:>6.2}   true={:>5.1}   |err|={:.3}   {}", names(dir, dist), g, goal(dir, dist), (g - goal(dir, dist)).abs(), if held { "HELD-OUT" } else { "train" }); } }
 
     let e = train_frozen(&ctx, da, db).await;

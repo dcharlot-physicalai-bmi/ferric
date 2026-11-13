@@ -117,10 +117,10 @@ async fn run() {
     let mut sched = UniPc::new(4);
     let mut lat: Vec<f64> = init_action.clone();
     let t0 = std::time::Instant::now();
-    for i in 0..4 {
-        let v: Vec<f64> = forward(&lat, timesteps[i]).iter().map(|x| *x as f64).collect();
+    for (i, &ts) in timesteps.iter().enumerate().take(4) {
+        let v: Vec<f64> = forward(&lat, ts).iter().map(|x| *x as f64).collect();
         lat = sched.step(&v, &lat);
-        println!("  step {i} t={:.0}: latent[0,:4]={:?}", timesteps[i], round(&lat[..4], 5));
+        println!("  step {i} t={:.0}: latent[0,:4]={:?}", ts, round(&lat[..4], 5));
     }
     println!("rollout (4× packing forward + UniPC) {:?}", t0.elapsed());
     let maxerr = lat.iter().zip(&final_ref).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);

@@ -11,9 +11,19 @@
 use ferric_tensor::Tensor;
 use std::sync::Arc;
 
-#[allow(clippy::too_many_arguments)]
-fn cpu_depthwise(x: &[f32], w: &[f32], n: usize, h: usize, wd: usize, c: usize,
-                 kh: usize, kw: usize, stride: (usize, usize), pad: (usize, usize)) -> Vec<f32> {
+#[derive(Clone, Copy)]
+struct DwGeom {
+    n: usize,
+    h: usize,
+    wd: usize,
+    c: usize,
+    kh: usize,
+    kw: usize,
+    stride: (usize, usize),
+    pad: (usize, usize),
+}
+fn cpu_depthwise(x: &[f32], w: &[f32], g: DwGeom) -> Vec<f32> {
+    let DwGeom { n, h, wd, c, kh, kw, stride, pad } = g;
     let ho = (h + 2 * pad.0 - kh) / stride.0 + 1;
     let wo = (wd + 2 * pad.1 - kw) / stride.1 + 1;
     let mut out = vec![0f32; n * ho * wo * c];
@@ -35,24 +45,25 @@ async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
     let mut bad = 0;
     // The parakeet case is first: 3x3 stride 2 pad 1 over 256 channels.
-    let cases: &[(usize, usize, usize, usize, usize, usize, (usize, usize), (usize, usize))] = &[
-        (1, 586, 128, 256, 3, 3, (2, 2), (1, 1)),   // parakeet dw_striding stage, real shape
-        (1, 5, 4, 3, 3, 3, (1, 1), (1, 1)),
-        (1, 8, 8, 16, 3, 3, (2, 2), (1, 1)),
-        (2, 7, 5, 4, 3, 3, (2, 2), (1, 1)),         // batched, non-square, odd dims
-        (1, 6, 9, 5, 2, 3, (1, 2), (0, 1)),         // asymmetric kernel AND stride AND pad
+    let cases: &[DwGeom] = &[
+        DwGeom { n: 1, h: 586, wd: 128, c: 256, kh: 3, kw: 3, stride: (2, 2), pad: (1, 1) },
+        DwGeom { n: 1, h: 5, wd: 4, c: 3, kh: 3, kw: 3, stride: (1, 1), pad: (1, 1) },
+        DwGeom { n: 1, h: 8, wd: 8, c: 16, kh: 3, kw: 3, stride: (2, 2), pad: (1, 1) },
+        DwGeom { n: 2, h: 7, wd: 5, c: 4, kh: 3, kw: 3, stride: (2, 2), pad: (1, 1) },
+        DwGeom { n: 1, h: 6, wd: 9, c: 5, kh: 2, kw: 3, stride: (1, 2), pad: (0, 1) },
     ];
-    for &(n, h, wd, c, kh, kw, stride, pad) in cases {
+    for &g in cases {
+        let DwGeom { n, h, wd, c, kh, kw, stride, pad } = g;
         let x: Vec<f32> = (0..n * h * wd * c).map(|i| 0.1 * (((i * 7 + 3) % 23) as f32 - 11.0)).collect();
         let w: Vec<f32> = (0..kh * kw * c).map(|i| 0.1 * (((i * 5 + 2) % 13) as f32 - 6.0)).collect();
         let xt = Tensor::from_vec(&ctx, &x, &[n, h, wd, c]);
         let wt = Tensor::from_vec(&ctx, &w, &[kh, kw, 1, c]);
         let got = xt.depthwise_conv2d(&wt, stride, pad).to_vec().await;
-        let want = cpu_depthwise(&x, &w, n, h, wd, c, kh, kw, stride, pad);
+        let want = cpu_depthwise(&x, &w, g);
         assert_eq!(got.len(), want.len(), "shape {n}x{h}x{wd}x{c}: {} vs {}", got.len(), want.len());
         let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         println!("  n={n} {h}x{wd}x{c} k={kh}x{kw} s={stride:?} p={pad:?}  max|err| {err:.2e}");
-        if !(err < 1e-5) { bad += 1; }
+        if err.partial_cmp(&1e-5) != Some(std::cmp::Ordering::Less) { bad += 1; }
     }
 
     // Discrimination check: a depthwise conv must NOT equal a full conv over the same weights, or
@@ -60,7 +71,7 @@ async fn run() {
     let (h, wd, c) = (6usize, 6usize, 4usize);
     let x: Vec<f32> = (0..h * wd * c).map(|i| 0.1 * (i % 9) as f32).collect();
     let w: Vec<f32> = (0..3 * 3 * c).map(|i| 0.1 * (i % 5) as f32).collect();
-    let dw = cpu_depthwise(&x, &w, 1, h, wd, c, 3, 3, (1, 1), (1, 1));
+    let dw = cpu_depthwise(&x, &w, DwGeom { n: 1, h, wd, c, kh: 3, kw: 3, stride: (1, 1), pad: (1, 1) });
     let summed: f32 = dw.iter().sum();
     assert!(summed.abs() > 1e-3, "degenerate test data — the oracle cannot discriminate");
 

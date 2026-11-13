@@ -59,7 +59,9 @@ fn acc(x: &[f32], subset: &[usize]) -> f32 {
 }
 
 // sampler: adjusted=false → ULA (always accept); adjusted=true → MALA (Metropolis accept/reject). eps = step.
-async fn sample(ctx: &Arc<ferric_core::Context>, cps: &[Vec<Tensor>], one: &Tensor, subset: &[usize], k: usize, b: usize, eps: f32, adjusted: bool) -> (f32, f32) {
+struct SampleCfg { k: usize, b: usize, eps: f32, adjusted: bool }
+async fn sample(ctx: &Arc<ferric_core::Context>, cps: &[Vec<Tensor>], one: &Tensor, subset: &[usize], cfg: SampleCfg) -> (f32, f32) {
+    let SampleCfg { k, b, eps, adjusted } = cfg;
     let eps2 = eps * eps;
     let mut x = gen_uniform(b, 424242);
     let mut accepts = 0u64; let mut total = 0u64;
@@ -120,16 +122,16 @@ async fn run() {
     println!("     {:>6}   {:>8} {:>8} {:>12}", "ε", "ULA", "MALA", "MALA accept");
     let four = [0usize, 1, 2, 3];
     for &eps in &[0.15f32, 0.3, 0.5, 0.8, 1.2] {
-        let (ula, _) = sample(&ctx, &cps, &one, &four, k, b, eps, false).await;
-        let (mala, ar) = sample(&ctx, &cps, &one, &four, k, b, eps, true).await;
+        let (ula, _) = sample(&ctx, &cps, &one, &four, SampleCfg { k, b, eps, adjusted: false }).await;
+        let (mala, ar) = sample(&ctx, &cps, &one, &four, SampleCfg { k, b, eps, adjusted: true }).await;
         println!("     {:>6.2}   {:>7.0}% {:>7.0}% {:>11.0}%", eps, ula * 100.0, mala * 100.0, ar * 100.0);
     }
     println!("\n  reference (ε=0.3) across conjunctions — ULA vs MALA:");
     println!("     {:<28} {:>8} {:>8} {:>12}", "conjunction", "ULA", "MALA", "MALA accept");
     for subset in [vec![0usize, 1], vec![0, 2], vec![2, 3], vec![0, 1, 2], vec![0, 1, 2, 3]] {
         let nm: Vec<&str> = subset.iter().map(|&c| names[c]).collect();
-        let (ula, _) = sample(&ctx, &cps, &one, &subset, k, b, 0.3, false).await;
-        let (mala, ar) = sample(&ctx, &cps, &one, &subset, k, b, 0.3, true).await;
+        let (ula, _) = sample(&ctx, &cps, &one, &subset, SampleCfg { k, b, eps: 0.3, adjusted: false }).await;
+        let (mala, ar) = sample(&ctx, &cps, &one, &subset, SampleCfg { k, b, eps: 0.3, adjusted: true }).await;
         println!("     {:<28} {:>7.0}% {:>7.0}% {:>11.0}%", nm.join(" ∧ "), ula * 100.0, mala * 100.0, ar * 100.0);
     }
     println!("\n  the honest reading: well-tuned ULA already composes (build-1's collapse was step-size, not fundamental);");

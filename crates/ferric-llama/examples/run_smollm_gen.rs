@@ -14,7 +14,9 @@ const DH: usize = 64; const VOCAB: usize = 49152; const BASE: f32 = 100000.0; co
 
 fn logits_last(ctx: &Arc<ferric_core::Context>, g: &HashMap<String, Tensor>, ids: &[u32]) -> Tensor {
     let get = |n: &str| g.get(n).unwrap();
-    let mut x = get("model.embed_tokens.weight").gather_rows(ids);
+    let embed = get("model.embed_tokens.weight");
+    assert_eq!(embed.shape.last().copied(), Some(D), "SmolLM2-135M hidden size");
+    let mut x = embed.gather_rows(ids);
     for i in 0..NL {
         let p = format!("model.layers.{i}");
         let h = x.rmsnorm(get(&format!("{p}.input_layernorm.weight")), EPS);

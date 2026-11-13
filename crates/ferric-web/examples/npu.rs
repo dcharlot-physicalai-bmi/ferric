@@ -26,39 +26,55 @@ fn main() {
                "--user-data-dir=/tmp/ferric-npu", &url])
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("launch chrome");
 
-    let t0 = Instant::now();
-    let conn = loop {
-        if let Some(c) = bridge.take_worker() { break c; }
-        if t0.elapsed() > Duration::from_secs(30) { let _ = child.kill(); panic!("browser never connected"); }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let status = String::from_utf8_lossy(&conn.recv().expect("status frame")).into_owned(); // "WEBNN:npu" etc.
-    let device = status.strip_prefix("WEBNN:").unwrap_or("?").to_string();
-    println!("  WebNN reported device: {device}");
+    // Chrome is killed once the matmul returns; the exit status is the kill, so record it rather than
+    // treating the signal as a WebNN failure. `wait` still runs on the timeout and NO_WEBNN paths.
+    let outcome = (|| -> Result<NpuRun, String> {
+        let t0 = Instant::now();
+        let conn = loop {
+            if let Some(c) = bridge.take_worker() { break c; }
+            if t0.elapsed() > Duration::from_secs(30) { return Err("browser never connected".into()); }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let frame = conn.recv().map_err(|e| format!("status frame: {e}"))?;
+        let status = String::from_utf8_lossy(&frame).into_owned(); // "WEBNN:npu" etc.
+        let device = status.strip_prefix("WEBNN:").unwrap_or("?").to_string();
+        println!("  WebNN reported device: {device}");
+        if device == "NO_WEBNN" { return Ok(NpuRun::NoWebNn); }
 
-    if device == "NO_WEBNN" {
-        let _ = child.kill();
-        println!("⚠️  This Chrome build has no WebNN — code path is ready; enable WebNN or run on hardware/OS with an NPU driver.");
-        return;
-    }
+        // dispatch a matmul through WebNN (runs on the NPU when device == npu)
+        let dev = Device::BrowserWorker(conn);
+        let (batch, m, k, n) = (2usize, 8, 6, 5);
+        let a = seq(batch * m * k, 1.0);
+        let b = seq(k * n, 2.0);
+        let got = dev.bmm(&a, &b, batch, m, k, n);
+        let cpu = Device::Cpu.bmm(&a, &b, batch, m, k, n);
+        let diff = maxdiff(&got, &cpu);
+        // the ANE is an fp16 engine, so its result matches CPU-f32 only to fp16 precision (~1e-1)
+        let tol = if device == "npu" { 2e-1 } else { 1e-3 };
+        Ok(NpuRun::Checked { device, diff, tol })
+    })();
 
-    // dispatch a matmul through WebNN (runs on the NPU when device == npu)
-    let dev = Device::BrowserWorker(conn);
-    let (batch, m, k, n) = (2usize, 8, 6, 5);
-    let a = seq(batch * m * k, 1.0);
-    let b = seq(k * n, 2.0);
-    let got = dev.bmm(&a, &b, batch, m, k, n);
-    let cpu = Device::Cpu.bmm(&a, &b, batch, m, k, n);
-    let diff = maxdiff(&got, &cpu);
     let _ = child.kill();
-
-    // the ANE is an fp16 engine, so its result matches CPU-f32 only to fp16 precision (~1e-1)
-    let tol = if device == "npu" { 2e-1 } else { 1e-3 };
-    println!("  matmul via WebNN:{device} · max|webnn-cpu| = {diff:.2e} (tol {tol:.0e})");
-    assert!(diff < tol, "WebNN result mismatch {diff}");
-    if device == "npu" {
-        println!("✅ Ferric ran compute ON THE NPU — WebNN(npu) → CoreML → Apple Neural Engine, matches CPU to fp16 precision ({diff:.1e})");
-    } else {
-        println!("✅ Ferric ran compute via WebNN (device: {device}) — NPU code path works; bound to {device} on this machine");
+    let status = child.wait().expect("wait for chrome");
+    eprintln!("chrome exit status: {status}");
+    match outcome {
+        Err(e) => panic!("{e}"),
+        Ok(NpuRun::NoWebNn) => {
+            println!("⚠️  This Chrome build has no WebNN — code path is ready; enable WebNN or run on hardware/OS with an NPU driver.");
+        }
+        Ok(NpuRun::Checked { device, diff, tol }) => {
+            println!("  matmul via WebNN:{device} · max|webnn-cpu| = {diff:.2e} (tol {tol:.0e})");
+            assert!(diff < tol, "WebNN result mismatch {diff}");
+            if device == "npu" {
+                println!("✅ Ferric ran compute ON THE NPU — WebNN(npu) → CoreML → Apple Neural Engine, matches CPU to fp16 precision ({diff:.1e})");
+            } else {
+                println!("✅ Ferric ran compute via WebNN (device: {device}) — NPU code path works; bound to {device} on this machine");
+            }
+        }
     }
+}
+
+enum NpuRun {
+    NoWebNn,
+    Checked { device: String, diff: f32, tol: f32 },
 }

@@ -23,7 +23,7 @@ async fn run() {
     println!("  unbatched: {d0} dispatches → {s0} submits");
     println!("  batched:   {d1} dispatches → {s1} submits");
     println!("  {} identical result (max|Δ| = {e:.1e}), {}× fewer submits",
-        if ok { "✅" } else { "❌" }, if s1 > 0 { s0 / s1 } else { s0 });
+        if ok { "✅" } else { "❌" }, s0.checked_div(s1).unwrap_or(s0));
     assert!(ok && s1 < s0);
     println!("✅ command batching: N dispatches, 1 submit, same numbers");
 }

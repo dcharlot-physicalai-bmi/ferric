@@ -105,8 +105,8 @@ async fn decode_frame(dec: &mut Dec, ctx: &Arc<Context>, lat: &Tensor) -> Vec<f3
     x = dec.resnet(&x, "decoder.mid_block.resnets.0");
     x = dec.attn(&x, "decoder.mid_block.attentions.0");
     x = dec.resnet(&x, "decoder.mid_block.resnets.1");
-    for i in 0..4 {
-        let (cin, cout, ft, up_flag, up3d) = up_cfg[i]; let x_copy = x.clone();
+    for (i, &(cin, cout, ft, up_flag, up3d)) in up_cfg.iter().enumerate() {
+        let x_copy = x.clone();
         for r in 0..3 { x = dec.resnet(&x, &format!("decoder.up_blocks.{i}.resnets.{r}")); }
         if up_flag {
             if up3d { x = dec.time_up(&x, &format!("decoder.up_blocks.{i}.upsampler.time_conv"), true).await; }
@@ -188,8 +188,8 @@ async fn encode(ctx: &Arc<Context>, w: &HashMap<String, STensor>, img: &[f32]) -
     let mut x = Tensor::from_vec(ctx, &patched, &[1, ph, pw2, ic * 4]);
     let (ciw, cib) = cw("encoder.conv_in"); x = conv(&x, &ciw, &cib, 1, 1, 1);
     let down_cfg = [(160usize, 160usize, 1usize, true), (160, 320, 2, true), (320, 640, 2, true), (640, 640, 1, false)];
-    for i in 0..4 {
-        let (cin, cout, ft, down_flag) = down_cfg[i]; let x_copy = x.clone();
+    for (i, &(cin, cout, ft, down_flag)) in down_cfg.iter().enumerate() {
+        let x_copy = x.clone();
         x = resnet(&x, &format!("encoder.down_blocks.{i}.resnets.0"));
         x = resnet(&x, &format!("encoder.down_blocks.{i}.resnets.1"));
         if down_flag { x = pad_br(ctx, &x).await; let (dw, db) = cw2d(&format!("encoder.down_blocks.{i}.downsampler.resample.1")); x = x.conv3d(&dw, &db, (1, 2, 2), (0, 0)); }

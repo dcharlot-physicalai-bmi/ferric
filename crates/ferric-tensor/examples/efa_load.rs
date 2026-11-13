@@ -6,12 +6,13 @@
 //! Run: `cargo run -p ferric-tensor --example efa_load --release [-- /path/to/model-dir]`
 //! Default model dir: /Users/dcharlot/vibe-coding/efa/models/efa-hybrid-arm2
 use std::f32::consts::PI;
+type StTensor = (String, Vec<usize>, Vec<f32>);
 const H: usize = 96; const DT: f32 = 0.05; const CPL: f32 = 0.5;
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
 fn wrap(x: f32) -> f32 { let mut a = x; while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
 
-fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
+fn load_safetensors(path: &str) -> std::io::Result<Vec<StTensor>> {
     let raw = std::fs::read(path)?;
     let hl = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
     let header = std::str::from_utf8(&raw[8..8 + hl]).unwrap().to_string();
@@ -33,7 +34,9 @@ fn mlp_scalar(w: &[Vec<f32>], b1: &[f32], w2: &[f32], b2: &[f32], w3: &[f32], b3
     let mut h2 = vec![0.0f32; H]; for j in 0..H { let mut z = b2[j]; for k in 0..H { z += h1[k] * w2[k * H + j]; } h2[j] = z.max(0.0); }
     let mut o = b3; for j in 0..H { o += h2[j] * w3[j]; } o
 }
-fn mlp_vec(w: &[Vec<f32>], b1: &[f32], w2: &[f32], b2: &[f32], w3: &[f32], b3: &[f32], f: &[f32], nout: usize) -> Vec<f32> {
+struct MlpLayers<'a> { w: &'a [Vec<f32>], b1: &'a [f32], w2: &'a [f32], b2: &'a [f32], w3: &'a [f32], b3: &'a [f32] }
+fn mlp_vec(layers: MlpLayers<'_>, f: &[f32], nout: usize) -> Vec<f32> {
+    let MlpLayers { w, b1, w2, b2, w3, b3 } = layers;
     let mut h1 = vec![0.0f32; H]; for j in 0..H { let mut z = b1[j]; for c in 0..f.len() { z += f[c] * w[c][j]; } h1[j] = z.max(0.0); }
     let mut h2 = vec![0.0f32; H]; for j in 0..H { let mut z = b2[j]; for k in 0..H { z += h1[k] * w2[k * H + j]; } h2[j] = z.max(0.0); }
     (0..nout).map(|c| { let mut o = b3[c]; for j in 0..H { o += h2[j] * w3[j * nout + c]; } o }).collect()
@@ -77,7 +80,7 @@ fn main() {
         let act = |s: [f32; 4], g: (f32, f32)| -> (f32, f32) { let (mut a1, mut a2) = (0.0f32, 0.0f32);
             for k in 0..2 { let tt = k as f32 / 2.0;
                 let (g1, g2) = grad_a2(&ew, eb1, ew2, eb2, ew3, &feat(s, g, a1, a2, tt));
-                let wv = mlp_vec(&ww, wb1, ww2, wb2, ww3, wb3, &feat(s, g, a1, a2, tt), 2);
+                let wv = mlp_vec(MlpLayers { w: &ww, b1: wb1, w2: ww2, b2: wb2, w3: ww3, b3: wb3 }, &feat(s, g, a1, a2, tt), 2);
                 a1 += (-kappa * g1 + wv[0]) / 2.0; a2 += (-kappa * g2 + wv[1]) / 2.0; }
             (a1.clamp(-umax, umax), a2.clamp(-umax, umax)) };
         let goals = [(0.8f32, -0.8f32), (-1.0, 0.6), (0.5, 1.0), (-0.6, -0.9)];
@@ -110,7 +113,7 @@ fn main() {
             vec![d1.cos(), d1.sin(), s[3], d2.cos(), d2.sin(), s[4], d3.cos(), d3.sin(), s[5], s[0].sin(), s[1].sin(), s[2].sin(), a[0], a[1], a[2], tt] };
         let (fw, fb1, fw2, fb2, fw3, fb3) = (getv(&t, "flow", 16), get(&t, "flow.b1"), get(&t, "flow.w2"), get(&t, "flow.b2"), get(&t, "flow.w3"), get(&t, "flow.b3"));
         let act = |s: [f32; 6], g: (f32, f32, f32), kk: usize| -> [f32; 3] { let mut a = [0.0f32; 3];
-            for i in 0..kk { let tt = i as f32 / kk as f32; let v = mlp_vec(&fw, fb1, fw2, fb2, fw3, fb3, &feat(s, g, a, tt), 3);
+            for i in 0..kk { let tt = i as f32 / kk as f32; let v = mlp_vec(MlpLayers { w: &fw, b1: fb1, w2: fw2, b2: fb2, w3: fw3, b3: fb3 }, &feat(s, g, a, tt), 3);
                 for c in 0..3 { a[c] += v[c] / kk as f32; } }
             [a[0].clamp(-umax, umax), a[1].clamp(-umax, umax), a[2].clamp(-umax, umax)] };
         let goals = [(0.8f32, -0.6f32, 0.5f32), (-0.7, 0.5, -0.6), (0.5, 0.9, -0.4), (-0.5, -0.8, 0.7)];

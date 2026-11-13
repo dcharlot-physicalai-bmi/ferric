@@ -116,8 +116,8 @@ fn write_gate(mem: &mut Mem, p: &[f32; PDIM]) -> Verdict {
         if wrap(g_new - g_old).abs() > GOAL_AGREE { return Verdict::RefuseContradiction; }
         let k = mem.writes[i] as f32;
         for c in 0..PDIM { mem.xi[i][c] = mem.xi[i][c] * (k / (k + 1.0)) + p[c] / (k + 1.0); }
-        let mut n = 0.0; for c in 0..CDIM { n += mem.xi[i][c] * mem.xi[i][c]; }
-        let n = n.sqrt().max(1e-6); for c in 0..CDIM { mem.xi[i][c] /= n; }
+        let mut n = 0.0; for item_c in mem.xi[i].iter().take(CDIM) { n += *item_c * *item_c; }
+        let n = n.sqrt().max(1e-6); for item_c in mem.xi[i].iter_mut().take(CDIM) { *item_c /= n; }
         let gn = (mem.xi[i][CDIM].powi(2) + mem.xi[i][CDIM + 1].powi(2)).sqrt().max(1e-6);
         mem.xi[i][CDIM] /= gn; mem.xi[i][CDIM + 1] /= gn;
         mem.writes[i] += 1; Verdict::Consolidate }
@@ -128,12 +128,12 @@ fn mk_pattern(c: &[f32; CDIM], g: f32) -> [f32; PDIM] {
 }
 fn rand_ctx(seed: u32) -> [f32; CDIM] {
     let mut c = [0.0f32; CDIM]; let mut n = 0.0;
-    for k in 0..CDIM { c[k] = u(seed, 100 + k as u32) * 2.0 - 1.0; n += c[k] * c[k]; }
-    let n = n.sqrt().max(1e-6); for k in 0..CDIM { c[k] /= n; } c
+    for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k = u(seed, 100 + k as u32) * 2.0 - 1.0; n += *item_k * *item_k; }
+    let n = n.sqrt().max(1e-6); for item_k in c.iter_mut().take(CDIM) { *item_k /= n; } c
 }
 fn corrupt_cue(c: &[f32; CDIM], frac: f32, seed: u32) -> [f32; PDIM] {
     let mut q = [0.0f32; PDIM];
-    for k in 0..CDIM { q[k] = if u(seed, 300 + k as u32) < frac { 0.0 } else { c[k] }; } q
+    for (k, item_k) in c.iter().enumerate().take(CDIM) { q[k] = if u(seed, 300 + k as u32) < frac { 0.0 } else { *item_k }; } q
 }
 fn goal_of(q: &[f32; PDIM]) -> f32 { q[CDIM + 1].atan2(q[CDIM]) }
 fn main() {
@@ -165,8 +165,8 @@ fn main() {
             n_rep += 1;
             let i = (u(ev, 9) * truth.len() as f32) as usize % truth.len();
             let (c0, g0) = truth[i];
-            let mut c = c0; for k in 0..CDIM { c[k] += (u(ev * 3 + k as u32, 11) * 2.0 - 1.0) * 0.08; }
-            let mut n = 0.0; for k in 0..CDIM { n += c[k] * c[k]; } let n = n.sqrt().max(1e-6); for k in 0..CDIM { c[k] /= n; }
+            let mut c = c0; for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k += (u(ev * 3 + k as u32, 11) * 2.0 - 1.0) * 0.08; }
+            let mut n = 0.0; for item_k in c.iter().take(CDIM) { n += *item_k * *item_k; } let n = n.sqrt().max(1e-6); for item_k in c.iter_mut().take(CDIM) { *item_k /= n; }
             let g = g0 + (u(ev, 13) * 2.0 - 1.0) * 0.15;                 // goal observation noise
             rep_first.entry(i).or_insert(g);
             let p = mk_pattern(&c, g);
@@ -177,8 +177,8 @@ fn main() {
             let i = (u(ev, 15) * m0 as f32) as usize % m0;
             let (c0, g0) = truth[i];
             let mut c = c0; let dir = rand_ctx(7000 + ev);
-            for k in 0..CDIM { c[k] += dir[k] * 0.45; }                   // lands ~0.45–0.7 away: the conflict zone
-            let mut n = 0.0; for k in 0..CDIM { n += c[k] * c[k]; } let n = n.sqrt().max(1e-6); for k in 0..CDIM { c[k] /= n; }
+            for (k, item_k) in c.iter_mut().enumerate().take(CDIM) { *item_k += dir[k] * 0.45; }                   // lands ~0.45–0.7 away: the conflict zone
+            let mut n = 0.0; for item_k in c.iter().take(CDIM) { n += *item_k * *item_k; } let n = n.sqrt().max(1e-6); for item_k in c.iter_mut().take(CDIM) { *item_k /= n; }
             let g = wrap(g0 + PI * 0.8);                                  // contradictory goal
             let p = mk_pattern(&c, g);
             match write_gate(&mut gated, &p) { Verdict::RefuseAlias | Verdict::RefuseContradiction => refused_conf += 1, Verdict::Append => appended += 1, Verdict::Consolidate => consolidated += 1 }

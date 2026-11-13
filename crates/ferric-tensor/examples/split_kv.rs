@@ -209,8 +209,8 @@ async fn run() {
             // keys-per-split implied by the measured optimum at the smallest winning length
             let (_, n0, beats) = *recommend.iter().find(|(s, _, _)| *s == s0).unwrap();
             println!("    At S={s0} splitting beats not splitting by {beats:.2}x.");
-            if n0 > 0 {
-                println!("    Implied MIN_KEYS_PER_SPLIT there: {} (currently 512).", s0 / n0);
+            if let Some(per) = s0.checked_div(n0) {
+                println!("    Implied MIN_KEYS_PER_SPLIT there: {} (currently 512).", per);
             } else {
                 println!("    Every split count ties there, so the data fixes the GATE but not the");
                 println!("    formula: lower the threshold, and leave the count rule until repeats");

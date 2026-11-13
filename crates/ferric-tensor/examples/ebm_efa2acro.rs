@@ -92,7 +92,7 @@ fn node_state(i1: usize, i2: usize, i3: usize, i4: usize) -> [f32; 4] {
 // spec-exact episode: reward −1 per non-terminating step, 0 on the terminating one; cap 500
 fn episode<F: FnMut([f32; 4]) -> f32>(seed: u32, mut pol: F) -> (f32, bool) {
     let mut s = [0.0f32; 4];
-    for j in 0..4 { s[j] = (u01(seed, 3 + j as u32) * 2.0 - 1.0) * 0.1; }
+    for (j, item_j) in s.iter_mut().enumerate() { *item_j = (u01(seed, 3 + j as u32) * 2.0 - 1.0) * 0.1; }
     let mut ret = 0.0;
     for _ in 0..EPMAX { let a = pol(s); let ns = rk4(s, a);
         if terminal(ns) { return (ret, true); }                    // terminating step: reward 0
@@ -153,7 +153,7 @@ async fn run() {
     // teacher-rollout state pool for distillation (the trajectory distribution is what closed loop visits)
     let mut pool: Vec<[f32; 4]> = Vec::new();
     for k in 0..200u32 { let mut s = [0.0f32; 4];
-        for j in 0..4 { s[j] = (u01(20000 + k, 3 + j as u32) * 2.0 - 1.0) * 0.1; }
+        for (j, item_j) in s.iter_mut().enumerate() { *item_j = (u01(20000 + k, 3 + j as u32) * 2.0 - 1.0) * 0.1; }
         for _ in 0..EPMAX { pool.push(s); let a = dp.ustar(s); let ns = rk4(s, a); if terminal(ns) { break; } s = ns; } }
     println!("     teacher state pool: {} states from 200 rollouts", pool.len());
 
@@ -214,7 +214,7 @@ async fn run() {
     println!("\n  [C] the rescue measurement (100 spec episodes each; reward −1/step, −500 = never solves):");
     // multimodality diagnostic at the hanging start region: is the K=1 flow output collapsed toward 0?
     let (mut near0, mut probes) = (0, 0);
-    for k in 0..500u32 { let mut s = [0.0f32; 4]; for j in 0..4 { s[j] = (u01(k, 61 + j as u32) * 2.0 - 1.0) * 0.15; }
+    for k in 0..500u32 { let mut s = [0.0f32; 4]; for (j, item_j) in s.iter_mut().enumerate() { *item_j = (u01(k, 61 + j as u32) * 2.0 - 1.0) * 0.15; }
         if Ma::round3(m.act_k(s, 1)) == 0.0 { near0 += 1; } probes += 1; }
     println!("     DIAG hanging-region K=1 rounds to torque 0 on {:.0}% of probes (mode-average collapse test)", near0 as f32 / probes as f32 * 100.0);
     // τ from validation quantile over the teacher pool
@@ -263,11 +263,11 @@ async fn run() {
     let outdir = "/Users/dcharlot/vibe-coding/efa/models/efa-2-acrobot";
     std::fs::create_dir_all(outdir).unwrap();
     let mut ts: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
-    for c in 0..fin { ts.push((format!("flow.in{}", c), vec![1, H], m.flow.w[c].clone())); }
+    for (c, item_c) in m.flow.w.iter().enumerate().take(fin) { ts.push((format!("flow.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("flow.b1".into(), vec![H], m.flow.b1.clone())); ts.push(("flow.w2".into(), vec![H, H], m.flow.w2.clone()));
     ts.push(("flow.b2".into(), vec![H], m.flow.b2.clone())); ts.push(("flow.w3".into(), vec![H, 1], m.flow.w3.clone()));
     ts.push(("flow.b3".into(), vec![1], vec![m.flow.b3]));
-    for c in 0..pin { ts.push((format!("potential.in{}", c), vec![1, H], m.pot.w[c].clone())); }
+    for (c, item_c) in m.pot.w.iter().enumerate().take(pin) { ts.push((format!("potential.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("potential.b1".into(), vec![H], m.pot.b1.clone())); ts.push(("potential.w2".into(), vec![H, H], m.pot.w2.clone()));
     ts.push(("potential.b2".into(), vec![H], m.pot.b2.clone())); ts.push(("potential.w3".into(), vec![H, 1], m.pot.w3.clone()));
     ts.push(("potential.b3".into(), vec![1], vec![m.pot.b3]));

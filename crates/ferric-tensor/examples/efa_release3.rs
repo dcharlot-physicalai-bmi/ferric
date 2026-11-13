@@ -11,6 +11,7 @@ const G5: [f32; 5] = [-4.0, -2.0, 0.0, 2.0, 4.0];
 const TG: [(f32, f32, f32); 4] = [(0.8, -0.6, 0.5), (-0.7, 0.5, -0.6), (0.5, 0.9, -0.4), (-0.5, -0.8, 0.7)];
 const OUTDIR: &str = "/Users/dcharlot/vibe-coding/efa/models/efa-flow-arm3";
 use std::f32::consts::PI;
+type StTensor = (String, Vec<usize>, Vec<f32>);
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
@@ -43,7 +44,7 @@ fn save_safetensors(path: &str, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> s
     for (_, _, data) in tensors { for v in data { f.write_all(&v.to_le_bytes())?; } }
     Ok(())
 }
-fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
+fn load_safetensors(path: &str) -> std::io::Result<Vec<StTensor>> {
     let raw = std::fs::read(path)?;
     let hl = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
     let header = std::str::from_utf8(&raw[8..8 + hl]).unwrap().to_string();
@@ -157,7 +158,7 @@ async fn run() {
         if r1 < 95.0 { println!("     GATE FAILED (need K=1 ≥95%) — retrying with next seed\n"); continue; }
         std::fs::create_dir_all(OUTDIR).unwrap();
         let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![];
-        for c in 0..16 { tensors.push((format!("flow.in{}", c), vec![1, H], fl.w[c].clone())); }
+        for (c, item_c) in fl.w.iter().enumerate().take(16) { tensors.push((format!("flow.in{}", c), vec![1, H], item_c.clone())); }
         tensors.push(("flow.b1".into(), vec![H], fl.b1.clone())); tensors.push(("flow.w2".into(), vec![H, H], fl.w2.clone()));
         tensors.push(("flow.b2".into(), vec![H], fl.b2.clone())); tensors.push(("flow.w3".into(), vec![H, 3], fl.w3.clone()));
         tensors.push(("flow.b3".into(), vec![3], vec![fl.b3[0], fl.b3[1], fl.b3[2]]));

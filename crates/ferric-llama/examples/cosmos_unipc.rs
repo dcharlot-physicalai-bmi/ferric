@@ -15,11 +15,14 @@ fn solve(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> { // small Gaussian elimination
         let piv = (col..n).max_by(|&x, &y| a[x][col].abs().partial_cmp(&a[y][col].abs()).unwrap()).unwrap();
         a.swap(col, piv);
         let d = a[col][col];
-        for j in col..=n { a[col][j] /= d; }
+        for cell in &mut a[col][col..=n] { *cell /= d; }
         for i in 0..n { if i != col { let f = a[i][col]; for j in col..=n { a[i][j] -= f * a[col][j]; } } }
     }
     (0..n).map(|i| a[i][n]).collect()
 }
+
+// sigma_t, sigma_s0, alpha_t, h_phi_1, b_h, m0, R, b, D1s
+type BhParts = (f64, f64, f64, f64, f64, Vec<f64>, Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>);
 
 struct UniPc {
     order: usize, lof: bool, n: usize,
@@ -36,8 +39,7 @@ impl UniPc {
         sample.iter().zip(v).map(|(s, vv)| s - sig_t * vv).collect()
     }
     // returns (sigma_t, sigma_s0, alpha_t, h_phi_1, B_h, m0, R, b, D1s)
-    fn bh(&self, order: usize, si_curr: usize, si_prev: usize, extra: i64)
-        -> (f64, f64, f64, f64, f64, Vec<f64>, Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
+    fn bh(&self, order: usize, si_curr: usize, si_prev: usize, extra: i64) -> BhParts {
         let (alpha_t, sigma_t) = as_(SIGMAS[si_curr]);
         let (alpha_s0, sigma_s0) = as_(SIGMAS[si_prev]);
         let lam_t = alpha_t.ln() - sigma_t.ln();

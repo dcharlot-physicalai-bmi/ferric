@@ -87,7 +87,6 @@ impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
 // multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
 // push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
-#[allow(dead_code)] // example helper, not on the default path
 fn demo(w: &World) -> [f32; 2] {
     let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
     let contact = if et.abs() > 0.12 {                                   // ROTATION phase
@@ -103,7 +102,6 @@ fn demo(w: &World) -> [f32; 2] {
     let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
-#[allow(dead_code)] // example helper, not on the default path
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
     let mut w = World::new(seed, im); let mut best = 0.0f32;
     for _ in 0..((TMAX / DT) as usize) { let c = pol(&w); w.step(c); best = best.max(w.coverage()); if best >= 0.98 { break; } } best }
@@ -118,8 +116,8 @@ fn cov_at(w: &World) -> f32 { w.cov(120) }
 fn rollout_score(w0: &World, seq: &[[f32; 2]]) -> f32 {                 // action-repeat STRIDE → HZ*STRIDE effective horizon
     let mut w = w0.clone(); let mut s = 0.0; for a in seq { for _ in 0..STRIDE { w.step(*a); } s += cov_at(&w); }
     0.15 * s / seq.len() as f32 + 0.85 * cov_at(&w) }
-fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
-    let mut mu = mean.clone(); let mut sd = vec![0.5f32; HZ];
+fn mpc_act(w: &World, mean: &mut [[f32; 2]], seed: u32) -> [f32; 2] {
+    let mut mu = mean.to_vec(); let mut sd = vec![0.5f32; HZ];
     for it in 0..NITER {
         let mut scored: Vec<(f32, Vec<[f32; 2]>)> = (0..NS).map(|k| {
             let seq: Vec<[f32; 2]> = (0..HZ).map(|h| {
@@ -146,6 +144,8 @@ fn mpc_episode(seed: u32, im: f32) -> f32 {
     best }
 fn main() {
     let im = moment();
+    let reactive = episode(1, im, demo);
+    println!("  scripted reactive coverage {reactive:.3} · obs0 {:.3}", World::new(1, im).obs()[0]);
     println!("  EFA-2 · PUSHT via CEM-MPC — plan multi-push sequences on the verified physics (the demonstrator)\n");
     let self_cov = { let w = World { p: [0.3, -0.2], th: 0.7, v: [0.0; 2], w: 0.0, tp: [0.3, -0.2], tth: 0.7, im, push: [9.0, 9.0] }; w.coverage() };
     println!("  [V1] coverage self-check {:.3} · moment {:.4} · MPC: H={} samples={} iters={} elite={}", self_cov, im, HZ, NS, NITER, ELITE);

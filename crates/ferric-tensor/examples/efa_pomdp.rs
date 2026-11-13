@@ -14,6 +14,9 @@
 //! Run: `cargo run -p ferric-tensor --example efa_pomdp --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+type Cell = (usize, usize);
+type Cells = Vec<Cell>;
+type TaskEnds = (Cells, Cells);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -118,7 +121,7 @@ async fn run() {
     println!("  MPPI-memory best → the whole EFA stack (latent→Z→world-model→value→MPPI) composes on the fabric.");
 }
 
-fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+fn make_task(t: usize) -> TaskEnds {
     let pos: Vec<(usize, usize)> = (0..t).map(|i| { let left = u(i as u32, 21) < 0.5;
         if left { ((u(i as u32, 22) * 6.0) as usize % 6, (u(i as u32, 23) * G as f32) as usize % G) }
         else { (7 + (u(i as u32, 24) * 6.0) as usize % 6, (u(i as u32, 25) * G as f32) as usize % G) } }).collect();
@@ -130,7 +133,7 @@ fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
 
 // POMDP: write the goal latent into per-agent Hebbian Z at t=0 (surprise-gated: only while visible),
 // then recall the goal from Z and plan toward the recalled latent. memory=false → blind (zero goal).
-async fn reach_pomdp(ctx: &Arc<ferric_core::Context>, planner: &str, memory: bool, kk: usize, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+async fn reach_pomdp(ctx: &Arc<ferric_core::Context>, planner: &str, memory: bool, kk: usize, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> f32 {
     let d = 64usize;
     let (t, maxsteps) = (150usize, 60usize);
     let (mut pos, goal) = make_task(t);
@@ -145,7 +148,7 @@ async fn reach_pomdp(ctx: &Arc<ferric_core::Context>, planner: &str, memory: boo
         let mut r = vec![0.0f32; t * d];
         for i in 0..t { for a in 0..d {
             let mut z_row_dot_cue = 0.0f32; // = x_goal[i,a] * Σ_b cue[b]^2 = x_goal[i,a]
-            for b in 0..d { z_row_dot_cue += (xg_true[i * d + a] * cue[b]) * cue[b]; }
+            for item_b in cue.iter().take(d) { z_row_dot_cue += (xg_true[i * d + a] * *item_b) * *item_b; }
             r[i * d + a] = z_row_dot_cue;
         } }
         r
@@ -160,22 +163,22 @@ async fn reach_pomdp(ctx: &Arc<ferric_core::Context>, planner: &str, memory: boo
             // MPPI over the RECALLED goal
             let m = t * kk;
             let mut pos_rep: Vec<(usize, usize)> = Vec::with_capacity(m);
-            for i in 0..t { for _ in 0..kk { pos_rep.push(pos[i]); } }
+            for item_i in pos.iter().take(t) { for _ in 0..kk { pos_rep.push(*item_i); } }
             let mut acts: Vec<Vec<usize>> = vec![vec![0usize; m]; 6];
-            for i in 0..t { for k in 0..kk { for h in 0..6 {
+            for i in 0..t { for k in 0..kk { for (h, item_h) in acts.iter_mut().enumerate().take(6) {
                 let seed = h32((stp as u32).wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503) ^ (k as u32).wrapping_mul(2_246_822_519) ^ (h as u32).wrapping_mul(3_266_489_917));
-                acts[h][i * kk + k] = (seed as usize) % NA;
+                item_h[i * kk + k] = (seed as usize) % NA;
             } } }
             let first = acts[0].clone();
             let mut xh = enc_batch(&pos_rep);
-            for h in 0..6 { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + acts[h][r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
+            for item_h in acts.iter().take(6) { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + item_h[r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
             // tile recalled goal to [t*K]
             let mut xg_rep = vec![0.0f32; m * d]; for i in 0..t { for k in 0..kk { for a in 0..d { xg_rep[(i * kk + k) * d + a] = recalled[i * d + a]; } } }
             let vend = val_t(&xh, &Tensor::from_vec(ctx, &xg_rep, &[m, d])).to_vec().await;
             for i in 0..t { if reached[i] { continue; } let base = i * kk;
                 let mut vmax = f32::MIN; for k in 0..kk { if vend[base + k] > vmax { vmax = vend[base + k]; } }
                 let mut wsum = [0.0f32; NA]; for k in 0..kk { let w = ((vend[base + k] - vmax) / 0.5).exp(); wsum[first[base + k]] += w; }
-                let (mut ba, mut best) = (0usize, wsum[0]); for a in 1..NA { if wsum[a] > best { best = wsum[a]; ba = a; } }
+                let (mut ba, mut best) = (0usize, wsum[0]); for (a, item_a) in wsum.iter().enumerate().take(NA).skip(1) { if *item_a > best { best = *item_a; ba = a; } }
                 pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; }
             }
         } else {
@@ -187,7 +190,7 @@ async fn reach_pomdp(ctx: &Arc<ferric_core::Context>, planner: &str, memory: boo
                 for a2 in 0..NA { let x2 = predict_t(&xa, &onehot(a2)); mm = mm.maximum(&val_t(&x2, &xg));
                     for a3 in 0..NA { mm = mm.maximum(&val_t(&predict_t(&x2, &onehot(a3)), &xg)); } }
                 score.push(mm.to_vec().await); }
-            for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for a in 1..NA { if score[a][i] > best { best = score[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
+            for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for (a, item_a) in score.iter().enumerate().take(NA).skip(1) { if item_a[i] > best { best = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
         }
     }
     reached.iter().filter(|&&r| r).count() as f32 / t as f32

@@ -141,12 +141,12 @@ async fn time_decode(m: &Qwen3) -> f64 {
     let vn = m.cfg.n_vocab;
     let am = |l: &[f32]| l[l.len() - vn..].iter().enumerate()
         .fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0 as u32;
-    let mut c = Cache::new(&m.cfg);
-    let mut next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
+    let mut warm = Cache::new(&m.cfg);
+    am(&m.forward_cached(&[100u32, 200, 300], &mut warm).to_vec().await);
     let mut samples = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let mut c = Cache::new(&m.cfg);
-        next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
+        let mut next = am(&m.forward_cached(&[100u32, 200, 300], &mut c).to_vec().await);
         let t0 = std::time::Instant::now();
         for _ in 0..DECODE_TOKENS {
             next = am(&m.forward_cached(&[next], &mut c).to_vec().await);

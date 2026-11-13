@@ -25,12 +25,12 @@ fn item(seed: u32) -> (Vec<usize>, usize) {
     let dir = if u(seed, 1) > 0.5 { 1.0 } else { -1.0 };
     let mut e = vec![0usize; T];
     for item in e[..EARLY].iter_mut() { *item = if dir > 0.0 { 3 } else { 0 }; }               // +2·dir reliable signal
-    for t in EARLY..T { e[t] = if u(seed.wrapping_add(777), t as u32 + 1) > 0.5 { 3 } else { 0 }; } // ±2 strong noise
+    for (t, item_t) in e.iter_mut().enumerate().take(T).skip(EARLY) { *item_t = if u(seed.wrapping_add(777), t as u32 + 1) > 0.5 { 3 } else { 0 }; } // ±2 strong noise
     (e, if dir > 0.0 { 1 } else { 0 })
 }
 
 // tp = [emb[4,DH], wg[DH,1], wr[1,1], br[1], aparam[1]]. A = softplus(aparam). a0 forces A=0.
-fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &Vec<Vec<usize>>, bs: usize, k: usize, a0: bool) -> Var {
+fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &[Vec<usize>], bs: usize, k: usize, a0: bool) -> Var {
     let (emb, wg, wr, br) = (&tp[0], &tp[1], &tp[2], &tp[3]);
     let one = Var::leaf(Tensor::from_vec(ctx, &[1.0], &[1]));
     let al = Var::leaf(Tensor::from_vec(ctx, &[0.1], &[1]));

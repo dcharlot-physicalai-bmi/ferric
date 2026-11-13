@@ -70,11 +70,11 @@ async fn run() {
     let mut seed = 0x2545F4914F6CDD1Du64;
     let mut u = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 40) as f32 + 0.5) / (1u32 << 24) as f32 };
     let mut weight = vec![0f32; n];
-    for i in 0..n {
+    for w in &mut weight {
         let (a, b) = (u().max(1e-7), u());
         let g = (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos(); // N(0,1)
-        weight[i] = g * 0.02;
-        if u() < 0.01 { weight[i] *= 12.0; } // salient outliers
+        *w = g * 0.02;
+        if u() < 0.01 { *w *= 12.0; } // salient outliers
     }
     let weight = &weight[..];
     println!("weight: synthetic q_proj  shape [{rows},{cols}]  ({n} params, Gaussian + ~1% outliers)\n");

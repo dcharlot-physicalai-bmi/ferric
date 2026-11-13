@@ -101,7 +101,8 @@ async fn run() {
         (steps as f64 * n / dt, disp as f64 / (steps as f64 * n), (w0, now(&meter)))
     };
 
-    let mut arms: Vec<(&str, Vec<(f64, f64, (Option<f64>, Option<f64>))>)> = vec![
+    type BenchArms = Vec<(&'static str, Vec<(f64, f64, (Option<f64>, Option<f64>))>)>;
+    let mut arms: BenchArms = vec![
         ("base", vec![]), ("unmerged", vec![]), ("merged F32", vec![]), ("merged F16", vec![])];
     if dev_b.is_some() { arms.push(("batch4 base", vec![])); arms.push(("batch4 a|b|a|b", vec![])); }
     for rep in 0..reps {

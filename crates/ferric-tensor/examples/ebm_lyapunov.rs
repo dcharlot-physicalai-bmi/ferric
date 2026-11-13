@@ -81,7 +81,7 @@ async fn train(ctx: &Arc<ferric_core::Context>, lyap: bool) -> E {
         let mut loss = diff.mul(&diff).mean_all();
         if lyap && ectrl.is_some() {
             // V(g)=E(g); V>0 away from g: relu(0.5·d² − V); descent: relu(V(x')−V(x) + 0.3·d²)
-            let vg = enet(&l(&[(G - G).cos()], 1), &l(&[(G - G).sin()], 1), &l(&[0.0], 1), &l(&[G.cos()], 1), &l(&[G.sin()], 1), &pv, &ov);   // E(g,0)
+            let vg = enet(&l(&[0.0f32.cos()], 1), &l(&[0.0f32.sin()], 1), &l(&[0.0], 1), &l(&[G.cos()], 1), &l(&[G.sin()], 1), &pv, &ov);   // E(g,0)
             let vx = enet(&l(&lrc, bs), &l(&lrs, bs), &l(&lom, bs), &l(&lct, bs), &l(&lst, bs), &pv, &ov).sub(&vg);
             let vp = enet(&l(&prc, bs), &l(&prs, bs), &l(&pom, bs), &l(&pct, bs), &l(&pst, bs), &pv, &ov).sub(&vg);
             let d2v = Var::leaf(Tensor::from_vec(ctx, &dd, &[bs, 1]));

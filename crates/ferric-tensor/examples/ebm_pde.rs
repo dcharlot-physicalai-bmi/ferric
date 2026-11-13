@@ -32,13 +32,13 @@ fn main() {
     println!("  EFA energy-first — DISCOVER a PDE (Burgers u_t=−u·u_x+ν·u_xx) from spatiotemporal data (PDE-FIND)");
     let dx = 2.0 * std::f64::consts::PI / NX as f64; let dt = 0.0004; let nt = 800;
     // initial condition u0 = −sin(x); simulate viscous Burgers with periodic finite differences (explicit Euler)
-    let mut u = vec![0.0f64; NX]; for i in 0..NX { u[i] = -(i as f64 * dx).sin(); }
+    let mut u = vec![0.0f64; NX]; for (i, item_i) in u.iter_mut().enumerate().take(NX) { *item_i = -(i as f64 * dx).sin(); }
     let mut field = Vec::with_capacity(nt); field.push(u.clone());
     for _ in 1..nt {
         let mut un = vec![0.0f64; NX];
-        for i in 0..NX { let ip = (i + 1) % NX; let im = (i + NX - 1) % NX;
-            let ux = (u[ip] - u[im]) / (2.0 * dx); let uxx = (u[ip] - 2.0 * u[i] + u[im]) / (dx * dx);
-            un[i] = u[i] + dt * (-u[i] * ux + NU * uxx); }
+        for (i, item_i) in u.iter().enumerate().take(NX) { let ip = (i + 1) % NX; let im = (i + NX - 1) % NX;
+            let ux = (u[ip] - u[im]) / (2.0 * dx); let uxx = (u[ip] - 2.0 * *item_i + u[im]) / (dx * dx);
+            un[i] = *item_i + dt * (-*item_i * ux + NU * uxx); }
         u = un; field.push(u.clone());
     }
     // sample (x,t) interior points; compute u_t (time central-diff), u_x, u_xx (space central-diff), + 1% noise

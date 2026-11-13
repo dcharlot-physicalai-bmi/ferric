@@ -15,6 +15,9 @@
 //! Run: `cargo run -p ferric-tensor --example efa_maze_mppi --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+type Cell = (usize, usize);
+type Cells = Vec<Cell>;
+type TaskEnds = (Cells, Cells);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -121,7 +124,7 @@ async fn run() {
 }
 
 // shared start/goal generator: start one side of the wall, goal the other → must use the gap
-fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+fn make_task(t: usize) -> TaskEnds {
     let pos: Vec<(usize, usize)> = (0..t).map(|i| { let left = u(i as u32, 21) < 0.5;
         if left { ((u(i as u32, 22) * 6.0) as usize % 6, (u(i as u32, 23) * G as f32) as usize % G) }
         else { (7 + (u(i as u32, 24) * 6.0) as usize % 6, (u(i as u32, 25) * G as f32) as usize % G) } }).collect();
@@ -132,7 +135,7 @@ fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
 }
 
 // energy-descent (value=false) or greedy depth-3 value lookahead (value=true) — the prior actors
-async fn reach_greedy(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+async fn reach_greedy(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> f32 {
     let (t, maxsteps) = (150usize, 60usize);
     let (mut pos, goal) = make_task(t);
     let xg = enc_batch(&goal);
@@ -152,14 +155,14 @@ async fn reach_greedy(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &
             } else { let d2 = xa.sub(&xg); d2.mul(&d2).sum(&[1], true).to_vec().await.iter().map(|e| -e).collect() };
             score.push(s);
         }
-        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for a in 1..NA { if score[a][i] > best { best = score[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
+        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for (a, item_a) in score.iter().enumerate().take(NA).skip(1) { if item_a[i] > best { best = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
     }
     reached.iter().filter(|&&r| r).count() as f32 / t as f32
 }
 
 // MPPI/CEM: per agent sample K action sequences of horizon H, roll in latent, score by terminal value,
 // soft-min-weight, pick the first action with the most weight. Receding-horizon.
-async fn reach_mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+async fn reach_mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> f32 {
     let (t, maxsteps) = (150usize, 60usize);
     let (mut pos, goal) = make_task(t);
     let mut reached = vec![false; t];
@@ -172,16 +175,16 @@ async fn reach_mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambd
         for i in 0..t { for _ in 0..kk { pos_rep.push(pos[i]); goal_rep.push(goal[i]); } }
         // sample K action sequences per agent: acts[h] is [t*K] actions
         let mut acts: Vec<Vec<usize>> = vec![vec![0usize; m]; hh];
-        for i in 0..t { for k in 0..kk { for h in 0..hh {
+        for i in 0..t { for k in 0..kk { for (h, item_h) in acts.iter_mut().enumerate().take(hh) {
             let seed = h32((stp as u32).wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503) ^ (k as u32).wrapping_mul(2_246_822_519) ^ (h as u32).wrapping_mul(3_266_489_917));
-            acts[h][i * kk + k] = (seed as usize) % NA;
+            item_h[i * kk + k] = (seed as usize) % NA;
         } } }
         let first: Vec<usize> = acts[0].clone(); // first action of each sampled sequence
         // roll H steps through the world model in latent
         let mut xh = enc_batch(&pos_rep);
-        for h in 0..hh {
+        for item_h in acts.iter().take(hh) {
             let mut oh = vec![0.0f32; m * NA];
-            for r in 0..m { oh[r * NA + acts[h][r]] = 1.0; }
+            for r in 0..m { oh[r * NA + item_h[r]] = 1.0; }
             xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA]));
         }
         // terminal value V(x_H, goal) — the bootstrap that makes a short rollout count long-horizon
@@ -196,7 +199,7 @@ async fn reach_mppi(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambd
             let mut wsum = [0.0f32; NA];
             for k in 0..kk { let w = ((vend[base + k] - vmax) / lambda).exp(); wsum[first[base + k]] += w; }
             let (mut ba, mut best) = (0usize, wsum[0]);
-            for a in 1..NA { if wsum[a] > best { best = wsum[a]; ba = a; } }
+            for (a, item_a) in wsum.iter().enumerate().take(NA).skip(1) { if *item_a > best { best = *item_a; ba = a; } }
             pos[i] = next_pos(pos[i], ba);
             if pos[i] == goal[i] { reached[i] = true; }
         }

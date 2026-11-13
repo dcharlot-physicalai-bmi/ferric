@@ -34,7 +34,9 @@ fn nearest(a: f32, b: f32, y0: f32, y1: f32) -> (f32, f32) { let ss = sols(a, b)
 fn energy(yv: &Var, ab: &Var, p: &[Var], one: &Var) -> Var { let sp = |z: Var| z.exp().add(one).log(); let h1 = sp(yv.matmul(&p[0]).add(&ab.matmul(&p[1])).add(&p[2])); let h2 = sp(h1.matmul(&p[3]).add(&p[4])); h2.matmul(&p[5]).add(&p[6]) }
 
 /// K-step energy descent on a batch of contexts `ab` (t×2). Returns the settled y (t×2), read back.
-async fn descend(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, k: usize, ab: &[f32], t: usize, seed: u32) -> Vec<f32> {
+struct Descent { k: usize, t: usize, seed: u32 }
+async fn descend(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, ab: &[f32], run: Descent) -> Vec<f32> {
+    let Descent { k, t, seed } = run;
     let abv = Var::leaf(Tensor::from_vec(ctx, ab, &[t, 2]));
     let pv: Vec<Var> = p.iter().map(|x| Var::leaf(x.clone())).collect(); let ov = Var::leaf(one.clone()); let alv = Var::leaf(al.clone());
     let mut y = Var::leaf(Tensor::from_vec(ctx, &randn(t * 2, seed ^ 0xabc, 0.8), &[t, 2]));
@@ -45,14 +47,14 @@ async fn descend(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al
 async fn eval_acc(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, k: usize, t: usize, seed0: u32) -> f32 {
     let mut ab = vec![0.0f32; t * 2]; let mut probs = Vec::new();
     for i in 0..t { let (a, b) = ctx_ab(seed0 + i as u32 * 5); ab[i * 2] = a; ab[i * 2 + 1] = b; probs.push((a, b)); }
-    let yk = descend(ctx, p, one, al, k, &ab, t, seed0).await;
+    let yk = descend(ctx, p, one, al, &ab, Descent { k, t, seed: seed0 }).await;
     let mut ok = 0; for i in 0..t { if correct(probs[i].0, probs[i].1, yk[i * 2], yk[i * 2 + 1]) { ok += 1; } } ok as f32 / t as f32 * 100.0
 }
 /// mean model SURPRISE (post-descent constraint residual) over a fixed eval set — the one scalar
 async fn eval_surprise(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, k0: usize, t: usize, seed0: u32) -> f32 {
     let mut ab = vec![0.0f32; t * 2]; let mut probs = Vec::new();
     for i in 0..t { let (a, b) = ctx_ab(seed0 + i as u32 * 5); ab[i * 2] = a; ab[i * 2 + 1] = b; probs.push((a, b)); }
-    let yk = descend(ctx, p, one, al, k0, &ab, t, seed0 ^ 0x5ee).await;
+    let yk = descend(ctx, p, one, al, &ab, Descent { k: k0, t, seed: seed0 ^ 0x5ee }).await;
     let mut s = 0.0; for i in 0..t { s += resid(probs[i].0, probs[i].1, yk[i * 2], yk[i * 2 + 1]); } s / t as f32
 }
 
@@ -86,7 +88,7 @@ async fn train_run(ctx: &Arc<ferric_core::Context>, curious: bool) -> (Vec<Row>,
         for i in 0..pool { let (a, b) = ctx_ab(step as u32 * 131 + i as u32 * 3 + 1); pab[i * 2] = a; pab[i * 2 + 1] = b; pprob.push((a, b)); }
         // weight w_i: surprise (curious) or 1 (control); weighted-without-replacement via key = u^(1/w), take top bs
         let w: Vec<f32> = if curious {
-            let yk = descend(ctx, &p, &one, &al, 3, &pab, pool, step as u32 * 17 + 5).await;
+            let yk = descend(ctx, &p, &one, &al, &pab, Descent { k: 3, t: pool, seed: step as u32 * 17 + 5 }).await;
             (0..pool).map(|i| resid(pprob[i].0, pprob[i].1, yk[i * 2], yk[i * 2 + 1]).max(1e-3)).collect()
         } else { vec![1.0f32; pool] };
         let mut keyed: Vec<(f32, usize)> = (0..pool).map(|i| (u(i as u32, step as u32 * 7 + 3).powf(1.0 / w[i]), i)).collect();

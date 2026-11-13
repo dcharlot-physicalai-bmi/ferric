@@ -112,12 +112,11 @@ struct Pol { p: Vec<f32> }                                              // flat 
 fn pol_len() -> usize { OD * HS + HS + HS * HS + HS + HS * 2 + 2 }
 impl Pol {
     fn act(&self, ob: &[f32; OD]) -> [f32; 2] {
-        let p = &self.p; let mut o1 = HS; // offset cursors
-        let (w1s, b1s) = (0, OD * HS); let w2s = b1s + HS; let b2s = w2s + HS * HS; let w3s = b2s + HS; let b3s = w3s + HS * 2;
+        let p = &self.p;         let (w1s, b1s) = (0, OD * HS); let w2s = b1s + HS; let b2s = w2s + HS * HS; let w3s = b2s + HS; let b3s = w3s + HS * 2;
         let mut h1 = [0.0f32; HS]; for j in 0..HS { let mut z = p[b1s + j]; for c in 0..OD { z += ob[c] * p[w1s + c * HS + j]; } h1[j] = z.max(0.0); }
         let mut h2 = [0.0f32; HS]; for j in 0..HS { let mut z = p[b2s + j]; for k in 0..HS { z += h1[k] * p[w2s + k * HS + j]; } h2[j] = z.max(0.0); }
         let mut out = [p[b3s], p[b3s + 1]]; for j in 0..HS { out[0] += h2[j] * p[w3s + j * 2]; out[1] += h2[j] * p[w3s + j * 2 + 1]; }
-        o1 = o1; [out[0].tanh() * PUSH_V, out[1].tanh() * PUSH_V]        // tanh-bounded pusher velocity
+        [out[0].tanh() * PUSH_V, out[1].tanh() * PUSH_V]        // tanh-bounded pusher velocity
     }
 }
 // DENSE reward for one episode: mean coverage over the whole trajectory (rewards reaching AND holding the pose) —
@@ -142,24 +141,24 @@ async fn run() {
     // PEAKED ~0.29 by gen ~120 then DEGRADED to 0.10 by gen 500. Cause: the update θ += lr/(pop·σ)·grad grows 4× as σ
     // shrinks, so late training takes ever-larger steps and diverges. Best config is CONSTANT σ, ~120 gens → 0.28.
     let n = pol_len(); let (pop, gens, sigma, lr) = (48usize, 120usize, 0.10f32, 0.03f32);
-    let mut theta = vec![0.0f32; n]; for i in 0..n { theta[i] = gauss(12345, i) * 0.1; }
+    let mut theta = vec![0.0f32; n]; for (i, item_i) in theta.iter_mut().enumerate().take(n) { *item_i = gauss(12345, i) * 0.1; }
     println!("  ES: {} params · pop {} (antithetic) · {} gens · σ={} (constant) · lr={} · dense reward · fresh seeds/gen", n, pop, gens, sigma, lr);
     for g in 0..gens {
         // fresh random training seeds EACH generation → the policy must generalize, not memorize a fixed set
         let train: Vec<u32> = (0..24u32).map(|j| 200000 + g as u32 * 977 + j).collect();
         let mut fs = vec![0.0f32; pop]; let base = (g as u32 + 1) * 100003;
-        for i in 0..pop {                                              // antithetic pairs share an epsilon
+        for (i, item_i) in fs.iter_mut().enumerate().take(pop) {                                              // antithetic pairs share an epsilon
             let sign = if i % 2 == 0 { 1.0 } else { -1.0 }; let eseed = base + (i as u32 / 2);
-            let mut cand = theta.clone(); for k in 0..n { cand[k] += sign * sigma * gauss(eseed, k); }
-            fs[i] = fitness(&Pol { p: cand }, im, &train);
+            let mut cand = theta.clone(); for (k, item_k) in cand.iter_mut().enumerate().take(n) { *item_k += sign * sigma * gauss(eseed, k); }
+            *item_i = fitness(&Pol { p: cand }, im, &train);
         }
         // rank-normalize fitness to [-0.5,0.5]
         let mut idx: Vec<usize> = (0..pop).collect(); idx.sort_by(|&a, &b| fs[a].partial_cmp(&fs[b]).unwrap());
         let mut rankw = vec![0.0f32; pop]; for (r, &ii) in idx.iter().enumerate() { rankw[ii] = r as f32 / (pop as f32 - 1.0) - 0.5; }
         let mut grad = vec![0.0f32; n];
-        for i in 0..pop { let sign = if i % 2 == 0 { 1.0 } else { -1.0 }; let eseed = base + (i as u32 / 2);
-            for k in 0..n { grad[k] += rankw[i] * sign * gauss(eseed, k); } }
-        for k in 0..n { theta[k] += lr / (pop as f32 * sigma) * grad[k]; }
+        for (i, item_i) in rankw.iter().enumerate().take(pop) { let sign = if i % 2 == 0 { 1.0 } else { -1.0 }; let eseed = base + (i as u32 / 2);
+            for (k, item_k) in grad.iter_mut().enumerate().take(n) { *item_k += *item_i * sign * gauss(eseed, k); } }
+        for (k, item_k) in grad.iter().enumerate().take(n) { theta[k] += lr / (pop as f32 * sigma) * *item_k; }
         if g % 40 == 39 || g == gens - 1 {                             // report held-out best-coverage success (the task metric)
             let pol = Pol { p: theta.clone() }; let (mut mc, mut ok) = (0.0f32, 0);
             for k in 800..860u32 { let c = episode(k, im, |w| pol.act(&w.obs())); mc += c; if c >= COV_OK { ok += 1; } }

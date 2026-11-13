@@ -29,6 +29,7 @@ fn ground_contact(b: &Body, ground_top: f64) -> Option<f64> {
 // Restitution is VELOCITY-ONLY (no Baumgarte velocity bias — that injects energy on repeated elastic bounces, the
 // recorded bug: e=1 rebounded to 6.2×h). Penetration is corrected by POSITION projection (split from velocity) below.
 fn solve_ground(b: &mut Body, _pen: f64, e: f64, mu: f64) {
+    if b.fixed { return; }                                          // the ground plane does not take an impulse
     let vn = b.v[1];
     let mut jn = -(1.0 + e) * vn * b.m; if jn < 0.0 { jn = 0.0; }   // only if approaching (vn<0)
     b.v[1] += jn * b.inv_m;
@@ -38,15 +39,23 @@ fn solve_ground(b: &mut Body, _pen: f64, e: f64, mu: f64) {
             if jt < -max_t { jt = -max_t; }
     b.v[0] += jt * b.inv_m;
 }
+// Full projection onto the plane. A Baumgarte velocity bias (BAUM/DT)·pen injected energy on elastic
+// bounces, so velocity stays restitution-only; BAUM > 0 still enables this positional correction.
+fn project_plane(b: &mut Body, gt: f64) {
+    if b.fixed || BAUM <= 0.0 { return; }
+    let extent = if b.is_box { b.half[1] } else { b.r };
+    if b.p[1] - extent < gt { b.p[1] = gt + extent; }
+}
 fn main() {
     println!("  SAPIEN→Rust step 2 · contact/friction impulse solver · VERIFICATION\n");
-    let gt = 0.0;                                                       // ground top at y=0
+    let ground = Body::ground();
+    let gt = if ground.fixed { ground.p[1] + ground.half[1] } else { 0.0 }; // fixed ground's top face
     // ── [1] restitution: drop from h, rebound peak should be e²·h ──
     println!("  [1] restitution — drop ball from h=1.0, measured rebound peak vs analytic e²·h:");
     for &e in &[0.0f64, 0.5, 1.0] {
         let mut b = Body::ball(0.0, 1.0 + 0.05, 0.05, 1.0); let mut peak_after = 0.0f64; let mut bounced = false;
         for _ in 0..4000 { b.v[1] -= G * DT; b.p[1] += b.v[1] * DT;
-            if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, e, 0.0); if b.p[1] - b.r < gt { b.p[1] = gt + b.r; } bounced = true; }
+            if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, e, 0.0); project_plane(&mut b, gt); bounced = true; }
             if bounced && b.v[1] <= 0.0 { peak_after = peak_after.max(b.p[1] - b.r); } }
         println!("     e={:.1}: rebound peak {:.4} · analytic e²·h {:.4} · err {:.1e}", e, peak_after, e * e * 1.0, (peak_after - e * e).abs()); }
     // ── [2] Coulomb friction threshold (μ=0.5, N=mg): below μN no slide, above → a=(F−μN)/m ──
@@ -56,7 +65,7 @@ fn main() {
         let mut b = Body::boxb(0.0, 0.1, 0.1, 0.1, 1.0); let mut settled_v = 0.0;
         for step in 0..2000 { b.v[1] -= G * DT; b.v[0] += f * DT;       // gravity + applied tangential force
             b.p[0] += b.v[0] * DT; b.p[1] += b.v[1] * DT;
-            if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, 0.0, mu); if b.p[1] - b.half[1] < gt { b.p[1] = gt + b.half[1]; } }
+            if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, 0.0, mu); project_plane(&mut b, gt); }
             if step > 1500 { settled_v = b.v[0]; } }
         let a_ana = if f > mun { (f - mun) / 1.0 } else { 0.0 };
         let a_meas = settled_v / DT / 1.0;                              // steady acceleration ≈ per-step Δv/DT... report velocity trend
@@ -78,7 +87,7 @@ fn main() {
     println!("\n  [4] resting stability — box dropped, then at rest for 10 s (no drift, bounded penetration):");
     let mut b = Body::boxb(0.0, 0.1, 0.1, 0.1, 1.0); let (mut max_pen, mut max_drift) = (0.0f64, 0.0f64);
     for step in 0..2400 { b.v[1] -= G * DT; b.p[0] += b.v[0] * DT; b.p[1] += b.v[1] * DT;
-        if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, 0.0, 0.6); max_pen = max_pen.max(pen.max(0.0)); if b.p[1] - b.half[1] < gt { b.p[1] = gt + b.half[1]; } }
+        if let Some(pen) = ground_contact(&b, gt) { solve_ground(&mut b, pen, 0.0, 0.6); max_pen = max_pen.max(pen.max(0.0)); project_plane(&mut b, gt); }
         if step > 600 { max_drift = max_drift.max(b.v[0].abs() + (b.p[1] - (gt + b.half[1])).abs()); } }
     println!("     max penetration {:.2e} · max resting drift (v+Δy) {:.2e}  {}", max_pen, max_drift,
         if max_pen < 5e-3 && max_drift < 5e-3 { "✓ stable, bounded" } else { "✗" });

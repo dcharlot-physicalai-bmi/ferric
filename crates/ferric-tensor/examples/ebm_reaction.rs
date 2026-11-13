@@ -33,11 +33,11 @@ fn main() {
     let dx = 20.0 / NX as f64; let dt = 0.002; let nt = 1200;
     // initial condition: spatially-structured field so u, u_xx, u² all vary (not a uniform state / pure front)
     let mut u = vec![0.0f64; NX];
-    for i in 0..NX { let x = i as f64 * dx; u[i] = 0.45 + 0.25 * (0.7 * x).sin() + 0.12 * (1.9 * x + 1.0).sin(); }
+    for (i, item_i) in u.iter_mut().enumerate().take(NX) { let x = i as f64 * dx; *item_i = 0.45 + 0.25 * (0.7 * x).sin() + 0.12 * (1.9 * x + 1.0).sin(); }
     let mut field = Vec::with_capacity(nt); field.push(u.clone());
     for _ in 1..nt { let mut un = vec![0.0f64; NX];
-        for i in 0..NX { let ip = (i + 1) % NX; let im = (i + NX - 1) % NX; let uxx = (u[ip] - 2.0 * u[i] + u[im]) / (dx * dx);
-            un[i] = u[i] + dt * (uxx + u[i] * (1.0 - u[i])); }
+        for (i, item_i) in u.iter().enumerate().take(NX) { let ip = (i + 1) % NX; let im = (i + NX - 1) % NX; let uxx = (u[ip] - 2.0 * *item_i + u[im]) / (dx * dx);
+            un[i] = *item_i + dt * (uxx + *item_i * (1.0 - *item_i)); }
         u = un; field.push(u.clone()); }
     // sample (x,t) interior; finite-diff u_t/u_x/u_xx + 1% noise; build library
     let mut theta = Vec::new(); let mut ut = Vec::new(); let mut n = 0usize;

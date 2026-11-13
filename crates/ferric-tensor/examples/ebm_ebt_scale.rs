@@ -46,7 +46,9 @@ fn energy(yv: &Var, cx: &Var, p: &[Var], one: &Var) -> Var {
 }
 
 // solve a fresh test set by K descent steps; return constraint-satisfaction fraction
-async fn solve(ctx: &Arc<ferric_core::Context>, d: usize, p: &[Tensor], one: &Tensor, al: &Tensor, scale: f32, k: usize, t: usize, seed0: u32) -> f32 {
+struct SolveRun { scale: f32, k: usize, t: usize, seed0: u32 }
+async fn solve(ctx: &Arc<ferric_core::Context>, d: usize, p: &[Tensor], one: &Tensor, al: &Tensor, run: SolveRun) -> f32 {
+    let SolveRun { scale, k, t, seed0 } = run;
     let mut cxf = vec![0.0f32; t * 2 * (d - 1)]; let mut probs = Vec::with_capacity(t);
     for i in 0..t { let (c, _) = problem(d, seed0 + i as u32 * 7, scale); for (j, v) in c.iter().enumerate() { cxf[i * 2 * (d - 1) + j] = *v; } probs.push(c); }
     let cxv = Var::leaf(Tensor::from_vec(ctx, &cxf, &[t, 2 * (d - 1)]));
@@ -119,7 +121,7 @@ async fn run() {
         for &he in &[128usize, 256, 512] {
             let p = train(&ctx, d, he, &one).await;
             let mut best = 0.0f32;
-            for &k in &ks { let a = solve(&ctx, d, &p, &one, &al, 1.0, k, 400, 3000 + d as u32 * 1000 + he as u32).await * 100.0; if a > best { best = a; } }
+            for &k in &ks { let a = solve(&ctx, d, &p, &one, &al, SolveRun { scale: 1.0, k, t: 400, seed0: 3000 + d as u32 * 1000 + he as u32 }).await * 100.0; if a > best { best = a; } }
             print!("{:>5.0} ", best);
         }
         println!();

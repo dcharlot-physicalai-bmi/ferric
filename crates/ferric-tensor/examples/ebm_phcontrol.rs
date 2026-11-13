@@ -62,7 +62,7 @@ async fn run() {
     // eval: reach% + CERTIFY (fraction of steps with E non-increasing) across test goals
     let nep = 60usize; let ng = TESTG.len(); let n = nep * ng;
     let mut th = vec![0.0f32; n]; let mut om = vec![0.0f32; n]; let mut gg = vec![0.0f32; n];
-    for gi in 0..ng { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = TESTG[gi]; } }
+    for (gi, item_gi) in TESTG.iter().enumerate().take(ng) { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = *item_gi; } }
     let (mut reach, mut desc, mut dtot) = (vec![true; n], 0.0f32, 0.0f32);
     for t in 0..260 {
         // energy-shaping control: dV/dθ via autograd on the learned potential; u = sinθ − dV/dθ + (0.05−R)ω

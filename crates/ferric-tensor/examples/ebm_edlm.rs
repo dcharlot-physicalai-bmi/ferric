@@ -32,15 +32,15 @@ fn ar_input(prev: usize, t: usize, row: &mut [f32]) { for x in row.iter_mut() { 
 // autoregressively sample m sequences from the (frozen) AR proposal
 async fn ar_sample(ctx: &Arc<ferric_core::Context>, ap: &[Tensor], m: usize, seed: u32) -> Vec<Vec<usize>> {
     let mut seqs = vec![vec![0usize; L]; m]; let mut prev = vec![V; m];
-    for t in 0..L {
+    for (t, _) in (0..L).enumerate() {
         let mut inp = vec![0.0f32; m * (V + L)];
         for n in 0..m { ar_input(prev[n], t, &mut inp[n * (V + L)..(n + 1) * (V + L)]); }
         let lg = Tensor::from_vec(ctx, &inp, &[m, V + L]).matmul(&ap[0]).add(&ap[1]).relu().matmul(&ap[2]).add(&ap[3]).to_vec().await;
         for n in 0..m {
             let mut mx = f32::MIN; for k in 0..V { if lg[n * V + k] > mx { mx = lg[n * V + k]; } }
-            let mut ex = [0.0f32; V]; let mut z = 0.0f32; for k in 0..V { ex[k] = (lg[n * V + k] - mx).exp(); z += ex[k]; }
+            let mut ex = [0.0f32; V]; let mut z = 0.0f32; for (k, item_k) in ex.iter_mut().enumerate().take(V) { *item_k = (lg[n * V + k] - mx).exp(); z += *item_k; }
             let r = u(n as u32, seed.wrapping_add(t as u32 * 7919)); let mut cum = 0.0f32; let mut tok = V - 1;
-            for k in 0..V { cum += ex[k] / z; if r <= cum { tok = k; break; } }
+            for (k, item_k) in ex.iter().enumerate().take(V) { cum += *item_k / z; if r <= cum { tok = k; break; } }
             seqs[n][t] = tok; prev[n] = tok;
         }
     }

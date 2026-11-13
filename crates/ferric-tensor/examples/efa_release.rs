@@ -18,6 +18,7 @@ const G9: [f32; 9] = [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0];
 const TG: [(f32, f32); 4] = [(0.8, -0.8), (-1.0, 0.6), (0.5, 1.0), (-0.6, -0.9)];
 const OUTDIR: &str = "/Users/dcharlot/vibe-coding/efa/models/efa-hybrid-arm2";
 use std::f32::consts::PI;
+type StTensor = (String, Vec<usize>, Vec<f32>);
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
@@ -49,7 +50,7 @@ fn save_safetensors(path: &str, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> s
     for (_, _, data) in tensors { for v in data { f.write_all(&v.to_le_bytes())?; } }
     Ok(())
 }
-fn load_safetensors(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
+fn load_safetensors(path: &str) -> std::io::Result<Vec<StTensor>> {
     let raw = std::fs::read(path)?;
     let hl = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
     let header = std::str::from_utf8(&raw[8..8 + hl]).unwrap().to_string();
@@ -209,11 +210,11 @@ async fn run() {
         // ---- save ----
         std::fs::create_dir_all(OUTDIR).unwrap();
         let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![];
-        for c in 0..11 { tensors.push((format!("potential.in{}", c), vec![1, H], ef.w[c].clone())); }
+        for (c, item_c) in ef.w.iter().enumerate().take(11) { tensors.push((format!("potential.in{}", c), vec![1, H], item_c.clone())); }
         tensors.push(("potential.b1".into(), vec![H], ef.b1.clone())); tensors.push(("potential.w2".into(), vec![H, H], ef.w2.clone()));
         tensors.push(("potential.b2".into(), vec![H], ef.b2.clone())); tensors.push(("potential.w3".into(), vec![H, 1], ef.w3.clone()));
         tensors.push(("potential.b3".into(), vec![1], vec![ef.b3]));
-        for c in 0..11 { tensors.push((format!("correction.in{}", c), vec![1, H], wn.w[c].clone())); }
+        for (c, item_c) in wn.w.iter().enumerate().take(11) { tensors.push((format!("correction.in{}", c), vec![1, H], item_c.clone())); }
         tensors.push(("correction.b1".into(), vec![H], wn.b1.clone())); tensors.push(("correction.w2".into(), vec![H, H], wn.w2.clone()));
         tensors.push(("correction.b2".into(), vec![H], wn.b2.clone())); tensors.push(("correction.w3".into(), vec![H, 2], wn.w3.clone()));
         tensors.push(("correction.b3".into(), vec![2], vec![wn.b3[0], wn.b3[1]]));

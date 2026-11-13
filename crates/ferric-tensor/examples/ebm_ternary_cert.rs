@@ -19,6 +19,7 @@
 //!      artifact evaluated on the Rust fabric is the artifact dReal proved.
 //!   2. CERTIFIED DESCENT: rolls out trajectories from the certified annulus and measures the property the
 //!      SMT proof guarantees — V strictly decreases at every in-annulus step — plus convergence to the ball.
+//!
 //! HONEST scope: 2D benchmark; certificate is dReal's, on the annulus, at δ=5e-3 / decrease-margin 1e-3;
 //! R=1.4 has genuine counterexamples; the synthesis METHOD is Chang & Gao's — our legs are the ternary
 //! weights, the quadratic-anchored init, and the train-stricter-than-verify margin design. Artifact + ops
@@ -121,7 +122,7 @@ fn main() {
         if hit { reached += 1; }
     }
     println!("2 · CERTIFIED DESCENT: {}/{} in-annulus steps strictly decreased V ({}%); {}/{} trajectories reached the inner ball",
-        descents, steps_in, if steps_in > 0 { 100 * descents / steps_in } else { 0 }, reached, n);
+        descents, steps_in, (100 * descents).checked_div(steps_in).unwrap_or(0), reached, n);
     assert!(descents == steps_in && reached == n, "certified property violated at runtime");
 
     println!("\nPASS — the SMT-certified ternary energy runs, matches, and descends on the pure-Rust fabric.");

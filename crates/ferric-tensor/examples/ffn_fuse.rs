@@ -6,6 +6,8 @@ use ferric_core::Context;
 use ferric_tensor::{Q4_KWeights, Q5_KWeights, Q6_KWeights, Tensor};
 use std::sync::Arc;
 use half::f16;
+type StepFn = dyn Fn(&Tensor) -> Tensor;
+type StepPair = (Box<StepFn>, Box<StepFn>);
 
 fn q4k_block(seed: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(144);
@@ -67,10 +69,7 @@ async fn run() {
 
     for fmt in ["Q4_K", "Q5_K", "Q6_K"] {
         // build a gate_up weight and closures: fused kernel + un-fused reference, for this format
-        let (fused, refv): (
-            Box<dyn Fn(&Tensor) -> Tensor>,
-            Box<dyn Fn(&Tensor) -> Tensor>,
-        ) = match fmt {
+        let (fused, refv): StepPair = match fmt {
             "Q4_K" => {
                 let mut p = Vec::new();
                 for r in 0..rows_w { for blk in 0..nblk { p.extend(q4k_block((r * nblk + blk) as u32 + 1)); } }

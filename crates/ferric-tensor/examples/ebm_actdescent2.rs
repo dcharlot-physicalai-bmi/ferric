@@ -15,6 +15,8 @@ const H: usize = 64; const DT: f32 = 0.05; const GAMMA: f32 = 0.97; const UMAX: 
 const ACTS: [f32; 5] = [-3.0, -1.5, 0.0, 1.5, 3.0];
 const TESTG: [f32; 4] = [-1.5, -0.5, 0.5, 1.5];
 use std::f32::consts::PI;
+type Col = Vec<f32>;
+type FiveCols = (Col, Col, Col, Col, Col);
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
 fn u(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(i as u32, seed); let b = u(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect() }
@@ -86,7 +88,7 @@ async fn run() {
     let ks = [0usize, 1, 2, 4, 8, 16]; let mut results: Vec<(usize, f32, f32)> = vec![];
     for &kdesc in &ks {
         let mut th = vec![0.0f32; n]; let mut om = vec![0.0f32; n]; let mut gg = vec![0.0f32; n]; let mut uprev = vec![0.0f32; n];
-        for gi in 0..ng { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = TESTG[gi]; } }
+        for (gi, item_gi) in TESTG.iter().enumerate().take(ng) { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = *item_gi; } }
         let (mut reach, mut tv, mut tvn) = (vec![true; n], 0.0f32, 0.0f32);
         for t in 0..steps {
             let mut uu = vec![0.0f32; n];
@@ -94,7 +96,7 @@ async fn run() {
             else {
                 let mut ucur = uprev.clone();                                                    // warm-start
                 // per-episode state columns are constant across descent steps; only u,u² change
-                let (rcc, rss, omm, ctt, stt): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
+                let (rcc, rss, omm, ctt, stt): FiveCols =
                     (0..n).map(|i| { let d = th[i] - gg[i]; (d.cos(), d.sin(), om[i], th[i].cos(), th[i].sin()) }).fold((vec![], vec![], vec![], vec![], vec![]), |mut a, x| { a.0.push(x.0); a.1.push(x.1); a.2.push(x.2); a.3.push(x.3); a.4.push(x.4); a });
                 let rcv = Var::leaf(Tensor::from_vec(&ctx, &rcc, &[n, 1])); let rsv = Var::leaf(Tensor::from_vec(&ctx, &rss, &[n, 1])); let omv = Var::leaf(Tensor::from_vec(&ctx, &omm, &[n, 1]));
                 let ctv = Var::leaf(Tensor::from_vec(&ctx, &ctt, &[n, 1])); let stv = Var::leaf(Tensor::from_vec(&ctx, &stt, &[n, 1]));

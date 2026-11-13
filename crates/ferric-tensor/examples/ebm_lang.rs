@@ -84,18 +84,18 @@ async fn run() {
 
     // 1. CONTROL: obey each instruction (reach the instruction's goal by greedy descent)
     let mut reach = 0; let mut tot = 0; let n = 60usize;
-    for instr in 0..K { for i in 0..n { let mut th = (u(9000 + (instr * n + i) as u32, 1) * 2.0 - 1.0) * PI; let mut om = 0.0f32;
-        for _ in 0..200 { let uu = e.greedy(th, om, instr); let (nt, no) = step(th, om, uu); th = nt; om = no; if wrap(th - GOALS[instr]).abs() < 0.2 && om.abs() < 0.5 { break; } }
-        if wrap(th - GOALS[instr]).abs() < 0.3 && om.abs() < 0.6 { reach += 1; } tot += 1; } }
+    for (instr, item_instr) in GOALS.iter().enumerate().take(K) { for i in 0..n { let mut th = (u(9000 + (instr * n + i) as u32, 1) * 2.0 - 1.0) * PI; let mut om = 0.0f32;
+        for _ in 0..200 { let uu = e.greedy(th, om, instr); let (nt, no) = step(th, om, uu); th = nt; om = no; if wrap(th - *item_instr).abs() < 0.2 && om.abs() < 0.5 { break; } }
+        if wrap(th - *item_instr).abs() < 0.3 && om.abs() < 0.6 { reach += 1; } tot += 1; } }
     // 2. VERIFY: low-E picks the helping over the hurting action (vs TRUE distance to the instruction's goal)
     let mut vok = 0; let mut vtot = 0;
-    for instr in 0..K { for i in 0..400 { let th = (u(20000 + (instr * 400 + i) as u32, 1) * 2.0 - 1.0) * PI; let om = (u(20000 + (instr * 400 + i) as u32, 2) * 2.0 - 1.0) * 2.5;
-        let ug = e.greedy(th, om, instr); let (nt, _) = step(th, om, ug); let dg = wrap(nt - GOALS[instr]).abs();
+    for (instr, item_instr) in GOALS.iter().enumerate().take(K) { for i in 0..400 { let th = (u(20000 + (instr * 400 + i) as u32, 1) * 2.0 - 1.0) * PI; let om = (u(20000 + (instr * 400 + i) as u32, 2) * 2.0 - 1.0) * 2.5;
+        let ug = e.greedy(th, om, instr); let (nt, _) = step(th, om, ug); let dg = wrap(nt - *item_instr).abs();
         let mut wu = 0.0; let mut we_ = f32::MIN; for &uu in &ACTS { let (a, b) = step(th, om, uu); let en = e.eval(a, b, instr); if en > we_ { we_ = en; wu = uu; } }
-        let (wt, _) = step(th, om, wu); if dg <= wrap(wt - GOALS[instr]).abs() { vok += 1; } vtot += 1; } }
+        let (wt, _) = step(th, om, wu); if dg <= wrap(wt - *item_instr).abs() { vok += 1; } vtot += 1; } }
     // 3. REMEMBER: does each INSTRUCTION's energy put its minimum at that instruction's goal? (the energy DECODED the command)
     let mut mem = 0.0f32;
-    for instr in 0..K { let mut bth = 0.0; let mut be = f32::MAX; for gi in 0..361 { let th = -PI + gi as f32 / 360.0 * 2.0 * PI; let en = e.eval(th, 0.0, instr); if en < be { be = en; bth = th; } } mem += wrap(bth - GOALS[instr]).abs(); }
+    for (instr, item_instr) in GOALS.iter().enumerate().take(K) { let mut bth = 0.0; let mut be = f32::MAX; for gi in 0..361 { let th = -PI + gi as f32 / 360.0 * 2.0 * PI; let en = e.eval(th, 0.0, instr); if en < be { be = en; bth = th; } } mem += wrap(bth - *item_instr).abs(); }
     mem /= K as f32;
     // 4. CERTIFY (Lyapunov) along the controlled trajectory
     let mut mono = 0.0f32; let mut mtot = 0.0f32;

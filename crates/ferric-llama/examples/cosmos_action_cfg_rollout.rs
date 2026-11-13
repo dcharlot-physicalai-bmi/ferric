@@ -110,9 +110,9 @@ async fn run() {
     let mut sched = UniPc::new(4);
     let mut lat: Vec<f64> = init_action.clone();
     let t0 = std::time::Instant::now();
-    for i in 0..4 {
-        let cond = forward(&und_cond, &lat, timesteps[i]);
-        let uncond = forward(&und_uncond, &lat, timesteps[i]);
+    for (i, &ts) in timesteps.iter().enumerate().take(4) {
+        let cond = forward(&und_cond, &lat, ts);
+        let uncond = forward(&und_uncond, &lat, ts);
         // CFG + zero padding channels of the velocity
         let mut v = vec![0f64; alen * adim];
         for a in 0..alen { for c in 0..adim {
@@ -121,7 +121,7 @@ async fn run() {
         }}
         lat = sched.step(&v, &lat);
         for a in 0..alen { for c in raw..adim { lat[a * adim + c] = 0.0; } } // zero padding channels of latents
-        println!("  step {i} t={:.0}: latent[0,:5]={:?}", timesteps[i], round(&lat[..5], 5));
+        println!("  step {i} t={:.0}: latent[0,:5]={:?}", ts, round(&lat[..5], 5));
     }
     println!("CFG rollout (8× packing forward + UniPC) {:?}", t0.elapsed());
     // slice to raw_action_dim

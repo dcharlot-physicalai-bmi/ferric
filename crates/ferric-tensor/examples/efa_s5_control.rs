@@ -35,14 +35,17 @@ fn gbox(x1: Iv, x2: Iv, a: f64, b: f64, c: f64, k1: f64, k2: f64) -> f64 {
     let vx2 = x1.scale(2.0*b).add(x2.scale(2.0*c));
     vx1.mul(f1).add(vx2.mul(f2)).add(x1.sq().add(x2.sq()).scale(ALPHA)).hi
 }
-fn cert_box(x1: Iv, x2: Iv, a:f64,b:f64,c:f64,k1:f64,k2:f64, depth:u32) -> Option<(f64,f64)> {
+#[derive(Clone, Copy)]
+struct Gains { a: f64, b: f64, c: f64, k1: f64, k2: f64 }
+fn cert_box(x1: Iv, x2: Iv, g: Gains, depth: u32) -> Option<(f64, f64)> {
+    let Gains { a, b, c, k1, k2 } = g;
     if x1.lo>-R0 && x1.hi<R0 && x2.lo>-R0 && x2.hi<R0 { return None; }
     // positivity of V=xᵀPx is structural for a,c>0 & det>0; here we check the decrease condition soundly
     if gbox(x1,x2,a,b,c,k1,k2) < 0.0 { return None; }
     if depth==0 { return Some(((x1.lo+x1.hi)/2.0,(x2.lo+x2.hi)/2.0)); }
     let (m1,m2)=((x1.lo+x1.hi)/2.0,(x2.lo+x2.hi)/2.0);
     for &(p,q) in &[(x1.lo,m1),(m1,x1.hi)] { for &(u,v) in &[(x2.lo,m2),(m2,x2.hi)] {
-        if let Some(w)=cert_box(Iv{lo:p,hi:q},Iv{lo:u,hi:v},a,b,c,k1,k2,depth-1){return Some(w);} } }
+        if let Some(w)=cert_box(Iv{lo:p,hi:q},Iv{lo:u,hi:v}, Gains { a, b, c, k1, k2 }, depth-1){return Some(w);} } }
     None
 }
 fn verify(a:f64,b:f64,c:f64,k1:f64,k2:f64, r:f64) -> (usize, Vec<(f64,f64)>) {
@@ -50,7 +53,7 @@ fn verify(a:f64,b:f64,c:f64,k1:f64,k2:f64, r:f64) -> (usize, Vec<(f64,f64)>) {
     if a<=1e-6 || c<=1e-6 || a*c-b*b<=1e-6 { return (GB*GB, vec![(0.1,0.0)]); }
     let mut ce=Vec::new(); let step=2.0*r/GB as f64;
     for i in 0..GB { for j in 0..GB { let (lo1,lo2)=(-r+i as f64*step,-r+j as f64*step);
-        if let Some(w)=cert_box(Iv{lo:lo1,hi:lo1+step},Iv{lo:lo2,hi:lo2+step},a,b,c,k1,k2,MAXD){ce.push(w);} } }
+        if let Some(w)=cert_box(Iv{lo:lo1,hi:lo1+step},Iv{lo:lo2,hi:lo2+step}, Gains { a, b, c, k1, k2 }, MAXD){ce.push(w);} } }
     (ce.len(), ce)
 }
 // independent oracle: does the closed loop truly reach upright from x0?

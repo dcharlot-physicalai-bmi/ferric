@@ -103,8 +103,8 @@ async fn run() {
     for c in 0..NC {
         let e0 = etraj[0][c]; let ef = etraj[kmax][c]; efinal[c] = ef;
         let drop = (e0 - ef).max(1e-6);
-        let mut w = 0.0; for k in 0..=kmax { w += (etraj[k][c] - ef).max(0.0); } work[c] = w;              // integrated descent "work"
-        let mut s = kmax as f32; for k in 0..=kmax { if e0 - etraj[k][c] >= 0.95 * drop { s = k as f32; break; } } steps95[c] = s;
+        let mut w = 0.0; for item_k in etraj.iter().take(kmax + 1) { w += (item_k[c] - ef).max(0.0); } work[c] = w;              // integrated descent "work"
+        let mut s = kmax as f32; for (k, item_k) in etraj.iter().enumerate().take(kmax + 1) { if e0 - item_k[c] >= 0.95 * drop { s = k as f32; break; } } steps95[c] = s;
         let mut d = 0.0; for k in 0..V { let pt = tp[c * V + k]; let pm = pfin[c * V + k].max(1e-9); if pt > 1e-9 { d += pt * (pt / pm).ln(); } } kl[c] = d;
     }
     let mean_kl = kl.iter().sum::<f32>() / NC as f32;

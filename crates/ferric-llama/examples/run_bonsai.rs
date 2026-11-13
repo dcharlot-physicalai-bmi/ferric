@@ -103,7 +103,7 @@ async fn run() {
     let finite = last.iter().all(|x| x.is_finite());
     let mut idx: Vec<usize> = (0..last.len()).collect();
     idx.sort_by(|&a, &b| last[b].partial_cmp(&last[a]).unwrap());
-    println!("\nforward {:?} ({} tok){}", dt, ids.len(), if layers.is_some() { format!(" [first {} layers]", layers.unwrap()) } else { String::new() });
+    println!("\nforward {:?} ({} tok){}", dt, ids.len(), if let Some(n) = layers { format!(" [first {n} layers]") } else { String::new() });
     println!("  finite: {finite}");
     println!("  top-8 next-token:");
     for &i in idx.iter().take(8) {

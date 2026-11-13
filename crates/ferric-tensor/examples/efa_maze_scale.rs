@@ -11,6 +11,7 @@
 //! Run: `cargo run -p ferric-tensor --example efa_maze_scale --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+type Cell = (usize, usize);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -123,7 +124,7 @@ async fn run() {
     println!("  If it plateaus → the remaining gap is data/algorithm, not capacity.");
 }
 
-async fn reach(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+async fn reach(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> f32 {
     let (t, maxsteps) = (150usize, 60usize);
     let pos0: Vec<(usize, usize)> = (0..t).map(|i| {
         let left = u(i as u32, 21) < 0.5;
@@ -153,7 +154,7 @@ async fn reach(ctx: &Arc<ferric_core::Context>, value: bool, predict_t: &dyn Fn(
             } else { let d2 = xa.sub(&xg); d2.mul(&d2).sum(&[1], true).to_vec().await.iter().map(|e| -e).collect() };
             score.push(s);
         }
-        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for a in 1..NA { if score[a][i] > best { best = score[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
+        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for (a, item_a) in score.iter().enumerate().take(NA).skip(1) { if item_a[i] > best { best = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
     }
     reached.iter().filter(|&&r| r).count() as f32 / t as f32
 }

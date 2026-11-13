@@ -23,27 +23,35 @@ fn main() {
                "--user-data-dir=/tmp/ferric-bw", &bridge.url()])
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("launch chrome");
 
-    // wait for the tab to connect and signal ready
-    let t0 = Instant::now();
-    let conn = loop {
-        if let Some(c) = bridge.take_worker() { break c; }
-        if t0.elapsed() > Duration::from_secs(30) { let _ = child.kill(); panic!("browser never connected"); }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let ready = conn.recv().expect("ready handshake");
-    println!("  browser worker connected ({}B ready frame)", ready.len());
+    // The tab is killed after the matmul; its status is the signal from that kill. Record it, then
+    // surface a connect/handshake failure that happened before the reap.
+    let outcome = (|| -> Result<f32, String> {
+        // wait for the tab to connect and signal ready
+        let t0 = Instant::now();
+        let conn = loop {
+            if let Some(c) = bridge.take_worker() { break c; }
+            if t0.elapsed() > Duration::from_secs(30) { return Err("browser never connected".into()); }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let ready = conn.recv().map_err(|e| format!("ready handshake: {e}"))?;
+        println!("  browser worker connected ({}B ready frame)", ready.len());
 
-    // dispatch a batched matmul to the browser's WebGPU
-    let dev = Device::BrowserWorker(conn);
-    let (batch, m, k, n) = (4usize, 8, 6, 5);
-    let a = seq(batch * m * k, 1.0);
-    let b = seq(k * n, 2.0);
-    let got = dev.bmm(&a, &b, batch, m, k, n);
-    let cpu = Device::Cpu.bmm(&a, &b, batch, m, k, n);
-    let diff = maxdiff(&got, &cpu);
+        // dispatch a batched matmul to the browser's WebGPU
+        let dev = Device::BrowserWorker(conn);
+        let (batch, m, k, n) = (4usize, 8, 6, 5);
+        let a = seq(batch * m * k, 1.0);
+        let b = seq(k * n, 2.0);
+        let got = dev.bmm(&a, &b, batch, m, k, n);
+        let cpu = Device::Cpu.bmm(&a, &b, batch, m, k, n);
+        let diff = maxdiff(&got, &cpu);
+        println!("  matmul [{batch},{m},{k}]·[{k},{n}] on {} · max|browser-cpu| = {:.2e}", dev.name(), diff);
+        Ok(diff)
+    })();
+
     let _ = child.kill();
-
-    println!("  matmul [{batch},{m},{k}]·[{k},{n}] on {} · max|browser-cpu| = {:.2e}", dev.name(), diff);
+    let status = child.wait().expect("wait for chrome");
+    eprintln!("chrome exit status: {status}");
+    let diff = outcome.unwrap_or_else(|e| panic!("{e}"));
     assert!(diff < 1e-3, "browser worker mismatch {diff}");
     println!("✅ The scheduler physically spans the BROWSER — a tab's WebGPU served an op dispatched from native Rust");
 }

@@ -40,11 +40,11 @@ fn main() {
     // _mask_velocity_predictions (action branch) + CFG: zero conditioning rows, zero pad channels
     let mask_pad_cfg = |cond: &[f64], uncond: &[f64]| -> Vec<f64> {
         let mut v = vec![0.0; t * adim];
-        for row in 0..t {
+        for (row, &mask) in cond_mask.iter().enumerate().take(t) {
             for c in 0..adim {
                 let k = row * adim + c;
                 let cfg_v = uncond[k] + cfg * (cond[k] - uncond[k]);
-                v[k] = if c >= raw { 0.0 } else { cfg_v * (1.0 - cond_mask[row]) };
+                v[k] = if c >= raw { 0.0 } else { cfg_v * (1.0 - mask) };
             }
         }
         v

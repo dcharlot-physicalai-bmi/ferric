@@ -30,7 +30,9 @@ fn correct(a: f32, b: f32, y0: f32, y1: f32) -> bool { (y0 * y0 + y1 * y1 - a).a
 fn energy(yv: &Var, ab: &Var, p: &[Var], one: &Var) -> Var { let sp = |z: Var| z.exp().add(one).log(); let h1 = sp(yv.matmul(&p[0]).add(&ab.matmul(&p[1])).add(&p[2])); let h2 = sp(h1.matmul(&p[3]).add(&p[4])); h2.matmul(&p[5]).add(&p[6]) }
 
 // solve by energy descent (K steps); return fraction satisfying the constraints
-async fn solve(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, amin: f32, amax: f32, k: usize, t: usize, seed0: u32) -> f32 {
+struct SolveSpan { amin: f32, amax: f32, k: usize, t: usize, seed0: u32 }
+async fn solve(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, al: &Tensor, run: SolveSpan) -> f32 {
+    let SolveSpan { amin, amax, k, t, seed0 } = run;
     let mut ab = vec![0.0f32; t * 2]; let mut probs = Vec::with_capacity(t);
     for i in 0..t { let (a, b) = ctx_ab(seed0 + i as u32 * 5, amin, amax); ab[i * 2] = a; ab[i * 2 + 1] = b; probs.push((a, b)); }
     let abv = Var::leaf(Tensor::from_vec(ctx, &ab, &[t, 2])); let pv: Vec<Var> = p.iter().map(|x| Var::leaf(x.clone())).collect(); let ov = Var::leaf(one.clone()); let alv = Var::leaf(al.clone());
@@ -79,10 +81,10 @@ async fn run() {
     // ---- eval: solve accuracy by energy descent, vs K (thinking), in-dist and OOD ----
     println!("\n  solve accuracy of the descent-trained EBT vs #thinking steps K (multivalued; NOTE: a fair feedforward also solves this — see ebm_edge.rs):");
     print!("     in-distribution (a∈[0.6,1.4]):  ");
-    for &k in &[1usize, 3, 6, 12, 25] { print!("K={}:{:>3.0}%  ", k, solve(&ctx, &p, &one, &al, 0.6, 1.4, k, 400, 900).await * 100.0); }
+    for &k in &[1usize, 3, 6, 12, 25] { print!("K={}:{:>3.0}%  ", k, solve(&ctx, &p, &one, &al, SolveSpan { amin: 0.6, amax: 1.4, k, t: 400, seed0: 900 }).await * 100.0); }
     println!();
     print!("     OUT-OF-DIST (a∈[1.4,2.2]):      ");
-    for &k in &[1usize, 3, 6, 12, 25] { print!("K={}:{:>3.0}%  ", k, solve(&ctx, &p, &one, &al, 1.4, 2.2, k, 400, 5000).await * 100.0); }
+    for &k in &[1usize, 3, 6, 12, 25] { print!("K={}:{:>3.0}%  ", k, solve(&ctx, &p, &one, &al, SolveSpan { amin: 1.4, amax: 2.2, k, t: 400, seed0: 5000 }).await * 100.0); }
     println!("\n\n  trained THROUGH the unrolled descent (2nd-order autograd) → the EBT solves the multivalued system by");
     println!("  energy descent where feed-forward can't, and thinking (more K) refines the answer — the real EBT, on Ferric.");
 }

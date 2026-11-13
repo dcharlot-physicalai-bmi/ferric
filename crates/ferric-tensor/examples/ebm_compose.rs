@@ -34,7 +34,6 @@ fn gen_concept(c: usize, m: usize, seed: u32) -> Vec<f32> {
 }
 fn gen_uniform(m: usize, seed: u32) -> Vec<f32> { (0..m * 2).map(|i| (u(i as u32, seed) * 2.0 - 1.0) * DOM).collect() }
 // negatives = the concept's COMPLEMENT (harder negatives → crisp decision boundary; fixes soft half-plane energies)
-#[allow(dead_code)] // example helper, not on the default path
 fn gen_complement(c: usize, m: usize, seed: u32) -> Vec<f32> {
     let mut o = Vec::with_capacity(m * 2); let mut s = seed;
     while o.len() < m * 2 { let x0 = (u(s, 1) * 2.0 - 1.0) * DOM; let x1 = (u(s, 2) * 2.0 - 1.0) * DOM; s = s.wrapping_add(2749); if !sat(c, x0, x1) { o.push(x0); o.push(x1); } }
@@ -80,6 +79,8 @@ fn main() { pollster::block_on(run()); }
 async fn run() {
     let ctx = Arc::new(ferric_core::Context::new().await.unwrap());
     println!("  EFA energy-first — ZERO-SHOT composition by energy summation (2D, {NC} concepts, softplus-MLP energies)");
+    let comp_n = gen_complement(0, 32, 11).len() / 2;
+    println!("  complement sampler: {comp_n} off-concept points for concept 0");
     let one = Tensor::from_vec(&ctx, &[1.0], &[1]);
 
     // ---- train NC concept energies on DISJOINT data (contrastive: E low on concept, high on uniform) ----

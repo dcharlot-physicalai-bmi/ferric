@@ -17,6 +17,8 @@
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
 use ferric_certify::Iv; // SOUND interval arithmetic (outward-rounded) — replaces the
+type Col = Vec<f32>;
+type CoeffCols = (Col, Col, Col, Col, Col, Col, Col);
 // local round-to-nearest implementation this example used to carry. See ferric-certify: the naive
 // version can narrow an interval and so assert a bound it has not earned.
 
@@ -89,7 +91,7 @@ fn verify(a: f64, b: f64, cc: f64) -> (usize, Vec<(f64, f64)>) {
 
 // ================= the LEARNER (Ferric autograd; V,V̇ are linear in (a,b,c)) =================
 // Per point x: V = a·x1² + 2b·x1x2 + c·x2² ;  V̇ = a·(2 x1 f1) + b·(2(x2 f1 + x1 f2)) + c·(2 x2 f2).
-fn coeffs(pts: &[(f64, f64)]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn coeffs(pts: &[(f64, f64)]) -> CoeffCols {
     let (mut ca, mut cb, mut cc, mut da, mut db, mut dc, mut r2) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
     for &(x1, x2) in pts {
@@ -103,7 +105,7 @@ fn coeffs(pts: &[(f64, f64)]) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f3
 
 fn main() { pollster::block_on(run()); }
 async fn run() {
-    let ctx = Arc::new(Context_new().await);
+    let ctx = Arc::new(context_new().await);
     println!("FUSED discover→verify — damped pendulum, quadratic Lyapunov certificate on annulus [{R0},{R}]");
     println!("  learner: Ferric autograd (a,b,c)   verifier: sound f64 interval boxes ({GB}×{GB})   one program\n");
 
@@ -163,4 +165,4 @@ async fn run() {
 }
 
 // tiny local Context bring-up (keeps the example self-contained)
-async fn Context_new() -> ferric_core::Context { ferric_core::Context::new().await.unwrap() }
+async fn context_new() -> ferric_core::Context { ferric_core::Context::new().await.unwrap() }

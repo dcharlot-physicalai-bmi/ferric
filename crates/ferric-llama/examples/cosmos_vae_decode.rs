@@ -121,8 +121,7 @@ async fn run() {
     println!("  mid       Δ={:.2e}", check(&x, "mid"));
     // ---- up_blocks 0..3 (WanResidualUpBlock) ----
     let up_cfg = [(1024usize, 1024usize, 2usize, true), (1024, 1024, 2, true), (1024, 512, 1, true), (512, 256, 0, false)];
-    for i in 0..4 {
-        let (cin, cout, ft, up_flag) = up_cfg[i];
+    for (i, &(cin, cout, ft, up_flag)) in up_cfg.iter().enumerate() {
         let x_copy = x.clone();
         for r in 0..3 { x = mlp_res(&x, &format!("decoder.up_blocks.{i}.resnets.{r}")); }
         if up_flag {

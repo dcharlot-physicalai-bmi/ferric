@@ -88,7 +88,7 @@ async fn run() {
     let ks = [0usize, 1, 2, 4, 8, 16]; let mut results: Vec<(usize, f32, f32)> = vec![];
     for &kdesc in &ks {
         let mut th = vec![0.0f32; n]; let mut om = vec![0.0f32; n]; let mut gg = vec![0.0f32; n]; let mut uprev = vec![0.0f32; n];
-        for gi in 0..ng { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = TESTG[gi]; } }
+        for (gi, item_gi) in TESTG.iter().enumerate().take(ng) { for e in 0..nep { let idx = gi * nep + e; th[idx] = (u(900 + idx as u32, 7) * 2.0 - 1.0) * PI; gg[idx] = *item_gi; } }
         let (mut reach, mut tv, mut tvn) = (vec![true; n], 0.0f32, 0.0f32);
         for t in 0..steps {
             let mut uu = vec![0.0f32; n];

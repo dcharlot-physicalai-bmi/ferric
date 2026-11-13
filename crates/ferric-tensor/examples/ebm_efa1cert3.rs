@@ -95,7 +95,7 @@ fn main() {
     let gt = [0.8f32, -0.6, 0.5];
     let th_pts = [0usize, 41, 21, 11]; let om_pts = [0usize, 33, 13, 7];
     let mut certjson: Vec<String> = vec![];
-    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gt[j]; }
+    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gt[..nj]);
         // attractor + measured ω envelope
         let mut xstar = vec![0.0f32; d]; xstar[..nj].copy_from_slice(&g[..nj]);
         for _ in 0..800 { xstar = fcl(&m, bi, &xstar, g); }

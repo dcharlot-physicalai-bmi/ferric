@@ -11,6 +11,9 @@
 use ferric_tensor::{Adam, Tensor, Var};
 use std::collections::VecDeque;
 use std::sync::Arc;
+type Cell = (usize, usize);
+type Cells = Vec<Cell>;
+type TaskEnds = (Cells, Cells);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -126,14 +129,14 @@ async fn run() {
     println!("  {:<24}  {:>5.0}%  {:>11}   {:>12.2}×", "naive euclidean-greedy", nav_reach * 100.0, "—", nav_ratio);
     // EFA MPPI at increasing K
     for &k in &[64usize, 256, 512] {
-        let (r, _, ratio) = efa_mppi_reach(&ctx, k, 6, 0.5, &pos0, &goal, &dists, &opt_len, &predict_t, &vt, &enc_batch).await;
+        let (r, _, ratio) = efa_mppi_reach(&ctx, MppiCfg { kk: k, hh: 6, lambda: 0.5, opt_len: &opt_len }, &pos0, &goal, &predict_t, &vt, &enc_batch).await;
         println!("  {:<24}  {:>5.0}%  {:>11}   {:>12.2}×", format!("EFA MPPI K={k}"), r * 100.0, "—", ratio);
     }
     println!("\n  reach vs the true 100% ceiling; EFA/opt ratio = how much longer than the shortest path (1.00 = optimal).");
     println!("  more MPPI compute → reach up, path→shorter: test-time search closing the gap to exact optimal.");
 }
 
-fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+fn make_task(t: usize) -> TaskEnds {
     let pos: Vec<(usize, usize)> = (0..t).map(|i| { let left = u(i as u32, 21) < 0.5;
         if left { ((u(i as u32, 22) * 6.0) as usize % 6, (u(i as u32, 23) * G as f32) as usize % G) }
         else { (7 + (u(i as u32, 24) * 6.0) as usize % 6, (u(i as u32, 25) * G as f32) as usize % G) } }).collect();
@@ -147,11 +150,11 @@ fn make_task(t: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
 fn optimal_reach(pos0: &[(usize, usize)], goal: &[(usize, usize)], dists: &[Vec<i32>], opt_len: &[i32]) -> (f32, f32, f32) {
     let t = pos0.len(); let mut reached = 0; let mut sum_len = 0i64; let mut cnt = 0;
     for i in 0..t {
-        let mut p = pos0[i]; let mut steps = 0;
-        for _ in 0..80 { if p == goal[i] { reached += 1; sum_len += steps as i64; cnt += 1; break; }
+        let mut p = pos0[i];
+        for (steps, _) in (0..80).enumerate() { if p == goal[i] { reached += 1; sum_len += steps as i64; cnt += 1; break; }
             let mut ba = 0; let mut bd = i32::MAX;
             for a in 0..NA { let nc = next_pos(p, a); let dd = dists[i][nc.1 * G + nc.0]; if dd >= 0 && dd < bd { bd = dd; ba = a; } }
-            p = next_pos(p, ba); steps += 1; }
+            p = next_pos(p, ba); }
     }
     let _ = opt_len; (reached as f32 / t as f32, if cnt > 0 { sum_len as f32 / cnt as f32 } else { 0.0 }, 1.0)
 }
@@ -160,17 +163,19 @@ fn optimal_reach(pos0: &[(usize, usize)], goal: &[(usize, usize)], dists: &[Vec<
 fn naive_reach(pos0: &[(usize, usize)], goal: &[(usize, usize)], _dists: &[Vec<i32>], opt_len: &[i32]) -> (f32, f32, f32) {
     let t = pos0.len(); let mut reached = 0; let (mut rsum, mut rcnt) = (0.0f32, 0);
     for i in 0..t {
-        let mut p = pos0[i]; let mut steps = 0;
-        for _ in 0..80 { if p == goal[i] { reached += 1; if opt_len[i] > 0 { rsum += steps as f32 / opt_len[i] as f32; rcnt += 1; } break; }
+        let mut p = pos0[i];
+        for (steps, _) in (0..80).enumerate() { if p == goal[i] { reached += 1; if opt_len[i] > 0 { rsum += steps as f32 / opt_len[i] as f32; rcnt += 1; } break; }
             let mut ba = 0; let mut bd = f32::MAX;
             for a in 0..NA { let nc = next_pos(p, a); let dx = nc.0 as f32 - goal[i].0 as f32; let dy = nc.1 as f32 - goal[i].1 as f32; let dd = dx * dx + dy * dy; if dd < bd { bd = dd; ba = a; } }
-            p = next_pos(p, ba); steps += 1; }
+            p = next_pos(p, ba); }
     }
     (reached as f32 / t as f32, 0.0, if rcnt > 0 { rsum / rcnt as f32 } else { 0.0 })
 }
 
 // EFA MPPI; return (reach, _, mean path/optimal ratio over successes)
-async fn efa_mppi_reach(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, lambda: f32, pos0: &[(usize, usize)], goal: &[(usize, usize)], _dists: &[Vec<i32>], opt_len: &[i32], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> (f32, f32, f32) {
+struct MppiCfg<'a> { kk: usize, hh: usize, lambda: f32, opt_len: &'a [i32] }
+async fn efa_mppi_reach(ctx: &Arc<ferric_core::Context>, cfg: MppiCfg<'_>, pos0: &[(usize, usize)], goal: &[(usize, usize)], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> (f32, f32, f32) {
+    let MppiCfg { kk, hh, lambda, opt_len } = cfg;
     let t = pos0.len(); let maxsteps = 60usize;
     let mut pos = pos0.to_vec();
     let mut reached = vec![false; t]; let mut steps_at = vec![0usize; t];
@@ -181,19 +186,19 @@ async fn efa_mppi_reach(ctx: &Arc<ferric_core::Context>, kk: usize, hh: usize, l
         let mut goal_rep: Vec<(usize, usize)> = Vec::with_capacity(m);
         for i in 0..t { for _ in 0..kk { pos_rep.push(pos[i]); goal_rep.push(goal[i]); } }
         let mut acts: Vec<Vec<usize>> = vec![vec![0usize; m]; hh];
-        for i in 0..t { for k in 0..kk { for h in 0..hh {
+        for i in 0..t { for k in 0..kk { for (h, item_h) in acts.iter_mut().enumerate().take(hh) {
             let seed = h32((stp as u32).wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503) ^ (k as u32).wrapping_mul(2_246_822_519) ^ (h as u32).wrapping_mul(3_266_489_917));
-            acts[h][i * kk + k] = (seed as usize) % NA;
+            item_h[i * kk + k] = (seed as usize) % NA;
         } } }
         let first: Vec<usize> = acts[0].clone();
         let mut xh = enc_batch(&pos_rep);
-        for h in 0..hh { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + acts[h][r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
+        for item_h in acts.iter().take(hh) { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + item_h[r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
         let xg = enc_batch(&goal_rep);
         let vend = val_t(&xh, &xg).to_vec().await;
         for i in 0..t { if reached[i] { continue; } let base = i * kk;
             let mut vmax = f32::MIN; for k in 0..kk { if vend[base + k] > vmax { vmax = vend[base + k]; } }
             let mut wsum = [0.0f32; NA]; for k in 0..kk { let w = ((vend[base + k] - vmax) / lambda).exp(); wsum[first[base + k]] += w; }
-            let (mut ba, mut best) = (0usize, wsum[0]); for a in 1..NA { if wsum[a] > best { best = wsum[a]; ba = a; } }
+            let (mut ba, mut best) = (0usize, wsum[0]); for (a, item_a) in wsum.iter().enumerate().take(NA).skip(1) { if *item_a > best { best = *item_a; ba = a; } }
             pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; steps_at[i] = stp + 1; }
         }
     }

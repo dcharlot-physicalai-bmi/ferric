@@ -41,10 +41,10 @@ fn correct(a: f32, b: f32, y0: f32, y1: f32) -> bool { (y0 * y0 + y1 * y1 - a).a
 
 async fn ff_acc(ctx: &Arc<ferric_core::Context>, fp: &[Tensor], amin: f32, amax: f32, b: usize, seed0: u32) -> f32 {
     let mut ab = vec![0.0f32; b * 2]; let mut gt = vec![(0.0f32, 0.0f32); b];
-    for i in 0..b { let (a, bb, _, _) = sample_ctx(seed0 + i as u32 * 7, amin, amax); ab[i * 2] = a; ab[i * 2 + 1] = bb; gt[i] = (a, bb); }
+    for (i, item_i) in gt.iter_mut().enumerate().take(b) { let (a, bb, _, _) = sample_ctx(seed0 + i as u32 * 7, amin, amax); ab[i * 2] = a; ab[i * 2 + 1] = bb; *item_i = (a, bb); }
     let abt = Tensor::from_vec(ctx, &ab, &[b, 2]);
     let out = abt.matmul(&fp[0]).add(&fp[1]).relu().matmul(&fp[2]).add(&fp[3]).relu().matmul(&fp[4]).add(&fp[5]).to_vec().await;
-    let mut ok = 0; for i in 0..b { if correct(gt[i].0, gt[i].1, out[i * 2], out[i * 2 + 1]) { ok += 1; } } ok as f32 / b as f32
+    let mut ok = 0; for (i, item_i) in gt.iter().enumerate().take(b) { if correct(item_i.0, item_i.1, out[i * 2], out[i * 2 + 1]) { ok += 1; } } ok as f32 / b as f32
 }
 
 // energy E(ab, ŷ): softplus MLP, ŷ and context enter the first layer separately (so we grad only ŷ)
@@ -63,15 +63,17 @@ fn energy_t(y: &Tensor, ab: &Tensor, p: &[Tensor], one: &Tensor) -> Tensor {
     h2.matmul(&p[5]).add(&p[6])
 }
 // energy-as-verifier (robust where descent was fragile): per context, score N candidate ŷ, keep min-energy
-async fn bestof_acc(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, nn: usize, amin: f32, amax: f32, b: usize, seed0: u32) -> f32 {
+struct BestOf { nn: usize, amin: f32, amax: f32, b: usize, seed0: u32 }
+async fn bestof_acc(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, run: BestOf) -> f32 {
+    let BestOf { nn, amin, amax, b, seed0 } = run;
     let mut ab = vec![0.0f32; b * nn * 2]; let mut yc = vec![0.0f32; b * nn * 2]; let mut gt = vec![(0.0f32, 0.0f32); b];
-    for i in 0..b { let (a, bb, _, _) = sample_ctx(seed0 + i as u32 * 7, amin, amax); gt[i] = (a, bb);
+    for (i, item_i) in gt.iter_mut().enumerate().take(b) { let (a, bb, _, _) = sample_ctx(seed0 + i as u32 * 7, amin, amax); *item_i = (a, bb);
         for j in 0..nn { let idx = i * nn + j; ab[idx * 2] = a; ab[idx * 2 + 1] = bb;
             yc[idx * 2] = (u(idx as u32, seed0 * 3 + 1) * 2.0 - 1.0) * 1.9; yc[idx * 2 + 1] = (u(idx as u32, seed0 * 3 + 7) * 2.0 - 1.0) * 1.9; } }
     let e = energy_t(&Tensor::from_vec(ctx, &yc, &[b * nn, 2]), &Tensor::from_vec(ctx, &ab, &[b * nn, 2]), p, one).to_vec().await;
     let mut ok = 0;
-    for i in 0..b { let (mut bi, mut be) = (0usize, f32::MAX); for j in 0..nn { let idx = i * nn + j; if e[idx] < be { be = e[idx]; bi = idx; } }
-        if correct(gt[i].0, gt[i].1, yc[bi * 2], yc[bi * 2 + 1]) { ok += 1; } }
+    for (i, item_i) in gt.iter().enumerate().take(b) { let (mut bi, mut be) = (0usize, f32::MAX); for j in 0..nn { let idx = i * nn + j; if e[idx] < be { be = e[idx]; bi = idx; } }
+        if correct(item_i.0, item_i.1, yc[bi * 2], yc[bi * 2 + 1]) { ok += 1; } }
     ok as f32 / b as f32
 }
 
@@ -124,11 +126,11 @@ async fn run() {
     println!("\n  nonlinear system ŷ₀²+ŷ₁²=a ∧ ŷ₀·ŷ₁=b — solve accuracy (energy-verify best-of-N vs feed-forward):");
     println!("     in-distribution (a∈[0.6,1.4]):  feed-forward(1 pass) {:>3.0}%", ff_acc(&ctx, &fp, 0.6, 1.4, 400, 1000).await * 100.0);
     print!("        energy best-of-N  ");
-    for &nn in &[1usize, 4, 16, 64, 256] { print!("N={}:{:>3.0}%  ", nn, bestof_acc(&ctx, &p, &one, nn, 0.6, 1.4, 400, 2000).await * 100.0); }
+    for &nn in &[1usize, 4, 16, 64, 256] { print!("N={}:{:>3.0}%  ", nn, bestof_acc(&ctx, &p, &one, BestOf { nn, amin: 0.6, amax: 1.4, b: 400, seed0: 2000 }).await * 100.0); }
     println!();
     println!("     OUT-OF-DISTRIBUTION (a∈[1.4,2.2]):  feed-forward(1 pass) {:>3.0}%", ff_acc(&ctx, &fp, 1.4, 2.2, 400, 3000).await * 100.0);
     print!("        energy best-of-N  ");
-    for &nn in &[1usize, 4, 16, 64, 256] { print!("N={}:{:>3.0}%  ", nn, bestof_acc(&ctx, &p, &one, nn, 1.4, 2.2, 400, 4000).await * 100.0); }
+    for &nn in &[1usize, 4, 16, 64, 256] { print!("N={}:{:>3.0}%  ", nn, bestof_acc(&ctx, &p, &one, BestOf { nn, amin: 1.4, amax: 2.2, b: 400, seed0: 4000 }).await * 100.0); }
     println!();
     println!("\n  EBT signatures: energy-verification accuracy RISES with N (test-time thinking) and SOLVES the multivalued");
     println!("  system where feed-forward regression structurally can't (it averages the 4 solutions → satisfies none).");

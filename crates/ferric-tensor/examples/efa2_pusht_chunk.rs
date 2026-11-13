@@ -89,7 +89,6 @@ impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
 // multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
 // push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
-#[allow(dead_code)] // example helper, not on the default path
 fn demo(w: &World) -> [f32; 2] {
     let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
     let contact = if et.abs() > 0.12 {                                   // ROTATION phase
@@ -105,7 +104,6 @@ fn demo(w: &World) -> [f32; 2] {
     let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
-#[allow(dead_code)] // example helper, not on the default path
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
     let mut w = World::new(seed, im); let mut best = 0.0f32;
     for _ in 0..((TMAX / DT) as usize) { let c = pol(&w); w.step(c); best = best.max(w.coverage()); if best >= 0.98 { break; } } best }
@@ -120,8 +118,8 @@ fn cov_at(w: &World) -> f32 { w.cov(120) }
 fn rollout_score(w0: &World, seq: &[[f32; 2]]) -> f32 {                 // action-repeat STRIDE → HZ*STRIDE effective horizon
     let mut w = w0.clone(); let mut s = 0.0; for a in seq { for _ in 0..STRIDE { w.step(*a); } s += cov_at(&w); }
     0.15 * s / seq.len() as f32 + 0.85 * cov_at(&w) }
-fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
-    let mut mu = mean.clone(); let mut sd = vec![0.5f32; HZ];
+fn mpc_act(w: &World, mean: &mut [[f32; 2]], seed: u32) -> [f32; 2] {
+    let mut mu = mean.to_vec(); let mut sd = vec![0.5f32; HZ];
     for it in 0..NITER {
         let mut scored: Vec<(f32, Vec<[f32; 2]>)> = (0..NS).map(|k| {
             let seq: Vec<[f32; 2]> = (0..HZ).map(|h| {
@@ -139,7 +137,6 @@ fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
     let act = mu[0]; mean[..(HZ - 1)].copy_from_slice(&mu[1..((HZ - 1) + 1)]); mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
     act }
 fn gauss(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32), u(seed, i as u32 + 777)); (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }
-#[allow(dead_code)] // example helper, not on the default path
 fn mpc_episode(seed: u32, im: f32) -> f32 {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let mut best = 0.0f32;
     let decisions = ((TMAX / DT) as usize) / STRIDE;
@@ -167,13 +164,16 @@ fn mpc_chunks(seed: u32, im: f32, ob: &mut Vec<[f32; ODP]>, ch: &mut Vec<[f32; O
         obs_at.push(w.obs()); macros.push([a[0] / PUSH_V, a[1] / PUSH_V]);
         for _ in 0..STRIDE { w.step(a); }
             if w.coverage() >= 0.98 { break; } }
-    for t in 0..macros.len() { let mut c = [0.0f32; OUT];                // chunk = next CM macro-actions (clamped at end)
+    for (t, item_t) in obs_at.iter().enumerate().take(macros.len()) { let mut c = [0.0f32; OUT];
         for j in 0..CM { let idx = (t + j).min(macros.len() - 1); c[j * 2] = macros[idx][0]; c[j * 2 + 1] = macros[idx][1]; }
-        ob.push(obs_at[t]); ch.push(c); }
+        ob.push(*item_t); ch.push(c); }
 }
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let im = moment();
+    let reactive = episode(1, im, demo);
+    let planned = mpc_episode(2, im);
+    println!("  baselines on the real path: reactive {reactive:.3} · mpc {planned:.3}");
     println!("  EFA-2 · PUSHT — ACTION-CHUNKING distillation from MPC (predict {} macro-actions, execute open-loop)\n", CM);
     let n_demo = 60u32; let mut ob: Vec<[f32; ODP]> = vec![]; let mut ch: Vec<[f32; OUT]> = vec![];
     print!("  generating {} MPC demo episodes… ", n_demo); for k in 0..n_demo { mpc_chunks(3000 + k, im, &mut ob, &mut ch); }

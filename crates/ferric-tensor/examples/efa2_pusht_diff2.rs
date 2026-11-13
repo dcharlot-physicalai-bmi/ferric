@@ -89,7 +89,6 @@ impl Map0 for [f32; 2] { fn map0(self, o: [f32; 2]) -> [f32; 2] { [self[0] + o[0
 // perpendicular ∝ orientation error, so a single continuous push both translates (toward target) and rotates (toward θ*).
 // multi-push PLANNER: rotate the T (chase a bar-tip tangentially to spin toward target θ) when orientation is off;
 // push the COM to the target position when aligned. Underactuated pose control needs this sequencing, not a servo.
-#[allow(dead_code)] // example helper, not on the default path
 fn demo(w: &World) -> [f32; 2] {
     let et = wrap(w.tth - w.th); let ep = [w.tp[0] - w.p[0], w.tp[1] - w.p[1]];
     let contact = if et.abs() > 0.12 {                                   // ROTATION phase
@@ -105,7 +104,6 @@ fn demo(w: &World) -> [f32; 2] {
     let mv = if nrm(to) > 1e-4 { unit(to) } else { unit(ep) };
     [mv[0] * PUSH_V, mv[1] * PUSH_V]
 }
-#[allow(dead_code)] // example helper, not on the default path
 fn episode<F: FnMut(&World) -> [f32; 2]>(seed: u32, im: f32, mut pol: F) -> f32 {
     let mut w = World::new(seed, im); let mut best = 0.0f32;
     for _ in 0..((TMAX / DT) as usize) { let c = pol(&w); w.step(c); best = best.max(w.coverage()); if best >= 0.98 { break; } } best }
@@ -120,8 +118,8 @@ fn cov_at(w: &World) -> f32 { w.cov(120) }
 fn rollout_score(w0: &World, seq: &[[f32; 2]]) -> f32 {                 // action-repeat STRIDE → HZ*STRIDE effective horizon
     let mut w = w0.clone(); let mut s = 0.0; for a in seq { for _ in 0..STRIDE { w.step(*a); } s += cov_at(&w); }
     0.15 * s / seq.len() as f32 + 0.85 * cov_at(&w) }
-fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
-    let mut mu = mean.clone(); let mut sd = vec![0.5f32; HZ];
+fn mpc_act(w: &World, mean: &mut [[f32; 2]], seed: u32) -> [f32; 2] {
+    let mut mu = mean.to_vec(); let mut sd = vec![0.5f32; HZ];
     for it in 0..NITER {
         let mut scored: Vec<(f32, Vec<[f32; 2]>)> = (0..NS).map(|k| {
             let seq: Vec<[f32; 2]> = (0..HZ).map(|h| {
@@ -139,7 +137,6 @@ fn mpc_act(w: &World, mean: &mut Vec<[f32; 2]>, seed: u32) -> [f32; 2] {
     let act = mu[0]; mean[..(HZ - 1)].copy_from_slice(&mu[1..((HZ - 1) + 1)]); mean[HZ - 1] = [0.0, 0.0];   // warm-start shift
     act }
 fn gauss(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32), u(seed, i as u32 + 777)); (-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos() }
-#[allow(dead_code)] // example helper, not on the default path
 fn mpc_episode(seed: u32, im: f32) -> f32 {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let mut best = 0.0f32;
     let decisions = ((TMAX / DT) as usize) / STRIDE;
@@ -166,9 +163,9 @@ fn gnoise(seed: u32, i: usize) -> f32 { let (a, b) = (u(seed, i as u32 + 1), u(s
 // COSINE schedule (Nichol-Dhariwal): abar_T ≈ 0 so the forward process fully noises → in-distribution sampling
 fn cosine() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let f = |x: f32| (((x + 0.008) / 1.008) * PI / 2.0).cos().powi(2); let f0 = f(0.0);
-    let mut abar = vec![0.0f32; T]; for i in 0..T { abar[i] = (f((i as f32 + 1.0) / T as f32) / f0).clamp(1e-5, 0.9999); }
+    let mut abar = vec![0.0f32; T]; for (i, item_i) in abar.iter_mut().enumerate().take(T) { *item_i = (f((i as f32 + 1.0) / T as f32) / f0).clamp(1e-5, 0.9999); }
     let mut betas = vec![0.0f32; T]; let mut alphas = vec![0.0f32; T];
-    for i in 0..T { let prev = if i == 0 { 1.0 } else { abar[i - 1] }; betas[i] = (1.0 - abar[i] / prev).clamp(1e-5, 0.999); alphas[i] = 1.0 - betas[i]; }
+    for (i, item_i) in abar.iter().enumerate().take(T) { let prev = if i == 0 { 1.0 } else { abar[i - 1] }; betas[i] = (1.0 - *item_i / prev).clamp(1e-5, 0.999); alphas[i] = 1.0 - betas[i]; }
     (betas, alphas, abar) }
 fn mpc_chunks(seed: u32, im: f32, ob: &mut Vec<[f32; ODP]>, ch: &mut Vec<[f32; AD]>) {
     let mut w = World::new(seed, im); let mut mean = vec![[0.0f32; 2]; HZ]; let decisions = ((TMAX / DT) as usize) / STRIDE;
@@ -176,12 +173,15 @@ fn mpc_chunks(seed: u32, im: f32, ob: &mut Vec<[f32; ODP]>, ch: &mut Vec<[f32; A
     for _t in 0..decisions { let a = mpc_act(&w, &mut mean, seed.wrapping_mul(31) + _t as u32 * 7919);
         obs_at.push(w.obs()); macros.push([a[0] / PUSH_V, a[1] / PUSH_V]); for _ in 0..STRIDE { w.step(a); }
             if w.coverage() >= 0.98 { break; } }
-    for t in 0..macros.len() { let mut c = [0.0f32; AD]; for j in 0..CM { let idx = (t + j).min(macros.len() - 1); c[j * 2] = macros[idx][0]; c[j * 2 + 1] = macros[idx][1]; }
-        ob.push(obs_at[t]); ch.push(c); }
+    for (t, item_t) in obs_at.iter().enumerate().take(macros.len()) { let mut c = [0.0f32; AD]; for j in 0..CM { let idx = (t + j).min(macros.len() - 1); c[j * 2] = macros[idx][0]; c[j * 2 + 1] = macros[idx][1]; }
+        ob.push(*item_t); ch.push(c); }
 }
 fn main() { pollster::block_on(run()); }
 async fn run() {
     let im = moment(); let (betas, alphas, abar) = cosine();
+    let reactive = episode(1, im, demo);
+    let planned = mpc_episode(2, im);
+    println!("  baselines on the real path: reactive {reactive:.3} · mpc {planned:.3}");
     println!("  EFA-2 · PUSHT — FULL-SCALE DIFFUSION (cosine schedule, T={} steps, {} demos, HD={})\n", T, NDEMO, HD);
     println!("  schedule sanity: abar_0={:.3} abar_T={:.4} (must be ~0 to fully noise — the nano-run bug was abar_T~0.85)", abar[0], abar[T - 1]);
     // ── demos (cached) ──
@@ -191,7 +191,7 @@ async fn run() {
             for k in 0..ODP { o[k] = f[i * rec + k]; } for k in 0..AD { c[k] = f[i * rec + ODP + k]; } ob.push(o); ch.push(c); }
         println!("  loaded {} cached (obs,chunk) demo pairs", ob.len());
     } else { print!("  generating {} MPC demo episodes… ", NDEMO); for k in 0..NDEMO { mpc_chunks(3000 + k, im, &mut ob, &mut ch); }
-        let mut buf: Vec<u8> = vec![]; for i in 0..ob.len() { for k in 0..ODP { buf.extend_from_slice(&ob[i][k].to_le_bytes()); } for k in 0..AD { buf.extend_from_slice(&ch[i][k].to_le_bytes()); } }
+        let mut buf: Vec<u8> = vec![]; for i in 0..ob.len() { for item_k in ob[i].iter().take(ODP) { buf.extend_from_slice(&item_k.to_le_bytes()); } for item_k in ch[i].iter().take(AD) { buf.extend_from_slice(&item_k.to_le_bytes()); } }
         let _ = std::fs::write(DEMOF, buf); println!("collected {} pairs (cached)", ob.len()); }
     // ── train ε_θ ──
     let ctx = std::sync::Arc::new(Context::new().await.expect("ctx")); let nin = AD + 1 + ODP; let bs = 512; let np = ob.len();
@@ -217,12 +217,12 @@ async fn run() {
     let mut wv = Vec::new(); for item in pp[..nin].iter() { wv.push(item.to_vec().await); }
     let net = DNet { w: wv, b1: pp[nin].to_vec().await, w2: pp[nin + 1].to_vec().await, b2: pp[nin + 2].to_vec().await, w3: pp[nin + 3].to_vec().await, b3: pp[nin + 4].to_vec().await };
     // x0-prediction DDPM posterior sampling (stable at small T)
-    let sample = |ob: &[f32; ODP], seed: u32| -> [f32; AD] { let mut x = [0.0f32; AD]; for c in 0..AD { x[c] = gnoise(seed, c); }
+    let sample = |ob: &[f32; ODP], seed: u32| -> [f32; AD] { let mut x = [0.0f32; AD]; for (c, item_c) in x.iter_mut().enumerate().take(AD) { *item_c = gnoise(seed, c); }
         for i in (0..T).rev() { let eps = net.eps(&x, i as f32 / T as f32, ob); let sab = abar[i].sqrt(); let sbb = (1.0 - abar[i]).sqrt();
-            let mut x0 = [0.0f32; AD]; for c in 0..AD { x0[c] = ((x[c] - sbb * eps[c]) / sab).clamp(-1.2, 1.2); }
+            let mut x0 = [0.0f32; AD]; for (c, item_c) in x.iter().enumerate().take(AD) { x0[c] = ((*item_c - sbb * eps[c]) / sab).clamp(-1.2, 1.2); }
             if i > 0 { let ap = abar[i - 1]; let c1 = ap.sqrt() * betas[i] / (1.0 - abar[i]); let c2 = alphas[i].sqrt() * (1.0 - ap) / (1.0 - abar[i]);
                 let var = (betas[i] * (1.0 - ap) / (1.0 - abar[i])).max(0.0).sqrt();
-                for c in 0..AD { x[c] = c1 * x0[c] + c2 * x[c] + var * gnoise(seed.wrapping_add(9973 + i as u32), c); } }
+                for (c, item_c) in x.iter_mut().enumerate().take(AD) { *item_c = c1 * x0[c] + c2 * *item_c + var * gnoise(seed.wrapping_add(9973 + i as u32), c); } }
             else { x = x0; } }
         x };
     println!("\n  the card — FULL-SCALE DIFFUSION policy, PushT (200 held-out; sample chunk, execute open-loop, re-sample):");

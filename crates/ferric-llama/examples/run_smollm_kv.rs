@@ -21,6 +21,9 @@ async fn run() {
     let w = safetensors(&std::fs::read(format!("{dir}/model.safetensors")).unwrap()).unwrap();
     let g: HashMap<String, Tensor> = w.iter().map(|(k, t)| (k.clone(), Tensor::from_vec(&ctx, &t.data, &t.shape))).collect();
     let get = |n: &str| g.get(n).unwrap();
+    let embed = get("model.embed_tokens.weight");
+    assert_eq!(embed.shape.first().copied(), Some(VOCAB), "SmolLM2-135M vocab");
+    assert_eq!(embed.shape.last().copied(), Some(D), "SmolLM2-135M hidden size");
 
     let prompt = "The capital of France is";
     let prompt_ids = bpe.encode(prompt);

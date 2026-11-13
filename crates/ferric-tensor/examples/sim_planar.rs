@@ -30,11 +30,13 @@ impl Arm {
     // COM Jacobian: J[i][j] = ∂COM_i/∂q_j  (2-vector). ud(φ)=(cosφ,sinφ).
     fn jac(&self, q: &[f64]) -> Vec<Vec<[f64; 2]>> { let ph = self.phis(q); let n = self.n();
         let mut j = vec![vec![[0.0f64; 2]; n]; n];
-        for i in 0..n { for jj in 0..=i {                                    // only q_j with j ≤ i affect link i
+        for i in 0..n {
+            // only q_j with j ≤ i affect link i
+            for (jj, slot) in j[i].iter_mut().enumerate().take(i + 1) {
             let mut v = [0.0f64; 2];
             for k in jj..i { v[0] += self.l[k] * ph[k].cos(); v[1] += self.l[k] * ph[k].sin(); }  // proximal segments k in [j,i)
             v[0] += self.lc[i] * ph[i].cos(); v[1] += self.lc[i] * ph[i].sin();                    // own COM offset
-            j[i][jj] = v; } } j }
+            *slot = v; } } j }
     fn mass_matrix(&self, q: &[f64]) -> Vec<Vec<f64>> { let n = self.n(); let j = self.jac(q);
         let mut mm = vec![vec![0.0f64; n]; n];
         for a in 0..n { for b in 0..n { let mut s = 0.0;

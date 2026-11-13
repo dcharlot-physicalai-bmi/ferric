@@ -3,8 +3,8 @@
 //! The 3-DOF resolution (ebm_arm3c) was one seed. This reruns the full pipeline (FVI value HV=128 → two-stage teacher →
 //! flow distill → eval) at 3 independent seeds, varying init, sampling, AND eval-episode seeds, and reports per-seed rows
 //! + min/mean/max. The 2-DOF flow headline already has independent replications (flow2, hflow, lsweep λ≤0.1 all trained
-//! fresh and hit 100%); the 3-DOF number is the one that needed this. HONEST: 3 seeds is robustness-lite, not a
-//! statistical study; recipe slightly lightened (18k FVI, 6k distill) to fit three runs.
+//!   fresh and hit 100%); the 3-DOF number is the one that needed this. HONEST: 3 seeds is robustness-lite, not a
+//!   statistical study; recipe slightly lightened (18k FVI, 6k distill) to fit three runs.
 //!
 //! Run: `cargo run -p ferric-tensor --example ebm_mseed --release`
 use ferric_tensor::{Adam, Tensor, Var};

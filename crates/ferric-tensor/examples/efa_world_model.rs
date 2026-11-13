@@ -158,7 +158,7 @@ async fn run() {
             for i in 0..t {
                 if reached[i] { continue; }
                 let (mut ba, mut best) = (0usize, en[0][i]);
-                for a in 1..NA { if en[a][i] < best { best = en[a][i]; ba = a; } }
+                for (a, item_a) in en.iter().enumerate().take(NA).skip(1) { if item_a[i] < best { best = item_a[i]; ba = a; } }
                 pos[i] = next_pos(pos[i], ba);
                 if pos[i] == goal[i] { reached[i] = true; }
             }

@@ -12,6 +12,7 @@
 //! Run: `cargo run -p ferric-tensor --example efa_tour --release`
 use ferric_tensor::{Adam, Tensor, Var};
 use std::sync::Arc;
+type Cell = (usize, usize);
 
 const G: usize = 13;
 const IN: usize = G * G;
@@ -108,18 +109,18 @@ async fn run() {
     println!("  [greedy depth-3 planner]");
     println!("     {:>4}   {:>9}   {:>9}   {:>9}   {:>7}", "K", "additive", "delta", "hopfield", "blind");
     for &k in &[4usize, 8, 12, 16] {
-        let add = tour(&ctx, "additive", "greedy", 0, k, &cues, &predict_t, &vt, &enc_batch).await;
-        let del = tour(&ctx, "delta", "greedy", 0, k, &cues, &predict_t, &vt, &enc_batch).await;
-        let hop = tour(&ctx, "hopfield", "greedy", 0, k, &cues, &predict_t, &vt, &enc_batch).await;
-        let bli = tour(&ctx, "blind", "greedy", 0, k, &cues, &predict_t, &vt, &enc_batch).await;
+        let add = tour(&ctx, TourPlan { cond: "additive", planner: "greedy", mppi_k: 0, k }, &cues, &predict_t, &vt, &enc_batch).await;
+        let del = tour(&ctx, TourPlan { cond: "delta", planner: "greedy", mppi_k: 0, k }, &cues, &predict_t, &vt, &enc_batch).await;
+        let hop = tour(&ctx, TourPlan { cond: "hopfield", planner: "greedy", mppi_k: 0, k }, &cues, &predict_t, &vt, &enc_batch).await;
+        let bli = tour(&ctx, TourPlan { cond: "blind", planner: "greedy", mppi_k: 0, k }, &cues, &predict_t, &vt, &enc_batch).await;
         println!("     {:>4}   {:>8.0}%   {:>8.0}%   {:>8.0}%   {:>6.0}%", k, add * 100.0, del * 100.0, hop * 100.0, bli * 100.0);
     }
     println!("\n  [MPPI K=192 planner — better per-landmark reach precision → does the recall-quality gap widen?]");
     println!("     {:>4}   {:>9}   {:>9}   {:>9}", "K", "additive", "delta", "hopfield");
     for &k in &[4usize, 8, 12, 16] {
-        let add = tour(&ctx, "additive", "mppi", 192, k, &cues, &predict_t, &vt, &enc_batch).await;
-        let del = tour(&ctx, "delta", "mppi", 192, k, &cues, &predict_t, &vt, &enc_batch).await;
-        let hop = tour(&ctx, "hopfield", "mppi", 192, k, &cues, &predict_t, &vt, &enc_batch).await;
+        let add = tour(&ctx, TourPlan { cond: "additive", planner: "mppi", mppi_k: 192, k }, &cues, &predict_t, &vt, &enc_batch).await;
+        let del = tour(&ctx, TourPlan { cond: "delta", planner: "mppi", mppi_k: 192, k }, &cues, &predict_t, &vt, &enc_batch).await;
+        let hop = tour(&ctx, TourPlan { cond: "hopfield", planner: "mppi", mppi_k: 192, k }, &cues, &predict_t, &vt, &enc_batch).await;
         println!("     {:>4}   {:>8.0}%   {:>8.0}%   {:>8.0}%", k, add * 100.0, del * 100.0, hop * 100.0);
     }
     println!("\n  delta/hopfield ≥ additive as K grows → the gradient-free memory upgrades pay off IN THE LOOP");
@@ -127,16 +128,18 @@ async fn run() {
 }
 
 // run the K-landmark tour for `t` agents; return mean fraction of landmarks reached in order.
-async fn tour(ctx: &Arc<ferric_core::Context>, cond: &str, planner: &str, mppi_k: usize, k: usize, cues: &[Vec<f32>], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[(usize, usize)]) -> Tensor) -> f32 {
+struct TourPlan<'a> { cond: &'a str, planner: &'a str, mppi_k: usize, k: usize }
+async fn tour(ctx: &Arc<ferric_core::Context>, plan: TourPlan<'_>, cues: &[Vec<f32>], predict_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, val_t: &dyn Fn(&Tensor, &Tensor) -> Tensor, enc_batch: &dyn Fn(&[Cell]) -> Tensor) -> f32 {
+    let TourPlan { cond, planner, mppi_k, k } = plan;
     let t = 100usize;
     let maxsteps = 14 * k + 20;
     // start + K distinct landmark cells per agent
     let mut pos: Vec<(usize, usize)> = (0..t).map(|i| cell(9000 + i as u32)).collect();
-    let mut land: Vec<Vec<(usize, usize)>> = vec![Vec::with_capacity(k); t];
+    let mut land: Vec<Vec<(usize, usize)>> = (0..t).map(|_| Vec::with_capacity(k)).collect();
     for i in 0..t { let mut s = 3000 + (i * 97) as u32; while land[i].len() < k { let c = cell(s); if !land[i].contains(&c) && c != pos[i] { land[i].push(c); } s = s.wrapping_add(131); } }
     // landmark latents [t*k, d] → cpu
     let mut lm_cells: Vec<(usize, usize)> = Vec::with_capacity(t * k);
-    for i in 0..t { for j in 0..k { lm_cells.push(land[i][j]); } }
+    for item_i in land.iter().take(t) { for item_j in item_i.iter().take(k) { lm_cells.push(*item_j); } }
     let lm_lat = enc_batch(&lm_cells).to_vec().await; // [t*k*d]
 
     // build per-agent memory once (t=0 write, surprise-gated = all landmarks novel at t=0)
@@ -185,23 +188,23 @@ async fn tour(ctx: &Arc<ferric_core::Context>, cond: &str, planner: &str, mppi_k
         if planner == "mppi" {
             let m = t * mppi_k;
             let mut pos_rep: Vec<(usize, usize)> = Vec::with_capacity(m);
-            for i in 0..t { for _ in 0..mppi_k { pos_rep.push(pos[i]); } }
+            for item_i in pos.iter().take(t) { for _ in 0..mppi_k { pos_rep.push(*item_i); } }
             let hh = 6usize;
             let mut acts: Vec<Vec<usize>> = vec![vec![0usize; m]; hh];
-            for i in 0..t { for kk in 0..mppi_k { for h in 0..hh {
+            for i in 0..t { for kk in 0..mppi_k { for (h, item_h) in acts.iter_mut().enumerate().take(hh) {
                 let seed = h32((stp as u32).wrapping_mul(2_654_435_761) ^ (i as u32).wrapping_mul(40_503) ^ (kk as u32).wrapping_mul(2_246_822_519) ^ (h as u32).wrapping_mul(3_266_489_917));
-                acts[h][i * mppi_k + kk] = (seed as usize) % NA;
+                item_h[i * mppi_k + kk] = (seed as usize) % NA;
             } } }
             let first = acts[0].clone();
             let mut xh = enc_batch(&pos_rep);
-            for h in 0..hh { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + acts[h][r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
+            for item_h in acts.iter().take(hh) { let mut oh = vec![0.0f32; m * NA]; for r in 0..m { oh[r * NA + item_h[r]] = 1.0; } xh = predict_t(&xh, &Tensor::from_vec(ctx, &oh, &[m, NA])); }
             let mut xg_rep = vec![0.0f32; m * D]; for i in 0..t { for kk in 0..mppi_k { for a in 0..D { xg_rep[(i * mppi_k + kk) * D + a] = xgv[i * D + a]; } } }
             let vend = val_t(&xh, &Tensor::from_vec(ctx, &xg_rep, &[m, D])).to_vec().await;
-            for i in 0..t { let base = i * mppi_k;
+            for (i, item_i) in chosen.iter_mut().enumerate().take(t) { let base = i * mppi_k;
                 let mut vmax = f32::MIN; for kk in 0..mppi_k { if vend[base + kk] > vmax { vmax = vend[base + kk]; } }
                 let mut wsum = [0.0f32; NA]; for kk in 0..mppi_k { let w = ((vend[base + kk] - vmax) / 0.5).exp(); wsum[first[base + kk]] += w; }
-                let (mut ba, mut best) = (0usize, wsum[0]); for a in 1..NA { if wsum[a] > best { best = wsum[a]; ba = a; } }
-                chosen[i] = ba;
+                let (mut ba, mut best) = (0usize, wsum[0]); for (a, item_a) in wsum.iter().enumerate().take(NA).skip(1) { if *item_a > best { best = *item_a; ba = a; } }
+                *item_i = ba;
             }
         } else {
             let xg = Tensor::from_vec(ctx, &xgv, &[t, D]);
@@ -212,9 +215,9 @@ async fn tour(ctx: &Arc<ferric_core::Context>, cond: &str, planner: &str, mppi_k
                 for a2 in 0..NA { let x2 = predict_t(&xa, &onehot(a2)); mm = mm.maximum(&val_t(&x2, &xg));
                     for a3 in 0..NA { mm = mm.maximum(&val_t(&predict_t(&x2, &onehot(a3)), &xg)); } }
                 score.push(mm.to_vec().await); }
-            for i in 0..t { let (mut ba, mut best) = (0usize, score[0][i]); for a in 1..NA { if score[a][i] > best { best = score[a][i]; ba = a; } } chosen[i] = ba; }
+            for (i, item_i) in chosen.iter_mut().enumerate().take(t) { let (mut ba, mut best) = (0usize, score[0][i]); for (a, item_a) in score.iter().enumerate().take(NA).skip(1) { if item_a[i] > best { best = item_a[i]; ba = a; } } *item_i = ba; }
         }
-        for i in 0..t { if prog[i] >= k { continue; } pos[i] = next_pos(pos[i], chosen[i]); if pos[i] == land[i][prog[i]] { prog[i] += 1; } }
+        for (i, item_i) in chosen.iter().enumerate().take(t) { if prog[i] >= k { continue; } pos[i] = next_pos(pos[i], *item_i); if pos[i] == land[i][prog[i]] { prog[i] += 1; } }
     }
     prog.iter().map(|&p| p as f32 / k as f32).sum::<f32>() / t as f32
 }

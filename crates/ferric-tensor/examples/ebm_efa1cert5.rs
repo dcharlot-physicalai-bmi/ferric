@@ -89,7 +89,7 @@ fn main() {
     let gt4 = [[0.8f32, -0.6, 0.5], [-0.7, 0.5, -0.6], [0.5, 0.9, -0.4], [-0.5, -0.8, 0.7]];
     let th_pts = [0usize, 41, 21, 11]; let om_pts = [0usize, 33, 13, 7];
     let mut certjson: Vec<String> = vec![];
-    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj;
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi; let d = 2 * nj;
         println!("  [{}-DOF]  goal        residual   ρ-proxy σ_P(A)   core r (radial)   funnel certified   median entry", nj);
         let mut worst = (0usize, 101.0f32, 0.0f32, 0.0f32); // (goal, funnel%, core_r, residual)
         let mut rows: Vec<String> = vec![];
@@ -135,7 +135,7 @@ fn main() {
                     // random direction in d-dim, P-norm scaled to shell radius r
                     let mut dir: Vec<f32> = (0..d).map(|c| u(k * 7 + c as u32, 900 + gi as u32) * 2.0 - 1.0).collect();
                     let n: f32 = dir.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-                    for c in 0..d { dir[c] /= n; }
+                    for item_c in dir.iter_mut().take(d) { *item_c /= n; }
                     // scale so pnorm(x) = r: factor = r / pnorm(xstar + dir)
                     let mut probe = xstar.clone(); for c in 0..d { probe[c] += dir[c]; }
                     let pn = pnorm(&probe).max(1e-9);

@@ -8,6 +8,7 @@
 //!      24.5/2.6/0.1% — kept as the recorded negative); the correct lens is σmax(P^½ J P^-½) < 1 where P is the
 //!      Lyapunov metric of the closed-loop linearization A at x* (P ≈ Σ (Aᵀ)ᵏAᵏ, so AᵀPA−P=−I). Grid-certify the box,
 //!      report the certified ball around x*, and empirically check convergence (card criterion) from inside it.
+//!
 //! Results REPLACE the "certificates" field in the artifact's config.json — the certificate ships WITH the weights.
 //! HONEST: grid-sampled (rigorous route = interval/CROWN), one representative goal certified per body (residuals
 //! measured on all four card goals), FD Jacobians.
@@ -106,7 +107,7 @@ fn main() {
     let gt4 = [[0.8f32, -0.6, 0.5], [-0.7, 0.5, -0.6], [0.5, 0.9, -0.4], [-0.5, -0.8, 0.7]];
     print!("  [0] harness validation vs shipped card (must be 100/100/100):  reach =");
     let mut valid = true;
-    for bi in 0..NB { let nj = NJ[bi]; let (mut reach, nn) = (0, 60);
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi; let (mut reach, nn) = (0, 60);
         for k in 0..nn { let sd = 900 + (bi * 100 + k) as u32; let mut s = [0.0f32; 6]; let mut g = [0.0f32; 3];
             let gtk = gt4[k % 4]; for j in 0..nj { s[j] = (u(sd, 7 + j as u32) * 2.0 - 1.0) * PI; g[j] = gtk[j]; }
             for _ in 0..300 { let a = m.act(bi, s, g); s = step(nj, s, a); }
@@ -116,7 +117,7 @@ fn main() {
     if !valid { return; }
     println!("\n     body   fp residual ‖x*−(g,0)‖ (4 goals)   ρ(A) at x*    P-metric certified   ball r (P-norm)   empirical");
     let mut certjson: Vec<String> = vec![];
-    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj;
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi; let d = 2 * nj;
         // ── Stage 1: attractor per card goal — roll long from the goal, then polish; measure residual to (g,0) ──
         let mut residuals = vec![]; let mut xstar_rep = vec![0.0f32; d]; let mut fp_gap_rep = 0.0;
         for (gi, gtk) in gt4.iter().enumerate() { let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gtk[..nj]);

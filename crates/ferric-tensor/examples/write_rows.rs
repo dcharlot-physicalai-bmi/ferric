@@ -129,7 +129,7 @@ async fn run() {
         }).collect();
         v
     };
-    /// Stamp f16 1.0 over the scale field of every block, leaving the payload random.
+    // Stamp f16 1.0 over the scale field of every block, leaving the payload random.
     let with_scale = |mut v: Vec<u8>, blk: usize| -> Vec<u8> {
         for b in (0..v.len()).step_by(blk) { v[b] = 0x00; v[b + 1] = 0x3C; }
         v

@@ -36,7 +36,7 @@ fn cl_item(seed: u32) -> (Vec<usize>, usize) { // consistent dir, one late dip t
 }
 
 // incremental descent in the tilted double well. tp = [emb[4,DH], wg[DH,1], wr[1,1], br[1]] (caller owns the leaves).
-fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &Vec<Vec<usize>>, bs: usize, k: usize, sig: f32, nseed: u32) -> Var {
+fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &[Vec<usize>], bs: usize, k: usize, sig: f32, nseed: u32) -> Var {
     let (emb, wg, wr, br) = (&tp[0], &tp[1], &tp[2], &tp[3]);
     let four = Var::leaf(Tensor::from_vec(ctx, &[4.0 * AW], &[1]));
     let one = Var::leaf(Tensor::from_vec(ctx, &[1.0], &[1]));
@@ -44,8 +44,8 @@ fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &Vec<Vec<usize>>, 
     let mut d = Var::leaf(Tensor::zeros(ctx, &[bs, 1]));
     let mut h = Var::leaf(Tensor::zeros(ctx, &[bs, DH]));
     let mut nc = nseed;
-    for t in 0..T {
-        let mut oh = vec![0.0f32; bs * 4]; for i in 0..bs { oh[i * 4 + toks[t][i]] = 1.0; }
+    for item_t in toks.iter().take(T) {
+        let mut oh = vec![0.0f32; bs * 4]; for i in 0..bs { oh[i * 4 + item_t[i]] = 1.0; }
         h = h.add(&Var::leaf(Tensor::from_vec(ctx, &oh, &[bs, 4])).matmul(emb));
         let tilt = h.matmul(wg); // g(h) = learned evidence coupling → [bs,1]
         for _ in 0..k {
@@ -77,7 +77,7 @@ async fn run() {
 
     for step in 0..2000 {
         let mut toks = vec![vec![0usize; bs]; T]; let mut lbl = vec![0.0f32; bs];
-        for i in 0..bs { let mut s = 0.0f32; for t in 0..T { let e = (u(step as u32 * 31 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; toks[t][i] = e; s += EV[e]; } lbl[i] = if s > 0.0 { 1.0 } else { 0.0 }; }
+        for i in 0..bs { let mut s = 0.0f32; for (t, item_t) in toks.iter_mut().enumerate().take(T) { let e = (u(step as u32 * 31 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; item_t[i] = e; s += EV[e]; } lbl[i] = if s > 0.0 { 1.0 } else { 0.0 }; }
         let ktr = 3 + (h32(step as u32 ^ 0x51ec) % 5) as usize; // budget 3..8
         let tpv: Vec<Var> = tp.iter().map(|t| Var::leaf(t.clone())).collect();
         let logit = forward(&ctx, &tpv, &toks, bs, ktr, sig_tr, step as u32 * 101 + 7);
@@ -93,7 +93,7 @@ async fn run() {
 
     // sanity: accuracy on random sequences
     let rn = 400usize; let mut rtok = vec![vec![0usize; rn]; T]; let mut rlbl = vec![0usize; rn];
-    for i in 0..rn { let mut s = 0.0f32; for t in 0..T { let e = (u(77000 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; rtok[t][i] = e; s += EV[e]; } rlbl[i] = if s > 0.0 { 1 } else { 0 }; }
+    for i in 0..rn { let mut s = 0.0f32; for (t, item_t) in rtok.iter_mut().enumerate().take(T) { let e = (u(77000 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; item_t[i] = e; s += EV[e]; } rlbl[i] = if s > 0.0 { 1 } else { 0 }; }
     let rtpv: Vec<Var> = tp.iter().map(|t| Var::leaf(t.clone())).collect();
     let rl = forward(&ctx, &rtpv, &rtok, rn, 12, 0.12, 31).value().to_vec().await;
     let mut racc = 0; for i in 0..rn { if (if rl[i] > 0.0 { 1 } else { 0 }) == rlbl[i] { racc += 1; } }

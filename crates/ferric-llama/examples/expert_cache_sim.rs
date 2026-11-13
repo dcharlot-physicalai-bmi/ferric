@@ -185,8 +185,17 @@ fn belady_hits(seq: &[Access], cap: usize) -> (u64, u64) {
 /// effective decay window: `DECAY_TOKENS / decays_per_token`. **0 disables decay entirely** — hotness
 /// then accumulates over the whole trace, which is true LFU and the thing the original write-up
 /// mistakenly believed it was measuring.
-fn shipped_hits(seq: &[Access], cap: usize, n_layers: u32, n_experts: u32, k: usize,
-                slot: usize, backing: &dyn Backing, decays_per_token: u32) -> Option<(u64, u64)> {
+#[derive(Clone, Copy)]
+struct ShippedGeom {
+    n_layers: u32,
+    n_experts: u32,
+    k: usize,
+    slot: usize,
+}
+
+fn shipped_hits(seq: &[Access], cap: usize, geom: &ShippedGeom, backing: &dyn Backing,
+                decays_per_token: u32) -> Option<(u64, u64)> {
+    let ShippedGeom { n_layers, n_experts, k, slot } = *geom;
     let mut c = ExpertCache::new(n_layers, n_experts, slot, cap, k).ok()?;
     let mut tok = usize::MAX;
     let mut i = 0usize;
@@ -280,6 +289,7 @@ async fn run() {
     // ---- replay ----------------------------------------------------------------------------
     const SLOT: usize = 64; // hit rate is what is being measured; real bytes are applied after
     let backing = SliceBacking::new(vec![0u8; n_layers as usize * ne as usize * SLOT]);
+    let geom = ShippedGeom { n_layers, n_experts: ne, k, slot: SLOT };
     let floor = moe.len() * k;
     // ⛔ THE FLOOR PUBLISHED FIRST WAS A TRUNCATION ARTIFACT. FERRIC_MAX_LAYERS caps the model at 12
     // layers; the checkpoint has far more, so a DEPLOYED cache's floor is several times this one and
@@ -305,7 +315,7 @@ async fn run() {
     for cap in caps {
         let (lh, lg) = lru_hits(&seq, cap);
         let (bh, _) = belady_hits(&seq, cap);
-        let sh = shipped_hits(&seq, cap, n_layers, ne, k, SLOT, &backing, 1);
+        let sh = shipped_hits(&seq, cap, &geom, &backing, 1);
         let (l, b) = (lh as f64 / lg as f64, bh as f64 / lg as f64);
         match sh {
             Some((s, sg)) => {
@@ -333,7 +343,7 @@ async fn run() {
         let (lh, lg) = lru_hits(&seq, cap);
         let mut row = format!("  {cap:>9}  {:>7.1}%", 100.0 * lh as f64 / lg as f64);
         for d in [0u32, 1, 4, 16] {
-            match shipped_hits(&seq, cap, n_layers, ne, k, SLOT, &backing, d) {
+            match shipped_hits(&seq, cap, &geom, &backing, d) {
                 Some((h, gt)) => row.push_str(&format!("  {:>9.1}%", 100.0 * h as f64 / gt as f64)),
                 None => row.push_str(&format!("  {:>10}", "refused")),
             }

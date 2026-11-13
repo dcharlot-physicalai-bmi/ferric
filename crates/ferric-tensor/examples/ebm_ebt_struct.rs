@@ -39,7 +39,9 @@ fn selectors(ctx: &Arc<ferric_core::Context>, d: usize) -> (Tensor, Tensor) {
 }
 
 // STRUCTURED energy: sum of shared local link-energies. g = [w_yL,w_yR,w_a,w_b (each [1,H]), b1 [H], W2 [H,1], b2 [1]]
-fn senergy(y: &Var, af: &Var, bf: &Var, l: &Var, r: &Var, g: &[Var], one: &Var, d: usize, bs: usize) -> Var {
+struct LinkGeom<'a> { l: &'a Var, r: &'a Var, d: usize, bs: usize }
+fn senergy(y: &Var, af: &Var, bf: &Var, g: &[Var], one: &Var, geom: LinkGeom<'_>) -> Var {
+    let LinkGeom { l, r, d, bs } = geom;
     let sp = |z: Var| z.exp().add(one).log();
     let m = bs * (d - 1);
     let yl = y.matmul(l).reshape(&[m, 1]);
@@ -50,14 +52,16 @@ fn senergy(y: &Var, af: &Var, bf: &Var, l: &Var, r: &Var, g: &[Var], one: &Var, 
     sp(pre).matmul(&g[5]).add(&g[6]) // [m,1] per-link energies; sum_all → total (links only touch their own ŷ)
 }
 
-async fn solve(ctx: &Arc<ferric_core::Context>, d: usize, g: &[Tensor], l: &Tensor, r: &Tensor, one: &Tensor, al: &Tensor, k: usize, t: usize, seed0: u32) -> f32 {
+struct SolveRun { d: usize, k: usize, t: usize, seed0: u32 }
+async fn solve(ctx: &Arc<ferric_core::Context>, g: &[Tensor], l: &Tensor, r: &Tensor, one: &Tensor, al: &Tensor, run: SolveRun) -> f32 {
+    let SolveRun { d, k, t, seed0 } = run;
     let (mut af, mut bf) = (vec![0.0f32; t * (d - 1)], vec![0.0f32; t * (d - 1)]); let mut probs = Vec::with_capacity(t);
     for i in 0..t { let (a, b, _) = problem(d, seed0 + i as u32 * 7); for j in 0..d - 1 { af[i * (d - 1) + j] = a[j]; bf[i * (d - 1) + j] = b[j]; } probs.push((a, b)); }
     let afv = Var::leaf(Tensor::from_vec(ctx, &af, &[t, d - 1])); let bfv = Var::leaf(Tensor::from_vec(ctx, &bf, &[t, d - 1]));
     let lv = Var::leaf(l.clone()); let rv = Var::leaf(r.clone()); let ov = Var::leaf(one.clone()); let alv = Var::leaf(al.clone());
     let gv: Vec<Var> = g.iter().map(|x| Var::leaf(x.clone())).collect();
     let mut y = Var::leaf(Tensor::from_vec(ctx, &randn(t * d, seed0 ^ 0xabc, 0.8), &[t, d]));
-    for _ in 0..k { let e = senergy(&y, &afv, &bfv, &lv, &rv, &gv, &ov, d, t).sum_all(); let gr = grad(&e, &[y.clone()], None).remove(0); y = y.sub(&gr.mul(&alv)); }
+    for _ in 0..k { let e = senergy(&y, &afv, &bfv, &gv, &ov, LinkGeom { l: &lv, r: &rv, d, bs: t }).sum_all(); let gr = grad(&e, &[y.clone()], None).remove(0); y = y.sub(&gr.mul(&alv)); }
     let yk = y.value().to_vec().await;
     let mut ok = 0; for i in 0..t { if correct(d, &probs[i].0, &probs[i].1, &yk[i * d..(i + 1) * d]) { ok += 1; } } ok as f32 / t as f32
 }
@@ -82,7 +86,7 @@ async fn train(ctx: &Arc<ferric_core::Context>, d: usize, l: &Tensor, r: &Tensor
         let alv = Var::leaf(Tensor::from_vec(ctx, &[a_step], &[1]));
         let mut y = Var::leaf(Tensor::from_vec(ctx, &randn(bs * d, step as u32 * 17 + 3, 0.8), &[bs, d]));
         for si in 0..ktr {
-            let e = senergy(&y, &afv, &bfv, &lv, &rv, &gv, &ov, d, bs).sum_all();
+            let e = senergy(&y, &afv, &bfv, &gv, &ov, LinkGeom { l: &lv, r: &rv, d, bs }).sum_all();
             let gr = grad(&e, &[y.clone()], None).remove(0);
             y = y.sub(&gr.mul(&alv)).add(&Var::leaf(Tensor::from_vec(ctx, &randn(bs * d, step as u32 * 977 + si as u32 + 1, 0.02), &[bs, d])));
         }
@@ -112,7 +116,7 @@ async fn run() {
         let g = train(&ctx, d, &l, &r, &one).await;
         print!("    D={:<2} ({:>2} links) ", d, d - 1);
         let mut best = 0.0f32;
-        for m in [1usize, 2, 4, 8, 16, 32] { let k = (m * d).max(1); let a = solve(&ctx, d, &g, &l, &r, &one, &al, k, 400, 7000 + d as u32 * 100 + m as u32).await * 100.0; if a > best { best = a; } print!("{:>5.0} ", a); }
+        for m in [1usize, 2, 4, 8, 16, 32] { let k = (m * d).max(1); let a = solve(&ctx, &g, &l, &r, &one, &al, SolveRun { d, k, t: 400, seed0: 7000 + d as u32 * 100 + m as u32 }).await * 100.0; if a > best { best = a; } print!("{:>5.0} ", a); }
         println!("  | {:.0}", best);
     }
     println!("\n  If accuracy now HOLDS as D grows (where fixed-K≤25 collapsed), the earlier 'structure is worse' was a");

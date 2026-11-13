@@ -135,7 +135,7 @@ async fn eval_reach(ctx: &Arc<ferric_core::Context>, wp: &[Tensor], vp: &[Tensor
             for a2 in 0..NA { let x2 = predict_t(&xa, &onehot(a2)); m = m.maximum(&val_t(&x2, &xg, vp));
                 for a3 in 0..NA { m = m.maximum(&val_t(&predict_t(&x2, &onehot(a3)), &xg, vp)); } }
             score.push(m.to_vec().await); }
-        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for a in 1..NA { if score[a][i] > best { best = score[a][i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
+        for i in 0..t { if reached[i] { continue; } let (mut ba, mut best) = (0usize, score[0][i]); for (a, item_a) in score.iter().enumerate().take(NA).skip(1) { if item_a[i] > best { best = item_a[i]; ba = a; } } pos[i] = next_pos(pos[i], ba); if pos[i] == goal[i] { reached[i] = true; } }
     }
     reached.iter().filter(|&&r| r).count() as f32 / t as f32
 }

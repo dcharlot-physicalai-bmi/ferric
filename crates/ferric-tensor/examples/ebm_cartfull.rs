@@ -41,7 +41,7 @@ fn lqr(ad: &M4, bd: &V4, q: &M4, r: f32) -> V4 {
         let s = r + dot(bd, &pb);                  // R + Bdᵀ P Bd  (scalar)
         let bp = mv(&mt(&p), bd);                  // (Pᵀ)·Bd  (=P·Bd, P symmetric)
         // K = (Bdᵀ P Ad)/s
-        let atp_b = { let mut v = [0.0f32; 4]; let atp = mm(&mt(ad), &p); v = mv(&atp, bd); v }; // Adᵀ P Bd
+        let atp_b = { let atp = mm(&mt(ad), &p); mv(&atp, bd) }; // Adᵀ P Bd
         let bt_p_ad = { let pa = mm(&p, ad); let mut v = [0.0f32; 4]; for j in 0..4 { for k in 0..4 { v[j] += bd[k] * pa[k][j]; } } v }; // Bdᵀ P Ad (1×4)
         let atpad = mm(&mm(&mt(ad), &p), ad);      // Adᵀ P Ad
         let mut pn = *q;

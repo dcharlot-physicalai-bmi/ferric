@@ -108,7 +108,7 @@ async fn run() {
     let mut inits: Vec<[f32; 4]> = vec![]; let mut goals: Vec<(f32, f32)> = vec![];
     for (gi, &g) in TG.iter().enumerate() { for e in 0..nep { let sd = (gi * nep + e) as u32; inits.push([(u(900 + sd, 7) * 2.0 - 1.0) * PI, (u(900 + sd, 8) * 2.0 - 1.0) * PI, 0.0, 0.0]); goals.push(g); } }
     let run_discrete = |grid: &[f32]| -> f32 { let mut reach = 0; for i in 0..n { let mut s = inits[i]; let g = goals[i];
-        for t in 0..260 { let uu = vn.ustar(s, g, grid); s = step(s, uu.0, uu.1); if t >= 220 && (wrap(s[0] - g.0).abs() > 0.35 || wrap(s[1] - g.1).abs() > 0.35 || s[2].abs() > 0.7 || s[3].abs() > 0.7) { reach = reach; } }
+        for _ in 0..260 { let uu = vn.ustar(s, g, grid); s = step(s, uu.0, uu.1); }
         if wrap(s[0] - g.0).abs() < 0.35 && wrap(s[1] - g.1).abs() < 0.35 && s[2].abs() < 0.7 && s[3].abs() < 0.7 { reach += 1; } } reach as f32 / n as f32 * 100.0 };
     let rc = run_discrete(&G5); let rf = run_discrete(&G9);
 

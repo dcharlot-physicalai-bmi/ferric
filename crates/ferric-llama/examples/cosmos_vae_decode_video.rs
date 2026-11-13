@@ -229,8 +229,7 @@ async fn run() {
         x = dec.resnet(&x, "decoder.mid_block.resnets.0");
         x = dec.attn(&x, "decoder.mid_block.attentions.0");
         x = dec.resnet(&x, "decoder.mid_block.resnets.1");
-        for i in 0..4 {
-            let (cin, cout, ft, up_flag, up3d) = up_cfg[i];
+        for (i, &(cin, cout, ft, up_flag, up3d)) in up_cfg.iter().enumerate() {
             let x_copy = x.clone();
             for r in 0..3 { x = dec.resnet(&x, &format!("decoder.up_blocks.{i}.resnets.{r}")); }
             if up_flag {

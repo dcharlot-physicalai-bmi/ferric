@@ -19,6 +19,8 @@
 //!
 //! Run: `cargo run -p ferric-tensor --example ebm_efam6 --release`
 use std::f32::consts::PI;
+type Quad = (u64, u64, u64, usize);
+type LifeOut = (Vec<Quad>, u64, u64, usize);
 const H: usize = 128; const EMB: usize = 6; const DT: f32 = 0.05; const UMAX: f32 = 4.0;
 const MDIR: &str = "/Users/dcharlot/vibe-coding/efa/models/efa-1";
 const IMG: usize = 24; const NPIX: usize = IMG * IMG;
@@ -156,7 +158,7 @@ fn main() {
     // one episode stream, two operating points on the speed↔accuracy frontier of familiarity:
     //   VERIFY-ALWAYS  — never blind-trust; every known episode does the cheap 10-step interaction check (reliable)
     //   TRUST-FAMILIAR — after CONFIRM_TRUST confirmations, trust recall with ZERO interaction (cheap, accepts risk)
-    let run_life = |trust: bool| -> (Vec<(u64, u64, u64, usize)>, u64, u64, usize) {
+    let run_life = |trust: bool| -> LifeOut {
         let mut mem = Mem { xi: vec![], writes: vec![] };
         let (mut cum, mut succ) = (0u64, 0u64);
         let mut buckets = vec![]; let (mut bp, mut bs, mut bn) = (0u64, 0u64, 0u64);

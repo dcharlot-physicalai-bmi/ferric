@@ -42,7 +42,9 @@ fn cl_item(seed: u32) -> (Vec<usize>, usize) {
 }
 
 // incremental forward with a FIXED per-position budget k; returns final decision logits [bs,1]
-fn forward(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, alpha: &Tensor, toks: &Vec<Vec<usize>>, bs: usize, k: usize, sup: bool) -> (Var, Vec<Var>) {
+struct ForwardCfg { bs: usize, k: usize, sup: bool }
+fn forward(ctx: &Arc<ferric_core::Context>, p: &[Tensor], one: &Tensor, alpha: &Tensor, toks: &[Vec<usize>], cfg: ForwardCfg) -> (Var, Vec<Var>) {
+    let ForwardCfg { bs, k, sup } = cfg;
     let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone()); let av = Var::leaf(alpha.clone());
     let mut z = Var::leaf(Tensor::zeros(ctx, &[bs, DZ]));
     let mut h = Var::leaf(Tensor::zeros(ctx, &[bs, DZ]));
@@ -100,9 +102,9 @@ async fn run() {
 
     // ---- test: GP vs CTRL final-decision accuracy vs thinking budget K ----
     let n = 200usize;
-    let acc = |toks: &Vec<Vec<usize>>, lbl: &Vec<usize>, k: usize, ctx: &Arc<ferric_core::Context>, p: &[Tensor]| {
-        let (lg, _) = forward(ctx, p, &one, &alpha, toks, toks[0].len(), k, false);
-        (lg, lbl.clone())
+    let acc = |toks: &[Vec<usize>], lbl: &[usize], k: usize, ctx: &Arc<ferric_core::Context>, p: &[Tensor]| {
+        let (lg, _) = forward(ctx, p, &one, &alpha, toks, ForwardCfg { bs: toks[0].len(), k, sup: false });
+        (lg, lbl.to_vec())
     };
     // build GP and CTRL batches
     let mut gtok = vec![vec![0usize; n]; T]; let mut glbl = vec![0usize; n];

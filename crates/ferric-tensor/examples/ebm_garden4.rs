@@ -23,17 +23,17 @@ fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> { (0..n).map(|i| { let a = u(
 // task: early tokens (0..EARLY) are the reliable SIGNAL; label = sign(early sum). late tokens are same-value NOISE.
 // early sum forced nonzero. returns token indices [T] and label.
 fn item(seed: u32) -> (Vec<usize>, usize) {
-    let mut e = vec![0usize; T]; let mut es = 0.0f32; let mut tries = 0;
+    let mut e = vec![0usize; T]; let mut es: f32; let mut tries = 0;
     loop {
-        es = 0.0; for t in 0..EARLY { let k = (u(seed.wrapping_add(tries * 131), t as u32 + 1) * 4.0) as usize % 4; e[t] = k; es += EV[k]; }
+        es = 0.0; for (t, item_t) in e.iter_mut().enumerate().take(EARLY) { let k = (u(seed.wrapping_add(tries * 131), t as u32 + 1) * 4.0) as usize % 4; *item_t = k; es += EV[k]; }
         if es.abs() > 0.5 { break; } tries += 1; if tries > 20 { es = 1.0; e[0] = 3; break; }
     }
-    for t in EARLY..T { e[t] = (u(seed.wrapping_add(999), t as u32 + 1) * 4.0) as usize % 4; } // late = same-value noise
+    for (t, item_t) in e.iter_mut().enumerate().take(T).skip(EARLY) { *item_t = (u(seed.wrapping_add(999), t as u32 + 1) * 4.0) as usize % 4; } // late = same-value noise
     (e, if es > 0.0 { 1 } else { 0 })
 }
 
 // tp = [emb[4,DH], wg[DH,1], wr[1,1], br[1], aparam[1]]. A = softplus(aparam). a0=true forces A=0 (smooth ablation).
-fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &Vec<Vec<usize>>, bs: usize, k: usize, a0: bool) -> Var {
+fn forward(ctx: &Arc<ferric_core::Context>, tp: &[Var], toks: &[Vec<usize>], bs: usize, k: usize, a0: bool) -> Var {
     let (emb, wg, wr, br) = (&tp[0], &tp[1], &tp[2], &tp[3]);
     let one = Var::leaf(Tensor::from_vec(ctx, &[1.0], &[1]));
     let al = Var::leaf(Tensor::from_vec(ctx, &[0.1], &[1]));

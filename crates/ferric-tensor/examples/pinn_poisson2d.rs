@@ -15,13 +15,22 @@ use std::f32::consts::PI;
 const HW: usize = 40; // hidden width
 const GI: usize = 28; // interior grid per axis (GI² collocation points)
 
-#[allow(dead_code)] // example helper, not on the default path
 fn h32(mut h: u32) -> u32 { h ^= h >> 15; h = h.wrapping_mul(2246822519); h ^= h >> 13; h = h.wrapping_mul(3266489917); h ^= h >> 16; h }
-#[allow(dead_code)] // example helper, not on the default path
 fn u01(i: u32, s: u32) -> f32 { (h32(i.wrapping_mul(2654435761).wrapping_add(s)) % 1_000_000 + 1) as f32 / 1_000_000.0 }
-#[allow(dead_code)] // example helper, not on the default path
 fn randn(n: usize, seed: u32, sc: f32) -> Vec<f32> {
     (0..n).map(|i| { let a = u01(i as u32, seed); let b = u01(i as u32, seed.wrapping_add(9973)); ((-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()) * sc }).collect()
+}
+// SIREN init (same scales as Siren::new): first layer ω₀ with a random phase, hidden √(6/fan_in), output 1/√fan_in.
+fn siren_params(ctx: &Arc<ferric_core::Context>, dims: &[usize], seed: u32) -> Vec<Tensor> {
+    let mut params = Vec::with_capacity((dims.len() - 1) * 2);
+    for (l, w) in dims.windows(2).enumerate() {
+        let (fi, fo) = (w[0], w[1]);
+        let sc = if l == 0 { 2.4 } else if l + 1 == dims.len() - 1 { (1.0 / fi as f32).sqrt() } else { (6.0 / fi as f32).sqrt() };
+        params.push(Tensor::from_vec(ctx, &randn(fi * fo, seed.wrapping_add(l as u32 * 7 + 1), sc), &[fi, fo]));
+        let b = if l == 0 { randn(fo, seed.wrapping_add(99), 2.0) } else { vec![0.0; fo] };
+        params.push(Tensor::from_vec(ctx, &b, &[fo]));
+    }
+    params
 }
 
 // SIREN over (x,y) via the sciml library
@@ -53,8 +62,7 @@ async fn run() {
     let mx: Vec<f32> = (0..ni).flat_map(|_| [1.0f32, 0.0]).collect();
     let my: Vec<f32> = (0..ni).flat_map(|_| [0.0f32, 1.0]).collect();
 
-    let net = Siren::new(&ctx, &[2, HW, HW, 1], 1); // 2-D input SIREN from the sciml library
-    let mut wp = net.params.clone();
+    let mut wp = siren_params(&ctx, &[2, HW, HW, 1], 1); // 2-D input SIREN, example RNG, library forward
     let mut adam = Adam::new(&wp, 2e-3);
     let lambda = 20.0f32;
 

@@ -40,8 +40,8 @@ fn wer(reference: &str, hyp: &str) -> (usize, usize) {
     let r: Vec<&str> = reference.split_whitespace().collect();
     let h: Vec<&str> = hyp.split_whitespace().collect();
     let mut d = vec![vec![0usize; h.len() + 1]; r.len() + 1];
-    for i in 0..=r.len() { d[i][0] = i; }
-    for j in 0..=h.len() { d[0][j] = j; }
+    for (i, row) in d.iter_mut().enumerate().take(r.len() + 1) { row[0] = i; }
+    for (j, cell) in d[0].iter_mut().enumerate().take(h.len() + 1) { *cell = j; }
     for i in 1..=r.len() { for j in 1..=h.len() {
         let c = if r[i - 1].eq_ignore_ascii_case(h[j - 1]) { 0 } else { 1 };
         d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + c);

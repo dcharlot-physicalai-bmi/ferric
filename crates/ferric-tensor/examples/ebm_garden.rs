@@ -47,14 +47,14 @@ async fn run() {
 
     // one incremental forward over a batch of evidence-index sequences; returns final s-logit Var (+ optionally z per step)
     // toks: [T][bs] evidence indices
-    let forward = |p: &[Tensor], toks: &Vec<Vec<usize>>, bs: usize| {
+    let forward = |p: &[Tensor], toks: &[Vec<usize>], bs: usize| {
         let pv: Vec<Var> = p.iter().map(|t| Var::leaf(t.clone())).collect(); let ov = Var::leaf(one.clone()); let av = Var::leaf(alpha.clone());
         let mut z = Var::leaf(Tensor::zeros(&ctx, &[bs, DZ]));
         let mut h = Var::leaf(Tensor::zeros(&ctx, &[bs, DZ]));
         let mut zsnap: Vec<Var> = Vec::new();
-        for t in 0..T {
+        for item_t in toks.iter().take(T) {
             // h += onehot(tok) @ emb
-            let mut oh = vec![0.0f32; bs * 4]; for i in 0..bs { oh[i * 4 + toks[t][i]] = 1.0; }
+            let mut oh = vec![0.0f32; bs * 4]; for i in 0..bs { oh[i * 4 + item_t[i]] = 1.0; }
             let ohv = Var::leaf(Tensor::from_vec(&ctx, &oh, &[bs, 4]));
             h = h.add(&ohv.matmul(&pv[5]));
             for _ in 0..KTR { let e = energy(&z, &h, &pv, &ov).sum_all(); let g = grad(&e, &[z.clone()], None).remove(0); z = z.sub(&g.mul(&av)); }
@@ -67,7 +67,7 @@ async fn run() {
     for step in 0..1600 {
         // random uniform evidence sequences
         let mut toks = vec![vec![0usize; bs]; T]; let mut lbl = vec![0.0f32; bs];
-        for i in 0..bs { let mut s = 0.0f32; for t in 0..T { let e = (u(step as u32 * 31 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; toks[t][i] = e; s += EV[e]; }
+        for i in 0..bs { let mut s = 0.0f32; for (t, item_t) in toks.iter_mut().enumerate().take(T) { let e = (u(step as u32 * 31 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; item_t[i] = e; s += EV[e]; }
             lbl[i] = if s > 0.0 { 1.0 } else { 0.0 }; }
         let (logit, _z, pv) = forward(&p, &toks, bs);
         let ov = Var::leaf(one.clone());
@@ -85,7 +85,7 @@ async fn run() {
     let mut toks = vec![vec![0usize; eb]; T]; let mut lbl = vec![0.0f32; eb];
     // running cumulative-sign per item/position to mark reanalysis
     let mut csum = vec![vec![0.0f32; eb]; T];
-    for i in 0..eb { let mut s = 0.0f32; for t in 0..T { let e = (u(9000 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; toks[t][i] = e; s += EV[e]; csum[t][i] = s; } lbl[i] = if s > 0.0 { 1.0 } else { 0.0 }; }
+    for i in 0..eb { let mut s = 0.0f32; for (t, item_t) in toks.iter_mut().enumerate().take(T) { let e = (u(9000 + i as u32 * 7 + t as u32, 3) * 4.0) as usize % 4; item_t[i] = e; s += EV[e]; csum[t][i] = s; } lbl[i] = if s > 0.0 { 1.0 } else { 0.0 }; }
     let (logit, zsnap, _pv) = forward(&p, &toks, eb);
     let lg = logit.value().to_vec().await;
     let mut acc = 0; for i in 0..eb { let pred = if lg[i] > 0.0 { 1.0 } else { 0.0 }; if pred == lbl[i] { acc += 1; } }
@@ -114,8 +114,8 @@ async fn run() {
     println!("     positions withOUT a flip (no reanalysis):         {:.4}", eff_no / n_no.max(1.0));
     println!("     → ratio {:.2}×  (effort concentrates on REVISION, not on the equally-surprising input)\n", (eff_re / n_re.max(1.0)) / (eff_no / n_no.max(1.0)).max(1e-6));
     println!("  garden-path item (flips at position 4) vs control (no flip) — effort ‖Δz‖ by position:");
-    print!("     garden-path:  "); for t in 1..T { print!("p{}={:.3}  ", t + 1, eg[t]); } println!();
-    print!("     control:      "); for t in 1..T { print!("p{}={:.3}  ", t + 1, ec[t]); } println!();
+    print!("     garden-path:  "); for (t, item_t) in eg.iter().enumerate().take(T).skip(1) { print!("p{}={:.3}  ", t + 1, *item_t); } println!();
+    print!("     control:      "); for (t, item_t) in ec.iter().enumerate().take(T).skip(1) { print!("p{}={:.3}  ", t + 1, *item_t); } println!();
     println!("\n  If the flip position spikes (garden-path) while the control stays flat — at identical token surprisal —");
     println!("  the energy-based model spends compute on REANALYSIS: reasoning-depth difficulty, the reading-time kind.");
 }

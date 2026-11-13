@@ -91,7 +91,7 @@ fn main() {
     let gt = [0.8f32, -0.6, 0.5];
     let th_pts = [0usize, 41, 21, 11]; let om_pts = [0usize, 33, 13, 7];
     let mut certjson: Vec<String> = vec![];
-    for bi in 0..NB { let nj = NJ[bi]; let d = 2 * nj; let mut g = [0.0f32; 3]; for j in 0..nj { g[j] = gt[j]; }
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi; let d = 2 * nj; let mut g = [0.0f32; 3]; g[..nj].copy_from_slice(&gt[..nj]);
         // attractor + MEASURED transient ω envelope from full-circle starts (the invariant bound, adaptive)
         let mut xstar = vec![0.0f32; d]; xstar[..nj].copy_from_slice(&g[..nj]);
         for _ in 0..800 { xstar = fcl(&m, bi, &xstar, g); }
@@ -122,7 +122,7 @@ fn main() {
         let mut certified = 0usize;
         for it in 0..ITERS {
             let mut nmf = vec![0.0f32; total * d * d]; let mut nalive = alive.clone(); let mut changed = 0usize;
-            for n in 0..total { if !alive[n] { continue; }
+            for (n, item_n) in alive.iter().enumerate().take(total) { if !*item_n { continue; }
                 let ok = (|| -> Option<Vec<f32>> {
                     // locate image cell (θ dims periodic — always inside; ω dims may exit)
                     let mut base = vec![0usize; d]; let mut frac = vec![0.0f32; d];
@@ -155,7 +155,7 @@ fn main() {
         let frac_pct = certified as f32 / total as f32 * 100.0;
         // largest ball around x* fully certified (wrapped-θ Euclid)
         let mut ball = f32::MAX;
-        for n in 0..total { if !alive[n] { let x = node_x(n);
+        for (n, item_n) in alive.iter().enumerate().take(total) { if !*item_n { let x = node_x(n);
             let r: f32 = (0..d).map(|c| { let mut e = x[c] - xstar[c]; if c < nj { e = wrap(e); } e * e }).sum::<f32>().sqrt();
             if r < ball { ball = r; } } }
         if ball == f32::MAX { ball = f32::INFINITY; }

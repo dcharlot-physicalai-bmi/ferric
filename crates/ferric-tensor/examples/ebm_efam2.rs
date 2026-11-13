@@ -73,8 +73,8 @@ impl SeqMem {
         let mut q = *q0;
         for _ in 0..KMEM { let ws = self.weights(&q);
             let mut grad = [0.0f32; PDIM];
-            for (i, x) in self.xi.iter().enumerate() { for c in 0..PDIM { grad[c] += ws[i] * (q[c] - x[c]); } }
-            for c in 0..PDIM { q[c] -= ETA * grad[c]; } }
+            for (i, x) in self.xi.iter().enumerate() { for (c, item_c) in q.iter().enumerate().take(PDIM) { grad[c] += ws[i] * (*item_c - x[c]); } }
+            for (c, item_c) in q.iter_mut().enumerate().take(PDIM) { *item_c -= ETA * grad[c]; } }
         q
     }
     fn next(&self, q: &[f32; PDIM]) -> [f32; PDIM] {                   // hetero-readout: address current, emit SUCCESSOR
@@ -94,7 +94,7 @@ fn goal_of(q: &[f32; PDIM]) -> f32 { q[CDIM + 1].atan2(q[CDIM]) }
 fn mk_chain(goals: &[f32], seed: u32) -> SeqMem {
     let mut xi = Vec::with_capacity(goals.len());
     for (k, g) in goals.iter().enumerate() { let mut p = [0.0f32; PDIM]; let mut n = 0.0;
-        for c in 0..CDIM { p[c] = u(seed + k as u32, 100 + c as u32) * 2.0 - 1.0; n += p[c] * p[c]; }
+        for (c, item_c) in p.iter_mut().enumerate().take(CDIM) { *item_c = u(seed + k as u32, 100 + c as u32) * 2.0 - 1.0; n += *item_c * *item_c; }
         let n = n.sqrt().max(1e-6); for item in p[..CDIM].iter_mut() { *item /= n; }
         p[CDIM] = g.cos(); p[CDIM + 1] = g.sin(); xi.push(p); }
     SeqMem { xi }
@@ -124,7 +124,7 @@ fn main() {
         let mut corrupted_at = if kick { 400 + (u(ep, 77) * 800.0) as usize } else { usize::MAX };
         for stp in 0..6000 {
             if stp == corrupted_at {                                     // memory-state corruption (interference)
-                for c in 0..PDIM { q[c] += (u(ep * 7 + c as u32, 88) * 2.0 - 1.0) * sigma; }
+                for (c, item_c) in q.iter_mut().enumerate().take(PDIM) { *item_c += (u(ep * 7 + c as u32, 88) * 2.0 - 1.0) * sigma; }
                 corrupted_at = usize::MAX;
             }
             if cleanup && mem.energy(&q) > tau { q = mem.settle(&q); }   // energy-gated associative cleanup
@@ -175,7 +175,7 @@ fn main() {
         let mem = mk_chain(&wps, 9000 + (tr % 60) * 41);
         let k = 1 + (u(tr, 61) * 6.0) as usize;                  // enter at phase 1..6
         let mut cue = mem.xi[k];
-        for c in 0..CDIM { if u(tr, 300 + c as u32) < 0.25 { cue[c] = 0.0; } }  // 25% corrupted cue
+        for (c, item_c) in cue.iter_mut().enumerate().take(CDIM) { if u(tr, 300 + c as u32) < 0.25 { *item_c = 0.0; } }  // 25% corrupted cue
         cue[CDIM] = 0.0; cue[CDIM + 1] = 0.0;                           // goal coords unknown
         let q = mem.settle(&cue);
         if mem.slot(&q) == k { ok_entry += 1; } }

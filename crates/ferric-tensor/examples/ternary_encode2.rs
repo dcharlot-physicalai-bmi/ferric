@@ -73,10 +73,10 @@ async fn run() {
     let mut seed = 0x2545F4914F6CDD1Du64;
     let mut u = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 40) as f32 + 0.5) / (1u32 << 24) as f32 };
     let mut w = vec![0f32; n];
-    for i in 0..n {
+    for wi in &mut w {
         let (a, b) = (u().max(1e-7), u());
-        w[i] = (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos() * 0.02;
-        if u() < 0.01 { w[i] *= 12.0; }
+        *wi = (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos() * 0.02;
+        if u() < 0.01 { *wi *= 12.0; }
     }
     let x: Vec<f32> = (0..bs * cols).map(|i| ((i.wrapping_mul(2654435761usize)) as f32).sin() * 0.1).collect();
     // reference output y = X Wᵀ (f32), computed once via Ferric

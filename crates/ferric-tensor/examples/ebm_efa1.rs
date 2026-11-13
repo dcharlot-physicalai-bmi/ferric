@@ -101,7 +101,7 @@ impl Efa1 {
 fn eval_card(m: &Efa1, vns: &[Vn]) -> Vec<(f32, f32, bool)> {
     let gt = [[0.8f32, -0.6, 0.5], [-0.7, 0.5, -0.6], [0.5, 0.9, -0.4], [-0.5, -0.8, 0.7]];
     let mut rows = vec![];
-    for bi in 0..NB { let nj = NJ[bi];
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi;
         let (mut reach, nn) = (0, 60);
         for k in 0..nn { let sd = 900 + (bi * 100 + k) as u32; let mut s = [0.0f32; 6]; let mut g = [0.0f32; 3];
             let gtk = gt[k % 4]; for j in 0..nj { s[j] = (u(sd, 7 + j as u32) * 2.0 - 1.0) * PI; g[j] = gtk[j]; }
@@ -109,7 +109,7 @@ fn eval_card(m: &Efa1, vns: &[Vn]) -> Vec<(f32, f32, bool)> {
             if (0..nj).all(|i| wrap(s[i] - g[i]).abs() < 0.35 && s[3 + i].abs() < 0.7) { reach += 1; } }
         let (mut vg, mut vt) = (0, 0); for k in 0..2000u32 { let mut s = [0.0f32; 6]; let mut g = [0.0f32; 3];
             for j in 0..nj { let ju = j as u32; s[j] = (u(k, 41 + ju) * 2.0 - 1.0) * PI; s[3 + j] = (u(k, 44 + ju) * 2.0 - 1.0) * 3.0; g[j] = (u(k, 47 + ju) * 2.0 - 1.0) * 1.0; }
-            let us = vns[bi].ustar(s, g); let mut bad = [0.0f32; 3]; for j in 0..nj { bad[j] = (u(k, 50 + j as u32) * 2.0 - 1.0) * UMAX; }
+            let us = vns[bi].ustar(s, g); let mut bad = [0.0f32; 3]; for (j, item_j) in bad.iter_mut().enumerate().take(nj) { *item_j = (u(k, 50 + j as u32) * 2.0 - 1.0) * UMAX; }
             vt += 1; if m.energy(bi, s, g, us) < m.energy(bi, s, g, bad) { vg += 1; } }
         let s0 = [0.3f32, -0.2, 0.1, 0.0, 0.0, 0.0]; let g0 = [0.5f32, -0.3, 0.2];
         let (a1, a2) = (m.act(bi, s0, g0), m.act(bi, s0, g0));
@@ -121,7 +121,7 @@ fn print_card(rows: &[(f32, f32, bool)], fin: usize, tag: &str) {
     let flopf = 2 * (fin * H + H * H + H * 3); let flopv = 2 * (12 * HV + HV * HV + HV);
     println!("\n  ── EFA-1 IDENTITY CARD [{}] (one weights file, {} bodies) ──", tag, NB);
     println!("     body      reach(flow K=1)   verify    FLOPs/decision   vs discrete Gᵈ   determinism");
-    for bi in 0..NB { let nj = NJ[bi]; let (r, v, det) = rows[bi]; let gd = 5usize.pow(nj as u32) + 3usize.pow(nj as u32);
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi; let (r, v, det) = rows[bi]; let gd = 5usize.pow(nj as u32) + 3usize.pow(nj as u32);
         println!("     {}-DOF       {:>4.0}%           {:>4.1}%     {:>7}          {:>4}×          {}", nj, r, v, flopf, (gd * flopv) / flopf, if det { "bit-exact ✓" } else { "✗" }); }
 }
 
@@ -134,7 +134,7 @@ async fn run() {
 
     // ---- Stage A: per-body FVI value demonstrators ----
     let mut vns: Vec<Vn> = vec![];
-    for bi in 0..NB { let nj = NJ[bi];
+    for (bi, item_bi) in NJ.iter().enumerate().take(NB) { let nj = *item_bi;
         let vnet = |f: &[Var], pv: &[Var], ov: &Var| { let mut pre = pv[12].clone(); for c in 0..12 { pre = pre.add(&f[c].matmul(&pv[c])); } sp(sp(sp(pre, ov).matmul(&pv[13]).add(&pv[14]), ov).matmul(&pv[15]).add(&pv[16]), ov) };
         let mut p: Vec<Tensor> = (0..12).map(|c| Tensor::from_vec(&ctx, &randn(HV, 22 + (bi * 40 + c) as u32, 0.45), &[1, HV])).collect();
         p.push(Tensor::zeros(&ctx, &[HV])); p.push(Tensor::from_vec(&ctx, &randn(HV * HV, 400 + bi as u32, 1.0 / (HV as f32).sqrt()), &[HV, HV])); p.push(Tensor::zeros(&ctx, &[HV]));
@@ -160,7 +160,7 @@ async fn run() {
             let e = vnet(&(0..12).map(|c| l(&fc[c], bs)).collect::<Vec<_>>(), &pv, &ov); let d = e.sub(&Var::leaf(Tensor::from_vec(&ctx, &target, &[bs, 1]))); let loss = d.mul(&d).mean_all(); loss.backward();
             let g: Vec<Tensor> = pv.iter().zip(&p).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adam.step(&mut p, &g); if it % 200 == 0 { tgt = p.clone(); }
         }
-        let mut w: Vec<Vec<f32>> = Vec::new(); for c in 0..12 { w.push(p[c].to_vec().await); }
+        let mut w: Vec<Vec<f32>> = Vec::new(); for item_c in p.iter().take(12) { w.push(item_c.to_vec().await); }
         vns.push(Vn { w, b1: p[12].to_vec().await, w2: p[13].to_vec().await, b2: p[14].to_vec().await, w3: p[15].to_vec().await, b3: p[16].to_vec().await[0], nj });
         println!("  Stage A: body {} ({}-DOF) demonstrator trained", bi, nj);
     }
@@ -204,7 +204,7 @@ async fn run() {
         let fpv: Vec<Var> = fp.iter().map(|t| Var::leaf(t.clone())).collect(); let ev = Var::leaf(emb.clone());
         let embg = Var::leaf(Tensor::from_vec(&ctx, &oh, &[bs, NB])).matmul(&ev);        // [bs,EMB]
         let mut ff: Vec<Var> = (0..16).map(|c| l(&fcf[c], bs)).collect();
-        for c in 0..EMB { ff.push(embg.matmul(&Var::leaf(embsel[c].clone()))); }
+        for item_c in embsel.iter().take(EMB) { ff.push(embg.matmul(&Var::leaf(item_c.clone()))); }
         let v = fnet(&ff, &fpv);
         let d = v.sub(&Var::leaf(Tensor::from_vec(&ctx, &tb, &[bs, 3]))); let floss = d.mul(&d).mean_all(); floss.backward();
         let gf: Vec<Tensor> = fpv.iter().zip(&fp).map(|(v, t)| v.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &vec![0.0; t.numel()], &t.shape))).collect(); adamf.step(&mut fp, &gf);
@@ -212,8 +212,8 @@ async fn run() {
         // ---- potential update (contrastive; + emb) ----
         let ppv: Vec<Var> = pp.iter().map(|t| Var::leaf(t.clone())).collect(); let ev2 = Var::leaf(emb.clone());
         let embp = Var::leaf(Tensor::from_vec(&ctx, &ohp, &[bs, NB])).matmul(&ev2);
-        let mut pf: Vec<Var> = (0..15).map(|c| l(&pcp[c], bs)).collect(); for c in 0..EMB { pf.push(embp.matmul(&Var::leaf(embsel[c].clone()))); }
-        let mut nf2: Vec<Var> = (0..15).map(|c| l(&pcn[c], bs)).collect(); for c in 0..EMB { nf2.push(embp.matmul(&Var::leaf(embsel[c].clone()))); }
+        let mut pf: Vec<Var> = (0..15).map(|c| l(&pcp[c], bs)).collect(); for item_c in embsel.iter().take(EMB) { pf.push(embp.matmul(&Var::leaf(item_c.clone()))); }
+        let mut nf2: Vec<Var> = (0..15).map(|c| l(&pcn[c], bs)).collect(); for item_c in embsel.iter().take(EMB) { nf2.push(embp.matmul(&Var::leaf(item_c.clone()))); }
         let ep = pnet(&pf, &ppv); let en = pnet(&nf2, &ppv);
         let hinge = ep.sub(&en).add(&marg).relu(); let anch = ep.mul(&ep).mul(&Var::leaf(Tensor::from_vec(&ctx, &[0.02], &[1])));
         let ploss = hinge.add(&anch).mean_all(); ploss.backward();
@@ -221,8 +221,8 @@ async fn run() {
         let ge2 = ev2.grad().unwrap_or_else(|| Tensor::from_vec(&ctx, &[0.0; NB * EMB], &[NB, EMB])); adame.step(std::slice::from_mut(&mut emb), &[ge2]);
     }
     // extract shared model
-    let mut fw: Vec<Vec<f32>> = Vec::new(); for c in 0..fin { fw.push(fp[c].to_vec().await); }
-    let fb3 = fp[fin + 4].to_vec().await; let mut pw: Vec<Vec<f32>> = Vec::new(); for c in 0..pin { pw.push(pp[c].to_vec().await); }
+    let mut fw: Vec<Vec<f32>> = Vec::new(); for item_c in fp.iter().take(fin) { fw.push(item_c.to_vec().await); }
+    let fb3 = fp[fin + 4].to_vec().await; let mut pw: Vec<Vec<f32>> = Vec::new(); for item_c in pp.iter().take(pin) { pw.push(item_c.to_vec().await); }
     let m = Efa1 { emb: emb.to_vec().await,
         fw, fb1: fp[fin].to_vec().await, fw2: fp[fin + 1].to_vec().await, fb2: fp[fin + 2].to_vec().await, fw3: fp[fin + 3].to_vec().await, fb3: [fb3[0], fb3[1], fb3[2]],
         pw, pb1: pp[pin].to_vec().await, pw2: pp[pin + 1].to_vec().await, pb2: pp[pin + 2].to_vec().await, pw3: pp[pin + 3].to_vec().await, pb3: pp[pin + 4].to_vec().await[0] };
@@ -235,10 +235,10 @@ async fn run() {
     // save shared trunk + body embedding
     std::fs::create_dir_all(OUTDIR).unwrap();
     let mut ts: Vec<(String, Vec<usize>, Vec<f32>)> = vec![("body_embedding".into(), vec![NB, EMB], m.emb.clone())];
-    for c in 0..fin { ts.push((format!("flow.in{}", c), vec![1, H], m.fw[c].clone())); }
+    for (c, item_c) in m.fw.iter().enumerate().take(fin) { ts.push((format!("flow.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("flow.b1".into(), vec![H], m.fb1.clone())); ts.push(("flow.w2".into(), vec![H, H], m.fw2.clone()));
     ts.push(("flow.b2".into(), vec![H], m.fb2.clone())); ts.push(("flow.w3".into(), vec![H, 3], m.fw3.clone())); ts.push(("flow.b3".into(), vec![3], m.fb3.to_vec()));
-    for c in 0..pin { ts.push((format!("potential.in{}", c), vec![1, H], m.pw[c].clone())); }
+    for (c, item_c) in m.pw.iter().enumerate().take(pin) { ts.push((format!("potential.in{}", c), vec![1, H], item_c.clone())); }
     ts.push(("potential.b1".into(), vec![H], m.pb1.clone())); ts.push(("potential.w2".into(), vec![H, H], m.pw2.clone()));
     ts.push(("potential.b2".into(), vec![H], m.pb2.clone())); ts.push(("potential.w3".into(), vec![H, 1], m.pw3.clone())); ts.push(("potential.b3".into(), vec![1], vec![m.pb3]));
     save_st(&format!("{OUTDIR}/model.safetensors"), &ts).unwrap();

@@ -105,8 +105,7 @@ async fn run() {
 
     // ---- down blocks (WanResidualDownBlock) ----
     let down_cfg = [(160usize, 160usize, 1usize, true), (160, 320, 2, true), (320, 640, 2, true), (640, 640, 1, false)];
-    for i in 0..4 {
-        let (cin, cout, ft, down_flag) = down_cfg[i];
+    for (i, &(cin, cout, ft, down_flag)) in down_cfg.iter().enumerate() {
         let x_copy = x.clone();
         x = resnet(&x, &format!("encoder.down_blocks.{i}.resnets.0"));
         x = resnet(&x, &format!("encoder.down_blocks.{i}.resnets.1"));

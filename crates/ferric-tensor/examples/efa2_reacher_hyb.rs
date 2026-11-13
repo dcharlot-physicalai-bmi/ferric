@@ -21,9 +21,9 @@ struct Arm { m: [f32; 2], l: [f32; 2], lc: [f32; 2], ii: [f32; 2] }
 impl Arm {
     fn new() -> Arm { Arm { m: [1.0, 1.0], l: [L1, L2], lc: [0.5, 0.5], ii: [0.083, 0.083] } }
     fn jac(&self, q: &[f32; 2]) -> [[[f32; 2]; 2]; 2] { let ph = [q[0], q[0] + q[1]]; let mut j = [[[0.0f32; 2]; 2]; 2];
-        for i in 0..2 { for jj in 0..=i { let mut v = [0.0f32; 2];
+        for i in 0..2 { for (jj, item_jj) in j[i].iter_mut().enumerate().take(i + 1) { let mut v = [0.0f32; 2];
             for k in jj..i { v[0] += self.l[k] * ph[k].cos(); v[1] += self.l[k] * ph[k].sin(); }
-            v[0] += self.lc[i] * ph[i].cos(); v[1] += self.lc[i] * ph[i].sin(); j[i][jj] = v; } } j }
+            v[0] += self.lc[i] * ph[i].cos(); v[1] += self.lc[i] * ph[i].sin(); *item_jj = v; } } j }
     fn mm(&self, q: &[f32; 2]) -> [[f32; 2]; 2] { let j = self.jac(q); let mut m = [[0.0f32; 2]; 2];
         for a in 0..2 { for b in 0..2 { let mut s = 0.0;
             for i in 0..2 { s += self.m[i] * (j[i][a][0] * j[i][b][0] + j[i][a][1] * j[i][b][1]);
