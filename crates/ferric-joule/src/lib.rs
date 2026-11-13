@@ -917,21 +917,22 @@ fn parse_sample(line: &str) -> Option<MacmonSample> {
     })
 }
 
-/// 1-minute load average from `getloadavg(3)`. `None` off macOS or when the call fails.
+/// First number from `sysctl -n vm.loadavg`, which prints `{ 3.84 3.09 3.44 }`.
+pub fn parse_sysctl_loadavg(text: &str) -> Option<f64> {
+    let trimmed = text.trim().trim_start_matches('{').trim_end_matches('}').trim();
+    trimmed.split_whitespace().next()?.parse().ok()
+}
+
+/// 1-minute load average from `sysctl -n vm.loadavg`. `None` off macOS or when the command fails.
 pub fn macos_load1() -> Option<f64> {
-    #[cfg(target_os = "macos")]
-    {
-        extern "C" {
-            fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
-        }
-        let mut v = [0.0f64; 3];
-        let n = unsafe { getloadavg(v.as_mut_ptr(), 3) };
-        if n >= 1 { Some(v[0]) } else { None }
+    if std::env::consts::OS != "macos" {
+        return None;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
+    let out = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
+    parse_sysctl_loadavg(&String::from_utf8_lossy(&out.stdout))
 }
 
 impl Meter for Macmon {
@@ -1711,6 +1712,14 @@ mod meter_registry_tests {
         assert_eq!(rows, METERS.len(), "capability_report drifted from METERS");
         for (name, _, _) in METERS {
             assert!(capability_report().contains(name), "{name} is in METERS but not in the report");
+        }
+    }
+
+    #[test]
+    fn sysctl_vm_loadavg_takes_the_first_number() {
+        assert_eq!(parse_sysctl_loadavg("{ 3.84 3.09 3.44 }"), Some(3.84));
+        if std::env::consts::OS != "macos" {
+            assert!(macos_load1().is_none());
         }
     }
 

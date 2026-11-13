@@ -713,7 +713,7 @@ pub fn read_load1() -> Result<f64, String> {
     if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
         return crate::macmon::parse_proc_load1(&text);
     }
-    ferric_joule::macos_load1().ok_or_else(|| "getloadavg returned no load1".into())
+    ferric_joule::macos_load1().ok_or_else(|| "sysctl -n vm.loadavg returned no load1".into())
 }
 
 pub fn read_cpu_ticks() -> Result<Vec<CpuTicks>, String> {

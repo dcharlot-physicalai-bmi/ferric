@@ -197,13 +197,7 @@ pub fn parse_proc_load1(text: &str) -> Result<f64, String> {
 
 /// `sysctl -n vm.loadavg` prints `{ 1.23 0.45 0.20 }`.
 pub fn parse_sysctl_loadavg(text: &str) -> Result<f64, String> {
-    let trimmed = text.trim().trim_start_matches('{').trim_end_matches('}').trim();
-    trimmed
-        .split_whitespace()
-        .next()
-        .ok_or("sysctl vm.loadavg empty")?
-        .parse::<f64>()
-        .map_err(|e| e.to_string())
+    ferric_joule::parse_sysctl_loadavg(text).ok_or_else(|| "sysctl vm.loadavg empty".into())
 }
 
 pub struct Sampler {
@@ -335,5 +329,6 @@ mod tests {
     fn sysctl_and_proc_load1_parsers_take_the_first_number() {
         assert!((parse_proc_load1("1.25 0.80 0.40 1/200 9\n").unwrap() - 1.25).abs() < 1e-12);
         assert!((parse_sysctl_loadavg("{ 2.50 1.10 0.90 }\n").unwrap() - 2.50).abs() < 1e-12);
+        assert!((parse_sysctl_loadavg("{ 3.84 3.09 3.44 }").unwrap() - 3.84).abs() < 1e-12);
     }
 }

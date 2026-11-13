@@ -55,7 +55,7 @@ Each of `gpu_power`, `cpu_power`, `ane_power`, `ram_power`, `gpu_ram_power`, and
 
 If `ram_power` and `gpu_ram_power` read exactly 0, that scope is `unavailable`. A missing counter is not a measured zero. The SoC total (`cpu+gpu+ane+ram`) and the accelerator total (`gpu+ram`) are refused in that case, with a label, so they cannot be published as if DRAM were absent from the sum. One M5 Max probe of macmon 0.11.0 saw both DRAM fields at 0.0 while `sys_power` was nonzero. That probe is not a measurement.
 
-On macOS the receipt records `pinning: no core pinning was applied`. Per-core busy fraction is not collected. The quiet gate, declared before the run, is load1 from `getloadavg` (and `/proc/loadavg` when that file exists) plus the idle `sys_power` baseline. The same `/tmp/bmi-energy.lock` is held from preflight through the post bracket. No sudo and no `powermetrics`.
+On macOS the receipt records `pinning: no core pinning was applied`. Per-core busy fraction is not collected. The quiet gate, declared before the run, is load1 from `sysctl -n vm.loadavg` (and `/proc/loadavg` when that file exists) plus the idle `sys_power` baseline. The same `/tmp/bmi-energy.lock` is held from preflight through the post bracket. No sudo and no `powermetrics`.
 
 On the M5 Max, as the user who can run `macmon`:
 
