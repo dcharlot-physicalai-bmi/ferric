@@ -30,12 +30,15 @@ jobs:
       # Mesa 26.0.8's lavapipe is built against LLVM 21.1.8. On the AVX-512 EPYC
       # hosts ubuntu-latest hands out, that JIT assigns the VEX-only AVX2_SETALLONES
       # pseudo to ymm16–31 and the shader faults (llvm/llvm-project#169009,
-      # mesa#16702). `cargo test -p ferric-llama` died with signal 11 inside the
-      # generated code once a dense MLA kernel was compiled; the same suite passes
-      # on LLVM 20. AVX2 codegen of those shaders is correct on this LLVM. The pin
-      # selects that target for every step of this job. It does not skip a test,
-      # ignore a failure, or change an assertion. Metal and Kani do not read it.
-      GALLIUM_OVERRIDE_CPU_CAPS: avx2
+      # mesa#16702). `cargo test -p ferric-llama` died with signal 11. The same
+      # suite passes on this Mesa when the host is Intel and on LLVM 20. AVX2
+      # codegen is the target that does not hit it.
+      #
+      # The token is `avx`, not `avx2`. u_cpu_detect.c treats the value as a
+      # ceiling: `avx` clears has_avx512f and leaves has_avx2 set. `avx2` matches
+      # nothing, so it is a no-op and AVX-512 stays on. It does not skip a test
+      # or change an assertion. Metal and Kani do not read it.
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
       LP_NATIVE_VECTOR_WIDTH: "256"
     steps:
       - uses: actions/checkout@v7
@@ -78,9 +81,13 @@ jobs:
 
       # The unit + integration suites. These were absent from CI entirely, which meant the
       # placement-invariance test, the prefix-hash guards, the interval-arithmetic soundness check and
-      # every other assertion in the workspace ran only on a developer's machine. They take ~1.5s.
+      # every other assertion in the workspace ran only on a developer's machine.
+      #
+      # Lavapipe's LLVM JIT SIGSEGVs when several tests in one process compile
+      # shaders at once. One test at a time, the same ferric-llama binary passes.
+      # Every assertion still runs. Metal keeps the parallel suite.
       - name: Test workspace
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose -- --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
