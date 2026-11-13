@@ -838,20 +838,19 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let report = cpu_fault_report();
-        // The file was written on Linux, so a Linux drift is still bit-exact: the tolerance
-        // must not hide one. Apple libm disagrees by ~5e-9 in one gelu_tanh rmse
-        // (`elementwise.index_off_by_one_row`), which is inside 1e-7 and flips no flag.
-        // A bit-exact `assert_eq!` here made that ulp fail the Metal job before the
-        // tolerant compare could run (run 43435730656).
-        #[cfg(target_os = "linux")]
-        assert_eq!(file["cpu"], report, "the committed catalogue drifted on Linux, where it was written");
+        // The committed numbers match the libm that wrote the file. They are not bit-identical
+        // on every libm that can still be called Linux: GitHub's ubuntu-latest (glibc on
+        // resolute) and Apple libm both produce 0.23910627516696203 for
+        // `elementwise.index_off_by_one_row.rmse`, against 0.23910626993893822 in the file.
+        // The gap is 5.2e-9, inside 1e-7, and it flips no detection flag. A bit-exact compare
+        // failed both Metal (43435730656) and this runner (43458775739). A 1e-4 move still fails.
         catalogues_agree(&file["cpu"], &report, 1e-7)
             .unwrap_or_else(|e| panic!("the committed catalogue drifted past a libm ulp: {e}"));
         assert_eq!(file["llvmpipe"]["adapter"], "llvmpipe (LLVM 20.1.2, 256 bits)");
     }
 
-    /// The macOS rmse from Metal run 43435730656, pinned against the committed Linux value.
-    /// If the committed number moves, this fails on Linux too, and the gap has to be remeasured
+    /// The other libm's rmse (Apple, and glibc on ubuntu-latest), pinned against the committed value.
+    /// If the committed number moves, this fails everywhere, and the gap has to be remeasured
     /// rather than quietly absorbed.
     #[test]
     fn the_measured_macos_rmse_stays_a_libm_ulp() {
