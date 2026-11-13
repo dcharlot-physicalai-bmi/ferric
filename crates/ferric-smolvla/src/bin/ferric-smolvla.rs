@@ -540,7 +540,137 @@ fn stage_profile(a: &ferric_smolvla::ActivationTrace, b: &ferric_smolvla::Activa
     })
 }
 
+fn gpu_energy_macmon(args: &[String]) -> Result<String, String> {
+    let out_dir = flag(args, "--out-dir").ok_or("--out-dir")?.to_string();
+    let trials: usize = flag(args, "--trials").ok_or("--trials")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let warmup: usize = flag(args, "--warmup").ok_or("--warmup")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let baseline_s: f64 = ferric_fleet::duration_is_explicit(flag(args, "--baseline-s").and_then(|s| s.parse().ok()))?;
+    let period_ms: u64 = flag(args, "--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(1000);
+    if trials < 2 || warmup < 1 || period_ms == 0 {
+        return Err("need --trials >= 2, --warmup >= 1, --sample-ms > 0".into());
+    }
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let case = load_case(args)?;
+    let store = ferric_smolvla::weights::Store::open(&case.weights)?;
+    let mut sampler = ferric_fleet::Sampler::spawn(std::path::Path::new(flag(args, "--macmon-bin").unwrap_or("macmon")), period_ms)?;
+    let mut session = pollster::block_on(ferric_smolvla::GpuSession::open())?;
+    let adapter = session.ctx.adapter_name.clone();
+    if session.software {
+        return Err(format!("adapter `{adapter}` is software; no GPU energy run"));
+    }
+    ferric_fleet::gpu_receipt_allowed(&adapter)?;
+    let drain = ferric_fleet::Drain { submit_empty: true, poll_wait: true, readback: true };
+    ferric_fleet::require_drains(ferric_fleet::Phase::SteadyInfer, drain, drain)?;
+    let s = sample(&case, true, true, None, None, None, None);
+    let mut windows = Vec::new();
+    let clip = |rows: &[(u64, ferric_fleet::Reading)], a: u64, b: u64| -> Vec<(u64, ferric_fleet::Reading)> {
+        rows.iter().filter(|(t, _)| *t >= a && *t <= b).cloned().collect()
+    };
+    let mut run = |session: &mut ferric_smolvla::GpuSession, label: String, phase: &'static str| -> Result<serde_json::Value, String> {
+        session.drain();
+        let t0 = sampler.snapshot().last().map(|(t, _)| *t).unwrap_or(0);
+        let g = pollster::block_on(session.forward(&store, &s))?;
+        session.drain();
+        let rows = sampler.snapshot();
+        let t1 = rows.last().map(|(t, _)| *t).unwrap_or(t0);
+        let joules = ferric_fleet::integrate(&clip(&rows, t0, t1));
+        Ok(serde_json::json!({
+            "label": label,
+            "phase": phase,
+            "t_start_monotonic_ns": t0,
+            "t_end_monotonic_ns": t1,
+            "wall_s": (t1.saturating_sub(t0)) as f64 * 1e-9,
+            "macmon_j": {"sys": joules.sys, "cpu": joules.cpu, "gpu": joules.gpu, "ane": joules.ane},
+            "summed": false,
+            "raw_action_sha256": ferric_fleet::digest_f32(&g.raw_actions),
+            "dispatches": g.dispatches,
+            "completions": g.completions,
+            "readbacks": g.readbacks,
+        }))
+    };
+    windows.push(run(&mut session, "load_compile_first".into(), "load+compile")?);
+    for i in 0..warmup {
+        windows.push(run(&mut session, format!("warmup{i}"), "warmup")?);
+    }
+    let base = |session: &ferric_smolvla::GpuSession, label: &str| -> Result<serde_json::Value, String> {
+        session.drain();
+        let t0 = sampler.snapshot().last().map(|(t, _)| *t).unwrap_or(0);
+        session_idle_sleep(baseline_s);
+        session.drain();
+        let rows = sampler.snapshot();
+        let t1 = rows.last().map(|(t, _)| *t).unwrap_or(t0);
+        let joules = ferric_fleet::integrate(&clip(&rows, t0, t1));
+        Ok(serde_json::json!({
+            "label": label,
+            "phase": "idle-baseline",
+            "t_start_monotonic_ns": t0,
+            "t_end_monotonic_ns": t1,
+            "wall_s": (t1.saturating_sub(t0)) as f64 * 1e-9,
+            "macmon_j": {"sys": joules.sys, "cpu": joules.cpu, "gpu": joules.gpu, "ane": joules.ane},
+            "summed": false,
+        }))
+    };
+    windows.push(base(&session, "baseline_A1")?);
+    for i in 0..trials {
+        windows.push(run(&mut session, format!("trial{i}"), "steady-infer")?);
+    }
+    windows.push(base(&session, "baseline_A2")?);
+    sampler.stop();
+    let mut derived = serde_json::Map::new();
+    let trial_w: Vec<&serde_json::Value> = windows.iter().filter(|w| w["phase"] == "steady-infer").collect();
+    let a1 = windows.iter().find(|w| w["label"] == "baseline_A1");
+    let a2 = windows.iter().find(|w| w["label"] == "baseline_A2");
+    if let (Some(a1), Some(a2)) = (a1, a2) {
+        for key in ["sys", "cpu", "gpu", "ane"] {
+            let joule = |w: &serde_json::Value| w["macmon_j"][key].as_f64();
+            let wall = |w: &serde_json::Value| w["wall_s"].as_f64().unwrap_or(0.0);
+            let (Some(j1), Some(j2)) = (joule(a1), joule(a2)) else { continue };
+            if wall(a1) <= 0.0 || wall(a2) <= 0.0 { continue; }
+            let p1 = j1 / wall(a1);
+            let p2 = j2 / wall(a2);
+            let pb = (p1 + p2) / 2.0;
+            let gross: Vec<f64> = trial_w.iter().filter_map(|w| joule(w)).collect();
+            if gross.len() != trial_w.len() { continue; }
+            let inc: Vec<f64> = trial_w.iter().map(|w| ferric_fleet::incremental_joules(joule(w).unwrap(), wall(w), pb)).collect();
+            derived.insert(key.to_string(), serde_json::json!({
+                "gross_j_per_inference": gross,
+                "baseline_power_w_A1": p1,
+                "baseline_power_w_A2": p2,
+                "baseline_power_w_mean": pb,
+                "baseline_drift_w": p2 - p1,
+                "incremental_j_per_inference": inc,
+                "grade": "measured",
+            }));
+        }
+    }
+    let body = serde_json::json!({
+        "command": "ferric-smolvla gpu-energy",
+        "meter": "macmon",
+        "executable": false,
+        "attributable": false,
+        "attributable_reason": "gpu-energy does not apply the quiet-host gate; ferric-fleet energy-drive does",
+        "summed": false,
+        "overlaps": ferric_fleet::overlaps(),
+        "pinning": ferric_fleet::PINNING,
+        "pinning_reason": ferric_fleet::PINNING_REASON,
+        "busy_fraction_status": "unavailable",
+        "busy_fraction_reason": ferric_fleet::BUSY_FRACTION_REASON,
+        "sampling": {"command": ferric_fleet::pipe_args(period_ms), "interval_ms": period_ms},
+        "windows": windows,
+        "derived": derived,
+        "robot_actuated": false,
+        "authorized_rollout": false,
+        "gpu_energy": "sampled macmon sys, cpu, gpu, and ane watts around drained wgpu windows; the domains overlap and are not summed; isolated GPU energy is not claimed",
+    });
+    let text = serde_json::to_string_pretty(&body).unwrap();
+    fs::write(format!("{out_dir}/gpu-energy.json"), &text).map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
 fn gpu_energy(args: &[String]) -> Result<String, String> {
+    if flag(args, "--meter").unwrap_or("rapl") == "macmon" {
+        return gpu_energy_macmon(args);
+    }
     let out_dir = flag(args, "--out-dir").ok_or("--out-dir")?.to_string();
     let trials: usize = flag(args, "--trials").ok_or("--trials")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     let warmup: usize = flag(args, "--warmup").ok_or("--warmup")?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;

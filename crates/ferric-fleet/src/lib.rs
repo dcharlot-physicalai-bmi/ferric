@@ -9,6 +9,7 @@ mod acquire;
 mod bind;
 mod energy_drive;
 mod infer;
+mod macmon;
 mod meter;
 mod window;
 
@@ -16,9 +17,13 @@ pub use acquire::{Artifact, artifacts, url, verify_bytes};
 pub use bind::{ClockSnapshot, bind_clock};
 pub use infer::{ACTION_CHUNK_BLOCKER, digest_f32, load_tensor, state_proj};
 pub use energy_drive::{
-    judge, parse_cpu_list, pinned_argv, receipt_json, run_locked_attempt, run_until_quiet, try_lock_exclusive,
-    BusyFraction, CpuTicks, DriveReceipt, EnergySeries, Grade, LiveConfig, LockHold, LOAD1_MAX, LOCK_PATH,
-    SETTLE_S,
+    judge, macmon_receipt, parse_cpu_list, pinned_argv, receipt_json, run_locked_attempt, run_locked_macmon,
+    run_until_quiet, run_until_quiet_macmon, try_lock_exclusive, BusyFraction, CpuTicks, DriveReceipt,
+    EnergySeries, Grade, LiveConfig, LockHold, MacmonAttempt, MacmonConfig, LOAD1_MAX, LOCK_PATH, SETTLE_S,
+};
+pub use macmon::{
+    incremental_joules, integrate, overlaps, parse_line, parse_proc_load1, parse_sysctl_loadavg, pipe_args,
+    Reading, Sampler, BUSY_FRACTION_REASON, PINNING, PINNING_REASON,
 };
 pub use meter::{
     hwmon_input, trapezoid_joules, Domain, Sample, delta_uj, dram_joules, evaluate_domains,

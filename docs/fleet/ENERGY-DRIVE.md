@@ -35,3 +35,35 @@ nohup /path/to/ferric-fleet energy-drive \
 `VK_DRIVER_FILES` must not force lavapipe. wgpu's default enumeration on that host selects `Radeon 8060S Graphics (RADV STRIX_HALO)`. `gpu-energy` refuses a software adapter. The same command under a user systemd timer uses `Type=oneshot` and the same `ExecStart=` line, with `User=` set to the counter's owner. No unit should be installed as root for this driver.
 
 `gpu-energy` by itself is not an attributable receipt. The driver is what applies the quiet gates. `docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json` is an earlier measured run with `attributable: false` because the host was loaded. It is not relabeled.
+
+## macOS, macmon
+
+`--meter macmon` samples `macmon pipe -i <sample-ms> -s 0`. The fields are `cpu_power`, `gpu_power`, `ane_power`, and `sys_power` from current macmon `Metrics`, in watts, integrated with the same trapezoid as PPT. `sys_power` is at least `chip_power`, and `chip_power` is at least CPU + GPU + ANE + DRAM, so those meters overlap and are not added. Temperatures are `temp.cpu_temp_avg` and `temp.gpu_temp_avg`.
+
+There is no per-core pin. The receipt says `pinning: unavailable` instead of failing. Per-core busy fraction via `host_processor_info` is not collected; the quiet gate, declared before the run, is load1 (`sysctl -n vm.loadavg` on macOS, `/proc/loadavg` when that file exists) and the idle `sys_power` baseline. The same `/tmp/bmi-energy.lock` is held from preflight through the post bracket. No sudo and no `powermetrics`.
+
+On the M5 Max, as the user who can run `macmon`:
+
+```bash
+nohup /path/to/ferric-fleet energy-drive \
+  --meter macmon \
+  --macmon-bin macmon \
+  --lock /tmp/bmi-energy.lock \
+  --out-dir "$HOME/energy" \
+  --deadline-s 21600 \
+  --retry-wait-s 120 \
+  --settle-s 60 \
+  --load1-max 2 \
+  --sample-ms 1000 \
+  -- \
+  /path/to/ferric-smolvla gpu-energy \
+    --meter macmon \
+    --macmon-bin macmon \
+    --sample-ms 1000 \
+    --weights "$HOME/art/model.safetensors" \
+    --tokenizer /path/to/ferric/crates/ferric-smolvla/tests/fixtures/tokenizer.json \
+    --stats "$HOME/art/policy_preprocessor_step_5_normalizer_processor.safetensors" \
+    --out-dir "$HOME/energy/gpu-energy" \
+    --trials 10 --warmup 2 --baseline-s 30 \
+  > "$HOME/energy/driver.log" 2>&1 &
+```

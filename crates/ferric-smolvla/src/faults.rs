@@ -12,7 +12,9 @@ use ferric_core::cpu::{layernorm, rmsnorm, softmax};
 
 use crate::gemm::gemm_nt;
 use crate::model::{attention, gelu_tanh, rope};
-use crate::tolerance::{max_abs_bound, rope_invariant_holds, rope_residual};
+use crate::tolerance::{max_abs_bound, rope_residual};
+#[cfg(test)]
+use crate::tolerance::rope_invariant_holds;
 
 pub const FAULT_SEED: u64 = 0x5a17;
 

@@ -180,6 +180,10 @@ fn energy_drive(args: &[String]) -> i32 {
         eprintln!("energy-drive needs --out-dir and -- WORKLOAD");
         return 2;
     };
+    let meter = flag("--meter").unwrap_or("rapl");
+    if meter == "macmon" {
+        return energy_drive_macmon(&flags, &workload, out);
+    }
     let Some(pkg) = flag("--rapl-package") else {
         eprintln!("energy-drive needs --rapl-package");
         return 2;
@@ -230,6 +234,45 @@ fn energy_drive(args: &[String]) -> i32 {
         Ok(receipt) => {
             println!("{}", serde_json::to_string_pretty(&ferric_fleet::receipt_json(&receipt)).unwrap());
             if receipt.attributable { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+fn energy_drive_macmon(flags: &[String], workload: &[String], out: &str) -> i32 {
+    let flag = |name: &str| {
+        flags.iter().position(|a| a == name).and_then(|i| flags.get(i + 1)).map(String::as_str)
+    };
+    if workload.is_empty() {
+        eprintln!("energy-drive needs a workload after --");
+        return 2;
+    }
+    let deadline_s: f64 = flag("--deadline-s").and_then(|s| s.parse().ok()).unwrap_or(6.0 * 60.0 * 60.0);
+    let retry_s: f64 = flag("--retry-wait-s").and_then(|s| s.parse().ok()).unwrap_or(120.0);
+    let settle_s: f64 = flag("--settle-s").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::SETTLE_S);
+    let load1_max: f64 = flag("--load1-max").and_then(|s| s.parse().ok()).unwrap_or(ferric_fleet::LOAD1_MAX);
+    let sample_ms: u64 = flag("--sample-ms").and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let lock = flag("--lock").unwrap_or(ferric_fleet::LOCK_PATH);
+    let cfg = ferric_fleet::MacmonConfig {
+        settle_s,
+        load1_max,
+        sample_ms,
+        macmon_bin: flag("--macmon-bin").unwrap_or("macmon").to_string(),
+        workload: workload.to_vec(),
+    };
+    match ferric_fleet::run_until_quiet_macmon(
+        std::path::Path::new(lock),
+        std::path::Path::new(out),
+        std::time::Duration::from_secs_f64(deadline_s),
+        std::time::Duration::from_secs_f64(retry_s),
+        &cfg,
+    ) {
+        Ok(body) => {
+            println!("{}", serde_json::to_string_pretty(&body).unwrap());
+            if body["attributable"].as_bool().unwrap_or(false) { 0 } else { 1 }
         }
         Err(e) => {
             eprintln!("{e}");

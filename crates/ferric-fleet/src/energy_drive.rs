@@ -657,8 +657,17 @@ fn empty_series() -> EnergySeries {
 }
 
 pub fn read_load1() -> Result<f64, String> {
-    let text = std::fs::read_to_string("/proc/loadavg").map_err(|e| e.to_string())?;
-    text.split_whitespace().next().ok_or("loadavg empty")?.parse::<f64>().map_err(|e| e.to_string())
+    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+        return crate::macmon::parse_proc_load1(&text);
+    }
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .map_err(|e| format!("sysctl vm.loadavg: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sysctl vm.loadavg: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    crate::macmon::parse_sysctl_loadavg(&String::from_utf8_lossy(&out.stdout))
 }
 
 pub fn read_cpu_ticks() -> Result<Vec<CpuTicks>, String> {
@@ -976,6 +985,357 @@ fn refusal_now(lock: &LockGuard, cfg: &LiveConfig, reason: String) -> DriveRecei
     refused(reason, lock.hold(), &series, None)
 }
 
+pub struct MacmonConfig {
+    pub settle_s: f64,
+    pub load1_max: f64,
+    pub sample_ms: u64,
+    pub macmon_bin: String,
+    pub workload: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MacmonAttempt {
+    pub load1_pre: Vec<f64>,
+    pub load1_post: Vec<f64>,
+    pub pre: Vec<(u64, crate::macmon::Reading)>,
+    pub trial: Vec<(u64, crate::macmon::Reading)>,
+    pub post: Vec<(u64, crate::macmon::Reading)>,
+    pub load1_max: f64,
+    pub pre_reached: bool,
+    pub workload_reached: bool,
+    pub post_reached: bool,
+    pub failure: Option<String>,
+}
+
+pub fn macmon_receipt(attempt: &MacmonAttempt, lock: &LockHold) -> serde_json::Value {
+    let sys = |rows: &[(u64, crate::macmon::Reading)]| -> Vec<f64> {
+        rows.iter().filter_map(|(_, r)| r.sys_w).collect()
+    };
+    let temp_max = |rows: &[(u64, crate::macmon::Reading)], cpu: bool| -> Option<f64> {
+        rows.iter()
+            .filter_map(|(_, r)| if cpu { r.cpu_temp_c } else { r.gpu_temp_c })
+            .reduce(f64::max)
+    };
+    let mut reason = String::new();
+    let mut ok = attempt.failure.is_none();
+    if let Some(e) = &attempt.failure {
+        ok = false;
+        reason = e.clone();
+    }
+    if ok {
+        if let Err(e) = load_is_quiet(&attempt.load1_pre, attempt.load1_max) {
+            ok = false;
+            reason = format!("pre-trial idle: {e}");
+        }
+    }
+    if ok && attempt.post_reached {
+        if let Err(e) = load_is_quiet(&attempt.load1_post, attempt.load1_max) {
+            ok = false;
+            reason = format!("post-trial idle: {e}");
+        }
+    }
+    let pre_sys = sys(&attempt.pre);
+    let post_sys = sys(&attempt.post);
+    let drift = if !attempt.pre_reached {
+        serde_json::json!({"status": "not_reached", "phase": "pre_idle"})
+    } else if !attempt.workload_reached {
+        serde_json::json!({"status": "not_reached", "phase": "workload"})
+    } else if !attempt.post_reached {
+        serde_json::json!({"status": "not_reached", "phase": "post_idle"})
+    } else {
+        match drift_within_3_sigma(&pre_sys, &post_sys) {
+            Ok(()) => serde_json::json!({"status": "computed", "within_3_sigma": true}),
+            Err(e) => {
+                if ok {
+                    ok = false;
+                    reason = e.clone();
+                }
+                serde_json::json!({"status": "computed", "within_3_sigma": false, "reason": e})
+            }
+        }
+    };
+    let joules = if ok { Some(crate::macmon::integrate(&attempt.trial)) } else { None };
+    if ok && joules.as_ref().is_some_and(|j| j.sys.is_none() || j.cpu.is_none() || j.gpu.is_none() || j.ane.is_none()) {
+        ok = false;
+        reason = "a macmon meter has fewer than two samples in the workload window".into();
+    }
+    let joules = if ok { joules } else { None };
+    if reason.is_empty() {
+        reason = "quiet load1 and idle sys_power baseline passed; busy fraction was not available".into();
+    }
+    let phase = |reached: bool, load1: &[f64], rows: &[(u64, crate::macmon::Reading)]| {
+        serde_json::json!({
+            "reached": reached,
+            "load1": load1,
+            "load1_max": load1.iter().copied().reduce(f64::max),
+            "sys_power_w": sys(rows),
+            "cpu_temp_avg_max_c": temp_max(rows, true),
+            "gpu_temp_avg_max_c": temp_max(rows, false),
+        })
+    };
+    serde_json::json!({
+        "meter": "macmon",
+        "attributable": ok,
+        "reason": reason,
+        "joules": joules.map(|j| serde_json::json!({
+            "sys": j.sys,
+            "cpu": j.cpu,
+            "gpu": j.gpu,
+            "ane": j.ane,
+        })),
+        "summed": false,
+        "overlaps": crate::macmon::overlaps(),
+        "pinning": crate::macmon::PINNING,
+        "pinning_reason": crate::macmon::PINNING_REASON,
+        "busy_fraction": null,
+        "busy_fraction_status": crate::macmon::BUSY_FRACTION_STATUS,
+        "busy_fraction_reason": crate::macmon::BUSY_FRACTION_REASON,
+        "declared_before_run": true,
+        "phases": {
+            "pre_idle": phase(attempt.pre_reached, &attempt.load1_pre, &attempt.pre),
+            "workload": phase(attempt.workload_reached, &[], &attempt.trial),
+            "post_idle": phase(attempt.post_reached, &attempt.load1_post, &attempt.post),
+        },
+        "drift": drift,
+        "lock": {
+            "path": lock.path,
+            "pid": lock.pid,
+            "acquire_unix_ns": lock.acquire_unix_ns,
+            "release_unix_ns": lock.release_unix_ns,
+            "first_attempt_contended": lock.first_attempt_contended,
+            "contended": lock.contended,
+        },
+    })
+}
+
+fn slice_new(before: &[(u64, crate::macmon::Reading)], after: &[(u64, crate::macmon::Reading)]) -> Vec<(u64, crate::macmon::Reading)> {
+    if after.len() >= before.len() { after[before.len()..].to_vec() } else { Vec::new() }
+}
+
+fn macmon_fail(reason: String, load1_pre: Vec<f64>, pre: Vec<(u64, crate::macmon::Reading)>, workload: bool, lock: &LockHold) -> serde_json::Value {
+    macmon_receipt(&MacmonAttempt {
+        load1_pre,
+        load1_post: vec![],
+        pre,
+        trial: vec![],
+        post: vec![],
+        load1_max: LOAD1_MAX,
+        pre_reached: true,
+        workload_reached: workload,
+        post_reached: false,
+        failure: Some(reason),
+    }, lock)
+}
+
+pub fn run_locked_macmon(cfg: &MacmonConfig, lock: &LockGuard) -> serde_json::Value {
+    let hold = lock.hold();
+    let mut sampler = match crate::macmon::Sampler::spawn(std::path::Path::new(&cfg.macmon_bin), cfg.sample_ms) {
+        Ok(s) => s,
+        Err(e) => {
+            return macmon_receipt(&MacmonAttempt {
+                load1_pre: vec![],
+                load1_post: vec![],
+                pre: vec![],
+                trial: vec![],
+                post: vec![],
+                load1_max: cfg.load1_max,
+                pre_reached: false,
+                workload_reached: false,
+                post_reached: false,
+                failure: Some(e),
+            }, &hold);
+        }
+    };
+    let settle = || -> Result<Vec<f64>, (Vec<f64>, String)> {
+        let steps = cfg.settle_s.round().max(1.0) as u32;
+        let mut load1 = Vec::new();
+        for i in 0..steps {
+            let v = match read_load1() {
+                Ok(v) => v,
+                Err(e) => return Err((load1, e)),
+            };
+            load1.push(v);
+            if v > cfg.load1_max {
+                return Err((load1, format!("load1 {v} exceeds {}", cfg.load1_max)));
+            }
+            if i + 1 < steps {
+                sleep(Duration::from_secs(1));
+            }
+        }
+        Ok(load1)
+    };
+    let load1_pre = match settle() {
+        Ok(v) => v,
+        Err((load1, e)) => {
+            let pre = sampler.snapshot();
+            sampler.stop();
+            return macmon_receipt(&MacmonAttempt {
+                load1_pre: load1,
+                load1_post: vec![],
+                pre,
+                trial: vec![],
+                post: vec![],
+                load1_max: cfg.load1_max,
+                pre_reached: true,
+                workload_reached: false,
+                post_reached: false,
+                failure: Some(format!("pre-trial idle: {e}")),
+            }, &hold);
+        }
+    };
+    let pre = sampler.snapshot();
+    if cfg.workload.is_empty() {
+        sampler.stop();
+        return macmon_fail("workload command is empty".into(), load1_pre, pre, false, &hold);
+    }
+    let mut child = match std::process::Command::new(&cfg.workload[0]).args(&cfg.workload[1..]).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            sampler.stop();
+            return macmon_fail(format!("spawn workload: {e}"), load1_pre, pre, false, &hold);
+        }
+    };
+    let workload_end = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break sampler.snapshot(),
+            Ok(Some(status)) => {
+                sampler.stop();
+                return macmon_fail(format!("workload exit {status}"), load1_pre, pre, true, &hold);
+            }
+            Ok(None) => sleep(Duration::from_secs(1)),
+            Err(e) => {
+                sampler.stop();
+                return macmon_fail(e.to_string(), load1_pre, pre, true, &hold);
+            }
+        }
+    };
+    let trial = slice_new(&pre, &workload_end);
+    let load1_post = match settle() {
+        Ok(v) => v,
+        Err((load1, e)) => {
+            let post_all = sampler.snapshot();
+            sampler.stop();
+            return macmon_receipt(&MacmonAttempt {
+                load1_pre,
+                load1_post: load1,
+                pre,
+                trial,
+                post: slice_new(&workload_end, &post_all),
+                load1_max: cfg.load1_max,
+                pre_reached: true,
+                workload_reached: true,
+                post_reached: true,
+                failure: Some(format!("post-trial idle: {e}")),
+            }, &hold);
+        }
+    };
+    let post_all = sampler.snapshot();
+    sampler.stop();
+    macmon_receipt(&MacmonAttempt {
+        load1_pre,
+        load1_post,
+        pre,
+        trial,
+        post: slice_new(&workload_end, &post_all),
+        load1_max: cfg.load1_max,
+        pre_reached: true,
+        workload_reached: true,
+        post_reached: true,
+        failure: None,
+    }, &hold)
+}
+
+pub fn run_until_quiet_macmon(
+    lock_path: &Path,
+    out_dir: &Path,
+    deadline: Duration,
+    retry_wait: Duration,
+    cfg: &MacmonConfig,
+) -> Result<serde_json::Value, String> {
+    let started = std::time::Instant::now();
+    let mut first_contended = false;
+    let mut n = 0u32;
+    let write = |name: &str, body: &serde_json::Value| -> Result<(), String> {
+        write_receipt_value(&out_dir.join(name), body)
+    };
+    loop {
+        if started.elapsed() > deadline {
+            let body = macmon_receipt(&MacmonAttempt {
+                load1_pre: vec![],
+                load1_post: vec![],
+                pre: vec![],
+                trial: vec![],
+                post: vec![],
+                load1_max: cfg.load1_max,
+                pre_reached: false,
+                workload_reached: false,
+                post_reached: false,
+                failure: Some("deadline reached before a quiet attributable run".into()),
+            }, &LockHold {
+                path: lock_path.display().to_string(),
+                pid: std::process::id(),
+                acquire_unix_ns: None,
+                release_unix_ns: None,
+                first_attempt_contended: first_contended,
+                contended: false,
+            });
+            write("refusal-deadline.json", &body)?;
+            return Ok(body);
+        }
+        match try_lock_exclusive(lock_path)? {
+            None => {
+                first_contended = true;
+                let body = macmon_receipt(&MacmonAttempt {
+                    load1_pre: vec![],
+                    load1_post: vec![],
+                    pre: vec![],
+                    trial: vec![],
+                    post: vec![],
+                    load1_max: cfg.load1_max,
+                    pre_reached: false,
+                    workload_reached: false,
+                    post_reached: false,
+                    failure: Some("lock contended; counters were not read".into()),
+                }, &LockHold {
+                    path: lock_path.display().to_string(),
+                    pid: std::process::id(),
+                    acquire_unix_ns: None,
+                    release_unix_ns: None,
+                    first_attempt_contended: true,
+                    contended: true,
+                });
+                write(&format!("refusal-lock-{n}.json"), &body)?;
+                n += 1;
+                sleep(retry_wait);
+            }
+            Some(mut guard) => {
+                guard.first_attempt_contended = first_contended;
+                let mut body = run_locked_macmon(cfg, &guard);
+                if let Some(lock) = body.get_mut("lock") {
+                    lock["first_attempt_contended"] = serde_json::json!(first_contended);
+                    lock["release_unix_ns"] = serde_json::json!(unix_ns());
+                }
+                drop(guard);
+                if body["attributable"].as_bool().unwrap_or(false) {
+                    write("attributable.json", &body)?;
+                    return Ok(body);
+                }
+                write(&format!("refusal-{n}.json"), &body)?;
+                n += 1;
+                sleep(retry_wait);
+            }
+        }
+    }
+}
+
+fn write_receipt_value(path: &Path, body: &serde_json::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(body).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,5 +1612,65 @@ mod tests {
         assert_eq!(missing, vec![(0, 16), (1, 17), (2, 18), (3, 19)]);
         assert!(unpinned_siblings(&[0, 1, 2, 3, 16, 17, 18, 19], siblings).is_empty());
         assert_eq!(parse_cpu_list("0-3,16-19").unwrap(), vec![0, 1, 2, 3, 16, 17, 18, 19]);
+    }
+
+    fn mac_reading() -> crate::macmon::Reading {
+        crate::macmon::parse_line(
+            r#"{"cpu_power":0.20486385,"gpu_power":0.017451683,"ane_power":0.0,"sys_power":5.876533,"chip_power":1.4130547,"temp":{"cpu_temp_avg":43.73614,"gpu_temp_avg":36.95167}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_quiet_macmon_attempt_keeps_four_meters_and_nulls_joules_when_load_is_high() {
+        let r = mac_reading();
+        let pre = vec![(0, r.clone()), (1_000_000_000, r.clone())];
+        let trial = vec![(2_000_000_000, r.clone()), (3_000_000_000, r.clone())];
+        let post = vec![(4_000_000_000, r.clone()), (5_000_000_000, r)];
+        let quiet = macmon_receipt(&MacmonAttempt {
+            load1_pre: vec![0.4, 0.5],
+            load1_post: vec![0.3, 0.6],
+            pre,
+            trial,
+            post,
+            load1_max: 2.0,
+            pre_reached: true,
+            workload_reached: true,
+            post_reached: true,
+            failure: None,
+        }, &held());
+        assert_eq!(quiet["attributable"], true);
+        assert_eq!(quiet["summed"], false);
+        assert_eq!(quiet["pinning"], "unavailable");
+        assert_eq!(quiet["busy_fraction_status"], "unavailable");
+        assert!(quiet["busy_fraction"].is_null());
+        assert!(quiet["declared_before_run"] == true);
+        assert!((quiet["joules"]["sys"].as_f64().unwrap() - 5.876533).abs() < 1e-6);
+        assert!((quiet["joules"]["cpu"].as_f64().unwrap() - 0.20486385).abs() < 1e-6);
+        let summed = quiet["joules"]["sys"].as_f64().unwrap()
+            + quiet["joules"]["cpu"].as_f64().unwrap()
+            + quiet["joules"]["gpu"].as_f64().unwrap()
+            + quiet["joules"]["ane"].as_f64().unwrap();
+        assert!(summed > quiet["joules"]["sys"].as_f64().unwrap());
+        let mut busy = quiet.clone();
+        busy["load1_pre"] = serde_json::json!([3.0]);
+        let refused = macmon_receipt(&MacmonAttempt {
+            load1_pre: vec![0.2, 3.0],
+            load1_post: vec![],
+            pre: vec![],
+            trial: vec![],
+            post: vec![],
+            load1_max: 2.0,
+            pre_reached: true,
+            workload_reached: false,
+            post_reached: false,
+            failure: Some("pre-trial idle: load1 3 exceeds 2".into()),
+        }, &held());
+        assert_eq!(refused["attributable"], false);
+        assert!(refused["joules"].is_null());
+        assert_eq!(refused["phases"]["pre_idle"]["load1"], serde_json::json!([0.2, 3.0]));
+        assert_eq!(refused["pinning"], "unavailable");
+        assert_eq!(refused["busy_fraction_status"], "unavailable");
+        assert_eq!(refused["drift"]["phase"], "workload");
     }
 }
