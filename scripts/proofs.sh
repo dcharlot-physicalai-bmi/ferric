@@ -16,6 +16,11 @@
 #
 # `-Z stubbing` is required by the layout proofs and is not optional; running `cargo kani` without
 # it fails to compile rather than silently verifying less.
+#
+# Kani 0.68.0 (the latest release, 2026-09-16) does not use the stable 1.100.0 pin in
+# rust-toolchain.toml. The release bundle carries nightly-2026-08-21, rustc 1.100.0-nightly
+# (8925ea358, 2026-08-20). `cargo kani` selects that toolchain. The workspace rust-version stays
+# 1.98 because Cargo does not treat 1.100.0-nightly as satisfying rust-version = "1.100".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FLAGS=(-Z stubbing)

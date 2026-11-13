@@ -6,6 +6,10 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
+# MSRV stays 1.98. Kani 0.68.0 bundles nightly-2026-08-21
+# (rustc 1.100.0-nightly, 8925ea358, 2026-08-20), and Cargo does not treat
+# that pre-release as satisfying rust-version = "1.100". The compiler pin
+# for builds and CI is 1.100.0 in rust-toolchain.toml.
 rust-version = "1.98"
 license = "Apache-2.0"
 authors = ["Institute for Physical AI (physicalai-bmi.org)"]
