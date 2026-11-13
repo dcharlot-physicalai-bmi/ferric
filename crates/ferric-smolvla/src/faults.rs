@@ -799,12 +799,68 @@ mod tests {
         assert_eq!(row["end_to_end_detected"], true);
     }
 
+    /// Numbers may differ by a libm ulp. Booleans, strings and the shape of the catalogue may not.
+    ///
+    /// `f32::tanh` in `gelu_tanh` is not bit-identical between glibc and Apple libm. On Metal CI
+    /// run 43431745641 the only mismatch in the whole CPU catalogue was
+    /// `elementwise.index_off_by_one_row.rmse`: 0.23910626993893822 (committed, Linux) versus
+    /// 0.23910627516696203 (macOS), a gap of 5.2e-9. Every detection flag was already equal.
+    /// 1e-7 is three orders of magnitude under the raw-action bound (~2e-4) that those flags use,
+    /// and a 1e-4 move still fails — see [`a_real_rmse_change_is_not_a_libm_ulp`].
+    fn catalogues_agree(a: &serde_json::Value, b: &serde_json::Value, tol: f64) -> Result<(), String> {
+        use serde_json::Value;
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => {
+                let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                if (x.is_nan() && y.is_nan()) || (x - y).abs() <= tol { Ok(()) }
+                else { Err(format!("{x:.16e} vs {y:.16e}")) }
+            }
+            (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+                for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                    catalogues_agree(p, q, tol).map_err(|e| format!("[{i}] {e}"))?;
+                }
+                Ok(())
+            }
+            (Value::Object(x), Value::Object(y)) if x.len() == y.len() => {
+                for (k, v) in x {
+                    let Some(w) = y.get(k) else { return Err(format!("missing {k}")); };
+                    catalogues_agree(v, w, tol).map_err(|e| format!("{k}: {e}"))?;
+                }
+                Ok(())
+            }
+            (a, b) if a == b => Ok(()),
+            (a, b) => Err(format!("{a} vs {b}")),
+        }
+    }
+
     #[test]
     fn the_committed_receipt_matches_the_cpu_catalogue() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(file["cpu"], cpu_fault_report());
+        let report = cpu_fault_report();
+        // Linux (this is where the file was written) still matches to the bit. The tolerance
+        // exists for the other libm, and must not hide a Linux drift.
+        assert_eq!(file["cpu"], report, "the committed catalogue drifted on this libm");
+        catalogues_agree(&file["cpu"], &report, 1e-7).unwrap();
         assert_eq!(file["llvmpipe"]["adapter"], "llvmpipe (LLVM 20.1.2, 256 bits)");
+    }
+
+    #[test]
+    fn a_real_rmse_change_is_not_a_libm_ulp() {
+        let report = cpu_fault_report();
+        let path = ["kernels", "elementwise", "cases", "index_off_by_one_row", "rmse"];
+        let mut nudge = |delta: f64| {
+            let mut v = report.clone();
+            let slot = path.iter().take(path.len() - 1).fold(&mut v, |a, k| &mut a[*k]);
+            let key = path[path.len() - 1];
+            let n = slot[key].as_f64().unwrap() + delta;
+            slot[key] = serde_json::json!(n);
+            v
+        };
+        // The measured macOS gap, 5.2e-9, stays inside the cross-libm tolerance.
+        assert!(catalogues_agree(&report, &nudge(5.2e-9), 1e-7).is_ok());
+        let err = catalogues_agree(&report, &nudge(1e-4), 1e-7).unwrap_err();
+        assert!(err.contains("rmse"), "{err}");
     }
 
     #[test]
