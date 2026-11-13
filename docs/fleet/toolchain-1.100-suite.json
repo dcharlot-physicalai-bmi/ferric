@@ -1,7 +1,8 @@
 {
   "receipt": "toolchain-1.100 workspace suite",
   "date": "2026-11-13",
-  "head_base": "a999660dda508751961bddd86718b244f04dc0b6",
+  "head_base": "6e76cddcb0745776245c31dfda1b87804533bfa3",
+  "head_base_pre_rewrite_sha": "a999660dda508751961bddd86718b244f04dc0b6",
   "rustc": {
     "release": "1.100.0",
     "commit_hash": "0ef1bc386059596dada8fb65b50425aab2ea637a",

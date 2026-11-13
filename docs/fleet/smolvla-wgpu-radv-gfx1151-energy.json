@@ -41,7 +41,8 @@
     }
   },
   "commit": {
-    "sha": "9db29b0382cbab200b36c424f9c4067376b76b2d",
+    "sha": "946a7896c23bb3e02976ae1e24660df86e07d01b",
+    "pre_rewrite_sha": "9db29b0382cbab200b36c424f9c4067376b76b2d",
     "branch": "cursor/fleet-energy-harness-65da",
     "local_patch": "radv-energy.patch",
     "local_patch_sha256": "c7d920ad3d0b54e237ab4ad5b125dda0de4f97c713f5cf42892a53c843702a61",
@@ -125,7 +126,7 @@
     "state": "zeros(6), unnormalized network path"
   },
   "commands": [
-    "git clone https://github.com/dcharlot-physicalai-bmi/ferric && git checkout 9db29b0382cbab200b36c424f9c4067376b76b2d && git apply radv-energy.patch",
+    "git clone https://github.com/dcharlot-physicalai-bmi/ferric && git checkout 946a7896c23bb3e02976ae1e24660df86e07d01b && git apply radv-energy.patch",
     "cargo build --release -p ferric-smolvla -p ferric-fleet",
     "ferric-fleet acquire --dir $W/art",
     "ferric-fleet preflight --adapter-name 'Radeon 8060S Graphics (RADV STRIX_HALO)'",
@@ -150,7 +151,7 @@
     "radv_bitwise_equal_to_cpu": false
   },
   "parity": {
-    "reference": "scripts/smolvla_f32_reference.py at 9db29b0, PyTorch f32 (bf16 weights expanded to f32), rerun on the Grok box with 2.15.0+cpu",
+    "reference": "scripts/smolvla_f32_reference.py at 946a7896c23bb3e02976ae1e24660df86e07d01b (pre_rewrite_sha 9db29b0382cbab200b36c424f9c4067376b76b2d), PyTorch f32 (bf16 weights expanded to f32), rerun on the Grok box with 2.15.0+cpu",
     "declared_tolerance": null,
     "tolerance_note": "No numeric tolerance is declared in the repo. The comparison envelope used here is the max_abs the CPU f32 path achieved against PyTorch (committed reference and this Framework's CPU run).",
     "stages": {
