@@ -70,8 +70,8 @@ jobs:
           GALLIUM_DUMP_CPU: "1"
         run: |
           sudo apt-get install -y gdb
-          cargo test -p ferric-llama --lib --no-run --verbose > /tmp/llama-norun.txt
-          BIN=$(sed -n 's/.*(\(target\/[^)]*ferric_llama-[^)]*\)).*/\1/p' /tmp/llama-norun.txt | head -1)
+          cargo test -p ferric-llama --lib --no-run
+          BIN=$(find target -type f -executable -name 'ferric_llama-*' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
           echo "BIN=$BIN"
           test -n "$BIN" && test -x "$BIN"
           set +e
