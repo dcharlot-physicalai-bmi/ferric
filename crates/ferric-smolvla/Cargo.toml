@@ -3,18 +3,19 @@ name = "ferric-smolvla"
 description = "SmolVLA inference on Ferric CPU kernels, with a wgpu adapter check of state_proj. The forward is f32. It does not claim GPU energy."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-ferric-accept = { path = "../ferric-accept" }
-ferric-core = { path = "../ferric-core" }
-ferric-fleet = { path = "../ferric-fleet" }
-pollster = "0.4"
+ferric-accept = { path = "../ferric-accept", version = "0.3" }
+ferric-core = { path = "../ferric-core", version = "0.3" }
+ferric-fleet = { path = "../ferric-fleet", version = "0.3" }
+pollster = "1.0"
 serde_json = { version = "1", features = ["preserve_order"] }
-tokenizers = { version = "0.21.4", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [[bin]]
 name = "ferric-smolvla"

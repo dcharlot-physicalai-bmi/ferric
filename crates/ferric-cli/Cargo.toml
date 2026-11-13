@@ -3,6 +3,7 @@ name = "ferric-cli"
 description = "The `ferric` command line — run, chat, pull, list, show, ps, stop, rm and bench local models. An HTTP client of ferric-serve (Ollama's /api dialect) and a process manager for it; reports joules per answer."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -3,14 +3,15 @@ name = "ferric-fleet"
 description = "Fleet measurement harness for a later SmolVLA run. Pins artifacts, rejects software GPU adapters, and refuses energy claims the meters cannot support. It does not execute the model."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-fs4 = "0.12"
-ferric-joule = { path = "../ferric-joule" }
+fs4 = "1.1"
+ferric-joule = { path = "../ferric-joule", version = "0.3" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [[bin]]

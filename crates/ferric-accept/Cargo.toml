@@ -3,6 +3,7 @@ name = "ferric-accept"
 description = "Machine-checkable acceptance receipts for Ferric. Separates a measured result from a target and from a historical author claim, and rejects a pass that does not carry its protocol, provenance, and preregistered tolerance."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

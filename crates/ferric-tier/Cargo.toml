@@ -3,6 +3,7 @@ name = "ferric-tier"
 description = "Ferric: the memory hierarchy. Run models larger than memory by streaming weights, where placement decides speed but never results. Pure Rust, no_std-friendly core, browser-safe."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -18,4 +19,4 @@ categories = ["caching", "science", "wasm"]
 # Only for the real-checkpoint example. Dev-dependencies do not affect the library, so the crate stays
 # dependency-free and wasm-clean.
 [dev-dependencies]
-ferric-gguf = { path = "../ferric-gguf" }
+ferric-gguf = { path = "../ferric-gguf", version = "0.3" }

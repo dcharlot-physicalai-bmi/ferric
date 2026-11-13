@@ -3,6 +3,7 @@ name = "ferric-agent"
 description = "Ferric's model-agnostic agent layer — guided decoding (JSON / JSON-schema constrained sampling) and tool-call parsing. Pure Rust + serde_json, wasm-clean, shared by the native server and the browser/WASM path."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

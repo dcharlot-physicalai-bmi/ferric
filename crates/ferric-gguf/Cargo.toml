@@ -3,6 +3,7 @@ name = "ferric-gguf"
 description = "Ferric GGUF — pure-Rust reader AND writer for the GGUF container: dequantizers for 17 block formats (Q4_K/Q5_K/Q6_K, Q2_K/Q3_K, IQ4_NL/IQ4_XS, TQ2_0, MXFP4, F8_E4M3, ternary) plus Ferric's own quantizer. No C, no C++, no ggml."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,3 +18,6 @@ half = "2"
 [dev-dependencies]
 half = "2"
 pollster = "1.0.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

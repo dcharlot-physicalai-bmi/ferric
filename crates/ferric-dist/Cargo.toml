@@ -3,6 +3,7 @@ name = "ferric-dist"
 description = "Ferric: pipeline-parallel inference across machines. Layer-span routing with prefix-hash guards, so a stale worker refuses work rather than silently answering for the wrong position."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

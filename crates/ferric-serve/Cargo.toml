@@ -3,6 +3,7 @@ name = "ferric-serve"
 description = "OpenAI-compatible HTTP server for Ferric — the adoption on-ramp (drop-in /v1/chat/completions over the pure-Rust cross-fabric runtime)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -31,12 +32,12 @@ serde = { version = "1", features = ["derive"] }
 # float_roundtrip: a request's numbers parse to the nearest double (a json_schema's const/enum literals become
 # grammar text; see ferric-agent's Cargo.toml).
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-pollster = "0.4"
+pollster = "1.0"
 # The model's own chat template (Jinja), rendered as Hugging Face's apply_chat_template renders it. Vendored
 # like every other dependency. `pycompat` adds the Python str/dict methods HF templates call (.strip(),
 # .startswith(), .items()); `loop_controls` is jinja2.ext.loopcontrols, which HF enables.
-minijinja = { version = "2.24", default-features = false, features = ["builtins", "loop_controls", "macros", "serde", "preserve_order", "adjacent_loop_items", "std_collections", "deserialization", "json"] }
-minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
+minijinja = { version = "3.1", default-features = false, features = ["builtins", "loop_controls", "macros", "serde", "preserve_order", "adjacent_loop_items", "std_collections", "json"] }
+minijinja-contrib = { version = "3.1", default-features = false, features = ["pycompat"] }
 # Images a client sends (PNG, JPEG): decoded here, the one crate that receives them, so ferric-tensor stays
 # codec-free (see its image.rs). Pure Rust, vendored; checked against the pixels transformers' load_image gives.
 # JPEG is src/images/jpeg.rs (libjpeg-turbo's decode path, translated): a general decoder is not enough.

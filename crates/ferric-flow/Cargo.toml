@@ -3,6 +3,7 @@ name = "ferric-flow"
 description = "Ferric incremental dataflow — a pure-Rust reimplementation of the Differential Dataflow core (the (data, diff) change model). Operators (map/filter/join/reduce) refresh results by computing only the change, bit-identical to a full recompute and touching only the affected keys. The live-data / RAG / MCP substrate for the Institute, native to Ferric and wasm/edge-ready (no long-lived Python engine)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

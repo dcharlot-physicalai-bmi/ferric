@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.87"
 name = "wgpu-hal"
-version = "30.0.0"
+version = "30.0.2"
 authors = ["gfx-rs developers"]
 build = "build.rs"
 autolib = false
@@ -113,6 +113,7 @@ metal = [
     "dep:arrayvec",
     "dep:block2",
     "dep:bytemuck",
+    "dep:libloading",
     "dep:objc2",
     "dep:objc2-core-foundation",
     "dep:objc2-core-graphics",
@@ -210,10 +211,10 @@ default-features = false
 version = "0.4.29"
 
 [dependencies.naga]
-version = "30.0.0"
+version = "30.0.2"
 
 [dependencies.naga-types]
-version = "30.0.0"
+version = "30.0.2"
 
 [dependencies.ordered-float]
 version = ">=3, <6.0"
@@ -241,10 +242,10 @@ version = "2.0.12"
 default-features = false
 
 [dependencies.wgpu-naga-bridge]
-version = "30.0.0"
+version = "30.0.2"
 
 [dependencies.wgpu-types]
-version = "30.0.0"
+version = "30.0.2"
 default-features = false
 
 [dev-dependencies.env_logger]
@@ -255,7 +256,7 @@ default-features = false
 version = "0.33.0"
 
 [dev-dependencies.naga]
-version = "30.0.0"
+version = "30.0.2"
 features = [
     "wgsl-in",
     "termcolor",
@@ -266,20 +267,20 @@ version = "0.30.8"
 features = ["android-native-activity"]
 
 [build-dependencies.cfg_aliases]
-version = "0.2.1"
+version = "0.2.2"
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.js-sys]
-version = "0.3.85"
+version = "0.3.104"
 optional = true
 default-features = true
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wasm-bindgen]
-version = "0.2.108"
+version = "0.2.127"
 optional = true
 default-features = false
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.web-sys]
-version = "0.3.85"
+version = "0.3.104"
 features = [
     "default",
     "Window",

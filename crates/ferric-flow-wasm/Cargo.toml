@@ -3,6 +3,7 @@ name = "ferric-flow-wasm"
 description = "WASM bindings for ferric-flow's live vector index — load a serialized HNSW and query it from JS (browser or a Cloudflare Worker). The edge-native, in-Worker replacement for a managed vector DB."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.87.0"
 name = "wgpu"
-version = "30.0.0"
+version = "30.0.2"
 authors = ["gfx-rs developers"]
 build = "build.rs"
 exclude = ["Cargo.lock"]
@@ -171,7 +171,7 @@ default-features = false
 version = "0.4.29"
 
 [dependencies.naga]
-version = "30.0.0"
+version = "30.0.2"
 features = ["termcolor"]
 optional = true
 
@@ -192,11 +192,11 @@ default-features = false
 version = "1.1"
 
 [dependencies.wgpu-core]
-version = "30.0.0"
+version = "30.0.2"
 optional = true
 
 [dependencies.wgpu-types]
-version = "30.0.0"
+version = "30.0.2"
 default-features = false
 
 [dev-dependencies.bytemuck]
@@ -207,10 +207,10 @@ features = [
 ]
 
 [build-dependencies.cfg_aliases]
-version = "0.2.1"
+version = "0.2.2"
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.js-sys]
-version = "0.3.85"
+version = "0.3.104"
 optional = true
 default-features = false
 
@@ -219,17 +219,17 @@ version = "1.14"
 optional = true
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wasm-bindgen]
-version = "0.2.108"
+version = "0.2.127"
 optional = true
 default-features = false
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wasm-bindgen-futures]
-version = "0.4.58"
+version = "0.4.77"
 optional = true
 default-features = false
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.web-sys]
-version = "0.3.85"
+version = "0.3.104"
 features = [
     "HtmlCanvasElement",
     "OffscreenCanvas",
@@ -238,18 +238,18 @@ optional = true
 default-features = false
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wgpu-core]
-version = "30.0.0"
+version = "30.0.2"
 optional = true
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wgpu-hal]
-version = "30.0.0"
+version = "30.0.2"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.smallvec]
 version = "1.14"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgpu-core]
-version = "30.0.0"
+version = "30.0.2"
 features = [
     "renderdoc",
     "wgsl",
@@ -257,7 +257,7 @@ features = [
 ]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgpu-hal]
-version = "30.0.0"
+version = "30.0.2"
 
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies.portable-atomic]
 version = "1.10"
@@ -266,10 +266,10 @@ version = "1.10"
 version = "1.14"
 
 [target.'cfg(target_os = "emscripten")'.dependencies.wgpu-core]
-version = "30.0.0"
+version = "30.0.2"
 
 [target.'cfg(target_os = "emscripten")'.dependencies.wgpu-hal]
-version = "30.0.0"
+version = "30.0.2"
 
 [lints.clippy]
 ref_as_ptr = "warn"

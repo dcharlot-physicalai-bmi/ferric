@@ -3,6 +3,7 @@ name = "ferric-onnx"
 description = "Ferric L3 — a pure-Rust ONNX importer: parse a model graph and run it on Ferric GPU tensor ops. Runs real ONNX (MLP, self-attention, SmolVLA components) matching onnxruntime."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -17,7 +18,7 @@ ferric-core = { path = "../ferric-core", version = "0.3" }
 
 [build-dependencies]
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 
 [dev-dependencies]
 pollster = "1.0.1"

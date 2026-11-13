@@ -3,6 +3,7 @@ name = "ferric-web"
 description = "Ferric browser bindings — the same cross-fabric pure-Rust kernels running in WASM on WebGPU."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -27,5 +28,5 @@ js-sys = "0.3"
 console_error_panic_hook = "0.1"
 
 [dev-dependencies]
-pollster = "0.4"
+pollster = "1.0"
 ferric-joule = { path = "../ferric-joule", version = "0.3" }

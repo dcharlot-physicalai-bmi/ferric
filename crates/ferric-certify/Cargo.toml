@@ -3,6 +3,7 @@ name = "ferric-certify"
 description = "Ferric: sound interval arithmetic and branch-and-bound certification. Proves a property holds over a continuous domain, or returns a counterexample — with outward rounding, so a certificate is a proof rather than an estimate."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -3,6 +3,7 @@ name = "ferric-kv"
 description = "Ferric: paged KV cache with radix prefix sharing — block tables, copy-on-write, and cross-request reuse. Pure policy, no GPU, wasm-clean."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

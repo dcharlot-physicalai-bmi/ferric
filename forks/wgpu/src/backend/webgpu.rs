@@ -1002,17 +1002,20 @@ fn map_js_sys_limits(limits: &wgt::Limits) -> js_sys::Object<js_sys::Number> {
 }
 
 fn future_request_adapter(
-    result: Result<js_sys::JsOption<webgpu_sys::GpuAdapter>, wasm_bindgen::JsValue>,
+    result: Result<js_sys::JsNullable<webgpu_sys::GpuAdapter>, wasm_bindgen::JsValue>,
     requested_backends: Backends,
 ) -> Result<dispatch::DispatchAdapter, wgt::RequestAdapterError> {
     result
         .map_err(|_| request_adapter_null_error(requested_backends))
         .and_then(|adapter| {
             // ⛔ `requestAdapter()` resolves to NULL when there is no adapter, and
-            // `JsOption::into_option` maps only `undefined` to `None` (wasm-bindgen 0.2.126). A
-            // null therefore became `Some(null)`, the caller's first `get_info()` read `.info` on
-            // it, and the TypeError escaped the future: the JS promise never settled, so a page
-            // waiting to fall back to CPU hung instead. Null is absent, checked explicitly.
+            // `JsNullable::into_option` maps only `undefined` to `None` on the
+            // wasm-bindgen that shipped this binding. A null therefore became
+            // `Some(null)`, the caller's first `get_info()` read `.info` on it,
+            // and the TypeError escaped the future: the JS promise never settled,
+            // so a page waiting to fall back to CPU hung instead. Null is absent,
+            // checked explicitly. Kept after the 30.0.2 JsOption → JsNullable
+            // rename: the rename does not by itself prove null is `None`.
             if wasm_bindgen::JsValue::is_null(&adapter) {
                 return Err(request_adapter_null_error(requested_backends));
             }
@@ -1075,12 +1078,13 @@ fn future_request_device(
 }
 
 fn future_pop_error_scope(
-    result: Result<js_sys::JsOption<webgpu_sys::GpuError>, wasm_bindgen::JsValue>,
+    result: Result<js_sys::JsNullable<webgpu_sys::GpuError>, wasm_bindgen::JsValue>,
 ) -> Option<crate::Error> {
     let error = result.ok()?;
-    // `popErrorScope()` resolves to NULL when the scope captured no error, and `into_option` keeps
-    // a null as `Some` (see `future_request_adapter`): that reached `Error::from_js`, which panics
-    // on anything that is not a validation or out-of-memory error. A clean scope is `None`.
+    // `popErrorScope()` resolves to NULL when the scope captured no error, and
+    // `into_option` can keep a null as `Some` (see `future_request_adapter`):
+    // that reached `Error::from_js`, which panics on anything that is not a
+    // validation or out-of-memory error. A clean scope is `None`.
     if wasm_bindgen::JsValue::is_null(&error) {
         return None;
     }
@@ -2289,10 +2293,10 @@ impl dispatch::DeviceInterface for WebDevice {
             .bind_group_layouts
             .iter()
             .map(|bgl| match bgl {
-                Some(bgl) => js_sys::JsOption::wrap(bgl.inner.as_webgpu().inner.clone()),
-                None => js_sys::JsOption::new(),
+                Some(bgl) => js_sys::JsNullable::wrap(bgl.inner.as_webgpu().inner.clone()),
+                None => js_sys::JsNullable::new(),
             })
-            .collect::<Vec<js_sys::JsOption<webgpu_sys::GpuBindGroupLayout>>>();
+            .collect::<Vec<js_sys::JsNullable<webgpu_sys::GpuBindGroupLayout>>>();
         let mapped_desc = webgpu_sys::GpuPipelineLayoutDescriptor::new(&temp_layouts);
         if let Some(label) = desc.label {
             mapped_desc.set_label(label);
@@ -2344,11 +2348,11 @@ impl dispatch::DeviceInterface for WebDevice {
                         &mapped_attributes,
                     );
                     mapped_vbuf.set_step_mode(map_vertex_step_mode(vbuf.step_mode));
-                    js_sys::JsOption::wrap(mapped_vbuf)
+                    js_sys::JsNullable::wrap(mapped_vbuf)
                 }
-                None => js_sys::JsOption::new(),
+                None => js_sys::JsNullable::new(),
             })
-            .collect::<Vec<js_sys::JsOption<webgpu_sys::GpuVertexBufferLayout>>>();
+            .collect::<Vec<js_sys::JsNullable<webgpu_sys::GpuVertexBufferLayout>>>();
 
         mapped_vertex_state.set_buffers(&buffers);
 
@@ -2387,11 +2391,11 @@ impl dispatch::DeviceInterface for WebDevice {
                             mapped_color_state.set_blend(&mapped_blend_state);
                         }
                         mapped_color_state.set_write_mask(target.write_mask.bits());
-                        js_sys::JsOption::wrap(mapped_color_state)
+                        js_sys::JsNullable::wrap(mapped_color_state)
                     }
-                    None => js_sys::JsOption::new(),
+                    None => js_sys::JsNullable::new(),
                 })
-                .collect::<Vec<js_sys::JsOption<webgpu_sys::GpuColorTargetState>>>();
+                .collect::<Vec<js_sys::JsNullable<webgpu_sys::GpuColorTargetState>>>();
             let module = frag.module.inner.as_webgpu();
             let mapped_fragment_desc = webgpu_sys::GpuFragmentState::new(&module.module, &targets);
             insert_constants_map(&mapped_fragment_desc, frag.compilation_options.constants);
@@ -2608,14 +2612,14 @@ impl dispatch::DeviceInterface for WebDevice {
             .color_formats
             .iter()
             .map(|cf| match cf {
-                Some(cf) => js_sys::JsOption::wrap(
+                Some(cf) => js_sys::JsNullable::wrap(
                     wasm_bindgen::JsValue::from(map_texture_format(*cf))
                         .dyn_into::<js_sys::JsString>()
                         .unwrap(),
                 ),
-                None => js_sys::JsOption::new(),
+                None => js_sys::JsNullable::new(),
             })
-            .collect::<Vec<js_sys::JsOption<js_sys::JsString>>>();
+            .collect::<Vec<js_sys::JsNullable<js_sys::JsString>>>();
         let mapped_desc = webgpu_sys::GpuRenderBundleEncoderDescriptor::new(&mapped_color_formats);
         if let Some(label) = desc.label {
             mapped_desc.set_label(label);
@@ -3284,11 +3288,11 @@ impl dispatch::CommandEncoderInterface for WebCommandEncoder {
                     }
                     mapped_color_attachment.set_store_op(map_store_op(ca.ops.store));
 
-                    js_sys::JsOption::wrap(mapped_color_attachment)
+                    js_sys::JsNullable::wrap(mapped_color_attachment)
                 }
-                None => js_sys::JsOption::new(),
+                None => js_sys::JsNullable::new(),
             })
-            .collect::<Vec<js_sys::JsOption<webgpu_sys::GpuRenderPassColorAttachment>>>();
+            .collect::<Vec<js_sys::JsNullable<webgpu_sys::GpuRenderPassColorAttachment>>>();
 
         let mapped_desc = webgpu_sys::GpuRenderPassDescriptor::new(&mapped_color_attachments);
 
@@ -4193,7 +4197,11 @@ impl dispatch::SurfaceInterface for WebSurface {
             formats,
             // Doesn't really have meaning on the web.
             present_modes: vec![wgt::PresentMode::Fifo],
-            alpha_modes: vec![wgt::CompositeAlphaMode::Opaque],
+            // https://gpuweb.github.io/gpuweb/#gpucanvasalphamode
+            alpha_modes: vec![
+                wgt::CompositeAlphaMode::Opaque,
+                wgt::CompositeAlphaMode::PreMultiplied,
+            ],
             // Statically set to RENDER_ATTACHMENT for now. See https://gpuweb.github.io/gpuweb/#dom-gpucanvasconfiguration-usage
             usages: wgt::TextureUsages::RENDER_ATTACHMENT,
         }

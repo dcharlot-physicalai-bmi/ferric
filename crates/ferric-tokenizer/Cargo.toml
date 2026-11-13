@@ -3,6 +3,7 @@ name = "ferric-tokenizer"
 description = "Ferric tokenizer — a pure-Rust byte-level BPE (GPT-2/tiktoken family): lossless encode/decode, loads vocab.json + merges.txt. The prompt→ids→text glue for end-to-end LLM use."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

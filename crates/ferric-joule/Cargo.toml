@@ -2,6 +2,7 @@
 name = "ferric-joule"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Joules per task, measured. An energy framework whose contract is that a saving cannot be reported without the baseline it was measured against."
 
