@@ -145,26 +145,23 @@ kernel void NAME(device const float* x     [[buffer(0)]],                       
 {                                                                                                      \
     threadgroup half sx[MT * KT];                                                                      \
     threadgroup half sw[NT * KT];                                                                      \
-    threadgroup float sc[SWI ? MT * NT : 1]; /* the SwiGLU epilogue's gate|up tile (unused if !SWI) */  \
+    threadgroup float acc[MT * NT];                                                                    \
     const uint m0 = tg.y * MT;                                                                         \
     const uint n0 = SWI ? tg.x * (NT / 2) : tg.x * NT;                                                 \
-    /* Static extents. The tiles are constexpr (KT, MT, NT) and the threadgroup buffers are exactly    \
-       that size — out-of-range rows are zero-filled below, not expressed as a smaller runtime extent. \
-       `dextents` made the destination cooperative_tensor `extents<int, dynamic, dynamic>`. The Metal   \
-       compiler on a paravirtualized GPU then rejects the pipeline with                                \
-       "unsupported deferred-static-alloca-size function body" inside that type's MTL_SIZEAS           \
-       (CI run 36869740122, label qmm_q8_0). The same runner compiles and runs the device-tensor       \
-       matmul2d kernels, which never build this dynamic cooperative_tensor. Static extents are also    \
-       what Apple's MPP guide requires for an aligned tile. `remove_addrspace_t` keeps the destination \
-       call well-formed when the header rejects an address-space-qualified decltype. */                \
+    /* The accumulator is a threadgroup tensor, not a destination cooperative_tensor.                 \
+       CI runs 36869740122 and 43431738320 both rejected qmm_q8_0 with                                 \
+       "unsupported deferred-static-alloca-size" on                                                    \
+       cooperative_tensor<float, extents<int, dynamic, dynamic>, ...>. Static operand extents did not  \
+       change that: the destination-cooperative-tensor call still instantiated the dynamic type. The same \
+       runner compiles and runs matmul2d into an ordinary tensor (metal4). Extent 0 is N, extent 1    \
+       is M, so acc[r * NT + c] is the same layout the old store used. */                             \
+    for (uint e = t; e < MT * NT; e += NTHR) { acc[e] = 0.0f; }                                        \
     auto tX = tensor<threadgroup half, extents<int32_t, KT, MT>, tensor_inline>(sx, extents<int32_t, KT, MT>{}); \
     auto tW = tensor<threadgroup half, extents<int32_t, KT, NT>, tensor_inline>(sw, extents<int32_t, KT, NT>{}); \
+    auto tC = tensor<threadgroup float, extents<int32_t, NT, MT>, tensor_inline>(acc, extents<int32_t, NT, MT>{}); \
     constexpr auto desc = matmul2d_descriptor(MT, NT, KT, false, true, false,                         \
                                               matmul2d_descriptor::mode::multiply_accumulate);          \
     matmul2d<desc, execution_simdgroups<4>> mm;                                                        \
-    auto cT = mm.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(tX)>,           \
-                                                    metal::remove_addrspace_t<decltype(tW)>, float>(); \
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i) { if (cT.is_valid_element(i)) cT[i] = 0; }        \
     for (uint k0 = 0; k0 < d.K; k0 += KT) {                                                            \
         for (uint e = t; e < MT * KT / 4; e += NTHR) {                                                 \
             uint r = e / (KT / 4), c4 = e % (KT / 4);                                                  \
@@ -179,21 +176,21 @@ kernel void NAME(device const float* x     [[buffer(0)]],                       
             DQ(codes, aux, wr, k0 + 16 * h, d.K, sw + r * KT + 16 * h);                                \
         }                                                                                              \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                               \
-        mm.run(tX, tW, cT);                                                                            \
+        mm.run(tX, tW, tC);                                                                            \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                               \
     }                                                                                                  \
     if (!SWI) {                                                                                        \
-        auto tO = tensor<device float, dextents<int32_t, 2>, tensor_inline>(out, dextents<int32_t, 2>(d.N, d.M)); \
-        auto tOs = tO.slice(n0, m0);                                                                   \
-        cT.store(tOs);                                                                                 \
+        for (uint e = t; e < MT * NT; e += NTHR) {                                                     \
+            uint r = e / NT, c = e % NT;                                                               \
+            if (m0 + r < d.M && n0 + c < d.N) {                                                        \
+                out[(m0 + r) * d.N + n0 + c] = acc[r * NT + c];                                        \
+            }                                                                                          \
+        }                                                                                              \
     } else {                                                                                           \
-        auto tC = tensor<threadgroup float, extents<int32_t, NT, MT>, tensor_inline>(sc, extents<int32_t, NT, MT>{}); \
-        cT.store(tC);                                                                                  \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                                               \
         for (uint e = t; e < MT * (NT / 2); e += NTHR) {                                               \
             uint r = e / (NT / 2), c = e % (NT / 2);                                                   \
             if (m0 + r < d.M && n0 + c < d.act) {                                                      \
-                float g = sc[r * NT + c], u = sc[r * NT + NT / 2 + c];                                 \
+                float g = acc[r * NT + c], u = acc[r * NT + NT / 2 + c];                               \
                 out[(m0 + r) * d.act + n0 + c] = (g / (1.0f + exp(-g))) * u;                           \
             }                                                                                          \
         }                                                                                              \
