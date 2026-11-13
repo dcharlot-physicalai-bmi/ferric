@@ -838,11 +838,36 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let report = cpu_fault_report();
-        // Linux (this is where the file was written) still matches to the bit. The tolerance
-        // exists for the other libm, and must not hide a Linux drift.
-        assert_eq!(file["cpu"], report, "the committed catalogue drifted on this libm");
-        catalogues_agree(&file["cpu"], &report, 1e-7).unwrap();
+        // The file was written on Linux, so a Linux drift is still bit-exact: the tolerance
+        // must not hide one. Apple libm disagrees by ~5e-9 in one gelu_tanh rmse
+        // (`elementwise.index_off_by_one_row`), which is inside 1e-7 and flips no flag.
+        // A bit-exact `assert_eq!` here made that ulp fail the Metal job before the
+        // tolerant compare could run (run 43435730656).
+        #[cfg(target_os = "linux")]
+        assert_eq!(file["cpu"], report, "the committed catalogue drifted on Linux, where it was written");
+        catalogues_agree(&file["cpu"], &report, 1e-7)
+            .unwrap_or_else(|e| panic!("the committed catalogue drifted past a libm ulp: {e}"));
         assert_eq!(file["llvmpipe"]["adapter"], "llvmpipe (LLVM 20.1.2, 256 bits)");
+    }
+
+    /// The macOS rmse from Metal run 43435730656, pinned against the committed Linux value.
+    /// If the committed number moves, this fails on Linux too, and the gap has to be remeasured
+    /// rather than quietly absorbed.
+    #[test]
+    fn the_measured_macos_rmse_stays_a_libm_ulp() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
+        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut macos = file["cpu"].clone();
+        let slot = &mut macos["kernels"]["elementwise"]["cases"]["index_off_by_one_row"];
+        let committed = slot["rmse"].as_f64().unwrap();
+        assert!(
+            (committed - 0.23910626993893822).abs() < 1e-18,
+            "committed linux rmse moved to {committed}; remeasure the macOS gap before widening anything"
+        );
+        let measured = 0.23910627516696203_f64;
+        slot["rmse"] = serde_json::json!(measured);
+        catalogues_agree(&file["cpu"], &macos, 1e-7).expect("recorded macOS gap must stay inside 1e-7");
+        assert!((committed - measured).abs() > 1e-12);
     }
 
     #[test]
