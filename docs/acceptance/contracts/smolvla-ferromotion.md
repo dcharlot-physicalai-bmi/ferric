@@ -22,7 +22,7 @@ Pin: LeRobot commit `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a` (2026-07-23). Fil
 - Network noise / pre-slice tensor: `(batch, chunk_size, max_action_dim)` = `(batch, 50, 32)` by default, f32. `sample_actions` allocates that shape. Its docstring says `num_steps`; `num_steps` is the Euler count, default **10**, and is not the horizon.
 - After unpad: `(batch, chunk_size, action_dim)` with `action_dim = action_feature.shape[0]`, the dataset width, not 32 unless the dataset is 32.
 - Queue for `select_action` keeps `n_action_steps` (default 50). `n_action_steps > chunk_size` is a `ValueError`.
-- Canonical bytes, codec version **2**, domain `ferric.smolvla.action-chunk`. Version 1 in commit `831d729` is withdrawn: it allowed empty noise and had no joint metadata.
+- Canonical bytes, codec version **2**, domain `ferric.smolvla.action-chunk`. Version 1 in commit `2254e21dfcf71c4d6fae1172da260afa71f749e5` (pre_rewrite_sha `831d7298733da0c0548ed21d3bb4299dce8e061b`) is withdrawn: it allowed empty noise and had no joint metadata.
 - Unit strings and frame strings are caller labels stored in the digest. This crate does not parse them and does not convert degrees, radians, or meters.
 - Time is an integer clock the caller supplies. Action index `k` is at `t0_ns + k * step_duration_ns`. `step_duration_ns` of 0 is refused. There is no fps field and no conversion from a rate. `observation_delta_indices` in the pinned config is `[0]`.
 

@@ -22,7 +22,8 @@ pub const MODEL_ID: &str = "lerobot/smolvla_base";
 pub const INFERENCE_ENTRY_POINT: &str = "ferric.smolvla.predict_action_chunk.v1";
 /// Bytes this codec writes. Version 2.
 ///
-/// Version 1, in commit `831d729`, allowed an empty noise field and carried no
+/// Version 1, in commit `2254e21dfcf71c4d6fae1172da260afa71f749e5`
+/// (pre_rewrite_sha `831d7298733da0c0548ed21d3bb4299dce8e061b`), allowed an empty noise field and carried no
 /// joint order, frame, unit, limit, or step duration. It is not the handoff codec.
 pub const CHUNK_CODEC_VERSION: u32 = 2;
 pub const CHUNK_DOMAIN: &str = "ferric.smolvla.action-chunk";
