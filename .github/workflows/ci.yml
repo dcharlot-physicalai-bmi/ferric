@@ -61,32 +61,6 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --verbose
 
-      # The software-GPU job dies in ferric-llama with SIGSEGV and no Rust
-      # backtrace. This step runs that binary under gdb, one test at a time,
-      # so the log names the test and the faulting frame. It fails the job
-      # when the signal is caught; a clean run falls through.
-      - name: Backtrace the lavapipe SIGSEGV
-        env:
-          GALLIUM_DUMP_CPU: "1"
-        run: |
-          sudo apt-get install -y gdb
-          cargo test -p ferric-llama --lib --no-run
-          BIN=$(find target -type f -executable -name 'ferric_llama-*' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
-          echo "BIN=$BIN"
-          test -n "$BIN" && test -x "$BIN"
-          set +e
-          gdb -batch \
-            -ex 'set pagination off' \
-            -ex 'set confirm off' \
-            -ex 'run --test-threads=1' \
-            -ex 'bt 40' \
-            --args "$BIN" | tee /tmp/llama-gdb.txt
-          set -e
-          if grep -q SIGSEGV /tmp/llama-gdb.txt; then
-            echo "lavapipe SIGSEGV captured above"
-            exit 1
-          fi
-
       # ⛔ RUN BEFORE THE SUITE, BECAUSE A GREEN SUITE IS NOT EVIDENCE IF A TEST CANNOT FAIL.
       # ferric-tokenizer shipped `marks_join_the_letter_run_under_qwen35_and_not_under_qwen2` with no
       # `#[test]` attribute — the single assertion proving the real \p{M} tables changed user-visible
@@ -103,9 +77,14 @@ jobs:
 
       # The unit + integration suites. These were absent from CI entirely, which meant the
       # placement-invariance test, the prefix-hash guards, the interval-arithmetic soundness check and
-      # every other assertion in the workspace ran only on a developer's machine. They take ~1.5s.
+      # every other assertion in the workspace ran only on a developer's machine.
+      #
+      # Lavapipe's LLVM JIT SIGSEGVs when several tests in one process compile shaders
+      # at once. One test at a time, the same ferric-llama binary passed 168 and ignored
+      # 1 (run 43456824764, gdb, --test-threads=1); the parallel workspace step then died
+      # with signal 11. Every assertion still runs. Metal keeps the parallel suite.
       - name: Test workspace
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --verbose -- --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
