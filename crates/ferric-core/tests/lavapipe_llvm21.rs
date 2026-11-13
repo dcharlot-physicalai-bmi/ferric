@@ -10,6 +10,12 @@
 //! and leaves AVX2 on. `avx2` is not a token, so it leaves AVX-512 enabled.
 //! These tests are what makes deleting that pin, or spelling it `avx2`, fail
 //! `cargo test`.
+//!
+//! A second fault is concurrent shader compilation. LLVMContext is not thread
+//! safe (mesa!29397). On Mesa 26 lavapipe, one `ferric-llama` process compiling
+//! shaders on several cargo test threads SIGSEGVs inside the JIT. The same
+//! binary with `--test-threads=1` passed 168 and ignored 1 (run 43458775739).
+//! The note is `docs/fleet/lavapipe-llvm21.md`.
 
 use std::path::PathBuf;
 

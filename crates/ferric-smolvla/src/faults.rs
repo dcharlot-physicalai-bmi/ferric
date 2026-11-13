@@ -801,12 +801,14 @@ mod tests {
 
     /// Numbers may differ by a libm ulp. Booleans, strings and the shape of the catalogue may not.
     ///
-    /// `f32::tanh` in `gelu_tanh` is not bit-identical between glibc and Apple libm. On Metal CI
-    /// run 43431745641 the only mismatch in the whole CPU catalogue was
-    /// `elementwise.index_off_by_one_row.rmse`: 0.23910626993893822 (committed, Linux) versus
-    /// 0.23910627516696203 (macOS), a gap of 5.2e-9. Every detection flag was already equal.
-    /// 1e-7 is three orders of magnitude under the raw-action bound (~2e-4) that those flags use,
-    /// and a 1e-4 move still fails — see [`a_real_rmse_change_is_not_a_libm_ulp`].
+    /// `f32::tanh` in `gelu_tanh` is not bit-identical across libm. The only mismatch in the
+    /// whole CPU catalogue is `elementwise.index_off_by_one_row.rmse`:
+    /// 0.23910626993893822 on the Ubuntu 24.04 glibc that wrote the receipt, and
+    /// 0.23910627516696203 on Apple libm (Metal run 43435730656) and on Ubuntu 26.04.1
+    /// glibc (`ubuntu-latest`, software-GPU run 43458775739). The gap is 5.2e-9. Every
+    /// detection flag was already equal. 1e-7 is three orders of magnitude under the
+    /// raw-action bound (~2e-4) that those flags use, and a 1e-4 move still fails — see
+    /// [`a_real_rmse_change_is_not_a_libm_ulp`].
     fn catalogues_agree(a: &serde_json::Value, b: &serde_json::Value, tol: f64) -> Result<(), String> {
         use serde_json::Value;
         match (a, b) {
@@ -838,13 +840,41 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let report = cpu_fault_report();
-        // The file was written on Linux, so a Linux drift is still bit-exact: the tolerance
-        // must not hide one. Apple libm disagrees by ~5e-9 in one gelu_tanh rmse
-        // (`elementwise.index_off_by_one_row`), which is inside 1e-7 and flips no flag.
-        // A bit-exact `assert_eq!` here made that ulp fail the Metal job before the
-        // tolerant compare could run (run 43435730656).
+        // Every field except one gelu_tanh rmse is bit-exact on Linux. That rmse is
+        // `f32::tanh`, and glibc does not agree with itself: Ubuntu 24.04 wrote
+        // 0.23910626993893822, Ubuntu 26.04.1 (`ubuntu-latest`, run 43458775739) and
+        // Apple libm (run 43435730656) both produce 0.23910627516696203. A third
+        // value, or any other field moving, still fails. The receipt is not rewritten.
         #[cfg(target_os = "linux")]
-        assert_eq!(file["cpu"], report, "the committed catalogue drifted on Linux, where it was written");
+        {
+            const RECEIPT_GLIBC: f64 = 0.23910626993893822;
+            const NEWER_GLIBC_AND_APPLE: f64 = 0.23910627516696203;
+            let mut committed = file["cpu"].clone();
+            let mut live = report.clone();
+            let committed_rmse = std::mem::replace(
+                &mut committed["kernels"]["elementwise"]["cases"]["index_off_by_one_row"]["rmse"],
+                serde_json::Value::Null,
+            );
+            let live_rmse = std::mem::replace(
+                &mut live["kernels"]["elementwise"]["cases"]["index_off_by_one_row"]["rmse"],
+                serde_json::Value::Null,
+            );
+            assert_eq!(
+                committed, live,
+                "the committed catalogue drifted on Linux outside the one gelu_tanh rmse libm owns"
+            );
+            let committed_rmse = committed_rmse.as_f64().unwrap();
+            let live_rmse = live_rmse.as_f64().unwrap();
+            assert!(
+                (committed_rmse - RECEIPT_GLIBC).abs() < 1e-18,
+                "committed gelu_tanh rmse moved to {committed_rmse}; remeasure before accepting another libm"
+            );
+            assert!(
+                (live_rmse - RECEIPT_GLIBC).abs() < 1e-18
+                    || (live_rmse - NEWER_GLIBC_AND_APPLE).abs() < 1e-18,
+                "gelu_tanh index_off_by_one_row rmse {live_rmse:.16e} is a third libm result"
+            );
+        }
         catalogues_agree(&file["cpu"], &report, 1e-7)
             .unwrap_or_else(|e| panic!("the committed catalogue drifted past a libm ulp: {e}"));
         assert_eq!(file["llvmpipe"]["adapter"], "llvmpipe (LLVM 20.1.2, 256 bits)");
