@@ -1,0 +1,55 @@
+{
+  "receipt": "committed Cargo.lock remeasure",
+  "date": "2026-11-20",
+  "previous_lock_sha256": "3addbafb869cbd7511ec5064f7248be1b1990389f55e3b01a88a5b3c2de296c5",
+  "previous_lock_note": "Cited by docs/fleet/toolchain-1.100-smolvla.json, toolchain-1.100-faults.json, and toolchain-1.100-suite.json. Cargo.lock was gitignored, and that file is not recoverable from this VM or from those receipts. It was not rewritten into the new numbers.",
+  "rustc_vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5",
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "weights": {
+    "model_id": "lerobot/smolvla_base",
+    "revision": "5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6",
+    "model_safetensors_sha256": "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb",
+    "stats_safetensors_sha256": "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+  },
+  "python": {
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.4",
+    "safetensors": "0.8.0",
+    "tokenizers": "0.23.3"
+  },
+  "locks": {
+    "cursor/toolchain-1.100": {
+      "cargo_lock_sha256": "dcddf8451a3dd8f3bc2afc6f48669e97184cd358ca131aaf229902dfb4fa50da",
+      "resolve": "cargo metadata --locked succeeded. Fresh resolve of the upgraded manifests."
+    },
+    "cursor/fleet-energy-harness-65da": {
+      "cargo_lock_sha256": "dfb4e8fc5938342b51ec51dbf427c4fc9dade5ace975e27eaa4e2b3ce0342565",
+      "resolve": "cargo metadata --locked succeeded. Fresh resolve of this branch's older manifests (fs4 0.12, tokenizers 0.21.4, wgpu forks at their fleet versions)."
+    }
+  },
+  "parity_versus_docs_fleet_smolvla_f32_reference": {
+    "delta": "none. Every stage max_abs, rmse, and n equals docs/fleet/smolvla-f32-reference.json.",
+    "raw_actions_max_abs": 3.6954879760742188e-06
+  },
+  "llvmpipe_versus_docs_fleet_smolvla_wgpu_llvmpipe": {
+    "delta": "none. Adapter, dispatches, completions, readbacks, host_index_moves, raw_action_max_abs_vs_cpu, raw_action_rmse_vs_cpu, connector_token0_max_abs_vs_cpu, velocity0_max_abs_vs_cpu, and weight_sha256 match.",
+    "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
+    "raw_action_max_abs_vs_cpu": 4.291534423828125e-06
+  },
+  "fleet_lock_versus_toolchain_lock": {
+    "cpu_stage_files": "bitwise identical: prepared_image0, patch_token0, vision_l0_token0, vision_post_token0, connector_token0, state_token, text_l0_k_token0, velocity0, raw_actions",
+    "llvmpipe_fields": "identical to the toolchain-lock gpu receipt on every compared field"
+  },
+  "fault_catalogue": {
+    "seed": "0x5a17",
+    "test": "faults::tests::the_committed_receipt_matches_the_cpu_catalogue",
+    "toolchain_lock": "passed inside cargo test --locked --workspace",
+    "fleet_lock": "passed"
+  },
+  "suite": {
+    "command": "cargo test --locked --workspace --no-fail-fast",
+    "toolchain_lock": {"passed": 1164, "failed": 0, "ignored": 39, "exit_code": 0},
+    "fleet_lock": {"passed": 1163, "failed": 0, "ignored": 39, "exit_code": 0},
+    "count_note": "The one extra pass on the toolchain lock is macmon::tests::v011_keeps_power_fields_and_treats_null_temperature_as_absent. Five other name differences are the same tests after clippy renames. Nothing failed on either lock."
+  }
+}
