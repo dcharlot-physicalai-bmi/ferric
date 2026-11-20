@@ -693,11 +693,36 @@ r#"
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= dims.x) { return; }
     let v = bitcast<f32>(x[i]);
+    // |v| < 2^-24. The f32 GELU is exactly v/2. A hardware mul flushes that
+    // subnormal on Metal, so the half is a bit shift, the same one the CPU uses.
+    let mag = bitcast<u32>(v) & 0x7fffffffu;
+    if (mag < 0x33800000u) {
+        out[i] = gelu_half(v);
+        return;
+    }
     let z = dims.y;
     let cube = det_bar(det_bar(v * v, z) * v, z);
     let inner = det_bar(v + det_bar(0.044715 * cube, z), z);
     let t = det_tanh(det_bar(0.7978845834732056 * inner, z), z);
     out[i] = det_bar(det_bar(0.5 * v, z) * det_bar(1.0 + t, z), z);
+}
+fn gelu_half(v: f32) -> f32 {
+    let bits = bitcast<u32>(v);
+    let sign = bits & 0x80000000u;
+    let mag = bits & 0x7fffffffu;
+    if (mag == 0u) { return v; }
+    if (mag < 0x00800000u) {
+        let n = mag >> 1u;
+        let bump = (mag & 1u) & (n & 1u);
+        return bitcast<f32>(sign | (n + bump));
+    }
+    if (mag < 0x01000000u) {
+        let sig = 0x800000u | (mag & 0x7fffffu);
+        let n = sig >> 1u;
+        let bump = (sig & 1u) & (n & 1u);
+        return bitcast<f32>(sign | (n + bump));
+    }
+    return bitcast<f32>(sign | (mag - 0x00800000u));
 }
 "#
 );
@@ -1178,9 +1203,35 @@ pub mod cpu {
     }
 
     pub fn gelu_tanh_one(v: f32) -> f32 {
+        // |v| < 2^-24. Checked against the full formula for every such f32:
+        // the extra terms are below half an ulp, so the result is v/2. The
+        // shift matches IEEE rounding, including subnormals that Metal flushes.
+        let mag = v.to_bits() & 0x7fff_ffff;
+        if mag < 0x3380_0000 {
+            return gelu_half(v);
+        }
         let cube = bar(bar(v * v) * v);
         let inner = bar(v + bar(0.044715 * cube));
         gelu_tanh_at(v, inner)
+    }
+
+    fn gelu_half(v: f32) -> f32 {
+        let bits = v.to_bits();
+        let sign = bits & 0x8000_0000;
+        let mag = bits & 0x7fff_ffff;
+        if mag == 0 { return v; }
+        if mag < 0x0080_0000 {
+            let n = mag >> 1;
+            let bump = (mag & 1) & (n & 1);
+            return f32::from_bits(sign | (n + bump));
+        }
+        if mag < 0x0100_0000 {
+            let sig = 0x80_0000 | (mag & 0x7f_ffff);
+            let n = sig >> 1;
+            let bump = (sig & 1) & (n & 1);
+            return f32::from_bits(sign | (n + bump));
+        }
+        f32::from_bits(sign | (mag - 0x0080_0000))
     }
 
     /// GELU tanh whose pre-tanh argument is already chosen. The fault catalogue
@@ -2345,5 +2396,29 @@ mod det_tanh_tests {
         assert_eq!(checked, 4_278_190_080u64, "finite f32 coverage");
         assert_eq!(ident_non_cr, 0, "the proved |x| < 2^-12 range must be correctly rounded");
         assert_eq!(sat_non_cr, 0, "the proved saturation range must be correctly rounded");
+    }
+}
+
+#[cfg(test)]
+mod gelu_half_tests {
+    use super::cpu::gelu_tanh_one;
+
+    /// Every 4096th f32 below 2^-24, both signs. The full scan was run when
+    /// the cutoff was chosen: the GELU bits are the IEEE half, which is what
+    /// Metal was flushing to zero.
+    #[test]
+    fn gelu_below_two_to_the_minus_24_is_an_ieee_half() {
+        let mut bits = 1u32;
+        while bits < 0x3380_0000 {
+            let x = f32::from_bits(bits);
+            assert_eq!(gelu_tanh_one(x).to_bits(), (x * 0.5).to_bits(), "{bits:#x}");
+            let n = f32::from_bits(bits | 0x8000_0000);
+            assert_eq!(gelu_tanh_one(n).to_bits(), (n * 0.5).to_bits(), "neg {bits:#x}");
+            bits += 4096;
+        }
+        // Half of the smallest normal. This is the value Metal returned as +0.
+        assert_eq!(gelu_tanh_one(f32::from_bits(0x0080_0000)).to_bits(), 0x0040_0000);
+        assert_eq!(gelu_tanh_one(0.0).to_bits(), 0);
+        assert_eq!(gelu_tanh_one(-0.0).to_bits(), 0x8000_0000);
     }
 }
