@@ -51,8 +51,8 @@ fn the_software_gpu_job_pins_lavapipe_off_avx512() {
         "the pin must not sit next to a skipped failure"
     );
     assert!(
-        job.contains("cargo test --workspace --verbose -- --test-threads=1"),
-        "lavapipe SIGSEGVs when tests compile shaders concurrently; the suite must stay serial"
+        job.contains("cargo --locked test --workspace --verbose -- --test-threads=1"),
+        "lavapipe SIGSEGVs when tests compile shaders concurrently; the suite must stay serial and locked"
     );
 }
 
