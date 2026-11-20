@@ -25,7 +25,7 @@
     "change": "libm tanh replaced by det_tanh. Both the CPU and the shader use it, so this is GPU versus the new CPU, not GPU versus the libm CPU.",
     "rustc_vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5",
     "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
-    "cargo_lock_sha256": "dcddf8451a3dd8f3bc2afc6f48669e97184cd358ca131aaf229902dfb4fa50da",
+    "cargo_lock_sha256": "dfb4e8fc5938342b51ec51dbf427c4fc9dade5ace975e27eaa4e2b3ce0342565",
     "cargo_locked": true,
     "command": "cargo build --locked --release -p ferric-smolvla && ferric-smolvla gpu",
     "adapter": "llvmpipe (LLVM 20.1.2, 256 bits)",
