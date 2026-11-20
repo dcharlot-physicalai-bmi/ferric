@@ -523,6 +523,32 @@ fn det_ln(y: f32, z: u32) -> f32 {
     let lnm = det_bar(ts * p, z);
     return det_bar(det_bar(f32(e) * 0.6931471824645996, z) + lnm, z);
 }
+// tanh. Odd. |x| < 0.25 uses the Taylor odd polynomial (exp(2x)-1 cancels).
+// 0.25 <= |x| < 9 uses (exp(2|x|)-1)/(exp(2|x|)+1). |x| >= 9 saturates to ±1
+// in f32: 2*exp(-18) is below half an ulp of 1. Same sequence as
+// ferric_core::cpu::det_tanh. No builtin tanh and no division.
+fn det_tanh_poly(a: f32, z: u32) -> f32 {
+    let u = det_bar(a * a, z);
+    var p = 0.0218694885;
+    p = det_bar(det_bar(p * u, z) + -0.053968254, z);
+    p = det_bar(det_bar(p * u, z) + 0.133333333, z);
+    p = det_bar(det_bar(p * u, z) + -0.333333333, z);
+    p = det_bar(det_bar(p * u, z) + 1.0, z);
+    return det_bar(a * p, z);
+}
+fn det_tanh(v: f32, z: u32) -> f32 {
+    let a = abs(v);
+    if (a == 0.0) { return v; }
+    if (!(a < 9.0)) {
+        if (a != a) { return v; }
+        return sign(v);
+    }
+    if (a < 0.25) { return sign(v) * det_tanh_poly(a, z); }
+    let e = det_exp(det_bar(2.0 * a, z), z);
+    let num = det_bar(e - 1.0, z);
+    let den = det_bar(e + 1.0, z);
+    return sign(v) * det_bar(num * det_recip(den, z), z);
+}
 "#;
 
 const SILU_WGSL: &str = r#"
@@ -609,9 +635,11 @@ const GELU_TANH_WGSL: &str = r#"
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= dims.x) { return; }
     let v = x[i];
-    let c = 0.7978845834732056;
-    let cube = v * v * v;
-    out[i] = 0.5 * v * (1.0 + tanh(c * (v + 0.044715 * cube)));
+    let z = dims.y;
+    let cube = det_bar(det_bar(v * v, z) * v, z);
+    let inner = det_bar(v + det_bar(0.044715 * cube, z), z);
+    let t = det_tanh(det_bar(0.7978845834732056 * inner, z), z);
+    out[i] = det_bar(det_bar(0.5 * v, z) * det_bar(1.0 + t, z), z);
 }
 "#;
 
@@ -960,6 +988,117 @@ pub mod cpu {
     pub fn div(a: &[f32], b: &[f32]) -> Vec<f32> { a.iter().zip(b).map(|(x, y)| x / y).collect() }
     pub fn gelu(x: &[f32]) -> Vec<f32> {
         x.iter().map(|&v| 0.5 * v * (1.0 + libm_erf(v * std::f32::consts::FRAC_1_SQRT_2))).collect()
+    }
+
+    /// Fence one rounded f32 op so a later add cannot contract it into an FMA.
+    /// Not libm and not unsafe. The value is unchanged.
+    #[inline(always)]
+    fn bar(v: f32) -> f32 { std::hint::black_box(v) }
+
+    /// One IEEE mul, not contracted into a later add.
+    #[inline(always)]
+    pub fn det_mul(a: f32, b: f32) -> f32 { bar(a * b) }
+
+    /// One IEEE add, not contracted into a surrounding mul.
+    #[inline(always)]
+    pub fn det_add(a: f32, b: f32) -> f32 { bar(a + b) }
+
+    /// `det_exp` from [`DET_MATH_WGSL`], operation for operation.
+    /// Cody–Waite split plus a degree-6 Taylor polynomial on the reduced argument.
+    /// Each mul and add is a separate IEEE rounding; `bar` stops FMA contraction.
+    pub fn det_exp(v: f32) -> f32 {
+        let x = v.clamp(-87.0, 88.0);
+        let kf = (bar(x * 1.4426950216293335) + 0.5).floor();
+        let a = bar(x - bar(kf * 0.693115234375));
+        let r = bar(a - bar(kf * 3.194618329871446e-05));
+        let mut p = 0.0013888889_f32;
+        p = bar(bar(p * r) + 0.008333334);
+        p = bar(bar(p * r) + 0.041666668);
+        p = bar(bar(p * r) + 0.16666667);
+        p = bar(bar(p * r) + 0.5);
+        p = bar(bar(p * r) + 1.0);
+        p = bar(bar(p * r) + 1.0);
+        let k = (kf as i32).clamp(-126, 127);
+        let scale = f32::from_bits(((k + 127) as u32) << 23);
+        bar(p * scale)
+    }
+
+    /// `det_recip` from [`DET_MATH_WGSL`]: one integer seed and three Newton steps.
+    /// No division instruction. Positive finite inputs only, which is all `det_tanh` asks for.
+    pub fn det_recip(y: f32) -> f32 {
+        let mut x = f32::from_bits(0x7EF3_11C3u32.wrapping_sub(y.to_bits()));
+        let mut t = bar(y * x);
+        let mut w = bar(2.0 - t);
+        x = bar(x * w);
+        t = bar(y * x);
+        w = bar(2.0 - t);
+        x = bar(x * w);
+        t = bar(y * x);
+        w = bar(2.0 - t);
+        bar(x * w)
+    }
+
+    /// Taylor odd polynomial on `[0, 0.25]`. Coefficients are the f32 spellings of
+    /// `62/2835`, `-17/315`, `2/15`, `-1/3`, `1`.
+    fn det_tanh_poly(a: f32) -> f32 {
+        let u = bar(a * a);
+        let mut p = 0.0218694885_f32;
+        p = bar(bar(p * u) + -0.053968254);
+        p = bar(bar(p * u) + 0.133333333);
+        p = bar(bar(p * u) + -0.333333333);
+        p = bar(bar(p * u) + 1.0);
+        bar(a * p)
+    }
+
+    /// `tanh` as the shader's `det_tanh`, with `z = 0`.
+    ///
+    /// Odd. Zero stays signed zero. `|x| < 0.25` is [`det_tanh_poly`], because
+    /// `exp(2x) - 1` cancels. `0.25 <= |x| < 9` is `(exp(2|x|) - 1) / (exp(2|x|) + 1)`
+    /// through [`det_exp`] and [`det_recip`]. `|x| >= 9` returns `±1`, the f32
+    /// rounding of the real value: `2*exp(-18)` is under half an ulp of 1.
+    /// The only operations are IEEE mul, add, sub, floor, clamps, and bit casts.
+    /// Nothing calls libm, so glibc 2.39, Ubuntu 26.04's glibc, and Apple libm
+    /// cannot disagree.
+    ///
+    /// The error against `f64::tanh`, cast back to f32 (a correctly rounded f32
+    /// reference: an f64 ulp is far below half an f32 ulp), is at most 4 ulps
+    /// on the sweep in `det_tanh_stays_within_its_ulp_bound`. The worst sample
+    /// was 4 ulps at `8.320618`.
+    pub fn det_tanh(v: f32) -> f32 {
+        let a = v.abs();
+        if a == 0.0 { return v; }
+        if !(a < 9.0) {
+            if a.is_nan() { return v; }
+            return v.signum();
+        }
+        if a < 0.25 {
+            return det_tanh_poly(a).copysign(v);
+        }
+        let e = det_exp(bar(2.0 * a));
+        let num = bar(e - 1.0);
+        let den = bar(e + 1.0);
+        bar(num * det_recip(den)).copysign(v)
+    }
+
+    /// Hendrycks GELU tanh approximation. The constant `0.7978845834732056` is
+    /// the shader's f32 spelling of `sqrt(2/π)`. Every mul and add is barriered,
+    /// then [`det_tanh`] replaces `f32::tanh`.
+    pub fn gelu_tanh(x: &[f32]) -> Vec<f32> {
+        x.iter().copied().map(gelu_tanh_one).collect()
+    }
+
+    pub fn gelu_tanh_one(v: f32) -> f32 {
+        let cube = bar(bar(v * v) * v);
+        let inner = bar(v + bar(0.044715 * cube));
+        gelu_tanh_at(v, inner)
+    }
+
+    /// GELU tanh whose pre-tanh argument is already chosen. The fault catalogue
+    /// passes `v` (cubic dropped) or `v + 2·cubic` (cubic duplicated). The scale
+    /// `sqrt(2/π)` and the outer `0.5·v·(1+tanh)` stay the barriered sequence.
+    pub fn gelu_tanh_at(v: f32, argument: f32) -> f32 {
+        let t = det_tanh(bar(0.7978845834732056 * argument));
+        bar(bar(0.5 * v) * bar(1.0 + t))
     }
     fn libm_erf(z: f32) -> f32 {
         let s = z.signum(); let a = z.abs();
@@ -1844,4 +1983,73 @@ pub fn rmsnorm_sg_cpu(x: &[f32], w: &[f32], rows: usize, d: usize, eps: f32) -> 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod det_tanh_tests {
+    use super::cpu::det_tanh;
+
+    fn ordered(x: f32) -> i32 {
+        let i = x.to_bits() as i32;
+        if i < 0 { i32::MIN.wrapping_sub(i) } else { i }
+    }
+
+    fn ulp_distance(got: f32, reference: f32) -> u32 {
+        if got.is_nan() && reference.is_nan() { return 0; }
+        ordered(got).abs_diff(ordered(reference))
+    }
+
+    /// Dense sweep, not all 2^32 encodings. Every finite f32 in [-16, 16] is
+    /// about 2e9 values; a debug run of f64 tanh over that does not belong in
+    /// CI. The sweep covers:
+    /// - ±0, ±inf, NaN
+    /// - 1024 evenly spaced mantissas in every bin from 2^-12 through 16, both signs
+    /// - every 32nd f32 in [8, 10], where tanh rounds onto ±1
+    /// The reference is `f64::tanh` cast to f32. An f64 ulp is ~2^29 times smaller
+    /// than an f32 ulp near 1, so that cast is the correctly rounded f32 value.
+    #[test]
+    fn det_tanh_stays_within_its_ulp_bound() {
+        let mut max_ulps = 0u32;
+        let mut worst = 0.0f32;
+        let mut check = |x: f32| {
+            let got = det_tanh(x);
+            let reference = (f64::from(x).tanh()) as f32;
+            let d = ulp_distance(got, reference);
+            if d > max_ulps {
+                max_ulps = d;
+                worst = x;
+            }
+        };
+        check(0.0);
+        check(-0.0);
+        check(f32::INFINITY);
+        check(f32::NEG_INFINITY);
+        check(f32::NAN);
+        for exp in -12i32..=4 {
+            let base = f32::from_bits(((exp + 127) as u32) << 23);
+            let next = f32::from_bits(((exp + 128) as u32) << 23);
+            let step = (next.to_bits() - base.to_bits()) / 1024;
+            let mut bits = base.to_bits();
+            while bits < next.to_bits() {
+                let x = f32::from_bits(bits);
+                check(x);
+                check(-x);
+                bits += step.max(1);
+            }
+        }
+        // Every f32 in the bins where the coarse sweep was closest to the bound.
+        for (start, end) in [(0.2f32, 0.3f32), (1.0, 2.0), (8.0, 9.0)] {
+            let mut bits = start.to_bits();
+            let stop = end.to_bits();
+            while bits < stop {
+                check(f32::from_bits(bits));
+                check(-f32::from_bits(bits));
+                bits += 1;
+            }
+        }
+        assert!(
+            max_ulps <= 4,
+            "det_tanh ulp error {max_ulps} at {worst} exceeds the documented bound of 4"
+        );
+    }
 }

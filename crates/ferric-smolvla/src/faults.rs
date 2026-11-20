@@ -439,11 +439,19 @@ fn gelu_case(kind: Kind) -> Case {
         Kind::Dropped | Kind::Duplicated => {
             let i = pick(n, 61);
             let v = x[i];
-            let c = (2.0f32 / std::f32::consts::PI).sqrt();
-            let cubic = 0.044715 * v * v * v;
-            let inner = if kind == Kind::Dropped { v } else { v + 2.0 * cubic };
+            // ((0.044715 * v) * v) * v, each rounding kept. No libm sqrt and no f32::tanh.
+            let cubic = {
+                let c1 = ferric_core::cpu::det_mul(0.044715, v);
+                let c2 = ferric_core::cpu::det_mul(c1, v);
+                ferric_core::cpu::det_mul(c2, v)
+            };
+            let inner = if kind == Kind::Dropped {
+                v
+            } else {
+                ferric_core::cpu::det_add(v, ferric_core::cpu::det_mul(2.0, cubic))
+            };
             let mut y = clean.clone();
-            y[i] = 0.5 * v * (1.0 + (c * inner).tanh());
+            y[i] = ferric_core::cpu::gelu_tanh_at(v, inner);
             y
         }
         other => apply_output(&clean, 4, 4, other, 60),
@@ -799,16 +807,9 @@ mod tests {
         assert_eq!(row["end_to_end_detected"], true);
     }
 
-    /// Numbers may differ by a libm ulp. Booleans, strings and the shape of the catalogue may not.
-    ///
-    /// `f32::tanh` in `gelu_tanh` is not bit-identical across libm. The only mismatch in the
-    /// whole CPU catalogue is `elementwise.index_off_by_one_row.rmse`:
-    /// 0.23910626993893822 on the Ubuntu 24.04 glibc that wrote the receipt, and
-    /// 0.23910627516696203 on Apple libm (Metal run 43435730656) and on Ubuntu 26.04.1
-    /// glibc (`ubuntu-latest`, software-GPU run 43458775739). The gap is 5.2e-9. Every
-    /// detection flag was already equal. 1e-7 is three orders of magnitude under the
-    /// raw-action bound (~2e-4) that those flags use, and a 1e-4 move still fails — see
-    /// [`a_real_rmse_change_is_not_a_libm_ulp`].
+    /// Booleans, strings, and the shape of the catalogue must match. A 1e-4 move in a
+    /// number still fails — see [`a_real_rmse_change_is_not_a_libm_ulp`]. `gelu_tanh` no
+    /// longer calls libm, so the elementwise rmse is not a platform exception.
     fn catalogues_agree(a: &serde_json::Value, b: &serde_json::Value, tol: f64) -> Result<(), String> {
         use serde_json::Value;
         match (a, b) {
@@ -840,64 +841,10 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
         let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let report = cpu_fault_report();
-        // Every field except one gelu_tanh rmse is bit-exact on Linux. That rmse is
-        // `f32::tanh`, and glibc does not agree with itself: Ubuntu 24.04 wrote
-        // 0.23910626993893822, Ubuntu 26.04.1 (`ubuntu-latest`, run 43458775739) and
-        // Apple libm (run 43435730656) both produce 0.23910627516696203. A third
-        // value, or any other field moving, still fails. The receipt is not rewritten.
-        #[cfg(target_os = "linux")]
-        {
-            const RECEIPT_GLIBC: f64 = 0.23910626993893822;
-            const NEWER_GLIBC_AND_APPLE: f64 = 0.23910627516696203;
-            let mut committed = file["cpu"].clone();
-            let mut live = report.clone();
-            let committed_rmse = std::mem::replace(
-                &mut committed["kernels"]["elementwise"]["cases"]["index_off_by_one_row"]["rmse"],
-                serde_json::Value::Null,
-            );
-            let live_rmse = std::mem::replace(
-                &mut live["kernels"]["elementwise"]["cases"]["index_off_by_one_row"]["rmse"],
-                serde_json::Value::Null,
-            );
-            assert_eq!(
-                committed, live,
-                "the committed catalogue drifted on Linux outside the one gelu_tanh rmse libm owns"
-            );
-            let committed_rmse = committed_rmse.as_f64().unwrap();
-            let live_rmse = live_rmse.as_f64().unwrap();
-            assert!(
-                (committed_rmse - RECEIPT_GLIBC).abs() < 1e-18,
-                "committed gelu_tanh rmse moved to {committed_rmse}; remeasure before accepting another libm"
-            );
-            assert!(
-                (live_rmse - RECEIPT_GLIBC).abs() < 1e-18
-                    || (live_rmse - NEWER_GLIBC_AND_APPLE).abs() < 1e-18,
-                "gelu_tanh index_off_by_one_row rmse {live_rmse:.16e} is a third libm result"
-            );
-        }
+        assert_eq!(file["cpu"], report, "the committed catalogue drifted");
         catalogues_agree(&file["cpu"], &report, 1e-7)
-            .unwrap_or_else(|e| panic!("the committed catalogue drifted past a libm ulp: {e}"));
+            .unwrap_or_else(|e| panic!("the committed catalogue drifted past 1e-7: {e}"));
         assert_eq!(file["llvmpipe"]["adapter"], "llvmpipe (LLVM 20.1.2, 256 bits)");
-    }
-
-    /// The macOS rmse from Metal run 43435730656, pinned against the committed Linux value.
-    /// If the committed number moves, this fails on Linux too, and the gap has to be remeasured
-    /// rather than quietly absorbed.
-    #[test]
-    fn the_measured_macos_rmse_stays_a_libm_ulp() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/fleet/smolvla-fault-injection.json");
-        let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let mut macos = file["cpu"].clone();
-        let slot = &mut macos["kernels"]["elementwise"]["cases"]["index_off_by_one_row"];
-        let committed = slot["rmse"].as_f64().unwrap();
-        assert!(
-            (committed - 0.23910626993893822).abs() < 1e-18,
-            "committed linux rmse moved to {committed}; remeasure the macOS gap before widening anything"
-        );
-        let measured = 0.23910627516696203_f64;
-        slot["rmse"] = serde_json::json!(measured);
-        catalogues_agree(&file["cpu"], &macos, 1e-7).expect("recorded macOS gap must stay inside 1e-7");
-        assert!((committed - measured).abs() > 1e-12);
     }
 
     #[test]
@@ -912,7 +859,6 @@ mod tests {
             slot[key] = serde_json::json!(n);
             v
         };
-        // The measured macOS gap, 5.2e-9, stays inside the cross-libm tolerance.
         assert!(catalogues_agree(&report, &nudge(5.2e-9), 1e-7).is_ok());
         let err = catalogues_agree(&report, &nudge(1e-4), 1e-7).unwrap_err();
         assert!(err.contains("rmse"), "{err}");
