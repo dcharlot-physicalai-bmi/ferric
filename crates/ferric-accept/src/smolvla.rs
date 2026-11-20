@@ -5,7 +5,7 @@
 //! from pixels. The inference entry point is a name with status [`Support::Proposed`].
 //!
 //! Pins are the LeRobot sources at commit `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`
-//! (2026-07-23), files `configuration_smolvla.py`, `processor_smolvla.py`,
+//! (`a0eb860d (v0.6.1 lineage)`, 2026-07-23), files `configuration_smolvla.py`, `processor_smolvla.py`,
 //! `modeling_smolvla.py`, `normalize_processor.py`, and `policies/common/vla_utils.py`.
 //! Where a docstring in those files disagrees with the code, the code is the pin
 //! and the disagreement is recorded on [`DOCSTRING_DISAGREEMENTS`].

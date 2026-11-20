@@ -25,7 +25,11 @@
     },
     {
       "path": "docs/acceptance/contracts/smolvla-ferromotion.md",
-      "sha256": "8a92d99618f01e0ef95e3253c344d0b452cfef00f8944b4cbabdab213d17bfd6"
+      "sha256": "4d67f4c2a029427db4f06febe7b8a05dec5088273af7ec97ad17d252417862dc"
+    },
+    {
+      "path": "docs/acceptance/contracts/smolvla-ferromotion-v3.md",
+      "sha256": "705003e01f7e00af23386ebacb25cfb4a27564e719c9439a8c22421ddbfecac2"
     },
     {
       "path": "docs/acceptance/corpus/fabric-cells.json",

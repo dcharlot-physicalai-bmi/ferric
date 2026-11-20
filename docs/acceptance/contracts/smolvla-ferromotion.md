@@ -2,7 +2,7 @@
 
 Status of `ferric.smolvla.predict_action_chunk.v1`: **proposed**. This repository does not run SmolVLA. `predict_action_chunk()` in `crates/ferric-accept/src/smolvla.rs` returns a refusal. The checker tests the pins and the byte layout.
 
-Pin: LeRobot commit `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a` (2026-07-23). Files: `configuration_smolvla.py`, `processor_smolvla.py`, `modeling_smolvla.py`, `processor/normalize_processor.py`, `policies/common/vla_utils.py`. Model id named by the card: `lerobot/smolvla_base`. No weight sha256 is in this tree. Paper: https://arxiv.org/abs/2506.01844 (2 June 2025). Card: https://huggingface.co/lerobot/smolvla_base.
+Pin: LeRobot commit `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a` (`a0eb860d (v0.6.1 lineage)`, 2026-07-23). Files: `configuration_smolvla.py`, `processor_smolvla.py`, `modeling_smolvla.py`, `processor/normalize_processor.py`, `policies/common/vla_utils.py`. Model id named by the card: `lerobot/smolvla_base`. Weight sha256 pinned at `crates/ferric-smolvla/src/bin/ferric-smolvla.rs:85`: `7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb`. Paper: https://arxiv.org/abs/2506.01844 (2 June 2025). Card: https://huggingface.co/lerobot/smolvla_base.
 
 ## What Ferric has today
 

@@ -2,7 +2,7 @@
 """Independent SmolVLA f32 reference.
 
 Reads the bytes written by `ferric-smolvla network-forward` and reruns the
-LeRobot a0eb860d sample_actions math in PyTorch. BF16 weights are cast to
+LeRobot a0eb860d (v0.6.1 lineage) sample_actions math in PyTorch. BF16 weights are cast to
 float32 for the comparable path. A separate BF16 matmul is attempted and
 reported on its own. This script is not the inference runtime.
 """

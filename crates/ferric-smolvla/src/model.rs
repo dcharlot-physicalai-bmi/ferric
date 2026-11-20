@@ -1,6 +1,6 @@
 //! SmolVLA forward in f32.
 //!
-//! The graph is the LeRobot `a0eb860d` `sample_actions` path:
+//! The graph is the LeRobot `a0eb860d (v0.6.1 lineage)` `sample_actions` path:
 //! SigLIP-style vision, scale-4 pixel shuffle, connector, text prefix,
 //! then the expert with self-attention on even layers and cross-attention
 //! on odd layers, integrated for 10 Euler steps.
