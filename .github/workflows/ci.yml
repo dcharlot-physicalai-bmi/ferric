@@ -19,7 +19,8 @@ jobs:
     # the job had died at compile since 2026-07-22 and no one had ever seen it finish. There was no
     # duration to bound it against; there is now. Measured on the first fully green run (33927133667):
     # software GPU 34.2 min, real Metal 15.2 min, proofs 7.1 min. These sit at ~2.5-3x that, so
-    # ordinary variance never trips them while a hang costs minutes.
+    # ordinary variance never trips them while a hang costs minutes. Metal is 70
+    # because the release det_tanh sweep was added on top of the 15 minute job.
     # ⚠ ONE green sample each for the whole-job numbers. `Test workspace` is stable across three runs
     # (566/579/575 s); the validation step has a single green observation (1218 s). Raise a bound if
     # a legitimate run approaches it — do not tighten one toward an observation.
@@ -88,6 +89,12 @@ jobs:
       # Every assertion still runs. Metal keeps the parallel suite.
       - name: Test workspace
         run: cargo --locked test --workspace --verbose -- --test-threads=1
+
+      # Every finite f32 against a correctly rounded tanh. Ignored in the suite
+      # above because a debug build of a billion f64 tanh calls does not fit
+      # the job. This is the lock on the 1 ulp bound.
+      - name: Exhaustive det_tanh sweep
+        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
@@ -182,7 +189,7 @@ jobs:
           cargo --locked run -p ferric-tensor --example fabric
 
   macos-metal:
-    timeout-minutes: 45
+    timeout-minutes: 70
     name: build + validate (real Metal)
     runs-on: macos-latest
     steps:
@@ -201,6 +208,12 @@ jobs:
 
       - name: Test workspace
         run: cargo --locked test --workspace --verbose
+
+      # Same sweep as the software-GPU job. The CPU code has no libm, so a
+      # disagreement here is a contraction or a runtime difference, not a
+      # second algorithm.
+      - name: Exhaustive det_tanh sweep
+        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather

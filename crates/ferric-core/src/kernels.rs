@@ -62,7 +62,10 @@ impl Context {
     pub fn sqrt_t(&self, x: &Tensor) -> Tensor { self.unary(x, SQRT_WGSL, "sqrt") }
     pub fn gelu_t(&self, x: &Tensor) -> Tensor { self.unary(x, GELU_WGSL, "gelu") }
     /// PyTorch `gelu_pytorch_tanh`. SmolVLM vision uses this. It is not [`Self::gelu_t`].
-    pub fn gelu_tanh_t(&self, x: &Tensor) -> Tensor { self.unary(x, GELU_TANH_WGSL, "gelu_tanh") }
+    /// The tanh table is binding 3, the same bytes `cpu::det_tanh` reads.
+    pub fn gelu_tanh_t(&self, x: &Tensor) -> Tensor {
+        self.with_tanh_table(x, GELU_TANH_WGSL, "gelu_tanh")
+    }
     /// RoPE with an explicit position id per row.
     pub fn rope_positions_t(&self, x: &Tensor, positions: &[u32], heads: u32, dh: u32, base: f32) -> Tensor {
         let seq = positions.len() as u32;
@@ -91,6 +94,15 @@ impl Context {
     }
     pub fn sub_t(&self, a: &Tensor, b: &Tensor) -> Tensor { self.binary(a, b, SUB_WGSL, "sub") }
     pub fn div_t(&self, a: &Tensor, b: &Tensor) -> Tensor { self.binary(a, b, DIV_WGSL, "div") }
+    fn with_tanh_table(&self, x: &Tensor, wgsl: &str, name: &str) -> Tensor {
+        let n = x.len();
+        let out = self.empty(&x.shape);
+        let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
+        let table = self.storage("det_tanh_table", cpu::tanh_table());
+        let pipe = self.pipeline(name, wgsl);
+        self.dispatch(&pipe, &[&x.buf, &out.buf, &dims, &table], ((n as u32).div_ceil(64), 1, 1));
+        out
+    }
     fn unary(&self, x: &Tensor, wgsl: &str, name: &str) -> Tensor {
         let n = x.len();
         let out = self.empty(&x.shape);
@@ -249,6 +261,30 @@ impl Context {
         let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
         let pipe = self.pipeline("add", ADD_WGSL);
         self.dispatch(&pipe, &[&ab, &bb, &out, &dims], ((n as u32).div_ceil(64), 1, 1));
+        self.readback(&out, n).await
+    }
+
+    /// `cpu::det_tanh` on the device. Binding 3 is the same table the CPU reads.
+    pub async fn det_tanh(&self, x: &[f32]) -> Result<Vec<f32>> {
+        let n = x.len();
+        let xb = self.storage("x", x);
+        let out = self.out_buffer(n);
+        let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
+        let table = self.storage("det_tanh_table", cpu::tanh_table());
+        let pipe = self.pipeline("det_tanh", TANH_WGSL);
+        self.dispatch(&pipe, &[&xb, &out, &dims, &table], ((n as u32).div_ceil(64), 1, 1));
+        self.readback(&out, n).await
+    }
+
+    /// PyTorch `gelu_pytorch_tanh` on the device, bit-identical to `cpu::gelu_tanh`.
+    pub async fn gelu_tanh(&self, x: &[f32]) -> Result<Vec<f32>> {
+        let n = x.len();
+        let xb = self.storage("x", x);
+        let out = self.out_buffer(n);
+        let dims = self.uniform_u32("n", &[n as u32, 0, 0, 0]);
+        let table = self.storage("det_tanh_table", cpu::tanh_table());
+        let pipe = self.pipeline("gelu_tanh", GELU_TANH_WGSL);
+        self.dispatch(&pipe, &[&xb, &out, &dims, &table], ((n as u32).div_ceil(64), 1, 1));
         self.readback(&out, n).await
     }
 
@@ -531,32 +567,6 @@ fn det_ln(y: f32, z: u32) -> f32 {
     let lnm = det_bar(ts * p, z);
     return det_bar(det_bar(f32(e) * 0.6931471824645996, z) + lnm, z);
 }
-// tanh. Odd. |x| < 0.25 uses the Taylor odd polynomial (exp(2x)-1 cancels).
-// 0.25 <= |x| < 9 uses (exp(2|x|)-1)/(exp(2|x|)+1). |x| >= 9 saturates to ±1
-// in f32: 2*exp(-18) is below half an ulp of 1. Same sequence as
-// ferric_core::cpu::det_tanh. No builtin tanh and no division.
-fn det_tanh_poly(a: f32, z: u32) -> f32 {
-    let u = det_bar(a * a, z);
-    var p = 0.0218694885;
-    p = det_bar(det_bar(p * u, z) + -0.053968254, z);
-    p = det_bar(det_bar(p * u, z) + 0.133333333, z);
-    p = det_bar(det_bar(p * u, z) + -0.333333333, z);
-    p = det_bar(det_bar(p * u, z) + 1.0, z);
-    return det_bar(a * p, z);
-}
-fn det_tanh(v: f32, z: u32) -> f32 {
-    let a = abs(v);
-    if (a == 0.0) { return v; }
-    if (!(a < 9.0)) {
-        if (a != a) { return v; }
-        return sign(v);
-    }
-    if (a < 0.25) { return sign(v) * det_tanh_poly(a, z); }
-    let e = det_exp(det_bar(2.0 * a, z), z);
-    let num = det_bar(e - 1.0, z);
-    let den = det_bar(e + 1.0, z);
-    return sign(v) * det_bar(num * det_recip(den, z), z);
-}
 "#;
 
 const SILU_WGSL: &str = r#"
@@ -635,21 +645,80 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const GELU_TANH_WGSL: &str = r#"
-@group(0) @binding(0) var<storage, read>       x: array<f32>;
+/// Bindings, then `det_tanh`, then the caller's `main`. One literal so the
+/// CPU and both shaders cannot drift apart at the function body.
+macro_rules! tanh_shader {
+    ($tail:literal) => {
+        concat!(
+            r#"
+@group(0) @binding(0) var<storage, read>       x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform>             dims: vec4<u32>;
+@group(0) @binding(3) var<storage, read>       table: array<f32>;
+fn det_tanh(v: f32, z: u32) -> f32 {
+    let bits = bitcast<u32>(v);
+    let mag = bits & 0x7fffffffu;
+    if (mag == 0u) { return v; }
+    if (mag < 0x39800000u) { return v; }
+    if (mag >= 0x7f800000u) {
+        if (mag > 0x7f800000u) { return v; }
+        if ((bits & 0x80000000u) == 0u) { return 1.0; }
+        return -1.0;
+    }
+    let a = bitcast<f32>(mag);
+    let sat = bitcast<f32>(1091579060u);
+    if (!(a < sat)) {
+        if ((bits & 0x80000000u) == 0u) { return 1.0; }
+        return -1.0;
+    }
+    let scale = bitcast<f32>(0x46800000u);
+    let w = bitcast<f32>(0x38800000u);
+    let scaled = det_bar(a * scale, z);
+    let slot = u32(floor(scaled));
+    if (slot >= 147635u) {
+        if ((bits & 0x80000000u) == 0u) { return 1.0; }
+        return -1.0;
+    }
+    let base = slot * 2u;
+    let anchor = table[base];
+    let slope = table[base + 1u];
+    let lo = det_bar(f32(slot) * w, z);
+    let dx = det_bar(a - lo, z);
+    let prod = det_bar(slope * dx, z);
+    let y = det_bar(anchor + prod, z);
+    let signed = bitcast<u32>(y) ^ (bitcast<u32>(v) & 0x80000000u);
+    return bitcast<f32>(signed);
+}
+"#,
+            $tail
+        )
+    };
+}
+
+const GELU_TANH_WGSL: &str = tanh_shader!(
+r#"
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x; if (i >= dims.x) { return; }
-    let v = x[i];
+    let v = bitcast<f32>(x[i]);
     let z = dims.y;
     let cube = det_bar(det_bar(v * v, z) * v, z);
     let inner = det_bar(v + det_bar(0.044715 * cube, z), z);
     let t = det_tanh(det_bar(0.7978845834732056 * inner, z), z);
     out[i] = det_bar(det_bar(0.5 * v, z) * det_bar(1.0 + t, z), z);
 }
-"#;
+"#
+);
+
+const TANH_WGSL: &str = tanh_shader!(
+r#"
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x; if (i >= dims.x) { return; }
+    out[i] = det_tanh(bitcast<f32>(x[i]), dims.y);
+}
+"#
+);
 
 const ROPE_POS_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
@@ -1016,9 +1085,12 @@ pub mod cpu {
     /// Each mul and add is a separate IEEE rounding; `bar` stops FMA contraction.
     pub fn det_exp(v: f32) -> f32 {
         let x = v.clamp(-87.0, 88.0);
-        let kf = (bar(x * 1.4426950216293335) + 0.5).floor();
-        let a = bar(x - bar(kf * 0.693115234375));
-        let r = bar(a - bar(kf * 3.194618329871446e-05));
+        // The WGSL literals 1.4426950216293335, 0.693115234375 and
+        // 3.194618329871446e-05. Written as bits so a shorter decimal cannot
+        // drift and clippy does not rewrite them toward a libm constant.
+        let kf = (bar(x * f32::from_bits(0x3fb8_aa3b)) + 0.5).floor();
+        let a = bar(x - bar(kf * f32::from_bits(0x3f31_7000)));
+        let r = bar(a - bar(kf * f32::from_bits(0x3805_fdf4)));
         let mut p = 0.0013888889_f32;
         p = bar(bar(p * r) + 0.008333334);
         p = bar(bar(p * r) + 0.041666668);
@@ -1046,46 +1118,64 @@ pub mod cpu {
         bar(x * w)
     }
 
-    /// Taylor odd polynomial on `[0, 0.25]`. Coefficients are the f32 spellings of
-    /// `62/2835`, `-17/315`, `2/15`, `-1/3`, `1`.
-    fn det_tanh_poly(a: f32) -> f32 {
-        let u = bar(a * a);
-        let mut p = 0.0218694885_f32;
-        p = bar(bar(p * u) + -0.053968254);
-        p = bar(bar(p * u) + 0.133333333);
-        p = bar(bar(p * u) + -0.333333333);
-        p = bar(bar(p * u) + 1.0);
-        bar(a * p)
+    /// Linear table from [`det_tanh_table`], one anchor/slope pair per slot of
+    /// width 2^-14. Odd. `|x| >= SAT` returns ±1, which is the correctly
+    /// rounded f32 tanh there. The only operations are IEEE mul, add, sub and
+    /// floor, each separated by [`bar`], plus bit casts. No libm and no unsafe,
+    /// so glibc 2.39, Ubuntu 26.04's glibc and Apple libm cannot disagree, and
+    /// the WGSL copy of this function (same table, `det_bar` in place of `bar`)
+    /// is bit-identical.
+    ///
+    /// Against f64 tanh rounded to f32 the error is at most 1 ulp. The exhaustive
+    /// count of non-correctly-rounded inputs is recorded by
+    /// `det_tanh_every_finite_f32` and `docs/fleet/det-tanh-ulp.json`.
+    pub fn det_tanh(v: f32) -> f32 {
+        // Branch on the bits. A comparison against NaN is not a reliable NaN
+        // test in WGSL: some backends delete `x != x` and `sign(NaN)` is 0.
+        let bits = v.to_bits();
+        let mag = bits & 0x7fff_ffff;
+        if mag == 0 { return v; }
+        // |x| < 2^-12. |x - tanh(x)| < x^3/3 < half an ulp on this whole
+        // range (the bin [2^-13, 2^-12) is the tight one; smaller bins have
+        // more margin), so the correctly rounded value is x itself.
+        if mag < 0x3980_0000 { return v; }
+        if mag >= 0x7f80_0000 {
+            if mag > 0x7f80_0000 { return v; }
+            return if bits & 0x8000_0000 == 0 { 1.0 } else { -1.0 };
+        }
+        let a = f32::from_bits(mag);
+        let sat = f32::from_bits(crate::det_tanh_table::SAT_BITS);
+        if a >= sat {
+            return if bits & 0x8000_0000 == 0 { 1.0 } else { -1.0 };
+        }
+        let scale = f32::from_bits(crate::det_tanh_table::SCALE_BITS);
+        let w = f32::from_bits(crate::det_tanh_table::W_BITS);
+        let slot = bar(a * scale).floor() as u32;
+        if slot >= crate::det_tanh_table::N {
+            return if bits & 0x8000_0000 == 0 { 1.0 } else { -1.0 };
+        }
+        let pair = slot as usize * 2;
+        let table = tanh_table();
+        let anchor = table[pair];
+        let slope = table[pair + 1];
+        let lo = bar((slot as f32) * w);
+        let dx = bar(a - lo);
+        let prod = bar(slope * dx);
+        // Copy the sign bit. Same bit operation as the shader, so a negative
+        // slot result cannot take a different path on the two sides.
+        let y = bar(anchor + prod);
+        f32::from_bits(y.to_bits() ^ (v.to_bits() & 0x8000_0000))
     }
 
-    /// `tanh` as the shader's `det_tanh`, with `z = 0`.
-    ///
-    /// Odd. Zero stays signed zero. `|x| < 0.25` is [`det_tanh_poly`], because
-    /// `exp(2x) - 1` cancels. `0.25 <= |x| < 9` is `(exp(2|x|) - 1) / (exp(2|x|) + 1)`
-    /// through [`det_exp`] and [`det_recip`]. `|x| >= 9` returns `±1`, the f32
-    /// rounding of the real value: `2*exp(-18)` is under half an ulp of 1.
-    /// The only operations are IEEE mul, add, sub, floor, clamps, and bit casts.
-    /// Nothing calls libm, so glibc 2.39, Ubuntu 26.04's glibc, and Apple libm
-    /// cannot disagree.
-    ///
-    /// The error against `f64::tanh`, cast back to f32 (a correctly rounded f32
-    /// reference: an f64 ulp is far below half an f32 ulp), is at most 4 ulps
-    /// on the sweep in `det_tanh_stays_within_its_ulp_bound`. The worst sample
-    /// was 4 ulps at `8.320618`.
-    pub fn det_tanh(v: f32) -> f32 {
-        let a = v.abs();
-        if a == 0.0 { return v; }
-        if !(a < 9.0) {
-            if a.is_nan() { return v; }
-            return v.signum();
-        }
-        if a < 0.25 {
-            return det_tanh_poly(a).copysign(v);
-        }
-        let e = det_exp(bar(2.0 * a));
-        let num = bar(e - 1.0);
-        let den = bar(e + 1.0);
-        bar(num * det_recip(den)).copysign(v)
+    pub fn tanh_table() -> &'static [f32] {
+        use std::sync::OnceLock;
+        static TABLE: OnceLock<Vec<f32>> = OnceLock::new();
+        TABLE.get_or_init(|| {
+            include_bytes!("det_tanh_table.bin")
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
     }
 
     /// Hendrycks GELU tanh approximation. The constant `0.7978845834732056` is
@@ -1105,7 +1195,8 @@ pub mod cpu {
     /// passes `v` (cubic dropped) or `v + 2·cubic` (cubic duplicated). The scale
     /// `sqrt(2/π)` and the outer `0.5·v·(1+tanh)` stay the barriered sequence.
     pub fn gelu_tanh_at(v: f32, argument: f32) -> f32 {
-        let t = det_tanh(bar(0.7978845834732056 * argument));
+        // 0x3f4c422a, the shader literal 0.7978845834732056, sqrt(2/π) as f32.
+        let t = det_tanh(bar(f32::from_bits(0x3f4c_422a) * argument));
         bar(bar(0.5 * v) * bar(1.0 + t))
     }
     fn libm_erf(z: f32) -> f32 {
@@ -2008,21 +2099,107 @@ mod det_tanh_tests {
         ordered(got).abs_diff(ordered(reference))
     }
 
-    /// Dense sweep, not all 2^32 encodings. Every finite f32 in [-16, 16] is
-    /// about 2e9 values; a debug run of f64 tanh over that does not belong in
-    /// CI. The sweep covers:
-    /// - ±0, ±inf, NaN
-    /// - 1024 evenly spaced mantissas in every bin from 2^-12 through 16, both signs
-    /// - every 32nd f32 in [8, 10], where tanh rounds onto ±1
-    /// The reference is `f64::tanh` cast to f32. An f64 ulp is ~2^29 times smaller
-    /// than an f32 ulp near 1, so that cast is the correctly rounded f32 value.
+    /// Double-double, used only when `f64::tanh` lands within 1e-12 of an f32
+    /// midpoint. Sixteen Taylor terms of exp, accumulated in two f64s, are far
+    /// tighter than an f32 ulp on the reduced argument.
+    #[derive(Clone, Copy)]
+    struct Dd { hi: f64, lo: f64 }
+
+    impl Dd {
+        fn from(x: f64) -> Self { Self { hi: x, lo: 0.0 } }
+        fn add(self, b: Self) -> Self { add(self, b) }
+        fn sub(self, b: Self) -> Self { add(self, Self { hi: -b.hi, lo: -b.lo }) }
+        fn mul(self, b: Self) -> Self { mul(self, b) }
+        fn div(self, b: Self) -> Self { mul(self, recip(b)) }
+    }
+
+    fn two_sum(a: f64, b: f64) -> Dd {
+        let s = a + b;
+        let bb = s - a;
+        Dd { hi: s, lo: (a - (s - bb)) + (b - bb) }
+    }
+    fn add(a: Dd, b: Dd) -> Dd {
+        let s = two_sum(a.hi, b.hi);
+        let t = two_sum(s.lo, a.lo + b.lo);
+        two_sum(s.hi, t.hi + t.lo)
+    }
+    fn split(a: f64) -> (f64, f64) {
+        let c = (2f64.powi(27) + 1.0) * a;
+        let hi = c - (c - a);
+        (hi, a - hi)
+    }
+    fn two_prod(a: f64, b: f64) -> Dd {
+        let p = a * b;
+        let (a1, a2) = split(a);
+        let (b1, b2) = split(b);
+        Dd { hi: p, lo: a2 * b2 - (((p - a1 * b1) - a2 * b1) - a1 * b2) }
+    }
+    fn mul(a: Dd, b: Dd) -> Dd {
+        let p = two_prod(a.hi, b.hi);
+        two_sum(p.hi, p.lo + a.hi * b.lo + a.lo * b.hi)
+    }
+    fn recip(a: Dd) -> Dd {
+        let r = 1.0 / a.hi;
+        let e = mul(a, Dd::from(r));
+        let c = Dd::from(1.0).sub(e);
+        add(Dd::from(r), mul(Dd::from(r), c))
+    }
+    fn exp_dd(x: f64) -> Dd {
+        // Cody–Waite reduction. The two-part ln2 keeps the reduced argument's
+        // error well under an f64 ulp before the series starts.
+        const LN2_HI: f64 = 6.931471803691238e-1;
+        const LN2_LO: f64 = 1.9082149292705877e-10;
+        let n = (x / std::f64::consts::LN_2).round();
+        let r = (x - n * LN2_HI) - n * LN2_LO;
+        let mut term = Dd::from(1.0);
+        let mut sum = Dd::from(1.0);
+        let rd = Dd::from(r);
+        for k in 1..=20 {
+            term = term.mul(rd).div(Dd::from(k as f64));
+            sum = sum.add(term);
+        }
+        let scale = 2f64.powi(n as i32);
+        mul(sum, Dd::from(scale))
+    }
+    fn tanh_hp(x: f64) -> f64 {
+        if x.abs() >= 20.0 { return x.signum(); }
+        if x.abs() < 1.0 {
+            let e = exp_dd(2.0 * x).sub(Dd::from(1.0));
+            return e.div(e.add(Dd::from(2.0))).hi;
+        }
+        let e = exp_dd(2.0 * x);
+        e.sub(Dd::from(1.0)).div(e.add(Dd::from(1.0))).hi
+    }
+
+    /// Correctly rounded f32 tanh. `f64::tanh` cast to f32 is that value except
+    /// within a few f64 ulps of an f32 midpoint; those inputs are recomputed
+    /// with [`tanh_hp`].
+    /// `(correctly rounded tanh, f64 result was within 1e-12 of an f32 midpoint)`.
+    /// The magnitude is rounded, then the sign bit is copied. tanh is odd, and
+    /// an f32 midpoint stays a midpoint under negation.
+    fn cr_tanh(x: f32) -> (f32, bool) {
+        if x == 0.0 { return (x, false); }
+        if x.is_nan() { return (x, false); }
+        if !x.is_finite() { return (x.signum(), false); }
+        let y64 = f64::from(x.abs()).tanh();
+        let y32 = y64 as f32;
+        let back = f64::from(y32);
+        let toward = if y64 >= back { y32.to_bits() + 1 } else { y32.to_bits() - 1 };
+        let mid = (back + f64::from(f32::from_bits(toward))) * 0.5;
+        let ambiguous = (y64 - mid).abs() < 1e-12;
+        let mag = if ambiguous { tanh_hp(f64::from(x.abs())) as f32 } else { y32 };
+        (f32::from_bits(mag.to_bits() | (x.to_bits() & 0x8000_0000)), ambiguous)
+    }
+
+    /// Dense sweep that stays in the normal suite. The exhaustive lock is
+    /// [`det_tanh_every_finite_f32`], which CI runs in release.
     #[test]
     fn det_tanh_stays_within_its_ulp_bound() {
         let mut max_ulps = 0u32;
         let mut worst = 0.0f32;
         let mut check = |x: f32| {
             let got = det_tanh(x);
-            let reference = (f64::from(x).tanh()) as f32;
+            let reference = cr_tanh(x).0;
             let d = ulp_distance(got, reference);
             if d > max_ulps {
                 max_ulps = d;
@@ -2034,6 +2211,7 @@ mod det_tanh_tests {
         check(f32::INFINITY);
         check(f32::NEG_INFINITY);
         check(f32::NAN);
+        check(f32::from_bits(0x7fc0_0123));
         for exp in -12i32..=4 {
             let base = f32::from_bits(((exp + 127) as u32) << 23);
             let next = f32::from_bits(((exp + 128) as u32) << 23);
@@ -2046,8 +2224,7 @@ mod det_tanh_tests {
                 bits += step.max(1);
             }
         }
-        // Every f32 in the bins where the coarse sweep was closest to the bound.
-        for (start, end) in [(0.2f32, 0.3f32), (1.0, 2.0), (8.0, 9.0)] {
+        for (start, end) in [(0.2f32, 0.3f32), (1.0, 2.0), (8.0, 9.02f32)] {
             let mut bits = start.to_bits();
             let stop = end.to_bits();
             while bits < stop {
@@ -2056,9 +2233,126 @@ mod det_tanh_tests {
                 bits += 1;
             }
         }
+        // Subnormals, one per 64 encodings, both signs.
+        let mut bits = 1u32;
+        while bits < 0x0080_0000 {
+            check(f32::from_bits(bits));
+            check(-f32::from_bits(bits));
+            bits += 64;
+        }
         assert!(
-            max_ulps <= 4,
-            "det_tanh ulp error {max_ulps} at {worst} exceeds the documented bound of 4"
+            max_ulps <= 1,
+            "det_tanh ulp error {max_ulps} at {worst} (bits {:#x}) exceeds 1",
+            worst.to_bits()
         );
+        assert_eq!(crate::det_tanh_table::N, 147_635);
+        assert_eq!(crate::det_tanh_table::SAT_BITS, 1_091_579_060);
+        assert!(super::GELU_TANH_WGSL.contains("147635u") && super::GELU_TANH_WGSL.contains("1091579060u"));
+        assert!(super::TANH_WGSL.contains("147635u") && super::TANH_WGSL.contains("1091579060u"));
+    }
+
+    /// Every finite f32. tanh is odd, so the reference is computed on x >= 0
+    /// and the negative side is the sign-bit flip, which is checked against
+    /// `det_tanh` itself rather than assumed. ±0, ±inf and a payload NaN are
+    /// included. Release-only: about a billion f64 tanh calls.
+    #[test]
+    #[ignore]
+    fn det_tanh_every_finite_f32() {
+        // The higher-precision path has to agree with f64 tanh well inside an
+        // f32 ulp, or a midpoint decision is meaningless.
+        for i in 0..1000 {
+            let x = -8.0 + i as f64 * 0.016;
+            let d = (tanh_hp(x) - x.tanh()).abs();
+            assert!(d < 1e-14, "tanh_hp({x}) disagrees with f64 tanh by {d}");
+        }
+        let sat = f32::from_bits(crate::det_tanh_table::SAT_BITS);
+        assert_eq!(cr_tanh(sat).0, 1.0);
+        assert_eq!(cr_tanh(-sat).0, -1.0);
+        // |x - tanh(x)| < x^3/3. In the bin [2^e, 2^{e+1}) the ulp is 2^{e-23}
+        // and x < 2^{e+1}, so x^3/3 < 2^{3e+3}/3. That is strictly less than
+        // half an ulp when 2^{2e+27} < 3, i.e. e <= -13. So every finite x in
+        // [0, 2^{-12}) rounds to itself, with room to spare (no tie). The bin
+        // [2^{-13}, 2^{-12}) is the tightest of those and is checked directly.
+        const IDENT: u32 = 0x3980_0000; // 2^-12
+        let mut b = 0x3900_0000u32; // 2^-13
+        while b < IDENT {
+            let x = f32::from_bits(b);
+            assert_eq!(cr_tanh(x).0.to_bits(), x.to_bits(), "identity failed at {x}");
+            b += 1;
+        }
+        let mut max_ulps = 0u32;
+        let mut argmax = 0.0f32;
+        let mut non_cr = 0u64;
+        let mut ident_non_cr = 0u64;
+        let mut sat_non_cr = 0u64;
+        let mut ambiguous = 0u64;
+        let mut checked = 2u64;
+        // +0 and -0.
+        assert_eq!(det_tanh(0.0).to_bits(), 0);
+        assert_eq!(det_tanh(-0.0).to_bits(), 0x8000_0000);
+        assert_eq!(det_tanh(f32::INFINITY).to_bits(), 1.0f32.to_bits());
+        assert_eq!(det_tanh(f32::NEG_INFINITY).to_bits(), (-1.0f32).to_bits());
+        let nan = f32::from_bits(0x7fc0_0123);
+        assert!(det_tanh(nan).is_nan());
+        assert_eq!(det_tanh(nan).to_bits(), nan.to_bits());
+        let mut bits = 1u32;
+        let last = 0x7f7f_ffffu32;
+        while bits <= last {
+            let x = f32::from_bits(bits);
+            let got = det_tanh(x);
+            // Below 2^-12 the correctly rounded value is x itself (see the
+            // bound above). At and above `sat` it is 1. Only the middle calls
+            // f64 tanh, and only a midpoint within 1e-12 of the f64 result
+            // goes through the higher-precision series.
+            let (reference, amb) = if bits < 0x3980_0000 {
+                (x, false)
+            } else if x >= sat {
+                (1.0f32, false)
+            } else {
+                cr_tanh(x)
+            };
+            if amb { ambiguous += 1; }
+            let d = ulp_distance(got, reference);
+            checked += 1;
+            if d > 0 {
+                non_cr += 1;
+                if bits < 0x3980_0000 { ident_non_cr += 1; }
+                if x >= sat { sat_non_cr += 1; }
+            }
+            if d > max_ulps || (d == max_ulps && d > 0 && x.to_bits() < argmax.to_bits()) {
+                max_ulps = d;
+                argmax = x;
+            }
+            let neg_x = f32::from_bits(bits | 0x8000_0000);
+            let neg = det_tanh(neg_x);
+            assert_eq!(
+                neg.to_bits(),
+                got.to_bits() ^ 0x8000_0000,
+                "sign symmetry failed at {x} (bits {bits:#x})"
+            );
+            let neg_ref = f32::from_bits(reference.to_bits() ^ 0x8000_0000);
+            let dn = ulp_distance(neg, neg_ref);
+            checked += 1;
+            if dn > 0 { non_cr += 1; }
+            if bits & 0x03ff_ffff == 0 {
+                eprintln!("det_tanh sweep bits {bits:#x} max {max_ulps} non_cr {non_cr}");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+            if max_ulps > 1 {
+                panic!("det_tanh ulp error {max_ulps} at {argmax} (bits {:#x})", argmax.to_bits());
+            }
+            bits += 1;
+        }
+        eprintln!(
+            "det_tanh exhaustive: max_ulps {max_ulps} argmax {argmax} argmax_bits {:#x} non_cr {non_cr} ident_non_cr {ident_non_cr} sat_non_cr {sat_non_cr} ambiguous {ambiguous} checked {checked}",
+            argmax.to_bits()
+        );
+        assert_eq!(max_ulps, 1, "max ulp {max_ulps} at {argmax}");
+        assert_eq!(argmax.to_bits(), 0x39b8_9ba3, "argmax moved from 0.00035211173");
+        assert_eq!(non_cr, 56_557_800, "non-correctly-rounded count moved");
+        assert_eq!(ambiguous, 1_066_850, "midpoint count moved");
+        assert_eq!(checked, 4_278_190_080u64, "finite f32 coverage");
+        assert_eq!(ident_non_cr, 0, "the proved |x| < 2^-12 range must be correctly rounded");
+        assert_eq!(sat_non_cr, 0, "the proved saturation range must be correctly rounded");
     }
 }

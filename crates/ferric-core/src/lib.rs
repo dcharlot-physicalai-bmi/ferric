@@ -10,6 +10,7 @@
 
 pub type Result<T> = std::result::Result<T, String>;
 
+mod det_tanh_table;
 mod kernels;
 pub use kernels::cpu; // CPU references for validation
 pub use kernels::{layernorm_tree_cpu, rmsnorm_sg_cpu, rmsnorm_tree_cpu, softmax_tree_cpu};

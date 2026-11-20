@@ -1,11 +1,11 @@
 {
-  "lerobot_repository": "huggingface/lerobot",
-  "lerobot_commit": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
   "dtype": "f32",
   "weight_cast": "bf16 expanded to f32, f32 tensors left as f32",
   "input_class": "synthetic_protocol",
   "executable": false,
   "token_ids_match_tokenizer_json": true,
+  "lerobot_repository": "huggingface/lerobot",
+  "lerobot_commit": "a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a",
   "prepared_image0": {
     "max_abs": 2.384185791015625e-07,
     "rmse": 6.102035854382848e-08,
@@ -18,17 +18,17 @@
   },
   "vision_l0_token0": {
     "max_abs": 3.814697265625e-06,
-    "rmse": 4.6999670644254365e-07,
+    "rmse": 4.7585885454282106e-07,
     "n": 768
   },
   "vision_post_token0": {
-    "max_abs": 1.5735626220703125e-05,
-    "rmse": 3.841048510366818e-06,
+    "max_abs": 1.52587890625e-05,
+    "rmse": 3.759145556614385e-06,
     "n": 768
   },
   "connector_token0": {
-    "max_abs": 6.866455078125e-05,
-    "rmse": 1.2788995263690595e-05,
+    "max_abs": 0.0001068115234375,
+    "rmse": 1.229882036568597e-05,
     "n": 960
   },
   "state_token": {
@@ -37,18 +37,88 @@
     "n": 960
   },
   "text_l0_k_token0": {
-    "max_abs": 4.291534423828125e-06,
-    "rmse": 9.6998098797485e-07,
+    "max_abs": 6.198883056640625e-06,
+    "rmse": 1.2004803693344002e-06,
     "n": 320
   },
   "velocity0": {
-    "max_abs": 2.86102294921875e-06,
-    "rmse": 8.624640486232238e-07,
+    "max_abs": 3.337860107421875e-06,
+    "rmse": 9.350979439659568e-07,
     "n": 32
   },
   "raw_actions": {
-    "max_abs": 3.6954879760742188e-06,
-    "rmse": 3.9042464550220757e-07,
+    "max_abs": 3.2782554626464844e-06,
+    "rmse": 3.619176993652218e-07,
     "n": 1600
+  },
+  "method_change": {
+    "change": "libm tanh replaced by det_tanh (1 ulp linear table). Stage numbers below are the new measurement. The libm numbers are kept here.",
+    "rustc_vv": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0\nLLVM version: 23.1.5",
+    "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+    "cargo_lock_sha256": "dcddf8451a3dd8f3bc2afc6f48669e97184cd358ca131aaf229902dfb4fa50da",
+    "cargo_locked": true,
+    "command": "cargo build --locked --release -p ferric-smolvla && ferric-smolvla network-forward && scripts/smolvla_f32_reference.py",
+    "platform_of_this_measurement": "Ubuntu 24.04, glibc 2.39, torch 2.15.0+cpu",
+    "bound_raw_actions": 0.0001947678066714822,
+    "stop_rule": "stop if any stage max_abs exceeds 2x its glibc 2.39 value or the raw_actions bound. Not tripped.",
+    "libm": {
+      "ubuntu_24.04_glibc_2.39": {
+        "prepared_image0": {
+          "max_abs": 2.384185791015625e-07,
+          "rmse": 6.102035854382848e-08,
+          "n": 786432
+        },
+        "patch_token0": {
+          "max_abs": 7.152557373046875e-07,
+          "rmse": 7.016252112634902e-08,
+          "n": 768
+        },
+        "vision_l0_token0": {
+          "max_abs": 3.814697265625e-06,
+          "rmse": 4.6999670644254365e-07,
+          "n": 768
+        },
+        "vision_post_token0": {
+          "max_abs": 1.5735626220703125e-05,
+          "rmse": 3.841048510366818e-06,
+          "n": 768
+        },
+        "connector_token0": {
+          "max_abs": 6.866455078125e-05,
+          "rmse": 1.2788995263690595e-05,
+          "n": 960
+        },
+        "state_token": {
+          "max_abs": 0.0,
+          "rmse": 0.0,
+          "n": 960
+        },
+        "text_l0_k_token0": {
+          "max_abs": 4.291534423828125e-06,
+          "rmse": 9.6998098797485e-07,
+          "n": 320
+        },
+        "velocity0": {
+          "max_abs": 2.86102294921875e-06,
+          "rmse": 8.624640486232238e-07,
+          "n": 32
+        },
+        "raw_actions": {
+          "max_abs": 3.6954879760742188e-06,
+          "rmse": 3.9042464550220757e-07,
+          "n": 1600
+        }
+      },
+      "ubuntu_26.04_and_apple": "No separate stage table was recorded. The only measured libm disagreement on those platforms was elementwise.index_off_by_one_row.rmse in the fault catalogue: 0.23910627516696203 on both Ubuntu 26.04.1 (run 43458775739) and Apple libm (Metal run 43435730656), against 0.23910626993893822 on glibc 2.39."
+    },
+    "det_tanh_4ulp_max_abs_glibc_2.39": {
+      "vision_l0_token0": 3.5762786865234375e-06,
+      "vision_post_token0": 1.0967254638671875e-05,
+      "connector_token0": 8.392333984375e-05,
+      "text_l0_k_token0": 5.9604644775390625e-06,
+      "velocity0": 4.291534423828125e-06,
+      "raw_actions": 2.4437904357910156e-06
+    },
+    "note_4ulp": "Intermediate measurement of the 4 ulp det_tanh on this machine before the 1 ulp table. Not a libm value. Stages omitted from that column were unchanged from glibc 2.39."
   }
 }
