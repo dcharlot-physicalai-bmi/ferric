@@ -59,7 +59,7 @@ jobs:
           vulkaninfo --summary || true
 
       - name: Build workspace
-        run: cargo build --workspace --verbose
+        run: cargo --locked build --workspace --verbose
 
       # ⛔ RUN BEFORE THE SUITE, BECAUSE A GREEN SUITE IS NOT EVIDENCE IF A TEST CANNOT FAIL.
       # ferric-tokenizer shipped `marks_join_the_letter_run_under_qwen35_and_not_under_qwen2` with no
@@ -84,7 +84,7 @@ jobs:
       # 1 (run 43456824764, gdb, --test-threads=1); the parallel workspace step then died
       # with signal 11. Every assertion still runs. Metal keeps the parallel suite.
       - name: Test workspace
-        run: cargo test --workspace --verbose -- --test-threads=1
+        run: cargo --locked test --workspace --verbose -- --test-threads=1
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
@@ -100,7 +100,7 @@ jobs:
         # two crates below, and prefer adding new crates ahead of them.
         run: |
           for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer ferric-llama ferric-web; do
-            echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
+            echo "::group::$c"; cargo --locked build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
           done
 
       # Every example validates its GPU result against a reference (CPU / onnxruntime / numpy).
@@ -108,75 +108,75 @@ jobs:
       - name: Validate — core (transformer, LM, KV-cache generation)
         run: |
           for ex in transformer_block decoder_layer tiny_llm generate; do
-            echo "::group::$ex"; cargo run -p ferric-core --example $ex; echo "::endgroup::"
+            echo "::group::$ex"; cargo --locked run -p ferric-core --example $ex; echo "::endgroup::"
           done
 
       - name: Validate — ONNX importer vs onnxruntime references
         run: |
           for ex in run_mlp run_attn run_block run_struct run_swiglu; do
-            echo "::group::$ex"; cargo run -p ferric-onnx --example $ex; echo "::endgroup::"
+            echo "::group::$ex"; cargo --locked run -p ferric-onnx --example $ex; echo "::endgroup::"
           done
 
       - name: Validate — safetensors loader + Llama bridge
         run: |
-          cargo run -p ferric-load --example load_safetensors
-          cargo run -p ferric-llama --example run_llama
-          cargo run -p ferric-llama --example run_llama_unified
-          cargo run -p ferric-llama --example run_llama_quant
+          cargo --locked run -p ferric-load --example load_safetensors
+          cargo --locked run -p ferric-llama --example run_llama
+          cargo --locked run -p ferric-llama --example run_llama_unified
+          cargo --locked run -p ferric-llama --example run_llama_quant
           # hyv4's whole graph on a synthetic checkpoint: hyper-connections, the DSA indexer and its
           # sharing schedule, clamped-SwiGLU MoE, and CACHED DECODE against a full re-run. Run on
           # BOTH fabrics for the reason the Metal job already states about chunked_attn — a
           # mask-offset bug that appears on one backend and not the other is exactly what a
           # single-backend CI cannot see, and decode is a mask-offset feature.
-          cargo run -p ferric-llama --example hyv4_synthetic
+          cargo --locked run -p ferric-llama --example hyv4_synthetic
 
       - name: Validate — general tensor runtime + autograd training
         run: |
-          cargo run -p ferric-tensor --example general
-          cargo run -p ferric-tensor --example train
-          cargo run -p ferric-tensor --example dtypes
-          cargo run -p ferric-tensor --example transformer
-          cargo run -p ferric-tensor --example classify
-          cargo run -p ferric-tensor --example train_transformer
-          cargo run -p ferric-tensor --example bench
-          cargo run -p ferric-tensor --example autotune
-          cargo run -p ferric-tensor --example coverage
-          cargo run -p ferric-tensor --example ebm
-          cargo run -p ferric-tensor --example jepa
-          cargo run -p ferric-tensor --example slice
-          cargo run -p ferric-tensor --example cat
-          cargo run -p ferric-tensor --example flash
-          cargo run -p ferric-tensor --example chunked_attn
-          cargo run -p ferric-tensor --example gdn_state
-          cargo run -p ferric-tensor --example fattn
-          cargo run -p ferric-tensor --example overhead
-          cargo run -p ferric-tensor --example bandwidth
-          cargo run -p ferric-tensor --example subgroup_spike
-          cargo run -p ferric-tensor --example coop_spike
-          cargo run -p ferric-tensor --example coop_gemm
-          cargo run -p ferric-tensor --example coop_matmul_route
-          cargo run -p ferric-tensor --example coop_q2_0
-          cargo run -p ferric-tensor --example coop_q4_k
-          cargo run -p ferric-tensor --example coop_q6_k
-          cargo run -p ferric-tensor --example coop_q5_k
-          cargo run -p ferric-tensor --example coop_q8_0
-          cargo run -p ferric-tensor --example bench_fuse_mm
-          cargo run -p ferric-tensor --example bench_gdn
-          cargo run -p ferric-tensor --example batch
-          FERRIC_Q2_0_KERNEL=trans cargo run -p ferric-tensor --example q2_0
-          cargo run -p ferric-tensor --example q2_0
-          cargo run -p ferric-tensor --example q4_0
-          cargo run -p ferric-tensor --example q4_k
-          cargo run -p ferric-tensor --example q5_k
-          cargo run -p ferric-tensor --example q6_k
-          cargo run -p ferric-tensor --example q8_0
-          FERRIC_Q2_0_KERNEL=flat cargo run -p ferric-tensor --example q2_0
-          FERRIC_Q2_0_KERNEL=splitk cargo run -p ferric-tensor --example q2_0
-          cargo run -p ferric-tensor --example fusion
-          cargo run -p ferric-gguf --example roundtrip
-          cargo run -p ferric-tokenizer --example roundtrip
-          cargo run -p ferric-tensor --example devices
-          cargo run -p ferric-tensor --example fabric
+          cargo --locked run -p ferric-tensor --example general
+          cargo --locked run -p ferric-tensor --example train
+          cargo --locked run -p ferric-tensor --example dtypes
+          cargo --locked run -p ferric-tensor --example transformer
+          cargo --locked run -p ferric-tensor --example classify
+          cargo --locked run -p ferric-tensor --example train_transformer
+          cargo --locked run -p ferric-tensor --example bench
+          cargo --locked run -p ferric-tensor --example autotune
+          cargo --locked run -p ferric-tensor --example coverage
+          cargo --locked run -p ferric-tensor --example ebm
+          cargo --locked run -p ferric-tensor --example jepa
+          cargo --locked run -p ferric-tensor --example slice
+          cargo --locked run -p ferric-tensor --example cat
+          cargo --locked run -p ferric-tensor --example flash
+          cargo --locked run -p ferric-tensor --example chunked_attn
+          cargo --locked run -p ferric-tensor --example gdn_state
+          cargo --locked run -p ferric-tensor --example fattn
+          cargo --locked run -p ferric-tensor --example overhead
+          cargo --locked run -p ferric-tensor --example bandwidth
+          cargo --locked run -p ferric-tensor --example subgroup_spike
+          cargo --locked run -p ferric-tensor --example coop_spike
+          cargo --locked run -p ferric-tensor --example coop_gemm
+          cargo --locked run -p ferric-tensor --example coop_matmul_route
+          cargo --locked run -p ferric-tensor --example coop_q2_0
+          cargo --locked run -p ferric-tensor --example coop_q4_k
+          cargo --locked run -p ferric-tensor --example coop_q6_k
+          cargo --locked run -p ferric-tensor --example coop_q5_k
+          cargo --locked run -p ferric-tensor --example coop_q8_0
+          cargo --locked run -p ferric-tensor --example bench_fuse_mm
+          cargo --locked run -p ferric-tensor --example bench_gdn
+          cargo --locked run -p ferric-tensor --example batch
+          FERRIC_Q2_0_KERNEL=trans cargo --locked run -p ferric-tensor --example q2_0
+          cargo --locked run -p ferric-tensor --example q2_0
+          cargo --locked run -p ferric-tensor --example q4_0
+          cargo --locked run -p ferric-tensor --example q4_k
+          cargo --locked run -p ferric-tensor --example q5_k
+          cargo --locked run -p ferric-tensor --example q6_k
+          cargo --locked run -p ferric-tensor --example q8_0
+          FERRIC_Q2_0_KERNEL=flat cargo --locked run -p ferric-tensor --example q2_0
+          FERRIC_Q2_0_KERNEL=splitk cargo --locked run -p ferric-tensor --example q2_0
+          cargo --locked run -p ferric-tensor --example fusion
+          cargo --locked run -p ferric-gguf --example roundtrip
+          cargo --locked run -p ferric-tokenizer --example roundtrip
+          cargo --locked run -p ferric-tensor --example devices
+          cargo --locked run -p ferric-tensor --example fabric
 
   macos-metal:
     timeout-minutes: 45
@@ -192,10 +192,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build workspace
-        run: cargo build --workspace --verbose
+        run: cargo --locked build --workspace --verbose
 
       - name: Test workspace
-        run: cargo test --workspace --verbose
+        run: cargo --locked test --workspace --verbose
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
@@ -211,7 +211,7 @@ jobs:
         # two crates below, and prefer adding new crates ahead of them.
         run: |
           for c in ferric-core ferric-kv ferric-tier ferric-certify ferric-dist ferric-gguf ferric-tokenizer ferric-llama ferric-web; do
-            echo "::group::$c"; cargo build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
+            echo "::group::$c"; cargo --locked build -p $c --target wasm32-unknown-unknown; echo "::endgroup::"
           done
 
       # Ferric's differentiating claim is bit-reproducible output ACROSS FABRICS. The Linux job runs on
@@ -221,22 +221,22 @@ jobs:
       - name: Validate — kernels on real Metal
         run: |
           for ex in transformer_block decoder_layer tiny_llm generate; do
-            echo "::group::$ex"; cargo run -p ferric-core --example $ex; echo "::endgroup::"
+            echo "::group::$ex"; cargo --locked run -p ferric-core --example $ex; echo "::endgroup::"
           done
-          cargo run -p ferric-tensor --example devices
-          cargo run -p ferric-tensor --example fabric
-          cargo run -p ferric-tensor --example dtypes
-          cargo run -p ferric-tensor --example general
+          cargo --locked run -p ferric-tensor --example devices
+          cargo --locked run -p ferric-tensor --example fabric
+          cargo --locked run -p ferric-tensor --example dtypes
+          cargo --locked run -p ferric-tensor --example general
           # New kernel path (chunked prefill). Runs on BOTH jobs deliberately: lavapipe above and real
           # Metal here, because a mask-offset bug that only appears on one fabric is exactly the kind
           # of thing a single-backend CI cannot see.
-          cargo run -p ferric-tensor --example chunked_attn
-          cargo run -p ferric-llama --example hyv4_synthetic
+          cargo --locked run -p ferric-tensor --example chunked_attn
+          cargo --locked run -p ferric-llama --example hyv4_synthetic
 
       # Certificates and the tier policy are pure arithmetic and must agree everywhere. If a result here
       # differs from the Linux job, something is platform-dependent that must not be.
       - name: Validate — certificate re-verification (must match Linux exactly)
-        run: cargo run -p ferric-tensor --example ebm_cert_verify
+        run: cargo --locked run -p ferric-tensor --example ebm_cert_verify
 
   proofs:
     timeout-minutes: 30
