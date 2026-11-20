@@ -549,10 +549,7 @@ fn vision_layer(store: &Store, layer: usize, hidden: &[f32]) -> Result<Vec<f32>,
 }
 
 pub(crate) fn gelu_tanh(x: &[f32]) -> Vec<f32> {
-    let c = (2.0f32 / std::f32::consts::PI).sqrt();
-    x.iter()
-        .map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh()))
-        .collect()
+    ferric_core::cpu::gelu_tanh(x)
 }
 
 fn embed_tokens(store: &Store, ids: &[u32]) -> Result<Vec<f32>, String> {
