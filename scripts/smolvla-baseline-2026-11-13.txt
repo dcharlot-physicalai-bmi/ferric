@@ -4,7 +4,7 @@
 # Frozen, unchanged:
 #   PyTorch 2.15.0+cpu, as recorded in
 #   docs/fleet/smolvla-wgpu-radv-gfx1151-energy.json
-#   LeRobot a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a
+#   LeRobot a0eb860d (v0.6.1 lineage): a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a
 #   LeRobot v0.7.0 = 410c095eacc0011d998a73383eb94abed2715af0
 #   lerobot/smolvla_base rev 5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6
 #   model.safetensors sha256 7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb

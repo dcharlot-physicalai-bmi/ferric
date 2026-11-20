@@ -88,7 +88,7 @@
       "evidence": "bitwise_identical_prepared_images"
     }
   },
-  "later_stages": "The only prepare_images change in v0.7.0 is the uint8 cast. These f32 tensors are bitwise identical, and one remeasured f32 forward matches the a0eb860d receipt stage errors exactly. Later-stage deltas are 0 for that reason. The full graph was not executed twice.",
+  "later_stages": "The only prepare_images change in v0.7.0 is the uint8 cast. These f32 tensors are bitwise identical, and one remeasured f32 forward matches the a0eb860d (v0.6.1 lineage) receipt stage errors exactly. Later-stage deltas are 0 for that reason. The full graph was not executed twice.",
   "uint8_not_the_pinned_input": {
     "camera": 0,
     "construction": "round the pinned camera-0 f32 pixels to uint8, then run both prepare_images paths",

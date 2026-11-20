@@ -8,7 +8,7 @@ Primary sources, checked 2026-11-09:
 
 `lerobot/smolvla_base` Hub HEAD on this date is still `5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6` (card `lastModified` 2026-10-06). v0.7.0 does not pin a weight revision; `from_pretrained("lerobot/smolvla_base")` follows that Hub HEAD. The local `model.safetensors` measures `906712520` bytes and sha256 `7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb`, which matches the expected pin.
 
-The pinned inputs are f32 pixels in `[0, 1]`. On those tensors the uint8 branch is not taken. All three prepared images are bitwise identical between the a0eb860d path and the v0.7.0 path (`max_abs` 0, `rmse` 0, `n` 786432). One remeasured f32 forward matches `smolvla-f32-reference.json` on every stage. Later-stage deltas are 0 because that input is bitwise identical. The graph was not run twice.
+The pinned inputs are f32 pixels in `[0, 1]`. On those tensors the uint8 branch is not taken. All three prepared images are bitwise identical between the a0eb860d (v0.6.1 lineage) path and the v0.7.0 path (`max_abs` 0, `rmse` 0, `n` 786432). One remeasured f32 forward matches `smolvla-f32-reference.json` on every stage. Later-stage deltas are 0 because that input is bitwise identical. The graph was not run twice.
 
 A uint8 view of camera 0, which is not the pinned protocol, is a different measured result: `max_abs` 506.5058898925781, `rmse` 287.66815185546875. The old path leaves the 0..255 values in the resize and the following `* 2 - 1` reaches 507.5. The v0.7.0 path stays in `[-1, 0.9941176176071167]`.
 
