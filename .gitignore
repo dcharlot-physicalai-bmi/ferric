@@ -4,7 +4,6 @@ pkg/
 node_modules/
 *.log
 .DS_Store
-Cargo.lock
 
 # Vendored dependency tree — reconstructible with `cargo vendor` (see README "Offline builds").
 # Kept out of git to keep the repo lean; forks/ + [patch.crates-io] are committed.

@@ -32,7 +32,7 @@ fail=0
 for c in ferric-gguf ferric-llama; do
     if ! grep -rq "kani::proof" "crates/$c/src" 2>/dev/null; then continue; fi
     echo "=== $c ==="
-    out=$(timeout "$LIMIT" cargo kani -p "$c" "${FLAGS[@]}" 2>&1); rc=$?
+    out=$(timeout "$LIMIT" cargo --locked kani -p "$c" "${FLAGS[@]}" 2>&1); rc=$?
     echo "$out" | grep -E "Checking harness|VERIFICATION|Complete -"
     # The verdict is read off the summary line, NOT off cargo-kani's exit code and NOT off whether
     # grep found anything. The first version of this gate piped through grep, which matched the
