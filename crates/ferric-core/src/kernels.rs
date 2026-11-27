@@ -2435,7 +2435,7 @@ mod gelu_half_tests {
 #[cfg(test)]
 mod det_tanh_table_provenance {
     /// sha256 of `det_tanh_table.bin`. scripts/fit_det_tanh.py writes this file.
-    /// `det_tanh_table_matches_the_generator` rebuilds the same bytes from f64 tanh.
+    /// The generator is numpy 1.26.4's FMA tanh on Python 3.12.3, not Rust `f64::tanh`.
     const TABLE_SHA256: &str = "899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593";
 
     #[test]
@@ -2445,9 +2445,10 @@ mod det_tanh_table_provenance {
         assert_eq!(sha256_hex(bytes), TABLE_SHA256);
     }
 
-    /// `scripts/fit_det_tanh.py --check` rebuilds the table with numpy.tanh and
-    /// exits 1 unless the bytes match. Rust `f64::tanh` does not: it disagrees
-    /// at f32 rounding on 17977 of the stored words.
+    /// `scripts/fit_det_tanh.py --check` rebuilds the table with the numpy 1.26.4
+    /// FMA polynomial and exits 1 unless the bytes match. It also refuses a numpy
+    /// that dispatched libm tanh. Rust `f64::tanh` does not rebuild the file: it
+    /// disagrees at f32 rounding on 17977 of the stored words.
     #[test]
     fn det_tanh_table_matches_the_generator() {
         let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fit_det_tanh.py");

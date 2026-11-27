@@ -88,8 +88,14 @@ jobs:
       # Lavapipe's LLVM JIT SIGSEGVs when several tests in one process compile
       # shaders at once. One test at a time, the same ferric-llama binary passes.
       # Every assertion still runs. Metal keeps the parallel suite.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+
       - name: numpy for the det_tanh table generator
-        run: sudo apt-get update && sudo apt-get install -y python3-numpy
+        run: |
+          python3 -m pip install --disable-pip-version-check "numpy==1.26.4"
+          python3 -c 'import sys, numpy; assert sys.version_info[:3] == (3, 12, 3), sys.version; assert numpy.__version__ == "1.26.4", numpy.__version__; print(sys.version); print("numpy", numpy.__version__)'
 
       - name: Test workspace
         run: cargo --locked test --workspace --verbose -- --test-threads=1
@@ -212,8 +218,14 @@ jobs:
       - name: Build workspace
         run: cargo --locked build --workspace --verbose
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+
       - name: numpy for the det_tanh table generator
-        run: python3 -c 'import numpy' || python3 -m pip install --break-system-packages numpy
+        run: |
+          python3 -m pip install --disable-pip-version-check "numpy==1.26.4"
+          python3 -c 'import sys, numpy; assert sys.version_info[:3] == (3, 12, 3), sys.version; assert numpy.__version__ == "1.26.4", numpy.__version__; print(sys.version); print("numpy", numpy.__version__)'
 
       - name: Test workspace
         run: cargo --locked test --workspace --verbose

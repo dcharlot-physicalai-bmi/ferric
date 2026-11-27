@@ -13,6 +13,7 @@ mod faults;
 mod gemm;
 mod gpu;
 mod model;
+mod noise_math;
 mod tolerance;
 pub mod weights;
 
@@ -56,18 +57,42 @@ pub fn synthetic_image(cam: usize, h: usize, w: usize) -> Vec<f32> {
 }
 
 pub fn noise_from_seed(seed: u64) -> Vec<f32> {
+    // `seed | 1` makes an even seed and the next odd seed the same sequence.
+    // Version 3 refuses the even seed. This function still applies the mask so
+    // the odd seed, including 0x5a17, keeps the bytes already in the receipts.
     let mut state = seed | 1;
     let mut out = Vec::with_capacity(NOISE_LEN);
     while out.len() < NOISE_LEN {
         let u1 = next_unit(&mut state);
         let u2 = next_unit(&mut state);
-        let r = (-2.0 * u1.ln()).sqrt();
+        // u1 == 0 is possible (top 53 bits of the state clear). `ln(0)` is -∞,
+        // so r is +∞ and the f32 samples are ±∞ or NaN. It is not remapped.
+        let r = (-2.0 * noise_math::ln(u1)).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
-        out.push((r * theta.cos()) as f32);
+        out.push((r * noise_math::cos(theta)) as f32);
         if out.len() < NOISE_LEN {
-            out.push((r * theta.sin()) as f32);
+            out.push((r * noise_math::sin(theta)) as f32);
         }
     }
+    out
+}
+
+fn canonical_noise_bytes(seed: u64, payload: &[f32]) -> Vec<u8> {
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    let mut out = Vec::new();
+    put_str(&mut out, "f32");
+    out.extend_from_slice(&3u32.to_le_bytes());
+    for extent in [1u64, 50, 32] {
+        out.extend_from_slice(&extent.to_le_bytes());
+    }
+    put_str(&mut out, "le");
+    out.extend_from_slice(&f32_bytes(payload));
+    out.extend_from_slice(&seed.to_le_bytes());
+    put_str(&mut out, "xorshift64-box-muller-v1");
     out
 }
 
@@ -343,6 +368,22 @@ pub struct WgpuCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_0x5a17_noise_payload_is_the_receipt_hash() {
+        let noise = noise_from_seed(0x5a17);
+        assert_eq!(noise.len(), NOISE_LEN);
+        assert_eq!(
+            sha256_hex(&f32_bytes(&noise)),
+            "09adba264f855351fd2a0911ce66497cba8e54f9ca73d6b8d905c22918e0e4c2"
+        );
+        assert_eq!(noise_from_seed(2), noise_from_seed(3));
+        assert_ne!(noise_from_seed(1), noise_from_seed(2));
+        assert_eq!(
+            sha256_hex(&canonical_noise_bytes(0x5a17, &noise)),
+            "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c"
+        );
+    }
 
     #[test]
     fn state_proj_column_matches_the_extracted_weights() {
