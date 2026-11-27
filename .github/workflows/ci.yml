@@ -93,23 +93,7 @@ jobs:
       # which links an older glibc and runs on 26.04. The sha256 is the pin.
       - name: Python 3.12.3
         run: |
-          python3 - << 'PY'
-          import hashlib, os, tarfile, urllib.request
-          url = "https://github.com/actions/python-versions/releases/download/3.12.3-11057844995/python-3.12.3-linux-24.04-x64.tar.gz"
-          expected = "07ef2452a390e76505b5a26b37bae7f88bc260926ca70ae88cb679003ab42279"
-          path = "/tmp/python-3.12.3.tar.gz"
-          urllib.request.urlretrieve(url, path)
-          digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
-          if digest != expected:
-              raise SystemExit(f"python tarball sha256 {digest}")
-          dest = os.path.expanduser("~/python-3.12.3")
-          os.makedirs(dest, exist_ok=True)
-          with tarfile.open(path) as archive:
-              archive.extractall(dest, filter="data")
-          with open(os.environ["GITHUB_PATH"], "a") as pathfile:
-              pathfile.write(dest + "/bin\n")
-          print("extracted", dest)
-          PY
+          node scripts/ci_python_3123.js
           "$HOME/python-3.12.3/bin/python3" -c 'import sys; assert sys.version_info[:3] == (3, 12, 3), sys.version; print(sys.version)'
 
       - name: numpy for the det_tanh table generator
