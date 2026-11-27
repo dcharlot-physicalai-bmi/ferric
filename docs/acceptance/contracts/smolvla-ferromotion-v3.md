@@ -24,6 +24,10 @@ Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, n
 | 64 | weight sha256 |
 | 64 | stats sha256 |
 | string | stats key, one of `so100`, `so100-blue`, `so100-red` |
+| 64 | action mean sha256 |
+| 64 | action std sha256 |
+| 64 | state mean sha256 |
+| 64 | state std sha256 |
 | 64 | noise sha256 |
 | string | embodiment name |
 | u64 | `t0_num_ns` |
@@ -60,7 +64,7 @@ Both dataset cards record `fps` 30:
 - `lerobot/svla_so100_pickplace` `meta/info.json`, `robot_type` `so100`
 - `lerobot/svla_so101_pickplace` `meta/info.json`, `robot_type` `so100_follower`
 
-LeRobot `src/lerobot/robots/so_follower/so_follower.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a` builds the bus in this order. `use_degrees` defaults true (`SOFollowerConfig.use_degrees: bool = True`), so the five arm motors are `MotorNormMode.DEGREES`. The gripper is always `MotorNormMode.RANGE_0_100`.
+The bus order below is `src/lerobot/robots/so_follower/so_follower.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 50–59. `use_degrees` defaults true (`config_so_follower.py:42`), so that file's five arm motors are `MotorNormMode.DEGREES` and the gripper is `MotorNormMode.RANGE_0_100`. That is the contract's unit vocabulary. It is not the scale of the pinned dataset numbers. The dataset was not recorded by that revision: see Dataset meta.
 
 The version 3 unit tokens are `deg` and `percent_range`. `deg` is the contract spelling of `DEGREES`. `percent_range` is the contract spelling of `RANGE_0_100`. Any other unit string is refused. `deg` on the gripper, or `percent_range` on an arm joint, is refused.
 
@@ -79,9 +83,9 @@ The normative SO-100 names are the `svla_so100_pickplace` action names, in that 
 
 Embodiment token: `so100`. That is `robot_type` in the dataset info below, and it is the stats key `so100` (not `so100-blue` or `so100-red`).
 
-Frame token, every joint: `so100_joint`. `meta/info.json` has no frame field. The token names the `so_follower` joint-command space, not a Cartesian frame. Any other frame string on this embodiment is refused.
+Frame token, every joint: `so100_joint`. `meta/info.json` has no frame field. `so100_joint` is not an MJCF frame. The mapping from this token onto an MJCF joint (sign, offset, scale, clamp) lives in bmi-4's pinned receiver calibration map, not in this codec. Any other frame string on this embodiment is refused.
 
-Limits are a closed interval, `min < max`, value inside, as in version 2. The gripper limit is the `RANGE_0_100` interval, 0 to 100, not the dataset's observed maximum. The five arm limits are the dataset `action` min and max. Those are observed extrema in `meta/stats.json`, not a mechanical stop in `so_follower.py`.
+Limits are a closed interval, `min < max`, value inside, as in version 2. The five arm limits are the dataset `action` min and max, labeled **observed, sole sourced bound in contract units**. They are not a mechanical stop and they are not the full encoder domain. Widening them to that domain stays deferred: the formula revision in Dataset meta explains the scale of the stored numbers, and the hub object was rewritten on 2026-07-16. That rewrite is not a recording commit, and these limits are not replaced here. The gripper limit is the closed interval 0 to 100.
 
 | Index | min | max |
 |---|---|---|
@@ -92,13 +96,21 @@ Limits are a closed interval, `min < max`, value inside, as in version 2. The gr
 | 4 `main_wrist_roll` | 56.25 | 123.57421875 |
 | 5 `main_gripper` | 0 | 100 |
 
-The dataset's observed gripper action max is 34.93077850341797. A command between that and 100 is still inside the mode interval and is accepted. A command outside 0–100 is refused.
+The dataset's observed gripper action max is 34.93077850341797. A command between that and 100 is still inside the contract interval and is accepted. A command outside 0–100 is refused.
+
+`percent_range` is linear in calibrated ticks. At `a0eb860d`, `motors_bus.py:871-873` computes `((tick - min) / (max - min)) * 100` and `drive_mode` replaces that with `100 - norm`. At the recording revision below, `feetech.py:478` computes `(present - start) / (end - start) * 100`, and `feetech_calibration.py:192` passes `invert_drive_mode=True` for the gripper, which chooses which end is `start`. Either way the reversal is calibration, not a constant in this codec. The map from `percent_range` onto an MJCF Jaw is calibration-dependent and is not in this codec.
 
 ## Dataset meta
 
 `lerobot/svla_so100_pickplace` `meta/info.json` is pinned at Hub revision `728583b5eaf9e739a7f119e2def466fa1d552402` (dataset `sha` on 2026-11-27). The file sha256 is `aec8d0c7bd3d2dc693c160bd58f9fb6aabcbb24d4b28e2f09950a3aa6b246eef`. It records `robot_type` `so100`, `fps` 30, and the six action names above. It does not state units.
 
-`meta/stats.json` at the same revision has sha256 `5f53e159022a2ecf14bb01dd0623fcc498bffa719a776f1ef1858c6098169b89`. The arm min and max in the table above are `action.min` and `action.max` from that file. The units in the joint table are derived, not read from the dataset: `src/lerobot/robots/so_follower/so_follower.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 50–59, with `use_degrees: bool = True` at `config_so_follower.py:42`.
+`meta/stats.json` at the same revision has sha256 `5f53e159022a2ecf14bb01dd0623fcc498bffa719a776f1ef1858c6098169b89`. The arm min and max in the table above are `action.min` and `action.max` from that file. The dataset does not state its units.
+
+`a0eb860d` does not reproduce them. `motors_bus.py:874-877` at that commit sets degrees to `(val - mid) * 360 / max_res` with `max_res = resolution - 1`. `src/lerobot/motors/feetech/tables.py:190` sets `sts3215` resolution to 4096, so the divisor is 4095. Every arm extremum in this `stats.json`, both `action` and `observation.state`, is an exact multiple of `360/4096` and not of `360/4095`. `56.25 = 640 * 360 / 4096`. The `observation.state` gripper minimum is `-0.20718231797218323`. `RANGE_0_100` at `motors_bus.py:871-873` maps a tick clamped into `[min, max]` onto `[0, 100]`, and `drive_mode` only swaps that to `100 - norm`. The unnormalize clamp at lines 900–902 is `min(100, max(0, val))`. A negative state is outside both. Those two checks are why this dataset was not recorded at `a0eb860d`.
+
+The scale that matches the stored numbers is commit `974028bd28` (2025-03-13), `lerobot/common/robot_devices/motors/feetech.py:460`: `values[i] / (resolution // 2) * HALF_TURN_DEGREE`, with `HALF_TURN_DEGREE = 180` at line 49 and `sts3215` resolution 4096 at line 127. That is `steps * 360 / 4096`. The hub dataset was created 2025-05-12, while that file was still the current Feetech calibration (the next change of that path is the 2025-06-05 hardware redesign, `e23b41e79a`). `info.json` `codebase_version` is the string `v3.0`. That is a dataset-container label, not a git revision. The hub object was last modified 2026-07-16. This contract pins `974028bd28` as the formula the numbers match. It does not claim the 2026-07-16 rewrite recomputed them.
+
+The gripper at `974028bd28` is `CalibrationMode.LINEAR` (`lerobot/common/robot_devices/robots/feetech_calibration.py:270-271`). The formula is `feetech.py:478`. Values are accepted down to `LOWER_BOUND_LINEAR = -10` (`feetech.py:46`) before that file raises. `-0.20718231797218323` is inside that margin and outside `a0eb860d`'s `[0, 100]` clamp.
 
 ## Stats key
 
@@ -127,32 +139,58 @@ Embodiment and dataset pick the key:
 
 `so100-blue` and `so100-red` are keys in the same safetensors file. They are not `svla_so100_pickplace`. A `so100` chunk that cites `so100-blue` is refused.
 
-The header carries each tensor sha256, not only the file sha256. For the action key that is the two rows above. For STATE, the model safetensors has no `observation.state` tensors. STATE mean and std come from `meta/stats.json` `observation.state` at the revision above, cast to little-endian f32 in joint order. Their sha256 values, of those 24 bytes, are:
+The header carries each tensor sha256 in the four 64-hex fields after the stats key and before the noise sha256, in this order: action mean, action std, state mean, state std. Action mean and action std must equal the two rows of the chunk's stats key in the table above. State mean and state std must equal the two rows below. A mismatch is refused. The model safetensors has no `observation.state` tensors. STATE mean and std come from `meta/stats.json` `observation.state` at the revision above, cast to little-endian f32 in joint order. Their sha256 values, of those 24 bytes, are:
 
 | Tensor | sha256 |
 |---|---|
 | `observation.state` mean | `c0087077ccbf5362ee8dab2ec5cae2ee915123b176ade6c0be1fad3feb7a7eca` |
 | `observation.state` std | `09d52284cad4193fdaf1fe35c89dab6aa2711514b3043296b7811c13cb8f13ef` |
 
-MEAN_STD is `src/lerobot/processor/normalize_processor.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 349–362, `eps` default `1e-8` (line 97), and the saved preprocessor and postprocessor configs both set `"eps": 1e-08`.
+MEAN_STD is `src/lerobot/processor/normalize_processor.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 349–362, `eps` default `1e-8` (line 97), and the saved preprocessor and postprocessor configs both set `"eps": 1e-08`. Lines 341–345 cast the stored stats onto the tensor's device and dtype before either formula runs.
 
 Forward, STATE into the network: `(x - mean) / (std + 1e-8)`.
 
-Inverse, ACTION out of the network: `y * std + mean`. The inverse does not add epsilon. A missing mean or std for a MEAN_STD feature is refused. It is not IDENTITY.
+Inverse, ACTION out of the network: `y * std + mean`, with `std` and `mean` already cast to the tensor dtype. The inverse does not add epsilon. A missing mean or std for a MEAN_STD feature is refused. It is not IDENTITY.
 
 ## Noise
 
-`noise_sha256` is SHA-256 of this byte string, and of nothing smaller:
+`noise_sha256` is SHA-256 of this byte string, and of nothing smaller. A missing hash is refused. The placeholders `"11" * 32` and `"22" * 32` are not values of this hash.
 
-1. UTF-8 `f32`.
+Items 1, 4, and 7 are strings under the version 3 string rule: a `u32` little-endian byte length, then the UTF-8 bytes, no trailing NUL.
+
+1. `u32` length `3`, then UTF-8 `f32`.
 2. `u32` little-endian rank `3`.
 3. Three `u64` little-endian extents: `1`, `50`, `32`. That is `x_T` shaped `(batch, chunk_size, max_action_dim)`.
-4. UTF-8 `le`.
+4. `u32` length `2`, then UTF-8 `le`.
 5. The `50 * 32` little-endian f32 payload, time-major then joint.
-6. The `u64` little-endian seed.
-7. UTF-8 `xorshift64-box-muller-v1`.
+6. The `u64` little-endian caller seed. This is the seed before `seed | 1`.
+7. `u32` length `24`, then UTF-8 `xorshift64-box-muller-v1`.
 
-The payload is `noise_from_seed` in `crates/ferric-smolvla/src/lib.rs`: state starts at `seed | 1`; each step is `x ^= x << 13; x ^= x >> 7; x ^= x << 17`; the unit is `(x >> 11) as f64 / 2^53`; pairs go through Box–Muller and are cast to f32. A missing noise hash is refused. The placeholders `"11" * 32` and `"22" * 32` are not values of this hash.
+The reference implementation is `noise_from_seed` at `crates/ferric-smolvla/src/lib.rs:59` and `next_unit` in that file, and `ln`, `sin`, and `cos` at `crates/ferric-smolvla/src/noise_math.rs:65`, `:249`, and `:269`. The generator state starts at `seed | 1`. Each step is `x ^= x << 13; x ^= x >> 7; x ^= x << 17`. The unit is `(x >> 11) as f64 / 2^53`.
+
+`seed | 1` makes seeds `2k` and `2k+1` the same payload. Version 3 refuses an even seed, so two caller seeds cannot share one payload. The seed in item 6 is the odd caller seed.
+
+Box–Muller, in this order, for each pair `(u1, u2)`:
+
+```
+r = sqrt(-2 * ln(u1))
+theta = (2 * pi) * u2
+sample0 = r * cos(theta)
+sample1 = r * sin(theta)
+```
+
+`pi` is the f64 constant. `sqrt` is IEEE-754 square root. Each sample is cast f64 to f32, round ties to even, and `sample0` is emitted before `sample1`. If `u1` is 0, `ln(0)` is `-∞`, `r` is `+∞`, and the f32 samples are `±∞` or NaN according to the sign of the cosine or sine. The value is not replaced and the chunk is not refused for that reason. The xorshift state can be nonzero and still have its top 53 bits clear, so `u1 = 0` is reachable. It does not occur for seed `0x5a17`.
+
+`ln`, `sin`, and `cos` are the Sun fdlibm functions in `noise_math.rs`. They do not call platform libm. fdlibm's `e_log.c` bounds `ln` by less than 1 ulp. On `[-π/4, π/4]` the sine and cosine kernels are within `2^-58`. Argument reduction covers every angle `2·π·u2`. Platform `ln`, `sin`, and `cos` are not correctly rounded and are not interchangeable across machines. The emitted payload bytes are authoritative. A receiver hashes those bytes. It does not regenerate them.
+
+The noise hash has no nonce. That is intentional. The chunk is bound to the episode by the envelope's `episode_nonce` together with `chunk_sha256`.
+
+Golden, seed `0x5a17` (23063), 1600 little-endian f32 samples:
+
+- payload sha256, item 5 alone: `09adba264f855351fd2a0911ce66497cba8e54f9ca73d6b8d905c22918e0e4c2`
+- `noise_sha256`, the seven-item string above: `8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c`
+
+The payload sha256 is the value already stored as `noise_sha256` in `docs/fleet/smolvla-cpu-infer.json`. Replacing platform libm with the fdlibm functions did not change those bytes, and it did not change that receipt. The v3 `noise_sha256` is the longer string, not the payload alone.
 
 ## Interop with ferromorphic-chunk-binding 1
 
@@ -172,7 +210,9 @@ The binding's chunk fields, and where they sit in this canonical layout:
 
 The chunk period `period_num_ns / period_den` must equal the envelope's `period_num_ns / period_den` exactly, both rationals already reduced. A chunk whose period is a different reduced fraction is refused.
 
-`t0` must equal `origin_ns + k · period` for some integer `k`, with `origin_ns` and `period` taken from the episode below. The sum is the checked `u128` arithmetic above. A `t0` that is not on that grid is refused.
+`t0` must equal `origin_ns + k · period` for an integer `k >= 0`, with `origin_ns` and `period` taken from the episode below. The sum is the checked `u128` arithmetic above. A `t0` off that grid, or a negative `k`, is refused.
+
+Within one episode, `chunk_index` is strictly increasing, and a later `chunk_index` must have a strictly larger `k` than the earlier chunk. `k` is not required to equal `chunk_index * n_action_steps`.
 
 ## ferromorphic-episode 2
 

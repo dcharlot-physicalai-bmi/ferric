@@ -40,6 +40,9 @@
   "table_bin": "crates/ferric-core/src/det_tanh_table.bin",
   "table_sha256": "899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593",
   "generator": "scripts/fit_det_tanh.py",
-  "generator_check": "python3 scripts/fit_det_tanh.py --check, and cargo test --locked -p ferric-core --lib det_tanh_table_matches_the_generator",
-  "generator_note": "numpy.tanh on Ubuntu 24.04 (numpy 1.26.4, glibc 2.39) rebuilds the committed bytes. Rust f64::tanh does not: it disagrees at f32 rounding on 17977 of the 295270 stored words. The bit-exact generator is the Python script, not f64::tanh."
+  "generator_python": "3.12.3",
+  "generator_numpy": "1.26.4",
+  "generator_check": "python3 scripts/fit_det_tanh.py --check, and cargo test --locked -p ferric-core --lib det_tanh_table_matches_the_generator. Both require Python 3.12.3 and numpy 1.26.4.",
+  "generator_libm": "Host libm tanh is not the generator. numpy 1.26.4 np.tanh on an FMA3 or NEON CPU is simd_tanh_f64 in numpy/core/src/umath/loops_hyperbolic.dispatch.c.src at tag v1.26.4, an IEEE-754 fma Horner polynomial. The same numpy with FMA3 disabled falls back to libm tanh and rebuilds a different file, sha256 a76e14969922f5a71ea94ba1d3ae81bbc67ef21260ebf70848171dfc152660f2. The script vendors that polynomial, requires Python 3.12.3 and numpy 1.26.4, and refuses both a byte mismatch and an np.tanh that disagrees with the polynomial.",
+  "generator_note": "PyPI numpy 1.26.4 and Ubuntu python3-numpy 1:1.26.4+ds-6ubuntu1 both rebuild the committed bytes when the FMA path is active. Rust f64::tanh does not: it disagrees at f32 rounding on 17977 of the 295270 stored words."
 }
