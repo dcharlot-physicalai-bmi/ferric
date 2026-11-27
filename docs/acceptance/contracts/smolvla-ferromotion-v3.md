@@ -243,7 +243,11 @@ Fields, in this order:
 8. `origin_ns`
 9. `episode_nonce`
 
-For this SO-100 contract the only legal clock is 30 Hz with 20 substeps. `period_num_ns / period_den` is `100000000/3`. `dt_num_ns / dt_den` is `5000000/3`, which is that period divided by 20. Both fractions are already reduced (`gcd` with 3 is 1). Any other period or dt is refused.
+## SO-100 profile clock
+
+The envelope itself carries any reduced period and any reduced dt. `ferromorphic-episode 2` does not refuse a different pair.
+
+The ferric SO-100 profile is what refuses anything else. For this profile the only legal clock is 30 Hz with 20 substeps. `period_num_ns / period_den` is `100000000/3`. `dt_num_ns / dt_den` is `5000000/3`, which is that period divided by 20. Both fractions are already reduced (`gcd` with 3 is 1). Any other period or dt is refused.
 
 ## Provenance
 
