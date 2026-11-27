@@ -51,9 +51,16 @@ fn samples() -> Vec<f32> {
 
 #[test]
 fn the_shader_matches_the_cpu_on_a_dense_set() {
-    let Ok(ctx) = pollster::block_on(ferric_core::Context::new()) else {
-        eprintln!("no GPU context — shader parity is checked on the CI adapters");
-        return;
+    let require = std::env::var("FERRIC_REQUIRE_ADAPTER").ok().as_deref() == Some("1");
+    let ctx = match pollster::block_on(ferric_core::Context::new()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            if require {
+                panic!("FERRIC_REQUIRE_ADAPTER=1 and no GPU adapter: {e}");
+            }
+            eprintln!("no GPU context — shader parity is checked on the CI adapters");
+            return;
+        }
     };
     let xs = samples();
     let gpu = pollster::block_on(ctx.det_tanh(&xs)).expect("det_tanh dispatch");
@@ -87,5 +94,9 @@ fn the_shader_matches_the_cpu_on_a_dense_set() {
             xs[i]
         );
     }
-    eprintln!("det_tanh shader matched the CPU on {} values ({})", xs.len(), ctx.adapter_name);
+    println!(
+        "det_tanh shader matched the CPU on {} values, adapter {}",
+        xs.len(),
+        ctx.adapter_name
+    );
 }

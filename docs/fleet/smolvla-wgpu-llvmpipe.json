@@ -42,6 +42,8 @@
       "connector_token0_max_abs_vs_cpu": 0.00010967254638671875,
       "velocity0_max_abs_vs_cpu": 4.291534423828125e-06
     },
-    "radv": "not re-run. docs/fleet value 9.357929229736328e-06 is unchanged."
+    "radv": "not re-run. docs/fleet value 9.357929229736328e-06 is unchanged.",
+    "det_tanh_table_sha256": "899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593",
+    "connector_vs_cpu": "1.678466796875e-4 is 86% of the raw_actions bound 1.947677e-4 and is not a tanh discrepancy. CPU and shader share det_tanh. See connector_token0_analysis in docs/fleet/smolvla-f32-reference.json. The bound was not changed."
   }
 }

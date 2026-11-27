@@ -28,7 +28,8 @@
         "det_tanh_1ulp": 0.0017298758029937744
       }
     },
-    "llvmpipe_section": "not re-run. Those kernels do not call tanh. The RADV energy value was not touched."
+    "llvmpipe_section": "not re-run. Those kernels do not call tanh. The RADV energy value was not touched.",
+    "det_tanh_table_sha256": "899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593"
   },
   "cpu": {
     "seed": "0x5a17",

@@ -119,6 +119,38 @@
       "velocity0": 4.291534423828125e-06,
       "raw_actions": 2.4437904357910156e-06
     },
-    "note_4ulp": "Intermediate measurement of the 4 ulp det_tanh on this machine before the 1 ulp table. Not a libm value. Stages omitted from that column were unchanged from glibc 2.39."
+    "note_4ulp": "Intermediate measurement of the 4 ulp det_tanh on this machine before the 1 ulp table. Not a libm value. Stages omitted from that column were unchanged from glibc 2.39.",
+    "det_tanh_table_sha256": "899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593",
+    "connector_token0_analysis": {
+      "question": "Why connector_token0 max_abs vs PyTorch is larger for the 1 ulp table (1.068115234375e-4) than for the 4 ulp exp/polynomial tanh (8.392333984375e-5), and why llvmpipe vs CPU is 1.678466796875e-4.",
+      "bound_not_changed": 0.0001947678066714822,
+      "official_argmax": {
+        "index": 87,
+        "pytorch": -64.95669555664062,
+        "ferric_1ulp": -64.95658874511719,
+        "abs": 0.0001068115234375,
+        "n": 960
+      },
+      "where_tanh_runs": "Vision encoder only. 12 layers, 1024 tokens, MLP fc1 width 3072. 37748736 GELU tanh arguments, each f32 0x3f4c422a * (x + 0.044715*x^3). Text and the expert use SwiGLU, not tanh.",
+      "on_those_arguments": {
+        "table_vs_torch_tanh_ulp_max": 1,
+        "table_vs_torch_tanh_count_off_by_1": 7650183,
+        "table_vs_torch_tanh_count_above_1": 0,
+        "table_vs_correctly_rounded_count_off_by_1": 7640625,
+        "torch_tanh_vs_correctly_rounded_count_off_by_1": 385578,
+        "table_vs_torch_max_abs": 5.960464477539063e-08,
+        "four_ulp_vs_torch_tanh_ulp_max": 5,
+        "four_ulp_vs_torch_tanh_count_nonzero": 15544103,
+        "four_ulp_vs_torch_tanh_count_above_1": 1874276
+      },
+      "isolated_on_ferrics_prepared_image": {
+        "torch_tanh_vs_ferric_connector_max_abs": 9.1552734375e-05,
+        "table_tanh_vs_torch_tanh_connector_max_abs": 2.86102294921875e-05,
+        "four_ulp_tanh_vs_torch_tanh_connector_max_abs": 2.86102294921875e-05,
+        "four_ulp_tanh_vs_ferric_connector_max_abs": 8.392333984375e-05
+      },
+      "conclusion": "The extra connector error is in ferric, not in the PyTorch reference. On these 37748736 arguments torch.tanh is correctly rounded except for 385578 inputs (1 ulp). The 1 ulp table is 1 ulp from torch.tanh on 7650183 of them and never more. That local error is at most 5.96e-8. After fc2, twelve residuals, and the connector projection it moves connector_token0 by 2.86e-5 relative to a torch.tanh replay on the same prepared image. The 4 ulp kernel is pointwise farther from torch (up to 5 ulp, 15.5e6 inputs off) but those larger errors cancel in the connector max, which is why 8.39e-5 beat 1.07e-4. The published 1.07e-4 also includes PyTorch preparing the image itself: prepared_image0 is already 2.38e-7 off, and on element 87 that path adds about 1.5e-5 beyond the 9.16e-5 gap measured on ferric's own prepared image. llvmpipe's 1.678e-4 versus the CPU is not this tanh gap. Both sides call the same det_tanh and the shader test is bit-identical, so that residual is the other GPU kernels on the connector projection. raw_actions versus the CPU stays 4.77e-6. The raw_actions bound was not changed."
+    },
+    "fleet_lock_rerun_log": "docs/fleet/smolvla-fleet-lock-rerun-2026-11-27.txt"
   }
 }

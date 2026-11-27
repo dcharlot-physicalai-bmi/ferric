@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Build the linear table behind ferric_core::cpu::det_tanh.
 
+The committed bytes are `crates/ferric-core/src/det_tanh_table.bin`, sha256
+`899a6e91ef20ba61eb64222ae98f31bb7c3e12cbda25f0bc8472de621fcf0593`.
+`det_tanh_table_matches_the_generator` rebuilds those bytes from `f64::tanh`
+and refuses a mismatch. This script is the same procedure:
+
+1. Binary-search the smallest f32 at which `f32(tanh(f64(x)))` is 1.
+2. Slot width W = 2^-14. Slot count is floor(sat / W) + 1.
+3. Slot i stores little-endian f32 pairs
+   anchor = f32(tanh(i*W)), slope = f32((tanh((i+1)*W) - tanh(i*W)) / W).
+
+numpy.tanh and Rust f64::tanh agree on these arguments at f32 rounding.
+
 tanh is odd, so the table stores only x >= 0. Slot i covers
 [i / 16384, (i + 1) / 16384). The value is
 
@@ -16,7 +28,9 @@ the lock.
 """
 from __future__ import annotations
 
+import hashlib
 import struct
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -57,7 +71,16 @@ def main() -> None:
     raw = np.empty(n * 2, dtype=np.float32)
     raw[0::2] = anchor
     raw[1::2] = slope
-    BIN.write_bytes(raw.tobytes())
+    body = raw.tobytes()
+    digest = hashlib.sha256(body).hexdigest()
+    if "--check" in sys.argv:
+        committed = BIN.read_bytes()
+        if committed != body:
+            print(f"mismatch sha256 {digest} bytes {len(body)}", file=sys.stderr)
+            sys.exit(1)
+        print(digest)
+        return
+    BIN.write_bytes(body)
     META.write_text(
         "\n".join(
             [
