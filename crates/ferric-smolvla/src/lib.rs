@@ -88,17 +88,58 @@ mod tests {
     fn seed_0x5a17_noise_payload_is_the_receipt_hash() {
         let noise = noise_from_seed(0x5a17).expect("odd seed");
         assert_eq!(noise.len(), NOISE_LEN);
+        assert_eq!(f32_bytes(&noise).len(), 6400);
         assert!(noise.iter().all(|v| v.is_finite()));
         assert_eq!(
             sha256_hex(&f32_bytes(&noise)),
             "09adba264f855351fd2a0911ce66497cba8e54f9ca73d6b8d905c22918e0e4c2"
         );
-        assert!(noise_from_seed(2).is_err());
-        assert!(noise_from_seed(3).is_ok());
+        let canon = canonical_noise_bytes(0x5a17, &noise);
+        assert_eq!(canon.len(), 6477);
         assert_eq!(
-            sha256_hex(&canonical_noise_bytes(0x5a17, &noise)),
+            sha256_hex(&canon),
             "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c"
         );
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/acceptance/contracts/fixtures/smolvla-noise-v3.json"
+        ))
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(doc["payload_bytes"], 6400);
+        assert_eq!(doc["canonical_bytes"], 6477);
+        assert_eq!(doc["payload_sha256"], sha256_hex(&f32_bytes(&noise)));
+        assert_eq!(doc["noise_sha256"], sha256_hex(&canon));
+        let v3 = ferric_accept::smolvla_v3::ActionChunkV3 {
+            lerobot_commit: ferric_accept::smolvla::LEROBOT_COMMIT.into(),
+            model_id: ferric_accept::smolvla::MODEL_ID.into(),
+            weight_sha256: ferric_accept::smolvla_v3::WEIGHT_SHA256.into(),
+            stats_sha256: ferric_accept::smolvla_v3::STATS_FILE_SHA256.into(),
+            stats_key: "so100".into(),
+            action_mean_sha256: ferric_accept::smolvla_v3::SO100_ACTION_MEAN.into(),
+            action_std_sha256: ferric_accept::smolvla_v3::SO100_ACTION_STD.into(),
+            state_mean_sha256: ferric_accept::smolvla_v3::STATE_MEAN_SHA256.into(),
+            state_std_sha256: ferric_accept::smolvla_v3::STATE_STD_SHA256.into(),
+            noise_sha256: sha256_hex(&canon),
+            seed: 0x5a17,
+            embodiment: "so100".into(),
+            t0_num_ns: 100_000_000,
+            t0_den: 3,
+            period_num_ns: 100_000_000,
+            period_den: 3,
+            n_action_steps: 1,
+            action_dim: 6,
+            joints: ferric_accept::smolvla_v3::so100_joints(),
+            values: vec![0.0, 0.0, 0.0, 50.0, 90.0, 10.0],
+        };
+        let (bytes, digest) =
+            ferric_accept::smolvla_v3::encode_action_chunk_v3(&v3, &noise, 0, 5_000_000, 3).unwrap();
+        assert_eq!(digest, ferric_accept::hex(&ferric_accept::sha256(&bytes)));
+        let back = ferric_accept::smolvla_v3::decode_action_chunk_v3(&bytes).unwrap();
+        assert_eq!(back.seed, 0x5a17);
+        assert_eq!(back.noise_sha256, sha256_hex(&canon));
+        assert!(noise_from_seed(2).is_err());
+        assert!(noise_from_seed(3).is_ok());
     }
 
     #[test]

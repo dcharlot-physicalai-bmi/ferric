@@ -21,6 +21,7 @@
 mod check;
 mod sha256;
 pub mod smolvla;
+pub mod smolvla_v3;
 
 pub use check::{
     check_corpus, check_fabric_cell, check_issue, check_protocol, check_receipt, check_tolerance,

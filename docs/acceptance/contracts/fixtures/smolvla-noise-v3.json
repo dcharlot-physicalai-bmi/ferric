@@ -1,0 +1,10 @@
+{
+  "kind": "protocol_test",
+  "not_model_evidence": true,
+  "seed": "0x5a17",
+  "payload_bytes": 6400,
+  "payload_sha256": "09adba264f855351fd2a0911ce66497cba8e54f9ca73d6b8d905c22918e0e4c2",
+  "canonical_bytes": 6477,
+  "noise_sha256": "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c",
+  "note": "x_T for seed 0x5a17. The chunk stores noise_sha256 and the odd seed, not the payload."
+}
