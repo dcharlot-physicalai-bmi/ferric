@@ -213,7 +213,7 @@ jobs:
         run: cargo --locked build --workspace --verbose
 
       - name: numpy for the det_tanh table generator
-        run: python3 -c 'import numpy' || pip3 install --user numpy
+        run: python3 -c 'import numpy' || python3 -m pip install --break-system-packages numpy
 
       - name: Test workspace
         run: cargo --locked test --workspace --verbose
