@@ -9,6 +9,8 @@ Version 2 stays parseable forever. Magic `FERRIC-SMOLVLA-CHUNK` and a NUL, versi
 - `docs/acceptance/contracts/fixtures/smolvla-chunk-v2.json` → `6d668d7e25c89249c890d895ef15b8fdcbb97dab7a1339a0a97605c6e1172d86`
 - `docs/acceptance/contracts/fixtures/smolvla-empty-chunk-v2.json` → `6295818fa11b85b37ad8054c75e0a1935b0c0cbb5d7e419090c2520a17b1744e`
 
+Those two digests are version 2 only. Both fixtures use `t0_ns` `1000000000` and `step_duration_ns` `20000000`, the rationals `1000000000/1` and `20000000/1`. That clock is not the SO-100 30 Hz period `100000000/3`. Version 3 does not accept either fixture. Version 3 goldens will be generated on the `100000000/3` grid when the codec is written. This text does not write that codec.
+
 A reader branches on the version integer after the shared magic. Version 2 takes the version 2 layout. Version 3 takes the layout below. Any other version is refused. A version 2 golden is not a version 3 chunk, and a version 3 chunk is not a version 2 golden.
 
 ## Version 3 header
@@ -54,6 +56,8 @@ t(k) = t0_num_ns / t0_den + k * period_num_ns / period_den
 The digest stores the four reduced inputs, not this sum. A caller who asks for an integer nanosecond gets one only when the denominator divides the numerator exactly. Otherwise that conversion is refused. The rational itself is the time.
 
 For 30 Hz the period is `100000000/3` nanoseconds. `10^9 / 30 = 1000000000/30 = 100000000/3`, and `gcd(100000000, 3) = 1`. An integer `step_duration_ns` cannot say this; that is why version 2's two `u64` clocks are not the version 3 clock.
+
+`n_action_steps` is an integer in `1..=50`. `50` is the SmolVLA `chunk_size`, and it is the time extent in the noise byte string below. `0` is refused. A value above `50` is refused.
 
 ## Joints
 
@@ -204,15 +208,25 @@ The binding's chunk fields, and where they sit in this canonical layout:
 | `period_num_ns` | `period_num_ns` |
 | `period_den` | `period_den` |
 | `n_action_steps` | `n_action_steps` |
-| `envelope_sha256` | not a byte of the chunk. The envelope that cites this chunk carries it. |
-| `epoch` | not a byte of the chunk. The envelope carries it. |
-| `chunk_index` | not a byte of the chunk. The envelope carries it, and it is strictly increasing inside one episode. |
+| `envelope_sha256` | not a byte of the chunk. The `ferromorphic-chunk-binding 1` record carries it. |
+| `epoch` | not a byte of the chunk. The `ferromorphic-chunk-binding 1` record carries it, and it must equal the envelope's epoch. |
+| `chunk_index` | not a byte of the chunk. The `ferromorphic-chunk-binding 1` record carries it. Envelope v2 has no `chunk_index`. |
+
+Binding 1's decimal text for `t0_num_ns`, `t0_den`, `period_num_ns`, and `period_den` is exactly these `u64` values. A value above `u64::MAX` is refused.
 
 The chunk period `period_num_ns / period_den` must equal the envelope's `period_num_ns / period_den` exactly, both rationals already reduced. A chunk whose period is a different reduced fraction is refused.
 
-`t0` must equal `origin_ns + k · period` for an integer `k >= 0`, with `origin_ns` and `period` taken from the episode below. The sum is the checked `u128` arithmetic above. A `t0` off that grid, or a negative `k`, is refused.
+`t0` is on the grid if and only if some integer `k >= 0` satisfies
 
-Within one episode, `chunk_index` is strictly increasing, and a later `chunk_index` must have a strictly larger `k` than the earlier chunk. `k` is not required to equal `chunk_index * n_action_steps`.
+```
+t0_num_ns * period_den == (origin_ns * period_den + k * period_num_ns) * t0_den
+```
+
+Every product and sum in that identity is checked `u128` arithmetic. `origin_ns` and `period` come from the episode below. Equivalently, `d = t0_num_ns * period_den - origin_ns * t0_den * period_den` is `>= 0` and `period_num_ns * t0_den` divides `d`. A `t0` before `origin` is refused. Overflow is refused.
+
+Within one episode, a later `chunk_index` must have a strictly larger `k`. That is the same requirement as a strictly increasing `t0`. `k` is not required to equal `chunk_index * n_action_steps`.
+
+Late/Stale hold policy, `chunk_index` ordering, and the binding-hash stamp on StepReceipts are ferromorphic verifier checks under binding 1. Version 3 does not reimplement them in ferric.
 
 ## ferromorphic-episode 2
 
