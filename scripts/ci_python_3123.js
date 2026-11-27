@@ -1,16 +1,19 @@
-// Install the published CPython 3.12.3 Linux build onto PATH.
+// Install CPython 3.12.3 onto PATH.
 // ubuntu-latest is 26.04. actions/setup-python has no 3.12.3 build for that
 // image, and that image's PATH has neither python3, curl, nor sudo (exit 127).
-// Node is the runner runtime, so this downloads the 24.04 tarball, checks its
-// sha256, and extracts it. That binary is CPython 3.12.3 and links an older glibc.
+// Node is the runner runtime. The standalone build bundles libpython and links
+// only glibc, so it runs on 26.04.
 const crypto = require("crypto");
 const fs = require("fs");
 const https = require("https");
 const path = require("path");
 const zlib = require("zlib");
 
-const url = "https://github.com/actions/python-versions/releases/download/3.12.3-11057844995/python-3.12.3-linux-24.04-x64.tar.gz";
-const expected = "07ef2452a390e76505b5a26b37bae7f88bc260926ca70ae88cb679003ab42279";
+// The actions/python-versions 24.04 tarball links the system libpython3.12,
+// which Ubuntu 26.04 does not ship. This is the standalone 3.12.3 build:
+// libpython sits next to the binary, and only glibc is external.
+const url = "https://github.com/astral-sh/python-build-standalone/releases/download/20240415/cpython-3.12.3%2B20240415-x86_64-unknown-linux-gnu-install_only.tar.gz";
+const expected = "a73ba777b5d55ca89edef709e6b8521e3f3d4289581f174c8699adfb608d09d6";
 const tarball = "/tmp/python-3.12.3.tar.gz";
 
 function get(target, dest) {
@@ -53,7 +56,7 @@ function extract(gz, dest) {
     off += 512;
     const data = buf.subarray(off, off + size);
     off += Math.ceil(size / 512) * 512;
-    const rel = name.replace(/^\.\//, "");
+    const rel = name.replace(/^\.\//, "").replace(/^python\//, "");
     if (!rel || rel.includes("..")) continue;
     const target = path.join(dest, rel);
     if (type === "5") {
