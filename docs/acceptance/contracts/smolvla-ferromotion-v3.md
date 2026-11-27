@@ -15,7 +15,7 @@ A reader branches on the version integer after the shared magic. Version 2 takes
 
 ## Version 3 header
 
-Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, no trailing NUL. The three provenance hashes stay fixed 64-byte lowercase hex.
+Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, no trailing NUL. Seven provenance hashes stay fixed 64-byte lowercase hex, in header order: weight, stats, action mean, action std, state mean, state std, noise.
 
 | Order | Field |
 |---|---|
@@ -31,6 +31,7 @@ Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, n
 | 64 | state mean sha256 |
 | 64 | state std sha256 |
 | 64 | noise sha256 |
+| u64 | odd caller seed |
 | string | embodiment name |
 | u64 | `t0_num_ns` |
 | u64 | `t0_den` |
@@ -170,9 +171,9 @@ Items 1, 4, and 7 are strings under the version 3 string rule: a `u32` little-en
 6. The `u64` little-endian caller seed. This is the seed before `seed | 1`.
 7. `u32` length `24`, then UTF-8 `xorshift64-box-muller-v1`.
 
-The reference implementation is `noise_from_seed` at `crates/ferric-smolvla/src/lib.rs:59` and `next_unit` in that file, and `ln`, `sin`, and `cos` at `crates/ferric-smolvla/src/noise_math.rs:65`, `:249`, and `:269`. The generator state starts at `seed | 1`. Each step is `x ^= x << 13; x ^= x >> 7; x ^= x << 17`. The unit is `(x >> 11) as f64 / 2^53`.
+The reference implementation is toolchain commit `914fcc76e7d86a79d657b69435481c5dcfdc3314`. On that commit, `noise_from_seed` is `crates/ferric-smolvla/src/lib.rs:59` and `next_unit` is `lib.rs:102`. Fleet commit `b855cbe8340dbc4d8c7f2b4de04d8b7d67a2579e` has the same `noise_from_seed` at `lib.rs:59` and `next_unit` at `lib.rs:178`. `ln`, `sin`, and `cos` are `crates/ferric-smolvla/src/noise_math.rs:70`, `:254`, and `:274` on both commits. `k_cos` is `noise_math.rs:146` and `rem_pio2` is `noise_math.rs:198`, also on both. For an odd caller seed the generator state starts at `seed | 1`, which is that seed. Each step is `x ^= x << 13; x ^= x >> 7; x ^= x << 17`. The unit is `(x >> 11) as f64 / 2^53`.
 
-`seed | 1` makes seeds `2k` and `2k+1` the same payload. Version 3 refuses an even seed, so two caller seeds cannot share one payload. The seed in item 6 is the odd caller seed.
+`seed | 1` would make seeds `2k` and `2k+1` the same payload. The version 3 encoder and the version 3 decoder both refuse an even seed, so two caller seeds cannot share one payload. The header stores that odd caller seed as the `u64` immediately after the noise sha256. A receiver uses it to enforce the refusal and to recompute the seven-item noise string. Item 6 of that string is this same odd caller seed.
 
 Box–Muller, in this order, for each pair `(u1, u2)`:
 
@@ -183,9 +184,9 @@ sample0 = r * cos(theta)
 sample1 = r * sin(theta)
 ```
 
-`pi` is the f64 constant. `sqrt` is IEEE-754 square root. Each sample is cast f64 to f32, round ties to even, and `sample0` is emitted before `sample1`. If `u1` is 0, `ln(0)` is `-∞`, `r` is `+∞`, and the f32 samples are `±∞` or NaN according to the sign of the cosine or sine. The value is not replaced and the chunk is not refused for that reason. The xorshift state can be nonzero and still have its top 53 bits clear, so `u1 = 0` is reachable. It does not occur for seed `0x5a17`.
+`pi` is the f64 constant. `sqrt` is IEEE-754 square root. Each sample is cast f64 to f32, round ties to even, and `sample0` is emitted before `sample1`. The xorshift state can be nonzero and still have its top 53 bits clear, so `u1 = 0` is reachable. Then `ln(0)` is `-∞` and `r` is `+∞`. `+∞` times `0` is NaN. The encoder refuses any seed whose payload contains a non-finite value, from `u1 = 0`, from `+∞·0`, or from anything else. The sample is not replaced with a finite substitute. Seed `0x5a17` does not hit that case: every sample is finite. No NaN bit pattern is pinned.
 
-`ln`, `sin`, and `cos` are the Sun fdlibm functions in `noise_math.rs`. They do not call platform libm. fdlibm's `e_log.c` bounds `ln` by less than 1 ulp. On `[-π/4, π/4]` the sine and cosine kernels are within `2^-58`. Argument reduction covers every angle `2·π·u2`. Platform `ln`, `sin`, and `cos` are not correctly rounded and are not interchangeable across machines. The emitted payload bytes are authoritative. A receiver hashes those bytes. It does not regenerate them.
+`ln` follows fdlibm `e_log.c` and is bounded by less than 1 ulp. `k_sin`, `k_cos`, and `rem_pio2` follow the FreeBSD msun sources as revised in musl 1.2.5: musl `__cos.c` lines 67–70, `__rem_pio2.c` lines 38–39 and 119–132, and FreeBSD `k_cos.c` line 74. That is not the Sun 5.3 qx form. On `[-π/4, π/4]` the kernel remainder is at most `2^-58`. These functions do not call platform libm. Platform `ln`, `sin`, and `cos` are not correctly rounded and are not interchangeable across machines. The producer's emitted payload bytes are authoritative. A verifier holding them hashes them and does not regenerate them. The chunk itself does not carry the payload.
 
 The noise hash has no nonce. That is intentional. The chunk is bound to the episode by the envelope's `episode_nonce` together with `chunk_sha256`.
 
