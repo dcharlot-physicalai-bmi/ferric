@@ -1,6 +1,6 @@
 # SmolVLA chunk contract v3 for Ferromotion (bmi-4) and Ferromorphic (bmi-2)
 
-Status: **proposed**. This document is the contract text. It does not change the codec. `crates/ferric-accept/src/smolvla.rs` stays on version 2 until this text is reviewed. No golden for version 3 is invented here.
+Status: **proposed**. This document is the contract text. The version 3 codec is implemented in `crates/ferric-accept/src/smolvla_v3.rs`. `decode_action_chunk_v3_with_sha256` returns the decoded version 3 chunk together with sha256 of those bytes. `decode_action_chunk` in `crates/ferric-accept/src/smolvla.rs` dispatches on the version field.
 
 ## What stays
 
@@ -9,7 +9,7 @@ Version 2 stays parseable forever. Magic `FERRIC-SMOLVLA-CHUNK` and a NUL, versi
 - `docs/acceptance/contracts/fixtures/smolvla-chunk-v2.json` → `6d668d7e25c89249c890d895ef15b8fdcbb97dab7a1339a0a97605c6e1172d86`
 - `docs/acceptance/contracts/fixtures/smolvla-empty-chunk-v2.json` → `6295818fa11b85b37ad8054c75e0a1935b0c0cbb5d7e419090c2520a17b1744e`
 
-Those two digests are version 2 only. Both fixtures use `t0_ns` `1000000000` and `step_duration_ns` `20000000`, the rationals `1000000000/1` and `20000000/1`. That clock is not the SO-100 30 Hz period `100000000/3`. Version 3 does not accept either fixture. Version 3 goldens will be generated on the `100000000/3` grid when the codec is written. This text does not write that codec.
+Those two digests are version 2 only. Both fixtures use `t0_ns` `1000000000` and `step_duration_ns` `20000000`, the rationals `1000000000/1` and `20000000/1`. That clock is not the SO-100 30 Hz period `100000000/3`. Version 3 does not accept either fixture. The version 3 codec is implemented in `crates/ferric-accept/src/smolvla_v3.rs`, with `decode_action_chunk_v3_with_sha256` and the version-dispatching `decode_action_chunk`.
 
 A reader branches on the version integer after the shared magic. Version 2 takes the version 2 layout. Version 3 takes the layout below. Any other version is refused. A version 2 golden is not a version 3 chunk, and a version 3 chunk is not a version 2 golden.
 
@@ -227,7 +227,31 @@ Every product and sum in that identity is checked `u128` arithmetic. `origin_ns`
 
 Within one episode, a later `chunk_index` must have a strictly larger `k`. That is the same requirement as a strictly increasing `t0`. `k` is not required to equal `chunk_index * n_action_steps`.
 
-Late/Stale hold policy, `chunk_index` ordering, and the binding-hash stamp on StepReceipts are ferromorphic verifier checks under binding 1. Version 3 does not reimplement them in ferric.
+`k` is a `u64`. A grid identity whose `k` exceeds `u64::MAX` is refused as `Overflow`, which matches `t0_grid_k`. The SO-100 period `100000000/3` needs `k < 2^40`.
+
+## StepReceipt binding stamp (ferromorphic-chunk-binding 1)
+
+This section needs sign-off from ferromorphic and from ferromotion. Goldens come from ferromorphic. This tree has none.
+
+The stamp lives in `ferromorphic-step 3`. Step records before version 3 carry no stamp. Version 2 is never extended in place.
+
+Every simulation substep record carries these fields, in this order, after the existing step fields:
+
+1. `binding_sha256`. Lowercase 64-hex SHA-256 of the exact canonical `ferromorphic-chunk-binding 1` text that authorized the chunk being applied.
+2. `chunk_index`. A `u64`, equal to that binding's `chunk_index`.
+3. `action_index`. A `u32` in `0..n_action_steps`, the row of the chunk being applied.
+4. `substep_index`. A `u32` in `0..S`. `S = period/dt` and `S` is an exact integer. Under the SO-100 profile `S = 20`: period `100000000/3` ns, dt `5000000/3` ns.
+5. `hold`. One of `none`, `late`, or `stale`.
+
+The hash is the binding text's sha256. The binding already commits to `chunk_sha256` and `envelope_sha256`, so those two hashes are not repeated on the step.
+
+The stamp is written on every substep. Across steps with `hold = none`, the triple `(chunk_index, action_index, substep_index)` is strictly increasing in lexicographic order.
+
+When no accepted chunk covers the step's action time, the step carries the last accepted binding's `binding_sha256`, `chunk_index`, and `action_index` (the last row applied). Its substep counter continues. `hold` is `late` or `stale`. The hold policy, which target is commanded, and the late versus stale thresholds, are defined by ferromotion's clock contract. This section does not redefine them. The proposed default, pending bmi-4's sign-off, is a zero-order hold of the last applied position target, with no extrapolation. A step before any accepted chunk is refused. It is not stamped.
+
+The verifier refuses a stamp whose `binding_sha256` matches no accepted binding, a `chunk_index` or `action_index` outside that binding, a `substep_index >= S`, a non-monotonic triple on `hold = none`, a `hold` other than `none` whose fields differ from the last accepted values, a missing field, and uppercase hex.
+
+Ferric does not emit this stamp and does not run these checks.
 
 ## ferromorphic-episode 2
 
@@ -253,7 +277,7 @@ The ferric SO-100 profile is what refuses anything else. For this profile the on
 
 The weight pin is `7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb`, the check at `crates/ferric-smolvla/src/bin/ferric-smolvla.rs:85`. Version 2's sentence "No weight sha256 is in this tree" is stale and is removed there.
 
-`crates/ferric-smolvla/src/bin/ferric-smolvla.rs:301-302` still defaults a missing stats hash to `"11" * 32` and a missing noise hash to `"22" * 32`. Version 3 removes those defaults. A missing stats hash or a missing noise hash is refused. It is not filled in. The weight default on line 300 is already the pin above; stats and noise have no such pin and get none here.
+Version 3 removed those defaults. `simulate` requires `--stats-sha` and `--noise-sha`. The encoder and the decoder refuse `"1" * 64` and `"2" * 64` in every hash field with `MissingHash`. A missing stats hash or a missing noise hash is refused. It is not filled in. The weight default on line 314 of `crates/ferric-smolvla/src/bin/ferric-smolvla.rs` is already the pin above; stats and noise have no such pin and get none here.
 
 ## Digest
 
