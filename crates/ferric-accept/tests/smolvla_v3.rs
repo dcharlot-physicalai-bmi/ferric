@@ -271,3 +271,353 @@ fn to_hex(bytes: &[u8]) -> String {
     }
     s
 }
+
+struct V3Spans {
+    hashes: [usize; 7],
+    n_action_steps: usize,
+    action_dim: usize,
+    joint_count: usize,
+    first_value: usize,
+}
+
+fn spans(bytes: &[u8]) -> V3Spans {
+    let mut i = 25;
+    let skip_str = |bytes: &[u8], i: &mut usize| {
+        let n = u32::from_le_bytes(bytes[*i..*i + 4].try_into().unwrap()) as usize;
+        *i += 4 + n;
+    };
+    skip_str(bytes, &mut i);
+    skip_str(bytes, &mut i);
+    let mut hashes = [0usize; 7];
+    hashes[0] = i;
+    i += 64;
+    hashes[1] = i;
+    i += 64;
+    skip_str(bytes, &mut i);
+    for slot in 2..7 {
+        hashes[slot] = i;
+        i += 64;
+    }
+    i += 8;
+    skip_str(bytes, &mut i);
+    i += 32;
+    let n_action_steps = i;
+    i += 4;
+    let action_dim = i;
+    i += 4;
+    let joint_count = i;
+    let n = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    i += 4;
+    for _ in 0..n {
+        skip_str(bytes, &mut i);
+        skip_str(bytes, &mut i);
+        skip_str(bytes, &mut i);
+        i += 8;
+    }
+    i += 2;
+    V3Spans {
+        hashes,
+        n_action_steps,
+        action_dim,
+        joint_count,
+        first_value: i,
+    }
+}
+
+fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn v3_decoder_refuses_unbounded_header_counts() {
+    let noise = finite_noise();
+    let (bytes, _) = encode(3, &noise);
+    let at = spans(&bytes);
+
+    let mut joint = bytes.clone();
+    put_u32(&mut joint, at.joint_count, u32::MAX);
+    assert_eq!(decode_action_chunk_v3(&joint), Err(V3Error::JointCount));
+
+    for steps in [0u32, 51, u32::MAX] {
+        let mut patched = bytes.clone();
+        put_u32(&mut patched, at.n_action_steps, steps);
+        assert_eq!(
+            decode_action_chunk_v3(&patched),
+            Err(V3Error::ActionSteps),
+            "n_action_steps {steps}"
+        );
+    }
+
+    let mut dim = bytes.clone();
+    put_u32(&mut dim, at.action_dim, u32::MAX);
+    assert_eq!(decode_action_chunk_v3(&dim), Err(V3Error::ActionDim));
+}
+
+#[test]
+fn v3_string_length_is_checked_against_the_remaining_bytes() {
+    let noise = finite_noise();
+    let (mut bytes, _) = encode(3, &noise);
+    // Commit length sits immediately after magic and version.
+    put_u32(&mut bytes, 25, u32::MAX);
+    assert_eq!(decode_action_chunk_v3(&bytes), Err(V3Error::Truncated));
+}
+
+#[test]
+fn v3_encoder_and_decoder_refuse_placeholder_hashes() {
+    let noise = finite_noise();
+    let placeholders = ["1".repeat(64), "2".repeat(64)];
+    let fields: &[fn(&mut ActionChunkV3) -> &mut String] = &[
+        |c| &mut c.weight_sha256,
+        |c| &mut c.stats_sha256,
+        |c| &mut c.action_mean_sha256,
+        |c| &mut c.action_std_sha256,
+        |c| &mut c.state_mean_sha256,
+        |c| &mut c.state_std_sha256,
+        |c| &mut c.noise_sha256,
+    ];
+    for placeholder in &placeholders {
+        for field in fields {
+            let mut chunk = chunk_for(3, &noise);
+            *field(&mut chunk) = placeholder.clone();
+            assert_eq!(
+                encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN),
+                Err(V3Error::MissingHash)
+            );
+        }
+        let (bytes, _) = encode(3, &noise);
+        let at = spans(&bytes);
+        for hash_at in at.hashes {
+            let mut patched = bytes.clone();
+            patched[hash_at..hash_at + 64].copy_from_slice(placeholder.as_bytes());
+            assert_eq!(decode_action_chunk_v3(&patched), Err(V3Error::MissingHash));
+        }
+    }
+}
+
+#[test]
+fn v3_refuses_wrong_frame_swapped_order_and_pos_names() {
+    let noise = finite_noise();
+    let mut chunk = chunk_for(3, &noise);
+    chunk.joints[0].frame = "world".into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::JointFrame
+    );
+    let (mut bytes, _) = encode(3, &noise);
+    let frame = bytes.windows(11).position(|w| w == b"so100_joint").unwrap();
+    bytes[frame + 10] = b'X';
+    assert_eq!(decode_action_chunk_v3(&bytes), Err(V3Error::JointFrame));
+
+    let mut chunk = chunk_for(3, &noise);
+    chunk.joints.swap(0, 1);
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::JointName
+    );
+    let mut chunk = chunk_for(3, &noise);
+    chunk.joints[0].name = "main_shoulder_pan.pos".into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::JointName
+    );
+}
+
+#[test]
+fn v3_refuses_stats_key_embodiment_and_per_tensor_mismatch() {
+    let noise = finite_noise();
+    let mut chunk = chunk_for(3, &noise);
+    chunk.state_mean_sha256 = SO100_ACTION_MEAN.into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::StatsKeyMismatch
+    );
+    let mut chunk = chunk_for(3, &noise);
+    chunk.state_std_sha256 = SO100_ACTION_STD.into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::StatsKeyMismatch
+    );
+    let mut chunk = chunk_for(3, &noise);
+    chunk.action_mean_sha256 = ferric_accept::smolvla_v3::SO100_BLUE_ACTION_MEAN.into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::StatsKeyMismatch
+    );
+    let mut chunk = chunk_for(3, &noise);
+    chunk.embodiment = "so100-blue".into();
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::Embodiment
+    );
+    let (mut bytes, _) = encode(3, &noise);
+    let marker = b"\x05\x00\x00\x00so100";
+    let stats_key = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+    let embodiment = bytes[stats_key + 1..]
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .unwrap()
+        + stats_key
+        + 1;
+    bytes[embodiment + 4 + 4] = b'1';
+    assert_eq!(decode_action_chunk_v3(&bytes), Err(V3Error::Embodiment));
+}
+
+#[test]
+fn v3_refuses_u128_overflow() {
+    let noise = finite_noise();
+    let mut chunk = chunk_for(3, &noise);
+    chunk.t0_num_ns = 1;
+    chunk.t0_den = u64::MAX;
+    assert_eq!(
+        t0_grid_k(1, u64::MAX, SO100_PERIOD_NUM, SO100_PERIOD_DEN, u64::MAX),
+        Err(V3Error::Overflow)
+    );
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, u64::MAX, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::Overflow
+    );
+}
+
+#[test]
+fn v3_decoder_refuses_limit_nan_and_inf() {
+    let noise = finite_noise();
+    let (bytes, _) = encode(3, &noise);
+    let at = spans(&bytes);
+    let mut over = bytes.clone();
+    over[at.first_value + 20..at.first_value + 24].copy_from_slice(&101.0f32.to_le_bytes());
+    assert_eq!(decode_action_chunk_v3(&over), Err(V3Error::ValueOutsideLimit));
+    let mut nan = bytes.clone();
+    nan[at.first_value..at.first_value + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert_eq!(decode_action_chunk_v3(&nan), Err(V3Error::NonFiniteValue));
+    let mut inf = bytes.clone();
+    inf[at.first_value..at.first_value + 4].copy_from_slice(&f32::INFINITY.to_le_bytes());
+    assert_eq!(decode_action_chunk_v3(&inf), Err(V3Error::NonFiniteValue));
+}
+
+#[test]
+fn v3_decoder_refuses_every_truncated_prefix_and_trailing_bytes() {
+    let noise = finite_noise();
+    let (bytes, _) = encode(3, &noise);
+    for n in 0..bytes.len() {
+        assert!(
+            decode_action_chunk_v3(&bytes[..n]).is_err(),
+            "prefix {n} decoded"
+        );
+    }
+    let mut extra = bytes.clone();
+    extra.push(0);
+    assert_eq!(decode_action_chunk_v3(&extra), Err(V3Error::TrailingBytes));
+}
+
+#[test]
+fn v3_profile_refuses_every_clock_except_the_reduced_30hz_pair() {
+    use ferric_accept::smolvla_v3::check_so100_clock;
+    assert!(check_so100_clock(SO100_PERIOD_NUM, SO100_PERIOD_DEN, SO100_DT_NUM, SO100_DT_DEN).is_ok());
+    assert_eq!(
+        check_so100_clock(200_000_000, 6, SO100_DT_NUM, SO100_DT_DEN),
+        Err(V3Error::Unreduced)
+    );
+    assert_eq!(
+        check_so100_clock(SO100_PERIOD_NUM, SO100_PERIOD_DEN, 10_000_000, 6),
+        Err(V3Error::Unreduced)
+    );
+    assert_eq!(
+        check_so100_clock(20_000_000, 1, SO100_DT_NUM, SO100_DT_DEN),
+        Err(V3Error::Period)
+    );
+    assert_eq!(
+        check_so100_clock(SO100_PERIOD_NUM, SO100_PERIOD_DEN, 1, 1),
+        Err(V3Error::Dt)
+    );
+    let noise = finite_noise();
+    let mut chunk = chunk_for(3, &noise);
+    chunk.period_num_ns = 200_000_000;
+    chunk.period_den = 6;
+    assert_eq!(
+        encode_action_chunk_v3(&chunk, &noise, 0, SO100_DT_NUM, SO100_DT_DEN).unwrap_err(),
+        V3Error::Unreduced
+    );
+    assert_eq!(
+        encode_action_chunk_v3(&chunk_for(3, &noise), &noise, 0, 10_000_000, 6).unwrap_err(),
+        V3Error::Unreduced
+    );
+}
+
+fn from_hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn v3_fixture_record_locks_lengths_and_hashes() {
+    let root = repo_root();
+    let record_path = root.join("docs/acceptance/contracts/fixtures/smolvla-v3-fixture-record.json");
+    let record_bytes = std::fs::read(&record_path).unwrap();
+    assert_eq!(
+        hex_of(&record_bytes),
+        "e89abc688a40e2702049e6175f316691bbb646e64aa4f7dff3670c96e7777dd3"
+    );
+    let record: serde_json::Value = serde_json::from_slice(&record_bytes).unwrap();
+    let protocol = &record["fixtures"][0];
+    assert_eq!(protocol["canonical_len"], 943);
+    assert_eq!(
+        protocol["digest_sha256"],
+        "4e1722a629708d81221e5c75c1946dcd28af40ab639239bde1ea3893dbb643e5"
+    );
+    let real = &record["fixtures"][1];
+    assert_eq!(real["canonical_len"], 2119);
+    assert_eq!(
+        real["digest_sha256"],
+        "13e82f106898b5a2b1c6fb48f487cf7d6cbe81cb2f8410a71e8f626a2f0c329b"
+    );
+    assert_eq!(
+        real["noise_sha256"],
+        "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c"
+    );
+    for entry in record["fixtures"].as_array().unwrap() {
+        let path = root.join(entry["path"].as_str().unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(hex_of(&bytes), entry["file_sha256"].as_str().unwrap());
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(chunks) = doc.get("chunks").and_then(|v| v.as_array()) {
+            let recorded = entry["chunks"].as_array().unwrap();
+            assert_eq!(chunks.len(), 2);
+            assert!(chunks[0]["k"].as_u64().unwrap() < chunks[1]["k"].as_u64().unwrap());
+            assert_eq!(chunks[0]["chunk_index"], 0);
+            assert_eq!(chunks[1]["chunk_index"], 1);
+            assert_eq!(doc["action_values"], "fixture values, not model output");
+            for (got, want) in chunks.iter().zip(recorded) {
+                let raw = from_hex(got["canonical_hex"].as_str().unwrap());
+                assert_eq!(raw.len(), want["canonical_len"].as_u64().unwrap() as usize);
+                let (chunk, sha) =
+                    ferric_accept::smolvla_v3::decode_action_chunk_v3_with_sha256(&raw).unwrap();
+                assert_eq!(sha, want["digest_sha256"].as_str().unwrap());
+                assert_eq!(sha, got["canonical_sha256"].as_str().unwrap());
+                assert_eq!(chunk.noise_sha256, NOISE_CANONICAL_SHA256);
+                assert_eq!(chunk.stats_key, "so100");
+                assert!(chunk.values.iter().all(|v| v.is_finite()));
+            }
+        } else {
+            let raw = from_hex(doc["canonical_hex"].as_str().unwrap());
+            assert_eq!(raw.len() as u64, entry["canonical_len"].as_u64().unwrap());
+            let (chunk, sha) =
+                ferric_accept::smolvla_v3::decode_action_chunk_v3_with_sha256(&raw).unwrap();
+            assert_eq!(sha, entry["digest_sha256"].as_str().unwrap());
+            assert_eq!(sha, doc["digest_sha256"].as_str().unwrap());
+            assert!(chunk.values.iter().all(|v| v.is_finite()));
+        }
+    }
+    let real_doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(
+            "docs/acceptance/contracts/fixtures/smolvla-chunk-v3-real-noise.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(real_doc["action_values"], "fixture values, not model output");
+    assert_eq!(real_doc["n_action_steps"], 50);
+    assert_eq!(real_doc["noise_sha256"], NOISE_CANONICAL_SHA256);
+    assert_eq!(real_doc["k"], 1);
+}

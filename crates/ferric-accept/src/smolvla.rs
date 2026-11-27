@@ -380,6 +380,57 @@ pub fn action_timestamp_ns(t0_ns: u64, step_duration_ns: u64, index: u32, steps:
         .ok_or(ContractError::StepDurationAbsent)
 }
 
+/// A chunk read back from the shared magic. Version selects the layout.
+#[derive(Debug, Clone)]
+pub enum DecodedChunk {
+    V2 { chunk: ActionChunk, identity: ChunkIdentity },
+    V3(crate::smolvla_v3::ActionChunkV3),
+}
+
+/// Why a chunk could not be decoded. Version 2 contract failures stay [`ContractError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkDecodeError {
+    BadMagic,
+    BadVersion,
+    Truncated,
+    TrailingBytes,
+    BadUtf8,
+    BadHash,
+    BadDtype,
+    BadOrder,
+    UnexpectedCommit,
+    Contract(ContractError),
+    V3(crate::smolvla_v3::V3Error),
+}
+
+/// Branch on the version integer after the shared magic.
+///
+/// Version 2 uses the version 2 layout. Version 3 uses the version 3 layout.
+/// Any other version is refused.
+pub fn decode_action_chunk(bytes: &[u8]) -> Result<DecodedChunk, ChunkDecodeError> {
+    match chunk_version(bytes)? {
+        2 => {
+            let (chunk, identity) = decode_action_chunk_v2(bytes)?;
+            Ok(DecodedChunk::V2 { chunk, identity })
+        }
+        3 => {
+            let chunk = crate::smolvla_v3::decode_action_chunk_v3(bytes).map_err(ChunkDecodeError::V3)?;
+            Ok(DecodedChunk::V3(chunk))
+        }
+        _ => Err(ChunkDecodeError::BadVersion),
+    }
+}
+
+fn chunk_version(bytes: &[u8]) -> Result<u32, ChunkDecodeError> {
+    if bytes.len() < 21 || &bytes[..21] != b"FERRIC-SMOLVLA-CHUNK\0" {
+        return Err(ChunkDecodeError::BadMagic);
+    }
+    if bytes.len() < 25 {
+        return Err(ChunkDecodeError::Truncated);
+    }
+    Ok(u32::from_le_bytes(bytes[21..25].try_into().unwrap()))
+}
+
 /// Canonical bytes, then their sha256. The digest is not appended to the bytes.
 ///
 /// Layout, little-endian, version 2. Strings are a `u32` byte length then UTF-8,
@@ -414,6 +465,96 @@ pub fn encode_action_chunk(chunk: &ActionChunk, id: &ChunkIdentity) -> Result<(V
     }
     let digest = hex(&sha256(&buf));
     Ok((buf, digest))
+}
+
+/// Version 2 decoder. Re-encoding the result with [`encode_action_chunk`] yields the same bytes.
+pub fn decode_action_chunk_v2(bytes: &[u8]) -> Result<(ActionChunk, ChunkIdentity), ChunkDecodeError> {
+    if bytes.len() < 21 || &bytes[..21] != b"FERRIC-SMOLVLA-CHUNK\0" {
+        return Err(ChunkDecodeError::BadMagic);
+    }
+    let mut i = 21;
+    let version = read_u32_v2(bytes, &mut i)?;
+    if version != CHUNK_CODEC_VERSION {
+        return Err(ChunkDecodeError::BadVersion);
+    }
+    let commit = read_str_v2(bytes, &mut i)?;
+    if commit != LEROBOT_COMMIT {
+        return Err(ChunkDecodeError::UnexpectedCommit);
+    }
+    let model_id = read_str_v2(bytes, &mut i)?;
+    let weight_sha256 = read_hash_v2(bytes, &mut i)?;
+    let stats_sha256 = read_hash_v2(bytes, &mut i)?;
+    let noise_sha256 = read_hash_v2(bytes, &mut i)?;
+    let embodiment = read_str_v2(bytes, &mut i)?;
+    let t0_ns = read_u64_v2(bytes, &mut i)?;
+    let step_duration_ns = read_u64_v2(bytes, &mut i)?;
+    let n_action_steps = read_u32_v2(bytes, &mut i)?;
+    let action_dim = read_u32_v2(bytes, &mut i)?;
+    if n_action_steps > CHUNK_SIZE {
+        return Err(ChunkDecodeError::Contract(ContractError::ActionStepsExceedChunk {
+            n_action_steps,
+            chunk_size: CHUNK_SIZE,
+        }));
+    }
+    if action_dim == 0 || action_dim > MAX_ACTION_DIM {
+        return Err(ChunkDecodeError::Contract(ContractError::ActionDimExceedsMax {
+            got: action_dim,
+            max: MAX_ACTION_DIM,
+        }));
+    }
+    let n_joints = read_u32_v2(bytes, &mut i)?;
+    if n_joints != action_dim {
+        return Err(ChunkDecodeError::Contract(ContractError::JointCount {
+            joints: n_joints,
+            action_dim,
+        }));
+    }
+    let value_count = n_action_steps as usize * action_dim as usize;
+    let min_tail = (n_joints as usize) * 20 + 2 + value_count * 4;
+    if bytes.len().saturating_sub(i) < min_tail {
+        return Err(ChunkDecodeError::Truncated);
+    }
+    let mut joints = Vec::with_capacity(n_joints as usize);
+    for _ in 0..n_joints {
+        joints.push(JointMeta {
+            name: read_str_v2(bytes, &mut i)?,
+            unit: read_str_v2(bytes, &mut i)?,
+            frame: read_str_v2(bytes, &mut i)?,
+            min: read_f32_v2(bytes, &mut i)?,
+            max: read_f32_v2(bytes, &mut i)?,
+        });
+    }
+    let dtype = read_u8_v2(bytes, &mut i)?;
+    if dtype != 1 {
+        return Err(ChunkDecodeError::BadDtype);
+    }
+    let order = read_u8_v2(bytes, &mut i)?;
+    if order != 1 {
+        return Err(ChunkDecodeError::BadOrder);
+    }
+    if bytes.len().saturating_sub(i) < value_count * 4 {
+        return Err(ChunkDecodeError::Truncated);
+    }
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(read_f32_v2(bytes, &mut i)?);
+    }
+    if i != bytes.len() {
+        return Err(ChunkDecodeError::TrailingBytes);
+    }
+    let chunk = ActionChunk::try_new(n_action_steps, action_dim, values).map_err(ChunkDecodeError::Contract)?;
+    let identity = ChunkIdentity {
+        model_id,
+        weight_sha256,
+        stats_sha256,
+        noise_sha256,
+        embodiment,
+        t0_ns,
+        step_duration_ns,
+        joints,
+    };
+    check_identity(&chunk, &identity).map_err(ChunkDecodeError::Contract)?;
+    Ok((chunk, identity))
 }
 
 fn check_identity(chunk: &ActionChunk, id: &ChunkIdentity) -> Result<(), ContractError> {
@@ -499,6 +640,56 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
 
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+fn read_exact_v2<'a>(bytes: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], ChunkDecodeError> {
+    let end = i.checked_add(n).ok_or(ChunkDecodeError::Truncated)?;
+    if end > bytes.len() {
+        return Err(ChunkDecodeError::Truncated);
+    }
+    let s = &bytes[*i..end];
+    *i = end;
+    Ok(s)
+}
+
+fn read_u8_v2(bytes: &[u8], i: &mut usize) -> Result<u8, ChunkDecodeError> {
+    Ok(read_exact_v2(bytes, i, 1)?[0])
+}
+
+fn read_u32_v2(bytes: &[u8], i: &mut usize) -> Result<u32, ChunkDecodeError> {
+    let s = read_exact_v2(bytes, i, 4)?;
+    Ok(u32::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_u64_v2(bytes: &[u8], i: &mut usize) -> Result<u64, ChunkDecodeError> {
+    let s = read_exact_v2(bytes, i, 8)?;
+    Ok(u64::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_f32_v2(bytes: &[u8], i: &mut usize) -> Result<f32, ChunkDecodeError> {
+    let s = read_exact_v2(bytes, i, 4)?;
+    Ok(f32::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_hash_v2(bytes: &[u8], i: &mut usize) -> Result<String, ChunkDecodeError> {
+    let s = read_exact_v2(bytes, i, 64)?;
+    let text = std::str::from_utf8(s).map_err(|_| ChunkDecodeError::BadUtf8)?;
+    if !is_sha256(text) {
+        return Err(ChunkDecodeError::BadHash);
+    }
+    Ok(text.to_string())
+}
+
+fn read_str_v2(bytes: &[u8], i: &mut usize) -> Result<String, ChunkDecodeError> {
+    let n = read_u32_v2(bytes, i)? as usize;
+    let rest = bytes.len().checked_sub(*i).ok_or(ChunkDecodeError::Truncated)?;
+    if n > rest {
+        return Err(ChunkDecodeError::Truncated);
+    }
+    let s = read_exact_v2(bytes, i, n)?;
+    std::str::from_utf8(s)
+        .map(|t| t.to_string())
+        .map_err(|_| ChunkDecodeError::BadUtf8)
 }
 
 #[cfg(test)]
