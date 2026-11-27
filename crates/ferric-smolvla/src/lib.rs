@@ -431,6 +431,86 @@ mod tests {
     }
 
     #[test]
+    fn real_noise_golden_matches_seed_0x5a17() {
+        let noise = noise_from_seed(0x5a17).unwrap();
+        let noise_hash = sha256_hex(&canonical_noise_bytes(0x5a17, &noise));
+        assert_eq!(
+            noise_hash,
+            "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c"
+        );
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/acceptance/contracts/fixtures");
+        let row = [0.0f32, 0.0, 0.0, 50.0, 90.0, 10.0];
+        let mut values50 = Vec::new();
+        for _ in 0..50 {
+            values50.extend_from_slice(&row);
+        }
+        let chunk = |steps: u32, values: Vec<f32>, t0_num: u64, t0_den: u64| {
+            ferric_accept::smolvla_v3::ActionChunkV3 {
+                lerobot_commit: ferric_accept::smolvla::LEROBOT_COMMIT.into(),
+                model_id: ferric_accept::smolvla::MODEL_ID.into(),
+                weight_sha256: ferric_accept::smolvla_v3::WEIGHT_SHA256.into(),
+                stats_sha256: ferric_accept::smolvla_v3::STATS_FILE_SHA256.into(),
+                stats_key: "so100".into(),
+                action_mean_sha256: ferric_accept::smolvla_v3::SO100_ACTION_MEAN.into(),
+                action_std_sha256: ferric_accept::smolvla_v3::SO100_ACTION_STD.into(),
+                state_mean_sha256: ferric_accept::smolvla_v3::STATE_MEAN_SHA256.into(),
+                state_std_sha256: ferric_accept::smolvla_v3::STATE_STD_SHA256.into(),
+                noise_sha256: noise_hash.clone(),
+                seed: 0x5a17,
+                embodiment: "so100".into(),
+                t0_num_ns: t0_num,
+                t0_den: t0_den,
+                period_num_ns: 100_000_000,
+                period_den: 3,
+                n_action_steps: steps,
+                action_dim: 6,
+                joints: ferric_accept::smolvla_v3::so100_joints(),
+                values,
+            }
+        };
+        let encode = |c: &ferric_accept::smolvla_v3::ActionChunkV3| {
+            ferric_accept::smolvla_v3::encode_action_chunk_v3(c, &noise, 0, 5_000_000, 3).unwrap()
+        };
+        let real: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("smolvla-chunk-v3-real-noise.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(real["action_values"], "fixture values, not model output");
+        assert_eq!(real["noise_sha256"], noise_hash);
+        assert_eq!(real["n_action_steps"], 50);
+        let (bytes, digest) = encode(&chunk(50, values50, 100_000_000, 3));
+        assert_eq!(bytes.len(), 2119);
+        assert_eq!(digest, "13e82f106898b5a2b1c6fb48f487cf7d6cbe81cb2f8410a71e8f626a2f0c329b");
+        assert_eq!(digest, real["digest_sha256"]);
+        assert_eq!(hex_bytes(&bytes), real["canonical_hex"].as_str().unwrap());
+        let seq: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("smolvla-chunk-v3-sequence.json")).unwrap(),
+        )
+        .unwrap();
+        let (b0, d0) = encode(&chunk(1, row.to_vec(), 0, 1));
+        let (b1, d1) = encode(&chunk(1, row.to_vec(), 100_000_000, 3));
+        let chunks = seq["chunks"].as_array().unwrap();
+        assert_eq!(chunks[0]["chunk_index"], 0);
+        assert_eq!(chunks[1]["chunk_index"], 1);
+        assert!(chunks[0]["k"].as_u64().unwrap() < chunks[1]["k"].as_u64().unwrap());
+        assert_eq!(d0, chunks[0]["digest_sha256"]);
+        assert_eq!(d1, chunks[1]["digest_sha256"]);
+        assert_eq!(hex_bytes(&b0), chunks[0]["canonical_hex"].as_str().unwrap());
+        assert_eq!(hex_bytes(&b1), chunks[1]["canonical_hex"].as_str().unwrap());
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0xf) as usize] as char);
+        }
+        s
+    }
+
+    #[test]
     fn state_proj_column_matches_the_extracted_weights() {
         let bytes = include_bytes!("../../ferric-fleet/tests/fixtures/state_proj.safetensors");
         let store = weights::Store::open_bytes(bytes).unwrap();

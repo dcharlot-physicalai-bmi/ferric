@@ -241,41 +241,52 @@ pub fn decode_action_chunk_v3(bytes: &[u8]) -> Result<ActionChunkV3, V3Error> {
     if version != CHUNK_VERSION_V3 {
         return Err(V3Error::BadVersion);
     }
-    let chunk = ActionChunkV3 {
-        lerobot_commit: read_str(bytes, &mut i)?,
-        model_id: read_str(bytes, &mut i)?,
-        weight_sha256: read_hash(bytes, &mut i)?,
-        stats_sha256: read_hash(bytes, &mut i)?,
-        stats_key: read_str(bytes, &mut i)?,
-        action_mean_sha256: read_hash(bytes, &mut i)?,
-        action_std_sha256: read_hash(bytes, &mut i)?,
-        state_mean_sha256: read_hash(bytes, &mut i)?,
-        state_std_sha256: read_hash(bytes, &mut i)?,
-        noise_sha256: read_hash(bytes, &mut i)?,
-        seed: read_u64(bytes, &mut i)?,
-        embodiment: read_str(bytes, &mut i)?,
-        t0_num_ns: read_u64(bytes, &mut i)?,
-        t0_den: read_u64(bytes, &mut i)?,
-        period_num_ns: read_u64(bytes, &mut i)?,
-        period_den: read_u64(bytes, &mut i)?,
-        n_action_steps: read_u32(bytes, &mut i)?,
-        action_dim: read_u32(bytes, &mut i)?,
-        joints: {
-            let n = read_u32(bytes, &mut i)?;
-            let mut joints = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                joints.push(JointV3 {
-                    name: read_str(bytes, &mut i)?,
-                    unit: read_str(bytes, &mut i)?,
-                    frame: read_str(bytes, &mut i)?,
-                    min: read_f32(bytes, &mut i)?,
-                    max: read_f32(bytes, &mut i)?,
-                });
-            }
-            joints
-        },
-        values: Vec::new(),
-    };
+    let lerobot_commit = read_str(bytes, &mut i)?;
+    let model_id = read_str(bytes, &mut i)?;
+    let weight_sha256 = read_hash(bytes, &mut i)?;
+    let stats_sha256 = read_hash(bytes, &mut i)?;
+    let stats_key = read_str(bytes, &mut i)?;
+    let action_mean_sha256 = read_hash(bytes, &mut i)?;
+    let action_std_sha256 = read_hash(bytes, &mut i)?;
+    let state_mean_sha256 = read_hash(bytes, &mut i)?;
+    let state_std_sha256 = read_hash(bytes, &mut i)?;
+    let noise_sha256 = read_hash(bytes, &mut i)?;
+    let seed = read_u64(bytes, &mut i)?;
+    let embodiment = read_str(bytes, &mut i)?;
+    let t0_num_ns = read_u64(bytes, &mut i)?;
+    let t0_den = read_u64(bytes, &mut i)?;
+    let period_num_ns = read_u64(bytes, &mut i)?;
+    let period_den = read_u64(bytes, &mut i)?;
+    let n_action_steps = read_u32(bytes, &mut i)?;
+    let action_dim = read_u32(bytes, &mut i)?;
+    // Header counts are untrusted. Check them before any Vec is sized from them.
+    if !(1..=50).contains(&n_action_steps) {
+        return Err(V3Error::ActionSteps);
+    }
+    if action_dim != 6 {
+        return Err(V3Error::ActionDim);
+    }
+    let joint_count = read_u32(bytes, &mut i)?;
+    if joint_count != 6 || joint_count != action_dim {
+        return Err(V3Error::JointCount);
+    }
+    let value_count = n_action_steps as usize * action_dim as usize;
+    // Six joints are at least 20 bytes each (three length prefixes and two f32s),
+    // then the dtype byte, the order byte, and the f32 values.
+    let min_tail = 6 * 20 + 2 + value_count * 4;
+    if bytes.len().saturating_sub(i) < min_tail {
+        return Err(V3Error::Truncated);
+    }
+    let mut joints = Vec::with_capacity(6);
+    for _ in 0..6 {
+        joints.push(JointV3 {
+            name: read_str(bytes, &mut i)?,
+            unit: read_str(bytes, &mut i)?,
+            frame: read_str(bytes, &mut i)?,
+            min: read_f32(bytes, &mut i)?,
+            max: read_f32(bytes, &mut i)?,
+        });
+    }
     let dtype = read_u8(bytes, &mut i)?;
     if dtype != 1 {
         return Err(V3Error::BadDtype);
@@ -284,27 +295,50 @@ pub fn decode_action_chunk_v3(bytes: &[u8]) -> Result<ActionChunkV3, V3Error> {
     if order != 1 {
         return Err(V3Error::BadOrder);
     }
-    if !(1..=50).contains(&chunk.n_action_steps) || chunk.action_dim != 6 {
-        return Err(if chunk.action_dim != 6 {
-            V3Error::ActionDim
-        } else {
-            V3Error::ActionSteps
-        });
+    if bytes.len().saturating_sub(i) < value_count * 4 {
+        return Err(V3Error::Truncated);
     }
-    let count = chunk.n_action_steps as usize * chunk.action_dim as usize;
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
         values.push(read_f32(bytes, &mut i)?);
     }
     if i != bytes.len() {
         return Err(V3Error::TrailingBytes);
     }
-    let mut chunk = chunk;
-    chunk.values = values;
+    let chunk = ActionChunkV3 {
+        lerobot_commit,
+        model_id,
+        weight_sha256,
+        stats_sha256,
+        stats_key,
+        action_mean_sha256,
+        action_std_sha256,
+        state_mean_sha256,
+        state_std_sha256,
+        noise_sha256,
+        seed,
+        embodiment,
+        t0_num_ns,
+        t0_den,
+        period_num_ns,
+        period_den,
+        n_action_steps,
+        action_dim,
+        joints,
+        values,
+    };
     // Decoder checks. A zero-length noise payload is not in the chunk; finiteness of
     // the action values is. The seed refusal is.
     validate_decoded(&chunk)?;
     Ok(chunk)
+}
+
+/// Decoded version 3 chunk and SHA-256 of `bytes`.
+///
+/// Binding 1 calls that digest `chunk_sha256`. It is not a suffix of the bytes.
+pub fn decode_action_chunk_v3_with_sha256(bytes: &[u8]) -> Result<(ActionChunkV3, String), V3Error> {
+    let chunk = decode_action_chunk_v3(bytes)?;
+    Ok((chunk, hex(&sha256(bytes))))
 }
 
 fn write_chunk(buf: &mut Vec<u8>, chunk: &ActionChunkV3) {
@@ -353,6 +387,7 @@ fn check_chunk(
     if chunk.seed & 1 == 0 {
         return Err(V3Error::EvenSeed);
     }
+    refuse_placeholder_hashes(chunk)?;
     let expect = noise_sha256(chunk.seed, noise)?;
     if chunk.noise_sha256 != expect {
         return Err(V3Error::NoiseHashMismatch);
@@ -381,6 +416,7 @@ fn validate_decoded(chunk: &ActionChunkV3) -> Result<(), V3Error> {
     {
         return Err(V3Error::Embodiment);
     }
+    refuse_placeholder_hashes(chunk)?;
     for hash in [
         chunk.weight_sha256.as_str(),
         chunk.stats_sha256.as_str(),
@@ -505,6 +541,28 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+fn refuse_placeholder_hashes(chunk: &ActionChunkV3) -> Result<(), V3Error> {
+    for hash in [
+        chunk.weight_sha256.as_str(),
+        chunk.stats_sha256.as_str(),
+        chunk.action_mean_sha256.as_str(),
+        chunk.action_std_sha256.as_str(),
+        chunk.state_mean_sha256.as_str(),
+        chunk.state_std_sha256.as_str(),
+        chunk.noise_sha256.as_str(),
+    ] {
+        if is_placeholder_hash(hash) {
+            return Err(V3Error::MissingHash);
+        }
+    }
+    Ok(())
+}
+
+/// `"11" * 32` and `"22" * 32`. Those strings are not values of any header hash.
+fn is_placeholder_hash(s: &str) -> bool {
+    s.len() == 64 && (s.bytes().all(|c| c == b'1') || s.bytes().all(|c| c == b'2'))
+}
+
 fn is_sha256(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
@@ -516,34 +574,41 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+fn read_exact<'a>(bytes: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], V3Error> {
+    let end = i.checked_add(n).ok_or(V3Error::Truncated)?;
+    if end > bytes.len() {
+        return Err(V3Error::Truncated);
+    }
+    let s = &bytes[*i..end];
+    *i = end;
+    Ok(s)
+}
+
 fn read_u8(bytes: &[u8], i: &mut usize) -> Result<u8, V3Error> {
-    let b = *bytes.get(*i).ok_or(V3Error::Truncated)?;
-    *i += 1;
-    Ok(b)
+    Ok(read_exact(bytes, i, 1)?[0])
 }
 
 fn read_u32(bytes: &[u8], i: &mut usize) -> Result<u32, V3Error> {
-    let s = bytes.get(*i..*i + 4).ok_or(V3Error::Truncated)?;
-    *i += 4;
+    let s = read_exact(bytes, i, 4)?;
     Ok(u32::from_le_bytes(s.try_into().unwrap()))
 }
 
 fn read_u64(bytes: &[u8], i: &mut usize) -> Result<u64, V3Error> {
-    let s = bytes.get(*i..*i + 8).ok_or(V3Error::Truncated)?;
-    *i += 8;
+    let s = read_exact(bytes, i, 8)?;
     Ok(u64::from_le_bytes(s.try_into().unwrap()))
 }
 
 fn read_f32(bytes: &[u8], i: &mut usize) -> Result<f32, V3Error> {
-    let s = bytes.get(*i..*i + 4).ok_or(V3Error::Truncated)?;
-    *i += 4;
+    let s = read_exact(bytes, i, 4)?;
     Ok(f32::from_le_bytes(s.try_into().unwrap()))
 }
 
 fn read_hash(bytes: &[u8], i: &mut usize) -> Result<String, V3Error> {
-    let s = bytes.get(*i..*i + 64).ok_or(V3Error::Truncated)?;
-    *i += 64;
+    let s = read_exact(bytes, i, 64)?;
     let text = std::str::from_utf8(s).map_err(|_| V3Error::BadUtf8)?;
+    if is_placeholder_hash(text) {
+        return Err(V3Error::MissingHash);
+    }
     if !is_sha256(text) {
         return Err(V3Error::BadHash);
     }
@@ -552,8 +617,11 @@ fn read_hash(bytes: &[u8], i: &mut usize) -> Result<String, V3Error> {
 
 fn read_str(bytes: &[u8], i: &mut usize) -> Result<String, V3Error> {
     let n = read_u32(bytes, i)? as usize;
-    let s = bytes.get(*i..*i + n).ok_or(V3Error::Truncated)?;
-    *i += n;
+    let rest = bytes.len().checked_sub(*i).ok_or(V3Error::Truncated)?;
+    if n > rest {
+        return Err(V3Error::Truncated);
+    }
+    let s = read_exact(bytes, i, n)?;
     std::str::from_utf8(s)
         .map(|t| t.to_string())
         .map_err(|_| V3Error::BadUtf8)

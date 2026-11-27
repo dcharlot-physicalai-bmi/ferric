@@ -287,7 +287,21 @@ fn gpu(args: &[String]) -> Result<String, String> {
     }).to_string())
 }
 
+fn required_sha(args: &[String], name: &str) -> Result<String, String> {
+    let Some(value) = flag(args, name) else {
+        return Err(format!("missing {name}"));
+    };
+    let placeholder = value.len() == 64
+        && (value.bytes().all(|c| c == b'1') || value.bytes().all(|c| c == b'2'));
+    if placeholder {
+        return Err(format!("{name} placeholder is refused"));
+    }
+    Ok(value.to_string())
+}
+
 fn simulate(args: &[String]) -> Result<String, String> {
+    let stats_sha256 = required_sha(args, "--stats-sha")?;
+    let noise_sha256 = required_sha(args, "--noise-sha")?;
     let actions_path = flag(args, "--actions").ok_or("--actions")?;
     let joints_path = flag(args, "--joints").ok_or("--joints")?;
     let bytes = fs::read(actions_path).map_err(|e| e.to_string())?;
@@ -298,8 +312,8 @@ fn simulate(args: &[String]) -> Result<String, String> {
     let id = ChunkIdentity {
         model_id: "lerobot/smolvla_base".into(),
         weight_sha256: flag(args, "--weight-sha").unwrap_or("7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb").to_string(),
-        stats_sha256: flag(args, "--stats-sha").map(|s| s.to_string()).unwrap_or_else(|| "11".repeat(32)),
-        noise_sha256: flag(args, "--noise-sha").map(|s| s.to_string()).unwrap_or_else(|| "22".repeat(32)),
+        stats_sha256,
+        noise_sha256,
         embodiment: flag(args, "--embodiment").unwrap_or("simulation-embodiment").into(),
         t0_ns: t0,
         step_duration_ns: step,
@@ -891,4 +905,39 @@ fn gpu_energy(args: &[String]) -> Result<String, String> {
 
 fn session_idle_sleep(s: f64) {
     std::thread::sleep(Duration::from_secs_f64(s));
+}
+
+#[cfg(test)]
+mod hash_flags {
+    use super::*;
+
+    #[test]
+    fn simulate_refuses_a_missing_or_placeholder_hash() {
+        let missing = simulate(&["--actions".into(), "x".into(), "--joints".into(), "y".into()]).unwrap_err();
+        assert_eq!(missing, "missing --stats-sha");
+        let stats_only = simulate(&[
+            "--stats-sha".into(),
+            "ab".repeat(32),
+            "--actions".into(),
+            "x".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(stats_only, "missing --noise-sha");
+        let ones = simulate(&[
+            "--stats-sha".into(),
+            "1".repeat(64),
+            "--noise-sha".into(),
+            "ab".repeat(32),
+        ])
+        .unwrap_err();
+        assert_eq!(ones, "--stats-sha placeholder is refused");
+        let twos = simulate(&[
+            "--stats-sha".into(),
+            "ab".repeat(32),
+            "--noise-sha".into(),
+            "2".repeat(64),
+        ])
+        .unwrap_err();
+        assert_eq!(twos, "--noise-sha placeholder is refused");
+    }
 }
