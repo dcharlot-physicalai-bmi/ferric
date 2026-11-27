@@ -26,9 +26,9 @@ Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, n
 | string | stats key, one of `so100`, `so100-blue`, `so100-red` |
 | 64 | noise sha256 |
 | string | embodiment name |
-| u64 | `t0_num` |
+| u64 | `t0_num_ns` |
 | u64 | `t0_den` |
-| u64 | `period_num` |
+| u64 | `period_num_ns` |
 | u64 | `period_den` |
 | u32 | `n_action_steps` |
 | u32 | `action_dim` |
@@ -43,8 +43,8 @@ Little-endian, same string rule as version 2: a `u32` byte length, then UTF-8, n
 Every product and sum used to place step `k` is checked `u128`. Overflow refuses the chunk. Step `k` (0-based, `k < n_action_steps`) is the rational
 
 ```
-t(k) = t0_num / t0_den + k * period_num / period_den
-     = (t0_num * period_den + k * period_num * t0_den) / (t0_den * period_den)
+t(k) = t0_num_ns / t0_den + k * period_num_ns / period_den
+     = (t0_num_ns * period_den + k * period_num_ns * t0_den) / (t0_den * period_den)
 ```
 
 The digest stores the four reduced inputs, not this sum. A caller who asks for an integer nanosecond gets one only when the denominator divides the numerator exactly. Otherwise that conversion is refused. The rational itself is the time.
@@ -77,7 +77,28 @@ The normative SO-100 names are the `svla_so100_pickplace` action names, in that 
 
 `svla_so101_pickplace` records a different action-name spelling of the same six motors: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`, `wrist_roll.pos`, `gripper.pos`. That spelling is not this table. A mixed list, a reordering, or a `.pos` name in an SO-100 chunk is refused. `action_dim` for this embodiment is 6.
 
-`min` and `max` stay caller limits with `min < max`, both finite, as in version 2. This text does not invent a degree interval.
+Embodiment token: `so100`. That is `robot_type` in the dataset info below, and it is the stats key `so100` (not `so100-blue` or `so100-red`).
+
+Frame token, every joint: `so100_joint`. `meta/info.json` has no frame field. The token names the `so_follower` joint-command space, not a Cartesian frame. Any other frame string on this embodiment is refused.
+
+Limits are a closed interval, `min < max`, value inside, as in version 2. The gripper limit is the `RANGE_0_100` interval, 0 to 100, not the dataset's observed maximum. The five arm limits are the dataset `action` min and max. Those are observed extrema in `meta/stats.json`, not a mechanical stop in `so_follower.py`.
+
+| Index | min | max |
+|---|---|---|
+| 0 `main_shoulder_pan` | -37.177734375 | 72.7734375 |
+| 1 `main_shoulder_lift` | -89.47265625 | 41.1328125 |
+| 2 `main_elbow_flex` | -49.04296875 | 74.619140625 |
+| 3 `main_wrist_flex` | 9.66796875 | 96.591796875 |
+| 4 `main_wrist_roll` | 56.25 | 123.57421875 |
+| 5 `main_gripper` | 0 | 100 |
+
+The dataset's observed gripper action max is 34.93077850341797. A command between that and 100 is still inside the mode interval and is accepted. A command outside 0–100 is refused.
+
+## Dataset meta
+
+`lerobot/svla_so100_pickplace` `meta/info.json` is pinned at Hub revision `728583b5eaf9e739a7f119e2def466fa1d552402` (dataset `sha` on 2026-11-27). The file sha256 is `aec8d0c7bd3d2dc693c160bd58f9fb6aabcbb24d4b28e2f09950a3aa6b246eef`. It records `robot_type` `so100`, `fps` 30, and the six action names above. It does not state units.
+
+`meta/stats.json` at the same revision has sha256 `5f53e159022a2ecf14bb01dd0623fcc498bffa719a776f1ef1858c6098169b89`. The arm min and max in the table above are `action.min` and `action.max` from that file. The units in the joint table are derived, not read from the dataset: `src/lerobot/robots/so_follower/so_follower.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 50–59, with `use_degrees: bool = True` at `config_so_follower.py:42`.
 
 ## Stats key
 
@@ -95,6 +116,79 @@ Each tensor is six little-endian f32s. The sha256 is of those 24 bytes:
 | `so100-red` | `so100-red.buffer.action.std` | `4deb2fcd2af0aa4667f6b09748b5e527e543ca36c13e204b75273e7cc62c8bf6` |
 
 A chunk records one of those three keys. A missing key, a different key, or a tensor sha256 that does not match the row is refused.
+
+Embodiment and dataset pick the key:
+
+| Embodiment token | Dataset | Stats key |
+|---|---|---|
+| `so100` | `lerobot/svla_so100_pickplace` | `so100` |
+| `so100-blue` | a blue SO-100 policy that names that prefix | `so100-blue` |
+| `so100-red` | a red SO-100 policy that names that prefix | `so100-red` |
+
+`so100-blue` and `so100-red` are keys in the same safetensors file. They are not `svla_so100_pickplace`. A `so100` chunk that cites `so100-blue` is refused.
+
+The header carries each tensor sha256, not only the file sha256. For the action key that is the two rows above. For STATE, the model safetensors has no `observation.state` tensors. STATE mean and std come from `meta/stats.json` `observation.state` at the revision above, cast to little-endian f32 in joint order. Their sha256 values, of those 24 bytes, are:
+
+| Tensor | sha256 |
+|---|---|
+| `observation.state` mean | `c0087077ccbf5362ee8dab2ec5cae2ee915123b176ade6c0be1fad3feb7a7eca` |
+| `observation.state` std | `09d52284cad4193fdaf1fe35c89dab6aa2711514b3043296b7811c13cb8f13ef` |
+
+MEAN_STD is `src/lerobot/processor/normalize_processor.py` at `a0eb860d1e4d566157dd0eba11b5c86f9ea7d07a`, lines 349–362, `eps` default `1e-8` (line 97), and the saved preprocessor and postprocessor configs both set `"eps": 1e-08`.
+
+Forward, STATE into the network: `(x - mean) / (std + 1e-8)`.
+
+Inverse, ACTION out of the network: `y * std + mean`. The inverse does not add epsilon. A missing mean or std for a MEAN_STD feature is refused. It is not IDENTITY.
+
+## Noise
+
+`noise_sha256` is SHA-256 of this byte string, and of nothing smaller:
+
+1. UTF-8 `f32`.
+2. `u32` little-endian rank `3`.
+3. Three `u64` little-endian extents: `1`, `50`, `32`. That is `x_T` shaped `(batch, chunk_size, max_action_dim)`.
+4. UTF-8 `le`.
+5. The `50 * 32` little-endian f32 payload, time-major then joint.
+6. The `u64` little-endian seed.
+7. UTF-8 `xorshift64-box-muller-v1`.
+
+The payload is `noise_from_seed` in `crates/ferric-smolvla/src/lib.rs`: state starts at `seed | 1`; each step is `x ^= x << 13; x ^= x >> 7; x ^= x << 17`; the unit is `(x >> 11) as f64 / 2^53`; pairs go through Box–Muller and are cast to f32. A missing noise hash is refused. The placeholders `"11" * 32` and `"22" * 32` are not values of this hash.
+
+## Interop with ferromorphic-chunk-binding 1
+
+The binding's chunk fields, and where they sit in this canonical layout:
+
+| Binding field | Ferric field |
+|---|---|
+| `chunk_sha256` | `digest_sha256`, SHA-256 of the full canonical bytes, magic and header included |
+| `t0_num_ns` | `t0_num_ns` |
+| `t0_den` | `t0_den` |
+| `period_num_ns` | `period_num_ns` |
+| `period_den` | `period_den` |
+| `n_action_steps` | `n_action_steps` |
+| `envelope_sha256` | not a byte of the chunk. The envelope that cites this chunk carries it. |
+| `epoch` | not a byte of the chunk. The envelope carries it. |
+| `chunk_index` | not a byte of the chunk. The envelope carries it, and it is strictly increasing inside one episode. |
+
+The chunk period `period_num_ns / period_den` must equal the envelope's `period_num_ns / period_den` exactly, both rationals already reduced. A chunk whose period is a different reduced fraction is refused.
+
+`t0` must equal `origin_ns + k · period` for some integer `k`, with `origin_ns` and `period` taken from the episode below. The sum is the checked `u128` arithmetic above. A `t0` that is not on that grid is refused.
+
+## ferromorphic-episode 2
+
+Fields, in this order:
+
+1. `version`
+2. `epoch`
+3. `dt_num_ns`
+4. `dt_den`
+5. `dt_bits`
+6. `period_num_ns`
+7. `period_den`
+8. `origin_ns`
+9. `episode_nonce`
+
+For this SO-100 contract the only legal clock is 30 Hz with 20 substeps. `period_num_ns / period_den` is `100000000/3`. `dt_num_ns / dt_den` is `5000000/3`, which is that period divided by 20. Both fractions are already reduced (`gcd` with 3 is 1). Any other period or dt is refused.
 
 ## Provenance
 

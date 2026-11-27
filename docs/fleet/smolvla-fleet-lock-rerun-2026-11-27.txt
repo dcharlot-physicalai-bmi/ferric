@@ -1,0 +1,55 @@
+# Re-run of the SmolVLA stage and llvmpipe receipts on the fleet lock
+
+The receipts had been labelled with Cargo.lock sha256
+dfb4e8fc5938342b51ec51dbf427c4fc9dade5ace975e27eaa4e2b3ce0342565
+before this log existed. This run is that lock, on Ubuntu 24.04, glibc 2.39.
+
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+commit-hash 0ef1bc386059596dada8fb65b50425aab2ea637a
+LLVM 23.1.5
+cargo 1.100.0
+command prefix: cargo +1.100.0 build --locked --release -p ferric-smolvla
+
+## CPU versus PyTorch 2.15.0+cpu
+
+ferric-smolvla network-forward
+  --weights model.safetensors (sha256 7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb)
+  --stats policy_preprocessor_step_5_normalizer_processor.safetensors
+  --tokenizer crates/ferric-smolvla/tests/fixtures/tokenizer.json
+  --trace-dir /tmp/smolvla-fleet-rerun
+
+scripts/smolvla_f32_reference.py --dtype f32 on that trace.
+
+Compared with docs/fleet/smolvla-f32-reference.json stage objects
+(max_abs, rmse, n). Every stage matched:
+
+prepared_image0 MATCH
+patch_token0 MATCH
+vision_l0_token0 MATCH
+vision_post_token0 MATCH
+connector_token0 MATCH  max_abs 0.0001068115234375
+state_token MATCH
+text_l0_k_token0 MATCH
+velocity0 MATCH
+raw_actions MATCH  max_abs 3.2782554626464844e-06
+
+## llvmpipe versus that CPU
+
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+GALLIUM_OVERRIDE_CPU_CAPS=avx
+LP_NATIVE_VECTOR_WIDTH=256
+ferric-smolvla gpu, same weights and tokenizer.
+
+Compared with docs/fleet/smolvla-wgpu-llvmpipe.json. Matched:
+
+adapter llvmpipe (LLVM 20.1.2, 256 bits)
+dispatches 27482
+completions 66
+readbacks 398
+raw_action_max_abs_vs_cpu 4.76837158203125e-06
+raw_action_rmse_vs_cpu 6.619673058594344e-07
+connector_token0_max_abs_vs_cpu 0.0001678466796875
+velocity0_max_abs_vs_cpu 3.0994415283203125e-06
+weight_sha256 7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb
+
+No energy counters were read. The RADV value was not touched.

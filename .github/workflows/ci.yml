@@ -42,6 +42,7 @@ jobs:
       # assertion. Metal and Kani do not read it.
       GALLIUM_OVERRIDE_CPU_CAPS: avx
       LP_NATIVE_VECTOR_WIDTH: "256"
+      FERRIC_REQUIRE_ADAPTER: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -84,6 +85,9 @@ jobs:
       # at once. One test at a time, the same ferric-llama binary passed 168 and ignored
       # 1 (run 43456824764, gdb, --test-threads=1); the parallel workspace step then died
       # with signal 11. Every assertion still runs. Metal keeps the parallel suite.
+      - name: numpy for the det_tanh table generator
+        run: sudo apt-get update && sudo apt-get install -y python3-numpy
+
       - name: Test workspace
         run: cargo --locked test --workspace --verbose -- --test-threads=1
 
@@ -91,7 +95,7 @@ jobs:
       # above because a debug build of a billion f64 tanh calls does not fit
       # the job. This is the lock on the 1 ulp bound.
       - name: Exhaustive det_tanh sweep
-        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1
+        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1 --nocapture
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
@@ -189,6 +193,8 @@ jobs:
     timeout-minutes: 70
     name: build + validate (real Metal)
     runs-on: macos-latest
+    env:
+      FERRIC_REQUIRE_ADAPTER: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -201,6 +207,9 @@ jobs:
       - name: Build workspace
         run: cargo --locked build --workspace --verbose
 
+      - name: numpy for the det_tanh table generator
+        run: python3 -c 'import numpy' || pip3 install --user numpy
+
       - name: Test workspace
         run: cargo --locked test --workspace --verbose
 
@@ -208,7 +217,7 @@ jobs:
       # disagreement here is a contraction or a runtime difference, not a
       # second algorithm.
       - name: Exhaustive det_tanh sweep
-        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1
+        run: cargo --locked test --release -p ferric-core --lib det_tanh_every_finite_f32 -- --ignored --test-threads=1 --nocapture
 
       - name: Build browser target (wasm32 + WebGPU)
         # Every crate that claims to be wasm-clean is built here, so the claim is CI-enforced rather
