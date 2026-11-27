@@ -1,14 +1,19 @@
 //! Deterministic `ln`, `sin`, and `cos` for [`crate::noise_from_seed`].
 //!
-//! These are the Sun fdlibm algorithms (public domain, notice preserved below),
-//! evaluated with IEEE-754 round-to-nearest operations and no platform libm call.
-//! `f64::sqrt` is the IEEE-754 square root, one correctly rounded operation.
+//! These are ferric's functions. They use IEEE-754 round-to-nearest operations
+//! and do not call platform libm. `f64::sqrt` is the IEEE-754 square root.
 //!
-//! `ln` is `__ieee754_log` from fdlibm `e_log.c`: the error analysis there bounds
-//! the error by less than 1 ulp. `sin` and `cos` are fdlibm `s_sin.c`, `s_cos.c`,
-//! `k_sin.c`, `k_cos.c`, and `e_rem_pio2.c`. On `[-π/4, π/4]` the kernel remainder
-//! is at most `2^-58`. Argument reduction for `|x| < 2^20·π/2` is the medium path
-//! in `e_rem_pio2.c`, which covers every Box–Muller angle `2·π·u2`.
+//! `ln` follows fdlibm `e_log.c` (`__ieee754_log`). That file's error analysis
+//! bounds the error by less than 1 ulp. The SunPro notice from `e_log.c` is
+//! preserved below.
+//!
+//! `k_sin`, `k_cos`, and `rem_pio2` follow the FreeBSD msun sources as revised
+//! in musl 1.2.5, not the Sun 5.3 qx form. The cosine return is musl `__cos.c`
+//! lines 67–70 (`w + (((1-w)-hz) + (z*r-x*y))`). The reduction constants are
+//! musl `__rem_pio2.c` lines 38–39, and the medium-size correction is lines
+//! 119–132. FreeBSD `k_cos.c` line 74 is that same return. On `[-π/4, π/4]`
+//! the kernel remainder is at most `2^-58`. The medium path covers every
+//! Box–Muller angle `2·π·u2`.
 //!
 //! Copyright (C) 1993 by Sun Microsystems, Inc. Permission to use, copy, modify,
 //! and distribute this software is freely granted, provided that this notice is

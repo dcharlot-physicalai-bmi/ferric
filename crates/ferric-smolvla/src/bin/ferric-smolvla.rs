@@ -95,7 +95,7 @@ fn load_case(args: &[String]) -> Result<Case, String> {
         image_bytes.extend(ferric_smolvla::f32_bytes(&img));
         images.push(img);
     }
-    let noise = noise_from_seed(seed);
+    let noise = noise_from_seed(seed)?;
     Ok(Case {
         weights,
         stats,

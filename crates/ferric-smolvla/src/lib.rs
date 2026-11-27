@@ -56,17 +56,17 @@ pub fn synthetic_image(cam: usize, h: usize, w: usize) -> Vec<f32> {
     v
 }
 
-pub fn noise_from_seed(seed: u64) -> Vec<f32> {
-    // `seed | 1` makes an even seed and the next odd seed the same sequence.
-    // Version 3 refuses the even seed. This function still applies the mask so
-    // the odd seed, including 0x5a17, keeps the bytes already in the receipts.
+pub fn noise_from_seed(seed: u64) -> Result<Vec<f32>, String> {
+    // `seed | 1` would make an even seed and the next odd seed the same payload.
+    // Version 3 refuses the even caller seed instead of emitting that payload.
+    if seed & 1 == 0 {
+        return Err(format!("even noise seed {seed:#x} is refused"));
+    }
     let mut state = seed | 1;
     let mut out = Vec::with_capacity(NOISE_LEN);
     while out.len() < NOISE_LEN {
         let u1 = next_unit(&mut state);
         let u2 = next_unit(&mut state);
-        // u1 == 0 is possible (top 53 bits of the state clear). `ln(0)` is -∞,
-        // so r is +∞ and the f32 samples are ±∞ or NaN. It is not remapped.
         let r = (-2.0 * noise_math::ln(u1)).sqrt();
         let theta = 2.0 * std::f64::consts::PI * u2;
         out.push((r * noise_math::cos(theta)) as f32);
@@ -74,7 +74,10 @@ pub fn noise_from_seed(seed: u64) -> Vec<f32> {
             out.push((r * noise_math::sin(theta)) as f32);
         }
     }
-    out
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err(format!("noise seed {seed:#x} produced a non-finite sample"));
+    }
+    Ok(out)
 }
 
 fn canonical_noise_bytes(seed: u64, payload: &[f32]) -> Vec<u8> {
@@ -371,14 +374,15 @@ mod tests {
 
     #[test]
     fn seed_0x5a17_noise_payload_is_the_receipt_hash() {
-        let noise = noise_from_seed(0x5a17);
+        let noise = noise_from_seed(0x5a17).expect("odd seed");
         assert_eq!(noise.len(), NOISE_LEN);
+        assert!(noise.iter().all(|v| v.is_finite()));
         assert_eq!(
             sha256_hex(&f32_bytes(&noise)),
             "09adba264f855351fd2a0911ce66497cba8e54f9ca73d6b8d905c22918e0e4c2"
         );
-        assert_eq!(noise_from_seed(2), noise_from_seed(3));
-        assert_ne!(noise_from_seed(1), noise_from_seed(2));
+        assert!(noise_from_seed(2).is_err());
+        assert!(noise_from_seed(3).is_ok());
         assert_eq!(
             sha256_hex(&canonical_noise_bytes(0x5a17, &noise)),
             "8db2ebc813c83673d6b61b10b2c2a2352018371cbfe9c661f3b405ac6370b61c"
